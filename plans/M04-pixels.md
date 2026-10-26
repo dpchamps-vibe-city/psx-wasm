@@ -1,7 +1,7 @@
 # M4 — Pixels
 
-**Status:** in progress (tasks 1–3, 5, 6 and 9 done; the GTE is wired into
-the runtime; task 4's ABI part is done, its native-host imports are pending)
+**Status:** in progress (tasks 1–7 and 9 done; the GTE and the GPU are wired
+into the runtime)
 **Depends on:** M2, M3. **Unlocks:** M5, M7.
 **Design refs:** design: Runtime (gpu, gte, sio), §5 (adapters), Oracles
 (per-device status); decisions D12, D13, D20–D24.
@@ -195,8 +195,9 @@ golden.
    are no recorded GTE vectors.)*
 3. [x] GPU front end: packet decoder for every type, state, renderer
    command emission. Unit tests decode every packet type.
-4. [ ] Renderer command interface in `psxw-abi`; host imports in the
-   native host. (*The interface is done:* `psxw_abi::render`, ABI 2. The
+4. [x] Renderer command interface in `psxw-abi`; host imports in the
+   native host. *(`psxw-host-native::render`: a null renderer by default,
+   and the render server for `--render server`.)* (*The interface is done:* `psxw_abi::render`, ABI 2. The
    native host's `render_submit`, `render_readback` and `present` wait
    for M2's host; see Findings, "Integration".)
 5. [x] `psx-render-gl` with a headless EGL context (Docker image with Mesa
@@ -206,8 +207,10 @@ golden.
 6. [x] Primitives: sprites and rectangles, then polygons, then lines;
    blending, dither and mask; hazard tracking. Check each feature against
    emulator goldens from synthetic vectors before recorded ones.
-7. [ ] libgpu adapters (classification from M1's report) and the libgpu
-   conformance harness (register decoder).
+7. [x] libgpu adapters (classification from M1's report) and the libgpu
+   conformance harness (register decoder). *(D42: libgpu runs as original
+   code over the GPU front end and DMA, so it has no adapters.
+   `psxw conform btn --lib libgpu` drives it end to end.)*
 8. [ ] libetc adapters (`VSync` modes 0, 1, n, −1; callbacks) and
    conformance.
 9. [x] SIO pad device; libpad and libapi pad adapters; conformance (SIO0
@@ -359,6 +362,21 @@ golden.
     400 `mix`, 100 `clut-many` and 100 `batch-big` vectors from seeds
     `0x50ac05`–`07`, and 600 `mix` vectors (with copies and uploads) from
     `0x50ac09`: 0 differ.
+
+- **2026-10-26** (`02180f4`): the GPU in the runtime (D42).
+  - **Devices:** `psx_devices::dma`; the bus gained DMA channels 2 and 6
+    and the GPU ports. `GPU_cw` (A0h:49h) feeds GP0.
+  - **Plumbing:** libetc's DMA callbacks arrive through `Sdk::on_dma`.
+    The host interface has `render_submit`/`render_readback`/`present`,
+    and the native host has a `Render` trait (null by default).
+    `psxw-cli::render::ServerRender` drives the render server.
+  - **libgpu** is a device library: its 23 adapters were removed and the
+    boundary policy is `device`.
+  - **Results:** `psxw conform btn --lib libgpu --render server` passes
+    (17 steps). PutDrawEnv's background fill reads back as `0x4104` and
+    an 8×2 tile at (4,1) as `0x085F`, through the original
+    ResetGraph/PutDispEnv/PutDrawEnv/ClearOTagR/SetTile/AddPrim/DrawOTag/
+    DrawSync/StoreImage.
 
 ## Findings
 

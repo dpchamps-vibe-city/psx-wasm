@@ -346,7 +346,7 @@ The PsyQ policy, measured on the 361 SDK members btn links:
 |---|---|
 | libapi | Translated. BIOS calls go to the Rust BIOS. Adapters for `counter.o` (`SetRCnt`… program the timers directly) and for `pad.o`, `patch.o` and `chclrpad.o` (they patch Sony BIOS internals in RAM). |
 | libetc | Adapters for `VSync`, callbacks and interrupt setup. To be audited per member, like libapi. |
-| libgpu | Adapters at the device edge: `ResetGraph`, `DrawOTag`, `DrawSync`, `LoadImage`, `StoreImage`, `MoveImage`, `ClearImage`, `PutDrawEnv`, `PutDispEnv`, `SetDispMask`. Primitive setup and OT helpers stay guest code. |
+| libgpu | Guest code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
 | libcd | Adapters at the device edge: `CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`. Helpers such as `CdIntToPos` stay guest code. |
 | libspu | Adapters (register programming). Open question: register-level SPU emulation as the fallback for unknown versions. |
 | libpad | Guest code over the SIO0 device (D40). Its state machine is the behaviour games observe, and the device is a port of the oracle's. |

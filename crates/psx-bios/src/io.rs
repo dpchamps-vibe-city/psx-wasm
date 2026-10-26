@@ -301,7 +301,10 @@ mod tests {
         assert_eq!((call.addr, then), (0x8000_2000, Some(0x8000_3000)));
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
-        assert!(m.io_read(0x1F80_1810, 4).is_err(), "GPU is not modelled here");
+        assert!(m.io_read(0x1F80_1C00, 2).is_err(), "the SPU is not on the bus");
+        // GP1(08h) display mode, read back in GPUSTAT bits 17-22.
+        m.io_write(0x1F80_1814, 4, 0x0800_0001).unwrap();
+        assert_eq!((m.io_read(0x1F80_1814, 4).unwrap() >> 17) & 3, 1);
         m.io_write(0x1F80_1124, 2, 0x0200).unwrap();
         assert_eq!(m.io_read(0x1F80_1124, 2).unwrap(), 0x0600);
     }
