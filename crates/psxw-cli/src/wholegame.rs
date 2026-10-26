@@ -2,7 +2,7 @@
 //! (plans/completed/M03-oracle-harness.md, tasks 8 and 9).
 //!
 //! ```text
-//! psxw oracle play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--check determinism]
+//! psxw oracle play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--check determinism]
 //! psxw oracle ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--require-equal]
 //! ```
 //!
@@ -21,7 +21,7 @@ use psxw_oracle::ramdiff::{self, KERNEL, Layout, OverlayLayout, PointDiff};
 use serde::Serialize;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--check determinism] \
+pub const USAGE: &str = "play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--check determinism] \
                          | ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--require-equal]";
 
 const DEFAULT_STACK: u32 = 0x1_0000;
@@ -126,6 +126,7 @@ struct PlayArgs {
     frames: Option<u64>,
     dump_at: Vec<u64>,
     dump_counter: Vec<u32>,
+    frames_every: Option<u64>,
     every: u64,
     at: Vec<u32>,
     determinism: bool,
@@ -138,6 +139,7 @@ fn parse(args: &[&str]) -> Result<PlayArgs> {
         frames: None,
         dump_at: vec![],
         dump_counter: vec![],
+        frames_every: None,
         every: 600,
         at: vec![],
         determinism: false,
@@ -150,6 +152,7 @@ fn parse(args: &[&str]) -> Result<PlayArgs> {
             "--frames" => a.frames = Some(list::<u64>(it.next(), "--frames")?[0]),
             "--dump-at" => a.dump_at = list(it.next(), "--dump-at")?,
             "--dump-counter" => a.dump_counter = list(it.next(), "--dump-counter")?,
+            "--frames-every" => a.frames_every = Some(list::<u64>(it.next(), "--frames-every")?[0]),
             "--every" => a.every = list::<u64>(it.next(), "--every")?[0],
             "--at" => a.at = list(it.next(), "--at")?,
             "--check" => match it.next() {
@@ -171,12 +174,38 @@ fn emu_play(ws: &Workspace, game: &str, replay: &[u8], frames: u64, trace: u32, 
         trace_u32: Some(trace),
         dump_at: a.dump_at.clone(),
         dump_counter: a.dump_counter.clone(),
+        frames_every: a.frames_every,
         out_dir: dir,
     };
     let t = std::time::Instant::now();
     let p = play::play(ws, &o)?;
+    ppm_to_png(&p.out_dir.join("frames"))?;
     eprintln!("play: {} frames in {:.1}s; {} dumps in {}", p.run.frames, t.elapsed().as_secs_f64(), p.run.dumps.len(), p.out_dir.display());
     Ok(p)
+}
+
+/// The host's `frame_*.ppm` pictures in `dir` as PNGs, like the native
+/// host's `--dump-frames`.
+pub fn ppm_to_png(dir: &std::path::Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+    for e in entries {
+        let p = e?.path();
+        if p.extension().is_none_or(|x| x != "ppm") {
+            continue;
+        }
+        let b = std::fs::read(&p)?;
+        let mut fields = b.splitn(4, |c| c.is_ascii_whitespace());
+        let (Some(b"P6"), Some(w), Some(h), Some(rest)) = (fields.next(), fields.next(), fields.next(), fields.next()) else {
+            bail!("{}: not a binary PPM", p.display());
+        };
+        let (w, h): (u32, u32) = (std::str::from_utf8(w)?.parse()?, std::str::from_utf8(h)?.parse()?);
+        let rgb = &rest[rest.iter().position(|c| c.is_ascii_whitespace()).context("PPM header")? + 1..];
+        ensure!(rgb.len() == (w * h * 3) as usize, "{}: {} pixel bytes for {w}x{h}", p.display(), rgb.len());
+        let rgba: Vec<u8> = rgb.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect();
+        std::fs::write(p.with_extension("png"), psxw_host_native::render::png(w, h, &rgba))?;
+        std::fs::remove_file(&p)?;
+    }
+    Ok(())
 }
 
 /// `psxw oracle play`: exit criterion 4 with `--check determinism`.

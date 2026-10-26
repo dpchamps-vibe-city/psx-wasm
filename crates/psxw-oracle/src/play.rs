@@ -63,6 +63,8 @@ pub struct PlayOptions {
     pub trace_u32: Option<u32>,
     pub dump_at: Vec<u64>,
     pub dump_counter: Vec<u32>,
+    /// Every Nth presented frame as `frames/frame_NNNNNN.ppm`.
+    pub frames_every: Option<u64>,
     /// Receives `trace.bin`, `ram_*.bin`, `play.json` and `host.log`.
     pub out_dir: PathBuf,
 }
@@ -128,6 +130,9 @@ pub fn play(ws: &Workspace, o: &PlayOptions) -> Result<Played> {
     }
     if !o.dump_counter.is_empty() {
         args.extend(["--dump-counter".into(), list(o.dump_counter.iter().map(u32::to_string).collect())]);
+    }
+    if let Some(n) = o.frames_every {
+        args.extend(["--frames-every".into(), n.to_string()]);
     }
     let argv = images::docker_run(
         &imgs.emu.id,

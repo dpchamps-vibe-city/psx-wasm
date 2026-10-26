@@ -59,6 +59,7 @@ fn play_traces_and_dumps_deterministically() {
             trace_u32: Some(wire::MBX_ADDR + wire::MBX_OFF_MAGIC),
             dump_at: vec![550],
             dump_counter: vec![wire::MBX_MAGIC],
+            frames_every: None,
             out_dir: base.join(format!("run-{n}")),
         };
         play::play(&ws, &o).unwrap()

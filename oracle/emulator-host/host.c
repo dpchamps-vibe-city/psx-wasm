@@ -17,6 +17,7 @@
  *                                PS-X EXE loader hooks a Sony-BIOS address.
  *   play --disc GAME.cue --replay R --frames N --out DIR
  *        [--trace-u32 ADDR] [--dump-at F,..] [--dump-counter V,..]
+ *        [--frames-every N]
  *                                run a game from a psx-wasm replay file
  *                                (crates/psxw-abi/src/replay.rs): the pad
  *                                state of frame k is what the core reads
@@ -28,6 +29,8 @@
  *                                Writes DIR/trace.bin, DIR/ram_*.bin and
  *                                DIR/play.json. Frame numbers, file names
  *                                and button words match psxw-host-native.
+ *                                With --frames-every N, every Nth presented
+ *                                frame goes to DIR/frames/frame_NNNNNN.ppm.
  */
 
 #define _GNU_SOURCE
@@ -283,6 +286,9 @@ static void core_log(enum retro_log_level level, const char *fmt, ...) {
     }
 }
 
+/* The core's video format (SET_PIXEL_FORMAT), for --frames-every. */
+static enum retro_pixel_format pixel_format = RETRO_PIXEL_FORMAT_0RGB1555;
+
 static bool environment(unsigned cmd, void *data) {
     switch (cmd) {
     case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
@@ -327,6 +333,7 @@ static bool environment(unsigned cmd, void *data) {
         *(bool *)data = false;
         return true;
     case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+        pixel_format = *(const enum retro_pixel_format *)data;
         return true;
     case RETRO_ENVIRONMENT_GET_LANGUAGE:
         *(unsigned *)data = RETRO_LANGUAGE_ENGLISH;
@@ -389,12 +396,42 @@ static bool environment(unsigned cmd, void *data) {
     }
 }
 
+/* play --frames-every: the frame retro_run is producing, and where its
+ * pictures go. */
+static uint64_t frames_run;
+static uint64_t frames_every;
+static const char *frames_dir;
+
+/* One presented frame as a binary PPM, from the core's pixel format. */
+static void write_ppm(const void *data, unsigned width, unsigned height, size_t pitch) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s/frame_%06llu.ppm", frames_dir, (unsigned long long)frames_run);
+    FILE *f = fopen(path, "wb");
+    if (!f) die(EXIT_USAGE, "create %s: %s", path, strerror(errno));
+    fprintf(f, "P6\n%u %u\n255\n", width, height);
+    for (unsigned y = 0; y < height; y++) {
+        const uint8_t *row = (const uint8_t *)data + y * pitch;
+        for (unsigned x = 0; x < width; x++) {
+            uint8_t rgb[3];
+            if (pixel_format == RETRO_PIXEL_FORMAT_XRGB8888) {
+                uint32_t p = ((const uint32_t *)row)[x];
+                rgb[0] = p >> 16, rgb[1] = p >> 8, rgb[2] = p;
+            } else {
+                uint16_t p = ((const uint16_t *)row)[x];
+                if (pixel_format == RETRO_PIXEL_FORMAT_RGB565)
+                    rgb[0] = (p >> 11) << 3, rgb[1] = ((p >> 5) & 63) << 2, rgb[2] = (p & 31) << 3;
+                else
+                    rgb[0] = ((p >> 10) & 31) << 3, rgb[1] = ((p >> 5) & 31) << 3, rgb[2] = (p & 31) << 3;
+            }
+            fwrite(rgb, 1, 3, f);
+        }
+    }
+    if (fclose(f) != 0) die(EXIT_USAGE, "write %s", path);
+}
+
 static void video_refresh(const void *data, unsigned width, unsigned height, size_t pitch) {
-    (void)data;
-    (void)width;
-    (void)height;
-    (void)pitch;
     frames_presented++;
+    if (frames_every && data && frames_run % frames_every == 0) write_ppm(data, width, height, pitch);
 }
 
 static void audio_sample(int16_t left, int16_t right) {
@@ -417,7 +454,6 @@ static size_t replay_len;
 static uint32_t replay_frames;
 static size_t replay_data;
 static uint32_t replay_clock;
-static uint64_t frames_run;
 
 #define REPLAY_HEADER_LEN_V1 56
 #define REPLAY_HEADER_LEN 64
@@ -809,6 +845,7 @@ struct play_args {
     int ndump_at;
     uint32_t dump_counter[MAX_DUMPS];
     int ndump_counter;
+    uint64_t frames_every;
 };
 
 struct dump_rec {
@@ -869,6 +906,13 @@ static int mode_play(const struct play_args *a) {
     if (!a->disc || !a->replay || !a->out_dir || !a->frames)
         die(EXIT_USAGE, "play needs --disc, --replay, --frames and --out");
     if (a->ndump_counter && !a->trace) die(EXIT_USAGE, "--dump-counter needs --trace-u32");
+    char frames_path[4096];
+    if (a->frames_every) {
+        snprintf(frames_path, sizeof frames_path, "%s/frames", a->out_dir);
+        mkdir(frames_path, 0777);
+        frames_dir = frames_path;
+        frames_every = a->frames_every;
+    }
     uint8_t *r = read_file(a->replay, &replay_len);
     if (replay_len < REPLAY_HEADER_LEN_V1 || memcmp(r, "PSXWRPL", 8) != 0) die(EXIT_USAGE, "%s: not a replay", a->replay);
     switch (le32(r + 8)) {
@@ -947,7 +991,7 @@ static void usage(void) {
             "       psxw-emu-host exe (--disc R.cue | --exe R.exe) --vectors IN --out OUT [--provenance P.json]\n"
             "                     [--mailbox ADDR] [--boot-frames N] [--timeout-frames N] [--dump-ram F] [common]\n"
             "       psxw-emu-host play --disc GAME.cue --replay R --frames N --out DIR [--trace-u32 ADDR]\n"
-            "                     [--dump-at F,..] [--dump-counter V,..] [--provenance P.json] [common]\n"
+            "                     [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--provenance P.json] [common]\n"
             "common: --core LIB --system DIR --work DIR --log FILE --option KEY=VALUE --verbose\n");
     exit(EXIT_USAGE);
 }
@@ -1023,6 +1067,9 @@ int main(int argc, char **argv) {
                 if (pa.ndump_counter == MAX_DUMPS) die(EXIT_USAGE, "too many --dump-counter values");
                 pa.dump_counter[pa.ndump_counter++] = (uint32_t)vals[j];
             }
+        } else if (!strcmp(k, "--frames-every")) {
+            TAKE();
+            pa.frames_every = parse_num(v);
         } else if (!strcmp(k, "--vectors")) {
             TAKE();
             ea.vectors = v;
