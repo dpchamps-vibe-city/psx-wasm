@@ -285,6 +285,17 @@ golden.
     vectors (150 and 300 per generator), 0 differ.
   - `cargo test` on the touched crates passes, including
     `psxw-gpu-oracle`'s present test in the pinned image.
+- **2026-10-26** (`dac9bb6`): three generators exercising the plumbing
+  rather than one feature: `mix` (20–60 primitives of every kind per
+  vector), `clut-many` (more colour-table reloads in one batch than there
+  are slots), `batch-big` (more primitives in one batch than one draw
+  call holds); example `gpubisect`. Results:
+  - `psxw oracle check btn --device gpu`: **2,493 vectors: 1,050
+    verified, 1,443 provisional (3 handwritten + 1,440 synthetic from 36
+    generators), 0 unresolved, 0 failed.**
+  - Soak: seed `0x50ac08` over all 36 generators (5,400 vectors), plus
+    400 `mix`, 100 `clut-many` and 100 `batch-big` vectors from seeds
+    `0x50ac05`–`07`: 0 differ.
 
 ## Findings
 
@@ -293,7 +304,8 @@ golden.
 - **Commands:** `psxw oracle selftest`, `psxw oracle capture --missing`,
   `psxw oracle check btn --device gpu` (counts in the Progress log). The
   gpu device builds its image and the render server on first use; the
-  whole check of 2,373 vectors takes about 2.5–4 s.
+  whole check of 2,493 vectors takes about 3–4 s. In all, 40,650 soak
+  vectors (not archived) also match.
 - **Throughput** (`cargo run --release -p psxw-gpu-oracle --example
   gpubench`, Mesa llvmpipe in Docker, 3 repetitions):
   - backend, per vector including the pipe round trip and VRAM reset:
@@ -421,14 +433,20 @@ golden.
   even after VRAM under them changes, until GP0(01h), a page change, or a
   CPU↔VRAM or VRAM↔VRAM transfer; Beetle models this. The backend always
   samples current VRAM (D20's read copy).
-  - Evidence: soak seed `0x50ac01` had 2 of 150 `tex-feedback` vectors
+  - Evidence 1: soak seed `0x50ac01` had 2 of 150 `tex-feedback` vectors
     differ. In both, a page was sampled, then drawn into, then sampled
     again with no invalidation in between, and Beetle served the
     pre-write texels. psx-spx: abusing the cache "is only seen in some
     demos, and never in actual games".
-  - The `tex-feedback` generator therefore always invalidates between
-    the write and the second sampling; the comment in `gpu_synth.rs`
-    records why.
+  - Evidence 2: the first `mix` vectors had 1 of 40 differ (`gpubisect`
+    found the packet). A big sprite spilled from the destination into a
+    page it had sampled. A later sprite sampled the overwritten texels,
+    with only a flip-bit change of the draw mode in between, which does
+    not invalidate the cache.
+  - The generators keep to what the backend models: `tex-feedback`
+    always invalidates between the write and the second sampling, and
+    `mix` confines drawing to its destination, as a game does to its
+    draw buffer. The comments in `gpu_synth.rs` record why.
   - Within-row self-feedback (a row sampling texels it drew itself)
     depends on the cache too, so it is only exact when no cached line
     goes stale.
@@ -492,4 +510,6 @@ golden.
   - `gpucover`: pixels each generator changes;
   - `gpusoak --seed S --per N`: another seed, any count, captured and
     compared on the spot, keeping only mismatches;
-  - `gpubench`: throughput.
+  - `gpubench`: throughput;
+  - `gpubisect <id>`: the first packet after which the GPU and the device
+    target disagree (captures every packet prefix).
