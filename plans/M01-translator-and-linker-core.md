@@ -300,7 +300,13 @@ adapters.
     bytes.
 - **Execution.** Run F_c on memory copy A and F_t on copy B under wasmtime
   with fuel limits. Both running out of fuel counts as "both diverge",
-  recorded, not failed.
+  recorded, not failed. When only one side runs out, the seed is run
+  again with 4x the fuel for both; only a seed that still runs out on one
+  side is a `fuel` verdict. Below the stack area excluded from the
+  comparison lies a 256-byte band of all-ones bytes. A function given a
+  random pointer may scan for an all-ones terminator, and the band stops
+  the scan before it reads stack frames (which C and the original lay out
+  differently).
 - **Comparison:**
   - the return value, masked to the declared return kind from prototype
     facts;

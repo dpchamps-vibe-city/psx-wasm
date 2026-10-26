@@ -30,11 +30,20 @@ unsafe extern "C" {
     fn host_storage_write(name: *const u8, len: usize, src: *const u8, n: usize) -> i32;
     #[link_name = "report"]
     fn host_report(ptr: *const u8, len: usize);
+    #[link_name = "render_submit"]
+    fn host_render_submit(ptr: *const u8, len: usize);
+    #[link_name = "render_readback"]
+    fn host_render_readback(x: u32, y: u32, w: u32, h: u32, dst: *mut u8);
+    #[link_name = "present"]
+    fn host_present(desc: *const u8);
+    #[link_name = "audio"]
+    fn host_audio(ptr: *const u8, frames: usize);
 }
 
 #[link(wasm_import_module = "guest")]
 unsafe extern "C" {
     fn guest_invoke(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64;
+    fn guest_invoke_irq(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64;
     fn guest_sp_get() -> u32;
     fn guest_sp_set(v: u32);
     fn guest_gp_get() -> u32;
@@ -80,6 +89,21 @@ impl Host for FfiHost {
     }
     fn report(&mut self, json: &str) {
         unsafe { host_report(json.as_ptr(), json.len()) }
+    }
+    fn render_submit(&mut self, words: &[u32]) {
+        unsafe { host_render_submit(words.as_ptr().cast(), words.len() * 4) }
+    }
+    fn render_readback(&mut self, x: u32, y: u32, w: u32, h: u32) -> Vec<u16> {
+        let mut px = vec![0u16; (w * h) as usize];
+        unsafe { host_render_readback(x, y, w, h, px.as_mut_ptr().cast()) };
+        px
+    }
+    fn present(&mut self, desc: &psxw_abi::render::PresentDesc) {
+        let words = desc.to_words();
+        unsafe { host_present(words.as_ptr().cast()) }
+    }
+    fn audio(&mut self, frames: &[[i16; 2]]) {
+        unsafe { host_audio(frames.as_ptr().cast(), frames.len()) }
     }
 }
 
@@ -135,6 +159,10 @@ struct Guest;
 impl Invoke for Guest {
     fn invoke(&mut self, c: GuestCall) -> u64 {
         unsafe { guest_invoke(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) }
+    }
+
+    fn invoke_irq(&mut self, c: GuestCall) -> u64 {
+        unsafe { guest_invoke_irq(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) }
     }
 }
 
@@ -346,6 +374,20 @@ pub extern "C" fn cop0_write(r: u32, v: u32) {
 #[unsafe(export_name = "rfe")]
 pub extern "C" fn rfe() {}
 
+/// ReturnFromException (B0h:17h): the guest unwinds to the
+/// `guest_invoke_irq` that entered the exception handler.
+#[unsafe(export_name = "return_from_exception")]
+pub extern "C" fn return_from_exception() {
+    let in_irq = with(|rt| {
+        let mut m = rt.m.borrow_mut();
+        m.rfe = true;
+        m.in_irq
+    });
+    if !in_irq {
+        fatal(5, "ReturnFromException outside an exception handler");
+    }
+}
+
 /// The GTE's register file, in the runtime-private page of the guest
 /// window (psxw-abi `phys::RUNTIME_PRIVATE`): 64 words, data then control.
 fn gte() -> &'static mut psx_gte::Gte {
@@ -410,6 +452,33 @@ pub extern "C" fn psxw_report() {
         let m = unsafe { &*rt.m.as_ptr() };
         let counts: Vec<String> = m.counts.iter().map(|(k, v)| format!("{k:?}:{v}")).collect();
         let errors: Vec<String> = m.sdk.cd.edc_errors.iter().map(|e| format!("{e:?}")).collect();
+        let events: Vec<String> = m
+            .kernel
+            .events
+            .iter()
+            .filter(|e| e.status != 0)
+            .map(|e| format!("\"{:08x}/{:x} mode {:x} status {:x} func {:08x}\"", e.class, e.spec, e.mode, e.status, e.func))
+            .collect();
+        // CD loads under the drive model (M7 task 7's evidence): totals and
+        // the longest.
+        let loads = &m.sdk.cd.loads;
+        let ms = |c: u64| c as f64 * 1000.0 / psx_devices::clock::CPU_HZ as f64;
+        let mut longest: Vec<_> = loads.iter().collect();
+        longest.sort_by_key(|l| std::cmp::Reverse(l.cycles));
+        let longest: Vec<String> = longest
+            .iter()
+            .take(16)
+            .map(|l| format!("{{\"lba\":{},\"sectors\":{},\"ms\":{:.1},\"seek_ms\":{:.1}}}", l.lba, l.sectors, ms(l.cycles), ms(l.seek)))
+            .collect();
+        let cd_loads = format!(
+            "{{\"timing\":\"{:?}\",\"reads\":{},\"sectors\":{},\"ms\":{:.1},\"seek_ms\":{:.1},\"longest\":[{}]}}",
+            m.drive.timing,
+            loads.len(),
+            loads.iter().map(|l| l.sectors as u64).sum::<u64>(),
+            ms(loads.iter().map(|l| l.cycles).sum()),
+            ms(loads.iter().map(|l| l.seek).sum()),
+            longest.join(",")
+        );
         let io: Vec<String> = m
             .io
             .iter()
@@ -417,13 +486,18 @@ pub extern "C" fn psxw_report() {
             .map(|(t, a, n, v, w)| format!("\"{t} {} {a:08x}/{n} {v:#x}\"", if *w { "W" } else { "R" }))
             .collect();
         format!(
-            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}]}}",
+            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"cd_loads\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{}}}",
             m.vblanks,
             m.clock.now,
             m.sdk.cd.sectors,
+            cd_loads,
             errors.join(","),
             counts.join(","),
-            io.join(",")
+            io.join(","),
+            events.join(","),
+            m.crit,
+            m.in_irq,
+            m.calls.len()
         )
     });
     report(json);

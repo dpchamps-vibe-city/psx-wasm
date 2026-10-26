@@ -17,6 +17,9 @@ psn00bsdk_add_executable(
     spu.c
     bios.c
     bios_call.s
+    # Last, so the code before it keeps its addresses (SPU_RUN results are
+    # sensitive to the runner's timing).
+    cd.c
 )
 target_include_directories(psxw-runner PRIVATE ${PSXW_INCLUDE})
 target_compile_options(psxw-runner PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror -std=gnu11>)

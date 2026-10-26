@@ -71,6 +71,7 @@ static op_fn *lookup(uint32_t op) {
     case PSXW_OP_SPU_RESET: return op_spu_reset;
     case PSXW_OP_SPU_RAM_WRITE: return op_spu_ram_write;
     case PSXW_OP_SPU_RUN: return op_spu_run;
+    case PSXW_OP_CD_XA: return op_cd_xa;
     case PSXW_OP_BIOS_CALL: return op_bios_call;
     default: return 0;
     }

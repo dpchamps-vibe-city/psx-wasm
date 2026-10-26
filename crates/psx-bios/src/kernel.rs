@@ -48,6 +48,8 @@ pub struct Kernel {
     pub custom_exit: u32,
     /// `SysEnqIntRP` queues: priority → handler structs.
     pub int_handlers: BTreeMap<u32, Vec<u32>>,
+    /// Memory cards and their files.
+    pub cards: crate::card::Cards,
 }
 
 impl Kernel {

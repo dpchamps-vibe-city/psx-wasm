@@ -18,11 +18,11 @@
 [library.libapi]   # BIOS trampolines go to the Rust BIOS; counter.o, pad.o,
 policy = "adapter" # patch.o, first.o patch BIOS internals or program timers
 
-[library.libetc]   # VSync, callbacks, interrupt setup
-policy = "adapter"
+[library.libetc]   # D45: original over the IRQ controller, DMA and timers,
+policy = "device"  # entered through the BIOS's custom exception exit
 
-[library.libgpu]   # the device edge (ResetGraph, DrawOTag, LoadImage, …)
-policy = "adapter"
+[library.libgpu]   # D42: original over the GPU front end and DMA
+policy = "device"
 
 [library.libcd]    # the drive (CdInit, CdControl*, CdRead*, CdSearchFile, …)
 policy = "adapter"
@@ -33,8 +33,8 @@ policy = "adapter"
 [library.libpad]   # D40: original over SIO0
 policy = "device"
 
-[library.libmcrd]
-policy = "adapter"
+[library.libmcrd]  # guest code over the BIOS card functions
+policy = "guest"
 
 [library.libmcx]
 policy = "adapter"

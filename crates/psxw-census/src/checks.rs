@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Imports the runtime provides (not guest symbols).
-const RUNTIME_IMPORTS: &[&str] = &["__psxw_break"];
+const RUNTIME_IMPORTS: &[&str] =
+    &["__psxw_break", "psx_gte_mfc2", "psx_gte_cfc2", "psx_gte_mtc2", "psx_gte_ctc2", "psx_gte_exec"];
 
 fn hex(a: u32) -> String {
     format!("0x{a:08X}")

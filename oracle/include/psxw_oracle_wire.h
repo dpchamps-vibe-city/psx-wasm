@@ -146,6 +146,10 @@
 /* Diagnostic: waiting for the SPU capture-half edge (value: SPUSTAT). */
 #define PSXW_DIAG_SPU_SYNC 0x00000005u
 
+/* Diagnostic: waiting for a CD controller interrupt or idle (value: */
+/* the status register, and the interrupt flags << 8). */
+#define PSXW_DIAG_CD 0x00000006u
+
 /* ---- Runner operations ---- */
 
 /* Payload: any bytes. Result: the same bytes. */
@@ -198,6 +202,17 @@
 /* n_captures × (u32 addr, u32 len). Result: u32 v0, then each capture. */
 /* Addresses lie in the scratch region. */
 #define PSXW_OP_BIOS_CALL 0x00000040u
+
+/* Payload: u32 lba, u32 mode, u32 file, u32 channel, u32 samples, u32 */
+/* n_captures, n_captures × (u32 addr, u32 len). Result: each capture */
+/* (SPU RAM). XA-ADPCM streaming, after SPU_RESET: SPUCNT C001h (CD */
+/* audio in), main and CD volumes up; the CD's audio matrix L→L and */
+/* R→R at 80h, ADPCM unmuted; then Setmode(mode), Setfilter(file, */
+/* channel), Setloc(lba), ReadS. The captures are DMA-read `samples` × */
+/* `SPU_CYCLES_PER_SAMPLE` cycles after ReadS is acknowledged, while */
+/* the SPU keeps running; then Pause. CD interrupts are acknowledged */
+/* as they come. */
+#define PSXW_OP_CD_XA 0x00000050u
 
 /* ---- Payload layouts and limits ---- */
 
@@ -286,6 +301,10 @@
 
 /* One BIOS A0/B0/C0 call with memory set-up and captures. */
 #define PSXW_VK_BIOS_CALL 0x00000005u
+
+/* XA-ADPCM from the runner disc's test file, captured from the SPU's */
+/* CD input buffers. */
+#define PSXW_VK_CD_XA 0x00000006u
 
 /* ---- Exchange files (driver ↔ psxw-emu-host) ---- */
 

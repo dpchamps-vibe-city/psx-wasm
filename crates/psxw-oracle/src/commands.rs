@@ -4,6 +4,7 @@
 
 use crate::exact;
 use crate::golden::{EXACT_TARGET, Provenance};
+use crate::gpu_synth;
 use crate::gte;
 use crate::handwritten;
 use crate::images;
@@ -40,6 +41,15 @@ fn install_gte(store: &Store) -> Result<String> {
     let total: usize = counts.values().sum();
     let parts: Vec<String> = counts.iter().map(|(g, n)| format!("{g} {n}")).collect();
     Ok(format!("synthetic GTE vectors: {total} (seed {:#018x}; {})", gte::DEFAULT_SEED, parts.join(", ")))
+}
+
+/// Store the XA vectors for the runner disc's test file; the note for
+/// reports.
+fn install_xa(ws: &Workspace, store: &Store) -> Result<String> {
+    Ok(match images::load(ws)?.runner.xa_lba {
+        Some(lba) => format!("XA vectors: {} (test file at LBA {lba})", crate::xa_disc::install(store, lba)?.len()),
+        None => "XA vectors: none (the runner disc has no XA test file; run `psxw oracle images build`)".into(),
+    })
 }
 
 /// Store the synthetic SPU vectors (default seed); the note for reports.
@@ -151,7 +161,9 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     let store = store(ws);
     handwritten::install(&store)?;
     let gte_note = install_gte(&store)?;
+    let xa_note = install_xa(ws, &store)?;
     let spu_note = if kind.is_none_or(|k| k == Kind::SpuRun) { Some(install_spu(&store)?) } else { None };
+    let synthetic = gpu_synth::install(&store)?;
     let mut target = DockerTarget::open(ws)?;
     let tid = target.id().to_string();
     let ids: Vec<VectorId> = store.vector_ids()?;
@@ -169,8 +181,9 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     report.target = Some(tid.clone());
     report.seed = Some(format!("{:#018x}", gte::DEFAULT_SEED));
     report.notes.push(gte_note);
+    report.notes.push(xa_note);
     report.notes.extend(spu_note);
-    let (mut new, mut same, mut changed) = (0usize, 0usize, 0usize);
+    let (mut new, mut same, mut changed, mut moved) = (0usize, 0usize, 0usize, 0usize);
     for ((id, v), res) in vectors.iter().zip(results) {
         let group = groups.get(id).cloned().unwrap_or_else(|| "unlisted".into());
         let entry = |verdict, reference: &str, detail: String| Entry {
@@ -199,6 +212,10 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
             _ => String::new(),
         };
         match store.golden(&tid, id)? {
+            Some((old, _)) if old != got && crate::verdict::timing_variable(v.kind()) => {
+                moved += 1;
+                detail = "captured at another moment (timing-variable; its check compares values)".into();
+            }
             Some((old, _)) if old != got => {
                 changed += 1;
                 verdict = Verdict::Failed;
@@ -220,7 +237,14 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
         }
         report.add(entry(verdict, &format!("{reference:?}").to_lowercase(), detail));
     }
-    report.notes.push(format!("{new} captured, {same} reproduced byte for byte, {changed} changed"));
+    report.notes.push(format!(
+        "{new} captured, {same} reproduced byte for byte, {moved} timing-variable captured at another moment, {changed} changed"
+    ));
+    report.notes.push(format!(
+        "synthetic GPU vectors: {synthetic} ({} per generator, seed {:#018x})",
+        gpu_synth::PER_GENERATOR,
+        gpu_synth::SEED
+    ));
     let path = report.write(&report_dir(ws, &["capture"]))?;
     Ok((report, path))
 }
@@ -234,9 +258,16 @@ pub trait DeviceUnderTest {
     fn name(&self) -> String;
     /// The vector's result, in the same layout as a target's.
     fn run(&mut self, v: &Vector, store: &Store) -> Result<Vec<u8>>;
+    /// For results psx-wasm can't reproduce byte for byte without the
+    /// target's timing (when the runner read a buffer that was still being
+    /// written): whether the reference result is consistent with this
+    /// device, instead of `run`. `None`: compare `run`'s bytes.
+    fn consistent(&mut self, _v: &Vector, _store: &Store, _reference: &[u8]) -> Option<Result<(), String>> {
+        None
+    }
 }
 
-pub const DEVICES: [&str; 4] = ["gpu", "gte", "spu", "bios"];
+pub const DEVICES: [&str; 5] = ["gpu", "gte", "spu", "bios", "xa"];
 
 /// The result of `check`.
 pub struct Checked {
@@ -248,8 +279,9 @@ pub struct Checked {
 
 /// `psxw oracle check <game> --device D`: run psx-wasm's implementation on
 /// every archived vector of the device (the game's recorded set plus the
-/// harness's handwritten and selftest sets) and judge it against the
-/// strongest golden: exact, hardware, then this pin's emulator.
+/// harness's handwritten, selftest and synthetic sets) and judge it
+/// against the strongest golden: exact, hardware, then this pin's
+/// emulator.
 pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn DeviceUnderTest>]) -> Result<Checked> {
     ws.game(game).with_context(|| format!("unknown game {game}"))?;
     if !DEVICES.contains(&device) {
@@ -259,6 +291,9 @@ pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn Devi
     let mut notes = Vec::new();
     if device == "gte" {
         notes.push(install_gte(&store)?);
+    }
+    if device == "xa" {
+        notes.push(install_xa(ws, &store)?);
     }
     if device == "spu" {
         notes.push(install_spu(&store)?);
@@ -378,7 +413,15 @@ pub fn compare(
             }
         }
         let em = store.golden(emulator_target, id)?.map(|g| g.0);
-        let (verdict, reference, detail) = match imp.run(v, store) {
+        let strongest = exact.as_ref().map(|e| (Reference::Exact, e)).or(hw.as_ref().map(|h| (Reference::Hardware, h))).or(em.as_ref().map(|e| (Reference::Emulator, e)));
+        let consistent = match strongest {
+            Some((reference, golden)) => imp.consistent(v, store, golden).map(|r| (reference, r)),
+            None => None,
+        };
+        let (verdict, reference, detail) = match consistent {
+            Some((reference, Ok(()))) => (if reference == Reference::Emulator { Verdict::Provisional } else { Verdict::Verified }, reference, None),
+            Some((reference, Err(e))) => (Verdict::Failed, reference, Some(e)),
+            None => match imp.run(v, store) {
             Err(e) => (Verdict::Failed, Reference::None, Some(format!("{e:#}"))),
             Ok(got) => {
                 let (verdict, reference) = judge(v.kind(), &got, exact.as_deref(), hw.as_deref(), em.as_deref());
@@ -395,6 +438,7 @@ pub fn compare(
                 };
                 (verdict, reference, detail)
             }
+            },
         };
         report.add(Entry {
             vector: id.hex(),
@@ -467,17 +511,19 @@ mod tests {
 /// reproduces its golden, psx-gte matches every GTE golden of every game
 /// (M4 exit criterion 1), and psx-spu every SPU golden (M6 exit criterion
 /// 1).
-pub fn ci(ws: &Workspace) -> Result<Vec<(Report, PathBuf)>> {
+/// `psxw oracle ci`: images, selftest, capture (determinism), then the
+/// check of every device in `impls` for every game.
+pub fn ci(ws: &Workspace, impls: &mut [Box<dyn DeviceUnderTest>]) -> Result<Vec<(Report, PathBuf)>> {
     let imgs = images::load(ws)?;
     images::verify(ws, &imgs)?;
     eprintln!("ci: images match inputs.lock ({}, {})", imgs.emu.id, imgs.sdk.id);
     let st = selftest(ws, DEFAULT_SEED, DEFAULT_SELFTEST)?;
     let cap = capture(ws, None, false)?;
     let mut out = vec![st, cap];
+    let devices: Vec<String> = impls.iter().map(|i| i.device().to_string()).collect();
     for game in ws.lock.game.keys() {
-        let mut impls: Vec<Box<dyn DeviceUnderTest>> = vec![Box::new(gte::Device), Box::new(spu::Device::default())];
-        for device in ["gte", "spu"] {
-            let checked = check(ws, game, device, &mut impls)?;
+        for d in &devices {
+            let checked = check(ws, game, d, impls)?;
             out.push((checked.report, checked.path));
         }
     }

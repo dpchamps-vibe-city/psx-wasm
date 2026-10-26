@@ -31,6 +31,9 @@ const FUEL: u64 = 20_000_000;
 /// guest register in a local and re-reads memory at loop heads, so it may
 /// take a few times the C's wasm instructions for the same work.
 const TRANSLATED_FUEL_SCALE: u64 = 4;
+/// One side ran out of fuel and the other didn't: the seed is run again
+/// with this much more fuel for both before it counts as a `fuel` verdict.
+const RETRY_FUEL_SCALE: u64 = 4;
 /// The C side compiles each function as if alone: no automatic inlining,
 /// and no tail-call or tail-recursion rewriting of the calls it makes.
 const HARNESS_FLAGS: &[&str] = &["-fno-inline-functions", "-fno-optimize-sibling-calls"];
@@ -589,17 +592,25 @@ fn run_pair(
                 _ => *slot,
             };
         }
-        let c = h.run(&fc, seed, args, &scratch, &stack, 1);
-        let c_pages: BTreeMap<usize, Vec<u8>> = c.dirty.iter().map(|&pg| (pg, h.page(pg).to_vec())).collect();
-        h.restore(&c.dirty);
-        let t = h.run(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE);
-        let verdict = compare(h, p, &c, &t, &c_pages, masks);
-        let mut all = c.dirty.clone();
-        all.extend(t.dirty.iter().copied());
-        if verdict.is_err() && verbose {
-            explain(h, p, &args, &stack, &c, &t, &c_pages);
+        // When only one side runs out of fuel the budget, not the code,
+        // decided: retry once with RETRY_FUEL_SCALE times as much for both.
+        let mut verdict = Err(("fuel", String::new()));
+        for scale in [1, RETRY_FUEL_SCALE] {
+            let c = h.run(&fc, seed, args, &scratch, &stack, scale);
+            let c_pages: BTreeMap<usize, Vec<u8>> = c.dirty.iter().map(|&pg| (pg, h.page(pg).to_vec())).collect();
+            h.restore(&c.dirty);
+            let t = h.run(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE * scale);
+            verdict = compare(h, p, &c, &t, &c_pages, masks);
+            let mut all = c.dirty.clone();
+            all.extend(t.dirty.iter().copied());
+            if verdict.is_err() && verbose {
+                explain(h, p, &args, &stack, &c, &t, &c_pages);
+            }
+            h.restore(&all);
+            if !matches!(verdict, Err(("fuel", _))) {
+                break;
+            }
         }
-        h.restore(&all);
         match verdict {
             Ok(Agree::Same) => {}
             Ok(Agree::BothFuel) => report.both_fuel += 1,

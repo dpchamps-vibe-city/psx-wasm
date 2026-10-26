@@ -35,6 +35,11 @@ The game sounds right, and every piece is checked against an oracle:
     running: provisional, refine here (and bump `RUNNER_VERSION`);
   - the Beetle option `spu_silent_voice` is forced off: on, it leaves SPU
     register state inexact.
+- From M4's Findings: SPU_RUN results depend on what ran before them in
+  the same emulator session. The handwritten `spu_noise_voice_3`
+  (`d61a8b7b…`) reproduces its golden alone, but differs (709 bytes) in a
+  full `capture` next to M4's 1,320 synthetic GPU vectors. Make SPU_RUN
+  independent of session history before trusting SPU goldens.
 - btn facts:
   - it reads the SPU's key status in 6 places;
   - it uses `SsSetTickMode` and `SsSeqCalledTbyT` (sequencer ticks from a
@@ -121,23 +126,38 @@ unverified.
    voices 1 and 3. Capture goldens; reach zero failures in
    `psxw oracle check --device spu`.
 4. [ ] libspu adapters and conformance (register decoder).
-5. [ ] libsnd tick path through root-counter events. The libsnd functions
+5. [x] libsnd tick path through root-counter events. The libsnd functions
    btn uses must run as translated or C guest code with no traps.
+   *(`psxw conform btn --lib libsnd`: `SsSeqCalledTbyT` runs exactly 60
+   times over 60 vblanks under `SS_TICK60` and 240 under `SS_TICK240`. The
+   sequences btn plays during gameplay run in the disc-gated runs.)*
 6. [ ] SPU recording hook; record btn vectors over `title-to-gameplay`;
    capture; zero failures.
 7. [ ] XA: `ReadS`, filters, decoding, resampling, CD input, real-rate
-   delivery.
-8. [ ] Test-disc tooling in `psxw-psx-sdk` (mkpsxiso, psxavenc); a
+   delivery. *(All but the CD input, which waits for the SPU device:
+   `psx_devices::xa`, the libcd adapters' stream. Decoding and resampling
+   match the emulator exactly; see task 8.)*
+8. [x] Test-disc tooling in `psxw-psx-sdk` (mkpsxiso, psxavenc); a
    generator for XA test discs; the runner's `CD_XA` kind; goldens; zero
    failures.
-9. [ ] Host audio: native WAV and optional `cpal`; the web ring buffer
-   (M5's worklet).
+   *(`psxw_oracle::xa_disc` generates the sectors directly, so psxavenc
+   isn't needed. 28 vectors are consistent with the emulator, and with
+   them `psxw oracle check btn --device xa` reports zero failures.)*
+9. [x] Host audio: native WAV and optional `cpal`; the web ring buffer
+   (M5's worklet). *(`host.audio`, ABI 5: each vblank hands the host the
+   frames due in virtual time, 768 cycles each. `psxw run --audio-wav`;
+   the Worker fills the worklet's ring. Both hash the frames the same way,
+   and `web-test game` compares them. `cpal` playback isn't added; it's
+   optional.)*
 10. [ ] Remove the sound-driver exclusions from `game.toml`;
     `psxw oracle ramdiff btn --replay title-to-gameplay` reaches zero
     differences.
 11. [ ] Audio determinism: identical audio hashes across two runs, and
     across hosts once M5 is done. Add everything to `psxw ci`; docs,
-    README status.
+    README status. *(Both checks exist: `psxw run --check determinism`
+    adds `audio-determinism`, and `web-test game` compares the audio with
+    the native host's. Both are in `psxw ci` through the `boot` and
+    `web-game` gates, and their runs wait for the disc.)*
 
 ## Exit criteria (all automated)
 
@@ -164,5 +184,104 @@ unverified.
   correctly, or is documented as incompatible with streamed audio.
 
 ## Progress log
+
+- **2026-10-26** (this commit): task 7 up to the SPU. The SPU device
+  itself is being written alongside (tasks 1-3).
+  - **`psx_devices::xa`:**
+    - XA-ADPCM decoding as psx-spx gives it: 4- and 8-bit, mono and
+      stereo, shift 13-15 acting as 9, and per-channel history across
+      sectors;
+    - the 25-point zigzag resampler to 44.1 kHz, with 18.9 kHz samples
+      fed twice. The resampler is provisional: psx-spx calls it "nearly
+      correct", and its table's DC gain is about 0.91.
+  - **libcd adapters:**
+    - With XA-ADPCM mode set, a Form2 audio sector goes to the decoder
+      and isn't delivered as data. With the filter bit set, only sectors
+      matching `Setfilter`'s file and channel play.
+    - `Mute`/`Demute` gate the output.
+    - The samples go to `Machine::cd_audio`, the seam the SPU's CD input
+      will take them from.
+    - XA streams run at the disc's real rate even under instant timing,
+      which settles the plan's open risk on rate coupling.
+
+- **2026-10-26** (this commit): task 9.
+  - **ABI 5:** `host.audio(ptr, frames)` carries 44.1 kHz stereo i16.
+    `Machine::audio_vblank` hands over exactly the frames that fell due:
+    one per 768 cycles of virtual time, so 737.14 per NTSC frame on
+    average. Their source is `cd_audio` until the SPU mixes (silence
+    when empty).
+  - **Native host:** `psxw run --audio-wav PATH` streams a WAV file, and
+    the run report's `audio` gives frames, audible frames and an FNV-1a
+    hash.
+  - **Web host:** the Worker writes into the AudioWorklet's ring and
+    hashes the frames the same way, in 32-bit halves (checked against a
+    BigInt reference). `psxw web-test game` compares the audio frames and
+    hash with the native host's.
+  - **Check:** a conformance run (38 vblanks) delivers 28,015 silent
+    frames.
+
+- **2026-10-26** (this commit): task 5.
+  - **The libsnd scenario** (`psxw conform btn --lib libsnd`, in the
+    `conform` gate) counts entries to `SsSeqCalledTbyT` through a build
+    probe (`psxw_build::game::Options::probes`, read mid-run with
+    `Conform::counts`). It runs ResetCallback, SsInit, then each tick
+    mode with SsStart for 60 vblanks and SsEnd.
+  - **Both tick sources reach libsnd's tick:**
+    - `SS_TICK60`: libsnd's own vblank callback, through original libetc
+      (D45), ran 60 times;
+    - `SS_TICK240`: root counter 2's events, through libapi's counter
+      adapters and the BIOS event chain, ran 240 times.
+  - **Guest libraries are compared with themselves:** a library whose
+    boundary policy is guest is now built the same on both sides.
+    Forcing libsnd into a device library would send its direct SPU
+    register writes (`_SsInit`) to a bus that has no SPU yet.
+
+- **2026-10-26** (this commit): task 8, XA through the CD controller.
+  - **The test file:** `psxw_oracle::xa_disc` generates `XATEST.XA`, and
+    `psxw oracle images build` writes it onto the runner disc (mounted at
+    `/gen`; mkpsxiso `xa` file type) and records its LBA.
+    - It has 7 regions, one per coding plus a filter-0 region, each
+      interleaved at the factor that plays it in real time at double
+      speed.
+    - Each region has 4 played channels, with filler channels in the
+      other slots.
+    - Each channel's first sector uses filter 0, so decoding from it
+      doesn't depend on history.
+  - **The runner's `OP_CD_XA`** (`oracle/runner/cd.c`, linked last, so
+    the other ops' code keeps its addresses):
+    - it sets SPUCNT for CD audio and the CD's audio matrix;
+    - Setmode, Setfilter, Setloc, ReadS by polling;
+    - it acknowledges interrupts while 0.8 s pass, DMA-reads the CD
+      capture buffers, and pauses.
+    - A batch holds at most one, which keeps each exchange inside the
+      host's time limit.
+  - **The check** (`check --device xa`) decodes and resamples the same
+    sectors. Each 512-sample capture ring must appear exactly in that
+    stream, at any position and resampler phase: when the runner read
+    it is the emulator's timing. The captures aren't byte-reproducible
+    across sessions, because the seek starts from wherever the previous
+    vector left the head. So capture keeps such goldens
+    (`verdict::timing_variable`).
+  - **What the oracle settled.** Against psx-spx, five changes, now in
+    `psx_devices::xa` marked `oracle:`. Found by fitting the captures
+    (`examples/xa_probe` dumps them):
+    - **Filter arithmetic:** `(old*f0 >> 6) + (older*f1 >> 6)`, not
+      `(old*f0 + older*f1 + 32) / 64`. Only that made the filtered
+      regions consistent.
+    - **Reserved shifts 13-15** shift by that much. psx-spx says they
+      act as 9 on hardware.
+    - **Resampler rounding:** the 29 products are summed, then shifted
+      by 15. psx-spx truncates each division by 8000h.
+    - **Table5's taps 24 and 26** are -2 and 0, not -1 and +1. Table5 is
+      then exactly Table1 reversed, as the tables' symmetry implies, so
+      psx-spx probably has a misprint. Least squares over the filter-0
+      region found it: 44 of 4,096 samples off before, 0 after.
+    - **18.9 kHz** isn't 37.8 kHz with each sample doubled. It is the
+      same polyphase filter at 3/7 of an input per output, 7 outputs
+      every 3 inputs, with the tables in the order of their fractions.
+  - **Result:** all 28 vectors are consistent (provisional). Before the
+    fixes, 24 of 28 failed.
+  - **The rest of the archive is undisturbed:** after the runner change,
+    a full recapture reproduced all 8,062 other vectors byte for byte.
 
 ## Findings

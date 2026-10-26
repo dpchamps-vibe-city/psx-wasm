@@ -66,6 +66,11 @@ pub struct Provenance {
     /// For exact results: the generator and its seed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generator: Option<String>,
+    /// For hardware results: the rig, console model, BIOS version and
+    /// contributor, and hashes of the batch manifest and results
+    /// ([`crate::batch`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hardware: BTreeMap<String, String>,
     /// RFC 3339, UTC.
     pub created: String,
 }
@@ -89,6 +94,7 @@ impl Provenance {
             images: BTreeMap::new(),
             binaries: BTreeMap::new(),
             generator: Some(generator.to_string()),
+            hardware: BTreeMap::new(),
             created: now_rfc3339(),
         }
     }

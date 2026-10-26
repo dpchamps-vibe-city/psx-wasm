@@ -5,8 +5,9 @@
 //!   every sector passes EDC, the disc matches its pin, every overlay load
 //!   is byte-exact, no trap, at least 600 VSync waits, the main loop
 //!   entered;
-//! - `--check determinism` (criterion 3): two runs, identical RAM hashes at
-//!   frames 60, 300 and 600;
+//! - `--check determinism` (criterion 3; M6 task 11): two runs, identical
+//!   RAM hashes at frames 60, 300 and 600, and identical audio (frames and
+//!   hash);
 //! - `--check no-trap`: the run reaches its frame limit (the UBSan gate,
 //!   with `--wasm out/<game>/game-ubsan.wasm`).
 
@@ -43,6 +44,20 @@ pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Ve
             "--wasm" => o.wasm = val()?.into(),
             "--check" => checks.push(val()?),
             "--verbose" => o.verbose = true,
+            "--render" => {
+                if val()? == "server" {
+                    o.render = Some(crate::render::server(ws));
+                }
+            }
+            "--vram-hash-at" => o.vram_hash_at = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
+            "--dump-frames" => o.dump_frames = Some((val()?.into(), 1)),
+            "--audio-wav" => o.audio_wav = Some(val()?.into()),
+            "--dump-every" => {
+                let n: u64 = val()?.parse()?;
+                if let Some(d) = &mut o.dump_frames {
+                    d.1 = n;
+                }
+            }
             other => bail!("unknown run option {other}"),
         }
     }
@@ -178,6 +193,12 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
             name: "determinism",
             pass: same,
             detail: format!("{:?} vs {:?}", r.ram_hashes, again.ram_hashes),
+        });
+        let (a, b) = (&r.audio, &again.audio);
+        results.push(Check {
+            name: "audio-determinism",
+            pass: a.frames == b.frames && a.hash == b.hash && a.frames > 0,
+            detail: format!("{} frames {} vs {} frames {}", a.frames, a.hash, b.frames, b.hash),
         });
     }
     if checks.iter().any(|c| c == "no-trap") {

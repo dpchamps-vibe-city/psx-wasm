@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>psx-wasm WebGL2 probe</title></head>
+<body>
+<pre id="out">probing…</pre>
+<script type="module">
+// Reports whether WebGL2 is available on an OffscreenCanvas and a canvas,
+// with the browser's own reason when it isn't (diagnosing headless setups).
+const params = new URLSearchParams(location.search);
+const browser = params.get("browser") || "unknown";
+function probe(canvas) {
+  let reason = null;
+  canvas.addEventListener?.("webglcontextcreationerror", (e) => (reason = e.statusMessage));
+  let gl = null;
+  try {
+    gl = canvas.getContext("webgl2", { antialias: false });
+  } catch (e) {
+    reason = String(e);
+  }
+  if (!gl) return { ok: false, reason };
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  return { ok: true, renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER), version: gl.getParameter(gl.VERSION) };
+}
+const result = {
+  browser,
+  userAgent: navigator.userAgent,
+  crossOriginIsolated,
+  offscreen: probe(new OffscreenCanvas(64, 64)),
+  canvas: probe(document.createElement("canvas")),
+  webgl1: !!document.createElement("canvas").getContext("webgl"),
+};
+document.getElementById("out").textContent = JSON.stringify(result, null, 2);
+fetch(`/result?browser=${browser}`, { method: "POST", body: JSON.stringify(result) });
+</script>
+</body>
+</html>

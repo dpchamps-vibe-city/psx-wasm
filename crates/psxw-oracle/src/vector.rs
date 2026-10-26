@@ -33,10 +33,11 @@ pub enum Kind {
     GteOp,
     SpuRun,
     BiosCall,
+    CdXa,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [Kind::Echo, Kind::GpuDraw, Kind::GpuTransfer, Kind::GteOp, Kind::SpuRun, Kind::BiosCall];
+    pub const ALL: [Kind; 7] = [Kind::Echo, Kind::GpuDraw, Kind::GpuTransfer, Kind::GteOp, Kind::SpuRun, Kind::BiosCall, Kind::CdXa];
 
     pub fn tag(self) -> u32 {
         match self {
@@ -46,6 +47,7 @@ impl Kind {
             Kind::GteOp => wire::VK_GTE_OP,
             Kind::SpuRun => wire::VK_SPU_RUN,
             Kind::BiosCall => wire::VK_BIOS_CALL,
+            Kind::CdXa => wire::VK_CD_XA,
         }
     }
 
@@ -62,6 +64,7 @@ impl Kind {
             Kind::GteOp => "gte_op",
             Kind::SpuRun => "spu_run",
             Kind::BiosCall => "bios_call",
+            Kind::CdXa => "cd_xa",
         }
     }
 
@@ -80,6 +83,7 @@ impl Kind {
             Kind::GteOp => "gte",
             Kind::SpuRun => "spu",
             Kind::BiosCall => "bios",
+            Kind::CdXa => "xa",
         }
     }
 }
@@ -245,6 +249,23 @@ pub struct BiosCall {
     pub captures: Vec<(u32, u32)>,
 }
 
+/// XA-ADPCM played from the runner disc's test file (`crate::xa_disc`) and
+/// captured from the SPU's CD input buffers. `file_lba` is where the file
+/// starts on the target's disc, `start` the first sector played (within
+/// the file), `mode`/`file`/`channel` the Setmode and Setfilter values.
+/// Result: each capture. See OP_CD_XA.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CdXa {
+    pub xa: BlobRef,
+    pub file_lba: u32,
+    pub start: u32,
+    pub mode: u32,
+    pub file: u32,
+    pub channel: u32,
+    pub samples: u32,
+    pub captures: Vec<(u32, u32)>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Vector {
     Echo(Vec<u8>),
@@ -253,6 +274,7 @@ pub enum Vector {
     GteOp(GteOp),
     SpuRun(SpuRun),
     BiosCall(BiosCall),
+    CdXa(CdXa),
 }
 
 /// SPU RAM the runner reserves (its silent loop block).
@@ -267,6 +289,7 @@ impl Vector {
             Vector::GteOp(_) => Kind::GteOp,
             Vector::SpuRun(_) => Kind::SpuRun,
             Vector::BiosCall(_) => Kind::BiosCall,
+            Vector::CdXa(_) => Kind::CdXa,
         }
     }
 
@@ -288,6 +311,7 @@ impl Vector {
                 }))
                 .collect(),
             Vector::SpuRun(s) => s.ram.iter().map(|r| r.bytes).collect(),
+            Vector::CdXa(x) => vec![x.xa],
             _ => Vec::new(),
         }
     }
@@ -311,6 +335,7 @@ impl Vector {
             Vector::GteOp(_) => wire::GTE_EXEC_RESULT_SIZE as usize,
             Vector::SpuRun(s) => wire::SPU_SNAPSHOT_SIZE as usize + s.captures.iter().map(|c| c.1 as usize).sum::<usize>(),
             Vector::BiosCall(b) => 4 + b.captures.iter().map(|c| c.1 as usize).sum::<usize>(),
+            Vector::CdXa(x) => x.captures.iter().map(|c| c.1 as usize).sum(),
         }
     }
 
@@ -364,6 +389,13 @@ impl Vector {
                 }
                 for r in &s.ram {
                     ensure!(r.addr % wire::SPU_ADDR_ALIGN == 0, "SPU RAM address {:#x} unaligned", r.addr);
+                }
+            }
+            Vector::CdXa(x) => {
+                ensure!(x.samples <= 44_100 * 60, "XA run of {} samples", x.samples);
+                ensure!(x.mode <= 0xFF && x.file <= 0xFF && x.channel <= 0xFF, "XA mode or filter out of range");
+                for &(addr, len) in &x.captures {
+                    check_spu_range(addr, len)?;
                 }
             }
             Vector::BiosCall(b) => {
@@ -456,6 +488,13 @@ impl Vector {
                 }
                 e.pairs(&b.captures);
             }
+            Vector::CdXa(x) => {
+                e.hash(&x.xa.0);
+                for v in [x.file_lba, x.start, x.mode, x.file, x.channel, x.samples] {
+                    e.u32(v);
+                }
+                e.pairs(&x.captures);
+            }
         }
         e.0
     }
@@ -537,6 +576,12 @@ impl Vector {
                 }
                 let captures = d.pairs()?;
                 Vector::BiosCall(BiosCall { table, func, args, setup, captures })
+            }
+            Kind::CdXa => {
+                let xa = BlobRef(d.hash()?);
+                let (file_lba, start, mode, file, channel, samples) = (d.u32()?, d.u32()?, d.u32()?, d.u32()?, d.u32()?, d.u32()?);
+                let captures = d.pairs()?;
+                Vector::CdXa(CdXa { xa, file_lba, start, mode, file, channel, samples, captures })
             }
         };
         ensure!(d.pos == bytes.len(), "{} trailing bytes after the vector", bytes.len() - d.pos);

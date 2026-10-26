@@ -42,7 +42,19 @@ pub enum Reference {
 pub fn emulator_weak(kind: Kind) -> bool {
     match kind {
         Kind::Echo | Kind::GpuDraw | Kind::GpuTransfer | Kind::GteOp | Kind::SpuRun | Kind::BiosCall => false,
+        // The check ignores when the captures were read; their values are
+        // evidence.
+        Kind::CdXa => false,
     }
+}
+
+/// Kinds whose result includes when the runner happened to read a buffer
+/// still being written, which depends on what ran earlier in the session
+/// (an XA capture: the seek starts from wherever the head was). Recapture
+/// can't reproduce them byte for byte; their checks compare values, not
+/// bytes (`DeviceUnderTest::consistent`).
+pub fn timing_variable(kind: Kind) -> bool {
+    kind == Kind::CdXa
 }
 
 /// The verdict for `result`, given the references available. The

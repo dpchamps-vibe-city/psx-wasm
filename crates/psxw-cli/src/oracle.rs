@@ -12,6 +12,10 @@
 //! psxw oracle ci                        images verify + selftest + capture (the oracle's CI gate)
 //! psxw oracle play <game> …             the game under the emulator from a replay (wholegame.rs)
 //! psxw oracle ramdiff <game> …          psx-wasm's RAM vs the emulator's, by symbol (wholegame.rs)
+//! psxw oracle export --out DIR [--set S]… [--kind K] [--missing-hw]
+//!                                       batches for capture on a contributor's console (M10)
+//! psxw oracle import DIR                their results, as hw-<rig> goldens
+//! psxw oracle disagree                  emulator vs hardware goldens, vector by vector
 //! ```
 
 use anyhow::{Result, bail};
@@ -23,12 +27,18 @@ use std::path::Path;
 
 pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images verify | selftest [--seed N] [--count N] \
                          | capture [--kind K] [--missing] | check <game> --device D | ci \
-                         | play <game> … | ramdiff <game> …";
+                         | play <game> … | ramdiff <game> … \
+                         | export --out DIR [--set S].. [--kind K] [--missing-hw] | import DIR | disagree";
 
-/// psx-wasm's device implementations the oracle can check (gpu in M4 still
-/// to come).
-fn devices() -> Vec<Box<dyn DeviceUnderTest>> {
-    vec![Box::new(psxw_oracle::gte::Device), Box::new(psxw_oracle::spu::Device::default())]
+/// psx-wasm's device implementations the oracle can check. They start
+/// lazily: only the checked device runs.
+pub(crate) fn devices(ws: &Workspace) -> Vec<Box<dyn DeviceUnderTest>> {
+    vec![
+        Box::new(psxw_oracle::gte::Device),
+        Box::new(psxw_gpu_oracle::GpuDevice::new(ws)),
+        Box::new(psxw_oracle::spu::Device::default()),
+        Box::new(psxw_oracle::xa_disc::Device),
+    ]
 }
 
 fn finish(report: &Report, path: &Path) {
@@ -111,7 +121,7 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<()> {
             }
         }
         ["check", game, "--device", device] => {
-            let mut impls = devices();
+            let mut impls = devices(ws);
             let checked = commands::check(ws, game, device, &mut impls)?;
             finish(&checked.report, &checked.path);
             if !checked.implemented {
@@ -123,13 +133,82 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<()> {
         }
         ["ci"] => {
             let mut pass = true;
-            for (report, path) in commands::ci(ws)? {
+            for (report, path) in commands::ci(ws, &mut devices(ws))? {
                 finish(&report, &path);
                 pass &= report.pass;
             }
             if !pass {
                 std::process::exit(2);
             }
+        }
+        ["export", rest @ ..] => {
+            let (mut out, mut sets, mut kind, mut missing) = (None, Vec::new(), None, false);
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "--out" => out = it.next().map(|s| std::path::PathBuf::from(*s)),
+                    "--set" => sets.extend(it.next().map(|s| s.to_string())),
+                    "--kind" => match it.next() {
+                        Some(k) => kind = Some(Kind::parse(k)?),
+                        None => bail!("--kind needs a value"),
+                    },
+                    "--missing-hw" => missing = true,
+                    other => bail!("unknown export option {other}"),
+                }
+            }
+            let Some(out) = out else { bail!("export needs --out DIR") };
+            let store = psxw_oracle::Store::new(images::oracle_dir(ws));
+            let mut ids: std::collections::BTreeSet<psxw_oracle::VectorId> = std::collections::BTreeSet::new();
+            if sets.is_empty() {
+                ids.extend(store.vector_ids()?);
+            }
+            for s in &sets {
+                ids.extend(store.set(s)?);
+            }
+            let hw = psxw_oracle::batch::hardware_targets(&store);
+            let mut chosen = Vec::new();
+            for id in ids {
+                if kind.is_some_and(|k| store.vector(&id).map(|v| v.kind() != k).unwrap_or(true)) {
+                    continue;
+                }
+                if missing && hw.iter().any(|t| store.has_golden(t, &id)) {
+                    continue;
+                }
+                chosen.push(id);
+            }
+            let im = images::load(ws)?;
+            let m = psxw_oracle::batch::export(&store, &chosen, &ws.root.join(&im.runner.dir), &im.runner.files, &out)?;
+            println!("exported {} vectors in {} batches to {}", m.vectors.len(), m.batches.len(), out.display());
+        }
+        ["import", dir] => {
+            let store = psxw_oracle::Store::new(images::oracle_dir(ws));
+            let r = psxw_oracle::batch::import(&store, Path::new(dir))?;
+            println!("{}: {} goldens stored, {} vectors without one", r.target, r.stored, r.failed.len());
+            for (id, why) in r.failed.iter().take(16) {
+                println!("  {}: {why}", &id[..12]);
+            }
+        }
+        ["disagree"] => {
+            let store = psxw_oracle::Store::new(images::oracle_dir(ws));
+            let pins = ws.lock.oracle.as_ref().ok_or_else(|| anyhow::anyhow!("inputs.lock has no [oracle] section"))?;
+            let emu = psxw_oracle::target::emulator_target_id(pins.beetle.short(), pins.openbios.short());
+            let d = psxw_oracle::batch::disagreements(&store, &emu, &psxw_oracle::batch::hardware_targets(&store))?;
+            let path = ws.out_dir().join("oracle").join("disagreements.json");
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(&path, serde_json::to_string_pretty(&d)?)?;
+            println!(
+                "{} vs {:?}: {} compared, {} agree, {} differ, {} hardware-only",
+                d.emulator,
+                d.hardware,
+                d.compared,
+                d.agree,
+                d.differ.len(),
+                d.hardware_only
+            );
+            for x in d.differ.iter().take(16) {
+                println!("  {} {} ({}): {}", &x.vector[..12], x.kind, x.hardware, x.detail);
+            }
+            eprintln!("full report: {}", path.display());
         }
         ["play", game, rest @ ..] => {
             if !crate::wholegame::play_cmd(ws, game, rest)? {

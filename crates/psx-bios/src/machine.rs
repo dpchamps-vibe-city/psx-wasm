@@ -31,6 +31,16 @@ pub trait Host {
     fn storage_write(&mut self, name: &str, data: &[u8]) -> bool;
     /// A structured run-report event (JSON).
     fn report(&mut self, json: &str);
+    /// Renderer commands (`psxw_abi::render`) to execute.
+    fn render_submit(&mut self, _words: &[u32]) {}
+    /// A VRAM rectangle after everything submitted, `w * h` pixels.
+    fn render_readback(&mut self, _x: u32, _y: u32, w: u32, h: u32) -> Vec<u16> {
+        vec![0; (w * h) as usize]
+    }
+    /// Show a frame.
+    fn present(&mut self, _desc: &psxw_abi::render::PresentDesc) {}
+    /// Audio frames (left, right) at `psxw_abi::AUDIO_HZ`.
+    fn audio(&mut self, _frames: &[[i16; 2]]) {}
 }
 
 /// The guest's registers the runtime shares.
@@ -46,6 +56,19 @@ pub trait Regs {
 pub struct GuestCall {
     pub addr: u32,
     pub args: [u32; 4],
+}
+
+/// One step of the BIOS exception handler (psx-spx "BIOS Interrupt/
+/// Exception Handling"): every `SysEnqIntRP` element, priority 0 to 3,
+/// then the exit. A ReturnFromException in an element skips the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqStep {
+    /// An element's first function, and its second to call with the
+    /// first's result when that is nonzero.
+    Chain(GuestCall, Option<u32>),
+    /// The end of the handler: the custom exit (`HookEntryInt`, B0h:19h)
+    /// if one is set, entered like a longjmp to its buffer with 1.
+    Exit,
 }
 
 /// Events on the virtual timeline.
@@ -94,6 +117,8 @@ pub trait Sdk: Sized {
     fn ready(m: &Machine<Self>, cond: u32) -> bool;
     /// Called at every vblank, before callbacks are delivered.
     fn on_vblank(m: &mut Machine<Self>);
+    /// A DMA channel finished a transfer (device libraries' DMA).
+    fn on_dma(_m: &mut Machine<Self>, _ch: usize) {}
 }
 
 pub struct Machine<S> {
@@ -104,14 +129,23 @@ pub struct Machine<S> {
     pub clock: Clock<Event>,
     pub timers: [Timer; 3],
     pub drive: Drive,
+    /// The CD's audio output at 44.1 kHz (left, right): decoded XA, for
+    /// the SPU's CD input to take. Bounded: the oldest samples drop.
+    pub cd_audio: VecDeque<[i16; 2]>,
+    /// `Mute`/`Demute`: the drive's audio output is silenced.
+    pub cd_mute: bool,
+    /// The cycle up to which audio has been produced.
+    pub audio_at: u64,
     /// Vblanks so far.
     pub vblanks: u64,
     pub kernel: Kernel,
     /// Callbacks to run, in order.
     pub calls: VecDeque<GuestCall>,
-    /// Interrupt handler chains to run first: a verifier, and the handler
-    /// to call with its result when that is nonzero ([`crate::io`]).
-    pub irq_calls: VecDeque<(GuestCall, Option<u32>)>,
+    /// The exception handler's steps, run before anything else queued
+    /// ([`crate::io`]).
+    pub irq_calls: VecDeque<IrqStep>,
+    /// ReturnFromException ran in the guest call now unwinding.
+    pub rfe: bool,
     /// Register-level devices for original SDK code; `None` traps on I/O.
     pub io: Option<crate::io::Io>,
     /// Interrupts are disabled (critical section): events wait.
@@ -138,10 +172,14 @@ impl<S: Sdk> Machine<S> {
             clock: Clock::new(video),
             timers: [Timer::default(); 3],
             drive,
+            cd_audio: VecDeque::new(),
+            cd_mute: false,
+            audio_at: 0,
             vblanks: 0,
             kernel: Kernel::default(),
             calls: VecDeque::new(),
             irq_calls: VecDeque::new(),
+            rfe: false,
             io: None,
             crit: false,
             in_irq: false,
@@ -213,6 +251,9 @@ impl<S: Sdk> Machine<S> {
                 // The kernel's vblank handler delivers RCntCNT3 events.
                 self.deliver_event(0xF200_0003, 0x0002);
                 self.raise_irq(psx_devices::irq::VBLANK);
+                self.gpu_vblank();
+                self.card_vblank();
+                self.audio_vblank();
                 self.host.wait_vblank(self.vblanks);
             }
             Event::Timer(n) => {
@@ -231,6 +272,17 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
+    /// Hand the host the audio that fell due since the last vblank: one
+    /// frame per 768 cycles of virtual time. The source is the CD's output
+    /// until the SPU mixes it (M6); an empty source is silence.
+    fn audio_vblank(&mut self) {
+        const CYCLES: u64 = psx_devices::clock::CPU_HZ / psxw_abi::AUDIO_HZ as u64;
+        let n = (self.clock.now - self.audio_at) / CYCLES;
+        self.audio_at += n * CYCLES;
+        let frames: Vec<[i16; 2]> = (0..n).map(|_| self.cd_audio.pop_front().unwrap_or([0, 0])).collect();
+        self.host.audio(&frames);
+    }
+
     /// (Re)schedule root counter `n`'s next IRQ.
     pub fn reschedule_timer(&mut self, n: usize) {
         self.clock.cancel(|e| *e == Event::Timer(n as u8));
@@ -244,6 +296,9 @@ impl<S: Sdk> Machine<S> {
     /// for the rest.
     pub fn deliver_event(&mut self, class: u32, spec: u32) {
         let calls = self.kernel.deliver(class, spec);
+        if class & 0xFF00_0000 != 0xF200_0000 {
+            self.count(&format!("event.{class:08x}/{spec:x} -> {} callbacks", calls.len()));
+        }
         self.calls.extend(calls.into_iter().map(|addr| GuestCall { addr, args: [0; 4] }));
     }
 }

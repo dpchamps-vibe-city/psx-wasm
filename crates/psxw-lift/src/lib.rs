@@ -28,6 +28,60 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A BIOS trampoline at `addr` (PsyQ's libapi/libc stubs): `li t2, T;
+/// jr t2; li t1, F` with `T` one of the vectors. Returns `(T, F)`.
+pub fn bios_trampoline(program: &Program, originals: &Originals, from: &str, addr: u32) -> Option<(u8, u32)> {
+    let Some(Located::Code(c)) = program.locate(from, addr) else { return None };
+    let w = |i: u32| originals.word(&c, addr + 4 * i).map(decode::decode);
+    let (li_t2, jr, li_t1) = (w(0)?, w(1)?, w(2)?);
+    let li = |i: &decode::Insn, rt: u8| matches!(i.op, decode::Op::Addiu | decode::Op::Ori) && i.rs == 0 && i.rt == rt;
+    let table = li_t2.uimm;
+    let ok = li(&li_t2, 10) && jr.op == decode::Op::Jr && jr.rs == 10 && li(&li_t1, 9) && matches!(table, 0xA0 | 0xB0 | 0xC0);
+    ok.then_some((table as u8, li_t1.uimm))
+}
+
+/// `t1` after the delay slot of the branch at `b` runs: a BIOS call's
+/// function number, when it is a constant.
+fn t1_after_slot(g: &Graph, facts: &Facts, b: u32) -> Option<u32> {
+    let n = Node::Slot(b);
+    let d = g.nodes.get(&n)?;
+    let mut after = facts.consts.get(&n).copied().unwrap_or([None; 32]);
+    if let Some(w) = d.insn.writes() {
+        after[w as usize] = None;
+        if matches!(d.insn.op, decode::Op::Addiu | decode::Op::Ori) && d.insn.rs == 0 {
+            after[w as usize] = Some(if d.insn.op == decode::Op::Ori { d.insn.uimm } else { d.insn.simm as u32 });
+        }
+    }
+    after[9]
+}
+
+/// Calls that need non-local control flow (`emit::Exceptions`): `setjmp`
+/// sites (a direct call to an A0h:13h trampoline, or the vector itself
+/// with t1 = 13h) and `ReturnFromException` (B0h:17h through the vector).
+fn exception_sites(program: &Program, originals: &Originals, func: &Function, g: &Graph, facts: &Facts) -> emit::Exceptions {
+    let mut x = emit::Exceptions { continuation: func.sources.contains(&Source::Continuation), ..Default::default() };
+    for (n, d) in &g.nodes {
+        let Node::Slot(b) = *n else { continue };
+        let bios = |table: u8| matches!(d.transfer,
+            Transfer::Call { callee: Callee::Bios { table: t }, .. } | Transfer::Jump(Dest::Tail(Callee::Bios { table: t })) if t == table);
+        match &d.transfer {
+            Transfer::Call { callee: Callee::Direct { addr, .. }, .. }
+                if bios_trampoline(program, originals, &func.container, *addr) == Some((0xA0, 0x13)) =>
+            {
+                x.setjmp.insert(b);
+            }
+            Transfer::Call { callee: Callee::Bios { table: 0xA0 }, .. } if t1_after_slot(g, facts, b) == Some(0x13) => {
+                x.setjmp.insert(b);
+            }
+            _ if bios(0xB0) && t1_after_slot(g, facts, b) == Some(0x17) => {
+                x.rfe.insert(b);
+            }
+            _ => {}
+        }
+    }
+    x
+}
+
 /// Included by every generated file.
 pub const RT_HEADER: &str = include_str!("psxw_rt.h");
 pub const RT_HEADER_NAME: &str = "psxw_rt.h";
@@ -75,7 +129,18 @@ pub fn translate(
         "{} 0x{:08X} {} (extent 0x{:08X}..0x{:08X})",
         func.container, func.addr, func.name, func.addr, func.end
     );
-    let (c, externs) = emit::Emitter::new(&graph, &facts)?.function(&cname, &comment);
+    if func.sources.contains(&Source::Continuation) && func.sources.iter().any(|s| *s != Source::Continuation) {
+        return Err(LiftError {
+            pc: func.addr,
+            message: "a setjmp return address that is also a function entry".into(),
+        });
+    }
+    let exceptions = exception_sites(program, originals, func, &graph, &facts);
+    let mut graph = graph;
+    for &b in &exceptions.setjmp {
+        graph.wanted.insert((func.container.clone(), b + 8, Source::Continuation));
+    }
+    let (c, externs) = emit::Emitter::new(&graph, &facts)?.exceptions(exceptions).function(&cname, &comment);
     Ok(Translation { func: func.clone(), cname, c, graph, facts, externs })
 }
 
@@ -184,6 +249,10 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
         let mut added = false;
         for (c, a, source) in wanted {
             if program.code(&c).is_some_and(|code| code.starts.contains_key(&a)) {
+                // A continuation changes how an existing start is entered.
+                if source == Source::Continuation {
+                    added |= program.add_source(&c, a, source);
+                }
                 continue;
             }
             let enclosing = program.functions(&c).into_iter().filter(|f| f.addr < a && a < f.end).max_by_key(|f| f.addr);

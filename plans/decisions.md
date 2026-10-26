@@ -311,9 +311,107 @@ state, the device route becomes the default for libspu too.
 *Why:* the register model has to exist for the oracle in any case, and
 D40 showed the device route is exact by construction.
 
+**D42. libgpu runs as original code over the GPU front end and a DMA
+controller** (M4). The M4 GPU front end (`psx_devices::gpu`) is
+register-level: it takes GP0/GP1 words and answers GPUSTAT/GPUREAD. So
+libgpu became a device library like libpad (D40), and its 23 adapters were
+removed.
+- **The bus** (`psx-bios::io`) gained the DMA controller
+  (`psx_devices::dma`). It handles channel 2 in block and linked-list
+  modes and channel 6 (ordering-table clear), completing instantly in
+  virtual time, setting DICR and raising IRQ3. libetc's adapter gets
+  completions through `Sdk::on_dma`.
+- **The host renderer** gets the front end's output at each vblank and at
+  every VRAM→CPU transfer (`Host::render_submit`/`render_readback`/
+  `present`, the M4 render imports).
+- **Cost.** `DrawOTag` is one register write: the linked list is walked
+  in Rust, so it costs what an adapter would.
+
+*Why:* exact by construction, and version-independent: libgpu's own code
+decides every word. `psxw conform btn --lib libgpu --render server`
+draws a background fill and a tile through the original library, and
+reads both back exactly.
+
+**D43. Memory cards: libmcrd runs as guest code over an HLE BIOS card
+subsystem** (M7). The BIOS's card functions are documented in full
+(psx-spx: `bu00:` file functions, raw sector I/O, events and their pacing).
+libmcrd's own state machine (asynchronous commands, `MemCardSync`, the
+new-card handshake) is what games observe. As with D40/D42, an adapter
+would reimplement it; the original runs unchanged over `psx-bios::card`.
+- **The card image is raw 128 KiB** (`.mcr`) in host storage.
+- **Slot 1 always has a card** (formatted if no image exists). Slot 2 has
+  one only if its image exists, matching the oracle's default.
+- **libcard's thin BIOS wrappers keep adapters**: their `_patch_card`
+  patches Sony BIOS code in kernel RAM.
+
+**D44. Browser tests: Debian-snapshot browsers, results POSTed by the
+page** (M5). Two deviations from the plan's Playwright image and
+TypeScript shell:
+- **The test image is `psxw-browsers`:** Chromium and Firefox ESR from the
+  pinned Debian snapshot, on the oracle images' base, with no network.
+  Chromium runs headless on SwiftShader. Firefox runs on Xvfb with GLX
+  over llvmpipe, because headless Firefox finds no GL driver. A
+  test page runs on its own and POSTs its result to a small in-container
+  server; a script opens each browser headless and waits for that file.
+- **The web shell is plain ES modules,** with no build step.
+
+*Why:* it reuses the pins the oracle images already have and needs no
+Node toolchain. The image is much smaller than Playwright's, which
+matters on this machine. The tests only need a page to load and report,
+not to be scripted.
+
+**D45. libetc runs as original code; the BIOS's custom exception exit and
+ReturnFromException are wasm exceptions** (M4). libetc's interrupt layer
+isn't a set of register writes. `startIntr` calls `setjmp`, points the
+saved sp at a private stack, and installs the buffer with `HookEntryInt`
+(B0h:19h). After the `SysEnqIntRP` chains, the BIOS longjmps there with
+r2 = 1. libetc's dispatcher runs the callbacks and ends in
+`ReturnFromException` (B0h:17h), which never returns (psx-spx "BIOS
+Interrupt/Exception Handling"). Translated code can follow this with
+three lowerings, keyed on BIOS function numbers, not names:
+- **`setjmp`** (a call to an A0h:13h trampoline, or the vector with
+  t1 = 13h): the caller stores its own ra, sp, fp, s0-s7 and gp into the
+  buffer, in PsyQ's layout, and gets 0. The BIOS can't see a translated
+  caller's registers.
+- **The return address becomes a continuation entry**, a lift-tier
+  function (`Source::Continuation`) entered with the buffer and the
+  longjmp value. It reloads those registers.
+- **`ReturnFromException`** calls `psx.return_from_exception` and then
+  throws the guest's one tag. `guest_invoke_irq` (psxw-link) catches it,
+  and restores `$sp`/`$gp` as the BIOS restores the interrupted context.
+
+The runtime runs each exception as `IrqStep`s: every chain element, then
+the exit. An RFE skips the rest of that exception; an exit that returns
+normally is a fault. The default exit (no hook) is to return.
+
+Like D40/D42, libetc became a device library and its 15 adapters were
+removed. Measured against them first, the original matched on every
+vblank count, wait, video-mode and callback observation in `psxw conform
+btn --lib libetc` (59 steps). The adapters differed only where they had
+cut corners: `ResetCallback`'s first return (libetc's environment
+pointer, not 0) and `GetIntrMask` (9, not 0).
+- **Cost:** ABI 4. Every host needs wasm exception handling (exnref):
+  wasmtime's `gc-drc` feature, and Chromium and Firefox ESR in the pinned
+  images both compile the module. One throw per delivered interrupt.
+
+*Why:* the same reason as D40/D42. The original decides every observable
+value, version-independently. The lowerings are generic BIOS semantics
+that any SDK using `HookEntryInt` gets for free.
+
+**D46. Q1: browser tab only, for now** (M5). The default when nobody
+asks for a desktop shell, taken without the human's input as instructed
+(the human can reopen it). The bundle already runs in any
+cross-origin-isolated tab served with COOP/COEP (`psxw serve`). A Tauri
+shell would only add a window around the same bundle and a packaging
+toolchain to pin. M5 task 7 is not done.
+
+*Why:* nothing in M5-M8 needs a native window, and the native host
+(`psxw run`) covers headless use.
+
 ## Open questions (tracked)
 
-- **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.
+- **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser
+  tab only, for now (D46).
 - **Q2.** Register-level SPU fallback for unknown libspu versions.
   Decided: yes (D41).
 - **Q3.** The license for psx-wasm. Needed before any public release.

@@ -4,7 +4,9 @@
 //! a run stops after its frame budget. Per-frame RAM hashes, dumps and a
 //! traced word support the determinism and whole-game oracles.
 
+pub mod audio;
 pub mod disc;
+pub mod render;
 
 use anyhow::{Context as _, Result, bail};
 use disc::Disc;
@@ -41,6 +43,15 @@ pub struct Options {
     /// Wall-clock seconds a conformance call may run before it traps
     /// (a runaway guest loop); 0 = no limit.
     pub deadline_secs: u64,
+    /// The renderer; `None` runs headless with [`render::NullRender`].
+    pub render: Option<render::SharedRender>,
+    /// Frames at which to hash VRAM (needs a renderer with VRAM).
+    pub vram_hash_at: Vec<u64>,
+    /// Write every `.1`th presented frame to `.0` as `frame_NNNNNN.png`
+    /// (needs a renderer that draws).
+    pub dump_frames: Option<(PathBuf, u64)>,
+    /// Write the audio output here as a WAV file.
+    pub audio_wav: Option<PathBuf>,
 }
 
 /// An overlay's original text, by guest address.
@@ -74,6 +85,10 @@ pub struct RunReport {
     pub events: Vec<serde_json::Value>,
     pub logs: Vec<String>,
     pub dumps: Vec<Dump>,
+    pub render: render::RenderStats,
+    /// VRAM hashes by frame (with a renderer that has VRAM).
+    pub vram_hashes: BTreeMap<u64, String>,
+    pub audio: audio::AudioStats,
 }
 
 /// A RAM dump written during the run.
@@ -103,11 +118,19 @@ struct State {
     /// Frame since which an overlay's first words are in RAM without the
     /// rest matching (a load in progress, or a bad load).
     partial_since: Vec<Option<u64>>,
+    renderer: render::SharedRender,
+    render: render::RenderStats,
+    vram_hashes: BTreeMap<u64, String>,
+    audio: Option<audio::Sink>,
 }
 
 impl State {
     fn new(opts: &Options, disc: Option<Disc>) -> Self {
         State {
+            renderer: opts.render.clone().unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(Box::new(render::NullRender)))),
+            render: Default::default(),
+            vram_hashes: BTreeMap::new(),
+            audio: None,
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -217,12 +240,18 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
         events: s.events.into_iter().filter(|e| e["event"] != "report").collect(),
         logs: s.logs,
         dumps: s.dumps,
+        render: s.render,
+        vram_hashes: s.vram_hashes,
+        audio: s.audio.map(audio::Sink::finish).unwrap_or_default(),
     }
 }
 
 fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasmtime::Instance)> {
     let mut config = Config::new();
     config.epoch_interruption(opts.deadline_secs > 0);
+    // ReturnFromException unwinds guest frames with a wasm exception
+    // (libetc's interrupt exit; psxw-link `guest_invoke_irq`).
+    config.wasm_exceptions(true);
     let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, &opts.wasm).map_err(|e| anyhow::anyhow!("loading {}: {e}", opts.wasm.display()))?;
     let mut linker: Linker<State> = Linker::new(&engine);
@@ -389,6 +418,64 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         std::fs::create_dir_all(&dir).ok();
         if std::fs::write(dir.join(&name), data).is_ok() { 0 } else { -1 }
     })?;
+    use psxw_abi::render::imports as ri;
+    linker.func_wrap(h, ri::RENDER_SUBMIT, |mut c: Caller<'_, State>, ptr: u32, len: u32| -> wasmtime::Result<()> {
+        let bytes = read_bytes(&mut c, ptr, len);
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let s = c.data_mut();
+        s.render.submits += 1;
+        s.render.words += words.len() as u64;
+        let r = s.renderer.clone();
+        let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+        r.submit(&words).map_err(|e| wasmtime::Error::msg(format!("render_submit: {e:#}")))
+    })?;
+    linker.func_wrap(h, ri::RENDER_READBACK, |mut c: Caller<'_, State>, x: u32, y: u32, w: u32, hh: u32, dst: u32| -> wasmtime::Result<()> {
+        c.data_mut().render.readbacks += 1;
+        let r = c.data().renderer.clone();
+        let px = {
+            let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+            r.readback(psxw_abi::render::Rect { x, y, w, h: hh }).map_err(|e| wasmtime::Error::msg(format!("render_readback: {e:#}")))?
+        };
+        let bytes: Vec<u8> = px.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let m = mem(&mut c);
+        m.data_mut(&mut c)[dst as usize..dst as usize + bytes.len()].copy_from_slice(&bytes);
+        Ok(())
+    })?;
+    linker.func_wrap(h, ri::PRESENT, |mut c: Caller<'_, State>, ptr: u32| -> wasmtime::Result<()> {
+        let b = read_bytes(&mut c, ptr, 20);
+        let w: Vec<u32> = b.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let desc = psxw_abi::render::PresentDesc { flags: w[0], x: w[1], y: w[2], width: w[3], height: w[4] };
+        let s = c.data_mut();
+        s.render.presents += 1;
+        s.render.last_present = Some([w[0], w[1], w[2], w[3], w[4]]);
+        let frame = s.frame + 1;
+        let want_vram = s.opts.vram_hash_at.contains(&frame);
+        let dump = s.opts.dump_frames.clone().filter(|(_, every)| frame % (*every).max(1) == 0);
+        let r = s.renderer.clone();
+        let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+        r.present(&desc).map_err(|e| wasmtime::Error::msg(format!("present: {e:#}")))?;
+        if let Some((dir, _)) = dump {
+            if let Some((w, h, rgba)) = r.frame().map_err(|e| wasmtime::Error::msg(format!("frame: {e:#}")))? {
+                std::fs::create_dir_all(&dir).ok();
+                std::fs::write(dir.join(format!("frame_{frame:06}.png")), render::png(w, h, &rgba)).ok();
+            }
+        }
+        if want_vram {
+            if let Some(v) = r.vram().map_err(|e| wasmtime::Error::msg(format!("vram: {e:#}")))? {
+                let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();
+                drop(r);
+                c.data_mut().vram_hashes.insert(frame, format!("{:016x}", fnv(&bytes)));
+            }
+        }
+        Ok(())
+    })?;
+    linker.func_wrap(h, host::AUDIO, |mut c: Caller<'_, State>, ptr: u32, frames: u32| -> wasmtime::Result<()> {
+        let bytes = read_bytes(&mut c, ptr, frames * 4);
+        if let Some(a) = c.data_mut().audio.as_mut() {
+            a.push(&bytes).map_err(|e| wasmtime::Error::msg(format!("audio: {e}")))?;
+        }
+        Ok(())
+    })?;
     linker.func_wrap(h, host::REPORT, |mut c: Caller<'_, State>, ptr: u32, len: u32| {
         let text = String::from_utf8_lossy(&read_bytes(&mut c, ptr, len)).into_owned();
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -412,7 +499,8 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         c.data_mut().events.push(v);
     })?;
 
-    let state = State::new(opts, disc);
+    let mut state = State::new(opts, disc);
+    state.audio = Some(audio::Sink::new(opts.audio_wav.as_deref()).context("opening the audio WAV")?);
     let mut store = Store::new(&engine, state);
     if opts.deadline_secs > 0 {
         // Armed per call by `Conform`; nothing traps before that.
@@ -434,6 +522,9 @@ pub struct Conform {
     instance: wasmtime::Instance,
     memory: Memory,
     deadline: u64,
+    /// The guest stack pointer between calls (o32 stack arguments go at
+    /// `sp + 16`).
+    sp: u32,
     /// Ticks the engine's epoch once a second while the run lives.
     ticker: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -473,13 +564,23 @@ impl Conform {
             });
             stop
         });
-        Ok(Conform { store, instance, memory, deadline: opts.deadline_secs, ticker })
+        Ok(Conform { store, instance, memory, deadline: opts.deadline_secs, sp, ticker })
     }
 
     fn arm(&mut self) {
         if self.deadline > 0 {
             self.store.set_epoch_deadline(self.deadline);
         }
+    }
+
+    /// Calls the guest function at `addr` with any number of o32
+    /// arguments (from the fifth on, on the stack).
+    pub fn call_args(&mut self, addr: u32, args: &[u32]) -> Result<u64> {
+        for (i, a) in args.iter().enumerate().skip(4) {
+            self.write(self.sp + 4 * i as u32, &a.to_le_bytes());
+        }
+        let r = |i: usize| args.get(i).copied().unwrap_or(0);
+        self.call(addr, [r(0), r(1), r(2), r(3)])
     }
 
     /// Calls the guest function at `addr`; a trap is an error naming it.
@@ -503,6 +604,15 @@ impl Conform {
     pub fn write(&mut self, addr: u32, bytes: &[u8]) {
         let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
         self.memory.data_mut(&mut self.store)[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// The runtime's counters now (BIOS functions, adapters, probes), from
+    /// a mid-run `psxw_report`.
+    pub fn counts(&mut self) -> Result<BTreeMap<String, u64>> {
+        let f = self.instance.get_typed_func::<(), ()>(&mut self.store, "psxw_report")?;
+        f.call(&mut self.store, ())?;
+        let report = self.store.data_mut().events.pop().filter(|e| e["event"] == "report").context("no report")?;
+        Ok(report["counts"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect()).unwrap_or_default())
     }
 
     /// Vblanks so far.

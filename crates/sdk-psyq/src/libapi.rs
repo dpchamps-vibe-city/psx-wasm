@@ -103,9 +103,10 @@ fn pad_init(m: &mut M, a: [u32; 4]) -> Result {
     ret(1)
 }
 
-fn firstfile(_m: &mut M, _a: [u32; 4]) -> Result {
-    // No memory card until M7: no files.
-    ret(0)
+/// libapi's `firstfile` calls the BIOS's `firstfile2` (B0h:42h) and
+/// patches a BIOS bug in kernel RAM; the HLE BIOS has no such bug.
+fn firstfile(m: &mut M, a: [u32; 4]) -> Result {
+    psx_bios::bios::call(m, 0xB0, 0x42, a)
 }
 
 fn nop(_m: &mut M, _a: [u32; 4]) -> Result {

@@ -19,6 +19,18 @@ pub struct GameManifest {
     pub run: RunSection,
     #[serde(default)]
     pub oracle: OracleSection,
+    #[serde(default)]
+    pub conform: ConformSection,
+}
+
+/// `[conform]`: game facts the adapter-conformance scenarios need.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConformSection {
+    /// A function the interrupt scenarios install as a callback: it takes
+    /// no arguments and changes `callback_state` (a 32-bit word) the same
+    /// way on every call, so the word shows how often it ran.
+    pub callback: Option<String>,
+    pub callback_state: Option<String>,
 }
 
 /// `[oracle]`: the whole-game RAM oracle (`psxw oracle play`/`ramdiff`).

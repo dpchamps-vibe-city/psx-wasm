@@ -3,7 +3,8 @@
 //! `CdGetSector`), callbacks, and `CdSearchFile`. Every sector comes from
 //! the user's disc image and must pass its EDC; data lands in guest memory
 //! as each sector arrives on the virtual timeline (realistic or instant
-//! timing, D19). XA streaming and CD audio arrive with M6.
+//! timing, D19). XA-ADPCM sectors streamed with `ReadS` are decoded into
+//! `Machine::cd_audio` (M6); CD-DA playback is not modelled yet.
 //!
 //! Return conventions follow psyq-decomp `libcd`: `CdControl` returns 1
 //! once acknowledged; `CdRead` returns 1 when started; `CdReadSync` returns
@@ -13,6 +14,7 @@ use crate::{Adapter, M, Result, block, cond, ev, ret};
 use psx_bios::bios::HostDisc;
 use psx_bios::{Event, Flow, GuestCall, Wait};
 use psx_devices::cd::{self, mode, stat};
+use psx_devices::xa;
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("CdInit", cd_init),
@@ -68,8 +70,25 @@ pub const NO_INTR: u32 = 0;
 pub const DATA_READY: u32 = 1;
 pub const COMPLETE: u32 = 2;
 
+/// A finished `CdRead`, for the run report's timing evidence (M7 task 7:
+/// what loads cost under the drive model, for M10 to compare with
+/// hardware).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Load {
+    pub lba: u32,
+    pub sectors: u32,
+    /// Cycles from `CdRead` to its last sector.
+    pub cycles: u64,
+    /// Of which seeking.
+    pub seek: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Read {
+    pub start: u64,
+    pub first_lba: u32,
+    pub sectors: u32,
+    pub seek: u64,
     pub next_lba: u32,
     pub remaining: u32,
     pub dst: u32,
@@ -91,11 +110,20 @@ pub struct Cd {
     pub read: Option<Read>,
     /// ReadN/ReadS issued through CdControl: the next LBA streamed.
     pub streaming: Option<u32>,
+    /// `Setfilter`: the (file, channel) XA-ADPCM sectors must match when
+    /// the mode's filter bit is set.
+    pub filter: (u8, u8),
+    pub xa: xa::Decoder,
+    pub resample: [xa::Resampler; 2],
+    pub xa_sectors: u64,
+    /// 44.1 kHz frames the decoder produced.
+    pub xa_frames: u64,
     pub ready_sector: Option<Box<[u8; cd::RAW]>>,
     /// Bumped to invalidate in-flight sector events.
     pub generation: u32,
     pub sectors: u64,
     pub edc_errors: Vec<String>,
+    pub loads: Vec<Load>,
 }
 
 fn status(m: &M) -> u8 {
@@ -165,6 +193,7 @@ pub fn on_sector(m: &mut M, generation: u32) {
         m.drive.head = r.next_lba + 1;
         let left = r.remaining - 1;
         if left == 0 {
+            m.sdk.cd.loads.push(Load { lba: r.first_lba, sectors: r.sectors, cycles: m.clock.now - r.start, seek: r.seek });
             m.sdk.cd.read = None;
             m.drive.status &= !stat::READ;
             let f = m.sdk.cd.read_cb;
@@ -179,15 +208,57 @@ pub fn on_sector(m: &mut M, generation: u32) {
         return;
     }
     if let Some(lba) = m.sdk.cd.streaming {
-        m.sdk.cd.ready_sector = sector(m, lba);
+        let raw = sector(m, lba);
         m.drive.head = lba + 1;
         m.sdk.cd.streaming = Some(lba + 1);
-        let f = m.sdk.cd.ready_cb;
-        if f != 0 {
-            m.calls.push_back(GuestCall { addr: f, args: [DATA_READY, 0, 0, 0] });
+        let audio = raw.as_deref().is_some_and(|r| xa_sector(m, r));
+        if !audio {
+            m.sdk.cd.ready_sector = raw;
+            let f = m.sdk.cd.ready_cb;
+            if f != 0 {
+                m.calls.push_back(GuestCall { addr: f, args: [DATA_READY, 0, 0, 0] });
+            }
         }
-        let t = m.clock.now + m.drive.sector_cycles();
+        let t = m.clock.now + stream_cycles(m);
         schedule_sector(m, t);
+    }
+}
+
+/// Samples of CD audio kept for the SPU: a second.
+const CD_AUDIO_MAX: usize = 44_100;
+
+/// With XA-ADPCM on, a Form2 audio sector goes to the decoder, not to the
+/// host (psx-spx "CDROM XA Audio ADPCM Compression"); with the filter bit
+/// set, only those matching `Setfilter` play. Returns whether the sector
+/// was audio (and so isn't delivered as data).
+fn xa_sector(m: &mut M, raw: &[u8; cd::RAW]) -> bool {
+    let sh = xa::Subheader::parse(raw);
+    if m.drive.mode & mode::XA_ADPCM == 0 || !sh.is_audio() {
+        return false;
+    }
+    if m.drive.mode & mode::FILTER != 0 && (sh.file, sh.channel) != m.sdk.cd.filter {
+        return true;
+    }
+    let s = m.sdk.cd.xa.decode(raw);
+    let (l, r) = xa::resample(&s, &mut m.sdk.cd.resample);
+    m.sdk.cd.xa_sectors += 1;
+    m.sdk.cd.xa_frames += l.len() as u64;
+    if !m.cd_mute {
+        m.cd_audio.extend(l.into_iter().zip(r).map(|(l, r)| [l, r]));
+        let over = m.cd_audio.len().saturating_sub(CD_AUDIO_MAX);
+        m.cd_audio.drain(..over);
+    }
+    true
+}
+
+/// A stream's sector period. XA audio plays at the disc's real rate even
+/// under instant timing: its samples are tied to that rate.
+fn stream_cycles(m: &M) -> u64 {
+    if m.drive.mode & mode::XA_ADPCM != 0 {
+        let speed = if m.drive.mode & mode::DOUBLE_SPEED != 0 { 150 } else { 75 };
+        psx_devices::clock::CPU_HZ / speed
+    } else {
+        m.drive.sector_cycles()
     }
 }
 
@@ -215,7 +286,7 @@ fn control(m: &mut M, a: [u32; 4]) -> u32 {
             m.drive.status |= stat::READ;
             let seek = m.drive.seek_cycles(m.drive.head, m.drive.setloc);
             m.sdk.cd.streaming = Some(m.drive.setloc);
-            let t = m.clock.now + seek + m.drive.sector_cycles();
+            let t = m.clock.now + seek + stream_cycles(m);
             schedule_sector(m, t);
         }
         com::PAUSE | com::STOP | com::STANDBY | com::INIT => {
@@ -237,7 +308,10 @@ fn control(m: &mut M, a: [u32; 4]) -> u32 {
         }
         com::GETTN => res.extend([1, 1]),
         com::GETTD => res.extend([0, 2]),
-        com::NOP | com::MUTE | com::DEMUTE | com::SETFILTER | com::PLAY => {}
+        com::SETFILTER => m.sdk.cd.filter = (p(m, 0), p(m, 1)),
+        com::MUTE => m.cd_mute = true,
+        com::DEMUTE => m.cd_mute = false,
+        com::NOP | com::PLAY => {}
         _ => m.log(&format!("CdControl: command {c} not modelled")),
     }
     issue(m, c, extra);
@@ -302,10 +376,11 @@ fn cd_read(m: &mut M, a: [u32; 4]) -> Result {
     if sectors == 0 {
         return ret(1);
     }
-    m.sdk.cd.read = Some(Read { next_lba: m.drive.setloc, remaining: sectors, dst: buf, size, skip });
+    let seek = m.drive.seek_cycles(m.drive.head, m.drive.setloc);
+    let lba = m.drive.setloc;
+    m.sdk.cd.read = Some(Read { start: m.clock.now, first_lba: lba, sectors, seek, next_lba: lba, remaining: sectors, dst: buf, size, skip });
     m.drive.status |= stat::READ;
     m.drive.last_command = com::READN;
-    let seek = m.drive.seek_cycles(m.drive.head, m.drive.setloc);
     let t = m.clock.now + m.drive.ack_cycles() + seek + m.drive.sector_cycles();
     schedule_sector(m, t);
     ret(1)
@@ -431,6 +506,60 @@ mod tests {
                 assert!(took >= 3 * psx_devices::clock::CPU_HZ / 150, "{took}");
             }
         }
+    }
+
+    /// An XA-ADPCM sector (stereo, 37.8 kHz, 4-bit) of `file`/`channel`
+    /// whose every sample decodes to `level` (filter 0, shift 0, nibble 1
+    /// left / 2 right).
+    fn xa_sector(lba: u32, file: u8, channel: u8) -> [u8; cd::RAW] {
+        let mut s = [0u8; cd::RAW];
+        s[..12].copy_from_slice(&[0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0]);
+        s[12..15].copy_from_slice(&cd::lba_to_msf(lba));
+        s[15] = 2;
+        let sh = [file, channel, xa::SM_AUDIO | xa::SM_FORM2 | xa::SM_REALTIME, 0x01];
+        s[0x10..0x14].copy_from_slice(&sh);
+        s[0x14..0x18].copy_from_slice(&sh);
+        for i in 0..xa::PORTIONS {
+            let p = xa::DATA + i * xa::PORTION;
+            for j in 0..28 {
+                s[p + 16 + 4 * j..p + 20 + 4 * j].copy_from_slice(&0x2121_2121u32.to_le_bytes());
+            }
+        }
+        let e = cd::edc(&s[0x10..0x92C]);
+        s[0x92C..0x930].copy_from_slice(&e.to_le_bytes());
+        s
+    }
+
+    #[test]
+    fn reads_plays_matching_xa_and_delivers_data() {
+        let mut d = disc();
+        d[10] = xa_sector(10, 1, 2);
+        d[11] = xa_sector(11, 1, 3);
+        d[13] = xa_sector(13, 1, 2);
+        // Instant timing: XA still streams at the disc's rate.
+        let mut m = machine(d, BootOptions { cd_timing: 1, ..Default::default() });
+        m.sdk.cd.ready_cb = 0x8000_4000;
+        m.mem.write(0x8001_0000, &[mode::XA_ADPCM | mode::FILTER | mode::DOUBLE_SPEED, 0, 0, 0]);
+        call(&mut m, cd_control, [com::SETMODE as u32, 0x8001_0000, 0, 0]);
+        m.mem.write(0x8001_0000, &[1, 2]);
+        call(&mut m, cd_control, [com::SETFILTER as u32, 0x8001_0000, 0, 0]);
+        m.mem.write(0x8001_0000, &cd::lba_to_msf(10));
+        call(&mut m, cd_control, [com::SETLOC as u32, 0x8001_0000, 0, 0]);
+        call(&mut m, cd_control, [com::READS as u32, 0, 0, 0]);
+        let sector = psx_devices::clock::CPU_HZ / 150;
+        m.run_until(m.clock.now + 4 * sector + sector / 2);
+        assert_eq!(m.drive.head, 14, "four sectors at the double-speed rate");
+        assert_eq!(m.sdk.cd.xa_sectors, 2, "LBA 10 and 13 match the filter; 11 doesn't");
+        // 18 portions x 4 blocks x 28 samples per channel, 6 in : 7 out
+        // (the vblank on the way took its share for the host).
+        assert_eq!(m.sdk.cd.xa_frames, 2 * 2016 * 7 / 6);
+        assert!(!m.cd_audio.is_empty());
+        assert!(m.cd_audio.iter().skip(64).all(|&[l, r]| l > 0 && r > l), "left 1, right 2, through the filter");
+        let ready: Vec<_> = m.calls.iter().filter(|c| c.addr == 0x8000_4000).collect();
+        assert_eq!(ready.len(), 1, "only the data sector (LBA 12) is delivered");
+        assert_eq!(m.sdk.cd.ready_sector.as_ref().unwrap()[0x18], 12);
+        call(&mut m, cd_control, [com::MUTE as u32, 0, 0, 0]);
+        assert!(m.cd_mute);
     }
 
     #[test]

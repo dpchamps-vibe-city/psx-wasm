@@ -129,6 +129,9 @@ wire_consts!(ERRORS, "Error codes (mailbox error field and op status) and diagno
     DIAG_SPUSTAT = 4;
     /// Diagnostic: waiting for the SPU capture-half edge (value: SPUSTAT).
     DIAG_SPU_SYNC = 5;
+    /// Diagnostic: waiting for a CD controller interrupt or idle (value:
+    /// the status register, and the interrupt flags << 8).
+    DIAG_CD = 6;
 });
 
 wire_consts!(OPS, "Runner operations", {
@@ -172,6 +175,16 @@ wire_consts!(OPS, "Runner operations", {
     /// n_captures × (u32 addr, u32 len). Result: u32 v0, then each capture.
     /// Addresses lie in the scratch region.
     OP_BIOS_CALL = 0x40;
+    /// Payload: u32 lba, u32 mode, u32 file, u32 channel, u32 samples, u32
+    /// n_captures, n_captures × (u32 addr, u32 len). Result: each capture
+    /// (SPU RAM). XA-ADPCM streaming, after SPU_RESET: SPUCNT C001h (CD
+    /// audio in), main and CD volumes up; the CD's audio matrix L→L and
+    /// R→R at 80h, ADPCM unmuted; then Setmode(mode), Setfilter(file,
+    /// channel), Setloc(lba), ReadS. The captures are DMA-read `samples` ×
+    /// `SPU_CYCLES_PER_SAMPLE` cycles after ReadS is acknowledged, while
+    /// the SPU keeps running; then Pause. CD interrupts are acknowledged
+    /// as they come.
+    OP_CD_XA = 0x50;
 });
 
 wire_consts!(LAYOUT, "Payload layouts and limits", {
@@ -236,6 +249,9 @@ wire_consts!(VECTOR_KINDS, "Vector kinds (the type tag in a vector's canonical e
     VK_SPU_RUN = 4;
     /// One BIOS A0/B0/C0 call with memory set-up and captures.
     VK_BIOS_CALL = 5;
+    /// XA-ADPCM from the runner disc's test file, captured from the SPU's
+    /// CD input buffers.
+    VK_CD_XA = 6;
 });
 
 wire_consts!(EXCHANGE, "Exchange files (driver ↔ psxw-emu-host)", {

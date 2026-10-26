@@ -8,9 +8,11 @@
 //! Everything game-derived that this crate writes lives under `.oracle/`
 //! (gitignored); reports go under `out/oracle/`.
 
+pub mod batch;
 pub mod commands;
 pub mod exact;
 pub mod golden;
+pub mod gpu_synth;
 pub mod gte;
 pub mod handwritten;
 pub mod hash;
@@ -26,6 +28,7 @@ pub mod target;
 pub mod vector;
 pub mod verdict;
 pub mod wire;
+pub mod xa_disc;
 
 pub use hash::Hash;
 pub use record::Recorder;

@@ -34,6 +34,9 @@ uint32_t psxw_gp_get(void);
 void psxw_gp_set(uint32_t gp);
 /* Lowered to `call_indirect` through the dispatch table. */
 uint64_t psxw_call_indirect(uint32_t addr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);
+/* ReturnFromException (B0h:17h): lowered to a wasm `throw` that unwinds to
+ * the runtime's interrupt entry. */
+__attribute__((noreturn)) void psxw_return_from_exception(void);
 
 /* Runtime services. */
 uint64_t psxw_bios(uint32_t table, uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);

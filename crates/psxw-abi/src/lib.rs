@@ -10,11 +10,27 @@
 
 #![no_std]
 
+pub mod render;
 pub mod replay;
 
 /// Bumped whenever the host interface, the guest/runtime seam or the boot
 /// options change. `game.wasm` exports it; hosts refuse a mismatch.
-pub const ABI_VERSION: u32 = 2;
+///
+/// - 1: M2's host interface ([`host`]).
+/// - 2: adds the renderer command interface ([`render`], version
+///   [`render::RENDER_VERSION`]) and its host imports
+///   [`render::imports`] (`render_submit`, `render_readback`, `present`).
+/// - 3: device libraries' I/O (`psx.io_access`, `psx.io_trap`, D40) and the
+///   disc-free entry points (`psxw_conform_init`, `psxw_call`,
+///   `psxw_run_vblanks`).
+/// - 4: non-local exits for the BIOS's interrupt exit (D45):
+///   `guest.guest_invoke_irq`, `psx.return_from_exception`, and wasm
+///   exception handling in the module.
+/// - 5: audio output, `host.audio` (M6).
+pub const ABI_VERSION: u32 = 5;
+
+/// The audio output rate: the SPU's, one sample per 768 CPU cycles.
+pub const AUDIO_HZ: u32 = 44_100;
 
 /// wasm address of guest physical address 0. Folded into every guest
 /// load/store's `memarg` offset, so translation costs one `i32.and`.
@@ -108,6 +124,10 @@ pub mod psx {
     pub const IO_TRAP: &str = "io_trap";
     /// `(addr) -> ()`: a watched function was entered.
     pub const PROBE: &str = "probe";
+    /// `() -> ()`: ReturnFromException (B0h:17h) is about to unwind the
+    /// guest to `guest_invoke_irq`; the runtime notes it, or traps outside
+    /// an exception handler.
+    pub const RETURN_FROM_EXCEPTION: &str = "return_from_exception";
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
     pub const ADAPTER_PREFIX: &str = "adapter.";
@@ -124,6 +144,10 @@ pub mod guest {
     /// `(addr, a0, a1, a2, a3) -> i64`: call a guest function pointer
     /// through the dispatch table (boot, callbacks).
     pub const INVOKE: &str = "guest_invoke";
+    /// `(addr, a0, a1, a2, a3) -> i64`: the same, in exception context: a
+    /// ReturnFromException in the call unwinds to here (wasm `throw`), and
+    /// `$sp`/`$gp` are restored to their values at the call.
+    pub const INVOKE_IRQ: &str = "guest_invoke_irq";
 }
 
 /// What `game.wasm` imports from its host: module `host`. All pointers are
@@ -149,6 +173,11 @@ pub mod host {
     pub const STORAGE_WRITE: &str = "storage_write";
     /// `(event_ptr, len) -> ()`: a structured run-report event (JSON).
     pub const REPORT: &str = "report";
+    /// `(ptr, frames) -> ()`: audio since the previous call, at
+    /// [`AUDIO_HZ`](super::AUDIO_HZ): `frames` interleaved little-endian
+    /// i16 pairs (left, right). Called at each vblank with exactly the
+    /// samples that fell due in virtual time.
+    pub const AUDIO: &str = "audio";
 }
 
 /// What `game.wasm` exports.

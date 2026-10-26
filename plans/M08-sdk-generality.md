@@ -1,6 +1,7 @@
 # M8 — SDK generality
 
-**Status:** in progress (tasks 1–4)
+**Status:** in progress (tasks 1–4 and 7 done, Q2 decided; 5 waits for the
+PsyQ `.LIB` files, 6 is parked)
 **Depends on:** M2. Parallel with M4–M7. **Unlocks:** M9.
 **Design refs:** design §4 (the translated SDK cache), §5 (devices, BIOS,
 adapters keyed by object identity; layout generation); decisions D12–D15,
@@ -103,7 +104,9 @@ belongs to whichever milestone first needs them (M9).
 6. [ ] psyq-decomp C integration: per-function compile and difftest
    against the placed original; switch to the C tier where it passes; tier
    report.
-7. [ ] Generic per-object conformance in `psxw ci`.
+7. [x] Generic per-object conformance in `psxw ci`. *(The `conform` gate
+   runs every library scenario (libpad, libgpu, libmcrd); each report lists
+   the objects, as member and identity key, its verdict covers.)*
 8. [ ] Decide Q2; docs; README status. *(Q2 decided: D41.)*
 
 ## Exit criteria (all automated)

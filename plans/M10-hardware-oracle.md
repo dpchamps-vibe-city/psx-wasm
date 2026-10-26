@@ -1,6 +1,7 @@
 # M10 — Hardware oracle
 
-**Status:** not started. Waiting on a rig (human-needed).
+**Status:** in progress: the parts that need no rig (tasks 5 and 6) are
+done. The rest waits on a rig (human-needed).
 **Depends on:** M3, and a rig. Can run any time after M3.
 **Design refs:** design: Oracles (the upgrade path); decisions D22–D24.
 
@@ -76,8 +77,12 @@ real one.
 3. [ ] Capture the archive (resumable, with progress).
 4. [ ] CD timing envelope vectors and measurement; tune the model if
    needed; mark CD timing verified.
-5. [ ] Verdict recomputation; emulator–hardware disagreement report.
-6. [ ] Batch export and import for community capture.
+5. [x] Verdict recomputation; emulator–hardware disagreement report.
+   *(Recomputation was already in `check`, which judges against
+   hardware goldens first. `psxw oracle disagree` writes the report.)*
+6. [x] Batch export and import for community capture. *(`psxw oracle
+   export`/`import`, `psxw_oracle::batch`. Provenance carries hashes,
+   not signatures.)*
 7. [ ] Add hardware-golden verification to `psxw ci` (when goldens
    exist); docs, README status.
 
@@ -90,6 +95,15 @@ real one.
 3. psx-wasm's realistic CD timing falls within the measured envelope for
    every `CD_SEQ` vector.
 4. The emulator–hardware disagreement report is published in Findings.
+
+## Questions for hardware
+
+- **XA reserved shifts 13-15.** The emulator shifts by that much;
+  psx-spx says they act as 9. psx-wasm follows the emulator for now
+  (`psx_devices::xa::header`). Real encoders never write these values.
+- **Table5 of the XA zigzag interpolation.** The emulator, and the
+  tables' symmetry, give taps 24 and 26 as -2 and 0; psx-spx prints -1
+  and +1.
 
 ## Progress log
 

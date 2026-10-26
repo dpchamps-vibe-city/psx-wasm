@@ -284,7 +284,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(&dir);
         let all = all(&store).unwrap();
-        for k in Kind::ALL {
+        // XA vectors name sectors on the runner disc, so xa_disc makes them
+        // against the built disc instead.
+        for k in Kind::ALL.into_iter().filter(|k| *k != Kind::CdXa) {
             assert!(all.iter().any(|h| h.vector.kind() == k), "no handwritten {k}");
         }
         for h in &all {

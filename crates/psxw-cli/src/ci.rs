@@ -102,8 +102,24 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         }
         Ok((pass, detail.join(", ")))
     })());
+    gate(&mut gates, "web-gpu", "M5", (|| {
+        let ok = crate::webtest::run(ws, &["gpu"])?;
+        Ok((ok, "every GPU vector through the browser renderer in Chromium and Firefox".into()))
+    })());
+    gate(&mut gates, "web-conform", "M5", (|| {
+        let ok = crate::webtest::run(ws, &["conform", game])?;
+        Ok((ok, "every conformance scenario replayed on game.wasm in Chromium and Firefox, native results".into()))
+    })());
+    gate(&mut gates, "web-storage", "M7", (|| {
+        let ok = crate::webtest::run(ws, &["storage"])?;
+        Ok((ok, "memory cards through OPFS in Chromium and Firefox".into()))
+    })());
+    gate(&mut gates, "web-game", "M5", (|| {
+        let ok = crate::webtest::run(ws, &["game", game])?;
+        Ok((ok, "RAM and VRAM hashes, native vs browsers".into()))
+    })());
     gate(&mut gates, "oracle", "M3", (|| {
-        let reports = psxw_oracle::commands::ci(ws)?;
+        let reports = psxw_oracle::commands::ci(ws, &mut crate::oracle::devices(ws))?;
         let pass = reports.iter().all(|(r, _)| r.pass);
         let detail: Vec<String> = reports.iter().map(|(r, _)| format!("{}: {}", r.command, if r.pass { "pass" } else { "FAIL" })).collect();
         Ok((pass, detail.join(", ")))

@@ -4,8 +4,9 @@
 //! Sources are never edited. Each TU is preprocessed with the host
 //! [`PRELUDE`], then normalized as text:
 //! - [`asm`]: register pinning stripped, top-level asm dropped, `break`
-//!   becomes a runtime call, barriers kept; real MIPS asm marks its function
-//!   for the lift tier;
+//!   becomes a runtime call, barriers kept, PsyQ GTE macros become GTE
+//!   intrinsics ([`gte`]); other real MIPS asm marks its function for the
+//!   lift tier;
 //! - [`compile`]: an error-driven loop applies named fixups for GCC 2.95-isms
 //!   clang rejects at file scope, and lifts any function clang can't compile.
 //!
@@ -19,6 +20,7 @@ pub mod clang;
 pub mod compile;
 pub mod diag;
 pub mod edit;
+pub mod gte;
 pub mod linemap;
 pub mod probe;
 pub mod protos;

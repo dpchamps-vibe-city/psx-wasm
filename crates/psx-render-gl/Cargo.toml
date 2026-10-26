@@ -1,0 +1,22 @@
+[package]
+name = "psx-render-gl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "The GPU backend: renderer commands to VRAM over glow (WebGL2 / GLES 3.0), byte-exact at 1x"
+
+[features]
+# A native headless context through EGL surfaceless (Mesa llvmpipe in
+# Docker), and the render server that runs on it.
+headless = ["dep:khronos-egl"]
+
+[dependencies]
+anyhow = "1.0.104"
+glow = "0.18.0"
+psxw-abi = { path = "../psxw-abi" }
+khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
+
+[[bin]]
+name = "psxw-render-server"
+path = "src/bin/psxw-render-server.rs"
+required-features = ["headless"]

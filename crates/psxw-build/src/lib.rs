@@ -3,3 +3,4 @@
 
 pub mod game;
 pub mod runtime;
+pub mod web;
