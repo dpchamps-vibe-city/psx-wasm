@@ -174,6 +174,38 @@ impl GpuDevice {
             *s = Some(Workspace::open(&self.ws_root).and_then(|ws| Server::start(&ws)).map_err(|e| format!("{e:#}")));
         }
     }
+
+    /// One request to the render server, starting it if needed.
+    fn call(&self, kind: u32, words: &[u32]) -> Result<Vec<u8>> {
+        self.ensure_server();
+        let mut guard = self.server.borrow_mut();
+        match guard.as_mut() {
+            Some(Ok(s)) => s.call(kind, words),
+            Some(Err(e)) => bail!("render server unavailable: {e}"),
+            None => bail!("render server not started"),
+        }
+    }
+
+    /// Zero the backend's VRAM.
+    pub fn reset(&mut self) -> Result<()> {
+        self.call(server::RESET, &[]).map(|_| ())
+    }
+
+    /// Execute a renderer command stream; returns its READBACK pixels.
+    pub fn execute(&mut self, stream: &[u32]) -> Result<Vec<u16>> {
+        let bytes = self.call(server::RUN, stream)?;
+        Ok(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    }
+
+    /// The last presented frame: width, height, RGBA8 rows from the top.
+    pub fn frame(&mut self) -> Result<(u32, u32, Vec<u8>)> {
+        let bytes = self.call(server::FRAME, &[])?;
+        ensure!(bytes.len() >= 8, "short frame");
+        let w = u32::from_le_bytes(bytes[..4].try_into()?);
+        let h = u32::from_le_bytes(bytes[4..8].try_into()?);
+        ensure!(bytes.len() == 8 + (w * h * 4) as usize, "frame of {} bytes for {w}x{h}", bytes.len());
+        Ok((w, h, bytes[8..].to_vec()))
+    }
 }
 
 impl DeviceUnderTest for GpuDevice {
@@ -192,15 +224,8 @@ impl DeviceUnderTest for GpuDevice {
 
     fn run(&mut self, v: &Vector, store: &Store) -> Result<Vec<u8>> {
         let stream = replay(v, store)?;
-        self.ensure_server();
-        let mut guard = self.server.borrow_mut();
-        let server = match guard.as_mut() {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => bail!("render server unavailable: {e}"),
-            None => bail!("render server not started"),
-        };
-        server.call(server::RESET, &[])?;
-        let bytes = server.call(server::RUN, &stream)?;
+        self.call(server::RESET, &[])?;
+        let bytes = self.call(server::RUN, &stream)?;
         ensure!(bytes.len() == v.result_len(), "{} result bytes, the vector has {}", bytes.len(), v.result_len());
         Ok(bytes)
     }

@@ -267,15 +267,18 @@ impl Renderer {
                     };
                 }
                 Command::Draw(recs) => {
-                    let n = recs.len() / PRIM_WORDS;
-                    let mut scratch = std::mem::take(&mut self.scratch);
-                    scratch.clear();
-                    scratch.resize(n * WORDS, 0);
-                    for (i, rec) in recs.chunks_exact(PRIM_WORDS).enumerate() {
-                        setup::primitive(rec, &self.clip, &mut scratch[i * WORDS..(i + 1) * WORDS]);
+                    // Runs of ordinary records draw as one batch; a serial
+                    // record draws alone, row by row.
+                    let mut run_start = 0;
+                    let all: Vec<&[u32]> = recs.chunks_exact(PRIM_WORDS).collect();
+                    for (i, rec) in all.iter().enumerate() {
+                        if rec[0] & render::prim::SERIAL != 0 {
+                            self.draw_batch(&all[run_start..i]);
+                            self.draw_serial(rec);
+                            run_start = i + 1;
+                        }
                     }
-                    self.draw_records(&mut scratch, n);
-                    self.scratch = scratch;
+                    self.draw_batch(&all[run_start..]);
                 }
                 Command::Fill { rect, color } => {
                     let mut rec = vec![0u32; WORDS];
@@ -351,6 +354,76 @@ impl Renderer {
     /// The pixels READBACK commands produced, in order.
     pub fn take_readbacks(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.readbacks)
+    }
+
+    /// Set up and draw primitive records as one batch.
+    fn draw_batch(&mut self, recs: &[&[u32]]) {
+        if recs.is_empty() {
+            return;
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.resize(recs.len() * WORDS, 0);
+        for (i, rec) in recs.iter().enumerate() {
+            setup::primitive(rec, &self.clip, &mut scratch[i * WORDS..(i + 1) * WORDS]);
+        }
+        self.draw_records(&mut scratch, recs.len());
+        self.scratch = scratch;
+    }
+
+    /// A primitive that samples where it draws, row by row in the GPU's
+    /// raster order, each row's pixels synced to the read copy before the
+    /// next row samples ([`render::prim::SERIAL`]).
+    fn draw_serial(&mut self, rec: &[u32]) {
+        let mut one = [0u32; PRIM_WORDS];
+        one.copy_from_slice(&rec[..PRIM_WORDS]);
+        one[0] &= !render::prim::SERIAL;
+        match one[0] & render::prim::KIND_MASK {
+            render::prim::RECT => {
+                let mut w = vec![0u32; WORDS];
+                setup::primitive(&one, &self.clip, &mut w);
+                let (ys, yb) = (w[14] as i32, w[15] as i32);
+                if w[8] <= w[10] {
+                    for y in ys..yb {
+                        self.draw_row(&one, y);
+                    }
+                }
+            }
+            render::prim::TRIANGLE | render::prim::QUAD => {
+                // A quad is its two triangles, one after the other.
+                let quad = one[0] & render::prim::KIND_MASK == render::prim::QUAD;
+                let mut tris = vec![one];
+                if quad {
+                    let mut second = one;
+                    second[3..12].copy_from_slice(&one[6..15]);
+                    tris[0][0] = (one[0] & !render::prim::KIND_MASK) | render::prim::TRIANGLE;
+                    second[0] = tris[0][0];
+                    tris.push(second);
+                }
+                for t in tris {
+                    for y in setup::triangle_rows(&t) {
+                        self.draw_row(&t, y);
+                    }
+                }
+            }
+            _ => self.draw_batch(&[&one]),
+        }
+    }
+
+    /// Draw one row of a primitive (`y` as the drawing-area test sees it),
+    /// then sync that row.
+    fn draw_row(&mut self, rec: &[u32], y: i32) {
+        let saved = self.clip;
+        if y < saved.y0 || y > saved.y1 {
+            return;
+        }
+        self.clip.y0 = y;
+        self.clip.y1 = y;
+        self.draw_batch(&[rec]);
+        self.clip = saved;
+        if saved.x1 >= saved.x0 {
+            self.sync(saved.x0 as u32, (y & 511) as u32, (saved.x1 - saved.x0 + 1) as u32, 1);
+        }
     }
 
     /// Copy draw-copy regions to the read copy.

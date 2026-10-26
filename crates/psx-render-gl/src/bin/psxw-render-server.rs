@@ -9,7 +9,7 @@
 //! ```
 
 use anyhow::Result;
-use psx_render_gl::server::{self, INFO, QUIT, RESET, RUN, STATUS_ERROR, STATUS_OK};
+use psx_render_gl::server::{self, FRAME, INFO, QUIT, RESET, RUN, STATUS_ERROR, STATUS_OK};
 use psx_render_gl::{BACKEND_VERSION, Renderer, headless::Headless};
 use std::io::{BufReader, BufWriter};
 
@@ -54,6 +54,16 @@ fn main() -> Result<()> {
                 server::write_response(&mut output, STATUS_OK, &[])?;
             }
             INFO => server::write_response(&mut output, STATUS_OK, info_json(&r, &headless).as_bytes())?,
+            FRAME => match r.frame() {
+                Some(f) => {
+                    let mut bytes = Vec::with_capacity(8 + f.rgba.len());
+                    bytes.extend_from_slice(&f.width.to_le_bytes());
+                    bytes.extend_from_slice(&f.height.to_le_bytes());
+                    bytes.extend_from_slice(&f.rgba);
+                    server::write_response(&mut output, STATUS_OK, &bytes)?
+                }
+                None => server::write_response(&mut output, STATUS_ERROR, b"nothing presented yet")?,
+            },
             QUIT => break,
             other => server::write_response(&mut output, STATUS_ERROR, format!("unknown request {other}").as_bytes())?,
         }

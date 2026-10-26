@@ -53,6 +53,12 @@ pub const GENERATORS: &[&str] = &[
     "big",
     "coord-wrap",
     "misc",
+    "tex-feedback",
+    "mesh-semi",
+    "clip-high",
+    "rect-big",
+    "tex-mode3",
+    "poly-sliver",
 ];
 
 /// A generated vector.
@@ -77,15 +83,40 @@ pub fn generate(store: &Store, seed: u64, per: usize) -> Result<Vec<Synth>> {
 }
 
 /// Store the default synthetic set; returns how many vectors it holds.
+/// The sets are replaced, not extended: vectors a changed generator no
+/// longer makes leave the sets, and their files and goldens are removed
+/// unless another set still lists them.
 pub fn install(store: &Store) -> Result<usize> {
     let all = generate(store, SEED, PER_GENERATOR)?;
+    let mut old = std::collections::BTreeSet::new();
+    for name in store.set_names()?.into_iter().filter(|n| n.starts_with(SET_PREFIX)) {
+        old.extend(store.set(&name)?);
+        std::fs::remove_file(store.root().join("sets").join(format!("{name}.ids")))?;
+    }
+    let mut new = std::collections::BTreeSet::new();
     for &name in GENERATORS {
         let ids: Vec<_> = all
             .iter()
             .filter(|s| s.generator == name)
             .map(|s| store.put_vector(&s.vector))
             .collect::<Result<_>>()?;
+        new.extend(ids.iter().copied());
         store.add_to_set(&format!("{SET_PREFIX}{name}"), ids)?;
+    }
+    let mut listed = std::collections::BTreeSet::new();
+    for name in store.set_names()? {
+        listed.extend(store.set(&name)?);
+    }
+    for id in old.difference(&new).filter(|id| !listed.contains(*id)) {
+        let hex = id.hex();
+        let _ = std::fs::remove_file(store.root().join("vectors").join(format!("{hex}.vec")));
+        if let Ok(dirs) = std::fs::read_dir(store.root().join("goldens")) {
+            for d in dirs.flatten() {
+                for ext in ["res", "json"] {
+                    let _ = std::fs::remove_file(d.path().join(format!("{hex}.{ext}")));
+                }
+            }
+        }
     }
     Ok(all.len())
 }
@@ -235,7 +266,7 @@ fn texture(b: &mut B, depth: u32, half: u32) -> Result<Tex> {
             }
         };
         b.area(Rect::new(cx as u16, cy as u16, entries as u16, 1), |g| if g.chance(8) { 0 } else { g.u16() })?;
-        clut = cy << 6 | cx / 16;
+        clut = (cy << 6) | (cx / 16);
     }
     Ok(Tex { depth, tpx, tpy, clut })
 }
@@ -731,6 +762,233 @@ fn build(name: &str, i: usize, b: &mut B) -> Result<()> {
                     let p = polygon(b, 0x30, local(&d, 4), None);
                     b.packet(p);
                 }
+            }
+        }
+        "tex-feedback" => {
+            // Drawing into a texture page, then sampling what was drawn,
+            // within one vector: the GPU's texture cache can still hold
+            // texels from before the write unless GP0(01h), a page change
+            // or a transfer invalidated it.
+            let depth = b.rng.below(3);
+            let half = b.rng.below(2);
+            let t = texture(b, depth, half)?;
+            let pw = 64 << depth;
+            let page = Rect::new((t.tpx * 64) as u16, (t.tpy * 256) as u16, pw as u16, 256);
+            let other = 1 - half as i32;
+            let (w, h) = (b.r(32, 96), b.r(32, 96));
+            let d = b.dest(w, h, other * 256, other * 256 + 256)?;
+            b.readback.push(page);
+            b.state(e1(t.tpx, t.tpy, 0, t.depth, false, 0), 0, (0, 0), 0);
+            let (px, py) = (page.x as i32, page.y as i32);
+            let dest_area = (d.x as i32, d.x as i32 + w - 16, d.y as i32, d.y as i32 + h - 16);
+            // Sample the page first, filling the texture cache. Then the
+            // cache is always invalidated before sampling again: psx-wasm
+            // does not model texels the cache keeps after VRAM under them
+            // changed (plans/M04-pixels.md, Findings), a behaviour psx-spx
+            // reports only demos rely on.
+            let warm = b.coin();
+            if warm {
+                let p = polygon(b, 0x2D, dest_area, Some((&t, 0)));
+                b.packet(p);
+            }
+            // Draw into the page.
+            let (rx, ry, rw, rh) = (px + b.r(0, pw - 16), py + b.r(0, 200), b.r(4, 16), b.r(4, 40));
+            let c = b.rgb();
+            b.packet(vec![0x6000_0000 | c, xy(rx, ry), (rh as u32) << 16 | rw as u32]);
+            match b.rng.below(if warm { 2 } else { 4 }) {
+                0 => b.packet(vec![0x0100_0000]),
+                // Away to another page and back: two page changes.
+                1 => {
+                    b.packet(vec![e1(t.tpx ^ 1, t.tpy, 0, t.depth, false, 0)]);
+                    b.packet(vec![e1(t.tpx, t.tpy, 0, t.depth, false, 0)]);
+                }
+                // The same page again: no change.
+                2 => b.packet(vec![e1(t.tpx, t.tpy, 0, t.depth, false, 0)]),
+                _ => {}
+            }
+            // Sample it again.
+            let op = b.pick(&[0x65, 0x7D]);
+            let p = rect(b, op, dest_area, Some(&t));
+            b.packet(p);
+        }
+        "mesh-semi" => {
+            // A grid of quads or triangles sharing edges, semi-transparent:
+            // a pixel two primitives both drew would be blended twice.
+            let textured = b.coin();
+            let depth = b.rng.below(3);
+            let (d, t) = scene(b, if textured { Some(depth) } else { None })?;
+            let abr = b.rng.below(4);
+            let dither = b.coin();
+            let (tpx, tpy, tdepth) = t.map(|t| (t.tpx, t.tpy, t.depth)).unwrap_or((0, 0, 0));
+            b.state(e1(tpx, tpy, abr, tdepth, dither, 0), 0, (d.x as i32, d.y as i32), 0);
+            let (nx, ny) = (b.r(2, 4) as usize, b.r(2, 4) as usize);
+            let (cw, ch) = (d.w as i32 / nx as i32, d.h as i32 / ny as i32);
+            let mut grid = vec![vec![(0i32, 0i32); nx + 1]; ny + 1];
+            for (j, row) in grid.iter_mut().enumerate() {
+                for (i, p) in row.iter_mut().enumerate() {
+                    let jx = if i == 0 || i == nx { 0 } else { b.r(-cw / 3, cw / 3) };
+                    let jy = if j == 0 || j == ny { 0 } else { b.r(-ch / 3, ch / 3) };
+                    *p = (i as i32 * cw + jx, j as i32 * ch + jy);
+                }
+            }
+            let gouraud = b.coin();
+            let tri = b.coin();
+            for j in 0..ny {
+                for i in 0..nx {
+                    let quad = [grid[j][i], grid[j][i + 1], grid[j + 1][i], grid[j + 1][i + 1]];
+                    let shapes: Vec<Vec<(i32, i32)>> =
+                        if tri { vec![vec![quad[0], quad[1], quad[2]], vec![quad[1], quad[2], quad[3]]] } else { vec![quad.to_vec()] };
+                    for shape in shapes {
+                        let op = 0x22
+                            | if shape.len() == 4 { 0x08 } else { 0 }
+                            | if gouraud { 0x10 } else { 0 }
+                            | if textured { 0x04 } else { 0 };
+                        let mut words = vec![op << 24 | b.rgb()];
+                        for (n, &(x, y)) in shape.iter().enumerate() {
+                            if n > 0 && gouraud {
+                                words.push(b.rgb());
+                            }
+                            words.push(xy(x, y));
+                            if let Some(t) = &t {
+                                let attr = match n {
+                                    0 => t.clut,
+                                    1 => tpage(t, abr),
+                                    _ => 0,
+                                };
+                                words.push(attr << 16 | b.rng.below(65536));
+                            }
+                        }
+                        b.packet(words);
+                    }
+                }
+            }
+        }
+        "clip-high" => {
+            // Drawing areas below row 511: the GPU plots rows at y & 511.
+            let (w, h) = (b.r(32, 128), b.r(32, 100));
+            let x = b.r(0, 1024 - w);
+            let abr = b.rng.below(4);
+            let dither = b.coin();
+            if b.coin() {
+                // Entirely below 512.
+                let d = b.dest(w, h, 0, 512)?;
+                b.state(e1(0, 0, abr, 0, dither, 0), 0, (d.x as i32, d.y as i32 + 512), 0);
+                b.state[2] = e3(d.x as u32, d.y as u32 + 512);
+                b.state[3] = e4((d.x + d.w - 1) as u32, (d.y + d.h - 1) as u32 + 512);
+            } else {
+                // Across 512: rows y0..511 and 0..y1-512.
+                let y0 = b.r(512 - h + 8, 504);
+                let top = Rect::new(x as u16, y0 as u16, w as u16, (512 - y0) as u16);
+                let bottom = Rect::new(x as u16, 0, w as u16, (h - (512 - y0)) as u16);
+                for r in [top, bottom] {
+                    b.random_area(r)?;
+                    b.readback.push(r);
+                }
+                b.state(e1(0, 0, abr, 0, dither, 0), 0, (x, y0), 0);
+                b.state[2] = e3(x as u32, y0 as u32);
+                b.state[3] = e4((x + w - 1) as u32, (y0 + h - 1) as u32);
+            }
+            let area = (-8, w + 8, -8, h + 8);
+            for _ in 0..b.r(1, 4) {
+                let p = match b.rng.below(3) {
+                    0 => {
+                        let op = b.pick(&[0x20, 0x28, 0x30, 0x38, 0x32, 0x3A]);
+                        polygon(b, op, area, None)
+                    }
+                    1 => {
+                        let op = b.pick(&[0x60, 0x62, 0x70, 0x78]);
+                        rect(b, op, area, None)
+                    }
+                    _ => {
+                        let op = b.pick(&[0x40, 0x50, 0x52]);
+                        line(b, op, 2, area)
+                    }
+                };
+                b.packet(p);
+            }
+        }
+        "rect-big" => {
+            let wide = b.coin();
+            let depth = b.rng.below(3);
+            let half = b.rng.below(2);
+            let t = texture(b, depth, half)?;
+            let other = 1 - half as i32;
+            let (w, h) = if wide { (b.r(400, 1024), b.r(8, 40)) } else { (b.r(16, 64), 256) };
+            let d = b.dest(w, h, other * 256, other * 256 + 256)?;
+            let (abr, flip) = (b.rng.below(4), b.rng.below(4));
+            b.state(e1(t.tpx, t.tpy, abr, t.depth, false, flip), 0, (d.x as i32, d.y as i32), 0);
+            for _ in 0..b.r(1, 2) {
+                let op = b.pick(&[0x60, 0x62, 0x64, 0x65, 0x66]);
+                let c = b.rgb();
+                let pos = xy(b.r(-4, 4), b.r(-4, 4));
+                let mut words = vec![op << 24 | c, pos];
+                if op & 4 != 0 {
+                    words.push(t.clut << 16 | b.rng.below(65536));
+                }
+                let (rw, rh) = (b.r(w - 8, 1023.min(w + 8)), b.r(h - 4, 511.min(h + 4)));
+                words.push((rh as u32) << 16 | rw as u32);
+                b.packet(words);
+            }
+        }
+        "tex-mode3" => {
+            // Texture depth 3 (reserved) draws as 15-bit.
+            let (d, t) = scene(b, Some(2))?;
+            let t = Tex { depth: 3, ..t.expect("texture") };
+            b.state(e1(t.tpx, t.tpy, 0, 3, false, 0), 0, (d.x as i32, d.y as i32), 0);
+            for _ in 0..b.r(1, 3) {
+                let p = if b.coin() {
+                    let op = b.pick(&[0x24, 0x25, 0x2C, 0x34]);
+                    polygon(b, op, local(&d, 8), Some((&t, 0)))
+                } else {
+                    let op = b.pick(&[0x64, 0x65, 0x7C]);
+                    rect(b, op, local(&d, 8), Some(&t))
+                };
+                b.packet(p);
+            }
+        }
+        "poly-sliver" => {
+            // Thin, tiny and steep triangles with strong gradients: small
+            // denominators in the interpolation setup, long edge walks.
+            let textured = b.coin();
+            let depth = b.rng.below(3);
+            let (d, t) = scene(b, if textured { Some(depth) } else { None })?;
+            let dither = b.coin();
+            b.state(e1(0, 0, 0, 0, dither, 0), 0, (d.x as i32, d.y as i32), 0);
+            for _ in 0..b.r(2, 6) {
+                let (cx, cy) = (b.r(0, d.w as i32), b.r(0, d.h as i32));
+                let pts: Vec<(i32, i32)> = match b.rng.below(3) {
+                    // Tiny.
+                    0 => (0..3).map(|_| (cx + b.r(-2, 2), cy + b.r(-2, 2))).collect(),
+                    // A long thin sliver.
+                    1 => {
+                        let (dx, dy) = (b.r(-60, 60), b.r(-60, 60));
+                        let (ex, ey) = (b.r(-1, 1), b.r(-1, 1));
+                        vec![(cx, cy), (cx + dx, cy + dy), (cx + dx + ex, cy + dy + ey)]
+                    }
+                    // Near-horizontal or near-vertical edges.
+                    _ => {
+                        let l = b.r(10, 80);
+                        let (a, c, e) = (b.r(0, 1), b.r(0, l), b.r(1, 3));
+                        if b.coin() { vec![(cx, cy), (cx + l, cy + a), (cx + c, cy + e)] } else { vec![(cx, cy), (cx + a, cy + l), (cx + e, cy + c)] }
+                    }
+                };
+                let op = if textured { b.pick(&[0x24, 0x34]) } else { b.pick(&[0x30, 0x20]) };
+                let mut words = vec![op << 24 | b.rgb()];
+                for (n, &(x, y)) in pts.iter().enumerate() {
+                    if n > 0 && op & 0x10 != 0 {
+                        words.push(b.rgb());
+                    }
+                    words.push(xy(x, y));
+                    if let Some(t) = &t {
+                        let attr = match n {
+                            0 => t.clut,
+                            1 => tpage(t, 0),
+                            _ => 0,
+                        };
+                        words.push(attr << 16 | b.rng.below(65536));
+                    }
+                }
+                b.packet(words);
             }
         }
         other => anyhow::bail!("unknown GPU generator {other}"),

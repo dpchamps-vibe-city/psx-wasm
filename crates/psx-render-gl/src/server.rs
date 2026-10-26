@@ -19,6 +19,9 @@ pub const RESET: u32 = 2;
 pub const INFO: u32 = 3;
 /// Stop.
 pub const QUIT: u32 = 4;
+/// The last presented frame: `u32 width, u32 height`, then RGBA8 rows
+/// from the top.
+pub const FRAME: u32 = 5;
 
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_ERROR: u32 = 1;

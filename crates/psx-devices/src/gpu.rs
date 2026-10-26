@@ -343,8 +343,12 @@ impl Gpu {
         match word >> 24 {
             0x00 => self.soft_reset(),
             0x01 => {
+                // psx-spx: resets the command buffer and the colour-table
+                // cache. (Beetle keeps its colour-table cache here; no
+                // vector can tell, since vectors carry no GP1 commands.)
                 self.abort_command();
                 self.fifo.clear();
+                self.clut_key = None;
             }
             0x02 => self.irq = false,
             0x03 => self.display.off = v & 1 != 0,
@@ -771,12 +775,17 @@ impl Gpu {
         self.clut_slot
     }
 
-    /// The VRAM a textured primitive can sample: its page under the
-    /// window, at most 256×256 texels.
-    fn texture_reads(&self, page: &TexPage) -> Areas {
-        let mode = page.mode.min(2);
-        let w = 256 >> (2 - mode);
-        Areas::wrapping(page.x64 * 64, page.y256 * 256, w, 256)
+    /// The VRAM a textured primitive can sample: texture coordinates in
+    /// `u.0..=u.1` and `v.0..=v.1` (a range outside 0..=255 wraps, so it
+    /// means all of them), through the window, on its page.
+    fn texture_reads(page: &TexPage, window: u32, u: (i32, i32), v: (i32, i32)) -> Areas {
+        let full = |r: (i32, i32), mask: u32| if r.0 < 0 || r.1 > 255 || mask != 0 { (0, 255) } else { (r.0 as u32, r.1 as u32) };
+        let (u0, u1) = full(u, window & 0x1F);
+        let (v0, v1) = full(v, (window >> 5) & 0x1F);
+        let shift = 2 - page.mode.min(2);
+        let x0 = page.x64 * 64 + (u0 >> shift);
+        let x1 = page.x64 * 64 + (u1 >> shift);
+        Areas::wrapping(x0, page.y256 * 256 + v0, x1 - x0 + 1, v1 - v0 + 1)
     }
 
     /// Where a primitive with this coordinate bounding box can plot,
@@ -807,8 +816,8 @@ impl Gpu {
         f
     }
 
-    fn reads_for(&self, flags: u32, page: &TexPage, writes: &Areas) -> Areas {
-        let mut reads = if flags & prim::TEXTURED != 0 { self.texture_reads(page) } else { Areas::none() };
+    fn reads_for(&self, flags: u32, texels: &Areas, writes: &Areas) -> Areas {
+        let mut reads = if flags & prim::TEXTURED != 0 { *texels } else { Areas::none() };
         if flags & (prim::SEMI | prim::MASK_CHECK) != 0 {
             for w in writes.iter() {
                 reads.push(w);
@@ -902,7 +911,7 @@ impl Gpu {
         self.add_polygon(rec, &all, true);
     }
 
-    fn add_polygon(&mut self, rec: [u32; PRIM_WORDS], v: &[Vertex], _quad: bool) {
+    fn add_polygon(&mut self, mut rec: [u32; PRIM_WORDS], v: &[Vertex], _quad: bool) {
         let xs = v.iter().map(|p| p.x);
         let ys = v.iter().map(|p| p.y);
         let (x0, x1) = (xs.clone().min().unwrap_or(0), xs.max().unwrap_or(0));
@@ -915,8 +924,23 @@ impl Gpu {
             mode: (rec[0] & prim::DEPTH_MASK) >> prim::DEPTH_SHIFT,
             ..TexPage::default()
         };
-        let reads = self.reads_for(rec[0], &page, &writes);
+        // Interpolated coordinates stay within the vertices' range, give or
+        // take the rounding of the setup.
+        let us = v.iter().map(|p| (p.uv & 0xFF) as i32);
+        let vs = v.iter().map(|p| ((p.uv >> 8) & 0xFF) as i32);
+        let u = (us.clone().min().unwrap_or(0) - 1, us.max().unwrap_or(0) + 1);
+        let vv = (vs.clone().min().unwrap_or(0) - 1, vs.max().unwrap_or(0) + 1);
+        let texels = Self::texture_reads(&page, rec[2], u, vv);
+        rec[0] |= Self::serial(rec[0], &texels, &writes);
+        let reads = self.reads_for(rec[0], &texels, &writes);
         self.add_prim(rec, reads, writes);
+    }
+
+    /// [`prim::SERIAL`] when a textured primitive can sample where it
+    /// draws.
+    fn serial(flags: u32, texels: &Areas, writes: &Areas) -> u32 {
+        let feedback = flags & prim::TEXTURED != 0 && texels.iter().any(|t| writes.iter().any(|w| w.overlaps(&t)));
+        if feedback { prim::SERIAL } else { 0 }
     }
 
     // ---------------------------------------------------------------
@@ -959,7 +983,7 @@ impl Gpu {
         let exact = [p0, p1].iter().all(|p| (0..1024).contains(&p.x) && (0..1024).contains(&p.y));
         let writes =
             self.plot_areas(p0.x.min(p1.x), p0.x.max(p1.x), p0.y.min(p1.y), p0.y.max(p1.y), exact);
-        let reads = self.reads_for(flags, &self.page.clone(), &writes);
+        let reads = self.reads_for(flags, &Areas::none(), &writes);
         self.add_prim(rec, reads, writes);
     }
 
@@ -1014,7 +1038,13 @@ impl Gpu {
         rec[5] = color;
         rec[6] = uv;
         let writes = self.plot_areas(x, x + w as i32 - 1, y, y + h as i32 - 1, true);
-        let reads = self.reads_for(flags, &page, &writes);
+        // Texture coordinates step by one per pixel (down with a flip).
+        let (u0, v0) = ((uv & 0xFF) as i32, ((uv >> 8) & 0xFF) as i32);
+        let u = if flags & prim::FLIP_X != 0 { ((u0 | 1) - (w as i32 - 1), u0 | 1) } else { (u0, u0 + w as i32 - 1) };
+        let v = if flags & prim::FLIP_Y != 0 { (v0 - (h as i32 - 1), v0) } else { (v0, v0 + h as i32 - 1) };
+        let texels = Self::texture_reads(&page, self.window, u, v);
+        rec[0] |= Self::serial(flags, &texels, &writes);
+        let reads = self.reads_for(flags, &texels, &writes);
         self.add_prim(rec, reads, writes);
     }
 
@@ -1311,7 +1341,7 @@ mod tests {
                         1 => (1 << 7 | 3 << 5 | 2) << 16, // 8-bit, abr 3, page x 128
                         _ => 0,
                     };
-                    words.push(attr | (n * 9) << 8 | n * 7);
+                    words.push(attr | ((n * 9) << 8) | (n * 7));
                 }
             }
             g.gp0_words(&words);
@@ -1334,7 +1364,7 @@ mod tests {
                 let rgb = if gouraud && n > 0 { 0x40_5060 + n as u32 } else { 0x10_2030 };
                 assert_eq!(r[4 + 3 * n], rgb, "{cc:#x} vertex {n}");
                 if textured {
-                    assert_eq!(r[5 + 3 * n], (n as u32 * 9) << 8 | n as u32 * 7);
+                    assert_eq!(r[5 + 3 * n], ((n as u32 * 9) << 8) | (n as u32 * 7));
                 }
             }
             if textured {
@@ -1381,7 +1411,7 @@ mod tests {
             assert_eq!(recs.len(), pts as usize, "{cc:#x}");
             for (n, r) in recs[..pts as usize - 1].iter().enumerate() {
                 assert_eq!(r[0] & prim::KIND_MASK, prim::LINE);
-                assert_eq!(r[0] & prim::DITHER != 0, true, "lines dither whenever dithering is on");
+                assert!(r[0] & prim::DITHER != 0, "lines dither whenever dithering is on");
                 assert_eq!(r[0] & prim::SEMI != 0, cc & 2 != 0);
                 assert_eq!(unpack_xy(r[3]), (5 * n as i32, 3 * n as i32));
                 assert_eq!(unpack_xy(r[5]), (5 * (n as i32 + 1), 3 * (n as i32 + 1)));

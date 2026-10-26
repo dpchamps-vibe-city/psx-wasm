@@ -160,6 +160,12 @@ pub mod prim {
     pub const FLIP_X: u32 = 1 << 14;
     /// Rectangles: texture coordinates decrease along y (GP0(E1h) bit 13).
     pub const FLIP_Y: u32 = 1 << 15;
+    /// The primitive samples texels where it also draws. The GPU draws
+    /// row by row (polygons in its own row order, rectangles top to
+    /// bottom), so a row samples what the rows before it drew; the
+    /// backend must too, instead of reading VRAM as it was before the
+    /// batch.
+    pub const SERIAL: u32 = 1 << 16;
 
     /// Word 1: texture page x in units of 64 pixels (bits 0–3), y in
     /// units of 256 rows (bit 4), colour-table slot in bits 16–31.

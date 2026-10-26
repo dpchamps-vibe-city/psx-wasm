@@ -240,6 +240,20 @@ fn triangle(mut v: [V; 3]) -> Option<[u32; 44]> {
     Some(w)
 }
 
+/// The rows of a TRIANGLE record in the order the GPU draws them, as the
+/// drawing-area test sees them (sign-extended to 11 bits). The GPU walks
+/// its two parts in the order of `tripart[]`: the part holding the core
+/// vertex's side first, each part up or down as its walk goes.
+pub fn triangle_rows(rec: &[u32]) -> Vec<i32> {
+    let Some(w) = triangle([vertex(rec, 0), vertex(rec, 1), vertex(rec, 2)]) else { return Vec::new() };
+    let (y0, y1, y2) = (w[1] as i32, w[2] as i32, w[3] as i32);
+    let (upper_dec, lower_dec) = (w[5] != 0, w[17] != 0);
+    let up: Vec<i32> = if upper_dec { (y0..y1).rev().collect() } else { (y0..y1).collect() };
+    let low: Vec<i32> = if lower_dec { (y1..y2).rev().collect() } else { (y1..y2).collect() };
+    let rows = if upper_dec { low.into_iter().chain(up) } else { up.into_iter().chain(low) };
+    rows.map(|y| (y << 21) >> 21).collect()
+}
+
 /// The covering rectangle of polygon vertices.
 fn polygon_cover(clip: &Clip, v: &[V]) -> [u32; 4] {
     let x0 = v.iter().map(|p| p.x).min().unwrap_or(0);
