@@ -13,6 +13,10 @@ pub struct Clang {
     pub defines: Vec<String>,
     /// Where the prelude header is written.
     pub prelude: PathBuf,
+    /// The original was compiled `-msoft-float`: its float arithmetic is
+    /// calls into the game's soft-float routines, which native wasm floats
+    /// don't reproduce, so C functions doing float arithmetic are lifted.
+    pub soft_float: bool,
 }
 
 /// Errors that GCC 2.95-era C trips in modern clang but that are only
@@ -32,7 +36,7 @@ impl Clang {
         std::fs::create_dir_all(work)?;
         let prelude = work.join("psxw_prelude.h");
         std::fs::write(&prelude, crate::PRELUDE)?;
-        Ok(Self { path, cwd, includes, defines, prelude })
+        Ok(Self { path, cwd, includes, defines, prelude, soft_float: false })
     }
 
     pub fn version(&self) -> Result<String> {
@@ -94,5 +98,34 @@ impl Clang {
             .arg(include);
         let out = cmd.arg(src).arg("-o").arg(obj).output().context("running clang -c")?;
         Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+    }
+
+    /// LLVM IR for a normalized TU, as `compile_i` would lower it.
+    pub fn emit_llvm(&self, i_path: &Path) -> Result<String> {
+        let mut cmd = self.base();
+        cmd.args(["-S", "-emit-llvm", "-O0", "-w", "-fno-builtin"]).args(crate::UB_CONTAINMENT_FLAGS);
+        for w in DOWNGRADED {
+            cmd.arg(format!("-Wno-error={w}"));
+        }
+        let out = cmd.arg(i_path).arg("-o").arg("-").output().context("running clang -emit-llvm")?;
+        if !out.status.success() {
+            bail!("clang -emit-llvm {} failed:\n{}", i_path.display(), String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(String::from_utf8(out.stdout)?)
+    }
+
+    /// Compile an already-normalized TU (`.i`) with extra flags, e.g. the
+    /// differential harness's no-auto-inline variant.
+    pub fn compile_variant(&self, i_path: &Path, obj: &Path, extra: &[&str]) -> Result<()> {
+        let mut cmd = self.base();
+        cmd.args(["-c", "-O2", "-w", "-fno-builtin"]).args(crate::UB_CONTAINMENT_FLAGS).args(extra);
+        for w in DOWNGRADED {
+            cmd.arg(format!("-Wno-error={w}"));
+        }
+        let out = cmd.arg(i_path).arg("-o").arg(obj).output().context("running clang -c")?;
+        if !out.status.success() {
+            bail!("clang -c {} failed:\n{}", i_path.display(), String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(())
     }
 }

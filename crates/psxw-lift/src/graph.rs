@@ -482,12 +482,10 @@ impl SymState {
             }
             Op::Or if i.rt == 0 => self.set(i.rd, s),
             Op::Or if i.rs == 0 => self.set(i.rd, t),
+            // Not folded even for a constant: a table index set to a constant
+            // on some path must keep its identity with the bounds check.
             Op::Sll => {
-                let v = match t {
-                    Sym::Const(c) => Sym::Const(c << i.sa),
-                    _ if i.sa == 0 => t,
-                    _ => Sym::Shl(Box::new(t), i.sa),
-                };
+                let v = if i.sa == 0 { t } else { Sym::Shl(Box::new(t), i.sa) };
                 self.set(i.rd, v)
             }
             Op::Lw => {

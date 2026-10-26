@@ -195,7 +195,7 @@ fn site_at(text: &str, start: usize, after_kw: usize, depth: i32) -> Option<AsmS
 }
 
 /// Byte index of `word` as a whole identifier in `s`.
-fn find_word(s: &str, word: &str) -> Option<usize> {
+pub fn find_word(s: &str, word: &str) -> Option<usize> {
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     s.match_indices(word).map(|(i, _)| i).find(|&i| {
         let before = i == 0 || !ident(s.as_bytes()[i - 1]);

@@ -29,6 +29,8 @@ pub struct Container {
     pub text: Vec<Range<u32>>,
     /// Start of each object's or TU's `.text` (each begins with a function).
     pub text_starts: Vec<u32>,
+    /// Read-only data ranges (`rodata`, `.rodata`, objects' `.rdata`).
+    pub rodata: Vec<Range<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +180,7 @@ fn container_from(cfg: &SplatConfig, is_main: bool) -> Container {
     let mut sdk = Vec::new();
     let mut text: Vec<Range<u32>> = Vec::new();
     let mut text_starts = Vec::new();
+    let mut rodata: Vec<Range<u32>> = Vec::new();
     let lo = cfg.code.iter().map(|s| s.vram).min().unwrap_or(0);
     let hi = cfg.code.iter().map(|s| s.vram_end()).max().unwrap_or(0);
     for seg in &cfg.code {
@@ -188,6 +191,13 @@ fn container_from(cfg: &SplatConfig, is_main: bool) -> Container {
                 match text.last_mut() {
                     Some(last) if last.end == r.start => last.end = r.end,
                     _ => text.push(r),
+                }
+            }
+            if is_rodata(sub) && sub.rom_end > sub.rom_start {
+                let r = seg.vram_of(sub.rom_start)..seg.vram_of(sub.rom_end);
+                match rodata.last_mut() {
+                    Some(last) if last.end == r.start => last.end = r.end,
+                    _ => rodata.push(r),
                 }
             }
             let Some(name) = &sub.name else { continue };
@@ -220,6 +230,15 @@ fn container_from(cfg: &SplatConfig, is_main: bool) -> Container {
         segments: cfg.code.iter().map(|s| (s.rom_start..s.rom_end, s.vram)).collect(),
         text,
         text_starts,
+        rodata,
+    }
+}
+
+fn is_rodata(sub: &splat::Subsegment) -> bool {
+    match sub.kind.as_str() {
+        "rodata" | ".rodata" => true,
+        "o" => sub.args.first().is_some_and(|s| s == ".rdata" || s == ".rodata"),
+        _ => false,
     }
 }
 
@@ -239,10 +258,30 @@ fn auto_name(name: &str) -> Option<Resolved> {
     if prefix.is_empty() || hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    // Only C identifiers: compiler-local labels such as clang's
+    // `.Lswitch.table.func_80012345` merely mention a function's name.
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    if !prefix.bytes().all(ident) || prefix.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
     let addr = u32::from_str_radix(hex, 16).ok()?;
     if !(0x8000_0000..0x8020_0000).contains(&addr) {
         return None;
     }
     let is_func = prefix == "func" || prefix.ends_with("_func");
     Some(Resolved { addr, size: None, is_func, container: None, via: Via::AutoName })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_names_are_identifiers() {
+        assert_eq!(auto_name("func_80012345").map(|r| r.addr), Some(0x8001_2345));
+        assert!(auto_name("func_80012345").is_some_and(|r| r.is_func));
+        assert_eq!(auto_name("D_8005E274").map(|r| r.addr), Some(0x8005_E274));
+        assert!(auto_name(".Lswitch.table.ovl_11_func_800F1BD0").is_none());
+        assert!(auto_name("func_90012345").is_none());
+    }
 }

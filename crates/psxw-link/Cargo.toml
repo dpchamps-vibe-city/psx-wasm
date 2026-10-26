@@ -8,3 +8,6 @@ anyhow = "1.0.104"
 psxw-abi = { path = "../psxw-abi" }
 psxw-inputs = { path = "../psxw-inputs" }
 wasmparser = "0.262.0"
+wasm-encoder = { version = "0.262.0", features = ["wasmparser"] }
+psxw-cc = { path = "../psxw-cc" }
+serde = { version = "1.0.229", features = ["derive"] }

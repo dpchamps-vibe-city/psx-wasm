@@ -76,4 +76,15 @@ impl Workspace {
         }
         Ok(clang)
     }
+
+    /// A file inside a pinned toolchain distribution, e.g.
+    /// `tool("binaryen", "bin/wasm-opt")`.
+    pub fn tool(&self, name: &str, rel: &str) -> Result<PathBuf> {
+        let pin = self.lock.toolchain.get(name).ok_or_else(|| anyhow!("inputs.lock has no [toolchain.{name}]"))?;
+        let path = self.toolchain_dir().join(&pin.dist).join(rel);
+        if !path.is_file() {
+            return Err(anyhow!("{} missing; run `psxw toolchain fetch`", path.display()));
+        }
+        Ok(path)
+    }
 }

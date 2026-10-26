@@ -106,9 +106,15 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
     loop {
         rounds += 1;
         let funcs: Vec<Function> = containers.iter().flat_map(|c| program.functions(c)).collect();
+        // Decompiled C is ABI-conformant, so the translations paired with it
+        // (and replaced by it) never inline their callees.
+        let no_inline = BTreeMap::new();
         let results: Vec<Result<Translation, (Function, LiftError)>> = funcs
             .par_iter()
-            .map(|f| translate(program, originals, f, &inline).map_err(|e| (f.clone(), e)))
+            .map(|f| {
+                let inline = if f.sources.contains(&Source::Defined) { &no_inline } else { &inline };
+                translate(program, originals, f, inline).map_err(|e| (f.clone(), e))
+            })
             .collect();
 
         // Reachable instruction addresses per function, to tell interior
@@ -156,7 +162,8 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
                 Some(Located::Code(c)) => Some(c),
                 _ => None,
             };
-            for t in results.iter().flatten() {
+            // Only callers that are translated in the game (not C) can inline.
+            for t in results.iter().flatten().filter(|t| !t.func.sources.contains(&Source::Defined)) {
                 for &(pc, target, pre_defs) in &t.facts.call_sites {
                     let Some(c) = callee_of(&t.func.container, target) else { continue };
                     let Some(cf) = facts.get(&(c.clone(), target)) else { continue };

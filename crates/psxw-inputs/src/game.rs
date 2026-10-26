@@ -10,8 +10,27 @@ pub struct GameManifest {
     pub c: CSection,
     pub probe: ProbeSection,
     pub reference: ReferenceSection,
+    /// Per-function tier pins, by function name.
     #[serde(default)]
-    pub tier: BTreeMap<String, String>,
+    pub tier: BTreeMap<String, TierPin>,
+    #[serde(default)]
+    pub difftest: DifftestSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DifftestSection {
+    /// Functions excluded from the differential comparison, with the
+    /// recorded reason (reported as `excluded`, never as a pass).
+    #[serde(default)]
+    pub exclude: BTreeMap<String, String>,
+}
+
+/// A function forced to a tier, with the evidence for it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TierPin {
+    /// `lift` (the C can't reproduce the original) or `c`.
+    pub tier: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

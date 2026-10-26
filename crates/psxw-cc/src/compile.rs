@@ -67,10 +67,51 @@ pub fn compile(
         }
     }
     let real: Vec<usize> = sites.iter().filter(|s| s.kind == asm::AsmKind::Real).map(|s| s.start).collect();
-    if !real.is_empty() {
+    // A GNU global register variable keeps its value in a MIPS register
+    // across calls (a hidden argument or return channel). C on wasm can't,
+    // so every function that uses one is lifted.
+    let globals: Vec<String> = sites
+        .iter()
+        .filter(|s| s.kind == asm::AsmKind::RegisterBinding && s.depth <= 0)
+        .filter_map(|s| {
+            let stmt = text[..s.start].rfind([';', '}']).map_or(0, |i| i + 1);
+            text[stmt..s.start].split(|c: char| !c.is_alphanumeric() && c != '_').rfind(|w| !w.is_empty()).map(str::to_string)
+        })
+        .collect();
+    // A local register variable that is read but never assigned observes
+    // whatever the register holds (e.g. the previous call's v0); that too
+    // only the original instructions can reproduce.
+    let locals: Vec<(usize, String)> = sites
+        .iter()
+        .filter(|s| s.kind == asm::AsmKind::RegisterBinding && s.depth > 0)
+        .filter_map(|s| {
+            let stmt = text[..s.start].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+            let after = &text[s.end..];
+            if after.trim_start().starts_with('=') {
+                return None;
+            }
+            text[stmt..s.start]
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .rfind(|w| !w.is_empty())
+                .map(|n| (s.start, n.to_string()))
+        })
+        .collect();
+    if !real.is_empty() || !globals.is_empty() || !locals.is_empty() {
         let ast = ast::parse(&text);
         let fns = ast.functions();
         let mut done = BTreeSet::new();
+        for f in &fns {
+            let body = &text[f.range.clone()];
+            if globals.iter().any(|g| asm::find_word(body, g).is_some()) && done.insert(f.range.start) {
+                edits.push(lift(&text, &ast, f, "global-register", &mut out));
+            }
+        }
+        for (at, name) in &locals {
+            let Some(f) = fns.iter().find(|f| f.range.contains(at)) else { continue };
+            if !assigns(&text[f.range.clone()], name) && done.insert(f.range.start) {
+                edits.push(lift(&text, &ast, f, "register-capture", &mut out));
+            }
+        }
         for off in real {
             match fns.iter().find(|f| f.range.contains(&off)) {
                 Some(f) if done.insert(f.range.start) => edits.push(lift(&text, &ast, f, "inline-asm", &mut out)),
@@ -95,6 +136,46 @@ pub fn compile(
         let (ok, diags) = clang.compile_i(&text, &i_path, &obj)?;
         let map = LineMap::new(&text);
         let errors: Vec<&Diag> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+        // A non-void function that can fall off its end returns whatever
+        // the original left in v0; C has no such value, so it's lifted.
+        let falls_off: Vec<&Diag> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning && d.message.contains("does not return a value"))
+            .collect();
+        if ok && errors.is_empty() && !falls_off.is_empty() {
+            let ast = ast::parse(&text);
+            let fns = ast.functions();
+            let mut edits = Vec::new();
+            let mut done = BTreeSet::new();
+            for d in falls_off {
+                let Some(offset) = map.offset(d.line) else { continue };
+                if let Some(f) = fns.iter().find(|f| f.range.contains(&offset)) {
+                    if done.insert(f.range.start) {
+                        edits.push(lift(&text, &ast, f, "return-type", &mut out));
+                    }
+                }
+            }
+            if !edits.is_empty() {
+                text = edit::apply(&text, edits);
+                continue;
+            }
+        }
+        if ok && errors.is_empty() && clang.soft_float {
+            let floats = float_functions(&obj)?;
+            if !floats.is_empty() {
+                let ast = ast::parse(&text);
+                let edits: Vec<Edit> = ast
+                    .functions()
+                    .iter()
+                    .filter(|f| floats.contains(&f.name))
+                    .map(|f| lift(&text, &ast, f, "soft-float", &mut out))
+                    .collect();
+                if !edits.is_empty() {
+                    text = edit::apply(&text, edits);
+                    continue;
+                }
+            }
+        }
         if ok && errors.is_empty() {
             record_warnings(&mut out, &diags, &map);
             out.ok = true;
@@ -224,4 +305,98 @@ fn incomplete_array_fix(
             vec![Edit::replace(range, "")]
         }
     })
+}
+
+/// Whether `body` assigns `name` (`=`, compound assignment, `++`/`--`) or
+/// takes its address.
+fn assigns(body: &str, name: &str) -> bool {
+    let b = body.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    body.match_indices(name).any(|(i, _)| {
+        let end = i + name.len();
+        if (i > 0 && ident(b[i - 1])) || b.get(end).is_some_and(|&c| ident(c)) {
+            return false;
+        }
+        let before = body[..i].trim_end();
+        let after = body[end..].trim_start();
+        let assign = after.starts_with('=') && !after.starts_with("==");
+        let compound = ["+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "++", "--"]
+            .iter()
+            .any(|op| after.starts_with(op));
+        assign || compound || before.ends_with("++") || before.ends_with("--") || before.ends_with('&') && !before.ends_with("&&")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assigns;
+
+    #[test]
+    fn detects_assignment() {
+        assert!(assigns("{ x = 1; }", "x"));
+        assert!(assigns("{ x += 1; }", "x"));
+        assert!(assigns("{ ++x; }", "x"));
+        assert!(assigns("{ f(&x); }", "x"));
+        assert!(!assigns("{ y = x; if (x == 2) {} }", "x"));
+        assert!(!assigns("{ xx = 1; }", "x"));
+    }
+}
+
+/// Names of the functions in a wasm object whose code does floating-point
+/// arithmetic (not merely moves bits through f32/f64 loads and stores).
+fn float_functions(obj: &Path) -> Result<BTreeSet<String>> {
+    use wasmparser::{KnownCustom, Linking, Operator as O, Parser, Payload, SymbolInfo};
+    let bytes = std::fs::read(obj)?;
+    let mut imported = 0u32;
+    let mut floaty: Vec<u32> = Vec::new();
+    let mut index = 0u32;
+    let mut names: BTreeMap<u32, String> = BTreeMap::new();
+    for payload in Parser::new(0).parse_all(&bytes) {
+        match payload? {
+            Payload::ImportSection(r) => {
+                for i in r.into_imports() {
+                    if matches!(i?.ty, wasmparser::TypeRef::Func(_)) {
+                        imported += 1;
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let mut ops = body.get_operators_reader()?;
+                let mut uses = false;
+                while !ops.eof() {
+                    uses |= matches!(
+                        ops.read()?,
+                        O::F32Add | O::F32Sub | O::F32Mul | O::F32Div | O::F64Add | O::F64Sub | O::F64Mul | O::F64Div
+                            | O::F32Sqrt | O::F64Sqrt | O::F32Lt | O::F32Gt | O::F32Le | O::F32Ge | O::F32Eq | O::F32Ne
+                            | O::F64Lt | O::F64Gt | O::F64Le | O::F64Ge | O::F64Eq | O::F64Ne
+                            | O::F32ConvertI32S | O::F32ConvertI32U | O::F64ConvertI32S | O::F64ConvertI32U
+                            | O::F32ConvertI64S | O::F64ConvertI64S | O::F32DemoteF64 | O::F64PromoteF32
+                            | O::I32TruncF32S | O::I32TruncF64S | O::I32TruncF32U | O::I32TruncF64U
+                            | O::I32TruncSatF32S | O::I32TruncSatF64S | O::I32TruncSatF32U | O::I32TruncSatF64U
+                            | O::F32Neg | O::F64Neg | O::F32Abs | O::F64Abs | O::F32Floor | O::F64Floor
+                            | O::F32Ceil | O::F64Ceil | O::F32Trunc | O::F64Trunc | O::F32Nearest | O::F64Nearest
+                    );
+                }
+                if uses {
+                    floaty.push(imported + index);
+                }
+                index += 1;
+            }
+            Payload::CustomSection(r) => {
+                if let KnownCustom::Linking(l) = r.as_known() {
+                    for sub in l.subsections() {
+                        if let Linking::SymbolTable(map) = sub? {
+                            for info in map {
+                                if let SymbolInfo::Func { index, name: Some(name), .. } = info? {
+                                    names.insert(index, name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(floaty.iter().filter_map(|i| names.get(i).cloned()).collect())
 }

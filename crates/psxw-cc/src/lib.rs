@@ -21,6 +21,7 @@ pub mod diag;
 pub mod edit;
 pub mod linemap;
 pub mod probe;
+pub mod protos;
 
 pub use clang::Clang;
 pub use compile::{Compiled, Lifted, compile};

@@ -45,13 +45,14 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let out_dir = ws.out_dir().join("census").join(&manifest.game.id).join(pin.short());
     let obj_dir = out_dir.join("obj");
     std::fs::create_dir_all(&obj_dir)?;
-    let clang = Clang::new(
+    let mut clang = Clang::new(
         ws.clang()?,
         snap.clone(),
         manifest.c.include.clone(),
         manifest.c.defines.clone(),
         &out_dir,
     )?;
+    clang.soft_float = manifest.reference.cc1flags.iter().any(|f| f == "-msoft-float");
 
     let tus: Vec<_> = map
         .containers

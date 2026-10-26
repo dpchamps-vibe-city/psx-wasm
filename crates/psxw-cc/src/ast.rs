@@ -264,3 +264,31 @@ fn asm_label(decl: &str) -> Option<String> {
     let end = rest[q + 1..].find('"')?;
     Some(rest[q + 1..q + 1 + end].to_string())
 }
+
+/// The harness variant of a normalized TU: every non-static, non-inline
+/// function definition becomes `weak`, so clang can't use one function's
+/// body when compiling another (no inlining, no call deletion, no
+/// interprocedural constant propagation). Each function then compiles as
+/// it would in isolation, which is what a function-level comparison needs.
+pub fn harness_variant(text: &str) -> String {
+    let ast = parse(text);
+    let mut inserts: Vec<usize> = Vec::new();
+    for f in ast.functions() {
+        let head = &ast.src[f.range.start..f.decl_end];
+        let specifiers = head.split(&f.name).next().unwrap_or("");
+        let words: Vec<&str> = specifiers.split(|c: char| !c.is_alphanumeric() && c != '_').collect();
+        if words.iter().any(|w| matches!(*w, "static" | "inline" | "__inline" | "__inline__")) {
+            continue;
+        }
+        inserts.push(f.range.start);
+    }
+    let mut out = String::with_capacity(text.len() + inserts.len() * 24);
+    let mut at = 0;
+    for i in inserts {
+        out.push_str(&text[at..i]);
+        out.push_str("__attribute__((weak)) ");
+        at = i;
+    }
+    out.push_str(&text[at..]);
+    out
+}

@@ -7,6 +7,8 @@
 //!                                       M0: compile every TU, check vs original
 //! psxw lift <game> [--function F | --container C | --all]
 //!                                       M1: translate every function to C
+//! psxw difftest <game> [--only S] [--seeds N] [--keep]
+//!                                       M1: translated == decompiled C
 //! ```
 
 use anyhow::{Result, bail};
@@ -69,6 +71,65 @@ fn run() -> Result<()> {
             if !report.verdict.pass {
                 std::process::exit(2);
             }
+        }
+        ["difftest", game, rest @ ..] => {
+            let mut opts =
+                psxw_difftest::Options { game: game.to_string(), only: None, seeds: 64, keep: false, verbose: false };
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "--only" => opts.only = it.next().map(|s| s.to_string()),
+                    "--seeds" => opts.seeds = it.next().and_then(|s| s.parse().ok()).unwrap_or(64),
+                    "--keep" => opts.keep = true,
+                    "--verbose" => opts.verbose = true,
+                    other => bail!("unknown difftest option {other}"),
+                }
+            }
+            let (report, json) = psxw_difftest::run(&ws, &opts)?;
+            print!("{}", report.summary());
+            eprintln!("\nfull report: {}", json.display());
+            if !report.pass() {
+                std::process::exit(2);
+            }
+        }
+        ["protos", game] => {
+            let manifest = ws.game(game)?;
+            let pin = ws.game_pin(&manifest)?;
+            let obj = ws.out_dir().join("census").join(game).join(pin.short()).join("obj");
+            let clang = psxw_cc::Clang::new(ws.clang()?, obj.clone(), Vec::new(), Vec::new(), &obj.join("..").join("protos"))?;
+            let mut files = Vec::new();
+            for c in std::fs::read_dir(&obj)? {
+                let c = c?.path();
+                if !c.is_dir() {
+                    continue;
+                }
+                for f in std::fs::read_dir(c)? {
+                    let p = f?.path();
+                    if p.extension().is_some_and(|e| e == "i") {
+                        files.push(p);
+                    }
+                }
+            }
+            use rayon::prelude::*;
+            let results: Vec<_> = files.par_iter().map(|p| (p.clone(), psxw_cc::protos::cached(&clang, p))).collect();
+            let (mut n, mut byval, mut sret, mut variadic, mut failed) = (0, 0, 0, 0, 0);
+            for (p, r) in &results {
+                match r {
+                    Ok(protos) => {
+                        for pr in protos {
+                            n += 1;
+                            byval += pr.params.iter().filter(|k| matches!(k, psxw_cc::protos::Kind::ByVal { .. })).count();
+                            sret += usize::from(pr.params.first().is_some_and(|k| matches!(k, psxw_cc::protos::Kind::Sret { .. })));
+                            variadic += usize::from(pr.variadic);
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{}: {e:#}", p.display());
+                    }
+                }
+            }
+            println!("{} TUs, {n} prototypes, {byval} by-value params, {sret} struct returns, {variadic} variadic, {failed} failed", files.len());
         }
         ["disasm", game, container, addr, rest @ ..] => {
             let inputs = psxw_lift::run::load(&ws, game)?;

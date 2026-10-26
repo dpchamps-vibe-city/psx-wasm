@@ -12,3 +12,6 @@ anyhow = "1.0.104"
 psxw-census = { version = "0.0.0", path = "../psxw-census" }
 psxw-inputs = { path = "../psxw-inputs" }
 psxw-lift = { path = "../psxw-lift" }
+psxw-cc = { path = "../psxw-cc" }
+psxw-difftest = { path = "../psxw-difftest" }
+rayon = "1.12.0"
