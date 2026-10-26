@@ -31,8 +31,57 @@ struct Observation {
 }
 
 struct Side {
-    c: Conform,
+    c: Traced,
     log: Vec<Observation>,
+}
+
+/// One step of a scenario and what it returned: enough to replay it on
+/// another host and compare (`psxw web-test conform`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum Step {
+    Write { addr: u32, hex: String },
+    Read { addr: u32, len: usize, hex: String },
+    /// Arguments past the fourth go on the stack at `sp + 4 * i`.
+    Call { addr: u32, args: Vec<u32>, ret: String },
+    Vblanks { n: u32 },
+}
+
+/// The conformance handle, recording every step.
+struct Traced {
+    c: Conform,
+    trace: std::cell::RefCell<Vec<Step>>,
+}
+
+impl Traced {
+    fn write(&mut self, addr: u32, bytes: &[u8]) {
+        self.c.write(addr, bytes);
+        self.trace.borrow_mut().push(Step::Write { addr, hex: hex(bytes) });
+    }
+
+    fn read(&self, addr: u32, len: usize) -> Vec<u8> {
+        let b = self.c.read(addr, len);
+        self.trace.borrow_mut().push(Step::Read { addr, len, hex: hex(&b) });
+        b
+    }
+
+    fn call(&mut self, addr: u32, args: [u32; 4]) -> Result<u64> {
+        let v = self.c.call(addr, args)?;
+        self.trace.borrow_mut().push(Step::Call { addr, args: args.to_vec(), ret: format!("{v:#x}") });
+        Ok(v)
+    }
+
+    fn call_args(&mut self, addr: u32, args: &[u32]) -> Result<u64> {
+        let v = self.c.call_args(addr, args)?;
+        self.trace.borrow_mut().push(Step::Call { addr, args: args.to_vec(), ret: format!("{v:#x}") });
+        Ok(v)
+    }
+
+    fn run_vblanks(&mut self, n: u32) -> Result<()> {
+        self.c.run_vblanks(n)?;
+        self.trace.borrow_mut().push(Step::Vblanks { n });
+        Ok(())
+    }
 }
 
 struct Ctx<'a> {
@@ -72,7 +121,7 @@ impl Side {
     /// Ends the run, writing its report (counters, recent I/O) next to
     /// the conformance report; keeps the observations.
     fn finish(self, dir: &std::path::Path, which: &str) -> Result<Finished> {
-        let r = self.c.finish();
+        let r = self.c.c.finish();
         std::fs::write(dir.join(format!("run-{which}.json")), serde_json::to_string_pretty(&r)?)?;
         Ok(Finished { log: self.log })
     }
@@ -259,6 +308,80 @@ fn replay(frames: u32) -> Vec<u8> {
     psxw_oracle::play::replay_from_presses("conform", frames + 2, &presses).expect("valid presses")
 }
 
+type Scenario = fn(&Ctx, &mut Side, u32) -> Result<()>;
+
+fn scenario_for(lib: &str) -> Result<Scenario> {
+    Ok(match lib {
+        "libpad" => libpad,
+        "libgpu" => libgpu,
+        "libmcrd" => libmcrd,
+        "libetc" => libetc,
+        other => bail!("no conformance scenario for {other} yet ({})", LIBRARIES.join(", ")),
+    })
+}
+
+/// What a scenario starts from: the EXE's text in RAM, its stack and gp.
+fn start(inputs: &psxw_lift::run::Inputs) -> Result<(Vec<(u32, Vec<u8>)>, u32, u32)> {
+    let exe = inputs.exe;
+    let file = inputs.originals.file(&inputs.map.main).context("the main EXE image is missing")?;
+    let text = file.get(0x800..0x800 + exe.t_size as usize).context("EXE shorter than its header")?.to_vec();
+    let sp = if exe.s_addr != 0 { exe.s_addr + exe.s_size } else { 0x801F_FF00 };
+    Ok((vec![(exe.t_addr, text)], sp, exe.gp0))
+}
+
+/// A scenario run on `game.wasm` with the server renderer, recorded for
+/// replay on another host: its steps and results, then the final VRAM and
+/// the audio it produced.
+#[derive(Debug, Serialize)]
+pub struct Recorded {
+    pub library: String,
+    pub sp: u32,
+    pub gp: u32,
+    /// Where the EXE text goes (the bundle's `ram.bin`).
+    pub ram_addr: u32,
+    pub steps: Vec<Step>,
+    /// FNV-1a of VRAM after the last step.
+    pub vram: String,
+    pub audio_frames: u64,
+    pub audio_hash: String,
+    #[serde(skip)]
+    pub ram: Vec<u8>,
+    #[serde(skip)]
+    pub replay: Vec<u8>,
+}
+
+pub fn record(ws: &Workspace, game: &str, lib: &str, frames: u32) -> Result<Recorded> {
+    let scenario = scenario_for(lib)?;
+    let inputs = psxw_lift::run::load(ws, game)?;
+    let (ram, sp, gp) = start(&inputs)?;
+    let wasm = psxw_build::game::build(ws, &psxw_build::game::Options::new(game))?.0.wasm;
+    let render = crate::render::server(ws);
+    let replay = replay(frames);
+    let o = Options { wasm: wasm.into(), replay: Some(replay.clone()), deadline_secs: 20, render: Some(render.clone()), ..Default::default() };
+    let mut side = Side { c: Traced { c: Conform::new(&o, &ram, sp, gp)?, trace: Default::default() }, log: vec![] };
+    scenario(&Ctx { inputs: &inputs }, &mut side, frames)?;
+    let vram = {
+        let mut r = render.lock().map_err(|_| anyhow::anyhow!("renderer poisoned"))?;
+        let px = r.vram()?.context("the server renderer has no VRAM")?;
+        let bytes: Vec<u8> = px.iter().flat_map(|p| p.to_le_bytes()).collect();
+        format!("{:016x}", psxw_host_native::fnv(&bytes))
+    };
+    let steps = side.c.trace.take();
+    let report = side.c.c.finish();
+    Ok(Recorded {
+        library: lib.into(),
+        sp,
+        gp,
+        ram_addr: ram[0].0,
+        steps,
+        vram,
+        audio_frames: report.audio.frames,
+        audio_hash: report.audio.hash,
+        ram: ram.into_iter().next().map(|r| r.1).unwrap_or_default(),
+        replay,
+    })
+}
+
 #[derive(Serialize)]
 struct Report {
     schema_version: u32,
@@ -290,20 +413,10 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         }
     }
     let lib = lib.context("--lib is required")?;
-    let scenario: fn(&Ctx, &mut Side, u32) -> Result<()> = match lib.as_str() {
-        "libpad" => libpad,
-        "libgpu" => libgpu,
-        "libmcrd" => libmcrd,
-        "libetc" => libetc,
-        other => bail!("no conformance scenario for {other} yet (libpad, libgpu, libmcrd, libetc)"),
-    };
+    let scenario = scenario_for(&lib)?;
 
     let inputs = psxw_lift::run::load(ws, game)?;
-    let exe = inputs.exe;
-    let file = inputs.originals.file(&inputs.map.main).context("the main EXE image is missing")?;
-    let text = file.get(0x800..0x800 + exe.t_size as usize).context("EXE shorter than its header")?.to_vec();
-    let ram = vec![(exe.t_addr, text)];
-    let sp = if exe.s_addr != 0 { exe.s_addr + exe.s_size } else { 0x801F_FF00 };
+    let (ram, sp, gp) = start(&inputs)?;
 
     let adapters = psxw_build::game::build(ws, &psxw_build::game::Options::new(game))?.0.wasm;
     let opts = psxw_build::game::Options { original: vec![lib.clone()], ..psxw_build::game::Options::new(game) };
@@ -316,7 +429,7 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         let render = server.then(|| crate::render::server(ws));
         let dump_frames = dump.clone().map(|d| (d.join(if wasm.ends_with("game.wasm") { "adapter" } else { "original" }), 1));
         let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, render, dump_frames, ..Default::default() };
-        Ok(Side { c: Conform::new(&o, &ram, sp, exe.gp0)?, log: vec![] })
+        Ok(Side { c: Traced { c: Conform::new(&o, &ram, sp, gp)?, trace: Default::default() }, log: vec![] })
     };
     let mut a = side(&adapters)?;
     let mut o = side(&original)?;

@@ -7,6 +7,12 @@
 //!
 //! `psxw web-test storage` (M7): memory cards through OPFS
 //! (`web/cards.js`, `web/test/storage.html`).
+//!
+//! `psxw web-test conform <game>` (M5): every conformance scenario,
+//! recorded natively step by step, replayed on the same game.wasm in each
+//! browser (`web/test/conform.html`): every return value and read, and the
+//! final VRAM and audio, must match. Cross-host determinism without a
+//! disc.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_inputs::Workspace;
@@ -17,6 +23,7 @@ use std::process::Command;
 
 pub const USAGE: &str = "web-test gpu [--browsers chromium,firefox] [--timeout SECONDS] \
                          | web-test storage [--browsers ..] [--timeout S] \
+                         | web-test conform <game> [--browsers ..] [--timeout S] \
                          | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--browsers ..] [--timeout S]";
 const IMAGE: &str = "psxw-browsers:local";
 
@@ -260,6 +267,86 @@ fn storage(ws: &Workspace, args: &[&str]) -> Result<bool> {
     Ok(pass)
 }
 
+fn conform(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
+    let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
+    let mut timeout = 600u32;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--browsers" => browsers = it.next().context("--browsers needs a value")?.split(',').map(str::to_string).collect(),
+            "--timeout" => timeout = it.next().context("--timeout needs a value")?.parse()?,
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let mut recs = Vec::new();
+    for lib in crate::conform::LIBRARIES {
+        eprintln!("web-test: recording the {lib} scenario natively");
+        recs.push(crate::conform::record(ws, game, lib, 120)?);
+    }
+    let wasm = psxw_build::game::build(ws, &psxw_build::game::Options::new(game))?.0.wasm;
+    let id = image(ws)?;
+    let bundle = ws.out_dir().join("web").join(format!("test-conform-{game}"));
+    let _ = std::fs::remove_dir_all(&bundle);
+    std::fs::create_dir_all(&bundle)?;
+    psxw_build::web::pkg(ws, &bundle.join("pkg"))?;
+    for f in ["conform.html", "conform.js"] {
+        std::fs::copy(ws.root.join("web/test").join(f), bundle.join(f))?;
+    }
+    std::fs::copy(&wasm, bundle.join("game.wasm"))?;
+    std::fs::write(bundle.join("conform.json"), serde_json::to_string(&recs)?)?;
+    std::fs::write(bundle.join("ram.bin"), &recs[0].ram)?;
+    std::fs::write(bundle.join("replay.rpl"), &recs[0].replay)?;
+    let results = ws.out_dir().join("web").join(format!("test-conform-{game}-results"));
+    let _ = std::fs::remove_dir_all(&results);
+    std::fs::create_dir_all(&results)?;
+    let mut argv_args: Vec<String> = vec!["conform.html".into(), timeout.to_string()];
+    argv_args.extend(browsers.iter().cloned());
+    let argv = docker_run(&id, &owner_of(&results)?, &[(bundle, "/www", true), (results.clone(), "/out", false)], None, &argv_args);
+    ensure!(Command::new("docker").args(&argv).status()?.success(), "the browser container failed");
+    let mut pass = true;
+    for b in &browsers {
+        let Ok(text) = std::fs::read_to_string(results.join(format!("result-{b}.json"))) else {
+            println!("{b}: no result within {timeout} s");
+            pass = false;
+            continue;
+        };
+        let r: serde_json::Value = serde_json::from_str(&text)?;
+        if let Some(e) = r["error"].as_str() {
+            println!("{b}: FAIL ({e})");
+            pass = false;
+            continue;
+        }
+        for (rec, got) in recs.iter().zip(r["results"].as_array().into_iter().flatten()) {
+            let mut problems = Vec::new();
+            if let Some(e) = got["error"].as_str() {
+                problems.push(e.to_string());
+            }
+            if let Some(d) = got["diffs"].as_array().filter(|d| !d.is_empty()) {
+                problems.extend(d.iter().take(4).map(|x| x.to_string()));
+            }
+            if got["vram"].as_str() != Some(rec.vram.as_str()) {
+                problems.push(format!("VRAM {} vs native {}", got["vram"], rec.vram));
+            }
+            if got["audio"]["hash"].as_str() != Some(rec.audio_hash.as_str()) || got["audio"]["frames"].as_u64() != Some(rec.audio_frames) {
+                problems.push(format!("audio {} vs native {} frames {}", got["audio"], rec.audio_frames, rec.audio_hash));
+            }
+            pass &= problems.is_empty();
+            println!(
+                "{b} {}: {} ({} steps, VRAM {}, {} audio frames)",
+                rec.library,
+                if problems.is_empty() { "PASS" } else { "FAIL" },
+                rec.steps.len(),
+                rec.vram,
+                rec.audio_frames
+            );
+            for p in problems {
+                println!("  {p}");
+            }
+        }
+    }
+    Ok(pass)
+}
+
 /// A replay with nothing pressed for `frames` frames.
 fn psxw_abi_replay_none(frames: u64) -> Vec<u8> {
     psxw_oracle::play::replay_from_presses("none", frames as u32, &[]).expect("empty replay")
@@ -276,6 +363,10 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
             return game(ws, g, &args[2..]);
         }
         Some(&"storage") => return storage(ws, &args[1..]),
+        Some(&"conform") => {
+            let g = it.next().context("web-test conform needs a game")?;
+            return conform(ws, g, &args[2..]);
+        }
         _ => bail!("usage: psxw {USAGE}"),
     }
     while let Some(a) = it.next() {

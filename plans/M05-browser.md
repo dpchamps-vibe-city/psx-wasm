@@ -93,9 +93,9 @@ produces. Its devices are already gated by M4's oracles.
    workflow. *(`?dev`; `web/README.md`.)*
 5. [ ] Playwright Docker image (pinned) and the cross-host determinism
    test for the `title-to-gameplay` replay, in both browsers. *(D44:
-   `psxw-browsers` instead of Playwright. `psxw web-test gpu` passes in
-   both browsers. `psxw web-test game` is written; it waits for the disc
-   and the replay.)*
+   `psxw-browsers` instead of Playwright. `psxw web-test gpu` and
+   `web-test conform` pass in both browsers. `psxw web-test game` is
+   written; it waits for the disc and the replay.)*
 6. [x] Performance report: frame-time percentiles in the worker. Reported,
    not gating. *(`frameMs` in the Worker's `hashes` message.)*
 7. [ ] *(optional, if Q1 says yes; D46: no for now)* Tauri shell serving the same bundle
@@ -175,6 +175,20 @@ produces. Its devices are already gated by M4's oracles.
       every import, with ABI 3.
   - **Frame times:** p50, p95, p99 and max of the wall time between
     vblanks, posted with the hashes.
+
+- **2026-10-26** (this commit): `psxw web-test conform <game>` (gate
+  `web-conform`), a disc-free cross-host determinism check.
+  - **How it works:** every conformance scenario (libpad, libgpu,
+    libmcrd, libetc) runs natively on `game.wasm` with the server
+    renderer, and every step is recorded with its result. The page
+    replays the steps on the same `game.wasm` in each browser, with the
+    WebRenderer and a host like the native conformance one.
+  - **Result:** all 1,334 steps match in Chromium and Firefox, every
+    return value and read, and so do the final VRAM hashes and the
+    audio frames and hash. That covers libetc's interrupt exit through
+    wasm exceptions (D45) in both browsers.
+  - **The check works:** a tampered return value in the recording is
+    reported (`got 0x8005650c, want 0x12345`).
 
 ## Findings
 
