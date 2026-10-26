@@ -507,31 +507,40 @@ a call into guest code.
   headers. A webview shell such as Tauri/wry sets them on its custom
   protocol; a static host needs them configured.
 
-## Validation: sources of truth
+## Oracles
 
-Every check needs an oracle that we didn't write. The design keeps
-emulators and test ROMs out of the verification path by being precise
-about what the truth is for each layer.
+**The rule:** every component needs an automated oracle that we didn't
+write. A component without one isn't done. If no oracle is available yet,
+the component is *provisional*: it can ship so the game runs, but every
+report marks it unverified and nothing calls it correct.
 
-**1. Above the device interface, the truth is the original code, and we
-have all of it.** The matching decomp plus the original objects define the
-behaviour of the game and every SDK library completely. These checks need
-nothing external:
+**There are four kinds of evidence, and only the first three are oracles:**
+
+| Kind | What it is | Status |
+|---|---|---|
+| **The original code** | The matching decomp and the original objects define the behaviour of the game and every SDK library completely | True oracle |
+| **Exact by construction** | Results fully determined by the data or by checksums: VRAM fills, copies and transfers; 1:1 unblended sprites and colour-table decoding; CD sector error-detection codes; redump.org disc hashes; the decomp's recorded file hashes; memory card frame checksums; the game's own save checksums | True oracle |
+| **A device target** | Vectors run on a real PS1 (*hardware*), or on a headless emulator standing in for it | Hardware is the true oracle; an emulator is a provisional one |
+| **Models** | Our own reference code, specs transcribed by us | Not an oracle; debugging aid only |
+
+### Oracles from the original code
+
 - **Translated vs decompiled C**, for every function that has both:
   thousands of functions across the two repos. This is the idea in
   btn-decompilation `plans/static-recompilation-project`.
 - **Adapters vs the translated original library.** Each adapter runs on the
-  same inputs as the translated PsyQ function it replaces, and the device
-  commands and SDK globals each produces are compared. A test-only decoder
-  turns the original's register writes back into device commands; for the
-  GPU that's free, since packets are the vocabulary. Every SDK version gets
-  this conformance test automatically.
+  same inputs as the PsyQ function it replaces, and the device commands and
+  SDK globals each produces are compared. A test-only decoder turns the
+  original's register writes back into device commands; for the GPU that's
+  free, since packets are the vocabulary. Every SDK version gets this
+  conformance test automatically.
 - **Build-time invariants:**
   - each guest address has exactly one implementation;
   - C-defined data equals the original bytes;
   - struct layouts agree between GCC and clang (the M0 probe);
   - every cross-tier call agrees on its prototype;
-  - resident-code fingerprints match the user's disc.
+  - resident-code fingerprints match the user's disc;
+  - after boot, RAM equals the EXE image.
 - **The C tier under clang.** Matched C is tuned to GCC 2.95 and may rely
   on undefined behaviour: signed overflow, uninitialized locals used to
   steer register allocation, type punning, out-of-bounds indexing into
@@ -543,41 +552,98 @@ nothing external:
     implements;
   - translated-vs-C tests catch whatever the flags miss.
 
-**2. At the device interface, the truth is the hardware's defined
-behaviour.** For the parts that are exact arithmetic or fixed formats, the
-specification is the oracle, written down from hardware research (psx-spx).
-Spec-derived unit tests cover:
-- GTE operations, including saturation and the FLAG register;
-- ADPCM and XA decoding;
-- CD sector formats and ISO9660;
-- BIOS call semantics;
-- packet decoding and VRAM transfer semantics;
-- pad report and memory card formats.
+### The device oracle harness
 
-**3. The game only needs what it can observe.** Anything that flows back
-into guest RAM or return values must be right: VRAM readback, SPU key
-status, CD status, pad data, timer values. Pixels on screen and audio
-samples are presentation, which only the player sees.
-- **Timing has a range, not a value.** The hardware itself varied: CD seek
-  times differed from read to read. Games were written to tolerate that,
-  so "realistic" CD timing needs to fall within the hardware's envelope,
-  not match one console.
-- **Exact rasterization and SPU interpolation are presentation details.**
-  Real hardware is their only true reference. The target is "spec-faithful
-  and looks right", and upscaling deliberately departs from exactness
-  anyway. Where exactness matters, hardware captures are kept as data: test
-  images and recordings, not programs to run.
+Device behaviour has one source of truth: the hardware. The harness makes
+that an automated oracle. The device target is pluggable: headless
+emulators now, a real console when one is available.
 
-**4. The game checks itself.**
-- **Deterministic replays** (same disc, build and input log) give golden
-  frame hashes and audio hashes for regressions.
-- **RAM invariants:** no guest access into the I/O range, and the stack
-  within bounds.
-- **The game's own integrity checks**, such as save checksums, pass.
-- **RAM is comparable by symbol.** The memory layout is the original's, so
-  guest RAM can be diffed against any reference capture of the original by
-  symbol name, if one ever exists. That reference is optional, not
-  required.
+```
+ psx-wasm run of the game ──► vector recorder ──► vector archive
+                                                    │
+                ┌───────────────────────────────────┤
+                ▼                                   ▼
+   runner.exe on a device target          psx-wasm device under test
+   (emulator A, emulator B, or a PS1)     (same vector)
+                │                                   │
+                ▼                                   │
+   golden store (result + provenance) ──► compare ◄─┘
+```
+
+- **The vector recorder** captures, from real psx-wasm runs, what the game
+  asks of each device: draw commands with the VRAM state before them, GTE
+  inputs, SPU voice setups and sample counts, CD command sequences. Coverage
+  is the game's real workload.
+- **The runner** is one small PS1 program, built with PSn00bSDK, that
+  executes vectors directly on the chips:
+  - load VRAM, send draw commands, read VRAM back;
+  - load GTE registers, run an operation, store the results and FLAG;
+  - set up SPU voices, run N samples, read the SPU RAM capture buffers,
+    the reverb work area and the voice status registers;
+  - issue CD commands and record status and arrival times.
+
+  It writes results to main RAM. A target therefore only needs to load an
+  EXE, run headless, and dump main RAM. On a console, vectors and results
+  travel over the serial port instead.
+- **Targets:**
+  - *Emulators now:* Mednafen through its Beetle PSX libretro core driven
+    by a small Rust host, DuckStation's headless regression-test runner,
+    and PCSX-Redux (headless, with OpenBIOS). They are pinned in
+    `inputs.lock`, built from source, and run as external tools. They are
+    never linked into psx-wasm, so their licenses don't touch it.
+  - *Hardware later:* an original PS1 with a serial port, a USB-serial
+    adapter, and FreePSXBoot or Unirom to run the runner. Anyone with such
+    a rig can run a batch of vectors, since the harness is data in, data
+    out.
+- **Every golden result records its provenance:** "hardware" or "emulator
+  X at commit Y". Verdicts against emulator results are provisional.
+- **The consensus rule.** An emulator result counts only when two
+  independent emulators agree bit for bit. Otherwise the vector is
+  *unresolved* and needs hardware.
+- **The upgrade path.** When hardware is available, the whole vector
+  archive runs on it once. Every verdict is recomputed, and every place an
+  emulator disagrees with hardware becomes a documented finding.
+
+### Oracle status per device
+
+| Device | Oracle | Strength today |
+|---|---|---|
+| GTE | Device target (exact results and FLAG) | Provisional, strong: leading emulators match hardware test results bit for bit |
+| GPU: fills, transfers, copies, 1:1 sprites, colour tables | Exact by construction | Verified |
+| GPU: polygons, lines, blending, dithering, mask bit | Device target (VRAM readback, byte for byte at 1×) | Provisional, strong |
+| SPU: voices, envelopes, interpolation, reverb | Device target (SPU RAM capture buffers, reverb work area, status registers) | Provisional, good |
+| XA decoding | Device target (decoded CD audio lands in the SPU RAM capture buffers) | Provisional, good |
+| CD data | Exact by construction (sector codes, disc and file hashes) | Verified |
+| CD timing | Device target: measured envelope; ours must fall inside it | Hardware only. Emulators approximate drive timing |
+| Memory card | Exact by construction (format checksums; the game accepts its own saves) | Verified |
+| Pad | Exact report formats; adapter vs the original libpad | Verified |
+| BIOS | Device target running BIOS calls; a legitimately dumped BIOS image can also be translated and run as the oracle | Provisional |
+
+Byte-exact GPU verdicts at 1× require exact rasterization in the WebGL2
+backend: each primitive draws a covering quad, and the fragment shader runs
+the PS1's edge and interpolation maths in integers. Upscaling and other
+enhancements can't be checked against 1× hardware. They are layered on the
+verified 1× mode as explicitly unverified options.
+
+### Whole-game oracles
+
+- **RAM by symbol against an emulator** (provisional). The original game
+  runs in a headless emulator with the same inputs as psx-wasm. Because the
+  memory layout is the original's, RAM can be compared by symbol at
+  matching values of the game's own frame counter: "at frame 4,210,
+  `gPlayerX` differs".
+- **What the game can observe must be right.** VRAM readback, SPU key
+  status, CD status, pad data and timer values feed back into game logic.
+  Pixels on screen and audio samples are presentation. Timing has a range,
+  not a value: CD seek times varied on real hardware and games were written
+  to tolerate that, so realistic timing must fall inside the hardware's
+  measured envelope.
+- **The game checks itself.**
+  - Deterministic replays (same disc, build and input log) give golden
+    frame and audio hashes for regressions.
+  - RAM invariants: no guest access into the I/O range, and the stack
+    within bounds.
+  - The game's own integrity checks, such as save checksums, pass.
 
 ## Pinning the inputs
 
