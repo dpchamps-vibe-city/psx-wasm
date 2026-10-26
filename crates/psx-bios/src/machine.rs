@@ -224,6 +224,7 @@ impl<S: Sdk> Machine<S> {
                 self.deliver_event(0xF200_0003, 0x0002);
                 self.raise_irq(psx_devices::irq::VBLANK);
                 self.gpu_vblank();
+                self.card_vblank();
                 self.host.wait_vblank(self.vblanks);
             }
             Event::Timer(n) => {
@@ -255,6 +256,9 @@ impl<S: Sdk> Machine<S> {
     /// for the rest.
     pub fn deliver_event(&mut self, class: u32, spec: u32) {
         let calls = self.kernel.deliver(class, spec);
+        if class & 0xFF00_0000 != 0xF200_0000 {
+            self.count(&format!("event.{class:08x}/{spec:x} -> {} callbacks", calls.len()));
+        }
         self.calls.extend(calls.into_iter().map(|addr| GuestCall { addr, args: [0; 4] }));
     }
 }

@@ -80,7 +80,7 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M4](M04-pixels.md) | Pixels | **in progress** (GTE and GPU devices exact vs the oracle; the pad runs over SIO0, D40) | M2, M3 | GTE/GPU vectors byte-exact vs goldens; adapter conformance; RAM by symbol |
 | [M5](M05-browser.md) | Browser host | not started | M4 | Cross-host determinism (browser == native hashes) |
 | [M6](M06-sound.md) | Sound | not started | M2, M3 (*parallel* with M4–M5) | SPU/XA vectors vs goldens; libspu conformance |
-| [M7](M07-saves-and-play-session.md) | Saves and full play session | not started | M4, M6 | Card checksums; game accepts its saves; RAM by symbol over a day |
+| [M7](M07-saves-and-play-session.md) | Saves and full play session | **in progress** (memory cards: device, HLE BIOS, libmcrd as guest code) | M4, M6 | Card checksums; game accepts its saves; RAM by symbol over a day |
 | [M8](M08-sdk-generality.md) | SDK generality | not started | M2 (*parallel* with M4–M7) | Per-object adapter conformance; psyq-decomp C == translated |
 | [M9](M09-second-game.md) | Second game | not started | M7, M8 | All gates with only a manifest |
 | [M10](M10-hardware-oracle.md) | Hardware oracle | not started | M3; a rig | Vector archive replayed on hardware |

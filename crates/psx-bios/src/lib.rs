@@ -7,6 +7,7 @@
 //! queue of guest callbacks.
 
 pub mod bios;
+pub mod card;
 pub mod io;
 pub mod kernel;
 pub mod machine;
@@ -148,6 +149,6 @@ mod tests {
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x17, [0x8001_0100, 0x8001_0200, 0, 0])) as i32, -1);
         ret(bios::call(&mut m, 0xA0, 0x2B, [0x8001_0300, 0x5A, 3, 0]));
         assert_eq!(m.mem.bytes(0x8001_0300, 4), vec![0x5A, 0x5A, 0x5A, 0]);
-        assert!(bios::call(&mut m, 0xA0, 0x00, [0; 4]).is_err());
+        assert!(bios::call(&mut m, 0xA0, 0x05, [0; 4]).is_err(), "ioctl is not implemented");
     }
 }

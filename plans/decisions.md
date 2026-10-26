@@ -332,6 +332,18 @@ decides every word. `psxw conform btn --lib libgpu --render server`
 draws a background fill and a tile through the original library, and
 reads both back exactly.
 
+**D43. Memory cards: libmcrd runs as guest code over an HLE BIOS card
+subsystem** (M7). The BIOS's card functions are documented in full
+(psx-spx: `bu00:` file functions, raw sector I/O, events and their pacing).
+libmcrd's own state machine (asynchronous commands, `MemCardSync`, the
+new-card handshake) is what games observe. As with D40/D42, an adapter
+would reimplement it; the original runs unchanged over `psx-bios::card`.
+- **The card image is raw 128 KiB** (`.mcr`) in host storage.
+- **Slot 1 always has a card** (formatted if no image exists). Slot 2 has
+  one only if its image exists, matching the oracle's default.
+- **libcard's thin BIOS wrappers keep adapters**: their `_patch_card`
+  patches Sony BIOS code in kernel RAM.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.

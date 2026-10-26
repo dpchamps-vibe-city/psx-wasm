@@ -1,36 +1,17 @@
-//! libmcrd, libcard and libmcx (M2: no memory card, no PocketStation; the
-//! card device arrives with M7). Commands are accepted and complete with
-//! "card does not exist".
+//! libcard's BIOS wrappers and libmcx (no PocketStation: commands
+//! complete with "no card"). libmcrd runs as guest code over the BIOS card
+//! functions (`psx-bios::card`).
 
 use crate::{Adapter, M, Result, ret};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
-    ("MemCardInit", zero),
-    ("MemCardEnd", zero),
-    ("MemCardStart", zero),
-    ("MemCardStop", zero),
-    ("MemCardExist", start),
-    ("MemCardAccept", start),
-    ("MemCardOpen", not_exist),
-    ("MemCardClose", zero),
-    ("MemCardReadData", start),
-    ("MemCardWriteData", start),
-    ("MemCardReadFile", start),
-    ("MemCardWriteFile", start),
-    ("MemCardCreateFile", not_exist),
-    ("MemCardDeleteFile", not_exist),
-    ("MemCardFormat", not_exist),
-    ("MemCardUnformat", not_exist),
-    ("MemCardGetDirentry", not_exist),
-    ("MemCardSync", sync),
-    ("MemCardCallback", zero),
-    ("InitCARD", zero),
-    ("InitCARD2", zero),
-    ("StartCARD", zero),
-    ("StartCARD2", zero),
+    ("InitCARD", cards),
+    ("InitCARD2", cards),
+    ("StartCARD", cards),
+    ("StartCARD2", cards),
     ("StopCARD", zero),
     ("StopCARD2", zero),
-    ("_bu_init", zero),
+    ("_bu_init", cards),
     ("McxStartCom", zero),
     ("McxStopCom", zero),
     ("McxSync", mcx_sync),
@@ -39,11 +20,9 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("McxExecApl", mcx_start),
 ];
 
-/// MemCardSync results.
+/// McxSync results.
 const DONE: u32 = 1;
 const NOTHING: u32 = u32::MAX;
-/// McErrCardNotExist.
-const ERR_NO_CARD: u32 = 1;
 /// McxErrNoCard.
 const MCX_NO_CARD: u32 = 1;
 
@@ -51,26 +30,6 @@ const MCX_NO_CARD: u32 = 1;
 pub struct Mc {
     /// The command started and not yet synced.
     pub pending: Option<u32>,
-}
-
-fn start(m: &mut M, _a: [u32; 4]) -> Result {
-    m.sdk.mc.pending = Some(1);
-    ret(1)
-}
-
-fn not_exist(_m: &mut M, _a: [u32; 4]) -> Result {
-    ret(ERR_NO_CARD)
-}
-
-fn sync(m: &mut M, a: [u32; 4]) -> Result {
-    let Some(c) = m.sdk.mc.pending.take() else { return ret(NOTHING) };
-    if a[1] != 0 {
-        m.mem.w32(a[1], c);
-    }
-    if a[2] != 0 {
-        m.mem.w32(a[2], ERR_NO_CARD);
-    }
-    ret(DONE)
 }
 
 fn mcx_start(m: &mut M, _a: [u32; 4]) -> Result {
@@ -87,6 +46,13 @@ fn mcx_sync(m: &mut M, a: [u32; 4]) -> Result {
         m.mem.w32(a[2], MCX_NO_CARD);
     }
     ret(DONE)
+}
+
+/// The BIOS wrappers (`InitCARD` → B(4Ah), …): the cards are ready
+/// (`psx-bios::card`), whatever `_patch_card` would patch in a Sony BIOS.
+fn cards(m: &mut M, _a: [u32; 4]) -> Result {
+    m.cards_ready();
+    ret(0)
 }
 
 fn zero(_m: &mut M, _a: [u32; 4]) -> Result {

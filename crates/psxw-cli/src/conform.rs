@@ -15,10 +15,10 @@ use psxw_host_native::{Conform, Options};
 use psxw_inputs::Workspace;
 use serde::Serialize;
 
-pub const USAGE: &str = "conform <game> --lib libpad|libgpu [--frames N] [--render server]";
+pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd [--frames N] [--render server] [--dump-frames DIR]";
 
 /// Libraries with a scenario (the `psxw ci` gate runs each).
-pub const LIBRARIES: &[&str] = &["libpad", "libgpu"];
+pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd"];
 
 /// Free RAM for scenario buffers: below the stack, above any game data.
 const SCRATCH: u32 = 0x801C_0000;
@@ -134,6 +134,57 @@ fn libgpu(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
     Ok(())
 }
 
+/// Poll `MemCardSync(1, &cmd, &result)` once per vblank until a command
+/// finishes; (frames waited, cmd, result).
+fn mc_sync(ctx: &Ctx, s: &mut Side, what: &str) -> Result<()> {
+    let (cmd, res) = (SCRATCH + 0x7F0, SCRATCH + 0x7F4);
+    for f in 0..600 {
+        let v = s.c.call(ctx.addr("MemCardSync")?, [1, cmd, res, 0])? as i32;
+        if v == 1 {
+            let word = |a: u32| s.c.read(a, 4).iter().rev().fold(0u32, |w, &b| w << 8 | b as u32);
+            let (c, r) = (word(cmd), word(res));
+            s.observe(format!("{what}: sync"), vec![format!("after {f} vblanks"), format!("cmd {c}"), format!("result {r}")]);
+            return Ok(());
+        }
+        s.c.run_vblanks(1)?;
+    }
+    s.observe(format!("{what}: sync"), vec!["never finished".into()]);
+    Ok(())
+}
+
+/// libmcrd (guest code over the BIOS card functions, M7): a new card in
+/// slot 1 (Exist reports it, Accept takes it), a file created, opened,
+/// written, read back and listed; slot 2 is empty.
+fn libmcrd(ctx: &Ctx, s: &mut Side, _frames: u32) -> Result<()> {
+    let (name, data, back, dir, files) = (SCRATCH, SCRATCH + 0x100, SCRATCH + 0x200, SCRATCH + 0x300, SCRATCH + 0x6F0);
+    s.c.write(name, b"BASLUS-00000PSXW\0");
+    let pattern: Vec<u8> = (0..128u32).map(|i| (i * 7 + 3) as u8).collect();
+    s.c.write(data, &pattern);
+    s.c.write(back, &[0; 128]);
+    // A game has its interrupt callbacks set up first.
+    s.call(ctx, "ResetCallback", [0; 4])?;
+    s.call(ctx, "MemCardInit", [0; 4])?;
+    s.call(ctx, "MemCardStart", [0; 4])?;
+    s.call(ctx, "MemCardExist", [0x00, 0, 0, 0])?;
+    mc_sync(ctx, s, "Exist slot 1")?;
+    s.call(ctx, "MemCardAccept", [0x00, 0, 0, 0])?;
+    mc_sync(ctx, s, "Accept slot 1")?;
+    s.call(ctx, "MemCardExist", [0x10, 0, 0, 0])?;
+    mc_sync(ctx, s, "Exist slot 2")?;
+    s.call(ctx, "MemCardCreateFile", [0x00, name, 1, 0])?;
+    s.call(ctx, "MemCardOpen", [0x00, name, 3, 0])?;
+    s.call(ctx, "MemCardWriteData", [data, 0x100, 128, 0])?;
+    mc_sync(ctx, s, "WriteData")?;
+    s.call(ctx, "MemCardReadData", [back, 0x100, 128, 0])?;
+    mc_sync(ctx, s, "ReadData")?;
+    s.observe("read back".into(), vec![(s.c.read(back, 128) == pattern).to_string()]);
+    s.call(ctx, "MemCardClose", [0; 4])?;
+    let v = s.c.call_args(ctx.addr("MemCardGetDirentry")?, &[0x00, name, dir, files, 0, 15])? as u32;
+    s.observe("MemCardGetDirentry(0, name, dir, files, 0, 15)".into(), vec![format!("{v:#x}")]);
+    s.observe("direntry".into(), vec![hex(&s.c.read(dir, 0x28)), hex(&s.c.read(files, 4))]);
+    Ok(())
+}
+
 /// The scenario's pad input: nothing, then single buttons, chords and a
 /// long hold (port 1); port 2 idle.
 fn replay(frames: u32) -> Vec<u8> {
@@ -175,7 +226,8 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let scenario: fn(&Ctx, &mut Side, u32) -> Result<()> = match lib.as_str() {
         "libpad" => libpad,
         "libgpu" => libgpu,
-        other => bail!("no conformance scenario for {other} yet (libpad, libgpu)"),
+        "libmcrd" => libmcrd,
+        other => bail!("no conformance scenario for {other} yet (libpad, libgpu, libmcrd)"),
     };
 
     let inputs = psxw_lift::run::load(ws, game)?;

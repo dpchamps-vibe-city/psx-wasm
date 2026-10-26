@@ -13,6 +13,7 @@ pub mod dma;
 pub mod gpu;
 pub mod irq;
 pub mod mem;
+pub mod memcard;
 pub mod sio;
 pub mod timers;
 

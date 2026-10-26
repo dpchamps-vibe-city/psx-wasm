@@ -38,12 +38,14 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x3F) => "printf",
         (0xA0, 0x44) => "FlushCache",
         (0xA0, 0x49) => "GPU_cw",
-        (0xA0, 0x70) => "_bu_init",
+        (0xA0, 0x55) | (0xA0, 0x70) => "_bu_init",
         (0xA0, 0x72) => "_96_remove",
         (0xA0, 0x9F) => "SetMemSize",
         (0xA0, 0xA1) => "SystemError",
         (0xA0, 0xAB) => "_card_info",
         (0xA0, 0xAC) => "_card_load",
+        (0xA0, 0xAD) => "_card_auto",
+        (0xA0, 0xAF) => "card_write_test",
         (0xB0, 0x07) => "DeliverEvent",
         (0xB0, 0x08) => "OpenEvent",
         (0xB0, 0x09) => "CloseEvent",
@@ -64,9 +66,12 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x35) => "write",
         (0xB0, 0x36) => "close",
         (0xB0, 0x3F) => "puts",
+        (0xB0, 0x41) => "format",
         (0xB0, 0x42) => "firstfile",
         (0xB0, 0x43) => "nextfile",
         (0xB0, 0x44) => "rename",
+        (0xB0, 0x45) => "erase",
+        (0xB0, 0x46) => "undelete",
         (0xB0, 0x4A) => "InitCard",
         (0xB0, 0x4B) => "StartCard",
         (0xB0, 0x4C) => "StopCard",
@@ -76,10 +81,16 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x51) => "Krom2RawAdd",
         (0xB0, 0x56) => "GetC0Table",
         (0xB0, 0x57) => "GetB0Table",
+        (0xB0, 0x54) => "_get_errno",
+        (0xB0, 0x55) => "_get_error",
         (0xB0, 0x5B) => "ChangeClearPad",
+        (0xB0, 0x5C) => "_card_status",
+        (0xB0, 0x5D) => "_card_wait",
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
         (0xC0, 0x0A) => "ChangeClearRCnt",
+        (0xC0, 0x1A) => "set_card_find_mode",
+        (0xC0, 0x1D) => "get_card_find_mode",
         _ => "?",
     }
 }
@@ -87,6 +98,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
 /// Whether [`call`] implements `(table, func)` (every implemented call is
 /// named, and only those).
 pub fn implemented(table: u32, func: u32) -> bool {
+    let (table, func) = if table == 0xA0 && func <= 4 { (0xB0, 0x32 + func) } else { (table, func) };
     name(table, func) != "?"
 }
 
@@ -97,6 +109,8 @@ fn len(n: u32) -> u32 {
 /// A0h/B0h/C0h function `func` with o32 arguments `a` (more on the guest
 /// stack). Errors name a function the BIOS doesn't implement.
 pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> Result<Flow<S>, String> {
+    // A(00h)..A(04h) are the B(32h)..B(36h) file functions.
+    let (table, func) = if table == 0xA0 && func <= 4 { (0xB0, 0x32 + func) } else { (table, func) };
     let label = format!("bios.{:02X}h:{:02X}h {}", table, func, name(table, func));
     m.count(&label);
     let r = |v: u32| Ok(Flow::ret(v));
@@ -212,7 +226,11 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.host.log(2, text.trim_end_matches('\n'));
             r(text.len() as u32)
         }
-        (0xA0, 0x44) | (0xA0, 0x70) | (0xA0, 0x72) | (0xA0, 0x9F) => r(0),
+        (0xA0, 0x44) | (0xA0, 0x72) | (0xA0, 0x9F) => r(0),
+        (0xA0, 0x55) | (0xA0, 0x70) => {
+            m.cards_ready();
+            r(0)
+        }
         (0xA0, 0x49) => {
             // GPU_cw: a GP0 word (after gpu_sync, which returns 0 here:
             // the GPU front end takes words at once).
@@ -220,12 +238,13 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xA0, 0xA1) => Err(format!("{label}: SystemError({:#x}, {:#x})", a[0], a[1])),
-        (0xA0, 0xAB) | (0xA0, 0xAC) => {
-            // Memory card presence: no card (M7). The kernel signals the
-            // result as a card event.
-            m.deliver_event(0xF400_0001, 0x0100);
-            r(1)
+        (0xA0, 0xAB) => r(m.card_info(a[0])),
+        (0xA0, 0xAC) => r(m.card_load(a[0])),
+        (0xA0, 0xAD) => {
+            m.kernel.cards.auto_format = a[0] != 0;
+            r(0)
         }
+        (0xA0, 0xAF) => r(m.card_write_test(a[0])),
 
         // --- B0h: events, pads, files, cards -----------------------------
         (0xB0, 0x07) => {
@@ -305,14 +324,23 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xB0, 0x32) => {
             let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
+            if crate::card::parse_path(&path).is_some() {
+                let fd = (0..16).find(|f| !m.kernel.files.contains_key(f) && !m.kernel.cards.files.contains_key(f));
+                return match fd {
+                    Some(fd) => r(m.card_open(&path, a[1], fd)),
+                    None => {
+                        m.kernel.cards.errno = crate::card::E_NO_FDS;
+                        r(u32::MAX)
+                    }
+                };
+            }
             if !path.to_ascii_lowercase().starts_with("cdrom:") {
-                // Memory card files (bu00:, bu10:) arrive with M7.
                 return r(u32::MAX);
             }
             let mut disc = HostDisc(&mut *m.host);
             match cd::find(&mut disc, &path) {
                 Some(e) if !e.dir => {
-                    let fd = (0..16).find(|f| !m.kernel.files.contains_key(f)).unwrap_or(16);
+                    let fd = (0..16).find(|f| !m.kernel.files.contains_key(f) && !m.kernel.cards.files.contains_key(f)).unwrap_or(16);
                     m.kernel.files.insert(fd, File { lba: e.lba, size: e.size, pos: 0 });
                     r(fd)
                 }
@@ -320,6 +348,14 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             }
         }
         (0xB0, 0x33) => {
+            if let Some(f) = m.kernel.cards.files.get_mut(&a[0]) {
+                f.pos = match a[2] {
+                    0 => a[1],
+                    1 => f.pos.wrapping_add(a[1]),
+                    _ => return r(u32::MAX),
+                };
+                return r(f.pos);
+            }
             let Some(f) = m.kernel.files.get_mut(&a[0]) else { return r(u32::MAX) };
             f.pos = match a[2] {
                 0 => a[1],
@@ -329,6 +365,9 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(f.pos)
         }
         (0xB0, 0x34) => {
+            if m.kernel.cards.files.contains_key(&a[0]) {
+                return r(m.card_io(a[0], a[1], a[2], false));
+            }
             let Some(f) = m.kernel.files.get(&a[0]).copied() else { return r(u32::MAX) };
             let n = a[2].min(f.size.saturating_sub(f.pos));
             let disc = HostDisc(&mut *m.host);
@@ -349,20 +388,60 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.files.get_mut(&a[0]).unwrap().pos += n;
             r(n)
         }
-        (0xB0, 0x35) => r(u32::MAX),
+        (0xB0, 0x35) => {
+            if m.kernel.cards.files.contains_key(&a[0]) {
+                return r(m.card_io(a[0], a[1], a[2], true));
+            }
+            r(u32::MAX)
+        }
         (0xB0, 0x36) => {
-            m.kernel.files.remove(&a[0]);
-            r(a[0])
+            let known = m.kernel.files.remove(&a[0]).is_some() | m.kernel.cards.files.remove(&a[0]).is_some();
+            r(if known { a[0] } else { u32::MAX })
+        }
+        (0xB0, 0x41) => {
+            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
+            r(m.card_format(&path))
         }
         (0xB0, 0x3F) => {
             let s = String::from_utf8_lossy(&mem.cstr(a[0], 1024)).into_owned();
             m.host.log(2, &s);
             r(0)
         }
-        (0xB0, 0x42) | (0xB0, 0x43) => r(0),
-        (0xB0, 0x44) => r(0),
-        (0xB0, 0x4A) | (0xB0, 0x4B) | (0xB0, 0x4C) | (0xB0, 0x50) => r(1),
-        (0xB0, 0x4E) | (0xB0, 0x4F) => r(0),
+        (0xB0, 0x42) => {
+            let pat = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
+            if crate::card::parse_path(&pat).is_some() {
+                return r(m.card_find(Some(&pat), a[1]));
+            }
+            r(0)
+        }
+        (0xB0, 0x43) => r(m.card_find(None, a[0])),
+        (0xB0, 0x44) => {
+            let from = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
+            let to = String::from_utf8_lossy(&mem.cstr(a[1], 128)).into_owned();
+            r(m.card_rename(&from, &to))
+        }
+        (0xB0, 0x45) | (0xB0, 0x46) => {
+            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
+            r(m.card_erase(&path, func == 0x46))
+        }
+        (0xB0, 0x4A) | (0xB0, 0x4B) | (0xB0, 0x4C) => {
+            m.cards_ready();
+            r(1)
+        }
+        (0xB0, 0x4E) => r(m.card_write(a[0], a[1], a[2])),
+        (0xB0, 0x4F) => r(m.card_read(a[0], a[1], a[2])),
+        (0xB0, 0x50) => {
+            m.card_new(0x00);
+            m.card_new(0x10);
+            r(1)
+        }
+        (0xB0, 0x54) => r(m.kernel.cards.errno),
+        (0xB0, 0x55) => r(if m.kernel.cards.files.contains_key(&a[0]) { m.kernel.cards.errno } else { u32::MAX }),
+        (0xB0, 0x5C) => {
+            m.cards_ready();
+            r(m.kernel.cards.status[(a[0] & 1) as usize])
+        }
+        (0xB0, 0x5D) => r(m.card_wait(a[0])),
         // No BIOS ROM, so no ROM kanji font.
         (0xB0, 0x51) => r(u32::MAX),
         // Kernel tables: addresses in kernel RAM, as the Sony BIOS has them.
@@ -384,6 +463,11 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             }
             r(0)
         }
+        (0xC0, 0x1A) => {
+            m.kernel.cards.find_mode = a[0];
+            r(0)
+        }
+        (0xC0, 0x1D) => r(m.kernel.cards.find_mode),
         (0xC0, 0x0A) => {
             let i = (a[0] as usize).min(3);
             let old = m.kernel.clear_rcnt[i];

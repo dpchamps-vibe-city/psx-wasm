@@ -504,6 +504,9 @@ pub struct Conform {
     instance: wasmtime::Instance,
     memory: Memory,
     deadline: u64,
+    /// The guest stack pointer between calls (o32 stack arguments go at
+    /// `sp + 16`).
+    sp: u32,
     /// Ticks the engine's epoch once a second while the run lives.
     ticker: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -543,13 +546,23 @@ impl Conform {
             });
             stop
         });
-        Ok(Conform { store, instance, memory, deadline: opts.deadline_secs, ticker })
+        Ok(Conform { store, instance, memory, deadline: opts.deadline_secs, sp, ticker })
     }
 
     fn arm(&mut self) {
         if self.deadline > 0 {
             self.store.set_epoch_deadline(self.deadline);
         }
+    }
+
+    /// Calls the guest function at `addr` with any number of o32
+    /// arguments (from the fifth on, on the stack).
+    pub fn call_args(&mut self, addr: u32, args: &[u32]) -> Result<u64> {
+        for (i, a) in args.iter().enumerate().skip(4) {
+            self.write(self.sp + 4 * i as u32, &a.to_le_bytes());
+        }
+        let r = |i: usize| args.get(i).copied().unwrap_or(0);
+        self.call(addr, [r(0), r(1), r(2), r(3)])
     }
 
     /// Calls the guest function at `addr`; a trap is an error naming it.

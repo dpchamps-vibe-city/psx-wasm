@@ -428,6 +428,13 @@ pub extern "C" fn psxw_report() {
         let m = unsafe { &*rt.m.as_ptr() };
         let counts: Vec<String> = m.counts.iter().map(|(k, v)| format!("{k:?}:{v}")).collect();
         let errors: Vec<String> = m.sdk.cd.edc_errors.iter().map(|e| format!("{e:?}")).collect();
+        let events: Vec<String> = m
+            .kernel
+            .events
+            .iter()
+            .filter(|e| e.status != 0)
+            .map(|e| format!("\"{:08x}/{:x} mode {:x} status {:x} func {:08x}\"", e.class, e.spec, e.mode, e.status, e.func))
+            .collect();
         let io: Vec<String> = m
             .io
             .iter()
@@ -435,13 +442,17 @@ pub extern "C" fn psxw_report() {
             .map(|(t, a, n, v, w)| format!("\"{t} {} {a:08x}/{n} {v:#x}\"", if *w { "W" } else { "R" }))
             .collect();
         format!(
-            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}]}}",
+            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{}}}",
             m.vblanks,
             m.clock.now,
             m.sdk.cd.sectors,
             errors.join(","),
             counts.join(","),
-            io.join(",")
+            io.join(","),
+            events.join(","),
+            m.crit,
+            m.in_irq,
+            m.calls.len()
         )
     });
     report(json);
