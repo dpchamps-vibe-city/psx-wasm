@@ -16,5 +16,6 @@ pub mod mem;
 pub mod memcard;
 pub mod sio;
 pub mod timers;
+pub mod xa;
 
 pub use mem::{Mem, VecMem};

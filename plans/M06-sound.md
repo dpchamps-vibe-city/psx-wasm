@@ -131,7 +131,8 @@ unverified.
 6. [ ] SPU recording hook; record btn vectors over `title-to-gameplay`;
    capture; zero failures.
 7. [ ] XA: `ReadS`, filters, decoding, resampling, CD input, real-rate
-   delivery.
+   delivery. *(All but the CD input, which waits for the SPU device:
+   `psx_devices::xa`, the libcd adapters' stream.)*
 8. [ ] Test-disc tooling in `psxw-psx-sdk` (mkpsxiso, psxavenc); a
    generator for XA test discs; the runner's `CD_XA` kind; goldens; zero
    failures.
@@ -169,5 +170,24 @@ unverified.
   correctly, or is documented as incompatible with streamed audio.
 
 ## Progress log
+
+- **2026-10-26** (this commit): task 7 up to the SPU. The SPU device
+  itself is being written alongside (tasks 1-3).
+  - **`psx_devices::xa`:**
+    - XA-ADPCM decoding as psx-spx gives it: 4- and 8-bit, mono and
+      stereo, shift 13-15 acting as 9, and per-channel history across
+      sectors;
+    - the 25-point zigzag resampler to 44.1 kHz, with 18.9 kHz samples
+      fed twice. The resampler is provisional: psx-spx calls it "nearly
+      correct", and its table's DC gain is about 0.91.
+  - **libcd adapters:**
+    - With XA-ADPCM mode set, a Form2 audio sector goes to the decoder
+      and isn't delivered as data. With the filter bit set, only sectors
+      matching `Setfilter`'s file and channel play.
+    - `Mute`/`Demute` gate the output.
+    - The samples go to `Machine::cd_audio`, the seam the SPU's CD input
+      will take them from.
+    - XA streams run at the disc's real rate even under instant timing,
+      which settles the plan's open risk on rate coupling.
 
 ## Findings

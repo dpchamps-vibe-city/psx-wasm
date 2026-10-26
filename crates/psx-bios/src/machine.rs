@@ -127,6 +127,11 @@ pub struct Machine<S> {
     pub clock: Clock<Event>,
     pub timers: [Timer; 3],
     pub drive: Drive,
+    /// The CD's audio output at 44.1 kHz (left, right): decoded XA, for
+    /// the SPU's CD input to take. Bounded: the oldest samples drop.
+    pub cd_audio: VecDeque<[i16; 2]>,
+    /// `Mute`/`Demute`: the drive's audio output is silenced.
+    pub cd_mute: bool,
     /// Vblanks so far.
     pub vblanks: u64,
     pub kernel: Kernel,
@@ -163,6 +168,8 @@ impl<S: Sdk> Machine<S> {
             clock: Clock::new(video),
             timers: [Timer::default(); 3],
             drive,
+            cd_audio: VecDeque::new(),
+            cd_mute: false,
             vblanks: 0,
             kernel: Kernel::default(),
             calls: VecDeque::new(),
