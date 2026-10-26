@@ -9,7 +9,9 @@
 
 pub mod cd;
 pub mod clock;
+pub mod irq;
 pub mod mem;
+pub mod sio;
 pub mod timers;
 
 pub use mem::{Mem, VecMem};

@@ -109,6 +109,11 @@ pub struct Machine<S> {
     pub kernel: Kernel,
     /// Callbacks to run, in order.
     pub calls: VecDeque<GuestCall>,
+    /// Interrupt handler chains to run first: a verifier, and the handler
+    /// to call with its result when that is nonzero ([`crate::io`]).
+    pub irq_calls: VecDeque<(GuestCall, Option<u32>)>,
+    /// Register-level devices for original SDK code; `None` traps on I/O.
+    pub io: Option<crate::io::Io>,
     /// Interrupts are disabled (critical section): events wait.
     pub crit: bool,
     /// A callback (interrupt handler) is running: no nested delivery.
@@ -136,6 +141,8 @@ impl<S: Sdk> Machine<S> {
             vblanks: 0,
             kernel: Kernel::default(),
             calls: VecDeque::new(),
+            irq_calls: VecDeque::new(),
+            io: None,
             crit: false,
             in_irq: false,
             sdk,
@@ -205,6 +212,7 @@ impl<S: Sdk> Machine<S> {
                 self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
                 // The kernel's vblank handler delivers RCntCNT3 events.
                 self.deliver_event(0xF200_0003, 0x0002);
+                self.raise_irq(psx_devices::irq::VBLANK);
                 self.host.wait_vblank(self.vblanks);
             }
             Event::Timer(n) => {
@@ -217,6 +225,7 @@ impl<S: Sdk> Machine<S> {
                 if self.kernel.timer_irq_enabled(n) {
                     self.deliver_event(0xF200_0000 | n as u32, 0x0002);
                 }
+                self.raise_irq(psx_devices::irq::TIMER0 + n as u32);
             }
             Event::Sdk(kind, data) => S::on_event(self, kind, data),
         }

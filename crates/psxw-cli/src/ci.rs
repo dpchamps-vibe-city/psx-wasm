@@ -79,7 +79,7 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         Ok((out.status.success(), format!("cargo test --workspace: {passed} passed")))
     })());
     let built = psxw_build::game::build(ws, &psxw_build::game::Options::new(game));
-    gate(&mut gates, "build", "M2", built.as_ref().map(|(_, wasm)| (true, wasm.display().to_string())).map_err(|e| anyhow::anyhow!("{e:#}")));
+    gate(&mut gates, "build", "M2", built.as_ref().map(|(r, _)| (true, r.wasm.clone())).map_err(|e| anyhow::anyhow!("{e:#}")));
     gate(&mut gates, "boot", "M2", (|| {
         built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;
         let (_, checks) = crate::run::evaluate(ws, game, &["--frames", "1200", "--check", "boot", "--check", "determinism"])?;
@@ -87,8 +87,8 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
     })());
     gate(&mut gates, "ubsan", "M2", (|| {
         let opts = psxw_build::game::Options { ubsan: true, ..psxw_build::game::Options::new(game) };
-        let (_, wasm) = psxw_build::game::build(ws, &opts)?;
-        let wasm = wasm.display().to_string();
+        let (report, _) = psxw_build::game::build(ws, &opts)?;
+        let wasm = report.wasm;
         let (_, checks) = crate::run::evaluate(ws, game, &["--frames", "1200", "--wasm", &wasm, "--check", "no-trap"])?;
         Ok(checks_detail(&checks))
     })());

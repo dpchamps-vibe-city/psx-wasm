@@ -83,7 +83,8 @@ pub struct Dump {
 }
 
 struct State {
-    disc: Disc,
+    /// None in conformance runs.
+    disc: Option<Disc>,
     opts: Options,
     frame: u64,
     logs: Vec<String>,
@@ -134,6 +135,64 @@ fn disc_exe_text(disc: &mut Disc, exe: &str) -> Option<Vec<u8>> {
 
 pub fn run(opts: Options) -> Result<RunReport> {
     let disc = Disc::open(&opts.disc)?;
+    let (mut store, instance) = instantiate(&opts, Some(disc))?;
+    let ptr = boot_options(&mut store, &instance, &opts)?;
+    let boot = instance.get_typed_func::<u32, ()>(&mut store, psxw_abi::exports::BOOT)?;
+    let stop = match boot.call(&mut store, ptr) {
+        Ok(()) => Stop::Exited,
+        Err(e) => stop_of(e),
+    };
+    Ok(finish(store, &instance, stop))
+}
+
+fn stop_of(e: wasmtime::Error) -> Stop {
+    let msg = format!("{e:?}");
+    if msg.contains(FRAME_LIMIT) {
+        Stop::FrameLimit
+    } else {
+        let root = e.root_cause().to_string();
+        let trace = msg.lines().filter(|l| l.contains(" - ")).take(24).collect::<Vec<_>>().join("\n");
+        Stop::Trap(format!("{root}\n{trace}"))
+    }
+}
+
+/// Writes `opts.boot` into runtime memory; returns the pointer.
+fn boot_options(store: &mut Store<State>, instance: &wasmtime::Instance, opts: &Options) -> Result<u32> {
+    let alloc = instance.get_typed_func::<u32, u32>(&mut *store, psxw_abi::exports::ALLOC)?;
+    let ptr = alloc.call(&mut *store, std::mem::size_of::<BootOptions>() as u32)?;
+    let b = opts.boot;
+    let words = [b.cd_timing, b.video, b.safepoint_budget, b.safepoint_quantum, b.debug, b.trace];
+    let memory = instance.get_memory(&mut *store, "memory").context("no memory")?;
+    for (i, w) in words.iter().enumerate() {
+        memory.data_mut(&mut *store)[ptr as usize + 4 * i..ptr as usize + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    Ok(ptr)
+}
+
+/// The run's report, after the entry point returned or trapped.
+fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) -> RunReport {
+    // The run's counters (readable after a trap: the runtime reads its
+    // state directly).
+    if let Ok(report) = instance.get_typed_func::<(), ()>(&mut store, "psxw_report") {
+        let _ = report.call(&mut store, ());
+    }
+    let s = store.into_data();
+    let report = s.events.iter().rev().find(|e| e["event"] == "report").cloned();
+    RunReport {
+        stop,
+        frames: s.frame,
+        ram_hashes: s.hashes,
+        trace: s.trace,
+        boot: s.boot,
+        boot_text_matches: s.boot_ok,
+        report,
+        events: s.events.into_iter().filter(|e| e["event"] != "report").collect(),
+        logs: s.logs,
+        dumps: s.dumps,
+    }
+}
+
+fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasmtime::Instance)> {
     let config = Config::new();
     let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, &opts.wasm).map_err(|e| anyhow::anyhow!("loading {}: {e}", opts.wasm.display()))?;
@@ -249,7 +308,7 @@ pub fn run(opts: Options) -> Result<RunReport> {
         Ok(())
     })?;
     linker.func_wrap(h, host::DISC_INFO, |mut c: Caller<'_, State>, out: u32| -> i32 {
-        let info = c.data().disc.info();
+        let Some(info) = c.data().disc.as_ref().map(Disc::info) else { return 0 };
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts((&info as *const psxw_abi::DiscInfo).cast(), std::mem::size_of::<psxw_abi::DiscInfo>())
         };
@@ -262,7 +321,7 @@ pub fn run(opts: Options) -> Result<RunReport> {
         let mut out = Vec::with_capacity(count as usize * 2352);
         for i in 0..count {
             let mut raw = [0u8; 2352];
-            if !c.data_mut().disc.read_raw(lba + i, &mut raw) {
+            if !c.data_mut().disc.as_mut().is_some_and(|d| d.read_raw(lba + i, &mut raw)) {
                 return -1;
             }
             if mode == 0 {
@@ -311,7 +370,7 @@ pub fn run(opts: Options) -> Result<RunReport> {
             // RAM over [t_addr, t_addr + t_size) must equal the disc's EXE.
             let exe = v["exe"].as_str().unwrap_or_default().to_string();
             let (t_addr, t_size) = (v["t_addr"].as_u64().unwrap_or(0) as u32, v["t_size"].as_u64().unwrap_or(0) as usize);
-            let want = disc_exe_text(&mut c.data_mut().disc, &exe);
+            let want = c.data_mut().disc.as_mut().and_then(|d| disc_exe_text(d, &exe));
             let m = mem(&mut c);
             let at = (t_addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
             let ok = want.is_some_and(|w| m.data(&c)[at..at + t_size] == w[..]);
@@ -346,45 +405,66 @@ pub fn run(opts: Options) -> Result<RunReport> {
     if version != psxw_abi::ABI_VERSION {
         bail!("game.wasm ABI {version}, host ABI {}", psxw_abi::ABI_VERSION);
     }
-    let alloc = instance.get_typed_func::<u32, u32>(&mut store, psxw_abi::exports::ALLOC)?;
-    let ptr = alloc.call(&mut store, std::mem::size_of::<BootOptions>() as u32)?;
-    let b = opts.boot;
-    let words = [b.cd_timing, b.video, b.safepoint_budget, b.safepoint_quantum, b.debug, b.trace];
-    let memory = instance.get_memory(&mut store, "memory").context("no memory")?;
-    for (i, w) in words.iter().enumerate() {
-        memory.data_mut(&mut store)[ptr as usize + 4 * i..ptr as usize + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    let boot = instance.get_typed_func::<u32, ()>(&mut store, psxw_abi::exports::BOOT)?;
-    let stop = match boot.call(&mut store, ptr) {
-        Ok(()) => Stop::Exited,
-        Err(e) => {
-            let msg = format!("{e:?}");
-            if msg.contains(FRAME_LIMIT) {
-                Stop::FrameLimit
-            } else {
-                let root = e.root_cause().to_string();
-                let trace = msg.lines().filter(|l| l.contains(" - ")).take(24).collect::<Vec<_>>().join("\n");
-                Stop::Trap(format!("{root}\n{trace}"))
-            }
+    Ok((store, instance))
+}
+
+/// A game module set up without a disc, driven call by call (adapter
+/// conformance): the host writes guest RAM, calls guest functions, and
+/// lets vblanks pass. Pad input comes from `opts.replay`, by vblank.
+pub struct Conform {
+    store: Store<State>,
+    instance: wasmtime::Instance,
+    memory: Memory,
+}
+
+impl Conform {
+    /// `ram`: (guest address, bytes) to write before the runtime starts;
+    /// `io`: attach register-level devices (original SDK code).
+    pub fn new(opts: &Options, ram: &[(u32, Vec<u8>)], sp: u32, gp: u32, io: bool) -> Result<Self> {
+        let mut opts = opts.clone();
+        if opts.frames == 0 {
+            opts.frames = u64::MAX;
         }
-    };
-    // The run's counters (readable after a trap: the runtime reads its
-    // state directly).
-    if let Ok(report) = instance.get_typed_func::<(), ()>(&mut store, "psxw_report") {
-        let _ = report.call(&mut store, ());
+        let (mut store, instance) = instantiate(&opts, None)?;
+        let memory = instance.get_memory(&mut store, "memory").context("no memory")?;
+        for (addr, bytes) in ram {
+            let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
+            memory.data_mut(&mut store)[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let ptr = boot_options(&mut store, &instance, &opts)?;
+        let init = instance.get_typed_func::<(u32, u32, u32, u32), ()>(&mut store, psxw_abi::exports::CONFORM_INIT)?;
+        init.call(&mut store, (ptr, sp, gp, io as u32))?;
+        Ok(Conform { store, instance, memory })
     }
-    let s = store.into_data();
-    let report = s.events.iter().rev().find(|e| e["event"] == "report").cloned();
-    Ok(RunReport {
-        stop,
-        frames: s.frame,
-        ram_hashes: s.hashes,
-        trace: s.trace,
-        boot: s.boot,
-        boot_text_matches: s.boot_ok,
-        report,
-        events: s.events.into_iter().filter(|e| e["event"] != "report").collect(),
-        logs: s.logs,
-        dumps: s.dumps,
-    })
+
+    /// Calls the guest function at `addr`; a trap is an error naming it.
+    pub fn call(&mut self, addr: u32, args: [u32; 4]) -> Result<u64> {
+        let f = self.instance.get_typed_func::<(u32, u32, u32, u32, u32), u64>(&mut self.store, psxw_abi::exports::CALL)?;
+        f.call(&mut self.store, (addr, args[0], args[1], args[2], args[3])).map_err(|e| anyhow::anyhow!("call {addr:#010x}: {:?}", stop_of(e)))
+    }
+
+    pub fn run_vblanks(&mut self, n: u32) -> Result<()> {
+        let f = self.instance.get_typed_func::<u32, ()>(&mut self.store, psxw_abi::exports::RUN_VBLANKS)?;
+        f.call(&mut self.store, n).map_err(|e| anyhow::anyhow!("run_vblanks: {:?}", stop_of(e)))
+    }
+
+    pub fn read(&self, addr: u32, len: usize) -> Vec<u8> {
+        let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
+        self.memory.data(&self.store)[at..at + len].to_vec()
+    }
+
+    pub fn write(&mut self, addr: u32, bytes: &[u8]) {
+        let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
+        self.memory.data_mut(&mut self.store)[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Vblanks so far.
+    pub fn frame(&self) -> u64 {
+        self.store.data().frame
+    }
+
+    /// Ends the run: its report (counters, logs).
+    pub fn finish(self) -> RunReport {
+        finish(self.store, &self.instance, Stop::Exited)
+    }
 }

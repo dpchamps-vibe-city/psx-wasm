@@ -7,6 +7,7 @@
 //! queue of guest callbacks.
 
 pub mod bios;
+pub mod io;
 pub mod kernel;
 pub mod machine;
 

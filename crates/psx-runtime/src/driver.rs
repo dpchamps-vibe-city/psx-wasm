@@ -17,16 +17,21 @@ pub trait Invoke {
 /// interrupts are disabled in a handler, as on hardware).
 pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
     loop {
-        let call = {
+        let (call, then) = {
             let mut m = rt.borrow_mut();
             if m.in_irq || m.crit {
                 return;
             }
-            let Some(c) = m.calls.pop_front() else { return };
+            // Interrupt handler chains first (the exception handler runs
+            // them before anything the kernel queues).
+            let Some(c) = m.irq_calls.pop_front().or_else(|| m.calls.pop_front().map(|c| (c, None))) else { return };
             m.in_irq = true;
             c
         };
-        inv.invoke(call);
+        let v = inv.invoke(call) as u32;
+        if let (Some(handler), true) = (then, v != 0) {
+            inv.invoke(GuestCall { addr: handler, args: [v, 0, 0, 0] });
+        }
         rt.borrow_mut().in_irq = false;
     }
 }

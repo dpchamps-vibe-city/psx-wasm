@@ -12,7 +12,7 @@
 //! psxw link-test <game> --function F    M1: link one pair, validate, run once
 //! psxw ci <game>                        every gate of every milestone in place
 //! psxw runtime build                    runtime.wasm (game-agnostic)
-//! psxw build <game> [--debug-io] [--ubsan]
+//! psxw build <game> [--debug-io] [--ubsan] [--original libpad,…]
 //!                                       M2: out/<game>/game.wasm
 //! psxw report tiers <game>              each function's tier, by library
 //! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose]
@@ -25,6 +25,7 @@ use psxw_inputs::{Workspace, snapshot, toolchain};
 
 mod ci;
 mod run;
+mod conform;
 mod oracle;
 mod wholegame;
 
@@ -161,6 +162,11 @@ fn run() -> Result<()> {
             }
         }
         ["oracle", rest @ ..] => oracle::run(&ws, rest)?,
+        ["conform", game, rest @ ..] => {
+            if !conform::run(&ws, game, rest)? {
+                std::process::exit(2);
+            }
+        }
         ["run", game, rest @ ..] => {
             if !run::run(&ws, game, rest)? {
                 std::process::exit(2);
@@ -187,10 +193,15 @@ fn run() -> Result<()> {
         }
         ["build", game, rest @ ..] => {
             let mut opts = psxw_build::game::Options::new(game);
-            for a in rest.iter() {
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
                 match *a {
                     "--debug-io" => opts.debug_io = true,
                     "--ubsan" => opts.ubsan = true,
+                    "--original" => match it.next() {
+                        Some(l) => opts.original.extend(l.split(',').map(str::to_string)),
+                        None => bail!("--original needs a library list"),
+                    },
                     other => bail!("unknown build option {other}"),
                 }
             }
@@ -221,7 +232,8 @@ fn run() -> Result<()> {
         _ => bail!(
             "usage: psxw toolchain fetch | inputs sync | census <game> [--only S] [--only-header S] [--no-probe] \
              | lift <game> [--function F | --container C | --all] | difftest <game> [--only S] [--seeds N] \
-             | link-test <game> --function F | ci <game> | {}",
+             | link-test <game> --function F | ci <game> | {} | {}",
+            conform::USAGE,
             oracle::USAGE
         ),
     }

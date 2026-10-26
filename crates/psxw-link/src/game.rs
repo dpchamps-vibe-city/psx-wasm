@@ -77,7 +77,7 @@ fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::GTE_MTC2, vec![i, i], vec![]),
         (psx::GTE_CTC2, vec![i, i], vec![]),
         (psx::GTE_EXEC, vec![i], vec![]),
-        (psx::IO_ACCESS, vec![i], vec![]),
+        (psx::IO_ACCESS, vec![i, i], vec![]),
         ("adapter", vec![i; 5], vec![V::I64]),
         (psx::PROBE, vec![i], vec![]),
     ]

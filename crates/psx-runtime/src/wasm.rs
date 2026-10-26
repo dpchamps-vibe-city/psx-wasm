@@ -176,9 +176,7 @@ pub extern "C" fn psxw_ram_hash() -> u64 {
     boot::fnv(&ram)
 }
 
-/// Boot the disc and run until the host stops the run.
-#[unsafe(no_mangle)]
-pub extern "C" fn psxw_boot(options: u32) {
+fn init(options: u32) {
     std::panic::set_hook(Box::new(|info| {
         let msg = info.to_string();
         fatal(2, &msg);
@@ -200,6 +198,12 @@ pub extern "C" fn psxw_boot(options: u32) {
     RT.with(|c| {
         let _ = c.set(rt);
     });
+}
+
+/// Boot the disc and run until the host stops the run.
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_boot(options: u32) {
+    init(options);
     let b = with(|rt| boot::load(&mut rt.m.borrow_mut())).unwrap_or_else(|e| fatal(3, &format!("boot: {e}")));
     report(format!(
         "{{\"event\":\"boot\",\"exe\":{:?},\"pc0\":{},\"gp0\":{},\"t_addr\":{},\"t_size\":{},\"b_addr\":{},\"b_size\":{},\"sp\":{},\"text_hash\":\"{:016x}\"}}",
@@ -208,6 +212,39 @@ pub extern "C" fn psxw_boot(options: u32) {
     Guest.invoke(GuestCall { addr: b.pc0, args: [0; 4] });
     with(|rt| rt.m.borrow_mut().log("the entry point returned"));
     report("{\"event\":\"exit\"}".into());
+}
+
+/// Set up without a disc; the host drives guest calls (psxw-abi
+/// `CONFORM_INIT`).
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_conform_init(options: u32, sp: u32, gp: u32, io: u32) {
+    init(options);
+    with(|rt| {
+        let mut m = rt.m.borrow_mut();
+        m.regs.set_sp(sp);
+        m.regs.set_gp(gp);
+        if io == 1 {
+            m.io = Some(Default::default());
+        }
+    });
+}
+
+/// Call a guest function, then run what it queued (psxw-abi `CALL`).
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_call(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
+    let v = Guest.invoke(GuestCall { addr, args: [a0, a1, a2, a3] });
+    with(|rt| driver::drain(&rt.m, &mut Guest));
+    v
+}
+
+/// Let `n` vblanks pass (psxw-abi `RUN_VBLANKS`).
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_run_vblanks(n: u32) {
+    with(|rt| {
+        let until = rt.m.borrow().vblanks + n as u64;
+        let flow = psx_bios::Flow::Block { until: psx_bios::Wait::Vblanks(until), then: Box::new(|_| psx_bios::Flow::Return(0)) };
+        driver::run(&rt.m, &mut Guest, flow);
+    });
 }
 
 // --- psx.*: what the guest imports ---------------------------------------
@@ -262,9 +299,28 @@ pub extern "C" fn kernel_call(addr: u32, _a0: u32, _a1: u32, _a2: u32, _a3: u32)
     fatal(8, &format!("call into BIOS kernel RAM at {addr:#010x}; this function needs an adapter"))
 }
 
+/// A guest access to the I/O window (debug and conformance builds): a load
+/// is about to read window offset `off`, or a store has just written it.
+/// With register-level devices attached, the device supplies or takes the
+/// value through the window; without, it is a trap.
 #[unsafe(export_name = "io_access")]
-pub extern "C" fn io_access(addr: u32) {
-    fatal(9, &format!("guest access to I/O register {:#010x}; this function needs an adapter", addr | 0x1F00_0000))
+pub extern "C" fn io_access(off: u32, kind: u32) {
+    let addr = 0x1F00_0000 | (off & 0xFF_FFFF);
+    let size = (kind & 0xFF).min(4);
+    let store = kind & 0x100 != 0;
+    let r = with(|rt| {
+        let mut m = rt.m.borrow_mut();
+        if store {
+            let mut b = [0u8; 4];
+            Window.read(addr, &mut b[..size as usize]);
+            m.io_write(addr, size, u32::from_le_bytes(b))
+        } else {
+            m.io_read(addr, size).map(|v| Window.write(addr, &v.to_le_bytes()[..size as usize]))
+        }
+    });
+    if let Err(e) = r {
+        fatal(9, &e)
+    }
 }
 
 /// Entry of a function the build was asked to watch (the boot check's

@@ -58,8 +58,11 @@ pub trait Resolver {
     fn loop_entry(&mut self) -> Vec<I<'static>> {
         Vec::new()
     }
-    /// When set, the function (`(window offset) -> ()`) every load and
-    /// store calls first if its address is in the I/O window.
+    /// When set, the function (`(window offset, kind) -> ()`) every access
+    /// to the I/O window calls: a load before reading (so a device model
+    /// can put the register's value in place), a store after writing (so
+    /// it can take the value). `kind` is the size in bytes, plus
+    /// [`IO_STORE`] for stores.
     fn io_check(&mut self) -> Option<u32> {
         None
     }
@@ -79,6 +82,9 @@ impl<R: Resolver> Reencode for TypeMap<'_, R> {
 fn masked(align: u32) -> MemArg {
     MemArg { offset: WINDOW_BASE as u64, align, memory_index: 0 }
 }
+
+/// `kind` bit of an I/O hook call for stores.
+pub const IO_STORE: u32 = 0x100;
 
 /// Page granularity of the dirty map.
 pub const DIRTY_PAGE_SHIFT: u32 = 12;
@@ -142,7 +148,7 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
             }
         };
         macro_rules! load {
-            ($memarg:expr, $ins:ident) => {{
+            ($memarg:expr, $ins:ident, $size:expr) => {{
                 let off = mem_reloc(r)?.unwrap_or($memarg.offset);
                 if off != 0 {
                     out.instruction(&I::I32Const(off as u32 as i32));
@@ -151,13 +157,13 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 out.instruction(&I::I32Const(WINDOW_MASK as i32));
                 out.instruction(&I::I32And);
                 if let Some(check) = io {
-                    io_guard(&mut out, t_addr, check);
+                    io_guard(&mut out, t_addr, check, $size);
                 }
                 out.instruction(&I::$ins(masked($memarg.align as u32)));
             }};
         }
         macro_rules! store {
-            ($memarg:expr, $ins:ident, $tmp:expr) => {{
+            ($memarg:expr, $ins:ident, $tmp:expr, $size:expr) => {{
                 let off = mem_reloc(r)?.unwrap_or($memarg.offset);
                 out.instruction(&I::LocalSet($tmp));
                 if off != 0 {
@@ -166,14 +172,14 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 }
                 out.instruction(&I::I32Const(WINDOW_MASK as i32));
                 out.instruction(&I::I32And);
-                if let Some(check) = io {
-                    io_guard(&mut out, t_addr, check);
-                }
-                if dirty.is_some() {
+                if dirty.is_some() || io.is_some() {
                     out.instruction(&I::LocalTee(t_addr));
                 }
                 out.instruction(&I::LocalGet($tmp));
                 out.instruction(&I::$ins(masked($memarg.align as u32)));
+                if let Some(check) = io {
+                    io_after_store(&mut out, t_addr, check, $size);
+                }
                 if let Some(map) = dirty {
                     out.instruction(&I::LocalGet(t_addr));
                     out.instruction(&I::I32Const(DIRTY_PAGE_SHIFT as i32));
@@ -223,29 +229,29 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 };
                 out.instruction(&I::I32Const(v));
             }
-            Operator::I32Load { memarg } => load!(memarg, I32Load),
-            Operator::I64Load { memarg } => load!(memarg, I64Load),
-            Operator::F32Load { memarg } => load!(memarg, F32Load),
-            Operator::F64Load { memarg } => load!(memarg, F64Load),
-            Operator::I32Load8S { memarg } => load!(memarg, I32Load8S),
-            Operator::I32Load8U { memarg } => load!(memarg, I32Load8U),
-            Operator::I32Load16S { memarg } => load!(memarg, I32Load16S),
-            Operator::I32Load16U { memarg } => load!(memarg, I32Load16U),
-            Operator::I64Load8S { memarg } => load!(memarg, I64Load8S),
-            Operator::I64Load8U { memarg } => load!(memarg, I64Load8U),
-            Operator::I64Load16S { memarg } => load!(memarg, I64Load16S),
-            Operator::I64Load16U { memarg } => load!(memarg, I64Load16U),
-            Operator::I64Load32S { memarg } => load!(memarg, I64Load32S),
-            Operator::I64Load32U { memarg } => load!(memarg, I64Load32U),
-            Operator::I32Store { memarg } => store!(memarg, I32Store, t_i32),
-            Operator::I32Store8 { memarg } => store!(memarg, I32Store8, t_i32),
-            Operator::I32Store16 { memarg } => store!(memarg, I32Store16, t_i32),
-            Operator::I64Store { memarg } => store!(memarg, I64Store, t_i64),
-            Operator::I64Store8 { memarg } => store!(memarg, I64Store8, t_i64),
-            Operator::I64Store16 { memarg } => store!(memarg, I64Store16, t_i64),
-            Operator::I64Store32 { memarg } => store!(memarg, I64Store32, t_i64),
-            Operator::F32Store { memarg } => store!(memarg, F32Store, t_f32),
-            Operator::F64Store { memarg } => store!(memarg, F64Store, t_f64),
+            Operator::I32Load { memarg } => load!(memarg, I32Load, 4),
+            Operator::I64Load { memarg } => load!(memarg, I64Load, 8),
+            Operator::F32Load { memarg } => load!(memarg, F32Load, 4),
+            Operator::F64Load { memarg } => load!(memarg, F64Load, 8),
+            Operator::I32Load8S { memarg } => load!(memarg, I32Load8S, 1),
+            Operator::I32Load8U { memarg } => load!(memarg, I32Load8U, 1),
+            Operator::I32Load16S { memarg } => load!(memarg, I32Load16S, 2),
+            Operator::I32Load16U { memarg } => load!(memarg, I32Load16U, 2),
+            Operator::I64Load8S { memarg } => load!(memarg, I64Load8S, 1),
+            Operator::I64Load8U { memarg } => load!(memarg, I64Load8U, 1),
+            Operator::I64Load16S { memarg } => load!(memarg, I64Load16S, 2),
+            Operator::I64Load16U { memarg } => load!(memarg, I64Load16U, 2),
+            Operator::I64Load32S { memarg } => load!(memarg, I64Load32S, 4),
+            Operator::I64Load32U { memarg } => load!(memarg, I64Load32U, 4),
+            Operator::I32Store { memarg } => store!(memarg, I32Store, t_i32, 4),
+            Operator::I32Store8 { memarg } => store!(memarg, I32Store8, t_i32, 1),
+            Operator::I32Store16 { memarg } => store!(memarg, I32Store16, t_i32, 2),
+            Operator::I64Store { memarg } => store!(memarg, I64Store, t_i64, 8),
+            Operator::I64Store8 { memarg } => store!(memarg, I64Store8, t_i64, 1),
+            Operator::I64Store16 { memarg } => store!(memarg, I64Store16, t_i64, 2),
+            Operator::I64Store32 { memarg } => store!(memarg, I64Store32, t_i64, 4),
+            Operator::F32Store { memarg } => store!(memarg, F32Store, t_f32, 4),
+            Operator::F64Store { memarg } => store!(memarg, F64Store, t_f64, 8),
             Operator::MemoryCopy { .. } => {
                 // [dst, src, n]
                 out.instruction(&I::LocalSet(t_i32b));
@@ -313,19 +319,33 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
 }
 
 /// With the masked address on the stack: call `check` when it lies in the
-/// I/O window, leaving the address in place.
-fn io_guard(out: &mut Function, t_addr: u32, check: u32) {
-    let io = psxw_abi::phys::IO;
+/// I/O window (a load of `size` bytes), leaving the address in place.
+fn io_guard(out: &mut Function, t_addr: u32, check: u32, size: u32) {
     out.instruction(&I::LocalTee(t_addr));
+    io_call(out, t_addr, check, size);
+    out.instruction(&I::LocalGet(t_addr));
+}
+
+/// After a store of `size` bytes to the address in `t_addr`: call `check`
+/// when it lies in the I/O window.
+fn io_after_store(out: &mut Function, t_addr: u32, check: u32, size: u32) {
+    out.instruction(&I::LocalGet(t_addr));
+    io_call(out, t_addr, check, size | IO_STORE);
+}
+
+/// With the address on the stack (consumed): `check(addr, kind)` when it
+/// lies in the I/O window.
+fn io_call(out: &mut Function, t_addr: u32, check: u32, kind: u32) {
+    let io = psxw_abi::phys::IO;
     out.instruction(&I::I32Const(io.start as i32));
     out.instruction(&I::I32Sub);
     out.instruction(&I::I32Const((io.end - io.start) as i32));
     out.instruction(&I::I32LtU);
     out.instruction(&I::If(wasm_encoder::BlockType::Empty));
     out.instruction(&I::LocalGet(t_addr));
+    out.instruction(&I::I32Const(kind as i32));
     out.instruction(&I::Call(check));
     out.instruction(&I::End);
-    out.instruction(&I::LocalGet(t_addr));
 }
 
 /// Mark `[dst, dst + n)` dirty, keeping `dst` (a wasm address) on the stack.

@@ -26,11 +26,27 @@ pub struct Options {
     pub budget: u32,
     /// Compile the C with UBSan in trap mode (`game-ubsan.wasm`).
     pub ubsan: bool,
+    /// SDK libraries (`libpad`, …) built from their original code instead
+    /// of adapters, with I/O-window accesses routed to the runtime
+    /// (`game-orig-<libs>.wasm`, for adapter conformance).
+    pub original: Vec<String>,
 }
 
 impl Options {
     pub fn new(game: &str) -> Self {
-        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false }
+        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![] }
+    }
+
+    /// The output name's suffix: `-ubsan`, `-orig-libpad+libetc`.
+    pub fn suffix(&self) -> String {
+        let mut s = String::new();
+        if !self.original.is_empty() {
+            s += &format!("-orig-{}", self.original.join("+"));
+        }
+        if self.ubsan {
+            s += "-ubsan";
+        }
+        s
     }
 }
 
@@ -173,7 +189,11 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     for t in &translations {
         let key = (t.func.container.clone(), t.func.addr);
         let in_sdk = inputs.map.sdk_at(&t.func.container, t.func.addr).is_some();
-        let tier = if let (true, Some(&id)) = (in_sdk, adapter_id.get(t.func.name.as_str())) {
+        let original = inputs
+            .map
+            .sdk_at(&t.func.container, t.func.addr)
+            .is_some_and(|p| opts.original.iter().any(|l| p.member.split('/').next() == Some(l.as_str())));
+        let tier = if let (true, Some(&id), false) = (in_sdk, adapter_id.get(t.func.name.as_str()), original) {
             Tier::Adapter(id)
         } else if let (Some(&(input, func)), false) = (c_defs.get(&key), pinned.contains(t.func.name.as_str())) {
             debug_assert!(t.func.sources.contains(&Source::Defined));
@@ -230,7 +250,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         tiers: tiers.clone(),
         overlays: overlays.clone(),
         budget: opts.budget,
-        debug_io: opts.debug_io,
+        debug_io: opts.debug_io || !opts.original.is_empty(),
         main: inputs.map.main.clone(),
         min_pages: 1024,
         probes: inputs
@@ -252,7 +272,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
 
     let dir = out_dir(ws, &opts.game);
     std::fs::create_dir_all(&dir)?;
-    let suffix = if opts.ubsan { "-ubsan" } else { "" };
+    let suffix = opts.suffix();
     let guest = dir.join(format!("guest{suffix}.wasm"));
     std::fs::write(&guest, &linked.wasm)?;
     let merged = dir.join("merged.wasm");
@@ -298,7 +318,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         overlay_addresses: overlays.len(),
         aux_symbols: linked.aux.len(),
         matched_rodata: linked.matched,
-        debug_io: opts.debug_io,
+        debug_io: opts.debug_io || !opts.original.is_empty(),
         guest_bytes: linked.wasm.len(),
         game_bytes: bytes.len(),
         wasm: game.display().to_string(),

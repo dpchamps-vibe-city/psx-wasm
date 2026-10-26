@@ -159,6 +159,17 @@ pub mod exports {
     pub const ALLOC: &str = "psxw_alloc";
     /// `() -> i64`: FNV-1a of guest RAM.
     pub const RAM_HASH: &str = "psxw_ram_hash";
+    /// `(options_ptr, sp, gp, io) -> ()`: set the runtime up without a disc,
+    /// for a host that drives guest calls itself (conformance runs). The
+    /// host has written guest RAM. `io` = 1 attaches register-level
+    /// devices (I/O-window accesses reach them instead of trapping).
+    pub const CONFORM_INIT: &str = "psxw_conform_init";
+    /// `(addr, a0, a1, a2, a3) -> i64`: call a guest function (o32), then
+    /// run the callbacks it left queued; `v0 | v1 << 32`.
+    pub const CALL: &str = "psxw_call";
+    /// `(n) -> ()`: let `n` vblanks of virtual time pass, delivering events
+    /// and running interrupt handlers and callbacks.
+    pub const RUN_VBLANKS: &str = "psxw_run_vblanks";
 }
 
 /// Boot options, as the host writes them (little-endian `u32` fields).
