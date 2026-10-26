@@ -1,5 +1,6 @@
-// The AudioWorklet (M5): plays the SharedArrayBuffer ring the game's audio
-// will fill (M6). Until then the ring stays empty and the output is silence.
+// The AudioWorklet (M5): plays the SharedArrayBuffer ring the Worker fills
+// from `host.audio` (M6): 44.1 kHz stereo frames; an empty ring plays
+// silence.
 
 class PsxwAudio extends AudioWorkletProcessor {
   constructor(opts) {

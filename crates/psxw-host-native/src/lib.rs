@@ -4,6 +4,7 @@
 //! a run stops after its frame budget. Per-frame RAM hashes, dumps and a
 //! traced word support the determinism and whole-game oracles.
 
+pub mod audio;
 pub mod disc;
 pub mod render;
 
@@ -49,6 +50,8 @@ pub struct Options {
     /// Write every `.1`th presented frame to `.0` as `frame_NNNNNN.png`
     /// (needs a renderer that draws).
     pub dump_frames: Option<(PathBuf, u64)>,
+    /// Write the audio output here as a WAV file.
+    pub audio_wav: Option<PathBuf>,
 }
 
 /// An overlay's original text, by guest address.
@@ -85,6 +88,7 @@ pub struct RunReport {
     pub render: render::RenderStats,
     /// VRAM hashes by frame (with a renderer that has VRAM).
     pub vram_hashes: BTreeMap<u64, String>,
+    pub audio: audio::AudioStats,
 }
 
 /// A RAM dump written during the run.
@@ -117,6 +121,7 @@ struct State {
     renderer: render::SharedRender,
     render: render::RenderStats,
     vram_hashes: BTreeMap<u64, String>,
+    audio: Option<audio::Sink>,
 }
 
 impl State {
@@ -125,6 +130,7 @@ impl State {
             renderer: opts.render.clone().unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(Box::new(render::NullRender)))),
             render: Default::default(),
             vram_hashes: BTreeMap::new(),
+            audio: None,
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -236,6 +242,7 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
         dumps: s.dumps,
         render: s.render,
         vram_hashes: s.vram_hashes,
+        audio: s.audio.map(audio::Sink::finish).unwrap_or_default(),
     }
 }
 
@@ -462,6 +469,13 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         }
         Ok(())
     })?;
+    linker.func_wrap(h, host::AUDIO, |mut c: Caller<'_, State>, ptr: u32, frames: u32| -> wasmtime::Result<()> {
+        let bytes = read_bytes(&mut c, ptr, frames * 4);
+        if let Some(a) = c.data_mut().audio.as_mut() {
+            a.push(&bytes).map_err(|e| wasmtime::Error::msg(format!("audio: {e}")))?;
+        }
+        Ok(())
+    })?;
     linker.func_wrap(h, host::REPORT, |mut c: Caller<'_, State>, ptr: u32, len: u32| {
         let text = String::from_utf8_lossy(&read_bytes(&mut c, ptr, len)).into_owned();
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -485,7 +499,8 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         c.data_mut().events.push(v);
     })?;
 
-    let state = State::new(opts, disc);
+    let mut state = State::new(opts, disc);
+    state.audio = Some(audio::Sink::new(opts.audio_wav.as_deref()).context("opening the audio WAV")?);
     let mut store = Store::new(&engine, state);
     if opts.deadline_secs > 0 {
         // Armed per call by `Conform`; nothing traps before that.

@@ -26,7 +26,11 @@ pub mod replay;
 /// - 4: non-local exits for the BIOS's interrupt exit (D45):
 ///   `guest.guest_invoke_irq`, `psx.return_from_exception`, and wasm
 ///   exception handling in the module.
-pub const ABI_VERSION: u32 = 4;
+/// - 5: audio output, `host.audio` (M6).
+pub const ABI_VERSION: u32 = 5;
+
+/// The audio output rate: the SPU's, one sample per 768 CPU cycles.
+pub const AUDIO_HZ: u32 = 44_100;
 
 /// wasm address of guest physical address 0. Folded into every guest
 /// load/store's `memarg` offset, so translation costs one `i32.and`.
@@ -169,6 +173,11 @@ pub mod host {
     pub const STORAGE_WRITE: &str = "storage_write";
     /// `(event_ptr, len) -> ()`: a structured run-report event (JSON).
     pub const REPORT: &str = "report";
+    /// `(ptr, frames) -> ()`: audio since the previous call, at
+    /// [`AUDIO_HZ`](super::AUDIO_HZ): `frames` interleaved little-endian
+    /// i16 pairs (left, right). Called at each vblank with exactly the
+    /// samples that fell due in virtual time.
+    pub const AUDIO: &str = "audio";
 }
 
 /// What `game.wasm` exports.

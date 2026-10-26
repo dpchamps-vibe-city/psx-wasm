@@ -36,6 +36,8 @@ unsafe extern "C" {
     fn host_render_readback(x: u32, y: u32, w: u32, h: u32, dst: *mut u8);
     #[link_name = "present"]
     fn host_present(desc: *const u8);
+    #[link_name = "audio"]
+    fn host_audio(ptr: *const u8, frames: usize);
 }
 
 #[link(wasm_import_module = "guest")]
@@ -99,6 +101,9 @@ impl Host for FfiHost {
     fn present(&mut self, desc: &psxw_abi::render::PresentDesc) {
         let words = desc.to_words();
         unsafe { host_present(words.as_ptr().cast()) }
+    }
+    fn audio(&mut self, frames: &[[i16; 2]]) {
+        unsafe { host_audio(frames.as_ptr().cast(), frames.len()) }
     }
 }
 

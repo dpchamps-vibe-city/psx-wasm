@@ -200,6 +200,10 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
                 diffs.push(format!("frame {f}: RAM native {nr:?} browser {br:?}; VRAM native {nv:?} browser {bv:?}"));
             }
         }
+        let (na, ba) = (&native.audio, &r["audio"]);
+        if ba["hash"].as_str() != Some(na.hash.as_str()) || ba["frames"].as_u64() != Some(na.frames) {
+            diffs.push(format!("audio: native {} frames {}, browser {} frames {}", na.frames, na.hash, ba["frames"], ba["hash"]));
+        }
         pass &= diffs.is_empty();
         println!("{b}: {} ({} frames compared, {} s in the browser)", if diffs.is_empty() { "PASS" } else { "FAIL" }, hash.len(), r["seconds"]);
         for d in diffs {

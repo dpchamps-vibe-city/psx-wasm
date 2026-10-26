@@ -50,6 +50,7 @@ pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Ve
             }
             "--vram-hash-at" => o.vram_hash_at = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             "--dump-frames" => o.dump_frames = Some((val()?.into(), 1)),
+            "--audio-wav" => o.audio_wav = Some(val()?.into()),
             "--dump-every" => {
                 let n: u64 = val()?.parse()?;
                 if let Some(d) = &mut o.dump_frames {

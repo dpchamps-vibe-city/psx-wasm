@@ -136,8 +136,12 @@ unverified.
 8. [ ] Test-disc tooling in `psxw-psx-sdk` (mkpsxiso, psxavenc); a
    generator for XA test discs; the runner's `CD_XA` kind; goldens; zero
    failures.
-9. [ ] Host audio: native WAV and optional `cpal`; the web ring buffer
-   (M5's worklet).
+9. [x] Host audio: native WAV and optional `cpal`; the web ring buffer
+   (M5's worklet). *(`host.audio`, ABI 5: each vblank hands the host the
+   frames due in virtual time, 768 cycles each. `psxw run --audio-wav`;
+   the Worker fills the worklet's ring. Both hash the frames the same way,
+   and `web-test game` compares them. `cpal` playback isn't added; it's
+   optional.)*
 10. [ ] Remove the sound-driver exclusions from `game.toml`;
     `psxw oracle ramdiff btn --replay title-to-gameplay` reaches zero
     differences.
@@ -189,5 +193,21 @@ unverified.
       will take them from.
     - XA streams run at the disc's real rate even under instant timing,
       which settles the plan's open risk on rate coupling.
+
+- **2026-10-26** (this commit): task 9.
+  - **ABI 5:** `host.audio(ptr, frames)` carries 44.1 kHz stereo i16.
+    `Machine::audio_vblank` hands over exactly the frames that fell due:
+    one per 768 cycles of virtual time, so 737.14 per NTSC frame on
+    average. Their source is `cd_audio` until the SPU mixes (silence
+    when empty).
+  - **Native host:** `psxw run --audio-wav PATH` streams a WAV file, and
+    the run report's `audio` gives frames, audible frames and an FNV-1a
+    hash.
+  - **Web host:** the Worker writes into the AudioWorklet's ring and
+    hashes the frames the same way, in 32-bit halves (checked against a
+    BigInt reference). `psxw web-test game` compares the audio frames and
+    hash with the native host's.
+  - **Check:** a conformance run (38 vblanks) delivers 28,015 silent
+    frames.
 
 ## Findings

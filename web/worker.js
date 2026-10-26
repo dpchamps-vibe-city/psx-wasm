@@ -7,7 +7,10 @@
 // - storage (memory cards): files in OPFS `saves/` (cards.js), loaded at
 //   start and written back as the game saves;
 // - rendering: psxw-host-web's WebRenderer (psx-render-gl on WebGL2) on
-//   the OffscreenCanvas.
+//   the OffscreenCanvas;
+// - audio: `host.audio` frames into the AudioWorklet's SharedArrayBuffer
+//   ring (audio.js), hashed as the native host does (FNV-1a over the
+//   frames' bytes).
 //
 // - dev mode (`options.dev`): guest.wasm and runtime.wasm instantiated
 //   separately and wired through JS trampolines, so a rebuilt runtime is
@@ -17,14 +20,14 @@
 //   into the re-created renderer when the context is restored (the
 //   colour-table cache refills on the next table change).
 //
-// Messages in: {type: "start", canvas, cue, padBuffer, options}.
+// Messages in: {type: "start", canvas, cue, padBuffer, audioRing, options}.
 // Messages out: {type: "status"|"report"|"log"|"hashes"|"stopped", ...}.
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, persist, savesDir } from "./cards.js";
 
-const ABI_VERSION = 4;
+const ABI_VERSION = 5;
 const NOTHING_PRESSED = 0xffff;
 const REPLAY_HEADER = 56;
 const FRAME_LIMIT = "psxw: frame limit";
@@ -76,7 +79,30 @@ async function instantiateDev(host) {
   return { ...guest.exports, ...runtime.exports, memory: guest.exports.memory };
 }
 
-async function run({ canvas, cue, padBuffer, options }) {
+/** FNV-1a 64 over bytes, in two 32-bit halves (the prime is 2^40 + 1B3h). */
+class Fnv64 {
+  constructor() {
+    this.hi = 0xcbf29ce4;
+    this.lo = 0x84222325;
+  }
+  bytes(b) {
+    let { hi, lo } = this;
+    for (let i = 0; i < b.length; i++) {
+      lo = (lo ^ b[i]) >>> 0;
+      const p = lo * 0x1b3;
+      const carry = Math.floor(p / 0x100000000);
+      hi = (hi * 0x1b3 + carry + ((lo << 8) >>> 0)) % 0x100000000;
+      lo = p >>> 0;
+    }
+    this.hi = hi;
+    this.lo = lo;
+  }
+  hex() {
+    return this.hi.toString(16).padStart(8, "0") + this.lo.toString(16).padStart(8, "0");
+  }
+}
+
+async function run({ canvas, cue, padBuffer, audioRing, options }) {
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
   let lost = false;
@@ -106,6 +132,10 @@ async function run({ canvas, cue, padBuffer, options }) {
   const ramHashes = {};
   const vramHashes = {};
   let lagFrames = 0;
+  const audioHash = new Fnv64();
+  let audioFrames = 0;
+  const ringHead = audioRing ? new Int32Array(audioRing, 0, 2) : null;
+  const ringSamples = audioRing ? new Int16Array(audioRing, 8) : null;
   const frameTimes = [];
   let lastVblank = 0;
 
@@ -194,6 +224,25 @@ async function run({ canvas, cue, padBuffer, options }) {
     present(p) {
       if (!lost) renderer.present(new Uint32Array(mem().slice(p, p + 20)));
     },
+    audio(p, frames) {
+      const b = bytes(p, frames * 4);
+      audioHash.bytes(b);
+      audioFrames += frames;
+      if (!ringHead) return;
+      // Frames the worklet hasn't played yet are kept; overflow drops new.
+      const s = new Int16Array(b.slice().buffer);
+      const size = ringSamples.length / 2;
+      let w = Atomics.load(ringHead, 0);
+      const r = Atomics.load(ringHead, 1);
+      for (let i = 0; i < frames; i++) {
+        const next = (w + 1) % size;
+        if (next === r) break;
+        ringSamples[2 * w] = s[2 * i];
+        ringSamples[2 * w + 1] = s[2 * i + 1];
+        w = next;
+      }
+      Atomics.store(ringHead, 0, w);
+    },
   };
 
   exports = options.dev ? await instantiateDev(host) : (await WebAssembly.instantiateStreaming(fetch(new URL("./game.wasm", import.meta.url)), { host })).instance.exports;
@@ -220,6 +269,7 @@ async function run({ canvas, cue, padBuffer, options }) {
   const sorted = frameTimes.slice().sort((a, b) => a - b);
   const pct = (p) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] * 100) / 100 : null);
   const frameMs = { p50: pct(50), p95: pct(95), p99: pct(99), max: pct(100) };
-  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs });
+  const audio = { frames: audioFrames, hash: audioHash.hex() };
+  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs, audio });
   postMessage({ type: "stopped", reason, frame });
 }

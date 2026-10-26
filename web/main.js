@@ -86,7 +86,7 @@ async function startAudio() {
   }
 }
 
-function start(cue) {
+function start(cue, audioRing) {
   const canvas = document.getElementById("screen").transferControlToOffscreen();
   const worker = new Worker("worker.js", { type: "module" });
   const options = {
@@ -115,7 +115,7 @@ function start(cue) {
       }
     }
   };
-  worker.postMessage({ type: "start", canvas, cue, padBuffer, options }, [canvas]);
+  worker.postMessage({ type: "start", canvas, cue, padBuffer, audioRing, options }, [canvas]);
 }
 
 const discInput = document.getElementById("disc");
@@ -163,9 +163,9 @@ for (const slot of [0, 1]) {
 startButton.addEventListener("click", async () => {
   startButton.disabled = true;
   running = true;
-  await startAudio();
+  const ring = await startAudio();
   requestAnimationFrame(pollInput);
-  start(cue);
+  start(cue, ring);
 });
 if (params.has("discurl")) {
   importDiscUrl(params.get("discurl"))

@@ -39,6 +39,8 @@ pub trait Host {
     }
     /// Show a frame.
     fn present(&mut self, _desc: &psxw_abi::render::PresentDesc) {}
+    /// Audio frames (left, right) at `psxw_abi::AUDIO_HZ`.
+    fn audio(&mut self, _frames: &[[i16; 2]]) {}
 }
 
 /// The guest's registers the runtime shares.
@@ -132,6 +134,8 @@ pub struct Machine<S> {
     pub cd_audio: VecDeque<[i16; 2]>,
     /// `Mute`/`Demute`: the drive's audio output is silenced.
     pub cd_mute: bool,
+    /// The cycle up to which audio has been produced.
+    pub audio_at: u64,
     /// Vblanks so far.
     pub vblanks: u64,
     pub kernel: Kernel,
@@ -170,6 +174,7 @@ impl<S: Sdk> Machine<S> {
             drive,
             cd_audio: VecDeque::new(),
             cd_mute: false,
+            audio_at: 0,
             vblanks: 0,
             kernel: Kernel::default(),
             calls: VecDeque::new(),
@@ -248,6 +253,7 @@ impl<S: Sdk> Machine<S> {
                 self.raise_irq(psx_devices::irq::VBLANK);
                 self.gpu_vblank();
                 self.card_vblank();
+                self.audio_vblank();
                 self.host.wait_vblank(self.vblanks);
             }
             Event::Timer(n) => {
@@ -264,6 +270,17 @@ impl<S: Sdk> Machine<S> {
             }
             Event::Sdk(kind, data) => S::on_event(self, kind, data),
         }
+    }
+
+    /// Hand the host the audio that fell due since the last vblank: one
+    /// frame per 768 cycles of virtual time. The source is the CD's output
+    /// until the SPU mixes it (M6); an empty source is silence.
+    fn audio_vblank(&mut self) {
+        const CYCLES: u64 = psx_devices::clock::CPU_HZ / psxw_abi::AUDIO_HZ as u64;
+        let n = (self.clock.now - self.audio_at) / CYCLES;
+        self.audio_at += n * CYCLES;
+        let frames: Vec<[i16; 2]> = (0..n).map(|_| self.cd_audio.pop_front().unwrap_or([0, 0])).collect();
+        self.host.audio(&frames);
     }
 
     /// (Re)schedule root counter `n`'s next IRQ.
