@@ -459,6 +459,26 @@ pub extern "C" fn psxw_report() {
             .filter(|e| e.status != 0)
             .map(|e| format!("\"{:08x}/{:x} mode {:x} status {:x} func {:08x}\"", e.class, e.spec, e.mode, e.status, e.func))
             .collect();
+        // CD loads under the drive model (M7 task 7's evidence): totals and
+        // the longest.
+        let loads = &m.sdk.cd.loads;
+        let ms = |c: u64| c as f64 * 1000.0 / psx_devices::clock::CPU_HZ as f64;
+        let mut longest: Vec<_> = loads.iter().collect();
+        longest.sort_by_key(|l| std::cmp::Reverse(l.cycles));
+        let longest: Vec<String> = longest
+            .iter()
+            .take(16)
+            .map(|l| format!("{{\"lba\":{},\"sectors\":{},\"ms\":{:.1},\"seek_ms\":{:.1}}}", l.lba, l.sectors, ms(l.cycles), ms(l.seek)))
+            .collect();
+        let cd_loads = format!(
+            "{{\"timing\":\"{:?}\",\"reads\":{},\"sectors\":{},\"ms\":{:.1},\"seek_ms\":{:.1},\"longest\":[{}]}}",
+            m.drive.timing,
+            loads.len(),
+            loads.iter().map(|l| l.sectors as u64).sum::<u64>(),
+            ms(loads.iter().map(|l| l.cycles).sum()),
+            ms(loads.iter().map(|l| l.seek).sum()),
+            longest.join(",")
+        );
         let io: Vec<String> = m
             .io
             .iter()
@@ -466,10 +486,11 @@ pub extern "C" fn psxw_report() {
             .map(|(t, a, n, v, w)| format!("\"{t} {} {a:08x}/{n} {v:#x}\"", if *w { "W" } else { "R" }))
             .collect();
         format!(
-            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{}}}",
+            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"cd_loads\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{}}}",
             m.vblanks,
             m.clock.now,
             m.sdk.cd.sectors,
+            cd_loads,
             errors.join(","),
             counts.join(","),
             io.join(","),

@@ -72,7 +72,9 @@ absent).
    differences, fixing devices and adapters (never adding exclusions).
 7. [ ] Document the CD timing envelope as unresolved (hardware only), with
    evidence of how long loads take under realistic timing, for M10 to
-   compare against.
+   compare against. *(Documented below, under Findings. The evidence is
+   collected: every run report's `cd_loads` lists the reads. The numbers
+   wait for the disc.)*
 8. [ ] Add everything to `psxw ci`; docs, README status.
 
 ## Exit criteria (all automated)
@@ -148,3 +150,28 @@ absent).
     A Worker that drops one byte fails the check.
 
 ## Findings
+
+### The CD timing envelope is unresolved (hardware only)
+
+Nothing here measures real drive timing. The oracle's emulator models
+it, psx-spx gives only typical figures, and the plan leaves the envelope
+to M10's rig. What the runtime does under realistic timing (D19;
+`psx_devices::cd::Drive`):
+- **Sector rate:** 75 sectors a second at single speed, 150 at double
+  (`CPU_HZ / 75` and `CPU_HZ / 150` cycles). XA streams always use it,
+  even under instant timing.
+- **Seek:** up to 8 sectors away costs that many sector times. Further
+  away it costs 20 ms to settle plus a stroke proportional to the
+  distance, 300 ms across a full 330,000-sector disc.
+- **Command acknowledgement:** 1 ms.
+- **Instant timing:** all of the above are 0, except XA streaming.
+
+What a game observes is mostly how long loads take: frames of loading
+screens, and when streamed music starts. So every run reports
+**`cd_loads`**: the timing mode, the number of `CdRead`s, sectors,
+total and seeking milliseconds, and the 16 longest reads (LBA, sectors,
+ms). With the disc, `psxw run btn --frames N` on a replay gives the
+model's figure for each load. M10 compares those with the same loads
+timed on hardware, and only then can the model be called right or
+tuned.
+

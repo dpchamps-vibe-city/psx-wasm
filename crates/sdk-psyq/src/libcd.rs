@@ -70,8 +70,25 @@ pub const NO_INTR: u32 = 0;
 pub const DATA_READY: u32 = 1;
 pub const COMPLETE: u32 = 2;
 
+/// A finished `CdRead`, for the run report's timing evidence (M7 task 7:
+/// what loads cost under the drive model, for M10 to compare with
+/// hardware).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Load {
+    pub lba: u32,
+    pub sectors: u32,
+    /// Cycles from `CdRead` to its last sector.
+    pub cycles: u64,
+    /// Of which seeking.
+    pub seek: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Read {
+    pub start: u64,
+    pub first_lba: u32,
+    pub sectors: u32,
+    pub seek: u64,
     pub next_lba: u32,
     pub remaining: u32,
     pub dst: u32,
@@ -99,11 +116,14 @@ pub struct Cd {
     pub xa: xa::Decoder,
     pub resample: [xa::Resampler; 2],
     pub xa_sectors: u64,
+    /// 44.1 kHz frames the decoder produced.
+    pub xa_frames: u64,
     pub ready_sector: Option<Box<[u8; cd::RAW]>>,
     /// Bumped to invalidate in-flight sector events.
     pub generation: u32,
     pub sectors: u64,
     pub edc_errors: Vec<String>,
+    pub loads: Vec<Load>,
 }
 
 fn status(m: &M) -> u8 {
@@ -173,6 +193,7 @@ pub fn on_sector(m: &mut M, generation: u32) {
         m.drive.head = r.next_lba + 1;
         let left = r.remaining - 1;
         if left == 0 {
+            m.sdk.cd.loads.push(Load { lba: r.first_lba, sectors: r.sectors, cycles: m.clock.now - r.start, seek: r.seek });
             m.sdk.cd.read = None;
             m.drive.status &= !stat::READ;
             let f = m.sdk.cd.read_cb;
@@ -221,6 +242,7 @@ fn xa_sector(m: &mut M, raw: &[u8; cd::RAW]) -> bool {
     let s = m.sdk.cd.xa.decode(raw);
     let (l, r) = xa::resample(&s, &mut m.sdk.cd.resample);
     m.sdk.cd.xa_sectors += 1;
+    m.sdk.cd.xa_frames += l.len() as u64;
     if !m.cd_mute {
         m.cd_audio.extend(l.into_iter().zip(r).map(|(l, r)| [l, r]));
         let over = m.cd_audio.len().saturating_sub(CD_AUDIO_MAX);
@@ -354,10 +376,11 @@ fn cd_read(m: &mut M, a: [u32; 4]) -> Result {
     if sectors == 0 {
         return ret(1);
     }
-    m.sdk.cd.read = Some(Read { next_lba: m.drive.setloc, remaining: sectors, dst: buf, size, skip });
+    let seek = m.drive.seek_cycles(m.drive.head, m.drive.setloc);
+    let lba = m.drive.setloc;
+    m.sdk.cd.read = Some(Read { start: m.clock.now, first_lba: lba, sectors, seek, next_lba: lba, remaining: sectors, dst: buf, size, skip });
     m.drive.status |= stat::READ;
     m.drive.last_command = com::READN;
-    let seek = m.drive.seek_cycles(m.drive.head, m.drive.setloc);
     let t = m.clock.now + m.drive.ack_cycles() + seek + m.drive.sector_cycles();
     schedule_sector(m, t);
     ret(1)
@@ -527,8 +550,10 @@ mod tests {
         m.run_until(m.clock.now + 4 * sector + sector / 2);
         assert_eq!(m.drive.head, 14, "four sectors at the double-speed rate");
         assert_eq!(m.sdk.cd.xa_sectors, 2, "LBA 10 and 13 match the filter; 11 doesn't");
-        // 18 portions x 4 blocks x 28 samples per channel, 6 in : 7 out.
-        assert_eq!(m.cd_audio.len(), 2 * 2016 * 7 / 6);
+        // 18 portions x 4 blocks x 28 samples per channel, 6 in : 7 out
+        // (the vblank on the way took its share for the host).
+        assert_eq!(m.sdk.cd.xa_frames, 2 * 2016 * 7 / 6);
+        assert!(!m.cd_audio.is_empty());
         assert!(m.cd_audio.iter().skip(64).all(|&[l, r]| l > 0 && r > l), "left 1, right 2, through the filter");
         let ready: Vec<_> = m.calls.iter().filter(|c| c.addr == 0x8000_4000).collect();
         assert_eq!(ready.len(), 1, "only the data sector (LBA 12) is delivered");
