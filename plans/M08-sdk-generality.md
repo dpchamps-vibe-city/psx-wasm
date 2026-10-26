@@ -104,7 +104,7 @@ belongs to whichever milestone first needs them (M9).
    against the placed original; switch to the C tier where it passes; tier
    report.
 7. [ ] Generic per-object conformance in `psxw ci`.
-8. [ ] Decide Q2; docs; README status.
+8. [ ] Decide Q2; docs; README status. *(Q2 decided: D41.)*
 
 ## Exit criteria (all automated)
 
@@ -181,6 +181,9 @@ belongs to whichever milestone first needs them (M9).
     DRAWENV, DISPENV, CdlLOC, CdlFILE and the Spu attribute structs). The
     libgpu and libcd adapters now use them; the remaining adapters will
     too as they're written.
+  - **Task 5 waits** for the original PsyQ `.LIB` files, a human-needed
+    input (Context). `psxw.local.toml` would name them; until then
+    btn's SDK members are translated from the game image, as now.
   - **Task 6 is parked:** psyq-decomp's C names data relative to its
     member (`D_000031F0`, `RO_STR_00003064`, `func_0000046C`) in a layout
     its gitignored build defines. Placing that C in a game means mapping

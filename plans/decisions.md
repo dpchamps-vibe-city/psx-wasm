@@ -299,11 +299,23 @@ functions keep adapters. A debug build still traps on their I/O
 hardware. This is the exception where the hardware is small and the
 library's logic is the behaviour.)
 
+**D41. Q2 decided: a register-level SPU is the fallback for unknown libspu
+versions** (M8). M6's `psx-devices::spu` models the SPU at register level
+anyway: its oracle vectors (`SPU_RUN`) are register writes. A libspu object
+with no validated adapter therefore gets `policy = "device"` in the
+boundary: the original library runs over the SPU registers, as libpad does
+over SIO0 (D40). Known objects keep their adapters, which are cheaper per
+call. If conformance shows the adapters can't match libspu's observable
+state, the device route becomes the default for libspu too.
+
+*Why:* the register model has to exist for the oracle in any case, and
+D40 showed the device route is exact by construction.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.
 - **Q2.** Register-level SPU fallback for unknown libspu versions.
-  Decided in M8.
+  Decided: yes (D41).
 - **Q3.** The license for psx-wasm. Needed before any public release.
   Constraint so far: `psx-devices::sio` is a close Rust port of Beetle
   PSX's `frontio.c` (GPLv2), made so SIO0 matches the oracle bit for bit.
