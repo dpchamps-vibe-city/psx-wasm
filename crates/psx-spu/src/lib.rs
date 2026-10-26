@@ -141,13 +141,15 @@ pub struct Voice {
     delay: u8,
     /// Ticks since the last key on (saturating).
     kon_age: u8,
+    /// Software wrote LSAX: loop-start flags no longer replace it.
+    lsa_locked: bool,
     /// Output after the envelope, for pitch modulation of the next voice.
     out: i32,
 }
 
 /// oracle: after a key on, the voice skips this many envelope and pitch
-/// updates (its first sample plays six times, the key-on tick included).
-pub const KEY_ON_DELAY: u8 = 5;
+/// updates (its first sample plays five times).
+pub const KEY_ON_DELAY: u8 = 4;
 
 /// oracle: the decoder decodes another data halfword when fewer than this
 /// many samples are buffered ahead of the playback position.
@@ -321,7 +323,12 @@ impl Spu {
                 reg::ADSR1 => v.adsr1 = value,
                 reg::ADSR2 => v.adsr2 = value,
                 reg::ENVX => v.envx = value as i16,
-                _ => v.lsa = value,
+                _ => {
+                    // oracle: a repeat address software writes sticks;
+                    // loop-start flags no longer replace it.
+                    v.lsa = value;
+                    v.lsa_locked = true;
+                }
             }
             return;
         }
@@ -442,7 +449,7 @@ impl Spu {
             v.flags = (hdr >> 8) as u8;
             v.shift = (hdr & 0xF) as u8;
             v.filter = ((hdr >> 4) & 0xF) as u8;
-            if v.flags & 4 != 0 {
+            if v.flags & 4 != 0 && !v.lsa_locked {
                 v.lsa = (addr >> 3) as u16;
             }
         }
@@ -450,19 +457,19 @@ impl Spu {
         self.touch(waddr);
         let word = self.ram_at(waddr);
         let v = &mut self.voices[vi];
-        let mut shift = v.shift as u32;
-        // oracle: shifts 13..15 decode as psx-spx's XA note says (as 9).
-        if shift > 12 {
-            shift = 9;
-        }
-        let filter = (v.filter & 7) as usize;
-        // oracle: filters 5..7 (not in psx-spx's table).
+        let shift = v.shift as u32;
+        let filter = v.filter as usize;
+        // oracle: filters 5..15 predict nothing (psx-spx lists 0..4).
         let (f0, f1) = if filter < 5 { (FILTER_POS[filter], FILTER_NEG[filter]) } else { (0, 0) };
         for i in 0..4 {
             let nib = ((word >> (4 * i)) & 0xF) as i32;
             let t = ((nib << 28) >> 28) << 12;
+            // oracle: shifts 13..15 decode a negative nibble as -80h and
+            // any other as 0 (psx-spx: "reportedly same as for CD-XA",
+            // whose reserved shifts act as 9).
+            let base = if shift > 12 { if nib & 8 != 0 { -0x80 } else { 0 } } else { t >> shift };
             // oracle: each prediction product is shifted (floored) on its own.
-            let s = clamp16((t >> shift) + ((v.prev[0] * f0) >> 6) + ((v.prev[1] * f1) >> 6));
+            let s = clamp16(base + ((v.prev[0] * f0) >> 6) + ((v.prev[1] * f1) >> 6));
             v.prev[1] = v.prev[0];
             v.prev[0] = s;
             v.ring[(v.decoded % 32) as usize] = s as i16;
@@ -585,8 +592,10 @@ impl Spu {
             let factor = (pmon_prev + 0x8000) as u32;
             step = (((step as i16 as i32) * factor as i32) >> 15) as u32 & 0xFFFF;
         }
+        // oracle: steps above 3FFFh clip to 3FFFh (psx-spx's pseudo code
+        // says 4000h, its range comment 0..3FFFh).
         if step > 0x3FFF {
-            step = 0x4000;
+            step = 0x3FFF;
         }
         v.counter += step as u64;
     }
@@ -595,12 +604,8 @@ impl Spu {
     pub fn tick(&mut self) -> [i16; 2] {
         let koff = core::mem::take(&mut self.koff);
         let kon = core::mem::take(&mut self.kon);
-        for vi in 0..VOICES {
-            let v = &mut self.voices[vi];
+        for v in self.voices.iter_mut() {
             v.kon_age = v.kon_age.saturating_add(1);
-            if kon & (1 << vi) != 0 {
-                self.key_on(vi);
-            }
         }
         self.noise_tick();
 
@@ -629,7 +634,13 @@ impl Spu {
             // The envelope and the pitch counter advance after the output,
             // except during the key-on delay.
             if self.voices[vi].delay > 0 {
-                self.voices[vi].delay -= 1;
+                let v = &mut self.voices[vi];
+                v.delay -= 1;
+                // oracle: the end of the key-on hold releases a software
+                // repeat address, so loop-start flags apply again.
+                if v.delay == 0 {
+                    v.lsa_locked = false;
+                }
             } else {
                 self.adsr(vi);
                 self.voice_advance(vi, prev_out);
@@ -639,10 +650,18 @@ impl Spu {
             Self::volume(v.vol[0], &mut v.volx[0], &mut v.vol_counter[0]);
             Self::volume(v.vol[1], &mut v.volx[1], &mut v.vol_counter[1]);
         }
-        // oracle: key off takes effect after this tick's envelope step, and
-        // not at all in the tick after a key on.
+        // oracle: key on takes effect after this tick's output and updates
+        // (the voice plays its old state once more); key off after the
+        // envelope step too, and not at all in the tick after a key on.
         for vi in 0..VOICES {
-            if koff & (1 << vi) != 0 && self.voices[vi].kon_age > 1 {
+            if kon & (1 << vi) != 0 {
+                self.key_on(vi);
+            }
+        }
+        for vi in 0..VOICES {
+            // oracle: a key off on a releasing voice changes nothing (its step
+            // counter runs on).
+            if koff & (1 << vi) != 0 && self.voices[vi].kon_age > 1 && self.voices[vi].phase != Phase::Release {
                 self.voices[vi].phase = Phase::Release;
                 self.voices[vi].env_counter = 0;
             }
