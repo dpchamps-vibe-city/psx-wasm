@@ -19,6 +19,11 @@ pub const STACK_TOP: u32 = 0x801F_F000;
 /// Compared memory excludes the callee's frames and the caller's argument
 /// area: `[STACK_TOP - STACK_EXCLUDE, STACK_TOP + 64)`.
 pub const STACK_EXCLUDE: u32 = 0x1_0000;
+/// All-ones bytes just below that area. A function given a random pointer
+/// may scan memory for an all-ones terminator (`0xFFFF`, `-1`) and run up
+/// into the stack frames, where C and the original lay out spills
+/// differently; the guard ends such a scan first, on both sides alike.
+pub const STACK_GUARD: u32 = 0x100;
 /// Seeded scratch memory that pointer arguments point into.
 pub const SCRATCH: u32 = 0x8070_0000;
 pub const SCRATCH_LEN: u32 = 0x8000;
@@ -166,6 +171,8 @@ impl Harness {
             let at = (*addr & 0x00FF_FFFF) as usize + WINDOW_BASE;
             memory.data_mut(&mut store)[at..at + bytes.len()].copy_from_slice(bytes);
         }
+        let guard = ((STACK_TOP - STACK_EXCLUDE - STACK_GUARD) & 0x00FF_FFFF) as usize + WINDOW_BASE;
+        memory.data_mut(&mut store)[guard..guard + STACK_GUARD as usize].fill(0xFF);
         let snapshot = memory.data(&store)[WINDOW_BASE..WINDOW_BASE + SNAPSHOT_LEN].to_vec();
         Ok(Self { store, instance, memory, snapshot, sp, fuel })
     }
