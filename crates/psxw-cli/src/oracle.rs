@@ -33,7 +33,7 @@ pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images 
 /// psx-wasm's device implementations the oracle can check (spu joins in
 /// M6). They start lazily: only the checked device runs.
 pub(crate) fn devices(ws: &Workspace) -> Vec<Box<dyn DeviceUnderTest>> {
-    vec![Box::new(psxw_oracle::gte::Device), Box::new(psxw_gpu_oracle::GpuDevice::new(ws))]
+    vec![Box::new(psxw_oracle::gte::Device), Box::new(psxw_gpu_oracle::GpuDevice::new(ws)), Box::new(psxw_oracle::xa_disc::Device)]
 }
 
 fn finish(report: &Report, path: &Path) {

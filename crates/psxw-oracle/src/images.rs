@@ -54,6 +54,9 @@ pub struct RunnerRecord {
     /// sha256 by file name.
     pub files: BTreeMap<String, String>,
     pub image_end: String,
+    /// Where the XA test file (`xa_disc::NAME`) starts on the runner disc.
+    #[serde(default)]
+    pub xa_lba: Option<u32>,
 }
 
 pub fn oracle_dir(ws: &Workspace) -> PathBuf {
@@ -258,11 +261,15 @@ pub fn build(ws: &Workspace, no_cache: bool) -> Result<Images> {
     let rdir = runner_dir(ws);
     let _ = std::fs::remove_dir_all(&rdir);
     std::fs::create_dir_all(&rdir)?;
+    // Generated disc files, mounted at /gen.
+    let gen_dir = oracle_dir(ws).join("work").join("gen");
+    std::fs::create_dir_all(&gen_dir)?;
+    std::fs::write(gen_dir.join("xatest.xa"), crate::xa_disc::file())?;
     eprintln!("images: building the runner");
     let out = docker_output(&docker_run(
         SDK_IMAGE,
         &user,
-        &[(ws.root.join("oracle"), "/src", true), (rdir.clone(), "/out", false)],
+        &[(ws.root.join("oracle"), "/src", true), (rdir.clone(), "/out", false), (gen_dir, "/gen", true)],
         None,
         &[],
     ))?;
@@ -288,6 +295,7 @@ pub fn build(ws: &Workspace, no_cache: bool) -> Result<Images> {
             dir: ".oracle/runner".into(),
             files,
             image_end: str_field(&runner_json, "image_end").to_string(),
+            xa_lba: Some(crate::xa_disc::file_lba(&rdir.join("psxw-runner.bin"))?),
         },
     };
     write_atomic(&images_path(ws), serde_json::to_string_pretty(&images)?.as_bytes())?;

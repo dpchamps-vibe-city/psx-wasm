@@ -792,6 +792,7 @@ name = "psxw-cli"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "psx-devices",
  "psxw-abi",
  "psxw-build",
  "psxw-cc",
@@ -910,6 +911,7 @@ name = "psxw-oracle"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "psx-devices",
  "psx-gte",
  "psxw-abi",
  "psxw-inputs",

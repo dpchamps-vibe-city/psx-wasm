@@ -96,6 +96,15 @@ real one.
    every `CD_SEQ` vector.
 4. The emulator–hardware disagreement report is published in Findings.
 
+## Questions for hardware
+
+- **XA reserved shifts 13-15.** The emulator shifts by that much;
+  psx-spx says they act as 9. psx-wasm follows the emulator for now
+  (`psx_devices::xa::header`). Real encoders never write these values.
+- **Table5 of the XA zigzag interpolation.** The emulator, and the
+  tables' symmetry, give taps 24 and 26 as -2 and 0; psx-spx prints -1
+  and +1.
+
 ## Progress log
 
 ## Findings

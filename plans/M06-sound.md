@@ -135,10 +135,14 @@ unverified.
    capture; zero failures.
 7. [ ] XA: `ReadS`, filters, decoding, resampling, CD input, real-rate
    delivery. *(All but the CD input, which waits for the SPU device:
-   `psx_devices::xa`, the libcd adapters' stream.)*
-8. [ ] Test-disc tooling in `psxw-psx-sdk` (mkpsxiso, psxavenc); a
+   `psx_devices::xa`, the libcd adapters' stream. Decoding and resampling
+   match the emulator exactly; see task 8.)*
+8. [x] Test-disc tooling in `psxw-psx-sdk` (mkpsxiso, psxavenc); a
    generator for XA test discs; the runner's `CD_XA` kind; goldens; zero
    failures.
+   *(`psxw_oracle::xa_disc` generates the sectors directly, so psxavenc
+   isn't needed. 28 vectors are consistent with the emulator, and with
+   them `psxw oracle check btn --device xa` reports zero failures.)*
 9. [x] Host audio: native WAV and optional `cpal`; the web ring buffer
    (M5's worklet). *(`host.audio`, ABI 5: each vblank hands the host the
    frames due in virtual time, 768 cycles each. `psxw run --audio-wav`;
@@ -231,5 +235,53 @@ unverified.
     boundary policy is guest is now built the same on both sides.
     Forcing libsnd into a device library would send its direct SPU
     register writes (`_SsInit`) to a bus that has no SPU yet.
+
+- **2026-10-26** (this commit): task 8, XA through the CD controller.
+  - **The test file:** `psxw_oracle::xa_disc` generates `XATEST.XA`, and
+    `psxw oracle images build` writes it onto the runner disc (mounted at
+    `/gen`; mkpsxiso `xa` file type) and records its LBA.
+    - It has 7 regions, one per coding plus a filter-0 region, each
+      interleaved at the factor that plays it in real time at double
+      speed.
+    - Each region has 4 played channels, with filler channels in the
+      other slots.
+    - Each channel's first sector uses filter 0, so decoding from it
+      doesn't depend on history.
+  - **The runner's `OP_CD_XA`** (`oracle/runner/cd.c`, linked last, so
+    the other ops' code keeps its addresses):
+    - it sets SPUCNT for CD audio and the CD's audio matrix;
+    - Setmode, Setfilter, Setloc, ReadS by polling;
+    - it acknowledges interrupts while 0.8 s pass, DMA-reads the CD
+      capture buffers, and pauses.
+    - A batch holds at most one, which keeps each exchange inside the
+      host's time limit.
+  - **The check** (`check --device xa`) decodes and resamples the same
+    sectors. Each 512-sample capture ring must appear exactly in that
+    stream, at any position and resampler phase: when the runner read
+    it is the emulator's timing. The captures aren't byte-reproducible
+    across sessions, because the seek starts from wherever the previous
+    vector left the head. So capture keeps such goldens
+    (`verdict::timing_variable`).
+  - **What the oracle settled.** Against psx-spx, five changes, now in
+    `psx_devices::xa` marked `oracle:`. Found by fitting the captures
+    (`examples/xa_probe` dumps them):
+    - **Filter arithmetic:** `(old*f0 >> 6) + (older*f1 >> 6)`, not
+      `(old*f0 + older*f1 + 32) / 64`. Only that made the filtered
+      regions consistent.
+    - **Reserved shifts 13-15** shift by that much. psx-spx says they
+      act as 9 on hardware.
+    - **Resampler rounding:** the 29 products are summed, then shifted
+      by 15. psx-spx truncates each division by 8000h.
+    - **Table5's taps 24 and 26** are -2 and 0, not -1 and +1. Table5 is
+      then exactly Table1 reversed, as the tables' symmetry implies, so
+      psx-spx probably has a misprint. Least squares over the filter-0
+      region found it: 44 of 4,096 samples off before, 0 after.
+    - **18.9 kHz** isn't 37.8 kHz with each sample doubled. It is the
+      same polyphase filter at 3/7 of an input per output, 7 outputs
+      every 3 inputs, with the tables in the order of their fractions.
+  - **Result:** all 28 vectors are consistent (provisional). Before the
+    fixes, 24 of 28 failed.
+  - **The rest of the archive is undisturbed:** after the runner change,
+    a full recapture reproduced all 8,062 other vectors byte for byte.
 
 ## Findings

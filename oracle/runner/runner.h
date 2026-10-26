@@ -16,6 +16,7 @@
 
 #define REG32(a) (*(volatile uint32_t *)(a))
 #define REG16(a) (*(volatile uint16_t *)(a))
+#define REG8(a) (*(volatile uint8_t *)(a))
 
 #define GP0 REG32(0xBF801810u)
 #define GP1 REG32(0xBF801814u)
@@ -106,6 +107,7 @@ typedef uint32_t op_fn(const uint8_t *payload, uint32_t len, uint8_t *result, ui
 op_fn op_gpu_reset, op_vram_write, op_vram_read, op_gpu_exec;
 op_fn op_gte_exec;
 op_fn op_spu_reset, op_spu_ram_write, op_spu_run;
+op_fn op_cd_xa;
 op_fn op_bios_call;
 
 /* A0/B0/C0 call: jumps to `table` with t1 = func. */

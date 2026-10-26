@@ -8,10 +8,15 @@
 //! channel when stereo), 8-bit sectors 4. The decoder keeps the two
 //! previous samples per channel across sectors.
 //!
-//! The decoding is psx-spx's, which is exact. The resampler is psx-spx's
-//! 25-point zigzag interpolation, which it calls "nearly correct":
-//! provisional until the XA oracle vectors (M6 task 8) settle it. 18900 Hz
-//! samples are fed to it twice each.
+//! Decoding and resampling follow psx-spx, with what the XA oracle
+//! vectors (M6 task 8) settled where it is open or disagrees, marked
+//! `oracle:`:
+//! - the filter's two products are shifted separately;
+//! - reserved shifts 13-15 shift by that much (psx-spx: "act as 9");
+//! - the zigzag tables' products are summed, then shifted once;
+//! - Table5 is Table1 reversed (psx-spx misprints two taps);
+//! - 18.9 kHz is the same polyphase filter at 3/7 the step, not a
+//!   doubled 37.8 kHz stream.
 
 /// psx-spx "Pos/neg Tables" (filters 0-3).
 const POS: [i32; 4] = [0, 60, 115, 98];
@@ -86,10 +91,12 @@ pub struct Decoder {
     pub prev: [(i32, i32); 2],
 }
 
-/// A header's shift (13..15 act as 9) and filter (0..3).
+/// A header's shift and filter (0..3).
+///
+/// oracle: shifts 13-15 shift by that much; psx-spx says they act as 9,
+/// on hardware. Encoders never write them.
 fn header(h: u8) -> (u32, usize) {
-    let s = (h & 0x0F) as u32;
-    (if s > 12 { 9 } else { s }, ((h >> 4) & 3) as usize)
+    ((h & 0x0F) as u32, ((h >> 4) & 3) as usize)
 }
 
 impl Decoder {
@@ -100,7 +107,9 @@ impl Decoder {
         let (f0, f1) = (POS[filter], NEG[filter]);
         let (mut old, mut older) = self.prev[ch];
         for t in raw {
-            let s = (t >> shift) + ((old * f0 + older * f1 + 32) >> 6);
+            // oracle: each product shifted on its own, no rounding term
+            // (psx-spx: `(old*f0 + older*f1 + 32) / 64`).
+            let s = (t >> shift) + ((old * f0) >> 6) + ((older * f1) >> 6);
             let s = s.clamp(-0x8000, 0x7FFF);
             out.push(s as i16);
             older = old;
@@ -136,7 +145,7 @@ impl Decoder {
 }
 
 /// psx-spx's zigzag tables: `ZIGZAG[phase][i - 1]` for i = 1..29.
-const ZIGZAG: [[i32; 29]; 7] = {
+pub const ZIGZAG: [[i32; 29]; 7] = {
     const ROWS: [[i32; 7]; 29] = [
         [0, 0, 0, 0, -0x0001, 0x0002, -0x0005],
         [0, 0, 0, -0x0001, 0x0003, -0x0008, 0x0011],
@@ -161,9 +170,12 @@ const ZIGZAG: [[i32; 29]; 7] = {
         [0x0350, -0x01A8, 0x00B3, -0x004B, 0x0041, -0x0023, 0x0010],
         [-0x016D, 0x00A6, -0x004A, 0x003C, -0x0022, 0x0011, -0x0008],
         [0x006B, -0x001B, 0x001F, -0x0013, 0x000A, -0x0005, 0x0002],
-        [0x000A, 0x0005, -0x0005, 0x0003, -0x0001, 0, 0],
+        // oracle: psx-spx prints Table5's taps 24 and 26 as -1 and +1; the
+        // emulator's captures, and the tables' mirror symmetry (Table5 is
+        // Table1 reversed), say -2 and 0.
+        [0x000A, 0x0005, -0x0005, 0x0003, -0x0002, 0, 0],
         [-0x0010, 0x0006, -0x0002, 0, 0, 0, 0],
-        [0x0011, -0x0008, 0x0003, -0x0002, 0x0001, 0, 0],
+        [0x0011, -0x0008, 0x0003, -0x0002, 0, 0, 0],
         [-0x0008, 0x0003, -0x0001, 0, 0, 0, 0],
         [0x0003, -0x0001, 0, 0, 0, 0, 0],
         [-0x0001, 0, 0, 0, 0, 0, 0],
@@ -181,33 +193,57 @@ const ZIGZAG: [[i32; 29]; 7] = {
     t
 };
 
-/// One channel's 37800 → 44100 Hz resampler: every sixth input sample
-/// emits seven outputs.
+/// What a group of seven outputs uses: per output, the zigzag table and
+/// how many inputs before the newest its window ends.
+///
+/// Output n of a group sits at fraction `step × n / 7` of an input past
+/// the group's start; table j interpolates fraction `-j / 7` with an
+/// offset of `⌊6j / 7⌋` inputs built in. At 37.8 kHz (step 6, a group
+/// every 6 inputs) that is table n at the newest input, psx-spx's
+/// arrangement. oracle: at 18.9 kHz (step 3, a group every 3 inputs) the
+/// fractions come in the order 0, 3/7, 6/7, 2/7, 5/7, 1/7, 4/7, and the
+/// tables with the larger built-in offsets end their windows 3 inputs
+/// back.
+const GROUP_37K8: [(usize, usize); 7] = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)];
+const GROUP_18K9: [(usize, usize); 7] = [(0, 0), (4, 3), (1, 0), (5, 3), (2, 0), (6, 3), (3, 0)];
+
+/// One channel's resampler to 44.1 kHz: 7 outputs for every 6 inputs at
+/// 37.8 kHz, for every 3 at 18.9 kHz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resampler {
     ring: [i16; 32],
     p: usize,
-    sixstep: u32,
+    /// Inputs until the next group.
+    left: u32,
 }
 
 impl Default for Resampler {
     fn default() -> Self {
-        // psx-spx: the six-step counter powers up random; 6 until the
-        // oracle says otherwise.
-        Resampler { ring: [0; 32], p: 0, sixstep: 6 }
+        // psx-spx: the counter powers up random.
+        Resampler { ring: [0; 32], p: 0, left: 6 }
     }
 }
 
 impl Resampler {
-    pub fn push(&mut self, sample: i16, out: &mut Vec<i16>) {
+    /// A resampler whose counter starts at `left` (1-6) inputs to go.
+    pub fn with_phase(left: u32) -> Self {
+        Resampler { left: left.clamp(1, 6), ..Default::default() }
+    }
+
+    pub fn push(&mut self, sample: i16, half_rate: bool, out: &mut Vec<i16>) {
         self.ring[self.p & 31] = sample;
         self.p += 1;
-        self.sixstep -= 1;
-        if self.sixstep == 0 {
-            self.sixstep = 6;
-            for table in &ZIGZAG {
-                let sum: i32 = (1..=29).map(|i| self.ring[(self.p.wrapping_sub(i)) & 31] as i32 * table[i - 1] / 0x8000).sum();
-                out.push(sum.clamp(-0x8000, 0x7FFF) as i16);
+        self.left -= 1;
+        if self.left == 0 {
+            let (group, every) = if half_rate { (&GROUP_18K9, 3) } else { (&GROUP_37K8, 6) };
+            self.left = every;
+            for &(t, back) in group {
+                let table = &ZIGZAG[t];
+                let end = self.p.wrapping_sub(back);
+                // oracle: the products are summed, then shifted once
+                // (psx-spx divides each by 8000h).
+                let sum: i32 = (1..=29).map(|i| self.ring[end.wrapping_sub(i) & 31] as i32 * table[i - 1]).sum();
+                out.push((sum >> 15).clamp(-0x8000, 0x7FFF) as i16);
             }
         }
     }
@@ -215,14 +251,11 @@ impl Resampler {
 
 /// A decoded sector at 44.1 kHz, both channels (mono sectors feed both).
 pub fn resample(s: &Samples, rs: &mut [Resampler; 2]) -> (Vec<i16>, Vec<i16>) {
-    let reps = if s.half_rate { 2 } else { 1 };
     let mut out = (Vec::new(), Vec::new());
     let right = if s.stereo { &s.right } else { &s.left };
     for (src, (r, dst)) in [&s.left, right].into_iter().zip(rs.iter_mut().zip([&mut out.0, &mut out.1])) {
         for &x in src {
-            for _ in 0..reps {
-                r.push(x, dst);
-            }
+            r.push(x, s.half_rate, dst);
         }
     }
     out
@@ -273,22 +306,22 @@ mod tests {
             let want = ((blk as i32) << 12) >> (12 - blk);
             assert!(s.left[blk * 28..(blk + 1) * 28].iter().all(|&x| x as i32 == want), "block {blk}");
         }
-        // Shift 13..15 act as 9; the nibble 8 is -8.
+        // oracle: shift 13..15 shift that far; the nibble 8 is -8.
         let s = Decoder::default().decode(&sector(0x00, [0x0F; 8], |_, _| 0x8888_8888));
-        assert_eq!(s.left[0] as i32, (-8 << 12) >> 9);
+        assert_eq!(s.left[0] as i32, (-8 << 12) >> 15);
     }
 
     #[test]
-    fn filters_follow_psx_spx_rounding() {
+    fn filters_shift_each_product() {
         // Filter 1 (60/64) after one sample of 0x1000 (shift 0, nibble 1):
-        // the rest decay by (old*60 + 32) >> 6.
+        // the rest decay by (old*60) >> 6.
         let hdr = [0x10; 8];
         let word = |i: usize, j: usize| if i == 0 && j == 0 { 0x0000_0001 } else { 0 };
         let s = Decoder::default().decode(&sector(0x00, hdr, word));
         let mut old = 0x1000;
         assert_eq!(s.left[0], 0x1000);
         for &x in &s.left[1..28] {
-            old = (old * 60 + 32) >> 6;
+            old = (old * 60) >> 6;
             assert_eq!(x as i32, old);
         }
     }
@@ -318,23 +351,23 @@ mod tests {
 
     #[test]
     fn resampler_rate_and_dc() {
-        // 6 in, 7 out. A constant settles, per phase, to the table's
-        // truncated per-term sum (the table's DC gain is about 0.91, as
-        // psx-spx gives it).
+        // 6 in, 7 out. A constant settles, per phase, to the table's sum
+        // times it, shifted down (the table's DC gain is about 0.91).
         let mut r = Resampler::default();
         let mut out = Vec::new();
         for _ in 0..600 {
-            r.push(0x4000, &mut out);
+            r.push(0x4000, false, &mut out);
         }
         assert_eq!(out.len(), 700);
         for (ph, table) in ZIGZAG.iter().enumerate() {
-            let want: i32 = table.iter().map(|&k| 0x4000 * k / 0x8000).sum();
+            let want: i32 = table.iter().map(|&k| 0x4000 * k).sum::<i32>() >> 15;
             assert_eq!(out[693 + ph] as i32, want, "phase {ph}");
             assert!((0x3900..0x3B00).contains(&want), "{want:#x}");
         }
-        // A sector is a multiple of six samples at either rate.
+        // 18.9 kHz: 7 outputs every 3 inputs (a sector is a multiple of
+        // three samples; the counter starts at 3 here).
         let s = Samples { left: vec![0; 4032], right: vec![], stereo: false, half_rate: true };
-        let (l, rt) = resample(&s, &mut Default::default());
-        assert_eq!((l.len(), rt.len()), (4032 * 2 * 7 / 6, 4032 * 2 * 7 / 6));
+        let (l, rt) = resample(&s, &mut [Resampler::with_phase(3), Resampler::with_phase(3)]);
+        assert_eq!((l.len(), rt.len()), (4032 * 7 / 3, 4032 * 7 / 3));
     }
 }

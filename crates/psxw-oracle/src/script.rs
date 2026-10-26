@@ -153,6 +153,22 @@ pub fn compile(v: &Vector, store: &Store) -> Result<Vec<Op>> {
             le(&mut p, g.cmd);
             ops.push(Op::keeping(wire::OP_GTE_EXEC, p, wire::GTE_EXEC_RESULT_SIZE as usize));
         }
+        Vector::CdXa(x) => {
+            let sectors = store.blob(&x.xa)?.len() / crate::xa_disc::SECTOR;
+            ensure!((x.start as usize) < sectors, "XA start sector {} past the file's {sectors}", x.start);
+            ops.push(Op::new(wire::OP_SPU_RESET, Vec::new()));
+            let mut p = Vec::new();
+            for v in [x.file_lba + x.start, x.mode, x.file, x.channel, x.samples] {
+                le(&mut p, v);
+            }
+            le(&mut p, x.captures.len() as u32);
+            for (a, n) in &x.captures {
+                le(&mut p, *a);
+                le(&mut p, *n);
+            }
+            ensure!(v.result_len() <= MAX_OP_RESULT, "XA run captures {} bytes, more than one exchange", v.result_len());
+            ops.push(Op::keeping(wire::OP_CD_XA, p, v.result_len()));
+        }
         Vector::SpuRun(s) => {
             ops.push(Op::new(wire::OP_SPU_RESET, Vec::new()));
             for r in &s.ram {
@@ -219,7 +235,9 @@ pub struct Plan {
     pub slots: Vec<Vec<(usize, usize)>>,
 }
 
-/// Pack ops into batches in order, as many per exchange as fit.
+/// Pack ops into batches in order, as many per exchange as fit. An
+/// OP_CD_XA plays up to a second or so of audio, so a batch holds at most
+/// one, to keep each exchange well inside the host's time limit.
 pub fn pack(ops: &[Vec<Op>]) -> Plan {
     let cap = wire::MBX_CAPACITY as usize;
     let mut plan = Plan::default();
@@ -241,7 +259,16 @@ pub fn pack(ops: &[Vec<Op>]) -> Plan {
         plan.batches.push(b);
         plan.slots.push(std::mem::take(cur));
     };
+    let mut xa_in_batch = false;
     for (v, vops) in ops.iter().enumerate() {
+        let is_xa = vops.iter().any(|op| op.code == wire::OP_CD_XA);
+        if is_xa && xa_in_batch {
+            flush(&mut plan, &mut cur);
+            in_len = 4;
+            out_len = 0;
+            xa_in_batch = false;
+        }
+        xa_in_batch |= is_xa;
         for (o, op) in vops.iter().enumerate() {
             let need_in = wire::BATCH_OP_HDR_SIZE as usize + pad4(op.payload.len());
             let need_out = wire::BATCH_RES_HDR_SIZE as usize + pad4(op.result_len);
@@ -249,6 +276,7 @@ pub fn pack(ops: &[Vec<Op>]) -> Plan {
                 flush(&mut plan, &mut cur);
                 in_len = 4;
                 out_len = 0;
+                xa_in_batch = is_xa;
             }
             cur.push((v, o));
             in_len += need_in;

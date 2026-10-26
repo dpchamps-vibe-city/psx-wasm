@@ -27,6 +27,7 @@ pub mod target;
 pub mod vector;
 pub mod verdict;
 pub mod wire;
+pub mod xa_disc;
 
 pub use hash::Hash;
 pub use record::Recorder;

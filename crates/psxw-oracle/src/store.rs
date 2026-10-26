@@ -186,6 +186,20 @@ impl Store {
         Ok(Some((bytes, prov)))
     }
 
+    /// Remove a vector and every target's golden for it (a generator's
+    /// vectors that its current version no longer makes).
+    pub fn remove_vector(&self, id: &VectorId) -> Result<()> {
+        let _ = std::fs::remove_file(self.vector_path(id));
+        if let Ok(targets) = std::fs::read_dir(self.root.join("goldens")) {
+            for t in targets.flatten() {
+                for ext in ["res", "json"] {
+                    let _ = std::fs::remove_file(t.path().join(format!("{}.{ext}", id.hex())));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_golden(&self, target: &str, id: &VectorId) -> bool {
         self.golden_dir(target).join(format!("{}.res", id.hex())).is_file()
     }
