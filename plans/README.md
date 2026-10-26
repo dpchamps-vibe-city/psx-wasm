@@ -75,8 +75,8 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 |---|---|---|---|---|
 | [M0](M00-census.md) | Census | **done** | — | GCC 2.95 vs clang layout probe; coverage; references |
 | [M1](M01-translator-and-linker-core.md) | Translator and linker core | **done** | M0 | Translated == decompiled C, every function that has both |
-| [M2](M02-whole-game-link-and-boot.md) | Whole-game link and headless boot | **in progress** (build passes; boot runs wait for the disc) | M1 | Boot RAM == EXE; CD sectors verify; overlays dispatch; main loop; determinism |
-| [M3](M03-oracle-harness.md) | Oracle harness (Docker) | **in progress** (tasks 8–9 implemented; exit criteria 4–5 wait for the disc) | M0 (*parallel* with M1–M2) | Exact-by-construction vectors reproduce through the emulator |
+| [M2](M02-whole-game-link-and-boot.md) | Whole-game link and headless boot | **done** | M1 | Boot RAM == EXE; CD sectors verify; overlays dispatch; main loop; determinism |
+| [M3](M03-oracle-harness.md) | Oracle harness (Docker) | **done** (whole-game RAM equality is a diagnostic while CD timing is unresolved, D48) | M0 (*parallel* with M1–M2) | Exact-by-construction vectors reproduce through the emulator |
 | [M4](M04-pixels.md) | Pixels | **in progress** (GTE and GPU devices exact vs the oracle; libpad, libgpu and libetc run as original code, D40/D42/D45) | M2, M3 | GTE/GPU vectors byte-exact vs goldens; adapter conformance; RAM by symbol |
 | [M5](M05-browser.md) | Browser host | **in progress** (browser renderer exact in Chromium and Firefox; context loss, dev mode; game determinism waits for the disc) | M4 | Cross-host determinism (browser == native hashes) |
 | [M6](M06-sound.md) | Sound | **in progress** (SPU device and vectors) | M2, M3 (*parallel* with M4–M5) | SPU/XA vectors vs goldens; libspu conformance |

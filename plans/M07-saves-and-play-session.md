@@ -70,6 +70,7 @@ absent).
    `games/btn/replays/`.
 6. [ ] `psxw oracle ramdiff btn --replay one-day`: drive it to zero
    differences, fixing devices and adapters (never adding exclusions).
+   *(Blocked on CD timing, D48.)*
 7. [ ] Document the CD timing envelope as unresolved (hardware only), with
    evidence of how long loads take under realistic timing, for M10 to
    compare against. *(Documented below, under Findings. The evidence is

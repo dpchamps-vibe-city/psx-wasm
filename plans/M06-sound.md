@@ -161,7 +161,7 @@ unverified.
    optional.)*
 10. [ ] Remove the sound-driver exclusions from `game.toml`;
     `psxw oracle ramdiff btn --replay title-to-gameplay` reaches zero
-    differences.
+    differences. *(Blocked on CD timing, D48.)*
 11. [ ] Audio determinism: identical audio hashes across two runs, and
     across hosts once M5 is done. Add everything to `psxw ci`; docs,
     README status. *(Both checks exist: `psxw run --check determinism`

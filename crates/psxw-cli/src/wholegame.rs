@@ -232,6 +232,8 @@ pub fn ramdiff_cmd(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     o.dump_counter = values.clone();
     o.dump_dir = Some(root.join("wasm"));
     let wasm = psxw_host_native::run(o)?;
+    // Same layout as the emulator's trace.bin: one u32 LE per frame.
+    std::fs::write(root.join("wasm").join("trace.bin"), wasm.trace.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>())?;
     let sp = wasm.boot.as_ref().and_then(|b| b["sp"].as_u64()).context("the run reported no boot sp")? as u32;
     eprintln!("ramdiff: psx-wasm traced {} frames; aligning on counter values {values:?}", wasm.trace.len());
 

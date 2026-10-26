@@ -1,6 +1,6 @@
 # M2 — Whole-game link and headless boot
 
-**Status:** not started
+**Status:** done
 **Depends on:** M1. **Unlocks:** M4, M6, M8 (and M3's whole-game oracle).
 **Design refs:** design §3 (overlays), §5 (SDK layers), §6 (time), §7
 (precompiled runtime), Runtime (boot, BIOS, clock, cd); decisions D7,
@@ -190,7 +190,7 @@ memory:
    - interior entry stubs;
    - safepoint pass;
    - debug masking mode.
-4. [ ] *(implemented; waits for the disc)* Pin the disc. When `psxw.local.toml` provides a disc for a game
+4. [x] Pin the disc. When `psxw.local.toml` provides a disc for a game
    with no pinned hash, compute track sha1s and print the
    `inputs.lock` entry to add. Afterwards always verify.
 5. [x] CD device:
@@ -209,11 +209,13 @@ memory:
    `psxw run btn --headless --frames N`.
 10. [x] Stub adapters for gpu, spu, pad and memory card (logging, with
     call counts in the run report).
-11. [ ] *(implemented; waits for the disc)* Boot checks (exit criterion 2): implement each as a runtime check
+11. [x] Boot checks (exit criterion 2): implement each as a runtime check
     or an analysis of the run report.
-12. [ ] *(implemented; waits for the disc)* Determinism check: two runs, RAM hashes compared at frames
+12. [x] Determinism check: two runs, RAM hashes compared at frames
     60/300/600.
-13. [ ] *(variant builds; the run waits for the disc)* UBSan variant: run the boot path; fix or document each report.
+13. [x] UBSan variant: run the boot path; fix or document each report.
+    *(Three reports, one cause, documented in `game.toml [ubsan.ignore]`;
+    see Findings.)*
 14. [x] `psxw report tiers btn`; update `psxw ci`; docs; README status.
 
 ## Exit criteria (all automated)
@@ -263,9 +265,21 @@ memory:
   fails on one the dispatcher doesn't implement (`out/<game>/bios-calls.json`;
   btn: 53 calls, all implemented). `psxw ci` gains the `build`, `boot`
   (boot and determinism checks) and `ubsan` gates.
-- **Waiting for the disc.** Exit criteria 2–5 need `psxw.local.toml`
-  `[game.btn] disc`. Until then the `boot` and `ubsan` gates fail with
-  "no disc image configured", and `psxw run` can't be exercised on btn.
+- **2026-10-26** (`a959e1e`, this commit): the disc. The human's image
+  is pinned in `inputs.lock` (one file, `hmb2n.bin`), and every check runs.
+  - **Exit criterion 2:** `psxw run btn --headless --frames 1200 --check
+    boot` passes:
+    - exe-loaded, disc-pinned;
+    - edc: 643 sectors, 0 errors;
+    - overlays: ovl_27's load verified;
+    - no-trap;
+    - vsync-waits: 999,030 `VSync` calls (the probe is now always built
+      in);
+    - main-loop: `RunSceneUpdateLoop` entered.
+  - **Exit criterion 3:** RAM hashes at frames 60, 300 and 600 are
+    identical across two runs, and so is the audio (884,693 frames).
+  - **Exit criterion 4:** the UBSan variant runs 1,200 frames without a
+    trap, with the three documented functions below.
 
 ## Findings
 
@@ -287,6 +301,22 @@ memory:
   function. `-fno-sanitize=function` because guest function pointers are
   MIPS addresses dispatched through the table, not wasm function
   references.
+
+### UBSan reports (exit criterion 4)
+
+UBSan runs in trap mode, so each report stops the run. A report is
+either fixed or documented in `game.toml [ubsan.ignore]`, which names the
+function and why the C is sound. The build turns that list into a clang
+`-fsanitize-ignorelist` for the variant, so the run continues to the
+next report.
+- **btn's three reports have one cause: an array-bounds check.** The
+  decomp's header declares `extern s32 gSoundArchiveOffsets[3]`. The
+  symbol is 0x25C bytes (151 entries), and the sound driver's archive
+  index ranges over all of it.
+- **The functions that index it are documented:**
+  `StartSoundArchiveRead`, `StepSoundLoad` and
+  `BeginSoundBankBodyTransfer`. The pinned decomp isn't ours to edit;
+  the declaration is the decomp's to fix.
 
 ### Boot checks: how each is decided
 

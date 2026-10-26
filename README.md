@@ -6,8 +6,9 @@ browser or webview. It is not an emulator: the game's C is compiled to wasm,
 the PSX memory map is preserved, and Rust services replace the hardware at
 the SDK boundary.
 
-Status: M0, M1 done; M2–M8 in progress. The game builds into
-`game.wasm`; booting it waits for the disc image (`psxw.local.toml`).
+Status: M0–M3 done; M4–M8 in progress. btn builds into `game.wasm` and
+boots from the user's disc (`psxw.local.toml`) into its main loop,
+deterministically, natively and in the browser.
 Milestones and their state: [plans/README.md](plans/README.md). The design
 is in [docs/design.md](docs/design.md); decisions in
 [plans/decisions.md](plans/decisions.md).

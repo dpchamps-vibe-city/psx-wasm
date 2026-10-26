@@ -225,7 +225,10 @@ golden.
     vectors; capture goldens; reach zero failures.
 11. [ ] `psxw oracle ramdiff btn --replay title-to-gameplay`, with
     `exclude_symbols` covering only sound-driver state (with reasons).
-    Reach zero differences.
+    Reach zero differences. *(Blocked on CD timing, D48: btn's RNG steps
+    on every pass of the loading loop, so its state depends on how long
+    loads take, and Beetle's drive timing differs from ours. ramdiff runs
+    end to end as a diagnostic; see Findings.)*
 12. [x] *(optional)* `asm-gte` normalizer rule; `difftest` on the
     functions that move to C. *(`psxw-cc::gte`: 7 btn functions move to
     C, and all 7 pass difftest.)*
@@ -425,6 +428,31 @@ golden.
     reports `C gte 00380001 vs translated gte 00180001`.
 
 ## Findings
+
+### Whole-game ramdiff (task 11): what differs, and why (D48)
+
+`psxw oracle ramdiff btn` with the manifest replay aligns frame-counter
+values 211, 509, 791 and 1037. Both sides now save `trace.bin`, the
+counter per frame, next to their dumps. Outside the kernel and the stack,
+about 7 KB differ in 34–44 symbols from counter 509 on. The classes:
+- **CD timing (D48):**
+  - `gRandomState`, and the sprite set ovl_27 picks with `Rand(3)`
+    (`gAuxSpriteHeader` and the 6 KB after it);
+  - the sound driver's per-frame state (`gSoundVoice*`, `_svm_*`);
+  - `Vcount`: vblanks during loads.
+
+  The loading loop steps the RNG without advancing the counter, and the
+  counter stalls differ per load: 33 vs 95 frames at 728, 110 vs 182 at
+  791, 10 vs 256 at 1003.
+- **libcd under adapters:** `CD_cbread`, `CD_read_dma_mode`, `CD_cbsync`
+  and the read state. The adapters keep this state in the runtime, not
+  in the game's RAM.
+- **BIOS-dependent patching:** `_patch_card_info` and `_patch_card2`.
+  On the emulator, libcard's patch routine rewrites these, with NOPs and
+  a branch chosen for the BIOS it finds. libcard has adapters here.
+- **libetc's interrupt stack:** inside the range the map gives `Hcount`
+  (4,400 bytes). It holds what interrupts left on that stack, which
+  depends on when they arrived.
 
 ### libetc: why its adapters stay, and what conformance needs
 

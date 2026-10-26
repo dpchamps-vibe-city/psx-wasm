@@ -432,6 +432,45 @@ its CD input. Its mix is what `host.audio` carries.
 *Why:* as D40/D42/D45. With the device exact, the original library
 decides everything a game can observe, and nothing is reimplemented.
 
+**D48. The whole-game RAM oracle is a diagnostic while CD timing is
+unresolved** (M4 task 11, M6 task 10, M7 task 6). Aligning on the game's
+frame counter was meant to absorb CD load time (M3). For btn it can't.
+- **What the disc runs showed:**
+  - `RunSceneUpdateLoop` calls `Rand(0xFFFF)` on every pass. While the
+    loading display is up, passes don't advance the frame counter, so
+    the RNG steps once per two vblanks of every load.
+  - Everything drawn from the RNG afterwards differs. For example, ovl_27
+    copies one of three sprite sets into `gAuxSpriteHeader` by `Rand(3)`:
+    6 KB differ from counter 509 on.
+  - Loads take longer under Beetle than under our realistic model. The
+    counter stalls for 33 vs 95 frames at 728, 110 vs 182 at 791, and
+    10 vs 256 at 1003.
+  - Beetle also adds random jitter to every command's latency, from its
+    own seeded generator.
+- **Consequence:**
+  - No drive model short of Beetle's own makes the RAM equal.
+  - On hardware, load times vary from run to run, so the same holds
+    against M10.
+- **Decision:**
+  - `psxw oracle ramdiff` stays as built (align, compare by symbol,
+    report) and is used as a diagnostic.
+  - The "zero differences" tasks are blocked on CD timing, which D23
+    leaves unresolved.
+  - The other difference classes it shows are recorded in M4's Findings
+    for later: libcard's BIOS-dependent patching, libetc's interrupt
+    stack, libcd's internal state under adapters, and `Vcount`.
+- **Not taken:**
+  - Patching Beetle to record its CD controller events, so psx-wasm
+    could replay them. The emulator stays an unmodified pinned build;
+    the human ruled out patching it for instrumentation.
+  - Moving libcd to original code over a register-level CD controller
+    only to remove its internal-state differences.
+- **What still gates:** determinism (two runs give identical RAM, frames
+  and audio), the boot checks, device vectors and conformance.
+
+*Why:* exact whole-game equality would compare two drive models, not the
+port. The machinery to force it would cost more than it tells us.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser

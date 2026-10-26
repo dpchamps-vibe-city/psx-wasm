@@ -166,6 +166,19 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         objs.extend(v.into_iter().map(|p| (c.id.clone(), p)));
     }
     let ubsan_dir = out_dir(ws, &opts.game).join("ubsan");
+    // The manifest's documented reports, as a clang ignore list; objects
+    // older than it are rebuilt.
+    let ignorelist = ubsan_dir.join("ignorelist.txt");
+    let mut ubsan_flags: Vec<String> = UBSAN_FLAGS.iter().map(|s| s.to_string()).collect();
+    if opts.ubsan {
+        std::fs::create_dir_all(&ubsan_dir)?;
+        let text: String = inputs.manifest.ubsan.ignore.keys().map(|f| format!("fun:{f}\n")).collect();
+        if std::fs::read_to_string(&ignorelist).ok().as_deref() != Some(text.as_str()) {
+            std::fs::write(&ignorelist, &text)?;
+        }
+        ubsan_flags.push(format!("-fsanitize-ignorelist={}", ignorelist.display()));
+    }
+    let ubsan_flags: Vec<&str> = ubsan_flags.iter().map(String::as_str).collect();
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
@@ -174,12 +187,12 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                 std::fs::create_dir_all(&dir)?;
                 let out = dir.join(o.file_name().unwrap_or_default());
                 let i = o.with_extension("i");
-                let fresh = match (std::fs::metadata(&out), std::fs::metadata(&i)) {
-                    (Ok(a), Ok(b)) => a.modified()? >= b.modified()?,
+                let fresh = match (std::fs::metadata(&out), std::fs::metadata(&i), std::fs::metadata(&ignorelist)) {
+                    (Ok(a), Ok(b), Ok(l)) => a.modified()? >= b.modified()?.max(l.modified()?),
                     _ => false,
                 };
                 if !fresh {
-                    clang.compile_variant(&i, &out, UBSAN_FLAGS)?;
+                    clang.compile_variant(&i, &out, &ubsan_flags)?;
                 }
                 out
             } else {

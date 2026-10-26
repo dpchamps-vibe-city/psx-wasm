@@ -21,6 +21,18 @@ pub struct GameManifest {
     pub oracle: OracleSection,
     #[serde(default)]
     pub conform: ConformSection,
+    #[serde(default)]
+    pub ubsan: UbsanSection,
+}
+
+/// `[ubsan]`: the UBSan variant's documented reports (M2 task 13).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UbsanSection {
+    /// Functions built without sanitizer checks, each with the report it
+    /// gave and why it isn't a defect of the C (e.g. a header that
+    /// understates an extern array's size).
+    #[serde(default)]
+    pub ignore: BTreeMap<String, String>,
 }
 
 /// `[conform]`: game facts the adapter-conformance scenarios need.

@@ -79,3 +79,10 @@ press = ["START@400", "START@550", "START@700", "START@850", "CROSS@1000", "CROS
 ovl_11_func_800ED7E0 = "choices.values[i] read with i == 5 when Rand(count) answers >= count; reads past the 5-element local array"
 ovl_11_func_800E7D4C = "enabled[group][Rand(6)] indexes a local array; answers outside 0..5 read past it"
 BuildSpriteEntryPackets = "clutList[12] has no bound; random frames with more than 12 distinct CLUT keys overflow it"
+
+# The UBSan variant's documented reports (M2 task 13): functions built
+# without sanitizer checks, each with the report and why the C is sound.
+[ubsan.ignore]
+StartSoundArchiveRead = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"
+StepSoundLoad = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"
+BeginSoundBankBodyTransfer = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"

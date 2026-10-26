@@ -1,6 +1,6 @@
 # M3 — Oracle harness (Docker)
 
-**Status:** in progress (tasks 1–7, 10, 11 done; 8–9 wait for M2)
+**Status:** done
 **Depends on:** M0. Parallel with M1–M2; the whole-game tasks (8–9) need
 M2's runs. **Unlocks:** M4, M6, M7, M10.
 **Design refs:** design: Oracles (device harness, per-device status,
@@ -254,9 +254,9 @@ mailbox, the store and the encoding end to end. It also supplies the
 6. [x] Runner kinds GPU_DRAW, GPU_TRANSFER, GTE_OP, SPU_RUN, BIOS_CALL;
    one handwritten vector of each through the whole pipeline.
 7. [x] Exact-by-construction generators plus `psxw oracle selftest`.
-8. [ ] *(implemented; the btn run waits for the disc)* Replay format in `psxw-abi`; the emulator host's
+8. [x] Replay format in `psxw-abi`; the emulator host's
    `play` mode; frame-counter tracing; RAM dumps; `psxw oracle play`.
-9. [ ] *(implemented; the btn run waits for the disc)* `psxw oracle ramdiff`: psx-wasm side (the M2 host
+9. [x] `psxw oracle ramdiff`: psx-wasm side (the M2 host
    gains `--replay`, `--trace-u32` and `--dump-at`), alignment,
    by-symbol comparison, report.
 10. [x] Recorder interface (`psxw-oracle::record`) that devices call; the
@@ -275,9 +275,9 @@ mailbox, the store and the encoding end to end. It also supplies the
    results.
 3. GTE, SPU and BIOS handwritten vectors are captured, with provenance.
    Capturing twice gives byte-identical results (emulator determinism).
-4. *(needs M2)* `psxw oracle play btn --replay <manifest replay>
+4. `psxw oracle play btn --replay <manifest replay>
    --dump-at …` is deterministic across two runs.
-5. *(needs M2)* `psxw oracle ramdiff btn --replay <manifest replay>` runs
+5. `psxw oracle ramdiff btn --replay <manifest replay>` runs
    end to end and writes a symbolized report. Equality isn't required
    until M4.
 6. The BIOS decision is recorded in Findings (OpenBIOS works, or the
@@ -339,6 +339,19 @@ mailbox, the store and the encoding end to end. It also supplies the
     runner disc twice: the trace and both dump kinds match exactly. The
     rebuilt emulator image changed only the host binary; `oracle ci` still
     reproduces all 1,074 goldens.
+- **2026-10-26** (`a959e1e`, this commit): the btn runs, with the disc.
+  - **Replay version 2:** the header names a clock, the guest address
+    of a u32 whose value indexes the entries. With the manifest's frame
+    counter as the clock, presses land on the same game frame on both
+    sides, whatever the boot and load times. Every host reads it: native,
+    the emulator host and the web worker.
+  - **Exit criterion 4:** `psxw oracle play btn --check determinism
+    --dump-at 600,1800,3000,4199` passes: 4 RAM dumps and 4,200 trace
+    words are identical across two runs.
+  - **Exit criterion 5:** `psxw oracle ramdiff btn` runs end to end. It
+    aligns counters 211, 509, 791 and 1037, and writes
+    `out/oracle/ramdiff/btn/report.json` plus both sides' `trace.bin`.
+    The differences are D48's (M4 Findings).
 
 ## Findings
 
