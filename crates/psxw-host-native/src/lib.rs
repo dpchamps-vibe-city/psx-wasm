@@ -32,6 +32,15 @@ pub struct Options {
     pub storage_dir: Option<PathBuf>,
     /// Echo guest logs to stderr.
     pub verbose: bool,
+    /// Overlay images whose residency is checked at every vblank.
+    pub overlays: Vec<Overlay>,
+}
+
+/// An overlay's original text, by guest address.
+#[derive(Debug, Clone, Default)]
+pub struct Overlay {
+    pub container: String,
+    pub text: Vec<(u32, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -70,7 +79,15 @@ struct State {
     boot: Option<serde_json::Value>,
     boot_ok: Option<bool>,
     stop: Option<Stop>,
+    resident: Vec<bool>,
+    /// Frame since which an overlay's first words are in RAM without the
+    /// rest matching (a load in progress, or a bad load).
+    partial_since: Vec<Option<u64>>,
 }
+
+/// A partial overlay older than this many frames is a bad load: longer
+/// than any whole-overlay read at CD speed.
+const LOAD_FRAMES: u64 = 300;
 
 const FRAME_LIMIT: &str = "psxw: frame limit";
 
@@ -147,6 +164,51 @@ pub fn run(opts: Options) -> Result<RunReport> {
                 s.trace.push(w);
             }
         }
+        // Overlay residency: whenever an overlay's first words are in RAM,
+        // its whole text must be.
+        let data = m.data(&c).to_vec();
+        let ram = guest_ram(&data);
+        let mut events = Vec::new();
+        let n = c.data().opts.overlays.len();
+        for i in 0..n {
+            let (container, verdict) = {
+                let o = &c.data().opts.overlays[i];
+                let Some((a0, t0)) = o.text.first() else { continue };
+                let at = (*a0 & 0x1F_FFFF) as usize;
+                if ram.get(at..at + 8) != t0.get(..8) {
+                    (o.container.clone(), None)
+                } else {
+                    let ok = o.text.iter().all(|(a, t)| {
+                        let at = (*a & 0x1F_FFFF) as usize;
+                        ram.get(at..at + t.len()) == Some(t.as_slice())
+                    });
+                    (o.container.clone(), Some(ok))
+                }
+            };
+            let was = c.data().resident[i];
+            let s = c.data_mut();
+            match verdict {
+                Some(true) => {
+                    s.partial_since[i] = None;
+                    if !was {
+                        events.push(serde_json::json!({"event": "overlay-resident", "container": container, "frame": frame}));
+                        s.resident[i] = true;
+                    }
+                }
+                Some(false) => {
+                    s.resident[i] = false;
+                    let since = *s.partial_since[i].get_or_insert(frame);
+                    if frame - since == LOAD_FRAMES {
+                        events.push(serde_json::json!({"event": "overlay-mismatch", "container": container, "frame": frame}));
+                    }
+                }
+                None => {
+                    s.resident[i] = false;
+                    s.partial_since[i] = None;
+                }
+            }
+        }
+        c.data_mut().events.extend(events);
         if frame >= c.data().opts.frames {
             return Err(wasmtime::Error::msg(FRAME_LIMIT));
         }
@@ -239,6 +301,8 @@ pub fn run(opts: Options) -> Result<RunReport> {
         boot: None,
         boot_ok: None,
         stop: None,
+        resident: vec![false; opts.overlays.len()],
+        partial_since: vec![None; opts.overlays.len()],
     };
     let mut store = Store::new(&engine, state);
     let instance = linker.instantiate(&mut store, &module)?;

@@ -38,7 +38,9 @@ cppflags = ["-Iinclude", "-Iinclude/psyq", "-undef", "-D__GNUC__=2", "-DINCLUDE_
 cc1 = "tools/vendor/old-gcc/build-gcc-2.95.2-psx/cc1"
 cc1flags = ["-O2", "-G8", "-mips1", "-mcpu=r3000", "-funsigned-char", "-fpeephole", "-ffunction-cse", "-fpcc-struct-return", "-fcommon", "-msoft-float", "-mgas", "-fgnu-linker", "-quiet"]
 
-[runtime]
+[run]
+# Entered once the game reaches its main loop (M2 boot check).
+main_loop_symbol = "RunSceneUpdateLoop"
 cd_timing = "realistic"
 
 # Per-function tier pins, each with its evidence. Only for function-specific

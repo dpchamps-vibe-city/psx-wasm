@@ -12,7 +12,9 @@
 //! psxw link-test <game> --function F    M1: link one pair, validate, run once
 //! psxw ci <game>                        every gate of every milestone in place
 //! psxw runtime build                    runtime.wasm (game-agnostic)
-//! psxw build <game> [--debug-io]        M2: out/<game>/game.wasm
+//! psxw build <game> [--debug-io] [--ubsan]
+//!                                       M2: out/<game>/game.wasm
+//! psxw report tiers <game>              each function's tier, by library
 //! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose]
 //!                                       M2: run game.wasm headless
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
@@ -163,6 +165,21 @@ fn run() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        ["report", "tiers", game] => {
+            let path = psxw_build::game::out_dir(&ws, game).join("tiers.json");
+            let text = std::fs::read_to_string(&path)
+                .map_err(|_| anyhow::anyhow!("{} missing; run `psxw build {game}`", path.display()))?;
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&text)?;
+            let mut by: std::collections::BTreeMap<(String, String), usize> = Default::default();
+            for r in &rows {
+                let lib = r["sdk"].as_str().map_or("game".to_string(), |m| m.split('/').next().unwrap_or(m).to_string());
+                *by.entry((lib, r["tier"].as_str().unwrap_or("?").to_string())).or_default() += 1;
+            }
+            for ((lib, tier), n) in by {
+                println!("{lib:<10} {tier:<8} {n}");
+            }
+            eprintln!("per-function tiers: {}", path.display());
+        }
         ["runtime", "build"] => {
             let p = psxw_build::runtime::build(&ws)?;
             eprintln!("runtime: {}", p.display());
@@ -172,6 +189,7 @@ fn run() -> Result<()> {
             for a in rest.iter() {
                 match *a {
                     "--debug-io" => opts.debug_io = true,
+                    "--ubsan" => opts.ubsan = true,
                     other => bail!("unknown build option {other}"),
                 }
             }

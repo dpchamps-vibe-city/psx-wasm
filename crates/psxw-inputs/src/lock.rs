@@ -93,6 +93,15 @@ pub struct RepoPin {
 pub struct DiscPin {
     pub exe: String,
     pub exe_sha256: String,
+    /// sha1 of each image file (`.bin`), in cue order.
+    #[serde(default)]
+    pub files: Vec<DiscFile>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DiscFile {
+    pub name: String,
+    pub sha1: String,
 }
 
 impl RepoPin {

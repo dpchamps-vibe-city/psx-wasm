@@ -15,6 +15,17 @@ pub struct GameManifest {
     pub tier: BTreeMap<String, TierPin>,
     #[serde(default)]
     pub difftest: DifftestSection,
+    #[serde(default)]
+    pub run: RunSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RunSection {
+    /// A function the game enters once it reaches its main loop (the boot
+    /// check requires it).
+    pub main_loop_symbol: Option<String>,
+    /// `realistic` or `instant` CD timing by default.
+    pub cd_timing: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -267,6 +267,13 @@ pub extern "C" fn io_access(addr: u32) {
     fatal(9, &format!("guest access to I/O register {:#010x}; this function needs an adapter", addr | 0x1F00_0000))
 }
 
+/// Entry of a function the build was asked to watch (the boot check's
+/// main-loop symbol).
+#[unsafe(export_name = "probe")]
+pub extern "C" fn probe(addr: u32) {
+    with(|rt| rt.m.borrow_mut().count(&format!("probe.{addr:08X}")));
+}
+
 #[unsafe(export_name = "cop0_read")]
 pub extern "C" fn cop0_read(r: u32) -> u32 {
     with(|rt| rt.cop0.borrow()[(r & 31) as usize])

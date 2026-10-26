@@ -24,13 +24,19 @@ pub struct Options {
     pub debug_io: bool,
     /// Loop iterations between safepoints.
     pub budget: u32,
+    /// Compile the C with UBSan in trap mode (`game-ubsan.wasm`).
+    pub ubsan: bool,
 }
 
 impl Options {
     pub fn new(game: &str) -> Self {
-        Self { game: game.into(), debug_io: false, budget: 1000 }
+        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false }
     }
 }
+
+/// UBSan in trap mode: each check is an `unreachable`, located by the
+/// trap's backtrace. (Signed overflow is defined under `-fwrapv`.)
+pub const UBSAN_FLAGS: &[&str] = &["-fsanitize=undefined", "-fsanitize-trap=undefined", "-fno-sanitize=function"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -82,8 +88,8 @@ pub fn out_dir(ws: &Workspace, game: &str) -> PathBuf {
 }
 
 pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
-    let runtime_path = crate::runtime::path(ws);
-    let runtime_path = if runtime_path.is_file() { runtime_path } else { crate::runtime::build(ws)? };
+    // Incremental: cheap when the runtime hasn't changed.
+    let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;
     let adapters = crate::runtime::adapters(&runtime)?;
 
@@ -108,9 +114,26 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         v.sort();
         objs.extend(v.into_iter().map(|p| (c.id.clone(), p)));
     }
+    let ubsan_dir = out_dir(ws, &opts.game).join("ubsan");
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
+            let obj_path = if opts.ubsan {
+                let dir = ubsan_dir.join(c);
+                std::fs::create_dir_all(&dir)?;
+                let out = dir.join(o.file_name().unwrap_or_default());
+                let i = o.with_extension("i");
+                let fresh = match (std::fs::metadata(&out), std::fs::metadata(&i)) {
+                    (Ok(a), Ok(b)) => a.modified()? >= b.modified()?,
+                    _ => false,
+                };
+                if !fresh {
+                    clang.compile_variant(&i, &out, UBSAN_FLAGS)?;
+                }
+                out
+            } else {
+                o.clone()
+            };
             let protos: BTreeMap<String, Proto> = psxw_cc::protos::cached(&clang, &o.with_extension("i"))?
                 .into_iter()
                 .fold(BTreeMap::new(), |mut m, p| {
@@ -122,7 +145,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             Ok(Input {
                 label: format!("{c}/{}", o.file_stem().unwrap_or_default().to_string_lossy()),
                 container: c.clone(),
-                obj: WasmObject::read(o)?,
+                obj: WasmObject::read(&obj_path)?,
                 protos,
                 generated: false,
                 gcc: Some(gcc),
@@ -209,6 +232,17 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         debug_io: opts.debug_io,
         main: inputs.map.main.clone(),
         min_pages: 1024,
+        probes: inputs
+            .manifest
+            .run
+            .main_loop_symbol
+            .iter()
+            .filter_map(|n| {
+                let r = inputs.map.resolve(&inputs.map.main, n)?;
+                let c = r.container.clone().unwrap_or_else(|| inputs.map.main.clone());
+                Some((c, r.addr))
+            })
+            .collect(),
     };
     let rodata = psxw_link::layout::Rodata::new(&inputs.map, &inputs.originals);
     eprintln!("build: linking {} inputs", link_inputs.len());
@@ -217,10 +251,11 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
 
     let dir = out_dir(ws, &opts.game);
     std::fs::create_dir_all(&dir)?;
-    let guest = dir.join("guest.wasm");
+    let suffix = if opts.ubsan { "-ubsan" } else { "" };
+    let guest = dir.join(format!("guest{suffix}.wasm"));
     std::fs::write(&guest, &linked.wasm)?;
     let merged = dir.join("merged.wasm");
-    let game = dir.join("game.wasm");
+    let game = dir.join(format!("game{suffix}.wasm"));
     eprintln!("build: merging with {}", runtime_path.display());
     run(Command::new(ws.tool("binaryen", "bin/wasm-merge")?)
         .args(FEATURES)
@@ -267,7 +302,24 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         game_bytes: bytes.len(),
         wasm: game.display().to_string(),
     };
-    let json = dir.join("build.json");
+    let tier_list: Vec<serde_json::Value> = tiers
+        .iter()
+        .map(|((c, a), t)| {
+            let name = translations
+                .iter()
+                .find(|x| x.func.container == *c && x.func.addr == *a)
+                .map_or_else(String::new, |x| x.func.name.clone());
+            serde_json::json!({
+                "container": c,
+                "addr": format!("0x{a:08X}"),
+                "name": name,
+                "tier": match t { Tier::C { .. } => "c", Tier::Lift { .. } => "lift", Tier::Adapter(_) => "adapter" },
+                "sdk": inputs.map.sdk_at(c, *a).map(|p| p.member.clone()),
+            })
+        })
+        .collect();
+    std::fs::write(dir.join(format!("tiers{suffix}.json")), serde_json::to_string_pretty(&tier_list)?)?;
+    let json = dir.join(format!("build{suffix}.json"));
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
     let _ = std::fs::remove_file(&merged);
     Ok((report, json))

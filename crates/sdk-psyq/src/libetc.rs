@@ -73,6 +73,7 @@ fn vsync(m: &mut M, a: [u32; 4]) -> Result {
     if mode == 1 {
         return ret(hcount);
     }
+    m.count("vsync.waits");
     let last = m.sdk.etc.last_vcount;
     let first = if mode > 0 { last + mode as u64 - 1 } else { last };
     block(Wait::Vblanks(first), move |m: &mut M| {

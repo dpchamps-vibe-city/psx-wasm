@@ -53,6 +53,8 @@ pub struct GameSpec {
     pub main: String,
     /// Initial guest memory pages (the runtime grows it).
     pub min_pages: u64,
+    /// Functions whose entry calls `psx.probe(addr)`.
+    pub probes: Vec<(String, u32)>,
 }
 
 /// The `psx.*` imports, in import order, with their signatures.
@@ -77,6 +79,7 @@ fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::GTE_EXEC, vec![i], vec![]),
         (psx::IO_ACCESS, vec![i], vec![]),
         ("adapter", vec![i; 5], vec![V::I64]),
+        (psx::PROBE, vec![i], vec![]),
     ]
 }
 
@@ -344,16 +347,32 @@ impl Resolver for R<'_, '_> {
     fn prologue(&mut self, func_symbol: Option<&str>) -> Result<Vec<I<'static>>> {
         let inputs = self.ctx.inputs;
         let inp = &inputs[self.input];
+        let mut out = Vec::new();
+        // A watched function: by its guest name (C) or its translation's.
+        let addr = func_symbol.and_then(|n| match n.strip_prefix("psxw_t_") {
+            Some(rest) => u32::from_str_radix(rest.rsplit('_').next()?, 16).ok(),
+            None => match classify_name(n) {
+                NameClass::Guest(g) if !inp.generated => self.ctx.map.resolve(&inp.container, g).map(|r| r.addr),
+                _ => None,
+            },
+        });
+        if let Some(a) = addr {
+            if self.ctx.spec.probes.iter().any(|(c, pa)| *c == inp.container && *pa == a) {
+                out.push(I::I32Const(a as i32));
+                out.push(I::Call(self.ctx.import(psx::PROBE)));
+            }
+        }
         let is_main = func_symbol.is_some_and(|n| classify_name(n) == NameClass::Guest("main"));
         if !(is_main && inp.gcc.is_some_and(|g| g.main_calls_main)) {
-            return Ok(Vec::new());
+            return Ok(out);
         }
         let container = inp.container.clone();
-        let Some(r) = self.ctx.map.resolve(&container, "__main") else { return Ok(Vec::new()) };
+        let Some(r) = self.ctx.map.resolve(&container, "__main") else { return Ok(out) };
         let target = self.ctx.entry(&container, r.addr).context("__main has no implementation")?;
         let sig = FuncType { params: vec![], results: vec![] };
         let stub = self.ctx.synth(Synth::ToO32 { input: self.input, name: "__main".into(), sig, target });
-        Ok(vec![I::Call(stub)])
+        out.push(I::Call(stub));
+        Ok(out)
     }
 
     fn loop_entry(&mut self) -> Vec<I<'static>> {

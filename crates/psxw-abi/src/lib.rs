@@ -100,6 +100,8 @@ pub mod psx {
     pub const GTE_EXEC: &str = "gte_exec";
     /// `(addr) -> ()`: debug builds trap on an access to the I/O window.
     pub const IO_ACCESS: &str = "io_access";
+    /// `(addr) -> ()`: a watched function was entered.
+    pub const PROBE: &str = "probe";
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
     pub const ADAPTER_PREFIX: &str = "adapter.";
