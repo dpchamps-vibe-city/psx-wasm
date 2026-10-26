@@ -143,6 +143,17 @@ impl Store {
         Ok(())
     }
 
+    /// Make a named set exactly `ids` (for generated sets, which a
+    /// generator determines completely).
+    pub fn replace_set(&self, name: &str, ids: impl IntoIterator<Item = VectorId>) -> Result<()> {
+        let set: BTreeSet<VectorId> = ids.into_iter().collect();
+        if set != self.set(name)? || !self.set_path(name).is_file() {
+            let _ = std::fs::remove_file(self.set_path(name));
+            self.add_to_set(name, set)?;
+        }
+        Ok(())
+    }
+
     pub fn set_names(&self) -> Result<Vec<String>> {
         let dir = self.root.join("sets");
         let mut names = Vec::new();
@@ -212,6 +223,10 @@ mod tests {
         assert_eq!(s.vector_ids().unwrap(), vec![id]);
         s.add_to_set("handwritten", [id]).unwrap();
         assert!(s.set("handwritten").unwrap().contains(&id));
+        let other = s.put_vector(&Vector::Echo(b"ho".to_vec())).unwrap();
+        s.add_to_set("generated", [id]).unwrap();
+        s.replace_set("generated", [other]).unwrap();
+        assert_eq!(s.set("generated").unwrap().into_iter().collect::<Vec<_>>(), vec![other]);
         let prov = Provenance::exact(&id, b"hi", "test", "echo");
         s.put_golden(&id, b"hi", &prov).unwrap();
         let (res, p) = s.golden("exact", &id).unwrap().unwrap();

@@ -4,6 +4,7 @@
 
 use crate::exact;
 use crate::golden::{EXACT_TARGET, Provenance};
+use crate::gte;
 use crate::handwritten;
 use crate::images;
 use crate::record::game_set;
@@ -24,6 +25,20 @@ pub const MIN_SELFTEST: usize = 1000;
 /// Default selftest size: 150 per generator.
 pub const DEFAULT_SELFTEST: usize = 150 * exact::GENERATORS.len();
 pub const SELFTEST_SET: &str = "selftest";
+/// Prefix of the sets synthetic generators fill (`synthetic-gte-commands`,
+/// …). `check` includes every such set.
+pub const SYNTHETIC_PREFIX: &str = "synthetic-";
+/// Devices whose milestone gate also fails on unresolved vectors (no
+/// golden): M4 exit criterion 1 wants every GTE vector matched.
+pub const UNRESOLVED_FAILS: [&str; 1] = ["gte"];
+
+/// Store the synthetic GTE vectors (default seed); the note for reports.
+fn install_gte(store: &Store) -> Result<String> {
+    let counts = gte::install(store, gte::DEFAULT_SEED)?;
+    let total: usize = counts.values().sum();
+    let parts: Vec<String> = counts.iter().map(|(g, n)| format!("{g} {n}")).collect();
+    Ok(format!("synthetic GTE vectors: {total} (seed {:#018x}; {})", gte::DEFAULT_SEED, parts.join(", ")))
+}
 
 pub fn store(ws: &Workspace) -> Store {
     Store::new(images::oracle_dir(ws))
@@ -120,6 +135,7 @@ pub fn selftest(ws: &Workspace, seed: u64, count: usize) -> Result<(Report, Path
 pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Report, PathBuf)> {
     let store = store(ws);
     handwritten::install(&store)?;
+    let gte_note = install_gte(&store)?;
     let mut target = DockerTarget::open(ws)?;
     let tid = target.id().to_string();
     let ids: Vec<VectorId> = store.vector_ids()?;
@@ -135,6 +151,8 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     let groups = set_index(&store)?;
     let mut report = Report::new("capture");
     report.target = Some(tid.clone());
+    report.seed = Some(format!("{:#018x}", gte::DEFAULT_SEED));
+    report.notes.push(gte_note);
     let (mut new, mut same, mut changed) = (0usize, 0usize, 0usize);
     for ((id, v), res) in vectors.iter().zip(results) {
         let group = groups.get(id).cloned().unwrap_or_else(|| "unlisted".into());
@@ -221,9 +239,14 @@ pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn Devi
         bail!("unknown device {device} (one of {})", DEVICES.join(", "));
     }
     let store = store(ws);
+    let mut notes = Vec::new();
+    if device == "gte" {
+        notes.push(install_gte(&store)?);
+    }
+    let synthetic: Vec<String> = store.set_names()?.into_iter().filter(|n| n.starts_with(SYNTHETIC_PREFIX)).collect();
     let mut ids = std::collections::BTreeSet::new();
     let mut group = BTreeMap::new();
-    for set in [game_set(game), handwritten::SET.to_string(), SELFTEST_SET.to_string()] {
+    for set in [game_set(game), handwritten::SET.to_string(), SELFTEST_SET.to_string()].into_iter().chain(synthetic) {
         for id in store.set(&set)? {
             if ids.insert(id) {
                 group.insert(id, set.clone());
@@ -242,6 +265,10 @@ pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn Devi
         .unwrap_or_default();
 
     let mut report = Report::new("check");
+    if device == "gte" {
+        report.seed = Some(format!("{:#018x}", gte::DEFAULT_SEED));
+    }
+    report.notes.extend(notes);
     let imp = impls.iter_mut().find(|i| i.device() == device);
     let implemented = imp.is_some();
     report.target = Some(match &imp {
@@ -269,10 +296,44 @@ pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn Devi
         Some(imp) => {
             let vectors: Vec<_> = vectors.into_iter().map(|(id, v)| (id, v, group[&id].clone())).collect();
             compare(&store, &vectors, imp.as_mut(), &emu, &hardware, &mut report)?;
+            disputed_note(&store, device, imp.as_mut(), &emu, &mut report)?;
+            let unresolved = report.count(Verdict::Unresolved);
+            if UNRESOLVED_FAILS.contains(&device) && unresolved > 0 {
+                report.pass = false;
+                report.notes.push(format!("{unresolved} {device} vectors have no golden; run `psxw oracle capture --missing`"));
+            }
         }
     }
     let path = report.write(&report_dir(ws, &["check", game, device]))?;
     Ok(Checked { report, path, implemented })
+}
+
+/// Sets of vectors where the device target and the specification disagree
+/// (`disputed-<device>…`, each with a Finding): kept out of the verdicts,
+/// reported in a note so the exclusion stays visible.
+pub const DISPUTED_PREFIX: &str = "disputed-";
+
+fn disputed_note(store: &Store, device: &str, imp: &mut dyn DeviceUnderTest, emulator_target: &str, report: &mut Report) -> Result<()> {
+    for set in store.set_names()?.into_iter().filter(|n| n.starts_with(DISPUTED_PREFIX)) {
+        let (mut n, mut agree, mut missing) = (0, 0, 0);
+        for (id, v) in load(store, store.set(&set)?)? {
+            if v.kind().device() != device {
+                continue;
+            }
+            n += 1;
+            match store.golden(emulator_target, &id)? {
+                Some((want, _)) => agree += usize::from(imp.run(&v, store).ok().as_deref() == Some(&want[..])),
+                None => missing += 1,
+            }
+        }
+        if n > 0 {
+            report.notes.push(format!(
+                "{set}: {n} disputed vectors kept out of the verdicts (emulator vs specification; see the milestone Findings): {} matches the emulator on {agree}, {missing} without a golden",
+                imp.name()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Run `imp` on each vector and judge it against the strongest golden.
@@ -379,13 +440,20 @@ mod tests {
 }
 
 /// The oracle's part of `psxw ci`: the images still match `inputs.lock`
-/// and the local daemon, the selftest passes, and every archived vector
-/// reproduces its golden.
+/// and the local daemon, the selftest passes, every archived vector
+/// reproduces its golden, and psx-gte matches every GTE golden of every
+/// game (M4 exit criterion 1).
 pub fn ci(ws: &Workspace) -> Result<Vec<(Report, PathBuf)>> {
     let imgs = images::load(ws)?;
     images::verify(ws, &imgs)?;
     eprintln!("ci: images match inputs.lock ({}, {})", imgs.emu.id, imgs.sdk.id);
     let st = selftest(ws, DEFAULT_SEED, DEFAULT_SELFTEST)?;
     let cap = capture(ws, None, false)?;
-    Ok(vec![st, cap])
+    let mut out = vec![st, cap];
+    for game in ws.lock.game.keys() {
+        let mut impls: Vec<Box<dyn DeviceUnderTest>> = vec![Box::new(gte::Device)];
+        let checked = check(ws, game, "gte", &mut impls)?;
+        out.push((checked.report, checked.path));
+    }
+    Ok(out)
 }

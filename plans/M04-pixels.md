@@ -1,6 +1,7 @@
 # M4 — Pixels
 
-**Status:** not started
+**Status:** in progress (tasks 1–2: psx-gte and its oracle; the runtime
+wiring of both is pending)
 **Depends on:** M2, M3. **Unlocks:** M5, M7.
 **Design refs:** design: Runtime (gpu, gte, sio), §5 (adapters), Oracles
 (per-device status); decisions D12, D13, D20–D24.
@@ -182,13 +183,16 @@ golden.
 
 ## Tasks
 
-1. [ ] `psx-gte`: register file and all commands, plus unit tests from
+1. [x] `psx-gte`: register file and all commands, plus unit tests from
    spec examples (debug aids). Wire it into the runtime's private page and
-   the intrinsics.
-2. [ ] GTE recording hook. Synthetic GTE edge vectors: saturation
+   the intrinsics. *(psx-gte is done; the wiring into `psx-runtime` is
+   pending, with M2's runtime work: see Findings.)*
+2. [x] GTE recording hook. Synthetic GTE edge vectors: saturation
    boundaries, division overflow, every command with `sf`/`lm`
    combinations. Run `psxw oracle capture` for GTE, then
-   `psxw oracle check --device gte`.
+   `psxw oracle check --device gte`. *(The hook is
+   `psxw_oracle::gte::GteHook`; the runtime does not call it yet, so there
+   are no recorded GTE vectors.)*
 3. [ ] GPU front end: packet decoder for every type, state, renderer
    command emission. Unit tests decode every packet type.
 4. [ ] Renderer command interface in `psxw-abi`; host imports in the
@@ -215,7 +219,8 @@ golden.
     functions that move to C.
 13. [ ] `psxw run btn --headless --replay … --dump-frames out/` writes
     PNGs for humans (not gating). Add the GPU and GTE checks to `psxw ci`.
-    Docs, README status.
+    Docs, README status. *(The GTE check is in: `psxw_oracle::commands::ci`
+    runs it for every game.)*
 
 ## Exit criteria (all automated)
 
@@ -250,4 +255,135 @@ golden.
 
 ## Progress log
 
+- **2026-10-26** (`8bb05c3`): `psx-gte`, exact per psx-spx: the register
+  file with its read and write behaviour, every command with `sf`, `lm`
+  and MVMVA's fields, the UNR division, FLAG; `no_std`, builds for
+  wasm32; 11 spec-derived unit tests (debug aids).
+- **2026-10-26** (`6c3ba64`): the oracle side, in `psxw-oracle::gte`:
+  psx-gte as the `gte` device (`psxw oracle check <game> --device gte`),
+  the synthetic generators, the disputed set, the recording hook
+  `GteHook`, and the GTE check in `commands::ci`. Results, all from
+  `psxw oracle …`:
+  - `capture --kind gte_op`: 5,543 synthetic vectors (seed
+    `0x505358574d340001`: commands 2,912, division 953, saturation 656,
+    fifo 430, orgb 200, registers 200, lzcr 192) plus the 13 handwritten
+    GTE vectors and the 6 disputed ones, captured with provenance on
+    `emu-beetle-7fea57a-openbios-8a86b7e-runner-1`. A full recapture
+    reproduced all 7,252 stored GTE vectors byte for byte.
+  - `check btn --device gte`: 5,556 vectors, 5,556 provisional, 0
+    unresolved, 0 failed. The first run failed 54 (50 AVSZ, 4 GPL); both
+    are settled in Findings.
+  - `ci`: images verify, selftest (1,050 verified), capture (8,313
+    vectors, 8,302 reproduced byte for byte, 11 new) and the GTE check
+    all pass.
+  - Mutation check (a throwaway harness, not committed): 21 deliberate
+    mistakes in psx-gte, from dropping the 44-bit wrap to an off-by-one in
+    the UNR index, were each caught, by 9 to 2,419 vectors. RTPT's
+    last-vertex-only depth cue was caught by 13 once a targeted group was
+    added, and the far colour's dropped-sum overflow flags by 37.
+  - `cargo test --workspace --release` passes.
+
 ## Findings
+
+### Where psx-spx is open, and what the device oracle settled
+
+psx-gte implements psx-spx. Where its text is ambiguous, the emulator
+goldens decided, and the code marks those places "oracle:".
+
+- **AVSZ3/AVSZ4's OTZ comes from the untruncated product.** psx-spx says
+  "OTZ = MAC0/1000h (saturated to 0..FFFFh)". When ZSF×ΣSZ overflows 32
+  bits, OTZ saturates the way the full product's sign says (FFFFh or 0,
+  with FLAG.18), not from MAC0's wrapped 32 bits. That was 50 of the
+  first run's 54 failures. Beetle implements it as "MAC0 overflow forces
+  OTZ to saturate", which is equivalent.
+- **RTPS/RTPT use the 44-bit sum, not the 32-bit registers.** SZ3 and
+  FLAG.22 come from the Z sum SAR 12, which differs from psx-spx's
+  "MAC3 SAR ((1-sf)*12)" when sf=0 and the sum passes 32 bits. SX2/SY2
+  come from the full OF + IR×q, before MAC0 truncates it. IR0/MAC0 are
+  depth-cued for RTPT's last vertex only.
+- **The intermediate steps saturate from MAC's 32 bits after SAR sf.**
+  That covers the far-colour bug's dropped partial sum and the depth-cue
+  "(FC−MAC)" IR. Both are checked as lm=0 and only raise flags (the far
+  colour's 44-bit overflow too).
+- **N/A opcodes.** The emulator runs 00h as RTPS and 1Ah as DCPL (Mednafen's
+  "alternate?" cases). psx-spx says 00h "modifies similar registers than
+  RTPS" and doesn't list 1Ah. psx-gte follows the oracle, and 32 vectors
+  check it. The other N/A opcodes clear FLAG and do nothing else, as in
+  the emulator. They have no vectors: psx-spx calls them unknown, and
+  some are reported unstable on hardware.
+- **Writes are never saturated.** The plan's "IR saturation on writes" is
+  the saturation commands apply when they write IR. `mtc2` to a 16-bit
+  register keeps the low half and sets no flag (psx-spx's note; the
+  `registers` generator checks it with garbage in every upper half).
+
+### Disputed: GPL's MAC overflow flag at exactly 2^43−1
+
+- **What disagrees.** With sf=1 and MAC SHL 12 + IR×IR0 = 2^43−1 exactly,
+  the emulator sets FLAG.30–28 (MAC positive overflow). psx-spx defines
+  the flag as "larger than 43 bits", and psx-gte flags only at 2^43.
+  The emulator's own MVMVA and RTPS paths also flag only at 2^43, and
+  the 44-bit boundary vectors above agree with them.
+- **The cause.** Beetle's `mednafen/psx/gte.c` routes GPL, DPCS/DPCT,
+  DCPL and INTPL through `i64_to_i44`, which tests
+  `value >= 0x7ffffffffff`, while `A_MV` tests `value >= 1 << 43`. Only
+  GPL can reach 2^43−1 exactly: the other commands' sums are multiples of
+  16, or bounded far below. It looks like an off-by-one in the emulator.
+- **Settled for now in favour of psx-spx.** The six vectors are kept in
+  the set `disputed-gte`. They are captured like any other, but kept out
+  of the verdicts, and every `check --device gte` report says so in a
+  note ("psx-gte matches the emulator on 0"). The generators avoid
+  exactly 2^43−1 in GPL. Hardware (M10) settles it. If hardware flags,
+  change GPL's accumulation step only.
+- **Impact.** A game would need a GPL accumulation landing on that one
+  value.
+
+### What GTE_EXEC cannot reach (covered by unit tests only)
+
+- **Three behaviours are never exercised.** The runner never writes SXYP
+  (15) or IRGB (28), and every vector runs a command, which clears FLAG.
+  So SXYP's move-on-write, IRGB's expansion into IR1..3, and FLAG writes
+  (bits 30..12 kept, bit 31 recomputed) are covered only by psx-gte's
+  spec unit tests: unverified. Reads are covered: SXYP, IRGB/ORGB, LZCR
+  and FLAG are read back in every vector.
+- **Reaching them needs a runner change.** Flags in GTE_OP's unused cmd
+  bits 25..31 ("also write SXYP", "also write IRGB", "no command") would
+  keep the vector encoding. But they need a `RUNNER_VERSION` bump and a
+  regenerated wire header. The header is copied into the emulator image,
+  so the change rebuilds `psxw-oracle-emu:local` for every checkout
+  (M3 Findings). Deferred to the next runner change.
+
+### Decisions
+
+- **The state is 64 words in hardware numbering.** Each word holds what
+  `mfc2`/`cfc2` returns, and the derived registers are kept current. The
+  runtime can therefore keep it in the runtime-private page
+  (`Gte::view_mut`), and a recorder can copy it. `GteRegs` stays as an
+  alias, because psx-runtime uses it.
+- **Generated sets.** The synthetic vectors live in
+  `synthetic-gte-<generator>`. `capture` and `check --device gte`
+  regenerate them from the default seed and replace the sets
+  (`Store::replace_set`), so a changed generator leaves no stale
+  members. `check` includes every `synthetic-*` set and reports
+  `disputed-*` sets in a note.
+- **Unresolved fails the GTE check.** `check --device gte` fails on
+  unresolved vectors too (`UNRESOLVED_FAILS`), because exit criterion 1
+  wants every GTE vector matched.
+- **`psxw ci` covers the GTE check.** `commands::ci` runs
+  `check <game> --device gte` for every game in `inputs.lock`, with no
+  change to `psxw-cli`'s `ci.rs`.
+
+### For the runtime (M2's `psx-runtime`; not wired here)
+
+- **Wire psx-gte in.** `psx-runtime` still stores raw words
+  (`gte.data[r] = v`) and only counts `gte_exec`. It should call
+  `Gte::mtc2/mfc2/ctc2/cfc2/exec`, with the `Gte` in the runtime-private
+  page.
+- **Call the recording hook.** Recording means calling
+  `GteHook::before_exec(rec, &gte, cmd)`, or `before_exec_raw` with the
+  64 words, just before each command. It records canonical vectors
+  (registers as read back, FLAG 0, the imm25), deduplicated, at most
+  `per_command` per command word, into a `Recorder` (a `StoreRecorder`
+  on `game-<id>`). `game.wasm` cannot hold a `StoreRecorder`, so the
+  native host has to do it, e.g. at the `gte_exec` callout from the
+  register page. Once recorded vectors exist, exit criterion 1 also
+  covers them.

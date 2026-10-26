@@ -462,3 +462,27 @@ mailbox, the store and the encoding end to end. It also supplies the
   `commands.rs` next to `capture`.
 - **Disk.** The images are 92 MB (emu) and 370 MB (sdk); a no-cache
   rebuild needs about 2 GB of build cache.
+
+### From M4 (the GTE work)
+
+- **One image tag serves every checkout on a Docker daemon.**
+  `psxw-oracle-emu:local` is shared. During M4, another worktree rebuilt
+  it: same core and host hashes, but a new image id. An `images build`
+  in a second worktree then re-tagged it back to the cached original.
+  Each checkout's `images verify` compares the tag with the id it
+  recorded, so the checkouts break each other's verification. That
+  happens even when the binaries are identical, and whenever their wire
+  headers differ (the header is copied into the emulator image).
+  - The GTE work avoided the fight by pointing the tag at its recorded
+    id only while capturing, then restoring it.
+  - Suggested fix: per-checkout tags, or verifying images by content (the
+    core, host and runner hashes already in `images.json`) rather than by
+    tag.
+- **Set conventions.** `check` now includes every set named
+  `synthetic-*` (generated vectors, e.g. `synthetic-gte-commands`).
+  Generators replace their sets (`Store::replace_set`).
+  `disputed-<device>…` sets hold vectors where the emulator and the
+  specification disagree. They are captured, kept out of the verdicts,
+  and summarised in a note of every `check`.
+- **`commands::ci` also runs `check <game> --device gte`** for every game
+  in `inputs.lock`.

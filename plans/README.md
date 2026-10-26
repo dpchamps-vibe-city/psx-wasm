@@ -77,7 +77,7 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M1](M01-translator-and-linker-core.md) | Translator and linker core | **done** | M0 | Translated == decompiled C, every function that has both |
 | [M2](M02-whole-game-link-and-boot.md) | Whole-game link and headless boot | **in progress** (build passes; boot runs wait for the disc) | M1 | Boot RAM == EXE; CD sectors verify; overlays dispatch; main loop; determinism |
 | [M3](M03-oracle-harness.md) | Oracle harness (Docker) | **in progress** (tasks 8–9 implemented; exit criteria 4–5 wait for the disc) | M0 (*parallel* with M1–M2) | Exact-by-construction vectors reproduce through the emulator |
-| [M4](M04-pixels.md) | Pixels | not started | M2, M3 | GTE/GPU vectors byte-exact vs goldens; adapter conformance; RAM by symbol |
+| [M4](M04-pixels.md) | Pixels | **in progress** | M2, M3 | GTE/GPU vectors byte-exact vs goldens; adapter conformance; RAM by symbol |
 | [M5](M05-browser.md) | Browser host | not started | M4 | Cross-host determinism (browser == native hashes) |
 | [M6](M06-sound.md) | Sound | not started | M2, M3 (*parallel* with M4–M5) | SPU/XA vectors vs goldens; libspu conformance |
 | [M7](M07-saves-and-play-session.md) | Saves and full play session | not started | M4, M6 | Card checksums; game accepts its saves; RAM by symbol over a day |
