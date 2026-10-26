@@ -119,6 +119,11 @@ impl AddressMap {
         Ok(Self { main, containers, symbols, by_name })
     }
 
+    /// A map with containers but no symbols (tests and synthetic inputs).
+    pub fn synthetic(main: &str, containers: Vec<Container>) -> Self {
+        Self { main: main.to_string(), containers, symbols: HashMap::new(), by_name: HashMap::new() }
+    }
+
     pub fn container(&self, id: &str) -> Option<&Container> {
         self.containers.iter().find(|c| c.id == id)
     }

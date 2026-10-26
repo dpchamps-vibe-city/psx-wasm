@@ -7,14 +7,17 @@
 //!                                       M0: compile every TU, check vs original
 //! psxw lift <game> [--function F | --container C | --all]
 //!                                       M1: translate every function to C
-//! psxw difftest <game> [--only S] [--seeds N] [--keep]
+//! psxw difftest <game> [--only S] [--seeds N] [--keep] [--verbose]
 //!                                       M1: translated == decompiled C
+//! psxw link-test <game> --function F    M1: link one pair, validate, run once
+//! psxw ci <game>                        every gate of every milestone in place
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! ```
 
 use anyhow::{Result, bail};
 use psxw_inputs::{Workspace, snapshot, toolchain};
 
+mod ci;
 mod oracle;
 
 fn main() {
@@ -150,10 +153,30 @@ fn run() -> Result<()> {
             }
         }
         ["oracle", rest @ ..] => oracle::run(&ws, rest)?,
+        ["ci", game] => {
+            if !ci::run(&ws, game)? {
+                std::process::exit(2);
+            }
+        }
+        ["link-test", game, "--function", f] => {
+            let opts = psxw_difftest::Options {
+                game: game.to_string(),
+                only: Some(f.to_string()),
+                seeds: 1,
+                keep: true,
+                verbose: true,
+            };
+            let (report, json) = psxw_difftest::run(&ws, &opts)?;
+            print!("{}", report.summary());
+            eprintln!("\nfull report: {json}; modules kept in {}", json.parent().map(|p| p.join("shards")).unwrap_or_default().display(), json = json.display());
+            if !report.pass() {
+                std::process::exit(2);
+            }
+        }
         _ => bail!(
             "usage: psxw toolchain fetch | inputs sync | census <game> [--only S] [--only-header S] [--no-probe] \
              | lift <game> [--function F | --container C | --all] | difftest <game> [--only S] [--seeds N] \
-             | {}",
+             | link-test <game> --function F | ci <game> | {}",
             oracle::USAGE
         ),
     }

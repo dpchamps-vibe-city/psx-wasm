@@ -22,6 +22,17 @@ pub struct Originals {
 }
 
 impl Originals {
+    /// Originals from in-memory images, each mapped at one guest address
+    /// (tests and synthetic inputs).
+    pub fn from_images(images: Vec<(String, u32, Vec<u8>)>) -> Self {
+        let mut out = Originals::default();
+        for (id, vram, bytes) in images {
+            let segments = vec![(0..bytes.len() as u32, vram)];
+            out.images.insert(id, Image { bytes, segments });
+        }
+        out
+    }
+
     /// Load every container's original from the user's checkout.
     pub fn load(checkout: &Path, map: &AddressMap) -> Result<Self> {
         let mut out = Originals::default();

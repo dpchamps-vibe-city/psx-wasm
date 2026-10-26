@@ -32,6 +32,24 @@ log and return plausible values.
     (`CdReadArchiveBytes` …) on top of libcd, which is guest code.
 - The disc image is user-supplied (`psxw.local.toml`). Its track sha1 is
   pinned in `inputs.lock` the first time it's provided.
+- **From M1's Findings:**
+  - **Call naming:** translated code calls `psxw_f_<ADDR>` (or
+    `psxw_d_<ADDR>` into an overlay slot). C calls guest functions by
+    name.
+  - **Lift-tier exceptions:** C-defined translations never inline; 13
+    asm functions inline register-passing callees (D33).
+  - **Harness mode lacks** the dispatch table, runtime imports, Rust
+    objects and named-data emission.
+  - **gp:** `__start` sets gp to `0x8005E274`.
+  - **Adapter-bound SDK objects** with I/O or BIOS-kernel accesses:
+    `libpad/pdresres`, `libmcx/mcxmain`, `libmcx/mcxdsr`, `libapi/first`,
+    `libcard/patch`. Indirect tail calls only in `libapi/patch`
+    (EnablePAD/DisablePAD) and `libmcx/mcxdsr`.
+  - **Narrow-argument risk:** decomp prototypes sometimes differ in
+    signedness or width from what GCC compiled against, so C→translated
+    edges can pass differently-extended values.
+  - **GCC conventions** (division checks, builtin `memcpy`, `__main`)
+    apply to all C inputs (D36).
 
 ## Scope
 

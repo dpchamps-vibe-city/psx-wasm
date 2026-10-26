@@ -1,6 +1,7 @@
 # psx-wasm: design sketch
 
-Status: **sketch, 2026-10-25. Nothing is implemented.** The numbers in this
+Status: **M0 and M1 implemented (2026-10-26); the M3 device oracle is in
+place apart from its whole-game tasks.** The numbers in this
 document were measured against `btn-decompilation@3a15992` (working tree
 dirty) and `psyq-decomp@302b6ae` on that date.
 
@@ -203,9 +204,23 @@ How each tier is produced:
 - **C tier.** A prelude, injected with `-include`, neutralizes MIPS-isms.
   The normalizer strips register-pinning asm and recognizes any splat-style
   `INCLUDE_ASM` expansion as a lift marker. The `gte_*` macros map onto
-  `psx-gte`. When a function body contains real inline asm or a GNU nested
-  function, `psxw-cc` blanks that body, so the function falls to the lift
-  tier.
+  `psx-gte`. A function falls to the lift tier when its C can't say what
+  the original does:
+  - it contains real inline asm or a GNU nested function;
+  - it uses a GNU global register variable, or reads a local register
+    variable it never assigns (a value carried in a MIPS register across
+    calls);
+  - it can fall off the end of a non-void function (the original returns
+    whatever is in `v0`);
+  - it does floating-point arithmetic and the original was built
+    `-msoft-float` (its results come from the game's own soft-float
+    routines).
+
+  At link time, C inputs also reproduce what GCC 2.95 did that clang doesn't
+  (the `Gcc` conventions): divisions give the R3000's results and the
+  original assembler's `break` checks instead of trapping; `memcpy` with a
+  constant size is expanded inline (builtins were on); `main` starts with a
+  call to `__main`.
 - **Lift tier: generated C.** The translator works one function at a time.
   For a game, it reads the **original container images** directly: the
   address space is kept exactly, so absolute addresses in placed code are
@@ -241,9 +256,31 @@ How each tier is produced:
   - A hardware register access is a build error: that code must have an
     adapter.
 
-  The default is *ABI mode*, which assumes o32 at function boundaries.
-  Clusters of handwritten asm that pass values in non-argument registers
-  fall back to *full-state mode*, where every register lives in memory.
+  Generated code assumes o32 at function boundaries. Handwritten asm that
+  passes values in non-argument registers (libgte's normalize helper takes
+  and returns `t0`–`t2`) is handled by *inline expansion*, not a separate
+  full-state mode. When a caller writes registers the callee reads on
+  entry, or reads registers after the call that the callee writes, the
+  callee is expanded into the caller with every register shared, and its
+  `jr ra` dispatches over the known return sites. That is exactly the
+  hardware's behaviour, and needs no register file in memory. Decompiled C
+  is ABI-conformant by construction, so C-defined functions and their
+  translations never inline.
+
+  Function discovery runs to a fixed point. Starts are seeded from the
+  inputs:
+  - symbol files;
+  - the first function of each object's `.text`;
+  - the census's C definitions;
+  - the EXE entry.
+
+  They grow from call targets and code addresses built in registers. An
+  address reachable inside an existing function becomes an interior entry
+  instead of splitting it. Jump tables are recovered from the GCC idiom,
+  including indices spilled to the stack. A constant read from the
+  straight-line window must be confirmed by dataflow. Calls name their
+  target by address (`psxw_f_<ADDR>`, or `psxw_d_<ADDR>` for a call into an
+  overlay slot), and the linker binds each one to a tier.
 - **A translated SDK is reusable.** Games link SDK members byte for byte, so
   the translated C is cached per SDK release, keyed by member hash, and
   reused by every game linking that member. It is derived from Sony's
@@ -689,7 +726,7 @@ Each milestone's exit is gated by an automated oracle.
 | # | Milestone | Gating oracle |
 |---|---|---|
 | M0 | Census | **Done** (see below) |
-| M1 | Translator and linker core | Translated matches decompiled C for every function that has both |
+| M1 | Translator and linker core | **Done** (see below) |
 | M2 | Whole-game link and headless boot | RAM equals the EXE image after boot; CD reads verify; overlays dispatch; main loop reached; deterministic |
 | M3 | Oracle harness (Docker image: Beetle PSX + OpenBIOS; PS1 runner; vector recorder; golden store) | Exact-by-construction vectors reproduce through the emulator; deterministic captures |
 | M4 | Pixels: GTE, GPU front end, WebGL2 backend (exact at 1×), pad, libgpu/libetc/libpad adapters | GTE and GPU vectors byte-exact against goldens; adapters match the original libraries; RAM by symbol through a replay |
@@ -733,6 +770,38 @@ Each milestone's exit is gated by an automated oracle.
     through K&R declarations), which need o32 adapters;
   - 6 interior entry points inside sized functions, which need entry stubs
     if anything calls them.
+
+### M1 result: btn @ 3a15992 (2026-10-26)
+
+- **Lift.** `psxw lift btn --all` translates and compiles all 3,359
+  functions (164,741 instructions) in about 9 seconds:
+  - 178 jump tables;
+  - 3 indirect tail calls, all in SDK objects;
+  - 208 indirect calls;
+  - 63 BIOS calls.
+
+  I/O and BIOS-kernel accesses all sit in SDK objects destined for adapters
+  (`libpad/pdresres`, `libmcx/*`, `libcard/patch`, `libapi/first`).
+- **Inline expansion.** 13 functions inline callees that pass values in
+  registers: the libgte `msc02` cluster, the BIOS GTE patch stub, and 7
+  undecompiled game functions that return their caller's `v0`.
+- **Differential harness.** `psxw difftest btn --seeds 64` takes about 6
+  seconds. Each pair of decompiled C (compiled as if alone) and translated
+  original runs from the same memory with ABI-shaped seeded inputs. Every
+  call they make is logged and answered identically.
+  - **Result:** 2,567 pass and 3 are excluded with recorded evidence.
+  - **The exclusions:** local-array UB reachable only with out-of-contract
+    inputs (`games/btn/game.toml [difftest.exclude]`).
+- **What triage turned into rules.** Each mismatch class became a general
+  rule or a fixed bug, not a pin:
+  - **Lift-tier rules:** global register variables, register-capture
+    locals, falling off a non-void function, and soft-float arithmetic.
+    That's 18 more functions in the lift tier, 2,566 C in all.
+  - **Link conventions:** GCC's division checks, builtin `memcpy` and
+    `__main`.
+  - **Bugs fixed:** auto-names restricted to C identifiers (clang's
+    `.Lswitch.table.func_X` had resolved to the function's own address);
+    jump-table indices keep their identity through constants.
 
 ## Risks
 

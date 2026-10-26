@@ -1,6 +1,6 @@
 # M1 — Translator and linker core
 
-**Status:** not started
+**Status:** done (2026-10-26)
 **Depends on:** M0. **Unlocks:** M2 (and M8's SDK translation).
 **Design refs:** design §1 (address space), §2 (function pointers), §4
 (implementations), §8 (linker); decisions D5, D6, D8–D11, D17.
@@ -320,41 +320,41 @@ adapters.
 
 ## Tasks
 
-1. [ ] Pin binaryen in `inputs.lock` as `[toolchain.binaryen]` (release
+1. [x] Pin binaryen in `inputs.lock` as `[toolchain.binaryen]` (release
    tarball, sha256) and extend `psxw toolchain fetch`.
-2. [ ] `psxw-lift::decode`: the full MIPS-I and COP0/COP2 decoder, with a
+2. [x] `psxw-lift::decode`: the full MIPS-I and COP0/COP2 decoder, with a
    table test of encodings for every opcode.
-3. [ ] Spec-derived unit tests for semantics edge cases (debug aids, not
+3. [x] Spec-derived unit tests for semantics edge cases (debug aids, not
    the oracle):
    - div/divu by zero, `INT_MIN / -1`;
    - `lwl`/`lwr`/`swl`/`swr` at all alignments;
    - load delay, delay slots;
    - add overflow.
-4. [ ] `discover`: function extents, interior entries, jump-table
+4. [x] `discover`: function extents, interior entries, jump-table
    recognition with failure reporting.
-5. [ ] `emit` plus `psxw_rt.h`, generating C for one function. Compile it
+5. [x] `emit` plus `psxw_rt.h`, generating C for one function. Compile it
    through `psxw-cc` (the normalizer isn't needed, but use the same flags).
-6. [ ] `psxw lift btn --all`: translate every function in every container
+6. [x] `psxw lift btn --all`: translate every function in every container
    (game and SDK ranges). Exit criterion 1.
-7. [ ] `psxw-cc::protos`: prototype facts per TU, unit-tested on census
+7. [x] `psxw-cc::protos`: prototype facts per TU, unit-tested on census
    TUs.
-8. [ ] `psxw-link::object`: code section, function types, code
+8. [x] `psxw-link::object`: code section, function types, code
    relocations.
-9. [ ] `psxw-link` layout: data placement, tentative merge, the AUX
+9. [x] `psxw-link` layout: data placement, tentative merge, the AUX
    allocator.
-10. [ ] `psxw-link` emit plus passes: mask, guest SP, intrinsics, indirect
+10. [x] `psxw-link` emit plus passes: mask, guest SP, intrinsics, indirect
     calls. Test each pass on handcrafted objects.
-11. [ ] Adapters (C↔o32, structs by value, variadic) and the dispatch
+11. [x] Adapters (C↔o32, structs by value, variadic) and the dispatch
     table.
-12. [ ] `psxw link-test btn --function F`: link one pair plus call-outs;
+12. [x] `psxw link-test btn --function F`: link one pair plus call-outs;
     validate; run once.
-13. [ ] `psxw-difftest`: generator, runner, comparison, report;
+13. [x] `psxw-difftest`: generator, runner, comparison, report;
     `psxw difftest`.
-14. [ ] Run the full difftest; triage every mismatch to zero unexplained.
-15. [ ] Full-state mode decision. If any function in the boot path needs
+14. [x] Run the full difftest; triage every mismatch to zero unexplained.
+15. [x] Full-state mode decision. If any function in the boot path needs
     non-ABI register passing (detected by entry-register-read analysis),
     implement it; otherwise record that it isn't needed yet.
-16. [ ] `psxw ci btn`: census plus difftest. Update docs and the README
+16. [x] `psxw ci btn`: census plus difftest. Update docs and the README
     status.
 
 ## Exit criteria (all automated)
@@ -388,4 +388,79 @@ adapters.
 
 ## Progress log
 
+- **2026-10-26 (`de56b5a`): translator.**
+  - binaryen `version_133` is pinned.
+  - `psxw-lift` covers decode, discovery to a fixed point, delay-slot-aware
+    control flow, jump tables, constants/liveness/load-delay analysis,
+    o32-form C emission and `psxw_rt.h`.
+  - `psxw lift btn --all`: 3,359 functions, all compiling.
+- **2026-10-26 (`ef75c1e`): linker and differential harness.**
+  - `psxw-cc::protos` reads prototype facts from clang's IR.
+  - `psxw-link`: full object reader, layout (named, content-matched,
+    AUX), rewrite passes, o32 marshaling, harness-mode link, GCC
+    conventions.
+  - `psxw-difftest`: shards, wasmtime runner with dirty-page snapshots,
+    seeded ABI-shaped inputs, comparison, and `--verbose` explanations.
+  - Triage of all mismatches into rules and fixes (see Findings).
+- **2026-10-26: gate and documentation.**
+  - R3000 semantics tests (`tests/semantics.rs`) and linker pass tests
+    (`tests/link_passes.rs`).
+  - `psxw link-test`, and `psxw ci btn` (inputs, census, lift, difftest,
+    unit tests, oracle): PASS in 38 s.
+  - Design, decisions (D33–D37) and README status updated.
+
 ## Findings
+
+- **Exit numbers.**
+  - Lift: 3,359 functions, 164,741 instructions, 178 jump tables, 3
+    indirect tail calls (all SDK), 208 indirect calls, 63 BIOS calls; 21
+    fall-throughs into the next function.
+  - I/O sites: in `libpad/pdresres`, `libmcx/mcxmain` and `libmcx/mcxdsr`.
+  - BIOS-kernel sites: in `libapi/first`, `libcard/patch` and
+    `libmcx/mcxdsr`.
+  - Difftest at 64 seeds: 2,567 pass, 3 excluded with evidence.
+- **Full-state mode is not needed (task 15).** Inline expansion covers
+  register passing (D33): 13 functions inline a callee.
+- **Mismatch classes and their dispositions**, all general unless noted:
+  - **Global register variables** (`CAPTURE_PREV_RET`, a v0 channel
+    across calls) and **register-capture locals:** lifted (D35).
+  - **`-Wreturn-type` functions** (the original returns the leftover
+    v0): lifted.
+  - **Soft-float:** one C function did double arithmetic; the original
+    calls the game's `__adddf3`/`__floatsidf`/…, so it was lifted.
+  - **Clang behaviour that changes the call sequence:** inlining,
+    deletion of calls to side-effect-free functions, IPSCCP, and
+    tail-recursion elimination. Handled by the harness's
+    function-at-a-time compile (D34). These clang transformations remain
+    legal in the game build.
+  - **GCC 2.95 builtins:** `memcpy` with a constant size was expanded
+    inline, so the linker reproduces it (D36).
+  - **Division by zero:** GCC/ASPSX checks it with `break 7` and
+    continues with the R3000's results; clang traps. The linker
+    reproduces the checks (D36). Clang may move or merge a trapping
+    division, so `break` events compare as a set.
+  - **Bug:** splat auto-name resolution matched clang's
+    `.Lswitch.table.<func>_<ADDR>`. Auto-names are now C identifiers only.
+  - **Bug:** jump-table recovery lost the index when a conditional path
+    set it to a constant; shifts no longer constant-fold in the window.
+  - **Harness bugs fixed:**
+    - the guard page past the window wasn't tracked;
+    - inline copies didn't mark their pages;
+    - adapter stack writes weren't restored between sides.
+  - **Excluded (3):** local-array UB reachable only with inputs outside
+    the function's contract (`Rand(n)` answered out of range, impossible
+    asset data). See `games/btn/game.toml [difftest.exclude]`.
+- **For M2 (copied to its Context):**
+  - **gp:** `__start` sets gp to `0x8005E274` (from code, not splat).
+  - **Narrow arguments:** the decomp's prototypes sometimes differ in
+    width or signedness from what GCC compiled against (a `u16` param the
+    original passes sign-extended). At C→translated edges the callee may
+    see differently-extended arguments. Expect `ramdiff` to catch any that
+    matter.
+  - **Call naming:** translated code calls `psxw_f_<ADDR>` (and
+    `psxw_d_<ADDR>` from the EXE into overlay slots); the game link binds
+    each to a tier.
+  - **Missing link features:** the dispatch table, imports, and Rust
+    objects (harness mode has none). Overlay function pointers are MIPS
+    addresses that collide across overlays, so the dispatch table needs
+    the overlay stub.

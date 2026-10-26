@@ -182,6 +182,9 @@ editing sources. The rules found in M0:
 - functions with real asm or GNU nested functions are lifted, inner
   nested functions included.
 
+M1 added four lift rules, each for C that can't say what the original does
+(see D35).
+
 **D29. Host support functions.** GCC inlined some builtins (`abs`,
 `labs`, `fabs`), so the original binaries carry no copy; the runtime
 supplies them.
@@ -196,6 +199,57 @@ game-derived is ever committed.
 
 **D32. No filesystem searching.** Inputs outside psx-wasm and the named
 decomp repos come from paths the human supplies.
+
+**D33. Register passing is handled by inline expansion, not full-state
+mode** (M1 task 15). A function with no C is expanded into its callers when
+there's evidence of register passing:
+- a caller writes, before the call, a register the callee reads on entry;
+- or a caller reads, after the call, a register the callee writes.
+
+Registers are shared and `jr ra` dispatches over the return sites, which is
+the hardware's behaviour. C-defined functions never inline. *Why:* btn needs
+it only for libgte `msc02` (helper in/out via `t0`–`t2`), the BIOS GTE patch
+stub, and 7 undecompiled game functions. A memory register file would cost
+every translated function. (design §4)
+
+**D34. The differential harness compares function by function.** Every
+call is a logged call-out, answered identically to both sides:
+- **The C side** is compiled as if alone: non-static definitions are made
+  `weak`, with `-fno-inline-functions -fno-optimize-sibling-calls`.
+- **Inputs follow the o32 contract:** narrow arguments are extended to
+  their declared type; pointer parameters and pointer-returning callees get
+  NULL or real pointers.
+- **The comparison:** return values masked to the declared kind, call-out
+  sequences (stack addresses equivalent, narrow arguments compared at their
+  declared width, `break` events compared as a set of codes), and every
+  page either side touched, apart from the stack.
+
+*Why:* this is what isolates a single function's semantics. Each relaxation
+has a recorded reason in `crates/psxw-difftest`.
+
+**D35. Normalizer lift rules from M1:**
+- functions using a GNU global register variable (`global-register`);
+- functions reading a local register variable they never assign
+  (`register-capture`);
+- non-void functions that can fall off the end (`return-type`);
+- C float arithmetic when the reference flags say `-msoft-float`
+  (`soft-float`).
+
+*Why:* in each case the C has no defined equivalent of the original's
+register or soft-float behaviour. These are GNU C and GCC idioms, so they're
+rules, not pins. (design §4)
+
+**D36. GCC conventions are reproduced at link time** for C inputs (the
+`Gcc` struct in `psxw-link`):
+- **Divisions** give the R3000's results with the original assembler's
+  `break` checks. The convention is measured from the translations: ASPSX
+  checks zero with code 7; GNU as also checks INT_MIN / -1, with 6 << 10.
+- **Constant-size `memcpy`** is expanded inline, as GCC's builtin did,
+  unless the reference flags say `-fno-builtin`.
+- **`main` calls `__main` first.**
+
+**D37. wasmtime 47** (the newest supporting the pinned Rust 1.94.1; 48+
+need newer rustc). Raising Rust would be a separate decision.
 
 ## Open questions (tracked)
 

@@ -193,7 +193,8 @@ fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, f: &mut Facts) {
                 }
             }
         }
-        if i.writes() == Some(28) {
+        // The %hi half of `lui gp; addiu gp` isn't a gp value.
+        if i.writes() == Some(28) && i.op != Op::Lui {
             let mut after = *st;
             step(i, n.pc(), &mut after);
             if let Some(v) = after[28] {

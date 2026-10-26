@@ -277,7 +277,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let gp = translations
         .iter()
         .find(|t| t.func.container == inputs.map.main && t.func.addr == inputs.exe.pc0)
-        .and_then(|t| t.facts.gp_writes.iter().next().copied())
+        .and_then(|t| t.facts.gp_writes.iter().next_back().copied())
         .unwrap_or(0);
 
     // Original images per container: the EXE always, plus the overlay.

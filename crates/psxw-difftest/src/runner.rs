@@ -174,6 +174,12 @@ impl Harness {
         Ok(self.instance.get_typed_func(&mut self.store, name)?)
     }
 
+    /// Guest memory at a guest address.
+    pub fn read(&self, addr: u32, len: usize) -> Vec<u8> {
+        let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE;
+        self.memory.data(&self.store)[at..at + len].to_vec()
+    }
+
     pub fn snapshot_page(&self, p: usize) -> &[u8] {
         let start = p * PAGE;
         let end = (start + PAGE).min(self.snapshot.len());
