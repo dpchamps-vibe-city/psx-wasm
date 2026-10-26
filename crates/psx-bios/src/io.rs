@@ -238,12 +238,17 @@ impl<S: Sdk> Machine<S> {
                 }
             }
             (dma::GPU, 2, true) => {
+                let mut recording = self.gpu_record_start();
                 let mut nodes = 0;
                 loop {
                     let header = self.mem.r32(addr);
+                    let word = |m: &Self, i: u32| m.mem.r32(addr.wrapping_add(4 * i) & 0x1F_FFFC);
                     for i in 1..=(header >> 24) {
-                        let w = self.mem.r32(addr.wrapping_add(4 * i) & 0x1F_FFFC);
+                        let w = word(self, i);
                         self.gp0(w);
+                    }
+                    if let Some((_, rec)) = recording.as_mut() {
+                        rec.push((1..=(header >> 24)).map(|i| word(self, i)).collect());
                     }
                     nodes += 1;
                     if header & 0x80_0000 != 0 {
@@ -253,6 +258,9 @@ impl<S: Sdk> Machine<S> {
                         return Err(format!("GPU DMA linked list at {:#010x} does not end", d.madr[ch]));
                     }
                     addr = header & 0x1F_FFFC;
+                }
+                if let Some((state, rec)) = recording {
+                    self.host.gpu_record(&state, &rec);
                 }
                 if let Some(io) = self.io.as_mut() {
                     io.dma.madr[ch] = 0x00FF_FFFF;
@@ -303,6 +311,21 @@ impl<S: Sdk> Machine<S> {
             }
         }
         Ok(())
+    }
+
+    /// When the run records GPU batches and the host wants this one: the
+    /// state it starts from, with everything before it submitted.
+    fn gpu_record_start(&mut self) -> Option<(Vec<u32>, Vec<Vec<u32>>)> {
+        if self.opts.trace & psxw_abi::BootOptions::TRACE_RECORD_GPU == 0 {
+            return None;
+        }
+        let io = self.io.as_mut()?;
+        let state = io.gpu.recordable_state()?;
+        let words = io.gpu.take_commands();
+        if !words.is_empty() {
+            self.host.render_submit(&words);
+        }
+        self.host.gpu_record_begin().then(|| (state.to_vec(), Vec::new()))
     }
 
     /// Run the SPU up to the current cycle: one tick per 768 cycles, each

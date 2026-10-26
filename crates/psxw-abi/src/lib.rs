@@ -27,7 +27,10 @@ pub mod replay;
 ///   `guest.guest_invoke_irq`, `psx.return_from_exception`, and wasm
 ///   exception handling in the module.
 /// - 5: audio output, `host.audio` (M6).
-pub const ABI_VERSION: u32 = 5;
+/// - 6: GPU draw recording, [`render::imports`] `gpu_record_begin` and
+///   `gpu_record` (M4), offered when [`BootOptions::TRACE_RECORD_GPU`] is
+///   set.
+pub const ABI_VERSION: u32 = 6;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -220,13 +223,16 @@ pub struct BootOptions {
     pub safepoint_quantum: u32,
     /// Bit 0: trap on I/O-window accesses; bit 1: verify resident overlays.
     pub debug: u32,
-    /// Bit 0: report every BIOS and adapter call.
+    /// Bit 0: report every BIOS and adapter call; bit 1: offer GPU draw
+    /// batches for recording.
     pub trace: u32,
 }
 
 impl BootOptions {
     pub const DEBUG_IO: u32 = 1;
     pub const DEBUG_OVERLAYS: u32 = 2;
+    pub const TRACE_CALLS: u32 = 1;
+    pub const TRACE_RECORD_GPU: u32 = 2;
 }
 
 /// Disc layout, as `disc_info` writes it.

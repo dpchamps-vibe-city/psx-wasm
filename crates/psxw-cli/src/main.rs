@@ -33,6 +33,7 @@ mod serve;
 mod webtest;
 mod oracle;
 mod wholegame;
+mod record;
 
 fn main() {
     if let Err(e) = run() {

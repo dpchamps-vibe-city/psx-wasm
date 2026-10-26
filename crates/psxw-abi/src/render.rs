@@ -245,6 +245,17 @@ pub mod imports {
     /// `(desc_ptr) -> ()`: show a frame described by a
     /// [`PresentDesc`](super::PresentDesc) at `desc_ptr`.
     pub const PRESENT: &str = "present";
+    /// `() -> i32`: a GPU linked-list transfer is about to start, and
+    /// everything before it has been submitted. Nonzero: the host records
+    /// this batch (and takes VRAM as it is now); the runtime then calls
+    /// [`GPU_RECORD`] when the transfer ends. Only called when the run
+    /// records ([`BootOptions::TRACE_RECORD_GPU`](crate::BootOptions)).
+    pub const GPU_RECORD_BEGIN: &str = "gpu_record_begin";
+    /// `(ptr, len) -> ()`: the batch, `len` bytes of little-endian `u32`s:
+    /// the count of state words, the GP0 state words (E1h-E6h) in force
+    /// when it started, then each linked-list node as its word count and
+    /// words.
+    pub const GPU_RECORD: &str = "gpu_record";
 }
 
 /// A VRAM rectangle in a command; `w` and `h` are 1..=1024 and 1..=512.

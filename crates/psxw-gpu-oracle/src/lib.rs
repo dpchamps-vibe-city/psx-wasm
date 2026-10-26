@@ -11,6 +11,7 @@
 //! in the same layout as the target's.
 
 pub mod image;
+pub mod record;
 
 use anyhow::{Context, Result, bail, ensure};
 use psx_devices::gpu::Gpu;

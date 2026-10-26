@@ -38,6 +38,10 @@ unsafe extern "C" {
     fn host_present(desc: *const u8);
     #[link_name = "audio"]
     fn host_audio(ptr: *const u8, frames: usize);
+    #[link_name = "gpu_record_begin"]
+    fn host_gpu_record_begin() -> i32;
+    #[link_name = "gpu_record"]
+    fn host_gpu_record(ptr: *const u8, len: usize);
 }
 
 #[link(wasm_import_module = "guest")]
@@ -104,6 +108,18 @@ impl Host for FfiHost {
     }
     fn audio(&mut self, frames: &[[i16; 2]]) {
         unsafe { host_audio(frames.as_ptr().cast(), frames.len()) }
+    }
+    fn gpu_record_begin(&mut self) -> bool {
+        unsafe { host_gpu_record_begin() != 0 }
+    }
+    fn gpu_record(&mut self, state: &[u32], nodes: &[Vec<u32>]) {
+        let mut words = vec![state.len() as u32];
+        words.extend_from_slice(state);
+        for n in nodes {
+            words.push(n.len() as u32);
+            words.extend_from_slice(n);
+        }
+        unsafe { host_gpu_record(words.as_ptr().cast(), words.len() * 4) }
     }
 }
 

@@ -52,6 +52,27 @@ pub struct Options {
     pub dump_frames: Option<(PathBuf, u64)>,
     /// Write the audio output here as a WAV file.
     pub audio_wav: Option<PathBuf>,
+    /// Record GPU linked-list batches (M4's recording hook; needs a
+    /// renderer with VRAM).
+    pub record_gpu: Option<GpuRecording>,
+}
+
+/// Which GPU batches a run records: the first linked-list transfer at
+/// least `every` frames after the last one recorded, up to `budget`.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuRecording {
+    pub every: u64,
+    pub budget: usize,
+}
+
+/// A recorded GPU linked-list transfer: VRAM before it, the GP0 state
+/// words it started from, and its nodes.
+#[derive(Debug, Clone)]
+pub struct GpuBatch {
+    pub frame: u64,
+    pub vram: Vec<u16>,
+    pub state: Vec<u32>,
+    pub nodes: Vec<Vec<u32>>,
 }
 
 /// An overlay's original text, by guest address.
@@ -89,6 +110,8 @@ pub struct RunReport {
     /// VRAM hashes by frame (with a renderer that has VRAM).
     pub vram_hashes: BTreeMap<u64, String>,
     pub audio: audio::AudioStats,
+    #[serde(skip)]
+    pub gpu_batches: Vec<GpuBatch>,
 }
 
 /// A RAM dump written during the run.
@@ -122,6 +145,9 @@ struct State {
     render: render::RenderStats,
     vram_hashes: BTreeMap<u64, String>,
     audio: Option<audio::Sink>,
+    /// VRAM taken at `gpu_record_begin`, for the batch now running.
+    gpu_vram: Option<Vec<u16>>,
+    gpu_batches: Vec<GpuBatch>,
 }
 
 impl State {
@@ -131,6 +157,8 @@ impl State {
             render: Default::default(),
             vram_hashes: BTreeMap::new(),
             audio: None,
+            gpu_vram: None,
+            gpu_batches: vec![],
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -212,7 +240,8 @@ fn boot_options(store: &mut Store<State>, instance: &wasmtime::Instance, opts: &
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, psxw_abi::exports::ALLOC)?;
     let ptr = alloc.call(&mut *store, std::mem::size_of::<BootOptions>() as u32)?;
     let b = opts.boot;
-    let words = [b.cd_timing, b.video, b.safepoint_budget, b.safepoint_quantum, b.debug, b.trace];
+    let trace = b.trace | if opts.record_gpu.is_some() { BootOptions::TRACE_RECORD_GPU } else { 0 };
+    let words = [b.cd_timing, b.video, b.safepoint_budget, b.safepoint_quantum, b.debug, trace];
     let memory = instance.get_memory(&mut *store, "memory").context("no memory")?;
     for (i, w) in words.iter().enumerate() {
         memory.data_mut(&mut *store)[ptr as usize + 4 * i..ptr as usize + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
@@ -243,6 +272,7 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
         render: s.render,
         vram_hashes: s.vram_hashes,
         audio: s.audio.map(audio::Sink::finish).unwrap_or_default(),
+        gpu_batches: s.gpu_batches,
     }
 }
 
@@ -449,6 +479,40 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         let bytes: Vec<u8> = px.iter().flat_map(|p| p.to_le_bytes()).collect();
         let m = mem(&mut c);
         m.data_mut(&mut c)[dst as usize..dst as usize + bytes.len()].copy_from_slice(&bytes);
+        Ok(())
+    })?;
+    linker.func_wrap(h, ri::GPU_RECORD_BEGIN, |mut c: Caller<'_, State>| -> wasmtime::Result<i32> {
+        let s = c.data_mut();
+        let Some(rec) = s.opts.record_gpu else { return Ok(0) };
+        let due = s.gpu_batches.last().is_none_or(|b| s.frame >= b.frame + rec.every);
+        if s.gpu_batches.len() >= rec.budget || !due {
+            return Ok(0);
+        }
+        let r = s.renderer.clone();
+        let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+        let all = psxw_abi::render::Rect { x: 0, y: 0, w: 1024, h: 512 };
+        let vram = r.readback(all).map_err(|e| wasmtime::Error::msg(format!("gpu_record_begin: {e:#}")))?;
+        drop(r);
+        // A renderer without VRAM (the null renderer) has nothing to record.
+        if vram.len() != 1024 * 512 {
+            return Ok(0);
+        }
+        c.data_mut().gpu_vram = Some(vram);
+        Ok(1)
+    })?;
+    linker.func_wrap(h, ri::GPU_RECORD, |mut c: Caller<'_, State>, ptr: u32, len: u32| -> wasmtime::Result<()> {
+        let bytes = read_bytes(&mut c, ptr, len);
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let s = c.data_mut();
+        let Some(vram) = s.gpu_vram.take() else { return Ok(()) };
+        let mut it = words.into_iter();
+        let n = it.next().unwrap_or(0) as usize;
+        let state: Vec<u32> = it.by_ref().take(n).collect();
+        let mut nodes = Vec::new();
+        while let Some(k) = it.next() {
+            nodes.push(it.by_ref().take(k as usize).collect());
+        }
+        s.gpu_batches.push(GpuBatch { frame: s.frame, vram, state, nodes });
         Ok(())
     })?;
     linker.func_wrap(h, ri::PRESENT, |mut c: Caller<'_, State>, ptr: u32| -> wasmtime::Result<()> {

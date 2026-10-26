@@ -12,6 +12,7 @@
 //! psxw oracle ci                        images verify + selftest + capture (the oracle's CI gate)
 //! psxw oracle play <game> …             the game under the emulator from a replay (wholegame.rs)
 //! psxw oracle ramdiff <game> …          psx-wasm's RAM vs the emulator's, by symbol (wholegame.rs)
+//! psxw oracle record <game> …           GPU vectors from a native run (record.rs)
 //! psxw oracle export --out DIR [--set S]… [--kind K] [--missing-hw]
 //!                                       batches for capture on a contributor's console (M10)
 //! psxw oracle import DIR                their results, as hw-<rig> goldens
@@ -27,7 +28,7 @@ use std::path::Path;
 
 pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images verify | selftest [--seed N] [--count N] \
                          | capture [--kind K] [--missing] | check <game> --device D | ci \
-                         | play <game> … | ramdiff <game> … \
+                         | play <game> … | ramdiff <game> … | record <game> … \
                          | export --out DIR [--set S].. [--kind K] [--missing-hw] | import DIR | disagree";
 
 /// psx-wasm's device implementations the oracle can check. They start
@@ -221,6 +222,8 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<()> {
             }
         }
         ["play" | "ramdiff", ..] => bail!("usage: psxw oracle {}", crate::wholegame::USAGE),
+        ["record", game, rest @ ..] => crate::record::record_cmd(ws, game, rest)?,
+        ["record", ..] => bail!("usage: psxw oracle {}", crate::record::USAGE),
         _ => bail!("usage: psxw {USAGE}"),
     }
     Ok(())

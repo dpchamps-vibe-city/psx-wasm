@@ -1,7 +1,7 @@
 # M4 — Pixels
 
-**Status:** in progress (tasks 1–7 and 9 done; the GTE and the GPU are wired
-into the runtime)
+**Status:** in progress (tasks 1–10 and 12–13 done; task 11 is blocked on
+CD timing, D48)
 **Depends on:** M2, M3. **Unlocks:** M5, M7.
 **Design refs:** design: Runtime (gpu, gte, sio), §5 (adapters), Oracles
 (per-device status); decisions D12, D13, D20–D24.
@@ -221,8 +221,10 @@ golden.
    adapters; `psxw conform btn --lib libpad` passes. libapi's pad members
    serve the BIOS pad driver, which the HLE BIOS implements. The optional
    window input comes with the native window.)*
-10. [ ] GPU recording hook. Author the `title-to-gameplay` replay; record
-    vectors; capture goldens; reach zero failures.
+10. [x] GPU recording hook. Author the `title-to-gameplay` replay; record
+    vectors; capture goldens; reach zero failures. *(`psxw oracle record
+    btn --replay title-to-gameplay`: 99 vectors from the title to walking
+    the farm, all byte-exact against their goldens.)*
 11. [ ] `psxw oracle ramdiff btn --replay title-to-gameplay`, with
     `exclude_symbols` covering only sound-driver state (with reasons).
     Reach zero differences. *(Blocked on CD timing, D48: btn's RNG steps
@@ -426,6 +428,43 @@ golden.
     hacks (hand-written branches), and stay lifted.
   - **The gate works:** with `rtps` deliberately mis-encoded, difftest
     reports `C gte 00380001 vs translated gte 00180001`.
+- **2026-10-26** (`fb7b795`, this commit): task 10.
+  - **The replay:** `games/btn/replays/title-to-gameplay.toml`, a press
+    list on the frame-counter clock, authored from headless frame dumps.
+    It goes through the title, NEW GAME, the opening dialogue, the naming
+    and birthday screens, then walks the farm. `--replay <name>` finds
+    named replays for `psxw run` and every oracle command.
+  - **What the replay found:** a lift defect. `VectorNormalS` branches
+    into code it shares with its neighbour, whose `jr ra` comes after
+    `ra` is restored from `a3`. A `jr ra` outside a function's extent was
+    taken as an inlined callee's return only, so entering gameplay hit
+    `bad_jump`. r31 starts at 0 in lifted code, standing for the caller's
+    return address, so an inlined-return switch now returns on 0.
+  - **The hook (ABI 6):**
+    - With `BootOptions::TRACE_RECORD_GPU`, the runtime offers each GPU
+      linked-list transfer to the host (`gpu_record_begin`) once
+      everything before it is submitted.
+    - If the host takes it, it reads all of VRAM, and the runtime then
+      sends the E1h-E6h state words the transfer started from and its
+      nodes (`gpu_record`). The front end gives those words only between
+      commands, and not under GP1-only state (texture disable, 480i).
+    - The browser hosts never record.
+  - **`psxw_gpu_oracle::record`:**
+    - Makes a list-mode GPU_DRAW: all of VRAM as its initial state, one
+      packet per node.
+    - Reads back every drawing area the batch draws in, plus what its
+      fills, copies and uploads write, split where they wrap.
+    - Skips what the target can't replay as the game ran it: commands
+      over 16 words, VRAM→CPU reads, nodes that split a command, lists
+      over one exchange.
+  - **`psxw oracle record <game> [--replay R] [--every F] [--budget N]`**
+    keeps the first transfer at least F frames after the last.
+  - **btn, `title-to-gameplay`:**
+    - Two passes: every 60 frames with a budget of 64, then every 150
+      frames with a budget of 40. 99 vectors; 3 batches were duplicates
+      and 2 drew nothing.
+    - `capture --missing` took their goldens. `check btn --device gpu`:
+      game-btn provisional 99, failed 0.
 
 ## Findings
 

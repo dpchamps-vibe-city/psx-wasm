@@ -8,7 +8,7 @@
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 
-const ABI_VERSION = 5;
+const ABI_VERSION = 6;
 const NOTHING_PRESSED = 0xffff;
 const REPLAY_HEADER = 64; // version 2, entries by vblank (clock 0)
 const WINDOW_BASE = 0x01000000;
@@ -80,6 +80,10 @@ async function scenario(module, rec, ram, replay) {
     present(p) {
       renderer.present(new Uint32Array(mem().slice(p, p + 20)));
     },
+    gpu_record_begin() {
+      return 0;
+    },
+    gpu_record() {},
     audio(p, frames) {
       audio.bytes(bytes(p, frames * 4));
       audioFrames += frames;

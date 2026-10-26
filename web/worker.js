@@ -27,7 +27,7 @@ import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, persist, savesDir } from "./cards.js";
 
-const ABI_VERSION = 5;
+const ABI_VERSION = 6;
 const NOTHING_PRESSED = 0xffff;
 const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";
@@ -232,6 +232,11 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
     present(p) {
       if (!lost) renderer.present(new Uint32Array(mem().slice(p, p + 20)));
     },
+    // GPU recording (ABI 6) is the native host's; the browser never asks.
+    gpu_record_begin() {
+      return 0;
+    },
+    gpu_record() {},
     audio(p, frames) {
       const b = bytes(p, frames * 4);
       audioHash.bytes(b);

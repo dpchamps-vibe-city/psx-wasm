@@ -269,8 +269,10 @@ impl Default for Gpu {
     }
 }
 
-/// Words a GP0 command needs before it can execute (Beetle's table).
-fn command_len(cc: u8) -> usize {
+/// Words a GP0 command needs before it can execute (Beetle's table):
+/// the whole command, except polylines (more vertices until the
+/// terminator) and CPU→VRAM transfers (pixel data after the header).
+pub fn command_len(cc: u8) -> usize {
     match cc {
         0x02 => 3,
         0x20..=0x3F => {
@@ -471,6 +473,28 @@ impl Gpu {
 
     /// Everything emitted so far (the open batch closed), for
     /// `render_submit`.
+    /// The draw state as the GP0 words that set it (E1h-E6h), when a
+    /// recorded batch could start from it: between commands, and with no
+    /// state that only GP1 sets (texture disable, an interlaced 480-line
+    /// display, which skips rows).
+    pub fn recordable_state(&self) -> Option<[u32; 6]> {
+        if !self.fifo.is_empty() || !matches!(self.in_cmd, InCmd::None) || self.tex_disable_allowed || self.display.interlaced_480() {
+            return None;
+        }
+        let p = &self.page;
+        let e1 = p.x64 | p.y256 << 4 | p.abr << 5 | p.mode << 7 | (self.dither as u32) << 9 | (self.draw_to_display as u32) << 10 | self.sprite_flip;
+        let [x0, y0, x1, y1] = self.clip;
+        let (ox, oy) = self.offset;
+        Some([
+            0xE100_0000 | e1,
+            0xE200_0000 | self.window,
+            0xE300_0000 | x0 | y0 << 10,
+            0xE400_0000 | x1 | y1 << 10,
+            0xE500_0000 | (ox as u32 & 0x7FF) | (oy as u32 & 0x7FF) << 11,
+            0xE600_0000 | self.mask_set as u32 | (self.mask_check as u32) << 1,
+        ])
+    }
+
     pub fn take_commands(&mut self) -> Vec<u32> {
         self.flush();
         std::mem::take(&mut self.out)
@@ -1669,5 +1693,16 @@ mod tests {
         let r = draws(&decode(&cmds(&mut g)));
         assert_eq!(r.len(), 1);
         assert_eq!(r[0][0] & prim::KIND_MASK, prim::TRIANGLE);
+    }
+
+    #[test]
+    fn recordable_state_round_trips() {
+        let mut g = Gpu::new();
+        let words = [0xE100_37AF, 0xE20A_BCDE, 0xE300_0000 | 7 << 10 | 3, 0xE400_0000 | 239 << 10 | 319, 0xE500_0000 | 0x7FF << 11 | 5, 0xE600_0003];
+        g.gp0_words(&words);
+        assert_eq!(g.recordable_state(), Some(words));
+        // Mid-command (a quad waiting for its fourth vertex): no state.
+        g.gp0_words(&[0x2800_00FF, 0, 1, 2]);
+        assert_eq!(g.recordable_state(), None);
     }
 }

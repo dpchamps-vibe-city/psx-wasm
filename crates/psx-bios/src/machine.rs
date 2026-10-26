@@ -39,6 +39,14 @@ pub trait Host {
     }
     /// Show a frame.
     fn present(&mut self, _desc: &psxw_abi::render::PresentDesc) {}
+    /// A GPU linked-list transfer is about to start, everything before it
+    /// submitted: whether to record it (M4's recording hook).
+    fn gpu_record_begin(&mut self) -> bool {
+        false
+    }
+    /// The recorded transfer: the GP0 state words it started from, and
+    /// its nodes' words.
+    fn gpu_record(&mut self, _state: &[u32], _nodes: &[Vec<u32>]) {}
     /// Audio frames (left, right) at `psxw_abi::AUDIO_HZ`.
     fn audio(&mut self, _frames: &[[i16; 2]]) {}
 }
