@@ -168,6 +168,8 @@ struct Ctx<'a> {
     synth_ix: HashMap<Synth, u32>,
     sp: u32,
     gp: u32,
+    /// GCC's static chain between lifted functions (psxw_rt.h).
+    chain: u32,
 }
 
 const CALLOUT_IMPORT: u32 = 0;
@@ -240,6 +242,8 @@ impl Resolver for InputResolver<'_, '_> {
             "psxw_sp_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.sp)])),
             "psxw_gp_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.gp)])),
             "psxw_gp_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.gp)])),
+            "psxw_chain_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.chain)])),
+            "psxw_chain_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.chain)])),
             "psxw_call_indirect" => return Ok(Lowered::Call(self.ctx.synth(Synth::Indirect))),
             n if SERVICES.contains(&n) => {
                 return Ok(Lowered::Call(self.ctx.synth(Synth::Service { name, sig: sig.clone() })));
@@ -363,6 +367,7 @@ pub fn link(
         synth_ix: HashMap::new(),
         sp: 0,
         gp: 1,
+        chain: 2,
     };
     let callout_ty = ctx.intern(&FuncType {
         params: vec![wasmparser::ValType::I32; 8],
@@ -453,7 +458,7 @@ pub fn link(
     module.section(&memory);
     let Mode::Harness { sp, gp, .. } = ctx.mode;
     let mut globals = GlobalSection::new();
-    for init in [sp, gp] {
+    for init in [sp, gp, 0] {
         globals.global(
             GlobalType { val_type: ValType::I32, mutable: true, shared: false },
             &ConstExpr::i32_const(init as i32),

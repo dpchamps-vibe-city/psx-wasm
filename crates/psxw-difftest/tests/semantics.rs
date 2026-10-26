@@ -129,7 +129,7 @@ fn run(words: &[u32], args: [u32; 4], data: &[u8]) -> Option<Run> {
     };
     let originals = Originals::from_images(vec![("test".into(), BASE, code.clone())]);
     let func = program.functions("test").remove(0);
-    let t = psxw_lift::translate(&program, &originals, &func, &BTreeMap::new()).expect("translates");
+    let t = psxw_lift::translate(&program, &originals, &func, &BTreeMap::new(), &Default::default()).expect("translates");
     let key: u64 = words.iter().fold(0xcbf2_9ce4_8422_2325, |h, w| (h ^ *w as u64).wrapping_mul(0x100_0000_01b3));
     let dir = std::env::temp_dir().join(format!("psxw-semantics-{key:016x}"));
     let failures = psxw_lift::run::write_and_compile(&ws, &dir, &[&t]).expect("compiles");

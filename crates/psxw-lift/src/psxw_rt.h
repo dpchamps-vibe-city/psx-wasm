@@ -32,6 +32,10 @@ uint32_t psxw_sp_get(void);
 void psxw_sp_set(uint32_t sp);
 uint32_t psxw_gp_get(void);
 void psxw_gp_set(uint32_t gp);
+/* GCC's static chain: a nested function's parent passes its frame in v0,
+ * which the o32 call doesn't carry. Lowered to a guest-register global. */
+uint32_t psxw_chain_get(void);
+void psxw_chain_set(uint32_t v0);
 /* Lowered to `call_indirect` through the dispatch table. */
 uint64_t psxw_call_indirect(uint32_t addr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);
 /* ReturnFromException (B0h:17h): lowered to a wasm `throw` that unwinds to

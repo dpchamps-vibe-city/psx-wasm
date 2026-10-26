@@ -156,6 +156,8 @@ struct Ctx<'a> {
     sp: u32,
     gp: u32,
     budget: u32,
+    /// GCC's static chain between lifted functions (psxw_rt.h).
+    chain: u32,
     o32_ty: u32,
     /// (input, function) of every device-library function.
     device: HashSet<(usize, u32)>,
@@ -252,6 +254,8 @@ impl Resolver for R<'_, '_> {
             "psxw_sp_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.sp)])),
             "psxw_gp_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.gp)])),
             "psxw_gp_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.gp)])),
+            "psxw_chain_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.chain)])),
+            "psxw_chain_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.chain)])),
             "psxw_call_indirect" => return Ok(Lowered::Call(self.ctx.synth(Synth::Indirect))),
             "psxw_return_from_exception" => return Ok(Lowered::Call(self.ctx.synth(Synth::Throw))),
             _ => {}
@@ -628,6 +632,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         sp: 0,
         gp: 1,
         budget: 2,
+        chain: 3,
         o32_ty: 0,
         device: spec
             .device_funcs
@@ -736,7 +741,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     tags.tag(TagType { kind: TagKind::Exception, func_type_idx: unit_ty });
     module.section(&tags);
     let mut globals = GlobalSection::new();
-    for init in [0, 0, spec.budget as i32] {
+    for init in [0, 0, spec.budget as i32, 0] {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));
     }
     module.section(&globals);

@@ -102,6 +102,7 @@ pub fn translate(
     originals: &Originals,
     func: &Function,
     inline: &BTreeMap<(String, u32), u32>,
+    chain: &BTreeSet<String>,
 ) -> Result<Translation, LiftError> {
     let in_code = |a: u32| {
         program.code(&func.container).is_some_and(|c| c.in_text(a))
@@ -140,7 +141,9 @@ pub fn translate(
     for &b in &exceptions.setjmp {
         graph.wanted.insert((func.container.clone(), b + 8, Source::Continuation));
     }
-    let (c, externs) = emit::Emitter::new(&graph, &facts)?.exceptions(exceptions).function(&cname, &comment);
+    let reads_chain = chain.contains(&program::call_symbol(&program.main, &func.container, func.addr));
+    let (c, externs) =
+        emit::Emitter::new(&graph, &facts)?.exceptions(exceptions).chain(chain, reads_chain).function(&cname, &comment);
     Ok(Translation { func: func.clone(), cname, c, graph, facts, externs })
 }
 
@@ -225,7 +228,7 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
             .par_iter()
             .map(|f| {
                 let inline = if f.sources.contains(&Source::Defined) { &no_inline } else { &inline };
-                translate(program, originals, f, inline).map_err(|e| (f.clone(), e))
+                translate(program, originals, f, inline, &BTreeSet::new()).map_err(|e| (f.clone(), e))
             })
             .collect();
 
@@ -321,6 +324,49 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
                     Ok(t) => out.ok.push(t),
                     Err(e) => out.failed.push(e),
                 }
+            }
+            // GCC's static chain: a nested function reads its parent's
+            // frame through v0, which the parent sets before the call and
+            // the o32 call doesn't pass. Its C is unusable (clang has no
+            // nested functions), so it is translated, and so is the parent;
+            // neither is inlined, since decompiled C is otherwise taken to
+            // be ABI-conformant. Every translation that reads v0 on entry
+            // takes it from the caller this way, as the hardware would.
+            let chain: BTreeSet<String> = out
+                .ok
+                .iter()
+                .filter(|t| t.facts.entry_reads & (1 << 2) != 0)
+                .map(|t| program::call_symbol(&program.main, &t.func.container, t.func.addr))
+                .collect();
+            if !chain.is_empty() {
+                let again: Vec<usize> = (0..out.ok.len())
+                    .filter(|&i| {
+                        let t = &out.ok[i];
+                        chain.contains(&program::call_symbol(&program.main, &t.func.container, t.func.addr))
+                            || t.externs.iter().any(|e| chain.contains(e))
+                    })
+                    .collect();
+                let no_inline = BTreeMap::new();
+                let redone: Vec<(usize, Result<Translation, LiftError>)> = again
+                    .par_iter()
+                    .map(|&i| {
+                        let f = &out.ok[i].func;
+                        let inline = if f.sources.contains(&Source::Defined) { &no_inline } else { &out.inline };
+                        (i, translate(program, originals, f, inline, &chain))
+                    })
+                    .collect();
+                let mut dropped = BTreeSet::new();
+                for (i, r) in redone {
+                    match r {
+                        Ok(t) => out.ok[i] = t,
+                        Err(e) => {
+                            out.failed.push((out.ok[i].func.clone(), e));
+                            dropped.insert(i);
+                        }
+                    }
+                }
+                let ok = std::mem::take(&mut out.ok);
+                out.ok = ok.into_iter().enumerate().filter(|(i, _)| !dropped.contains(i)).map(|(_, t)| t).collect();
             }
             return out;
         }
@@ -487,5 +533,56 @@ impl FunctionReport {
             .collect();
         r.load_delay_hazards = t.facts.hazards.len();
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use program::{Code, Start};
+
+    /// A GCC nested function reads its parent's frame through v0, which the
+    /// parent sets before the call (here ahead of a branch, so it isn't
+    /// register passing the inliner sees): the call passes it.
+    #[test]
+    fn static_chain() {
+        const BASE: u32 = 0x8001_0000;
+        let child = BASE + 0x28;
+        let words: [u32; 13] = [
+            0x27BD_FFE8,                              // addiu sp, sp, -24
+            0xAFBF_0010,                              // sw ra, 16(sp)
+            0x03A0_1021,                              // addu v0, sp, zero (the chain)
+            0x1000_0001,                              // b 1f
+            0,                                        // nop
+            0x0C00_0000 | (child >> 2 & 0x03FF_FFFF), // 1: jal child
+            0,                                        // nop
+            0x8FBF_0010,                              // lw ra, 16(sp)
+            0x03E0_0008,                              // jr ra
+            0x27BD_0018,                              // addiu sp, sp, 24
+            0x8C42_0000,                              // child: lw v0, 0(v0)
+            0x03E0_0008,                              // jr ra
+            0,                                        // nop
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let start = |name: &str, size: u32| Start { name: Some(name.into()), size: Some(size), sources: [Source::Symbol].into(), boundary: true };
+        let mut program = Program {
+            main: "test".into(),
+            containers: [(
+                "test".to_string(),
+                Code {
+                    id: "test".into(),
+                    text: vec![BASE..BASE + code.len() as u32],
+                    data: vec![],
+                    starts: [(BASE, start("parent", 0x28)), (child, start("child", 0xC))].into(),
+                },
+            )]
+            .into(),
+        };
+        let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
+        let out = translate_all(&mut program, &originals, &["test".into()]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let c = |a: u32| out.ok.iter().find(|t| t.func.addr == a).map(|t| t.c.clone()).expect("translated");
+        assert!(c(child).contains("r2 = psxw_chain_get()"), "{}", c(child));
+        assert!(c(BASE).contains(&format!("(psxw_chain_set(r2), psxw_f_{child:08X}(r4, r5, r6, r7))")), "{}", c(BASE));
     }
 }

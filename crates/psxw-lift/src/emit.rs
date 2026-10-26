@@ -36,6 +36,8 @@ pub struct Exceptions {
     pub continuation: bool,
 }
 
+static NO_CHAIN: BTreeSet<String> = BTreeSet::new();
+
 /// `setjmp`'s buffer: register and byte offset.
 const JMP_BUF: [(u8, u32); 12] =
     [(31, 0), (29, 4), (30, 8), (16, 12), (17, 16), (18, 20), (19, 24), (20, 28), (21, 32), (22, 36), (23, 40), (28, 44)];
@@ -44,6 +46,12 @@ pub struct Emitter<'a> {
     g: &'a Graph,
     facts: &'a Facts,
     x: Exceptions,
+    /// Call symbols of the translations that take GCC's static chain in v0
+    /// (lib.rs `translate_all`): calls to them pass v0 with
+    /// `psxw_chain_set`.
+    chain: &'a BTreeSet<String>,
+    /// This function is one of them: its entry v0 is `psxw_chain_get()`.
+    reads_chain: bool,
     preds: BTreeMap<Node, Vec<Node>>,
     skip: BTreeSet<Node>,
     temps: BTreeSet<String>,
@@ -68,6 +76,8 @@ impl<'a> Emitter<'a> {
             g,
             facts,
             x: Exceptions::default(),
+            chain: &NO_CHAIN,
+            reads_chain: false,
             preds,
             skip: BTreeSet::new(),
             temps: BTreeSet::new(),
@@ -78,6 +88,12 @@ impl<'a> Emitter<'a> {
 
     pub fn exceptions(mut self, x: Exceptions) -> Self {
         self.x = x;
+        self
+    }
+
+    pub fn chain(mut self, chain: &'a BTreeSet<String>, reads: bool) -> Self {
+        self.chain = chain;
+        self.reads_chain = reads;
         self
     }
 
@@ -115,6 +131,7 @@ impl<'a> Emitter<'a> {
                     2 => "a1".to_string(),
                     _ => saved(r).unwrap_or_else(|| "0".to_string()),
                 },
+                2 if self.reads_chain => "psxw_chain_get()".to_string(),
                 4..=7 => format!("a{}", r - 4),
                 28 => "psxw_gp_get()".to_string(),
                 29 => "psxw_sp_get()".to_string(),
@@ -308,7 +325,11 @@ impl<'a> Emitter<'a> {
         match c {
             Callee::Direct { symbol, .. } => {
                 self.externs.insert(symbol.clone());
-                format!("{symbol}(r4, r5, r6, r7)")
+                if self.chain.contains(symbol) {
+                    format!("(psxw_chain_set(r2), {symbol}(r4, r5, r6, r7))")
+                } else {
+                    format!("{symbol}(r4, r5, r6, r7)")
+                }
             }
             Callee::Indirect { .. } => "psxw_call_indirect(t_, r4, r5, r6, r7)".into(),
             Callee::Bios { table } => format!("psxw_bios(0x{table:02X}u, r9, r4, r5, r6, r7)"),
