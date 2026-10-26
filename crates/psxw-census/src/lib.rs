@@ -5,6 +5,7 @@
 //! compiler. Read-only: nothing is linked or run.
 
 mod checks;
+pub mod layout;
 pub mod report;
 
 use anyhow::{Context as _, Result};

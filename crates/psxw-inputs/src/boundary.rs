@@ -28,6 +28,17 @@ pub struct Boundary {
     library: BTreeMap<String, Entry>,
     #[serde(default)]
     object: BTreeMap<String, Entry>,
+    /// The structs adapters touch, for `psxw layout`.
+    pub layout: Option<LayoutSection>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LayoutSection {
+    /// SDK headers, under the game's probe include dir.
+    pub headers: Vec<String>,
+    pub structs: Vec<String>,
+    /// The generated Rust module, relative to the workspace.
+    pub output: String,
 }
 
 impl Boundary {

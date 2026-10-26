@@ -59,3 +59,16 @@ policy = "guest"
 
 [library.libmath]
 policy = "guest"
+
+# The structs adapters read and write, generated into Rust constants by
+# `psxw layout <game>` from the game's SDK headers (offsets checked equal
+# under the matching compiler and clang). Adapters use these, never
+# hand-written offsets.
+[layout]
+headers = ["psyq/libgpu.h", "psyq/libcd.h", "psyq/libspu.h"]
+structs = [
+  "RECT", "DRAWENV", "DISPENV",
+  "CdlLOC", "CdlFILE",
+  "SpuVolume", "SpuVoiceAttr", "SpuReverbAttr", "SpuExtAttr", "SpuCommonAttr",
+]
+output = "crates/sdk-psyq/src/layout.rs"

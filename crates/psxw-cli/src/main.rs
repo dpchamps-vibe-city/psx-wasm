@@ -21,7 +21,7 @@
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! ```
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use psxw_inputs::{Workspace, snapshot, toolchain};
 
 mod ci;
@@ -161,6 +161,21 @@ fn run() -> Result<()> {
                 };
                 println!("{pc:08X}: {w:08X}  {}{mark}", psxw_lift::decode::disasm(&insn, pc));
             }
+        }
+        ["layout", game] => {
+            let manifest = ws.game(game)?;
+            let path = manifest.game.boundary.clone().context("the game has no boundary")?;
+            let boundary = psxw_inputs::boundary::Boundary::load(&ws.root.join(&path))?;
+            let l = boundary.layout.context("the boundary has no [layout]")?;
+            let layouts = psxw_census::layout::sdk_layout(&ws, game, &l.headers, &l.structs)?;
+            let pin = ws.game_pin(&manifest)?;
+            let provenance = format!("From {} @ {}, headers {} ({}).", manifest.game.id, pin.short(), l.headers.join(", "), path.display());
+            let out = ws.root.join(&l.output);
+            std::fs::write(&out, psxw_census::layout::rust_module(&layouts, &provenance))?;
+            for s in &layouts {
+                println!("{:<14} size {:>3}, {} fields ({})", s.name, s.size, s.fields.len(), s.header);
+            }
+            eprintln!("wrote {}", out.display());
         }
         ["identity", game] => {
             let inputs = psxw_lift::run::load(&ws, game)?;

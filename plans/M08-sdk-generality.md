@@ -1,6 +1,6 @@
 # M8 — SDK generality
 
-**Status:** in progress (tasks 1–3)
+**Status:** in progress (tasks 1–4)
 **Depends on:** M2. Parallel with M4–M7. **Unlocks:** M9.
 **Design refs:** design §4 (the translated SDK cache), §5 (devices, BIOS,
 adapters keyed by object identity; layout generation); decisions D12–D15,
@@ -93,8 +93,9 @@ belongs to whichever milestone first needs them (M9).
    and the missing-adapter error. *(A table rather than a macro:
    `sdk_psyq::validated::VALIDATED`, (member, identity key).)*
 3. [x] Migrate the boundary policy to `boundary/psyq.toml`.
-4. [ ] Layout generator; regenerate the accessors for btn's adapters;
-   drive the conformance diffs to zero.
+4. [x] Layout generator; regenerate the accessors for btn's adapters;
+   drive the conformance diffs to zero. *(Generator and accessors done;
+   adapters use them. Conformance exists for libpad only, see M4.)*
 5. [ ] The PsyQ `.LIB` converter in Docker, pinned; `psxw-lift`
    relocatable mode; the translated-SDK cache; link btn from the cache and
    check that the result is identical in behaviour (difftest plus
@@ -172,6 +173,14 @@ belongs to whichever milestone first needs them (M9).
     unchanged. 9 functions touch hardware with no adapter, all
     unreachable: libcard `patch`, libapi `first` and libmcx internals,
     reached only through replaced entry points.
+  - **Task 4:** `psxw layout <game>` probes the structs that the
+    boundary's `[layout]` names (`psxw-census::layout`, the census's
+    probe), keeping values only where GCC 2.95 and clang agree. It writes
+    `crates/sdk-psyq/src/layout.rs`: per struct, `SIZEOF`, `ALIGNOF` and a
+    constant per field. There are 10 structs from btn's PsyQ headers (RECT,
+    DRAWENV, DISPENV, CdlLOC, CdlFILE and the Spu attribute structs). The
+    libgpu and libcd adapters now use them; the remaining adapters will
+    too as they're written.
   - **Task 6 is parked:** psyq-decomp's C names data relative to its
     member (`D_000031F0`, `RO_STR_00003064`, `func_0000046C`) in a layout
     its gitignored build defines. Placing that C in a game means mapping

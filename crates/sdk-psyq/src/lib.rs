@@ -19,6 +19,7 @@ pub mod libcd;
 pub mod libetc;
 pub mod libgpu;
 pub mod libmc;
+pub mod layout;
 pub mod libspu;
 pub mod validated;
 

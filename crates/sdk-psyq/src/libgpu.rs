@@ -60,7 +60,8 @@ fn start(m: &mut M, _a: [u32; 4]) -> Result {
 }
 
 fn store_image(m: &mut M, a: [u32; 4]) -> Result {
-    let (w, h) = (m.mem.r16(a[0] + 4) as usize, m.mem.r16(a[0] + 6) as usize);
+    use crate::layout::rect;
+    let (w, h) = (m.mem.r16(a[0] + rect::W) as usize, m.mem.r16(a[0] + rect::H) as usize);
     m.mem.write(a[1], &vec![0; w * h * 2]);
     start(m, a)
 }

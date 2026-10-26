@@ -364,8 +364,8 @@ fn zero(_m: &mut M, _a: [u32; 4]) -> Result {
     ret(0)
 }
 
-/// `CdlFILE *CdSearchFile(CdlFILE *fp, char *name)`: `{CdlLOC pos; u_long
-/// size; char name[16]}`. Reading the directory takes drive time.
+/// `CdlFILE *CdSearchFile(CdlFILE *fp, char *name)`. Reading the directory
+/// takes drive time.
 fn cd_search_file(m: &mut M, a: [u32; 4]) -> Result {
     let (fp, name_ptr) = (a[0], a[1]);
     let name = String::from_utf8_lossy(&m.mem.cstr(name_ptr, 64)).into_owned();
@@ -373,11 +373,15 @@ fn cd_search_file(m: &mut M, a: [u32; 4]) -> Result {
     let found = cd::find(&mut HostDisc(&mut *m.host), &name);
     let Some(e) = found.filter(|e| !e.dir) else { return ret(0) };
     let msf = cd::lba_to_msf(e.lba);
-    m.mem.write(fp, &[msf[0], msf[1], msf[2], 0]);
-    m.mem.w32(fp + 4, e.size);
+    use crate::layout::{cdl_file, cdl_loc};
+    m.mem.write(fp + cdl_file::POS, &[0; cdl_loc::SIZEOF as usize]);
+    m.mem.w8(fp + cdl_file::POS + cdl_loc::MINUTE, msf[0]);
+    m.mem.w8(fp + cdl_file::POS + cdl_loc::SECOND, msf[1]);
+    m.mem.w8(fp + cdl_file::POS + cdl_loc::SECTOR, msf[2]);
+    m.mem.w32(fp + cdl_file::SIZE, e.size);
     let mut n = e.name.as_bytes().to_vec();
-    n.resize(16, 0);
-    m.mem.write(fp + 8, &n);
+    n.resize((cdl_file::SIZEOF - cdl_file::NAME) as usize, 0);
+    m.mem.write(fp + cdl_file::NAME, &n);
     // A directory walk is a few sector reads after a seek.
     let reads = (m.sdk.cd.sectors - before).max(3);
     let t = m.clock.now + m.drive.seek_cycles(m.drive.head, e.lba) + reads * m.drive.sector_cycles();
