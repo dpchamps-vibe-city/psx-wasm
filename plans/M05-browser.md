@@ -124,3 +124,41 @@ produces. Its devices are already gated by M4's oracles.
 ## Progress log
 
 ## Findings
+
+### From M4's GPU backend (2026-10-26)
+
+- **`psx-render-gl` needs only WebGL2 core, no extensions.** It uses:
+  - an `R16UI` 1024×512 colour target plus an `R16UI` read copy, blitted
+    (`NEAREST`) between framebuffers;
+  - an `RGBA32UI` 1024×64 texture holding the primitive setup records;
+  - `texelFetch` on `usampler2D` in both stages, and an integer
+    fragment output;
+  - `clearBufferuiv`;
+  - `gl_VertexID`/`gl_InstanceID` with no vertex attributes (a bound
+    VAO);
+  - shaders in GLSL ES 3.00, integer arithmetic only, with 64-bit edge
+    arithmetic emulated in 32 bits.
+- **Check early on real browsers:**
+  - `int(uint)` must keep the bit pattern (Mesa does; ANGLE's D3D and
+    Metal back ends should be confirmed by the cross-host determinism
+    check);
+  - shader compile time and per-call validation overhead. The fragment
+    shader fetches up to 11 setup texels per pixel, and self-feedback
+    primitives draw one row per call.
+- **Readback:** `readPixels` uses `RED_INTEGER`/`UNSIGNED_SHORT` when the
+  implementation offers it for `R16UI`, else `RGBA_INTEGER`/
+  `UNSIGNED_INT` (16 bytes a pixel). `render_readback` must be
+  synchronous, which `readPixels` on an OffscreenCanvas context in the
+  worker is.
+- **Present:** `PRESENT` renders the display area (15- or 24-bit) into an
+  RGBA8 texture whose row 0 is the picture's bottom row, ready to blit
+  to a default framebuffer. The final blit to the canvas is still to
+  write (`Renderer::gl()` exposes the context). `PresentDesc` gives the
+  visible width and height from GP1(06h)–(08h).
+- **Imports to implement:**
+  - `render_submit(ptr, len)`: `Renderer::execute` on the words;
+  - `render_readback(x, y, w, h, dst)`: `Renderer::read_vram`;
+  - `present(desc_ptr)`: a `PresentDesc` of 5 `u32`s.
+
+  Names are in `psxw_abi::render::imports`. M4's Findings,
+  "Integration", has the front end side.

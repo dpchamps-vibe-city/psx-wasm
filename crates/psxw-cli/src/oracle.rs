@@ -25,10 +25,10 @@ pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images 
                          | capture [--kind K] [--missing] | check <game> --device D | ci \
                          | play <game> … | ramdiff <game> …";
 
-/// psx-wasm's device implementations the oracle can check (gpu in M4, spu
-/// in M6 still to come).
-fn devices() -> Vec<Box<dyn DeviceUnderTest>> {
-    vec![Box::new(psxw_oracle::gte::Device)]
+/// psx-wasm's device implementations the oracle can check (spu joins in
+/// M6). They start lazily: only the checked device runs.
+fn devices(ws: &Workspace) -> Vec<Box<dyn DeviceUnderTest>> {
+    vec![Box::new(psxw_oracle::gte::Device), Box::new(psxw_gpu_oracle::GpuDevice::new(ws))]
 }
 
 fn finish(report: &Report, path: &Path) {
@@ -111,7 +111,7 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<()> {
             }
         }
         ["check", game, "--device", device] => {
-            let mut impls = devices();
+            let mut impls = devices(ws);
             let checked = commands::check(ws, game, device, &mut impls)?;
             finish(&checked.report, &checked.path);
             if !checked.implemented {

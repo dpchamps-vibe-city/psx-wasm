@@ -11,6 +11,7 @@
 pub mod commands;
 pub mod exact;
 pub mod golden;
+pub mod gpu_synth;
 pub mod gte;
 pub mod handwritten;
 pub mod hash;

@@ -4,6 +4,7 @@
 
 use crate::exact;
 use crate::golden::{EXACT_TARGET, Provenance};
+use crate::gpu_synth;
 use crate::gte;
 use crate::handwritten;
 use crate::images;
@@ -136,6 +137,7 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     let store = store(ws);
     handwritten::install(&store)?;
     let gte_note = install_gte(&store)?;
+    let synthetic = gpu_synth::install(&store)?;
     let mut target = DockerTarget::open(ws)?;
     let tid = target.id().to_string();
     let ids: Vec<VectorId> = store.vector_ids()?;
@@ -204,6 +206,11 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
         report.add(entry(verdict, &format!("{reference:?}").to_lowercase(), detail));
     }
     report.notes.push(format!("{new} captured, {same} reproduced byte for byte, {changed} changed"));
+    report.notes.push(format!(
+        "synthetic GPU vectors: {synthetic} ({} per generator, seed {:#018x})",
+        gpu_synth::PER_GENERATOR,
+        gpu_synth::SEED
+    ));
     let path = report.write(&report_dir(ws, &["capture"]))?;
     Ok((report, path))
 }
@@ -231,8 +238,9 @@ pub struct Checked {
 
 /// `psxw oracle check <game> --device D`: run psx-wasm's implementation on
 /// every archived vector of the device (the game's recorded set plus the
-/// harness's handwritten and selftest sets) and judge it against the
-/// strongest golden: exact, hardware, then this pin's emulator.
+/// harness's handwritten, selftest and synthetic sets) and judge it
+/// against the strongest golden: exact, hardware, then this pin's
+/// emulator.
 pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn DeviceUnderTest>]) -> Result<Checked> {
     ws.game(game).with_context(|| format!("unknown game {game}"))?;
     if !DEVICES.contains(&device) {

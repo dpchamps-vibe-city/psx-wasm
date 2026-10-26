@@ -45,6 +45,14 @@ commit = "8a86b7ec1d246eb5ae9b213cac27aa2f7854a176"
 nugget_repo = "https://github.com/pcsx-redux/nugget"
 nugget_commit = "4dc70d2931121a0fde858a0354192b6df4fa22e8"
 
+[oracle.render_gl]
+# The GPU backend's headless image, psxw-render-gl (plans/M04-pixels.md):
+# Mesa llvmpipe (EGL surfaceless) from the [oracle] Debian snapshot on the
+# same base image, plus this Rust toolchain to build the render server.
+rust_version = "1.94.1"
+rust_url = "https://static.rust-lang.org/dist/rust-1.94.1-x86_64-unknown-linux-gnu.tar.xz"
+rust_sha256 = "294b3d81fa72e62581276290c60c81eb8b58498d333d422ca1dfc432877d0c40"
+
 [oracle.psn00bsdk]
 # The release archive bundles the toolchain (GCC mipsel-none-elf) and
 # mkpsxiso; the image build checks the GCC version.
