@@ -606,6 +606,15 @@ impl Conform {
         self.memory.data_mut(&mut self.store)[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
+    /// The runtime's counters now (BIOS functions, adapters, probes), from
+    /// a mid-run `psxw_report`.
+    pub fn counts(&mut self) -> Result<BTreeMap<String, u64>> {
+        let f = self.instance.get_typed_func::<(), ()>(&mut self.store, "psxw_report")?;
+        f.call(&mut self.store, ())?;
+        let report = self.store.data_mut().events.pop().filter(|e| e["event"] == "report").context("no report")?;
+        Ok(report["counts"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect()).unwrap_or_default())
+    }
+
     /// Vblanks so far.
     pub fn frame(&self) -> u64 {
         self.store.data().frame

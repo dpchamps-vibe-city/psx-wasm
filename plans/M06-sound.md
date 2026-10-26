@@ -126,8 +126,11 @@ unverified.
    voices 1 and 3. Capture goldens; reach zero failures in
    `psxw oracle check --device spu`.
 4. [ ] libspu adapters and conformance (register decoder).
-5. [ ] libsnd tick path through root-counter events. The libsnd functions
+5. [x] libsnd tick path through root-counter events. The libsnd functions
    btn uses must run as translated or C guest code with no traps.
+   *(`psxw conform btn --lib libsnd`: `SsSeqCalledTbyT` runs exactly 60
+   times over 60 vblanks under `SS_TICK60` and 240 under `SS_TICK240`. The
+   sequences btn plays during gameplay run in the disc-gated runs.)*
 6. [ ] SPU recording hook; record btn vectors over `title-to-gameplay`;
    capture; zero failures.
 7. [ ] XA: `ReadS`, filters, decoding, resampling, CD input, real-rate
@@ -212,5 +215,21 @@ unverified.
     hash with the native host's.
   - **Check:** a conformance run (38 vblanks) delivers 28,015 silent
     frames.
+
+- **2026-10-26** (this commit): task 5.
+  - **The libsnd scenario** (`psxw conform btn --lib libsnd`, in the
+    `conform` gate) counts entries to `SsSeqCalledTbyT` through a build
+    probe (`psxw_build::game::Options::probes`, read mid-run with
+    `Conform::counts`). It runs ResetCallback, SsInit, then each tick
+    mode with SsStart for 60 vblanks and SsEnd.
+  - **Both tick sources reach libsnd's tick:**
+    - `SS_TICK60`: libsnd's own vblank callback, through original libetc
+      (D45), ran 60 times;
+    - `SS_TICK240`: root counter 2's events, through libapi's counter
+      adapters and the BIOS event chain, ran 240 times.
+  - **Guest libraries are compared with themselves:** a library whose
+    boundary policy is guest is now built the same on both sides.
+    Forcing libsnd into a device library would send its direct SPU
+    register writes (`_SsInit`) to a bus that has no SPU yet.
 
 ## Findings

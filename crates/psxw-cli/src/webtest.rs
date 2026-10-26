@@ -279,7 +279,9 @@ fn conform(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         }
     }
     let mut recs = Vec::new();
-    for lib in crate::conform::LIBRARIES {
+    // Scenarios that count probe hits need a probed build; the replay runs
+    // the plain game.wasm.
+    for lib in crate::conform::LIBRARIES.iter().filter(|l| crate::conform::probes(l).is_empty()) {
         eprintln!("web-test: recording the {lib} scenario natively");
         recs.push(crate::conform::record(ws, game, lib, 120)?);
     }

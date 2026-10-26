@@ -32,11 +32,14 @@ pub struct Options {
     /// of adapters, with I/O-window accesses routed to the runtime
     /// (`game-orig-<libs>.wasm`, for adapter conformance).
     pub original: Vec<String>,
+    /// More functions, by name, whose entries count in the run report
+    /// (`probe.<addr>`), besides the manifest's main loop.
+    pub probes: Vec<String>,
 }
 
 impl Options {
     pub fn new(game: &str) -> Self {
-        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![] }
+        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![], probes: vec![] }
     }
 
     /// The output name's suffix: `-ubsan`, `-orig-libpad+libetc`.
@@ -47,6 +50,9 @@ impl Options {
         }
         if self.ubsan {
             s += "-ubsan";
+        }
+        if !self.probes.is_empty() {
+            s += "-probed";
         }
         s
     }
@@ -306,6 +312,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             .run
             .main_loop_symbol
             .iter()
+            .chain(&opts.probes)
             .filter_map(|n| {
                 let r = inputs.map.resolve(&inputs.map.main, n)?;
                 let c = r.container.clone().unwrap_or_else(|| inputs.map.main.clone());

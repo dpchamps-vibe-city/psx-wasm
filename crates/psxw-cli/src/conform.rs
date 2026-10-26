@@ -15,10 +15,18 @@ use psxw_host_native::{Conform, Options};
 use psxw_inputs::Workspace;
 use serde::Serialize;
 
-pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd|libetc [--frames N] [--render server] [--dump-frames DIR]";
+pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd|libetc|libsnd [--frames N] [--render server] [--dump-frames DIR]";
 
 /// Libraries with a scenario (the `psxw ci` gate runs each).
-pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd", "libetc"];
+pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd", "libetc", "libsnd"];
+
+/// Functions a scenario counts calls to (build probes): libsnd's tick.
+pub fn probes(lib: &str) -> &'static [&'static str] {
+    match lib {
+        "libsnd" => &["SsSeqCalledTbyT"],
+        _ => &[],
+    }
+}
 
 /// Free RAM for scenario buffers: below the stack, above any game data.
 const SCRATCH: u32 = 0x801C_0000;
@@ -81,6 +89,11 @@ impl Traced {
         self.c.run_vblanks(n)?;
         self.trace.borrow_mut().push(Step::Vblanks { n });
         Ok(())
+    }
+
+    /// Calls so far to a probed function (not a traced step).
+    fn probe_count(&mut self, addr: u32) -> Result<u64> {
+        Ok(self.c.counts()?.get(&format!("probe.{addr:08X}")).copied().unwrap_or(0))
     }
 }
 
@@ -298,6 +311,30 @@ fn libetc(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
     Ok(())
 }
 
+/// libsnd (M6 task 5): the sequencer's tick, which libsnd drives itself
+/// from the vblank (`SS_TICK60` on NTSC) or from root counter 2's events
+/// (`SS_TICK240`). With libetc's interrupts and the BIOS events under it,
+/// `SsSeqCalledTbyT` must run at the mode's rate: 60 or 240 times over 60
+/// vblanks (one NTSC second), give or take a tick.
+fn libsnd(ctx: &Ctx, s: &mut Side, _frames: u32) -> Result<()> {
+    let tick = ctx.addr("SsSeqCalledTbyT")?;
+    s.call(ctx, "ResetCallback", [0; 4])?;
+    s.call(ctx, "SsInit", [0; 4])?;
+    for (mode, name, rate) in [(1u32, "SS_TICK60", 60i64), (2, "SS_TICK240", 240)] {
+        s.call(ctx, "SsSetTickMode", [mode, 0, 0, 0])?;
+        s.call(ctx, "SsStart", [0; 4])?;
+        let before = s.c.probe_count(tick)?;
+        s.c.run_vblanks(60)?;
+        let ticks = (s.c.probe_count(tick)? - before) as i64;
+        s.observe(format!("{name}: ticks over 60 vblanks"), vec![ticks.to_string()]);
+        if (ticks - rate).abs() > 1 {
+            bail!("{name}: SsSeqCalledTbyT ran {ticks} times over 60 vblanks, expected {rate}");
+        }
+        s.call(ctx, "SsEnd", [0; 4])?;
+    }
+    Ok(())
+}
+
 /// The scenario's pad input: nothing, then single buttons, chords and a
 /// long hold (port 1); port 2 idle.
 fn replay(frames: u32) -> Vec<u8> {
@@ -316,6 +353,7 @@ fn scenario_for(lib: &str) -> Result<Scenario> {
         "libgpu" => libgpu,
         "libmcrd" => libmcrd,
         "libetc" => libetc,
+        "libsnd" => libsnd,
         other => bail!("no conformance scenario for {other} yet ({})", LIBRARIES.join(", ")),
     })
 }
@@ -418,9 +456,24 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let inputs = psxw_lift::run::load(ws, game)?;
     let (ram, sp, gp) = start(&inputs)?;
 
-    let adapters = psxw_build::game::build(ws, &psxw_build::game::Options::new(game))?.0.wasm;
-    let opts = psxw_build::game::Options { original: vec![lib.clone()], ..psxw_build::game::Options::new(game) };
-    let original = psxw_build::game::build(ws, &opts)?.0.wasm;
+    let probed = probes(&lib).iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    let base = psxw_build::game::Options { probes: probed.clone(), ..psxw_build::game::Options::new(game) };
+    let adapters = psxw_build::game::build(ws, &base)?.0.wasm;
+    // A library with adapters is compared with its original code over the
+    // devices. Guest code is already original on both sides, and running
+    // it as a device library would route its I/O to devices it may not
+    // have (libsnd writes SPU registers directly).
+    let boundary = match &inputs.manifest.game.boundary {
+        Some(p) => psxw_inputs::boundary::Boundary::load(&ws.root.join(p))?,
+        None => Default::default(),
+    };
+    let guest = boundary.policy(&format!("{lib}/")) == Some(psxw_inputs::boundary::Policy::Guest);
+    let original = if guest {
+        adapters.clone()
+    } else {
+        let opts = psxw_build::game::Options { original: vec![lib.clone()], ..base };
+        psxw_build::game::build(ws, &opts)?.0.wasm
+    };
 
     let ctx = Ctx { inputs: &inputs };
     let dir = ws.out_dir().join("conform").join(game);
