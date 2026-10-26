@@ -407,7 +407,7 @@ fn replay(frames: u32) -> Vec<u8> {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    psxw_oracle::play::replay_from_presses("conform", frames + 2, &presses).expect("valid presses")
+    psxw_oracle::play::replay_from_presses("conform", frames + 2, &presses, 0).expect("valid presses")
 }
 
 type Scenario = fn(&Ctx, &mut Side, u32) -> Result<()>;

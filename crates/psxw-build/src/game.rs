@@ -312,6 +312,9 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             .run
             .main_loop_symbol
             .iter()
+            // libetc's VSync: the boot check counts the game's frame waits
+            // (the SDK's own code runs it, D45, so no adapter counts them).
+            .chain(std::iter::once(&"VSync".to_string()))
             .chain(&opts.probes)
             .filter_map(|n| {
                 let r = inputs.map.resolve(&inputs.map.main, n)?;

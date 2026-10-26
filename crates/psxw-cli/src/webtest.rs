@@ -351,7 +351,7 @@ fn conform(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
 
 /// A replay with nothing pressed for `frames` frames.
 fn psxw_abi_replay_none(frames: u64) -> Vec<u8> {
-    psxw_oracle::play::replay_from_presses("none", frames as u32, &[]).expect("empty replay")
+    psxw_oracle::play::replay_from_presses("none", frames as u32, &[], 0).expect("empty replay")
 }
 
 pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {

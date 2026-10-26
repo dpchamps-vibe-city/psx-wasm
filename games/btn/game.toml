@@ -59,11 +59,12 @@ frame_counter = "D_8006C838+0x8"
 [oracle.exclude_symbols]
 
 # The default replay (psxw oracle play/ramdiff without --replay): the boot
-# sequence, then START and CROSS pulses through the title screen. Any input
-# serves; both sides run the same one.
+# sequence, then START and CROSS pulses through the title screen. Presses
+# are at frame-counter values (the replay's clock is [oracle] frame_counter),
+# so both sides see them at the same game state; `frames` is vblanks run.
 [oracle.replay]
-frames = 3600
-press = ["START@1200", "START@1500", "START@1800", "START@2100", "CROSS@2400", "CROSS@2700", "CROSS@3000", "CROSS@3300"]
+frames = 4200
+press = ["START@400", "START@550", "START@700", "START@850", "CROSS@1000", "CROSS@1150", "CROSS@1300", "CROSS@1450"]
 
 # Per-function tier pins, each with its evidence. Only for function-specific
 # defects; GCC/GNU C idioms get normalizer rules instead.

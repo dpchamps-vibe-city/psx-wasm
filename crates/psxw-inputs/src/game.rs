@@ -49,8 +49,10 @@ pub struct OracleSection {
     pub replay: Option<ReplaySpec>,
 }
 
-/// A replay described by its presses: `BUTTON[+BUTTON..]@FRAME[:HOLD]`
-/// (hold defaults to 4 frames). Built by `psxw_abi::replay::from_presses`.
+/// A replay described by its presses: `BUTTON[+BUTTON..]@AT[:HOLD]` (hold
+/// defaults to 4). `AT` and `HOLD` count `[oracle] frame_counter` values,
+/// the replay's clock (psxw-abi `replay`); `frames` is how many vblanks
+/// to run.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplaySpec {
     pub frames: u32,

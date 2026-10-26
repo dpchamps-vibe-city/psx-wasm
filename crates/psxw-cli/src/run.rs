@@ -147,8 +147,15 @@ fn boot_checks(ws: &Workspace, game: &str, o: &Options, r: &RunReport) -> Result
     let loaded = r.events.iter().filter(|e| e["event"] == "overlay-resident").count();
     v.push(Check { name: "overlays", pass: bad.is_empty(), detail: format!("{loaded} loads verified; mismatches {bad:?}") });
     v.push(Check { name: "no-trap", pass: r.stop == Stop::FrameLimit, detail: format!("{:?}", r.stop) });
-    let waits = count(r, "vsync.waits");
-    v.push(Check { name: "vsync-waits", pass: waits >= 600, detail: format!("{waits}") });
+    // Calls to libetc's VSync (a build probe): at least one per two frames.
+    let inputs = psxw_lift::run::load(ws, game)?;
+    let vsync = inputs.map.resolve(&inputs.map.main, "VSync").map(|r| r.addr);
+    let waits = vsync.map_or(0, |a| count(r, &format!("probe.{a:08X}")));
+    v.push(Check {
+        name: "vsync-waits",
+        pass: waits >= 600,
+        detail: if vsync.is_some() { format!("{waits} VSync calls") } else { "the map names no VSync".into() },
+    });
     let main_loop = match &manifest.run.main_loop_symbol {
         Some(sym) => {
             let inputs = psxw_lift::run::load(ws, game)?;

@@ -142,10 +142,11 @@ unverified.
    sequences btn plays during gameplay run in the disc-gated runs.)*
 6. [ ] SPU recording hook; record btn vectors over `title-to-gameplay`;
    capture; zero failures.
-7. [ ] XA: `ReadS`, filters, decoding, resampling, CD input, real-rate
-   delivery. *(All but the CD input, which waits for the SPU device:
-   `psx_devices::xa`, the libcd adapters' stream. Decoding and resampling
-   match the emulator exactly; see task 8.)*
+7. [x] XA: `ReadS`, filters, decoding, resampling, CD input, real-rate
+   delivery. *(`psx_devices::xa` and the libcd adapters' stream. Decoding
+   and resampling match the emulator exactly (task 8). The decoded frames
+   are the SPU's CD input, one per tick (D47). btn's own streamed music
+   plays in the disc-gated runs.)*
 8. [x] Test-disc tooling in `psxw-psx-sdk` (mkpsxiso, psxavenc); a
    generator for XA test discs; the runner's `CD_XA` kind; goldens; zero
    failures.

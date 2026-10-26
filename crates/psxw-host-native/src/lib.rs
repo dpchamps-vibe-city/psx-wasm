@@ -393,8 +393,18 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         0
     })?;
     linker.func_wrap(h, host::PAD_STATE, |mut c: Caller<'_, State>, port: u32, out: u32| -> i32 {
-        let buttons = match &c.data().opts.replay {
-            Some(r) => replay::frame(r, c.data().frame as u32)[port as usize & 1],
+        let header = c.data().opts.replay.as_deref().map(replay::Header::parse);
+        let buttons = match header {
+            Some(None) => return 0,
+            Some(Some(h)) => {
+                let frame = c.data().frame;
+                let m = mem(&mut c);
+                let at = h.entry(frame, |addr| {
+                    let o = (addr & 0x1F_FFFC) as usize + psxw_abi::WINDOW_BASE as usize;
+                    m.data(&c).get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                });
+                c.data().opts.replay.as_deref().map_or(replay::NOTHING_PRESSED, |r| replay::frame(r, at)[port as usize & 1])
+            }
             None if port == 0 => replay::NOTHING_PRESSED,
             None => return 0,
         };

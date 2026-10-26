@@ -10,7 +10,7 @@ import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 
 const ABI_VERSION = 5;
 const NOTHING_PRESSED = 0xffff;
-const REPLAY_HEADER = 56;
+const REPLAY_HEADER = 64; // version 2, entries by vblank (clock 0)
 const WINDOW_BASE = 0x01000000;
 const WINDOW_MASK = 0x00ffffff;
 

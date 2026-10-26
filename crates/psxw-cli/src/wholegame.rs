@@ -37,7 +37,11 @@ fn replay(ws: &Workspace, game: &str, path: Option<&str>) -> Result<(Vec<u8>, St
     }
     let manifest = ws.game(game)?;
     let spec = manifest.oracle.replay.as_ref().with_context(|| format!("games/{game}/game.toml has no [oracle.replay]; pass --replay"))?;
-    let bytes = play::replay_from_presses(game, spec.frames, &spec.press).map_err(|e| anyhow::anyhow!("[oracle.replay]: {e}"))?;
+    // Presses are frame-counter values (the replay's clock), so both runs
+    // see them at the same game state whatever their load times.
+    let inputs = psxw_lift::run::load(ws, game)?;
+    let clock = counter_addr(ws, game, &inputs)?;
+    let bytes = play::replay_from_presses(game, spec.frames, &spec.press, clock).map_err(|e| anyhow::anyhow!("[oracle.replay]: {e}"))?;
     let path = ws.out_dir().join("oracle").join("replays").join(format!("{game}.rpl"));
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(&path, &bytes)?;

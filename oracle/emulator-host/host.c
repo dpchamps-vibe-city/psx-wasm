@@ -409,13 +409,18 @@ static size_t audio_sample_batch(const int16_t *data, size_t frames) {
 
 static void input_poll(void) {}
 
-/* play mode: the replay, and the frame retro_run is producing. */
+/* play mode: the replay, and the frame retro_run is producing. Version 2
+ * replays may name a clock: the guest address of a u32 frame counter whose
+ * value picks the entry, instead of the frame number (psxw-abi replay). */
 static const uint8_t *replay;
 static size_t replay_len;
 static uint32_t replay_frames;
+static size_t replay_data;
+static uint32_t replay_clock;
 static uint64_t frames_run;
 
-#define REPLAY_HEADER_LEN 56
+#define REPLAY_HEADER_LEN_V1 56
+#define REPLAY_HEADER_LEN 64
 #define REPLAY_FRAME_LEN 4
 
 /*
@@ -430,9 +435,20 @@ static const unsigned PAD_MAP[16] = {
     RETRO_DEVICE_ID_JOYPAD_X,      RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_Y,
 };
 
+/* The core's main RAM (2 MiB), once a game is loaded. */
+static uint8_t *ram;
+static size_t ram_size;
+
 static uint16_t replay_buttons(unsigned port) {
-    if (!replay || port > 1 || frames_run >= replay_frames) return 0xFFFF;
-    const uint8_t *p = replay + REPLAY_HEADER_LEN + frames_run * REPLAY_FRAME_LEN + 2 * port;
+    if (!replay || port > 1) return 0xFFFF;
+    uint64_t at = frames_run;
+    if (replay_clock) {
+        uint32_t o = replay_clock & 0x1FFFFCu;
+        if (!ram || o + 4 > ram_size) return 0xFFFF;
+        at = (uint32_t)ram[o] | (uint32_t)ram[o + 1] << 8 | (uint32_t)ram[o + 2] << 16 | (uint32_t)ram[o + 3] << 24;
+    }
+    if (at >= replay_frames) return 0xFFFF;
+    const uint8_t *p = replay + replay_data + at * REPLAY_FRAME_LEN + 2 * port;
     return (uint16_t)(p[0] | p[1] << 8);
 }
 
@@ -608,8 +624,6 @@ static void write_facts(FILE *f, void (*extra)(FILE *)) {
 
 /* ---- the mailbox ------------------------------------------------------- */
 
-static uint8_t *ram;
-static size_t ram_size;
 static uint32_t mbx;
 
 static uint32_t rd32(uint32_t off) {
@@ -856,11 +870,19 @@ static int mode_play(const struct play_args *a) {
         die(EXIT_USAGE, "play needs --disc, --replay, --frames and --out");
     if (a->ndump_counter && !a->trace) die(EXIT_USAGE, "--dump-counter needs --trace-u32");
     uint8_t *r = read_file(a->replay, &replay_len);
-    if (replay_len < REPLAY_HEADER_LEN || memcmp(r, "PSXWRPL", 8) != 0) die(EXIT_USAGE, "%s: not a replay", a->replay);
-    if (le32(r + 8) != 1) die(EXIT_USAGE, "%s: replay version %u", a->replay, le32(r + 8));
+    if (replay_len < REPLAY_HEADER_LEN_V1 || memcmp(r, "PSXWRPL", 8) != 0) die(EXIT_USAGE, "%s: not a replay", a->replay);
+    switch (le32(r + 8)) {
+    case 1: replay_data = REPLAY_HEADER_LEN_V1; replay_clock = 0; break;
+    case 2:
+        if (replay_len < REPLAY_HEADER_LEN) die(EXIT_USAGE, "%s: truncated", a->replay);
+        replay_data = REPLAY_HEADER_LEN;
+        replay_clock = le32(r + 56);
+        break;
+    default: die(EXIT_USAGE, "%s: replay version %u", a->replay, le32(r + 8));
+    }
     play_pad_type = le32(r + 12);
     replay_frames = le32(r + 16);
-    if (replay_len < REPLAY_HEADER_LEN + (size_t)replay_frames * REPLAY_FRAME_LEN) die(EXIT_USAGE, "%s: truncated", a->replay);
+    if (replay_len < replay_data + (size_t)replay_frames * REPLAY_FRAME_LEN) die(EXIT_USAGE, "%s: truncated", a->replay);
     if (play_pad_type != 0x41) die(EXIT_USAGE, "%s: pad type 0x%x (only the digital pad, 0x41, is mapped)", a->replay, play_pad_type);
     sha1_hex(r, replay_len, replay_sha1);
     replay = r;

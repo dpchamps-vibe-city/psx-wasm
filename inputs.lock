@@ -79,6 +79,10 @@ build = ["make", "check-all"]
 exe = "SLUS_011.15"
 exe_sha256 = "34e3b35dcd3fb1cd9a7d4813b8a9ef987915826e3d436f1908ecbe2d4fdf1444"
 
+[[game.btn.disc.files]]
+name = "hmb2n.bin"
+sha1 = "cb26381fa1336bdd15f07469e59f1143ccf37b03"
+
 [sdk.psyq-470]
 repo = "../psyq-decomp"
 remote = "git@github.com:software-factory-vibe-city/psyq-decompilation.git"

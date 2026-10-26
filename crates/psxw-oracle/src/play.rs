@@ -15,11 +15,13 @@ use std::process::Command;
 
 /// A digital-pad replay from presses written `[2:]BUTTON[+BUTTON..]@FRAME[:HOLD]`
 /// (port 2 with the `2:` prefix; hold defaults to 4 frames).
-pub fn replay_from_presses(game_id: &str, frames: u32, presses: &[String]) -> Result<Vec<u8>, String> {
+/// `clock`: 0 for entries by vblank, or the address of the game's frame
+/// counter (psxw-abi `replay`), so `@FRAME` is that counter's value.
+pub fn replay_from_presses(game_id: &str, frames: u32, presses: &[String], clock: u32) -> Result<Vec<u8>, String> {
     let mut id = [0u8; 16];
     let n = game_id.len().min(15);
     id[..n].copy_from_slice(&game_id.as_bytes()[..n]);
-    let h = replay::Header { version: replay::VERSION, pad_type: 0x41, frames, game_id: id, disc_sha1: [0; 20] };
+    let h = replay::Header { version: replay::VERSION, pad_type: 0x41, frames, game_id: id, disc_sha1: [0; 20], clock };
     let mut head = [0u8; replay::HEADER_LEN];
     h.encode(&mut head);
     let mut words = vec![[replay::NOTHING_PRESSED; 2]; frames as usize];
@@ -167,13 +169,13 @@ mod tests {
 
     #[test]
     fn presses() {
-        let r = replay_from_presses("btn", 10, &["START@2:2".into(), "2:cross+up@9".into()]).unwrap();
+        let r = replay_from_presses("btn", 10, &["START@2:2".into(), "2:cross+up@9".into()], 0).unwrap();
         assert_eq!(replay::Header::parse(&r).unwrap().frames, 10);
         assert_eq!(replay::frame(&r, 1), [replay::NOTHING_PRESSED; 2]);
         assert_eq!(replay::frame(&r, 2), [!(1 << 3), replay::NOTHING_PRESSED]);
         assert_eq!(replay::frame(&r, 3), [!(1 << 3), replay::NOTHING_PRESSED]);
         assert_eq!(replay::frame(&r, 4), [replay::NOTHING_PRESSED; 2]);
         assert_eq!(replay::frame(&r, 9), [replay::NOTHING_PRESSED, !(1 << 14 | 1 << 4)]);
-        assert!(replay_from_presses("btn", 10, &["JUMP@1".into()]).is_err());
+        assert!(replay_from_presses("btn", 10, &["JUMP@1".into()], 0).is_err());
     }
 }

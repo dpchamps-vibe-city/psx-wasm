@@ -29,7 +29,7 @@ import { loadSaves, persist, savesDir } from "./cards.js";
 
 const ABI_VERSION = 5;
 const NOTHING_PRESSED = 0xffff;
-const REPLAY_HEADER = 56;
+const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";
 
 onmessage = async (e) => {
@@ -41,12 +41,20 @@ onmessage = async (e) => {
   }
 };
 
-/** Pad buttons for `port` at `frame` from a replay (psxw-abi replay). */
-function replayButtons(replay, frame, port) {
+/**
+ * Pad buttons for `port` at vblank `frame` from a replay (psxw-abi
+ * replay). Version 2 replays may name a clock: a guest u32 frame counter
+ * whose value (read with `readU32`) picks the entry.
+ */
+function replayButtons(replay, frame, port, readU32) {
   const dv = new DataView(replay.buffer, replay.byteOffset, replay.byteLength);
-  const frames = dv.getUint32(16, true);
-  if (frame >= frames) return NOTHING_PRESSED;
-  return dv.getUint16(REPLAY_HEADER + 4 * frame + 2 * port, true);
+  const version = dv.getUint32(8, true);
+  const entries = dv.getUint32(16, true);
+  const data = version === 1 ? 56 : 64;
+  const clock = version === 1 ? 0 : dv.getUint32(56, true);
+  const at = clock ? readU32(clock) : frame;
+  if (at >= entries) return NOTHING_PRESSED;
+  return dv.getUint16(data + 4 * at + 2 * port, true);
 }
 
 /**
@@ -188,7 +196,7 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
     },
     pad_state(port, out) {
       let buttons;
-      if (replay) buttons = replayButtons(replay, frame, port & 1);
+      if (replay) buttons = replayButtons(replay, frame, port & 1, (a) => new DataView(mem()).getUint32(WINDOW_BASE + (a & 0x1ffffc), true));
       else {
         buttons = Atomics.load(pad, 1 + (port & 1));
         if (buttons < 0) return 0;
