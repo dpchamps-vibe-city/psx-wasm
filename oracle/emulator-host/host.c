@@ -15,7 +15,19 @@
  *                                boot the runner, run every exchange in IN.
  *                                Under OpenBIOS only --disc works: Beetle's
  *                                PS-X EXE loader hooks a Sony-BIOS address.
- *   play ...                     replayed game runs (M3 task 8, needs M2)
+ *   play --disc GAME.cue --replay R --frames N --out DIR
+ *        [--trace-u32 ADDR] [--dump-at F,..] [--dump-counter V,..]
+ *                                run a game from a psx-wasm replay file
+ *                                (crates/psxw-abi/src/replay.rs): the pad
+ *                                state of frame k is what the core reads
+ *                                during retro_run k. After each frame the
+ *                                host records the word at ADDR (the game's
+ *                                frame counter) and dumps the 2 MiB of RAM
+ *                                at the listed frames, and at the first
+ *                                frame the counter equals each listed value.
+ *                                Writes DIR/trace.bin, DIR/ram_*.bin and
+ *                                DIR/play.json. Frame numbers, file names
+ *                                and button words match psxw-host-native.
  */
 
 #define _GNU_SOURCE
@@ -129,7 +141,6 @@ static const char *work_dir = ".";
 static char save_dir[4096];
 static FILE *log_file;
 static bool verbose;
-static uint64_t frames_run;
 static uint64_t frames_presented;
 static unsigned unknown_env[64];
 static int nunknown_env;
@@ -398,11 +409,38 @@ static size_t audio_sample_batch(const int16_t *data, size_t frames) {
 
 static void input_poll(void) {}
 
+/* play mode: the replay, and the frame retro_run is producing. */
+static const uint8_t *replay;
+static size_t replay_len;
+static uint32_t replay_frames;
+static uint64_t frames_run;
+
+#define REPLAY_HEADER_LEN 56
+#define REPLAY_FRAME_LEN 4
+
+/*
+ * Beetle builds the pad word from RetroPad ids with this table
+ * (input.c, input_map_controller): PlayStation bit i is RetroPad id
+ * PAD_MAP[i]. Replays hold the word libpad reports, active low.
+ */
+static const unsigned PAD_MAP[16] = {
+    RETRO_DEVICE_ID_JOYPAD_SELECT, RETRO_DEVICE_ID_JOYPAD_L3, RETRO_DEVICE_ID_JOYPAD_R3, RETRO_DEVICE_ID_JOYPAD_START,
+    RETRO_DEVICE_ID_JOYPAD_UP,     RETRO_DEVICE_ID_JOYPAD_RIGHT, RETRO_DEVICE_ID_JOYPAD_DOWN, RETRO_DEVICE_ID_JOYPAD_LEFT,
+    RETRO_DEVICE_ID_JOYPAD_L2,     RETRO_DEVICE_ID_JOYPAD_R2, RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_R,
+    RETRO_DEVICE_ID_JOYPAD_X,      RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_Y,
+};
+
+static uint16_t replay_buttons(unsigned port) {
+    if (!replay || port > 1 || frames_run >= replay_frames) return 0xFFFF;
+    const uint8_t *p = replay + REPLAY_HEADER_LEN + frames_run * REPLAY_FRAME_LEN + 2 * port;
+    return (uint16_t)(p[0] | p[1] << 8);
+}
+
 static int16_t input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
-    (void)port;
-    (void)device;
-    (void)index;
-    (void)id;
+    if (device != RETRO_DEVICE_JOYPAD || index != 0) return 0;
+    uint16_t word = replay_buttons(port);
+    for (int i = 0; i < 16; i++)
+        if (PAD_MAP[i] == id) return !(word >> i & 1);
     return 0;
 }
 
@@ -744,6 +782,141 @@ static int mode_exe(const struct exe_args *a) {
     return 0;
 }
 
+/* ---- play mode --------------------------------------------------------- */
+
+#define MAX_DUMPS 256
+
+struct play_args {
+    const char *disc, *replay, *out_dir, *provenance;
+    uint64_t frames;
+    bool trace;
+    uint32_t trace_addr;
+    uint64_t dump_at[MAX_DUMPS];
+    int ndump_at;
+    uint32_t dump_counter[MAX_DUMPS];
+    int ndump_counter;
+};
+
+struct dump_rec {
+    char file[64];
+    uint64_t frame;
+    uint32_t counter;
+    bool by_counter;
+    char sha1[41];
+};
+static struct dump_rec dumps[2 * MAX_DUMPS];
+static int ndumps;
+static char replay_sha1[41];
+static uint32_t play_pad_type;
+
+static void parse_list64(const char *s, uint64_t *out, int *n) {
+    char *copy = xstrdup(s);
+    for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
+        if (*n == MAX_DUMPS) die(EXIT_USAGE, "too many values in %s", s);
+        char *end;
+        errno = 0;
+        unsigned long long v = strtoull(tok, &end, 0);
+        if (errno || *end) die(EXIT_USAGE, "bad number %s", tok);
+        out[(*n)++] = v;
+    }
+    free(copy);
+}
+
+static void write_dump(const char *dir, const char *name, uint64_t frame, uint32_t counter, bool by_counter) {
+    if (ndumps == 2 * MAX_DUMPS) die(EXIT_USAGE, "too many dumps");
+    struct dump_rec *d = &dumps[ndumps++];
+    snprintf(d->file, sizeof d->file, "%s", name);
+    d->frame = frame;
+    d->counter = counter;
+    d->by_counter = by_counter;
+    sha1_hex(ram, ram_size, d->sha1);
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) die(EXIT_USAGE, "create %s: %s", path, strerror(errno));
+    if (fwrite(ram, 1, ram_size, f) != ram_size || fclose(f) != 0) die(EXIT_USAGE, "write %s", path);
+}
+
+static void write_play_stats(FILE *f) {
+    fprintf(f, ",\n  \"run\": {\"mode\": \"play\", \"replay_sha1\": \"%s\", \"pad_type\": %u, \"replay_frames\": %u, ",
+            replay_sha1, play_pad_type, replay_frames);
+    fprintf(f, "\"frames\": %llu, \"frames_presented\": %llu, \"dumps\": [", (unsigned long long)frames_run,
+            (unsigned long long)frames_presented);
+    for (int i = 0; i < ndumps; i++) {
+        fprintf(f, "%s\n    {\"file\": \"%s\", \"frame\": %llu, ", i ? "," : "", dumps[i].file,
+                (unsigned long long)dumps[i].frame);
+        if (dumps[i].by_counter) fprintf(f, "\"counter\": %u, ", dumps[i].counter);
+        fprintf(f, "\"sha1\": \"%s\"}", dumps[i].sha1);
+    }
+    fprintf(f, "%s]}", ndumps ? "\n  " : "");
+}
+
+static int mode_play(const struct play_args *a) {
+    if (!a->disc || !a->replay || !a->out_dir || !a->frames)
+        die(EXIT_USAGE, "play needs --disc, --replay, --frames and --out");
+    if (a->ndump_counter && !a->trace) die(EXIT_USAGE, "--dump-counter needs --trace-u32");
+    uint8_t *r = read_file(a->replay, &replay_len);
+    if (replay_len < REPLAY_HEADER_LEN || memcmp(r, "PSXWRPL", 8) != 0) die(EXIT_USAGE, "%s: not a replay", a->replay);
+    if (le32(r + 8) != 1) die(EXIT_USAGE, "%s: replay version %u", a->replay, le32(r + 8));
+    play_pad_type = le32(r + 12);
+    replay_frames = le32(r + 16);
+    if (replay_len < REPLAY_HEADER_LEN + (size_t)replay_frames * REPLAY_FRAME_LEN) die(EXIT_USAGE, "%s: truncated", a->replay);
+    if (play_pad_type != 0x41) die(EXIT_USAGE, "%s: pad type 0x%x (only the digital pad, 0x41, is mapped)", a->replay, play_pad_type);
+    sha1_hex(r, replay_len, replay_sha1);
+    replay = r;
+
+    struct retro_game_info game = {.path = a->disc, .data = NULL, .size = 0, .meta = NULL};
+    if (!core.load_game(&game)) die(EXIT_USAGE, "the core refused %s", a->disc);
+    core.set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+    core.set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
+    ram = core.get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+    ram_size = core.get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+    if (!ram || ram_size != 0x200000) die(EXIT_PROTOCOL, "core exposes %zu bytes of system RAM", ram_size);
+    mbx = 0;
+
+    char path[4096];
+    snprintf(path, sizeof path, "%s/trace.bin", a->out_dir);
+    FILE *trace = a->trace ? fopen(path, "wb") : NULL;
+    if (a->trace && !trace) die(EXIT_USAGE, "create %s: %s", path, strerror(errno));
+    uint32_t taddr = a->trace_addr & 0x1FFFFC;
+    bool counter_done[MAX_DUMPS] = {0};
+    while (frames_run < a->frames) {
+        run_frame();
+        uint32_t word = a->trace ? rd32(taddr) : 0;
+        if (trace) put32(trace, word);
+        for (int i = 0; i < a->ndump_at; i++) {
+            if (a->dump_at[i] != frames_run) continue;
+            char name[64];
+            snprintf(name, sizeof name, "ram_%06llu.bin", (unsigned long long)frames_run);
+            write_dump(a->out_dir, name, frames_run, word, false);
+        }
+        for (int i = 0; i < a->ndump_counter; i++) {
+            if (counter_done[i] || a->dump_counter[i] != word) continue;
+            counter_done[i] = true;
+            char name[64];
+            snprintf(name, sizeof name, "ram_c%010u.bin", word);
+            write_dump(a->out_dir, name, frames_run, word, true);
+        }
+    }
+    if (trace && fclose(trace) != 0) die(EXIT_USAGE, "write %s", path);
+
+    snprintf(path, sizeof path, "%s/play.json", a->out_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) die(EXIT_USAGE, "create %s: %s", path, strerror(errno));
+    write_facts(f, write_play_stats);
+    fclose(f);
+    if (a->provenance) {
+        f = fopen(a->provenance, "w");
+        if (!f) die(EXIT_USAGE, "create %s: %s", a->provenance, strerror(errno));
+        write_facts(f, write_play_stats);
+        fclose(f);
+    }
+    core.unload_game();
+    replay = NULL;
+    free(r);
+    return 0;
+}
+
 /* ---- main -------------------------------------------------------------- */
 
 static void usage(void) {
@@ -751,6 +924,8 @@ static void usage(void) {
             "usage: psxw-emu-host info [common]\n"
             "       psxw-emu-host exe (--disc R.cue | --exe R.exe) --vectors IN --out OUT [--provenance P.json]\n"
             "                     [--mailbox ADDR] [--boot-frames N] [--timeout-frames N] [--dump-ram F] [common]\n"
+            "       psxw-emu-host play --disc GAME.cue --replay R --frames N --out DIR [--trace-u32 ADDR]\n"
+            "                     [--dump-at F,..] [--dump-counter V,..] [--provenance P.json] [common]\n"
             "common: --core LIB --system DIR --work DIR --log FILE --option KEY=VALUE --verbose\n");
     exit(EXIT_USAGE);
 }
@@ -768,6 +943,7 @@ int main(int argc, char **argv) {
     const char *mode = argv[1];
     const char *log_path = NULL;
     struct exe_args ea = {.mailbox = PSXW_MBX_ADDR, .boot_frames = 3600, .timeout_frames = 600};
+    static struct play_args pa;
     for (int i = 2; i < argc; i++) {
         const char *k = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -802,15 +978,40 @@ int main(int argc, char **argv) {
         } else if (!strcmp(k, "--disc")) {
             TAKE();
             ea.disc = v;
+            pa.disc = v;
+        } else if (!strcmp(k, "--replay")) {
+            TAKE();
+            pa.replay = v;
+        } else if (!strcmp(k, "--frames")) {
+            TAKE();
+            pa.frames = parse_num(v);
+        } else if (!strcmp(k, "--trace-u32")) {
+            TAKE();
+            pa.trace = true;
+            pa.trace_addr = (uint32_t)parse_num(v);
+        } else if (!strcmp(k, "--dump-at")) {
+            TAKE();
+            parse_list64(v, pa.dump_at, &pa.ndump_at);
+        } else if (!strcmp(k, "--dump-counter")) {
+            TAKE();
+            uint64_t vals[MAX_DUMPS];
+            int n = 0;
+            parse_list64(v, vals, &n);
+            for (int j = 0; j < n; j++) {
+                if (pa.ndump_counter == MAX_DUMPS) die(EXIT_USAGE, "too many --dump-counter values");
+                pa.dump_counter[pa.ndump_counter++] = (uint32_t)vals[j];
+            }
         } else if (!strcmp(k, "--vectors")) {
             TAKE();
             ea.vectors = v;
         } else if (!strcmp(k, "--out")) {
             TAKE();
             ea.out = v;
+            pa.out_dir = v;
         } else if (!strcmp(k, "--provenance")) {
             TAKE();
             ea.provenance = v;
+            pa.provenance = v;
         } else if (!strcmp(k, "--dump-ram")) {
             TAKE();
             ea.dump_ram = v;
@@ -835,13 +1036,14 @@ int main(int argc, char **argv) {
     snprintf(save_dir, sizeof save_dir, "%s/save", work_dir);
     mkdir(save_dir, 0777);
 
-    if (!strcmp(mode, "play")) die(EXIT_USAGE, "play mode arrives with M3 task 8 (needs M2's replays)");
-    if (strcmp(mode, "info") && strcmp(mode, "exe")) usage();
+    if (strcmp(mode, "info") && strcmp(mode, "exe") && strcmp(mode, "play")) usage();
 
     core_open();
     int rc = 0;
     if (!strcmp(mode, "info"))
         write_facts(stdout, NULL);
+    else if (!strcmp(mode, "play"))
+        rc = mode_play(&pa);
     else
         rc = mode_exe(&ea);
     core.deinit();

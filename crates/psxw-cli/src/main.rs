@@ -26,6 +26,7 @@ use psxw_inputs::{Workspace, snapshot, toolchain};
 mod ci;
 mod run;
 mod oracle;
+mod wholegame;
 
 fn main() {
     if let Err(e) = run() {

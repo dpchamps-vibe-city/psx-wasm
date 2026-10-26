@@ -14,6 +14,8 @@ pub mod golden;
 pub mod handwritten;
 pub mod hash;
 pub mod images;
+pub mod play;
+pub mod ramdiff;
 pub mod record;
 pub mod report;
 pub mod script;

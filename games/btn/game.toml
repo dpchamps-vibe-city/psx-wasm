@@ -43,6 +43,21 @@ cc1flags = ["-O2", "-G8", "-mips1", "-mcpu=r3000", "-funsigned-char", "-fpeephol
 main_loop_symbol = "RunSceneUpdateLoop"
 cd_timing = "realistic"
 
+[oracle]
+# The whole-game RAM oracle aligns on this counter: RunSceneUpdateLoop adds
+# one to field +8 of the game state block every scene frame, and
+# state_memory_init zeroes the block once at boot.
+frame_counter = "D_8006C838+0x8"
+
+[oracle.exclude_symbols]
+
+# The default replay (psxw oracle play/ramdiff without --replay): the boot
+# sequence, then START and CROSS pulses through the title screen. Any input
+# serves; both sides run the same one.
+[oracle.replay]
+frames = 3600
+press = ["START@1200", "START@1500", "START@1800", "START@2100", "CROSS@2400", "CROSS@2700", "CROSS@3000", "CROSS@3300"]
+
 # Per-function tier pins, each with its evidence. Only for function-specific
 # defects; GCC/GNU C idioms get normalizer rules instead.
 [tier]

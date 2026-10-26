@@ -28,6 +28,15 @@ fn gate(gates: &mut Vec<Gate>, name: &'static str, milestone: &'static str, r: R
     gates.push(Gate { name, milestone, pass, detail });
 }
 
+fn checks_detail(checks: &[crate::run::Check]) -> (bool, String) {
+    let failed: Vec<String> = checks.iter().filter(|c| !c.pass).map(|c| format!("{}: {}", c.name, c.detail)).collect();
+    if failed.is_empty() {
+        (true, format!("{} checks pass", checks.len()))
+    } else {
+        (false, failed.join("; "))
+    }
+}
+
 pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
     let mut gates = Vec::new();
     gate(&mut gates, "inputs", "M0", (|| {
@@ -68,6 +77,20 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
             .filter_map(|l| l.split(' ').next()?.parse::<usize>().ok())
             .sum();
         Ok((out.status.success(), format!("cargo test --workspace: {passed} passed")))
+    })());
+    let built = psxw_build::game::build(ws, &psxw_build::game::Options::new(game));
+    gate(&mut gates, "build", "M2", built.as_ref().map(|(_, wasm)| (true, wasm.display().to_string())).map_err(|e| anyhow::anyhow!("{e:#}")));
+    gate(&mut gates, "boot", "M2", (|| {
+        built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;
+        let (_, checks) = crate::run::evaluate(ws, game, &["--frames", "1200", "--check", "boot", "--check", "determinism"])?;
+        Ok(checks_detail(&checks))
+    })());
+    gate(&mut gates, "ubsan", "M2", (|| {
+        let opts = psxw_build::game::Options { ubsan: true, ..psxw_build::game::Options::new(game) };
+        let (_, wasm) = psxw_build::game::build(ws, &opts)?;
+        let wasm = wasm.display().to_string();
+        let (_, checks) = crate::run::evaluate(ws, game, &["--frames", "1200", "--wasm", &wasm, "--check", "no-trap"])?;
+        Ok(checks_detail(&checks))
     })());
     gate(&mut gates, "oracle", "M3", (|| {
         let reports = psxw_oracle::commands::ci(ws)?;

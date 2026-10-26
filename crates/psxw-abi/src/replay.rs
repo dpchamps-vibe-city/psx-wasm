@@ -72,6 +72,12 @@ pub fn frame(bytes: &[u8], frame: u32) -> [u16; 2] {
     }
 }
 
+/// Button names in pad-word bit order.
+pub const BUTTONS: [&str; 16] = [
+    "SELECT", "L3", "R3", "START", "UP", "RIGHT", "DOWN", "LEFT", "L2", "R2", "L1", "R1", "TRIANGLE", "CIRCLE", "CROSS",
+    "SQUARE",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

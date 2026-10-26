@@ -6,7 +6,9 @@
 //!   is byte-exact, no trap, at least 600 VSync waits, the main loop
 //!   entered;
 //! - `--check determinism` (criterion 3): two runs, identical RAM hashes at
-//!   frames 60, 300 and 600.
+//!   frames 60, 300 and 600;
+//! - `--check no-trap`: the run reaches its frame limit (the UBSan gate,
+//!   with `--wasm out/<game>/game-ubsan.wasm`).
 
 use anyhow::{Result, bail};
 use psxw_host_native::{Options, Overlay, RunReport, Stop};
@@ -67,10 +69,10 @@ pub fn summary(r: &RunReport) -> String {
 }
 
 #[derive(Serialize)]
-struct Check {
-    name: &'static str,
-    pass: bool,
-    detail: String,
+pub struct Check {
+    pub name: &'static str,
+    pub pass: bool,
+    pub detail: String,
 }
 
 fn count(r: &RunReport, key: &str) -> u64 {
@@ -145,7 +147,9 @@ fn boot_checks(ws: &Workspace, game: &str, o: &Options, r: &RunReport) -> Result
     Ok(v)
 }
 
-pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
+/// Runs the game with `args` and evaluates the requested checks; writes
+/// `out/run/<game>/run.json` (and `checks.json` when there are checks).
+pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport, Vec<Check>)> {
     let (mut o, checks) = options(ws, game, args)?;
     if checks.iter().any(|c| c == "boot") {
         o.overlays = overlays(ws, game)?;
@@ -162,10 +166,7 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let r = psxw_host_native::run(o.clone())?;
     let dir = ws.out_dir().join("run").join(game);
     std::fs::create_dir_all(&dir)?;
-    let json = dir.join("run.json");
-    std::fs::write(&json, serde_json::to_string_pretty(&r)?)?;
-    print!("{}", summary(&r));
-    eprintln!("full report: {}", json.display());
+    std::fs::write(dir.join("run.json"), serde_json::to_string_pretty(&r)?)?;
     let mut results = Vec::new();
     if checks.iter().any(|c| c == "boot") {
         results.extend(boot_checks(ws, game, &o, &r)?);
@@ -179,13 +180,28 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
             detail: format!("{:?} vs {:?}", r.ram_hashes, again.ram_hashes),
         });
     }
+    if checks.iter().any(|c| c == "no-trap") {
+        results.push(Check { name: "no-trap", pass: r.stop == Stop::FrameLimit, detail: format!("{:?}", r.stop) });
+    }
+    for c in &checks {
+        if !["boot", "determinism", "no-trap"].contains(&c.as_str()) {
+            bail!("unknown check {c} (boot, determinism, no-trap)");
+        }
+    }
+    if !results.is_empty() {
+        std::fs::write(dir.join("checks.json"), serde_json::to_string_pretty(&results)?)?;
+    }
+    Ok((r, results))
+}
+
+pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
+    let (r, results) = evaluate(ws, game, args)?;
+    print!("{}", summary(&r));
+    eprintln!("full report: {}", ws.out_dir().join("run").join(game).join("run.json").display());
     let mut ok = matches!(r.stop, Stop::FrameLimit | Stop::Exited);
     for c in &results {
         println!("check {:<12} {:<4} {}", c.name, if c.pass { "ok" } else { "FAIL" }, c.detail);
         ok &= c.pass;
-    }
-    if !results.is_empty() {
-        std::fs::write(dir.join("checks.json"), serde_json::to_string_pretty(&results)?)?;
     }
     Ok(ok)
 }

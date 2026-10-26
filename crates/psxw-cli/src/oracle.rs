@@ -10,6 +10,8 @@
 //!                                       goldens for stored vectors (recapture checks determinism)
 //! psxw oracle check <game> --device D   psx-wasm's device vs the goldens
 //! psxw oracle ci                        images verify + selftest + capture (the oracle's CI gate)
+//! psxw oracle play <game> …             the game under the emulator from a replay (wholegame.rs)
+//! psxw oracle ramdiff <game> …          psx-wasm's RAM vs the emulator's, by symbol (wholegame.rs)
 //! ```
 
 use anyhow::{Result, bail};
@@ -20,7 +22,8 @@ use psxw_oracle::{Kind, images};
 use std::path::Path;
 
 pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images verify | selftest [--seed N] [--count N] \
-                         | capture [--kind K] [--missing] | check <game> --device D | ci";
+                         | capture [--kind K] [--missing] | check <game> --device D | ci \
+                         | play <game> … | ramdiff <game> …";
 
 /// psx-wasm's device implementations the oracle can check. Empty until the
 /// devices exist (gpu and gte in M4, spu in M6).
@@ -128,6 +131,17 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<()> {
                 std::process::exit(2);
             }
         }
+        ["play", game, rest @ ..] => {
+            if !crate::wholegame::play_cmd(ws, game, rest)? {
+                std::process::exit(2);
+            }
+        }
+        ["ramdiff", game, rest @ ..] => {
+            if !crate::wholegame::ramdiff_cmd(ws, game, rest)? {
+                std::process::exit(2);
+            }
+        }
+        ["play" | "ramdiff", ..] => bail!("usage: psxw oracle {}", crate::wholegame::USAGE),
         _ => bail!("usage: psxw {USAGE}"),
     }
     Ok(())

@@ -17,6 +17,33 @@ pub struct GameManifest {
     pub difftest: DifftestSection,
     #[serde(default)]
     pub run: RunSection,
+    #[serde(default)]
+    pub oracle: OracleSection,
+}
+
+/// `[oracle]`: the whole-game RAM oracle (`psxw oracle play`/`ramdiff`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OracleSection {
+    /// The game's own frame or tick counter, `symbol` or `symbol+offset`:
+    /// a 32-bit word both sides trace every frame to align on.
+    pub frame_counter: Option<String>,
+    /// Symbols left out of the comparison, each with its reason.
+    #[serde(default)]
+    pub exclude_symbols: BTreeMap<String, String>,
+    /// Bytes below the initial stack pointer left out as the stack
+    /// (default 64 KiB).
+    pub stack_size: Option<u32>,
+    /// The default replay, built from button presses.
+    pub replay: Option<ReplaySpec>,
+}
+
+/// A replay described by its presses: `BUTTON[+BUTTON..]@FRAME[:HOLD]`
+/// (hold defaults to 4 frames). Built by `psxw_abi::replay::from_presses`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplaySpec {
+    pub frames: u32,
+    #[serde(default)]
+    pub press: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

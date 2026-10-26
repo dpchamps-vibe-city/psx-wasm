@@ -29,6 +29,10 @@ pub struct Options {
     pub dump_dir: Option<PathBuf>,
     /// A guest word to record every frame (the game's frame counter).
     pub trace_u32: Option<u32>,
+    /// Dump guest RAM into `dump_dir` at the first frame the traced word
+    /// equals each of these values (`ram_c<value>.bin`, as the oracle's
+    /// emulator host names them).
+    pub dump_counter: Vec<u32>,
     pub storage_dir: Option<PathBuf>,
     /// Echo guest logs to stderr.
     pub verbose: bool,
@@ -66,6 +70,16 @@ pub struct RunReport {
     pub report: Option<serde_json::Value>,
     pub events: Vec<serde_json::Value>,
     pub logs: Vec<String>,
+    pub dumps: Vec<Dump>,
+}
+
+/// A RAM dump written during the run.
+#[derive(Debug, Clone, Serialize)]
+pub struct Dump {
+    pub file: String,
+    pub frame: u64,
+    /// The traced word's value, for dumps taken by counter.
+    pub counter: Option<u32>,
 }
 
 struct State {
@@ -79,6 +93,8 @@ struct State {
     boot: Option<serde_json::Value>,
     boot_ok: Option<bool>,
     stop: Option<Stop>,
+    dumps: Vec<Dump>,
+    counter_done: Vec<bool>,
     resident: Vec<bool>,
     /// Frame since which an overlay's first words are in RAM without the
     /// rest matching (a load in progress, or a bad load).
@@ -147,21 +163,39 @@ pub fn run(opts: Options) -> Result<RunReport> {
             let data = m.data(&c);
             let ram = guest_ram(data);
             let hash = want_hash.then(|| format!("{:016x}", fnv(ram)));
-            let dump = want_dump.then(|| ram.to_vec());
             let word = trace.map(|a| {
-                let o = (a & 0x1F_FFFF) as usize;
+                let o = (a & 0x1F_FFFC) as usize;
                 u32::from_le_bytes([ram[o], ram[o + 1], ram[o + 2], ram[o + 3]])
             });
+            let mut files = Vec::new();
+            if want_dump {
+                files.push(Dump { file: format!("ram_{frame:06}.bin"), frame, counter: None });
+            }
+            if let Some(w) = word {
+                let s = c.data();
+                for (i, v) in s.opts.dump_counter.iter().enumerate() {
+                    if *v == w && !s.counter_done[i] {
+                        files.push(Dump { file: format!("ram_c{w:010}.bin"), frame, counter: Some(w) });
+                    }
+                }
+            }
+            let ram = if files.is_empty() { Vec::new() } else { ram.to_vec() };
             let s = c.data_mut();
             if let Some(hsh) = hash {
                 s.hashes.insert(frame, hsh);
             }
-            if let (Some(d), Some(dir)) = (dump, s.opts.dump_dir.clone()) {
-                std::fs::create_dir_all(&dir).ok();
-                std::fs::write(dir.join(format!("ram_{frame:06}.bin")), d).ok();
-            }
             if let Some(w) = word {
                 s.trace.push(w);
+                for (i, v) in s.opts.dump_counter.iter().enumerate() {
+                    s.counter_done[i] |= *v == w;
+                }
+            }
+            if let Some(dir) = s.opts.dump_dir.clone() {
+                std::fs::create_dir_all(&dir).ok();
+                for d in files {
+                    std::fs::write(dir.join(&d.file), &ram).ok();
+                    s.dumps.push(d);
+                }
             }
         }
         // Overlay residency: whenever an overlay's first words are in RAM,
@@ -301,6 +335,8 @@ pub fn run(opts: Options) -> Result<RunReport> {
         boot: None,
         boot_ok: None,
         stop: None,
+        dumps: vec![],
+        counter_done: vec![false; opts.dump_counter.len()],
         resident: vec![false; opts.overlays.len()],
         partial_since: vec![None; opts.overlays.len()],
     };
@@ -349,5 +385,6 @@ pub fn run(opts: Options) -> Result<RunReport> {
         report,
         events: s.events.into_iter().filter(|e| e["event"] != "report").collect(),
         logs: s.logs,
+        dumps: s.dumps,
     })
 }
