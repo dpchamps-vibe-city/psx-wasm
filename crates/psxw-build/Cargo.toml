@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 psxw-abi = { path = "../psxw-abi" }
+psx-bios = { path = "../psx-bios" }
 psxw-cc = { path = "../psxw-cc" }
 psxw-inputs = { path = "../psxw-inputs" }
 psxw-lift = { path = "../psxw-lift" }

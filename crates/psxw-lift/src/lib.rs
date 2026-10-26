@@ -259,6 +259,39 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// A call through the BIOS tables at `0xA0`/`0xB0`/`0xC0`: the function
+/// number is `t1` after the delay slot (None when it isn't a constant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BiosCall {
+    pub pc: u32,
+    pub table: u8,
+    pub func: Option<u32>,
+}
+
+pub fn bios_calls(t: &Translation) -> Vec<BiosCall> {
+    let mut out = Vec::new();
+    for (n, d) in &t.graph.nodes {
+        let Node::Slot(_) = *n else { continue };
+        let table = match &d.transfer {
+            Transfer::Jump(Dest::Tail(Callee::Bios { table })) => *table,
+            Transfer::Call { callee: Callee::Bios { table }, .. } => *table,
+            Transfer::Call { next: Dest::Tail(Callee::Bios { table }), .. } => *table,
+            _ => continue,
+        };
+        let st = t.facts.consts.get(n).copied().unwrap_or([None; 32]);
+        // t1 after the slot instruction runs.
+        let mut after = st;
+        if let Some(w) = d.insn.writes() {
+            after[w as usize] = None;
+            if d.insn.op == decode::Op::Addiu && d.insn.rs == 0 {
+                after[w as usize] = Some(d.insn.simm as u32);
+            }
+        }
+        out.push(BiosCall { pc: n.pc(), table, func: after[9] });
+    }
+    out
+}
+
 impl FunctionReport {
     pub fn new(func: &Function, sdk_member: Option<String>, t: Option<&Translation>, error: Option<&LiftError>) -> Self {
         let mut r = FunctionReport {
@@ -290,7 +323,6 @@ impl FunctionReport {
         let Some(t) = t else { return r };
         r.insns = t.graph.nodes.keys().filter(|n| matches!(n, Node::Normal(_))).count();
         for (n, d) in &t.graph.nodes {
-            let pc = n.pc();
             let op = d.insn.op;
             use decode::Op;
             match op {
@@ -316,26 +348,11 @@ impl FunctionReport {
                 }
                 _ => {}
             }
-            let bios = match &d.transfer {
-                Transfer::Jump(Dest::Tail(Callee::Bios { table })) => Some(table),
-                Transfer::Call { callee: Callee::Bios { table }, .. } => Some(table),
-                Transfer::Call { next: Dest::Tail(Callee::Bios { table }), .. } => Some(table),
-                _ => None,
-            };
-            if let Some(table) = bios {
-                let st = t.facts.consts.get(n).copied().unwrap_or([None; 32]);
-                // t1 after the slot instruction runs.
-                let mut after = st;
-                if let Some(w) = d.insn.writes() {
-                    after[w as usize] = None;
-                    if d.insn.op == Op::Addiu && d.insn.rs == 0 {
-                        after[w as usize] = Some(d.insn.simm as u32);
-                    }
-                }
-                let func = after[9].map_or("?".to_string(), |v| format!("{v:02X}"));
-                r.bios_calls.push(format!("0x{pc:08X}: {table:02X}h:{func}h"));
-            }
         }
+        r.bios_calls = bios_calls(t)
+            .iter()
+            .map(|c| format!("0x{:08X}: {:02X}h:{}h", c.pc, c.table, c.func.map_or("?".into(), |f| format!("{f:02X}"))))
+            .collect();
         r.io = t.facts.io.iter().map(|(pc, a)| format!("0x{pc:08X} → 0x{a:08X}")).collect();
         r.kernel = t.facts.kernel.iter().map(|(pc, a)| format!("0x{pc:08X} → 0x{a:08X}")).collect();
         r.entry_reads = reg_list(t.facts.entry_reads);

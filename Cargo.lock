@@ -692,6 +692,7 @@ name = "psxw-build"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "psx-bios",
  "psxw-abi",
  "psxw-cc",
  "psxw-difftest",
@@ -831,6 +832,7 @@ name = "psxw-oracle"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "psxw-abi",
  "psxw-inputs",
  "serde",
  "serde_json",

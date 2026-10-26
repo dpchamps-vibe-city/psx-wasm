@@ -254,9 +254,9 @@ mailbox, the store and the encoding end to end. It also supplies the
 6. [x] Runner kinds GPU_DRAW, GPU_TRANSFER, GTE_OP, SPU_RUN, BIOS_CALL;
    one handwritten vector of each through the whole pipeline.
 7. [x] Exact-by-construction generators plus `psxw oracle selftest`.
-8. [ ] *(needs M2)* Replay format in `psxw-abi`; the emulator host's
+8. [ ] *(implemented; the btn run waits for the disc)* Replay format in `psxw-abi`; the emulator host's
    `play` mode; frame-counter tracing; RAM dumps; `psxw oracle play`.
-9. [ ] *(needs M2)* `psxw oracle ramdiff`: psx-wasm side (the M2 host
+9. [ ] *(implemented; the btn run waits for the disc)* `psxw oracle ramdiff`: psx-wasm side (the M2 host
    gains `--replay`, `--trace-u32` and `--dump-at`), alignment,
    by-symbol comparison, report.
 10. [x] Recorder interface (`psxw-oracle::record`) that devices call; the
@@ -326,6 +326,19 @@ mailbox, the store and the encoding end to end. It also supplies the
     (no implementation yet) and exits non-zero; `ci` passes.
   - `cargo test --workspace` passes (the Docker test skips when Docker or
     the images are missing).
+
+- **2026-10-26** (`a56369d`): tasks 8–9 implemented (D39).
+  - `psxw-emu-host play` reads replays with Beetle's own pad table
+    (`input.c` `input_map_controller`, checked at the pinned commit),
+    traces a word every frame, and dumps RAM by frame and by counter value.
+  - `psxw oracle play` mounts the user's disc read-only; `ramdiff` aligns
+    and compares by symbol.
+  - btn's counter is `D_8006C838+0x8`: `RunSceneUpdateLoop` adds one every
+    scene frame, and the boot-time `memset` zeroes it.
+  - `play_traces_and_dumps_deterministically` (`tests/docker.rs`) plays the
+    runner disc twice: the trace and both dump kinds match exactly. The
+    rebuilt emulator image changed only the host binary; `oracle ci` still
+    reproduces all 1,074 goldens.
 
 ## Findings
 

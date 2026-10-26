@@ -251,6 +251,35 @@ rules, not pins. (design §4)
 **D37. wasmtime 47** (the newest supporting the pinned Rust 1.94.1; 48+
 need newer rustc). Raising Rust would be a separate decision.
 
+**D38. The runtime is merged, not linked** (M2). `psx-runtime` is built
+by cargo as a wasm32 `cdylib` that imports the guest's memory
+(`--import-memory=guest,memory`) and places its data at `RUNTIME_BASE`
+(`--global-base`). `psxw-link` links only the guest (C and lifted
+objects, overlay stubs, dispatch, safepoints). binaryen `wasm-merge` then
+binds the guest's `psx.*` imports to the runtime's exports and the
+runtime's `guest.*` imports to the guest's exports, and `wasm-opt -O2`
+inlines across the seam. Each module keeps its own function table.
+
+*Why:* rustc's own wasm-ld handles every relocation Rust emits, so
+`psxw-link` doesn't have to (M2 task 2's "accept Rust objects"). The
+runtime stays swappable by re-merging, with no guest relink. The cost is
+binaryen in the toolchain pins, which M0 already has.
+
+**D39. Whole-game RAM oracle conventions** (M3 tasks 8–9):
+- **Alignment** is on values of the manifest's `[oracle] frame_counter`.
+  psx-wasm runs once to trace it and pick values (by default the counter
+  at every 600th frame), then both sides dump RAM at the first frame the
+  counter holds each value.
+- **Always excluded:** kernel RAM (`0x0`–`0xFFFF`: the HLE BIOS and
+  OpenBIOS keep different state there by construction) and the stack (64
+  KiB below the initial `sp` unless `[oracle] stack_size` says otherwise).
+  Manifest exclusions name a symbol and a reason.
+- **Attribution:** an unsized symbol extends to the next symbol (at most 64
+  KiB); overlay addresses use the symbols of whichever overlay's code is
+  resident in that dump; anything else is reported by 4 KiB page.
+- **Replays can be written as presses** (`BUTTON@FRAME[:HOLD]`), so a
+  game's default replay lives in its manifest as text.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.

@@ -179,42 +179,42 @@ memory:
 
 ## Tasks
 
-1. [ ] Split crates as listed. `psx-runtime` builds a wasm32 staticlib.
+1. [x] Split crates as listed. `psx-runtime` builds a wasm32 staticlib.
    Implement `psxw runtime build` and ABI versioning.
-2. [ ] Linker: accept Rust objects (all relocation types they emit); place
+2. [x] *(superseded by D38: the runtime is merged, not linked)* Linker: accept Rust objects (all relocation types they emit); place
    runtime data, stack and heap at `RUNTIME_BASE`; keep two tables.
-3. [ ] Linker game mode:
+3. [x] Linker game mode:
    - all containers;
    - overlay stubs;
    - absolute EXE→overlay calls;
    - interior entry stubs;
    - safepoint pass;
    - debug masking mode.
-4. [ ] Pin the disc. When `psxw.local.toml` provides a disc for a game
+4. [ ] *(implemented; waits for the disc)* Pin the disc. When `psxw.local.toml` provides a disc for a game
    with no pinned hash, compute track sha1s and print the
    `inputs.lock` entry to add. Afterwards always verify.
-5. [ ] CD device:
+5. [x] CD device:
    - image readers (cue parser, raw/user sectors, EDC check);
    - ISO9660;
    - the drive-command state machine;
    - the timing model (realistic: seek plus rotational estimate plus 75
      or 150 sectors/s; instant: zero), on the virtual clock.
-6. [ ] libcd data-path adapters (classification confirmed from M1's
+6. [x] libcd data-path adapters (classification confirmed from M1's
    hardware-access report).
-7. [ ] Clock, scheduler, events, root counters; libetc and `counter.o`
+7. [x] Clock, scheduler, events, root counters; libetc and `counter.o`
    adapters; the BIOS event functions.
-8. [ ] BIOS dispatcher: generate the needed call list from translator
+8. [x] BIOS dispatcher: generate the needed call list from translator
    output; implement each needed call; trap on the rest.
-9. [ ] Boot plus the host interface v1 plus the wasmtime host;
+9. [x] Boot plus the host interface v1 plus the wasmtime host;
    `psxw run btn --headless --frames N`.
-10. [ ] Stub adapters for gpu, spu, pad and memory card (logging, with
+10. [x] Stub adapters for gpu, spu, pad and memory card (logging, with
     call counts in the run report).
-11. [ ] Boot checks (exit criterion 2): implement each as a runtime check
+11. [ ] *(implemented; waits for the disc)* Boot checks (exit criterion 2): implement each as a runtime check
     or an analysis of the run report.
-12. [ ] Determinism check: two runs, RAM hashes compared at frames
+12. [ ] *(implemented; waits for the disc)* Determinism check: two runs, RAM hashes compared at frames
     60/300/600.
-13. [ ] UBSan variant: run the boot path; fix or document each report.
-14. [ ] `psxw report tiers btn`; update `psxw ci`; docs; README status.
+13. [ ] *(variant builds; the run waits for the disc)* UBSan variant: run the boot path; fix or document each report.
+14. [x] `psxw report tiers btn`; update `psxw ci`; docs; README status.
 
 ## Exit criteria (all automated)
 
@@ -251,4 +251,56 @@ memory:
 
 ## Progress log
 
+- **2026-10-26** (`c55980a`): crates `psx-runtime`, `psx-bios`,
+  `psx-devices` (clock, root counters, CD with EDC, ISO9660 and drive
+  timing), `sdk-psyq` (libetc, libapi `counter.o`, libcd data path, stub
+  libgpu/libspu/libpad/libmc); `psxw runtime build`; the game-mode link in
+  `psxw-link::game`; `psxw build`; the wasmtime host and `psxw run`.
+- **2026-10-26** (`7f5d4c3`): `psxw run --check boot|determinism|no-trap`,
+  the main-loop probe, overlay residency checks, the disc pin check,
+  `psxw build --ubsan`, `psxw report tiers`.
+- **2026-10-26**: the build lists every BIOS call the lifted code makes and
+  fails on one the dispatcher doesn't implement (`out/<game>/bios-calls.json`;
+  btn: 53 calls, all implemented). `psxw ci` gains the `build`, `boot`
+  (boot and determinism checks) and `ubsan` gates.
+- **Waiting for the disc.** Exit criteria 2–5 need `psxw.local.toml`
+  `[game.btn] disc`. Until then the `boot` and `ubsan` gates fail with
+  "no disc image configured", and `psxw run` can't be exercised on btn.
+
 ## Findings
+
+### Build (exit criterion 1): passes
+
+- `psxw build btn` → `out/btn/game.wasm`, 1,192,107 bytes, validated, ABI
+  checked. Tiers: 2,570 C, 654 lift, 135 adapter (`psxw report tiers btn`
+  breaks them down by container and library). The UBSan variant is
+  1,283,031 bytes.
+- **The runtime is merged, not linked** (D38). `runtime.wasm` is a cargo
+  `cdylib` (`--import-memory=guest,memory`, `--global-base=0x02000000`);
+  binaryen `wasm-merge` joins it with `guest.wasm`, then `wasm-opt -O2`.
+  The adapter list travels in a `psxw.adapters` custom section of
+  `runtime.wasm`, so the guest link knows which SDK functions the runtime
+  replaces without a separate manifest.
+- **UBSan runs in trap mode** (`-fsanitize=undefined
+  -fsanitize-trap=undefined`): each check is an `unreachable`, and the host
+  reports the wasm backtrace, whose innermost guest frame names the C
+  function. `-fno-sanitize=function` because guest function pointers are
+  MIPS addresses dispatched through the table, not wasm function
+  references.
+
+### Boot checks: how each is decided
+
+- **exe-loaded:** the host compares RAM over `[t_addr, t_addr + t_size)`
+  with the EXE on the disc right after load.
+- **disc-pinned:** sha1 of every file on the disc against `inputs.lock`;
+  on first use the entry to add is printed.
+- **edc:** every sector the CD device read passed EDC (the runtime records
+  failures), and at least one was read.
+- **overlays:** at every vblank, an overlay whose first 8 bytes are
+  resident must have its whole text resident. A partial image is allowed
+  for 300 vblanks (`LOAD_FRAMES`, a load in progress); longer is a bad
+  load.
+- **no-trap / vsync-waits / main-loop:** the run reaches its frame budget;
+  the libetc adapter counts completed `VSync` waits; a probe at the entry
+  of `[run] main_loop_symbol` counts entries.
+

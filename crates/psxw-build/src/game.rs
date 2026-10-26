@@ -2,7 +2,7 @@
 //! C, generated C, adapter bindings), merged with `runtime.wasm` into
 //! `out/<game>/game.wasm`.
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use psxw_cc::protos::Proto;
 use psxw_inputs::Workspace;
 use psxw_lift::program::Source;
@@ -12,7 +12,7 @@ use psxw_link::{Gcc, Input};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -184,6 +184,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         };
         tiers.insert(key, tier);
     }
+    bios_calls(&out_dir(ws, &opts.game), &lifted)?;
     let failures = psxw_lift::run::write_and_compile(ws, &lift_dir, &lifted)?;
     if !failures.is_empty() {
         bail!("{} translations don't compile; run `psxw lift {}`", failures.len(), opts.game);
@@ -353,6 +354,37 @@ fn check_abi(wasm: &[u8]) -> Result<()> {
             bail!("game.wasm doesn't export {need}");
         }
     }
+    Ok(())
+}
+
+/// The BIOS calls translated code makes (M2 task 8), by table and number,
+/// with their call sites; `bios-calls.json`. Each must be one the runtime's
+/// dispatcher implements, with a constant function number.
+fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
+    #[derive(Serialize, Default)]
+    struct Call {
+        name: &'static str,
+        implemented: bool,
+        sites: Vec<String>,
+    }
+    let mut calls: BTreeMap<String, Call> = BTreeMap::new();
+    for t in lifted {
+        for c in psxw_lift::bios_calls(t) {
+            let site = format!("{} 0x{:08X}", t.func.name, c.pc);
+            let (key, name, ok) = match c.func {
+                Some(f) => (format!("{:02X}h:{f:02X}h", c.table), psx_bios::bios::name(c.table as u32, f), psx_bios::bios::implemented(c.table as u32, f)),
+                None => (format!("{:02X}h:?", c.table), "(function number not constant)", false),
+            };
+            let e = calls.entry(key).or_insert_with(|| Call { name, implemented: ok, sites: vec![] });
+            e.sites.push(site);
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("bios-calls.json"), serde_json::to_string_pretty(&calls)?)?;
+    let missing: Vec<String> =
+        calls.iter().filter(|(_, c)| !c.implemented).map(|(k, c)| format!("{k} {} at {}", c.name, c.sites.join(", "))).collect();
+    ensure!(missing.is_empty(), "translated code makes BIOS calls the runtime doesn't implement:\n  {}", missing.join("\n  "));
+    eprintln!("build: {} BIOS calls, all implemented", calls.len());
     Ok(())
 }
 

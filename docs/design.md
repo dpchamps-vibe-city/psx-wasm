@@ -390,22 +390,24 @@ which matches the PSX model exactly: the main loop blocks in `VSync`. JSPI
 without `SharedArrayBuffer`. "Block" is a host trait, so the runtime doesn't
 care which of the two is in use.
 
-### 7. One linked module, with a precompiled runtime
+### 7. One module, with a prebuilt runtime merged in
 
-- **The runtime is precompiled once per runtime version.** It is
-  game-agnostic Rust, built as a wasm32 static library (relocatable
-  objects). Its data, stack and heap sit above the guest window. It reads
-  and writes guest memory through the window and never hands host pointers
-  to the guest.
-- **`psxw-link` links it with the game's cached objects** into one
-  `game.wasm`. That puts the GTE math in the same module as the game's hot
-  transform loops, where cross-module call overhead would hurt most.
-- **The runtime is hot-swappable by relinking.** A new runtime archive means
-  a relink of a few seconds, with no game code recompiled. `psxw-abi`
-  carries an ABI version, and the linker refuses mismatched pairs.
-- **Dev mode keeps them separate.** The runtime stays its own module sharing
-  the same memory, so it can be swapped at page load without relinking. The
-  ABI is the same; the linker just leaves the runtime imports unresolved.
+- **The runtime is prebuilt once per runtime version** (D38). It is
+  game-agnostic Rust, built by cargo as a wasm32 `cdylib` that imports the
+  guest's memory and keeps its data, stack and heap above the guest window
+  (`RUNTIME_BASE`). It reads and writes guest memory through the window and
+  never hands host pointers to the guest.
+- **binaryen `wasm-merge` joins it with the linked guest** into one
+  `game.wasm`: the guest's `psx.*` imports bind to runtime exports, the
+  runtime's `guest.*` imports to guest exports, and `wasm-opt` then inlines
+  across the seam. That puts the GTE math in the same module as the game's
+  hot transform loops, where cross-module call overhead would hurt most.
+- **The runtime is hot-swappable by re-merging**, with no game code
+  recompiled or relinked. `psxw-abi` carries an ABI version; the build
+  checks the merged module's exports and imports against it, and hosts
+  refuse a mismatched `psxw_abi_version`.
+- **Dev mode can keep them separate.** Unmerged, the two modules share the
+  same memory and the host wires the seam at instantiation.
 - **The host interface is the only seam.** `game.wasm` imports a small host
   interface: frame pacing, audio output, input, disc reads, and the
   renderer command interface (see Runtime). The browser host implements it
@@ -416,21 +418,21 @@ care which of the two is in use.
 ### 8. psx-wasm owns the final link
 
 Most of the job is *placement*: data at fixed addresses, function addresses
-that are MIPS addresses, overlay stubs, and the split between guest and
-runtime. wasm-ld can't express any of that.
+that are MIPS addresses, overlay stubs, and the guest's half of the seam
+with the runtime. wasm-ld can't express any of that.
 
 `psxw-link` reads relocatable wasm objects as described in the
 tool-conventions `Linking.md`, using `wasmparser` and `wasm-encoder`. Its
-inputs are the game's objects, both decompiled and generated C, plus the
-precompiled runtime archive. It resolves symbols against the address map
-and emits the module. The guest passes then run over guest functions only,
+inputs are the game's objects, both decompiled and generated C. It resolves
+symbols against the address map and emits the guest module, which is then
+merged with the runtime (§7). The guest passes then run over guest functions only,
 using walrus:
 1. Address masking, including `memory.copy` and `memory.fill`.
 2. The `__guest_sp` split.
 3. Safepoints.
 4. Rewriting indirect calls.
 
-Finally `wasm-opt -O3` runs.
+Finally `wasm-opt -O2` runs on the merged module.
 
 Two alternatives are held in reserve:
 - `wasm-ld --emit-relocs` followed by a re-homing pass, if writing the
@@ -458,12 +460,15 @@ Two alternatives are held in reserve:
                 ▼                                     │
             psxw-cc: clang → wasm objects             │
                 ▼                                     ▼
-            psxw-link ◄── precompiled runtime archive (devices, BIOS, adapters)
+            psxw-link         boundary: adapter names from the runtime
                  │  place data/funcs at original addresses, dispatch table,
                  │  o32 adapters, overlay stubs, interior entries
                  ▼
-            guest passes (mask, guest SP, safepoints) → wasm-opt
+            guest passes (mask, guest SP, safepoints) → guest.wasm
                  ▼
+            wasm-merge ◄── prebuilt runtime.wasm (devices, BIOS, adapters)
+                 ▼  then wasm-opt
+
             game.wasm  +  host (browser Worker shell, or wasmtime for tests)
 ```
 
@@ -683,7 +688,8 @@ verified 1× mode as explicitly unverified options.
   runs in a headless emulator with the same inputs as psx-wasm. Because the
   memory layout is the original's, RAM can be compared by symbol at
   matching values of the game's own frame counter: "at frame 4,210,
-  `gPlayerX` differs".
+  `gPlayerX` differs". `psxw oracle play` runs the emulator side and
+  `psxw oracle ramdiff` the comparison; conventions in D39.
 - **What the game can observe must be right.** VRAM readback, SPU key
   status, CD status, pad data and timer values feed back into game logic.
   Pixels on screen and audio samples are presentation. Timing has a range,

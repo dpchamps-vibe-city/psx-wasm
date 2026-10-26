@@ -84,6 +84,12 @@ pub fn name(table: u32, func: u32) -> &'static str {
     }
 }
 
+/// Whether [`call`] implements `(table, func)` (every implemented call is
+/// named, and only those).
+pub fn implemented(table: u32, func: u32) -> bool {
+    name(table, func) != "?"
+}
+
 fn len(n: u32) -> u32 {
     n.min(MAX_LEN)
 }
