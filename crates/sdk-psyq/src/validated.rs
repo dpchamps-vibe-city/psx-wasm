@@ -41,7 +41,6 @@ pub const VALIDATED: &[(&str, &str)] = &[
     ("libetc/intr_vb", "7b35e33a415638f9396475a83bf48b047cc266021f5786193fb1489853dbea09"),
     ("libetc/vmode", "410b8618d26d58e4bdf9d37e44e41605f853ac321bfc5cf5bf1d028315ff86c9"),
     ("libetc/vsync", "5ced3e577ea12a54481e823fd26a28b831c29d427c4728d4c35233f3c46095a8"),
-    ("libgpu/sys", "02b22171147b3ca173f009f2cd944c513074ba6db33d956ed051c67cdba18e04"),
     ("libmcrd/init", "f9161d47ddf227edab85fa17d7de2dba2dee02e4941580ae1227c45b98c23eb5"),
     ("libmcrd/libmcrd", "46f60baec8cd294aed0958245214ed7781696c7653f25b870c7f823d07f93e47"),
     ("libmcrd/unformat", "d4e6c6260f3bfdc091ef1cf4f5d504625ce3404c9b70945e38979eebc02b156d"),

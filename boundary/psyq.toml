@@ -21,8 +21,8 @@ policy = "adapter" # patch.o, first.o patch BIOS internals or program timers
 [library.libetc]   # VSync, callbacks, interrupt setup
 policy = "adapter"
 
-[library.libgpu]   # the device edge (ResetGraph, DrawOTag, LoadImage, …)
-policy = "adapter"
+[library.libgpu]   # D42: original over the GPU front end and DMA
+policy = "device"
 
 [library.libcd]    # the drive (CdInit, CdControl*, CdRead*, CdSearchFile, …)
 policy = "adapter"

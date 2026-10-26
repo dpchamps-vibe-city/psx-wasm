@@ -311,6 +311,27 @@ state, the device route becomes the default for libspu too.
 *Why:* the register model has to exist for the oracle in any case, and
 D40 showed the device route is exact by construction.
 
+**D42. libgpu runs as original code over the GPU front end and a DMA
+controller** (M4). The M4 GPU front end (`psx_devices::gpu`) is
+register-level: it takes GP0/GP1 words and answers GPUSTAT/GPUREAD. So
+libgpu became a device library like libpad (D40), and its 23 adapters were
+removed.
+- **The bus** (`psx-bios::io`) gained the DMA controller
+  (`psx_devices::dma`). It handles channel 2 in block and linked-list
+  modes and channel 6 (ordering-table clear), completing instantly in
+  virtual time, setting DICR and raising IRQ3. libetc's adapter gets
+  completions through `Sdk::on_dma`.
+- **The host renderer** gets the front end's output at each vblank and at
+  every VRAM→CPU transfer (`Host::render_submit`/`render_readback`/
+  `present`, the M4 render imports).
+- **Cost.** `DrawOTag` is one register write: the linked list is walked
+  in Rust, so it costs what an adapter would.
+
+*Why:* exact by construction, and version-independent: libgpu's own code
+decides every word. `psxw conform btn --lib libgpu --render server`
+draws a background fill and a tile through the original library, and
+reads both back exactly.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.

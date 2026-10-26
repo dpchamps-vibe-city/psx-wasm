@@ -30,6 +30,12 @@ unsafe extern "C" {
     fn host_storage_write(name: *const u8, len: usize, src: *const u8, n: usize) -> i32;
     #[link_name = "report"]
     fn host_report(ptr: *const u8, len: usize);
+    #[link_name = "render_submit"]
+    fn host_render_submit(ptr: *const u8, len: usize);
+    #[link_name = "render_readback"]
+    fn host_render_readback(x: u32, y: u32, w: u32, h: u32, dst: *mut u8);
+    #[link_name = "present"]
+    fn host_present(desc: *const u8);
 }
 
 #[link(wasm_import_module = "guest")]
@@ -80,6 +86,18 @@ impl Host for FfiHost {
     }
     fn report(&mut self, json: &str) {
         unsafe { host_report(json.as_ptr(), json.len()) }
+    }
+    fn render_submit(&mut self, words: &[u32]) {
+        unsafe { host_render_submit(words.as_ptr().cast(), words.len() * 4) }
+    }
+    fn render_readback(&mut self, x: u32, y: u32, w: u32, h: u32) -> Vec<u16> {
+        let mut px = vec![0u16; (w * h) as usize];
+        unsafe { host_render_readback(x, y, w, h, px.as_mut_ptr().cast()) };
+        px
+    }
+    fn present(&mut self, desc: &psxw_abi::render::PresentDesc) {
+        let words = desc.to_words();
+        unsafe { host_present(words.as_ptr().cast()) }
     }
 }
 

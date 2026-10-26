@@ -31,6 +31,14 @@ pub trait Host {
     fn storage_write(&mut self, name: &str, data: &[u8]) -> bool;
     /// A structured run-report event (JSON).
     fn report(&mut self, json: &str);
+    /// Renderer commands (`psxw_abi::render`) to execute.
+    fn render_submit(&mut self, _words: &[u32]) {}
+    /// A VRAM rectangle after everything submitted, `w * h` pixels.
+    fn render_readback(&mut self, _x: u32, _y: u32, w: u32, h: u32) -> Vec<u16> {
+        vec![0; (w * h) as usize]
+    }
+    /// Show a frame.
+    fn present(&mut self, _desc: &psxw_abi::render::PresentDesc) {}
 }
 
 /// The guest's registers the runtime shares.
@@ -94,6 +102,8 @@ pub trait Sdk: Sized {
     fn ready(m: &Machine<Self>, cond: u32) -> bool;
     /// Called at every vblank, before callbacks are delivered.
     fn on_vblank(m: &mut Machine<Self>);
+    /// A DMA channel finished a transfer (device libraries' DMA).
+    fn on_dma(_m: &mut Machine<Self>, _ch: usize) {}
 }
 
 pub struct Machine<S> {
@@ -213,6 +223,7 @@ impl<S: Sdk> Machine<S> {
                 // The kernel's vblank handler delivers RCntCNT3 events.
                 self.deliver_event(0xF200_0003, 0x0002);
                 self.raise_irq(psx_devices::irq::VBLANK);
+                self.gpu_vblank();
                 self.host.wait_vblank(self.vblanks);
             }
             Event::Timer(n) => {

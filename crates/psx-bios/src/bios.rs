@@ -214,7 +214,9 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0x44) | (0xA0, 0x70) | (0xA0, 0x72) | (0xA0, 0x9F) => r(0),
         (0xA0, 0x49) => {
-            // GPU GP1 command: the display device arrives with M4.
+            // GPU_cw: a GP0 word (after gpu_sync, which returns 0 here:
+            // the GPU front end takes words at once).
+            m.gp0(a[0]);
             r(0)
         }
         (0xA0, 0xA1) => Err(format!("{label}: SystemError({:#x}, {:#x})", a[0], a[1])),

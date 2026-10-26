@@ -15,10 +15,10 @@ use psxw_host_native::{Conform, Options};
 use psxw_inputs::Workspace;
 use serde::Serialize;
 
-pub const USAGE: &str = "conform <game> --lib libpad [--frames N]";
+pub const USAGE: &str = "conform <game> --lib libpad|libgpu [--frames N] [--render server]";
 
 /// Libraries with a scenario (the `psxw ci` gate runs each).
-pub const LIBRARIES: &[&str] = &["libpad"];
+pub const LIBRARIES: &[&str] = &["libpad", "libgpu"];
 
 /// Free RAM for scenario buffers: below the stack, above any game data.
 const SCRATCH: u32 = 0x801C_0000;
@@ -95,6 +95,45 @@ fn libpad(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
     Ok(())
 }
 
+/// libgpu (a device library, D42): reset, display and draw environments
+/// (with a background fill), an ordering table with one tile, a VRAM
+/// readback, the display mask, then vblanks with the field. With a real
+/// renderer the readback shows the fill and the tile.
+fn libgpu(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
+    use sdk_psyq::layout::{dispenv, drawenv};
+    let (disp, draw, ot, tile, r, buf) = (SCRATCH, SCRATCH + 0x40, SCRATCH + 0x100, SCRATCH + 0x200, SCRATCH + 0x300, SCRATCH + 0x400);
+    let rect_bytes = |x: u16, y: u16, w: u16, h: u16| [x.to_le_bytes(), y.to_le_bytes(), w.to_le_bytes(), h.to_le_bytes()].concat();
+    s.call(ctx, "ResetGraph", [0; 4])?;
+    s.c.write(disp, &[0; dispenv::SIZEOF as usize]);
+    s.c.write(disp + dispenv::DISP, &rect_bytes(0, 0, 320, 240));
+    s.call(ctx, "PutDispEnv", [disp, 0, 0, 0])?;
+    s.c.write(draw, &[0; drawenv::SIZEOF as usize]);
+    s.c.write(draw + drawenv::CLIP, &rect_bytes(0, 0, 320, 240));
+    s.c.write(draw + drawenv::DTD, &[1, 1, 1, 0x20, 0x40, 0x80]);
+    s.call(ctx, "PutDrawEnv", [draw, 0, 0, 0])?;
+    s.call(ctx, "ClearOTagR", [ot, 8, 0, 0])?;
+    // TILE (tag; r g b code; x y; w h): SetTile sets its length and code.
+    s.call(ctx, "SetTile", [tile, 0, 0, 0])?;
+    s.c.write(tile + 4, &[0xFF, 0x10, 0x10]);
+    s.c.write(tile + 8, &[4, 0, 1, 0, 8, 0, 2, 0]);
+    s.call(ctx, "AddPrim", [ot + 4 * 7, tile, 0, 0])?;
+    s.observe("ordering table".into(), vec![hex(&s.c.read(ot, 32)), hex(&s.c.read(tile, 4))]);
+    s.call(ctx, "DrawOTag", [ot + 4 * 7, 0, 0, 0])?;
+    s.call(ctx, "DrawSync", [0; 4])?;
+    s.c.write(r, &rect_bytes(0, 0, 16, 4));
+    s.c.write(buf, &[0xAA; 128]);
+    s.call(ctx, "StoreImage", [r, buf, 0, 0])?;
+    s.call(ctx, "DrawSync", [0; 4])?;
+    s.observe("StoreImage 16x4 at (0,0)".into(), vec![hex(&s.c.read(buf, 128))]);
+    s.call(ctx, "SetDispMask", [1, 0, 0, 0])?;
+    for f in 0..frames {
+        s.c.run_vblanks(1)?;
+        let ode = s.c.call(ctx.addr("GetODE")?, [0; 4])? as u32;
+        s.observe(format!("frame {f}"), vec![format!("GetODE {ode}")]);
+    }
+    Ok(())
+}
+
 /// The scenario's pad input: nothing, then single buttons, chords and a
 /// long hold (port 1); port 2 idle.
 fn replay(frames: u32) -> Vec<u8> {
@@ -120,18 +159,21 @@ struct Report {
 pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let mut lib = None;
     let mut frames = 120u32;
+    let mut server = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {
             "--lib" => lib = it.next().map(|s| s.to_string()),
             "--frames" => frames = it.next().context("--frames needs a value")?.parse()?,
+            "--render" => server = it.next().is_some_and(|r| *r == "server"),
             other => bail!("unknown conform option {other}"),
         }
     }
     let lib = lib.context("--lib is required")?;
     let scenario: fn(&Ctx, &mut Side, u32) -> Result<()> = match lib.as_str() {
         "libpad" => libpad,
-        other => bail!("no conformance scenario for {other} yet (libpad)"),
+        "libgpu" => libgpu,
+        other => bail!("no conformance scenario for {other} yet (libpad, libgpu)"),
     };
 
     let inputs = psxw_lift::run::load(ws, game)?;
@@ -149,7 +191,8 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let dir = ws.out_dir().join("conform").join(game);
     std::fs::create_dir_all(&dir)?;
     let side = |wasm: &str| -> Result<Side> {
-        let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, ..Default::default() };
+        let render = server.then(|| crate::render::server(ws));
+        let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, render, ..Default::default() };
         Ok(Side { c: Conform::new(&o, &ram, sp, exe.gp0)?, log: vec![] })
     };
     let mut a = side(&adapters)?;

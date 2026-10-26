@@ -8,8 +8,8 @@
 //! psyq-decomp records it.
 //!
 //! M2 scope: libetc, libapi's `counter.o`/`pad.o`/`patch.o`/`chclrpad.o`,
-//! the libcd data path; libgpu, libspu and the memory card libraries as
-//! plausible stubs until their devices exist (M4, M6, M7).
+//! the libcd data path; libspu and the memory card libraries as plausible
+//! stubs until their devices exist (M6, M7).
 //!
 //! Some libraries need no adapters: they run as the game's own code over
 //! register-level devices ([`DEVICE_LIBRARIES`], decision D40).
@@ -17,7 +17,6 @@
 pub mod libapi;
 pub mod libcd;
 pub mod libetc;
-pub mod libgpu;
 pub mod libmc;
 pub mod layout;
 pub mod libspu;
@@ -31,10 +30,14 @@ pub type Adapter = fn(&mut M, [u32; 4]) -> Result;
 
 /// Libraries that run as original code, their I/O-window accesses reaching
 /// the runtime's register-level devices (`psx_bios::io`), instead of
-/// being replaced (D40). libpad: its observable state (PadGetState's
-/// sequence, buffer bytes, return values) is its own state machine over a
-/// few SIO0 bytes per frame; the device is a port of the oracle's.
-pub const DEVICE_LIBRARIES: &[&str] = &["libpad"];
+/// being replaced.
+/// - libpad (D40): its observable state (PadGetState's sequence, buffer
+///   bytes, return values) is its own state machine over a few SIO0 bytes
+///   per frame; the device is a port of the oracle's.
+/// - libgpu (D42): the GPU front end takes GP0/GP1 words, so libgpu's own
+///   code drives it through the ports and DMA; an ordering table is one
+///   DMA linked-list walk in Rust.
+pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu"];
 
 /// Event kinds the adapters schedule.
 pub mod ev {
@@ -42,8 +45,6 @@ pub mod ev {
     pub const CD_COMPLETE: u32 = 1;
     /// The next sector of a read arrives (data: generation).
     pub const CD_SECTOR: u32 = 2;
-    /// A GPU transfer or drawing completes.
-    pub const GPU_IDLE: u32 = 3;
 }
 
 /// Conditions blocked adapters wait for.
@@ -51,7 +52,6 @@ pub mod cond {
     pub const CD_COMMAND_DONE: u32 = 1;
     pub const CD_READ_DONE: u32 = 2;
     pub const CD_DATA_READY: u32 = 3;
-    pub const GPU_IDLE: u32 = 4;
 }
 
 /// Adapter state.
@@ -59,7 +59,6 @@ pub mod cond {
 pub struct Psyq {
     pub etc: libetc::Etc,
     pub cd: libcd::Cd,
-    pub gpu: libgpu::Gpu,
     pub spu: libspu::Spu,
     pub mc: libmc::Mc,
 }
@@ -69,7 +68,6 @@ impl Sdk for Psyq {
         match kind {
             ev::CD_COMPLETE => libcd::on_complete(m, data),
             ev::CD_SECTOR => libcd::on_sector(m, data),
-            ev::GPU_IDLE => libgpu::on_idle(m),
             _ => m.log(&format!("sdk: unknown event {kind}")),
         }
     }
@@ -79,9 +77,12 @@ impl Sdk for Psyq {
             cond::CD_COMMAND_DONE => m.sdk.cd.busy_until.is_none(),
             cond::CD_READ_DONE => m.sdk.cd.read.is_none(),
             cond::CD_DATA_READY => m.sdk.cd.ready_sector.is_some() || m.sdk.cd.read.is_none() && m.sdk.cd.streaming.is_none(),
-            cond::GPU_IDLE => !m.sdk.gpu.busy,
             _ => true,
         }
+    }
+
+    fn on_dma(m: &mut M, ch: usize) {
+        libetc::dma_done(m, ch);
     }
 
     fn on_vblank(m: &mut M) {
@@ -103,7 +104,6 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     v.extend(libetc::ADAPTERS);
     v.extend(libapi::ADAPTERS);
     v.extend(libcd::ADAPTERS);
-    v.extend(libgpu::ADAPTERS);
     v.extend(libspu::ADAPTERS);
     v.extend(libmc::ADAPTERS);
     v

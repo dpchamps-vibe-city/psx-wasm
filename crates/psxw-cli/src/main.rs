@@ -27,6 +27,7 @@ use psxw_inputs::{Workspace, snapshot, toolchain};
 mod ci;
 mod run;
 mod conform;
+mod render;
 mod oracle;
 mod wholegame;
 

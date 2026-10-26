@@ -5,6 +5,7 @@
 //! traced word support the determinism and whole-game oracles.
 
 pub mod disc;
+pub mod render;
 
 use anyhow::{Context as _, Result, bail};
 use disc::Disc;
@@ -41,6 +42,10 @@ pub struct Options {
     /// Wall-clock seconds a conformance call may run before it traps
     /// (a runaway guest loop); 0 = no limit.
     pub deadline_secs: u64,
+    /// The renderer; `None` runs headless with [`render::NullRender`].
+    pub render: Option<render::SharedRender>,
+    /// Frames at which to hash VRAM (needs a renderer with VRAM).
+    pub vram_hash_at: Vec<u64>,
 }
 
 /// An overlay's original text, by guest address.
@@ -74,6 +79,9 @@ pub struct RunReport {
     pub events: Vec<serde_json::Value>,
     pub logs: Vec<String>,
     pub dumps: Vec<Dump>,
+    pub render: render::RenderStats,
+    /// VRAM hashes by frame (with a renderer that has VRAM).
+    pub vram_hashes: BTreeMap<u64, String>,
 }
 
 /// A RAM dump written during the run.
@@ -103,11 +111,17 @@ struct State {
     /// Frame since which an overlay's first words are in RAM without the
     /// rest matching (a load in progress, or a bad load).
     partial_since: Vec<Option<u64>>,
+    renderer: render::SharedRender,
+    render: render::RenderStats,
+    vram_hashes: BTreeMap<u64, String>,
 }
 
 impl State {
     fn new(opts: &Options, disc: Option<Disc>) -> Self {
         State {
+            renderer: opts.render.clone().unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(Box::new(render::NullRender)))),
+            render: Default::default(),
+            vram_hashes: BTreeMap::new(),
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -217,6 +231,8 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
         events: s.events.into_iter().filter(|e| e["event"] != "report").collect(),
         logs: s.logs,
         dumps: s.dumps,
+        render: s.render,
+        vram_hashes: s.vram_hashes,
     }
 }
 
@@ -388,6 +404,50 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         let Some(dir) = c.data().opts.storage_dir.clone() else { return -1 };
         std::fs::create_dir_all(&dir).ok();
         if std::fs::write(dir.join(&name), data).is_ok() { 0 } else { -1 }
+    })?;
+    use psxw_abi::render::imports as ri;
+    linker.func_wrap(h, ri::RENDER_SUBMIT, |mut c: Caller<'_, State>, ptr: u32, len: u32| -> wasmtime::Result<()> {
+        let bytes = read_bytes(&mut c, ptr, len);
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let s = c.data_mut();
+        s.render.submits += 1;
+        s.render.words += words.len() as u64;
+        let r = s.renderer.clone();
+        let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+        r.submit(&words).map_err(|e| wasmtime::Error::msg(format!("render_submit: {e:#}")))
+    })?;
+    linker.func_wrap(h, ri::RENDER_READBACK, |mut c: Caller<'_, State>, x: u32, y: u32, w: u32, hh: u32, dst: u32| -> wasmtime::Result<()> {
+        c.data_mut().render.readbacks += 1;
+        let r = c.data().renderer.clone();
+        let px = {
+            let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+            r.readback(psxw_abi::render::Rect { x, y, w, h: hh }).map_err(|e| wasmtime::Error::msg(format!("render_readback: {e:#}")))?
+        };
+        let bytes: Vec<u8> = px.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let m = mem(&mut c);
+        m.data_mut(&mut c)[dst as usize..dst as usize + bytes.len()].copy_from_slice(&bytes);
+        Ok(())
+    })?;
+    linker.func_wrap(h, ri::PRESENT, |mut c: Caller<'_, State>, ptr: u32| -> wasmtime::Result<()> {
+        let b = read_bytes(&mut c, ptr, 20);
+        let w: Vec<u32> = b.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let desc = psxw_abi::render::PresentDesc { flags: w[0], x: w[1], y: w[2], width: w[3], height: w[4] };
+        let s = c.data_mut();
+        s.render.presents += 1;
+        s.render.last_present = Some([w[0], w[1], w[2], w[3], w[4]]);
+        let frame = s.frame + 1;
+        let want_vram = s.opts.vram_hash_at.contains(&frame);
+        let r = s.renderer.clone();
+        let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+        r.present(&desc).map_err(|e| wasmtime::Error::msg(format!("present: {e:#}")))?;
+        if want_vram {
+            if let Some(v) = r.vram().map_err(|e| wasmtime::Error::msg(format!("vram: {e:#}")))? {
+                let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();
+                drop(r);
+                c.data_mut().vram_hashes.insert(frame, format!("{:016x}", fnv(&bytes)));
+            }
+        }
+        Ok(())
     })?;
     linker.func_wrap(h, host::REPORT, |mut c: Caller<'_, State>, ptr: u32, len: u32| {
         let text = String::from_utf8_lossy(&read_bytes(&mut c, ptr, len)).into_owned();
