@@ -1,6 +1,6 @@
 # M6 — Sound
 
-**Status:** in progress
+**Status:** done except task 10, which is blocked on CD timing (D48)
 **Depends on:** M2, M3. Parallel with M4–M5. **Unlocks:** M7.
 **Design refs:** design: Runtime (spu, cd), §5 (libsnd as guest code),
 Device behaviour notes (XA streaming, the timing coupling); decisions D14,
@@ -164,12 +164,13 @@ unverified.
 10. [ ] Remove the sound-driver exclusions from `game.toml`;
     `psxw oracle ramdiff btn --replay title-to-gameplay` reaches zero
     differences. *(Blocked on CD timing, D48.)*
-11. [ ] Audio determinism: identical audio hashes across two runs, and
+11. [x] Audio determinism: identical audio hashes across two runs, and
     across hosts once M5 is done. Add everything to `psxw ci`; docs,
-    README status. *(Both checks exist: `psxw run --check determinism`
-    adds `audio-determinism`, and `web-test game` compares the audio with
-    the native host's. Both are in `psxw ci` through the `boot` and
-    `web-game` gates, and their runs wait for the disc.)*
+    README status. *(`psxw run btn --check determinism`: 884,693 audio
+    frames with the same hash in both runs. `web-test game btn --replay
+    title-to-gameplay`: Chromium and Firefox produce the native host's
+    audio frames and hash. Both are in `psxw ci` through the `boot` and
+    `web-game` gates.)*
 
 ## Exit criteria (all automated)
 
