@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub const ADAPTERS_SECTION: &str = "psxw.adapters";
+/// SDK libraries that run over the runtime's devices (`sdk_psyq::DEVICE_LIBRARIES`).
+pub const DEVICES_SECTION: &str = "psxw.devices";
 
 pub fn path(ws: &Workspace) -> PathBuf {
     ws.out_dir().join("runtime").join("runtime.wasm")
@@ -29,23 +31,34 @@ pub fn build(ws: &Workspace) -> Result<PathBuf> {
     let built = ws.root.join("target/wasm32-unknown-unknown/runtime/psx_runtime.wasm");
     let mut bytes = std::fs::read(&built).with_context(|| format!("reading {}", built.display()))?;
     let names: Vec<&str> = sdk_psyq::adapters().into_iter().map(|(n, _)| n).collect();
-    let section = wasm_encoder::CustomSection { name: ADAPTERS_SECTION.into(), data: names.join("\n").into_bytes().into() };
     use wasm_encoder::Section;
+    let section = wasm_encoder::CustomSection { name: ADAPTERS_SECTION.into(), data: names.join("\n").into_bytes().into() };
     section.append_to(&mut bytes);
+    let devices = sdk_psyq::DEVICE_LIBRARIES.join("\n");
+    wasm_encoder::CustomSection { name: DEVICES_SECTION.into(), data: devices.into_bytes().into() }.append_to(&mut bytes);
     let out = path(ws);
     std::fs::create_dir_all(out.parent().unwrap())?;
     std::fs::write(&out, &bytes)?;
     Ok(out)
 }
 
-/// The adapter names stamped into a runtime module, in id order.
-pub fn adapters(wasm: &[u8]) -> Result<Vec<String>> {
+fn section(wasm: &[u8], name: &str) -> Result<Vec<String>> {
     for p in wasmparser::Parser::new(0).parse_all(wasm) {
         if let wasmparser::Payload::CustomSection(r) = p? {
-            if r.name() == ADAPTERS_SECTION {
+            if r.name() == name {
                 return Ok(String::from_utf8(r.data().to_vec())?.lines().map(str::to_string).collect());
             }
         }
     }
-    bail!("runtime.wasm has no {ADAPTERS_SECTION} section; rebuild it with `psxw runtime build`")
+    bail!("runtime.wasm has no {name} section; rebuild it with `psxw runtime build`")
+}
+
+/// The adapter names stamped into a runtime module, in id order.
+pub fn adapters(wasm: &[u8]) -> Result<Vec<String>> {
+    section(wasm, ADAPTERS_SECTION)
+}
+
+/// The SDK libraries a runtime module runs over its devices.
+pub fn devices(wasm: &[u8]) -> Result<Vec<String>> {
+    section(wasm, DEVICES_SECTION)
 }

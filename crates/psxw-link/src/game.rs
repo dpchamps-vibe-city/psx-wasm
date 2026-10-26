@@ -20,7 +20,7 @@ use crate::rewrite::{self, Lowered, Resolver};
 use anyhow::{Context as _, Result, bail};
 use psxw_abi::{TABLE_LEN, WINDOW_BASE, WINDOW_MASK, guest, psx, table_index};
 use psxw_inputs::AddressMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements, EntityType, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction as I, MemArg,
@@ -50,6 +50,9 @@ pub struct GameSpec {
     pub budget: u32,
     /// Trap on guest accesses to the I/O window.
     pub debug_io: bool,
+    /// Functions of device libraries (D40): their I/O-window accesses go
+    /// to the runtime's devices (`psx.io_access`).
+    pub device_funcs: BTreeSet<(String, u32)>,
     pub main: String,
     /// Initial guest memory pages (the runtime grows it).
     pub min_pages: u64,
@@ -78,6 +81,7 @@ fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::GTE_CTC2, vec![i, i], vec![]),
         (psx::GTE_EXEC, vec![i], vec![]),
         (psx::IO_ACCESS, vec![i, i], vec![]),
+        (psx::IO_TRAP, vec![i, i], vec![]),
         ("adapter", vec![i; 5], vec![V::I64]),
         (psx::PROBE, vec![i], vec![]),
     ]
@@ -144,6 +148,8 @@ struct Ctx<'a> {
     gp: u32,
     budget: u32,
     o32_ty: u32,
+    /// (input, function) of every device-library function.
+    device: HashSet<(usize, u32)>,
 }
 
 impl Ctx<'_> {
@@ -221,6 +227,8 @@ fn parse_generated(name: &str, main: &str) -> Option<(Option<String>, u32)> {
 struct R<'c, 'a> {
     ctx: &'c mut Ctx<'a>,
     input: usize,
+    /// The function being rewritten (index into the input's functions).
+    func: u32,
 }
 
 impl Resolver for R<'_, '_> {
@@ -393,7 +401,11 @@ impl Resolver for R<'_, '_> {
     }
 
     fn io_check(&mut self) -> Option<u32> {
-        self.ctx.spec.debug_io.then(|| self.ctx.import(psx::IO_ACCESS))
+        if self.ctx.device.contains(&(self.input, self.func)) {
+            Some(self.ctx.import(psx::IO_ACCESS))
+        } else {
+            self.ctx.spec.debug_io.then(|| self.ctx.import(psx::IO_TRAP))
+        }
     }
 }
 
@@ -577,6 +589,14 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         gp: 1,
         budget: 2,
         o32_ty: 0,
+        device: spec
+            .device_funcs
+            .iter()
+            .filter_map(|k| match spec.tiers.get(k) {
+                Some(Tier::Lift { input, func } | Tier::C { input, func }) => Some((*input, *func)),
+                _ => None,
+            })
+            .collect(),
     };
     ctx.o32_ty = ctx.intern(&o32());
     let mut import_types = Vec::new();
@@ -608,7 +628,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         let tix = ctx.intern(&ty);
         let index = f + obj.num_imported_funcs();
         let name = obj.func_symbol(index).map_or_else(|| format!("{}#{f}", inputs[i].label), |s| s.name.clone());
-        let b = rewrite::rewrite(obj, f as usize, &mut R { ctx: &mut ctx, input: i })
+        let b = rewrite::rewrite(obj, f as usize, &mut R { ctx: &mut ctx, input: i, func: f })
             .with_context(|| format!("{}: {name}", inputs[i].label))?;
         names.push((ctx.guest[&(i, f)], format!("{}:{name}", inputs[i].container)));
         bodies.push((tix, b));

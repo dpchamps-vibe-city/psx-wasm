@@ -187,7 +187,9 @@ fn init(options: u32) {
         unsafe { core::ptr::read_unaligned((options as usize) as *const BootOptions) }
     };
     let quantum = if opts.safepoint_quantum == 0 { 20_000 } else { opts.safepoint_quantum as u64 };
-    let m = Machine::new(Box::new(Window), Box::new(FfiHost), Box::new(FfiRegs), opts, Psyq::default());
+    let mut m = Machine::new(Box::new(Window), Box::new(FfiHost), Box::new(FfiRegs), opts, Psyq::default());
+    // Device libraries (D40) reach these registers.
+    m.io = Some(Default::default());
     let rt = Rt {
         m: RefCell::new(m),
         quantum,
@@ -217,15 +219,12 @@ pub extern "C" fn psxw_boot(options: u32) {
 /// Set up without a disc; the host drives guest calls (psxw-abi
 /// `CONFORM_INIT`).
 #[unsafe(no_mangle)]
-pub extern "C" fn psxw_conform_init(options: u32, sp: u32, gp: u32, io: u32) {
+pub extern "C" fn psxw_conform_init(options: u32, sp: u32, gp: u32) {
     init(options);
     with(|rt| {
         let mut m = rt.m.borrow_mut();
         m.regs.set_sp(sp);
         m.regs.set_gp(gp);
-        if io == 1 {
-            m.io = Some(Default::default());
-        }
     });
 }
 
@@ -299,10 +298,16 @@ pub extern "C" fn kernel_call(addr: u32, _a0: u32, _a1: u32, _a2: u32, _a3: u32)
     fatal(8, &format!("call into BIOS kernel RAM at {addr:#010x}; this function needs an adapter"))
 }
 
-/// A guest access to the I/O window (debug and conformance builds): a load
-/// is about to read window offset `off`, or a store has just written it.
-/// With register-level devices attached, the device supplies or takes the
-/// value through the window; without, it is a trap.
+/// A device library's access to the I/O window (D40): a load is about to
+/// read window offset `off`, or a store has just written it. The device
+/// supplies or takes the value through the window; an unmodelled register
+/// is a trap.
+/// Any other function's access to the I/O window in a debug build.
+#[unsafe(export_name = "io_trap")]
+pub extern "C" fn io_trap(off: u32, _kind: u32) {
+    fatal(9, &format!("guest access to I/O register {:#010x}; this function needs an adapter", 0x1F00_0000 | (off & 0xFF_FFFF)))
+}
+
 #[unsafe(export_name = "io_access")]
 pub extern "C" fn io_access(off: u32, kind: u32) {
     let addr = 0x1F00_0000 | (off & 0xFF_FFFF);

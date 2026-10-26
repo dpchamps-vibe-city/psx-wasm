@@ -8,15 +8,17 @@
 //! psyq-decomp records it.
 //!
 //! M2 scope: libetc, libapi's `counter.o`/`pad.o`/`patch.o`/`chclrpad.o`,
-//! the libcd data path; libgpu, libspu, libpad and the memory card
-//! libraries as plausible stubs until their devices exist (M4, M6, M7).
+//! the libcd data path; libgpu, libspu and the memory card libraries as
+//! plausible stubs until their devices exist (M4, M6, M7).
+//!
+//! Some libraries need no adapters: they run as the game's own code over
+//! register-level devices ([`DEVICE_LIBRARIES`], decision D40).
 
 pub mod libapi;
 pub mod libcd;
 pub mod libetc;
 pub mod libgpu;
 pub mod libmc;
-pub mod libpad;
 pub mod libspu;
 
 use psx_bios::{Flow, Machine, Sdk};
@@ -24,6 +26,13 @@ use psx_bios::{Flow, Machine, Sdk};
 pub type M = Machine<Psyq>;
 pub type Result = std::result::Result<Flow<Psyq>, String>;
 pub type Adapter = fn(&mut M, [u32; 4]) -> Result;
+
+/// Libraries that run as original code, their I/O-window accesses reaching
+/// the runtime's register-level devices (`psx_bios::io`), instead of
+/// being replaced (D40). libpad: its observable state (PadGetState's
+/// sequence, buffer bytes, return values) is its own state machine over a
+/// few SIO0 bytes per frame; the device is a port of the oracle's.
+pub const DEVICE_LIBRARIES: &[&str] = &["libpad"];
 
 /// Event kinds the adapters schedule.
 pub mod ev {
@@ -49,7 +58,6 @@ pub struct Psyq {
     pub etc: libetc::Etc,
     pub cd: libcd::Cd,
     pub gpu: libgpu::Gpu,
-    pub pad: libpad::Pad,
     pub spu: libspu::Spu,
     pub mc: libmc::Mc,
 }
@@ -76,7 +84,6 @@ impl Sdk for Psyq {
 
     fn on_vblank(m: &mut M) {
         libetc::on_vblank(m);
-        libpad::on_vblank(m);
     }
 }
 
@@ -95,7 +102,6 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     v.extend(libapi::ADAPTERS);
     v.extend(libcd::ADAPTERS);
     v.extend(libgpu::ADAPTERS);
-    v.extend(libpad::ADAPTERS);
     v.extend(libspu::ADAPTERS);
     v.extend(libmc::ADAPTERS);
     v

@@ -447,9 +447,8 @@ impl Drop for Conform {
 }
 
 impl Conform {
-    /// `ram`: (guest address, bytes) to write before the runtime starts;
-    /// `io`: attach register-level devices (original SDK code).
-    pub fn new(opts: &Options, ram: &[(u32, Vec<u8>)], sp: u32, gp: u32, io: bool) -> Result<Self> {
+    /// `ram`: (guest address, bytes) to write before the runtime starts.
+    pub fn new(opts: &Options, ram: &[(u32, Vec<u8>)], sp: u32, gp: u32) -> Result<Self> {
         let mut opts = opts.clone();
         if opts.frames == 0 {
             opts.frames = u64::MAX;
@@ -461,8 +460,8 @@ impl Conform {
             memory.data_mut(&mut store)[at..at + bytes.len()].copy_from_slice(bytes);
         }
         let ptr = boot_options(&mut store, &instance, &opts)?;
-        let init = instance.get_typed_func::<(u32, u32, u32, u32), ()>(&mut store, psxw_abi::exports::CONFORM_INIT)?;
-        init.call(&mut store, (ptr, sp, gp, io as u32))?;
+        let init = instance.get_typed_func::<(u32, u32, u32), ()>(&mut store, psxw_abi::exports::CONFORM_INIT)?;
+        init.call(&mut store, (ptr, sp, gp))?;
         let ticker = (opts.deadline_secs > 0).then(|| {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (engine, flag) = (store.engine().clone(), stop.clone());

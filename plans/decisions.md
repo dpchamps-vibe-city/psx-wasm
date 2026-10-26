@@ -280,6 +280,25 @@ binaryen in the toolchain pins, which M0 already has.
 - **Replays can be written as presses** (`BUTTON@FRAME[:HOLD]`), so a
   game's default replay lives in its manifest as text.
 
+**D40. Pad input runs through the original libpad over a register-level
+SIO0** (M4). `sdk_psyq::DEVICE_LIBRARIES` names libraries that get no
+adapters. Their functions' I/O-window accesses call the runtime
+(`psx.io_access`), whose bus (`psx_bios::io`) has the interrupt controller,
+the root counters and SIO0. SIO0 is a bit-level port of the oracle's
+FrontIO and digital pad. Interrupts walk the `SysEnqIntRP` chains as
+OpenBIOS does.
+
+*Why:* conformance against the translated library showed that what games
+observe is libpad's own state machine: PadGetState goes 0 → 1 → 2 over
+the first frames, the buffers start `FF 00`, PadStopCom returns 0, and
+port 2 is first polled a vblank after port 1. An adapter would have to
+reimplement that per libpad version. The original over the device is
+exact by construction, and costs a few SIO0 bytes per frame. Other
+functions keep adapters. A debug build still traps on their I/O
+(`psx.io_trap`). (The general rule stays §5: adapters for what touches
+hardware. This is the exception where the hardware is small and the
+library's logic is the behaviour.)
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.

@@ -17,6 +17,9 @@ use serde::Serialize;
 
 pub const USAGE: &str = "conform <game> --lib libpad [--frames N]";
 
+/// Libraries with a scenario (the `psxw ci` gate runs each).
+pub const LIBRARIES: &[&str] = &["libpad"];
+
 /// Free RAM for scenario buffers: below the stack, above any game data.
 const SCRATCH: u32 = 0x801C_0000;
 
@@ -145,12 +148,12 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let ctx = Ctx { inputs: &inputs };
     let dir = ws.out_dir().join("conform").join(game);
     std::fs::create_dir_all(&dir)?;
-    let side = |wasm: &str, io: bool| -> Result<Side> {
+    let side = |wasm: &str| -> Result<Side> {
         let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, ..Default::default() };
-        Ok(Side { c: Conform::new(&o, &ram, sp, exe.gp0, io)?, log: vec![] })
+        Ok(Side { c: Conform::new(&o, &ram, sp, exe.gp0)?, log: vec![] })
     };
-    let mut a = side(&adapters, false)?;
-    let mut o = side(&original, true)?;
+    let mut a = side(&adapters)?;
+    let mut o = side(&original)?;
     eprintln!("conform: adapter side ({adapters})");
     let ra = scenario(&ctx, &mut a, frames);
     eprintln!("conform: original side ({original})");

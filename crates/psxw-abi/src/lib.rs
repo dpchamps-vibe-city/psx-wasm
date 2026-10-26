@@ -14,7 +14,7 @@ pub mod replay;
 
 /// Bumped whenever the host interface, the guest/runtime seam or the boot
 /// options change. `game.wasm` exports it; hosts refuse a mismatch.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// wasm address of guest physical address 0. Folded into every guest
 /// load/store's `memarg` offset, so translation costs one `i32.and`.
@@ -98,8 +98,14 @@ pub mod psx {
     pub const GTE_MTC2: &str = "gte_mtc2";
     pub const GTE_CTC2: &str = "gte_ctc2";
     pub const GTE_EXEC: &str = "gte_exec";
-    /// `(addr) -> ()`: debug builds trap on an access to the I/O window.
+    /// `(window offset, kind) -> ()`: an access to the I/O window by a
+    /// function of a device library (D40): a load calls it before reading,
+    /// a store after writing; `kind` is the size plus 0x100 for stores. The
+    /// runtime's devices supply or take the value through the window.
     pub const IO_ACCESS: &str = "io_access";
+    /// `(window offset, kind) -> ()`: the same, in any other function of a
+    /// debug build: a trap (the function needs an adapter).
+    pub const IO_TRAP: &str = "io_trap";
     /// `(addr) -> ()`: a watched function was entered.
     pub const PROBE: &str = "probe";
     /// Adapters are exported as `adapter.<function name>` with the o32
@@ -159,10 +165,9 @@ pub mod exports {
     pub const ALLOC: &str = "psxw_alloc";
     /// `() -> i64`: FNV-1a of guest RAM.
     pub const RAM_HASH: &str = "psxw_ram_hash";
-    /// `(options_ptr, sp, gp, io) -> ()`: set the runtime up without a disc,
+    /// `(options_ptr, sp, gp) -> ()`: set the runtime up without a disc,
     /// for a host that drives guest calls itself (conformance runs). The
-    /// host has written guest RAM. `io` = 1 attaches register-level
-    /// devices (I/O-window accesses reach them instead of trapping).
+    /// host has written guest RAM.
     pub const CONFORM_INIT: &str = "psxw_conform_init";
     /// `(addr, a0, a1, a2, a3) -> i64`: call a guest function (o32), then
     /// run the callbacks it left queued; `v0 | v1 << 32`.

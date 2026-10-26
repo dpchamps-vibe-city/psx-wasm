@@ -208,8 +208,12 @@ golden.
    conformance harness (register decoder).
 8. [ ] libetc adapters (`VSync` modes 0, 1, n, −1; callbacks) and
    conformance.
-9. [ ] SIO pad device; libpad and libapi pad adapters; conformance (SIO0
-   decoder); replay input path; optional native window input.
+9. [x] SIO pad device; libpad and libapi pad adapters; conformance (SIO0
+   decoder); replay input path; optional native window input. *(D40:
+   libpad runs as original code over the SIO0 device, so it has no
+   adapters; `psxw conform btn --lib libpad` passes. libapi's pad members
+   serve the BIOS pad driver, which the HLE BIOS implements. The optional
+   window input comes with the native window.)*
 10. [ ] GPU recording hook. Author the `title-to-gameplay` replay; record
     vectors; capture goldens; reach zero failures.
 11. [ ] `psxw oracle ramdiff btn --replay title-to-gameplay`, with
@@ -282,6 +286,31 @@ golden.
     last-vertex-only depth cue was caught by 13 once a targeted group was
     added, and the far colour's dropped-sum overflow flags by 37.
   - `cargo test --workspace --release` passes.
+
+- **2026-10-26** (`b7f719e`, `ff17bea`, this commit): adapter conformance
+  and the pad (D40).
+  - **The harness:** `psxw conform <game> --lib L` runs one scenario of SDK
+    calls and vblanks without a disc, on the adapter build and on
+    `game-orig-L.wasm`, and compares return values and the SDK buffers
+    after each step.
+  - **I/O emulation:** the link's I/O hook passes the access kind and
+    runs after stores; `psx-bios::io` is the register bus.
+  - **SIO0:** a bit-level port of Beetle's FrontIO and gamepad.
+  - **IRQ chains:** they run as OpenBIOS runs them.
+  - **What the first run found:**
+    - libpad's IRQ helpers are reached only through a data table, so
+      the lift now starts functions at data pointers to unreachable code
+      (21 in btn);
+    - a hoisted load spun forever on JOY_STAT, so lifted loop heads now
+      carry a memory barrier;
+    - the libpad adapters differed from the original in their init bytes,
+      PadGetState's sequence and PadStopCom's result.
+
+    Hence D40.
+  - **Results:** `psxw conform btn --lib libpad --frames 120` passes, 124
+    steps, with the pad's button bytes identical frame for frame. The M1
+    difftest still passes (2,566 + 3 excluded), with the translated side
+    given 4x fuel.
 
 ## Findings
 

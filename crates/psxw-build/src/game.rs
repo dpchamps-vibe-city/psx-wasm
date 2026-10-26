@@ -108,6 +108,10 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;
     let adapters = crate::runtime::adapters(&runtime)?;
+    // Libraries whose own code runs over the runtime's devices (D40), and
+    // those built from their original code on request.
+    let mut device_libs = crate::runtime::devices(&runtime)?;
+    device_libs.extend(opts.original.iter().cloned());
 
     let mut inputs = psxw_lift::run::load(ws, &opts.game)?;
     let commit = inputs.commit.clone();
@@ -251,6 +255,13 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         overlays: overlays.clone(),
         budget: opts.budget,
         debug_io: opts.debug_io || !opts.original.is_empty(),
+        device_funcs: tiers
+            .keys()
+            .filter(|(c, a)| {
+                inputs.map.sdk_at(c, *a).is_some_and(|p| device_libs.iter().any(|l| p.member.split('/').next() == Some(l.as_str())))
+            })
+            .cloned()
+            .collect(),
         main: inputs.map.main.clone(),
         min_pages: 1024,
         probes: inputs

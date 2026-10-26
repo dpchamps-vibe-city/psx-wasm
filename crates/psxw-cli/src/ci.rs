@@ -92,6 +92,16 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         let (_, checks) = crate::run::evaluate(ws, game, &["--frames", "1200", "--wasm", &wasm, "--check", "no-trap"])?;
         Ok(checks_detail(&checks))
     })());
+    gate(&mut gates, "conform", "M4", (|| {
+        let mut detail = Vec::new();
+        let mut pass = true;
+        for lib in crate::conform::LIBRARIES {
+            let ok = crate::conform::run(ws, game, &["--lib", lib])?;
+            pass &= ok;
+            detail.push(format!("{lib} {}", if ok { "pass" } else { "FAIL" }));
+        }
+        Ok((pass, detail.join(", ")))
+    })());
     gate(&mut gates, "oracle", "M3", (|| {
         let reports = psxw_oracle::commands::ci(ws)?;
         let pass = reports.iter().all(|(r, _)| r.pass);

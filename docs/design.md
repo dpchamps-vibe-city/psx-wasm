@@ -349,11 +349,24 @@ The PsyQ policy, measured on the 361 SDK members btn links:
 | libgpu | Adapters at the device edge: `ResetGraph`, `DrawOTag`, `DrawSync`, `LoadImage`, `StoreImage`, `MoveImage`, `ClearImage`, `PutDrawEnv`, `PutDispEnv`, `SetDispMask`. Primitive setup and OT helpers stay guest code. |
 | libcd | Adapters at the device edge: `CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`. Helpers such as `CdIntToPos` stay guest code. |
 | libspu | Adapters (register programming). Open question: register-level SPU emulation as the fallback for unknown versions. |
-| libpad, libmcrd, libmcx, libcard | Adapters. |
+| libpad | Guest code over the SIO0 device (D40). Its state machine is the behaviour games observe, and the device is a port of the oracle's. |
+| libmcrd, libmcx, libcard | Adapters. |
 | libsnd | Guest code. The sequencer *is* the game's music, so the original runs and only libspu beneath it is replaced. |
 | libgs | Guest code. It only writes packets into RAM; `DrawOTag` is the device step. |
 | libgte | Guest code, with COP2 through `psx-gte`. Hot wrappers may get adapters for speed. |
 | libmath, libc | Guest code. `rand` must be the original, or the game plays differently. `memcpy` and `memset` may get adapters for speed. |
+
+**Device libraries (D40).** A library can run as guest code over
+register-level devices instead of getting adapters. Only its functions'
+I/O-window accesses reach the runtime's bus (`psx-bios::io`: interrupt
+controller, root counters, SIO0), and interrupts run the kernel's
+`SysEnqIntRP` chains. That pays off where the hardware traffic is tiny and
+the library's own logic is what games observe.
+
+**Conformance.** `psxw conform <game> --lib L` checks the result of the
+adapter rule. One scenario of SDK calls and vblanks runs on the build with
+adapters and on a build where `L` is its original code over the devices.
+The two must agree on what the game can observe.
 
 Adapters declare their C prototypes. The build checks them against the SDK
 headers, so a signature drift fails at link time, not at run time. The
