@@ -226,8 +226,9 @@ golden.
 11. [ ] `psxw oracle ramdiff btn --replay title-to-gameplay`, with
     `exclude_symbols` covering only sound-driver state (with reasons).
     Reach zero differences.
-12. [ ] *(optional)* `asm-gte` normalizer rule; `difftest` on the
-    functions that move to C.
+12. [x] *(optional)* `asm-gte` normalizer rule; `difftest` on the
+    functions that move to C. *(`psxw-cc::gte`: 7 btn functions move to
+    C, and all 7 pass difftest.)*
 13. [x] `psxw run btn --headless --replay … --dump-frames out/` writes
     PNGs for humans (not gating). Add the GPU and GTE checks to `psxw ci`.
     Docs, README status. *(`psxw_oracle::commands::ci` checks every device
@@ -404,6 +405,24 @@ golden.
     - So the adapters were removed, as for libpad and libgpu. All four
       scenarios pass with libetc original (libmcrd's goes through its
       interrupts too).
+
+- **2026-10-26** (this commit): task 12, the `asm-gte` rule.
+  - **`psxw-cc::gte`** rewrites a PsyQ GTE macro's asm statement into
+    calls to the GTE intrinsics, when it models every instruction:
+    - the coprocessor moves;
+    - the CPU loads, stores and ALU operations on scratch registers;
+    - commands as `cop2`, gas mnemonics, real `cop2` words, or DMPSX
+      placeholders.
+  - **Placeholders:** the command encodings are psyq-decomp's
+    `include/inline_a.inc`, and the placeholder indices are
+    `inline_c.h`'s. MVMVA's fields are decoded from bits 18-26. The
+    light- and colour-matrix families stay unmapped, because their
+    `lm` isn't pinned by a trusted source.
+  - **btn:** 7 functions move from lift to C; all 7 pass difftest (2,566
+    pass in all). The other 10 inline-asm functions are decomp matching
+    hacks (hand-written branches), and stay lifted.
+  - **The gate works:** with `rtps` deliberately mis-encoded, difftest
+    reports `C gte 00380001 vs translated gte 00180001`.
 
 ## Findings
 

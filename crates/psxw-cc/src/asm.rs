@@ -18,6 +18,9 @@ pub enum AsmKind {
     Break(String),
     /// `nop`: scheduling only.
     Nop,
+    /// PsyQ GTE macro code, lowered to the runtime's GTE intrinsics
+    /// ([`crate::gte`]): the C replacement.
+    Gte(String),
     /// Anything else: real MIPS instructions.
     Real,
 }
@@ -60,6 +63,7 @@ pub fn rule(site: &AsmSite) -> Option<&'static str> {
         AsmKind::Barrier => Some("asm-barrier"),
         AsmKind::Break(_) => Some("asm-break"),
         AsmKind::Nop => Some("asm-nop"),
+        AsmKind::Gte(_) => Some("asm-gte"),
         AsmKind::Label | AsmKind::Real => None,
     }
 }
@@ -99,6 +103,7 @@ pub fn edits(text: &str, sites: &[AsmSite]) -> Vec<Edit> {
                 }
             }
             AsmKind::Break(expr) => out.push(Edit::replace(s.start..s.end, format!("__psxw_break({expr})"))),
+            AsmKind::Gte(code) => out.push(Edit::replace(s.start..s.end, code.clone())),
             AsmKind::Label | AsmKind::Real => {}
         }
     }
@@ -188,6 +193,8 @@ fn site_at(text: &str, start: usize, after_kw: usize, depth: i32) -> Option<AsmS
             Some(expr) => AsmKind::Break(expr),
             None => AsmKind::Real,
         }
+    } else if let Some(code) = crate::gte::lower(&template, rest) {
+        AsmKind::Gte(code)
     } else {
         AsmKind::Real
     };
