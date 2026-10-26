@@ -1,41 +1,62 @@
 /*
  * GPU ops: reset, CPU<->VRAM rectangles and command execution, straight
  * on GP0/GP1 and DMA channel 2. No libgpu semantics.
+ *
+ * Pacing: every port packet, DMA block and linked-list node carries whole
+ * commands, and starts when the GPU is idle (GPUSTAT bit 26). Waiting on
+ * bit 28 per word would deadlock: it drops as soon as the first word of a
+ * command is queued (Beetle, like the hardware, reports "ready for a DMA
+ * block", not "FIFO not full"). Port and block packets are at most the
+ * FIFO depth (PSXW_GPU_PACKET_MAX_WORDS).
  */
 
 #include "runner.h"
 
 #define STAT_CMD_READY (1u << 26)  /* idle: no command, FIFO empty */
 #define STAT_VRAM_READY (1u << 27) /* VRAM->CPU data available */
-#define STAT_FIFO_READY (1u << 28) /* room for a word */
 #define CHCR_BUSY (1u << 24)
 
-/* Built here for linked-list DMA (and as a contiguous copy for block DMA). */
+/* Linked lists are built here; block-mode packets are copied here. */
 static uint32_t list_buf[PSXW_GPU_LIST_BUF_WORDS] __attribute__((aligned(16)));
 
 static uint32_t wait_stat(uint32_t mask) {
+    uint32_t s = 0;
     for (uint32_t i = 0; i < SPIN_LIMIT; i++)
-        if ((GPUSTAT & mask) == mask) return PSXW_ERR_NONE;
+        if (((s = GPUSTAT) & mask) == mask) return PSXW_ERR_NONE;
+    diag(PSXW_DIAG_GPUSTAT, s);
     return PSXW_ERR_TIMEOUT;
 }
 
 static uint32_t wait_dma2(void) {
+    uint32_t c = 0;
     for (uint32_t i = 0; i < SPIN_LIMIT; i++)
-        if (!(DMA_CHCR(2) & CHCR_BUSY)) return PSXW_ERR_NONE;
+        if (!((c = DMA_CHCR(2)) & CHCR_BUSY)) return PSXW_ERR_NONE;
+    diag(PSXW_DIAG_DMA2, c);
     return PSXW_ERR_TIMEOUT;
 }
 
+/* No DMA running, no command in progress, FIFO empty. */
 static uint32_t wait_idle(void) {
     uint32_t e = wait_dma2();
-    return e ? e : wait_stat(STAT_CMD_READY | STAT_FIFO_READY);
+    return e ? e : wait_stat(STAT_CMD_READY);
 }
 
-/* GP0 write through the port, waiting for FIFO room. */
-static uint32_t gp0(uint32_t w) {
-    uint32_t e = wait_stat(STAT_FIFO_READY);
+/* Whole commands (at most the FIFO depth) through the port, once idle. */
+static uint32_t send_port(const uint32_t *w, uint32_t n) {
+    uint32_t e = wait_idle();
     if (e) return e;
-    GP0 = w;
+    GP1 = 0x04000000u;
+    for (uint32_t k = 0; k < n; k++) GP0 = w[k];
     return PSXW_ERR_NONE;
+}
+
+/* `blocks` blocks of `bs` words to GP0 by DMA2 sync mode 1. */
+static uint32_t send_blocks(const uint32_t *w, uint32_t bs, uint32_t blocks) {
+    GP1 = 0x04000002u; /* DMA CPU->GP0 */
+    DMA_MADR(2) = PHYS(w);
+    DMA_BCR(2) = bs | blocks << 16;
+    DMA_CHCR(2) = 0x01000201u;
+    return wait_dma2();
 }
 
 struct rect {
@@ -68,6 +89,8 @@ uint32_t op_gpu_reset(const uint8_t *p, uint32_t len, uint8_t *res, uint32_t roo
     return wait_stat(STAT_CMD_READY);
 }
 
+/* GP0(A0h) header by port, the pixels by DMA in blocks of 16 words (as
+ * libgpu's LoadImage), any remainder by port. */
 uint32_t op_vram_write(const uint8_t *p, uint32_t len, uint8_t *res, uint32_t room, uint32_t *rlen) {
     (void)res;
     (void)room;
@@ -80,14 +103,13 @@ uint32_t op_vram_write(const uint8_t *p, uint32_t len, uint8_t *res, uint32_t ro
     const uint8_t *data = rd_bytes(&r, pixels * 2);
     if (!data || r.pos != len) return PSXW_ERR_BAD_LEN;
     const uint32_t *words = (const uint32_t *)data;
-    if ((e = wait_idle())) return e;
-    GP1 = 0x04000001u; /* FIFO mode */
-    if ((e = gp0(0xA0000000u)) || (e = gp0(rc.y << 16 | rc.x)) || (e = gp0(rc.h << 16 | rc.w))) return e;
-    for (uint32_t i = 0; i < (pixels + 1) / 2; i++)
-        if ((e = gp0(words[i]))) return e;
-    e = wait_idle();
+    uint32_t n = (pixels + 1) / 2, bulk = n / 16;
+    const uint32_t hdr[3] = {0xA0000000u, rc.y << 16 | rc.x, rc.h << 16 | rc.w};
+    if ((e = send_port(hdr, 3))) return e;
+    if (bulk && (e = send_blocks(words, 16, bulk))) return e;
     GP1 = 0x04000000u;
-    return e;
+    for (uint32_t i = bulk * 16; i < n; i++) GP0 = words[i];
+    return wait_idle();
 }
 
 uint32_t op_vram_read(const uint8_t *p, uint32_t len, uint8_t *res, uint32_t room, uint32_t *rlen) {
@@ -99,9 +121,8 @@ uint32_t op_vram_read(const uint8_t *p, uint32_t len, uint8_t *res, uint32_t roo
     uint32_t pixels = rc.w * rc.h;
     uint32_t words = (pixels + 1) / 2;
     if (words * 4 > room) return PSXW_ERR_RESULT_OVERFLOW;
-    if ((e = wait_idle())) return e;
-    GP1 = 0x04000000u;
-    if ((e = gp0(0xC0000000u)) || (e = gp0(rc.y << 16 | rc.x)) || (e = gp0(rc.h << 16 | rc.w))) return e;
+    const uint32_t hdr[3] = {0xC0000000u, rc.y << 16 | rc.x, rc.h << 16 | rc.w};
+    if ((e = send_port(hdr, 3))) return e;
     if ((e = wait_stat(STAT_VRAM_READY))) return e;
     for (uint32_t i = 0; i < words; i++) put_u32(res + 4 * i, GPUREAD);
     if (pixels & 1) { /* the last word's upper half is not VRAM */
@@ -124,62 +145,48 @@ uint32_t op_gpu_exec(const uint8_t *p, uint32_t len, uint8_t *res, uint32_t room
     if (!state || rd_u32(&r, &n_packets)) return PSXW_ERR_BAD_LEN;
     uint32_t packets_pos = r.pos;
 
-    /* Validate the packet list and size the DMA buffer. */
-    uint32_t total = 0;
+    /* Validate the packet list against the mode's limits. */
+    uint32_t total = 0, max = mode == PSXW_GPU_MODE_LIST ? 255 : PSXW_GPU_PACKET_MAX_WORDS;
     for (uint32_t i = 0; i < n_packets; i++) {
         uint32_t n;
         if (rd_u32(&r, &n) || n > len / 4 || !rd_bytes(&r, n * 4)) return PSXW_ERR_BAD_LEN;
         total += n + 1;
-        if (total > PSXW_GPU_LIST_BUF_WORDS || (mode == PSXW_GPU_MODE_LIST && n > 255)) return PSXW_ERR_BAD_LEN;
+        if (total > PSXW_GPU_LIST_BUF_WORDS || n > max) return PSXW_ERR_BAD_LEN;
     }
     if (r.pos != len) return PSXW_ERR_BAD_LEN;
 
-    if ((e = wait_idle())) return e;
-    GP1 = 0x04000001u;
-    if ((e = gp0(0x01000000u))) return e; /* clear the texture cache */
-    for (uint32_t i = 0; i < n_state; i++) {
-        if ((e = wait_stat(STAT_CMD_READY)) || (e = gp0(state[i]))) return e;
-    }
+    static const uint32_t clear_cache = 0x01000000u;
+    if ((e = send_port(&clear_cache, 1))) return e;
+    for (uint32_t i = 0; i < n_state; i++)
+        if ((e = send_port(&state[i], 1))) return e;
 
-    r.pos = packets_pos + 4;
-    if (mode == PSXW_GPU_MODE_PORT) {
-        for (uint32_t i = 0; i < n_packets; i++) {
-            uint32_t n = 0;
-            rd_u32(&r, &n);
-            const uint32_t *w = (const uint32_t *)rd_bytes(&r, n * 4);
-            if ((e = wait_stat(STAT_CMD_READY))) return e;
-            for (uint32_t k = 0; k < n; k++)
-                if ((e = gp0(w[k]))) return e;
+    r.pos = packets_pos;
+    uint32_t *node = list_buf;
+    for (uint32_t i = 0; i < n_packets; i++) {
+        uint32_t n = 0;
+        if (rd_u32(&r, &n)) return PSXW_ERR_BAD_LEN;
+        const uint32_t *w = (const uint32_t *)rd_bytes(&r, n * 4);
+        if (!w) return PSXW_ERR_BAD_LEN;
+        if (mode == PSXW_GPU_MODE_PORT) {
+            if ((e = send_port(w, n))) return e;
+        } else if (mode == PSXW_GPU_MODE_BLOCK) {
+            if (n == 0) continue;
+            memcpy(list_buf, w, n * 4);
+            if ((e = wait_idle()) || (e = send_blocks(list_buf, n, 1))) return e;
+        } else {
+            uint32_t *next = node + 1 + n;
+            node[0] = n << 24 | (i + 1 == n_packets ? 0x00FFFFFFu : PHYS(next));
+            memcpy(node + 1, w, n * 4);
+            node = next;
         }
-    } else {
-        uint32_t *node = list_buf, words = 0;
-        for (uint32_t i = 0; i < n_packets; i++) {
-            uint32_t n = 0;
-            rd_u32(&r, &n);
-            const uint32_t *w = (const uint32_t *)rd_bytes(&r, n * 4);
-            if (mode == PSXW_GPU_MODE_LIST) {
-                uint32_t *next = node + 1 + n;
-                node[0] = n << 24 | (i + 1 == n_packets ? 0x00FFFFFFu : PHYS(next));
-                memcpy(node + 1, w, n * 4);
-                node = next;
-            } else {
-                memcpy(list_buf + words, w, n * 4);
-                words += n;
-            }
-        }
-        if (mode == PSXW_GPU_MODE_LIST ? n_packets > 0 : words > 0) {
-            if ((e = wait_stat(STAT_CMD_READY))) return e;
-            GP1 = 0x04000002u; /* DMA CPU->GP0 */
-            DMA_MADR(2) = PHYS(list_buf);
-            if (mode == PSXW_GPU_MODE_LIST) {
-                DMA_BCR(2) = 0;
-                DMA_CHCR(2) = 0x01000401u;
-            } else {
-                DMA_BCR(2) = 1u | words << 16;
-                DMA_CHCR(2) = 0x01000201u;
-            }
-            if ((e = wait_dma2())) return e;
-        }
+    }
+    if (mode == PSXW_GPU_MODE_LIST && n_packets > 0) {
+        if ((e = wait_idle())) return e;
+        GP1 = 0x04000002u; /* DMA CPU->GP0 */
+        DMA_MADR(2) = PHYS(list_buf);
+        DMA_BCR(2) = 0;
+        DMA_CHCR(2) = 0x01000401u;
+        if ((e = wait_dma2())) return e;
     }
     e = wait_idle();
     GP1 = 0x04000000u;

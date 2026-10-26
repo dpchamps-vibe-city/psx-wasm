@@ -72,6 +72,11 @@ wire_consts!(MAILBOX, "Mailbox: a fixed region of main RAM shared by the runner 
     MBX_OFF_CAPACITY = 0x28;
     /// Header field: incremented by the runner while it waits (liveness).
     MBX_OFF_HEARTBEAT = 0x2C;
+    /// Header field: which device wait last timed out (a `DIAG_*` code);
+    /// the host clears it before each exchange and logs it when set.
+    MBX_OFF_DIAG_WHAT = 0x30;
+    /// Header field: the register value that wait last read.
+    MBX_OFF_DIAG_VALUE = 0x34;
     /// Start of the data area (payload in, result out).
     MBX_OFF_DATA = 0x40;
     /// State: the runner has not started (RAM still zero).
@@ -97,7 +102,7 @@ wire_consts!(BATCH, "Batch framing: payload = u32 n_ops, then n_ops op records; 
     BATCH_RES_HDR_SIZE = 8;
 });
 
-wire_consts!(ERRORS, "Error codes (mailbox error field and op status)", {
+wire_consts!(ERRORS, "Error codes (mailbox error field and op status) and diagnostics", {
     /// Success.
     ERR_NONE = 0;
     /// Unknown mailbox kind.
@@ -114,6 +119,16 @@ wire_consts!(ERRORS, "Error codes (mailbox error field and op status)", {
     ERR_SKIPPED = 0x15;
     /// The results would not fit in the mailbox.
     ERR_RESULT_OVERFLOW = 0x16;
+    /// Diagnostic: waiting on GPUSTAT (value: GPUSTAT).
+    DIAG_GPUSTAT = 1;
+    /// Diagnostic: waiting for DMA channel 2 (value: its CHCR).
+    DIAG_DMA2 = 2;
+    /// Diagnostic: waiting for DMA channel 4 (value: its CHCR).
+    DIAG_DMA4 = 3;
+    /// Diagnostic: waiting on SPUSTAT (value: SPUSTAT).
+    DIAG_SPUSTAT = 4;
+    /// Diagnostic: waiting for the SPU capture-half edge (value: SPUSTAT).
+    DIAG_SPU_SYNC = 5;
 });
 
 wire_consts!(OPS, "Runner operations", {
@@ -175,6 +190,9 @@ wire_consts!(LAYOUT, "Payload layouts and limits", {
     /// Words the runner can hold for building a linked list (packets plus
     /// one header word each).
     GPU_LIST_BUF_WORDS = 0x8000;
+    /// Largest packet in port and block modes: the GP0 FIFO depth. Each
+    /// packet (and each linked-list node) must hold whole commands.
+    GPU_PACKET_MAX_WORDS = 16;
     /// GTE_EXEC payload size.
     GTE_EXEC_PAYLOAD_SIZE = 260;
     /// GTE_EXEC result size.

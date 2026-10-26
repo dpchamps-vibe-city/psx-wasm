@@ -602,7 +602,7 @@ static void run_frame(void) {
 }
 
 /* Statistics for the provenance's "run" member. */
-static uint64_t stat_boot_frames, stat_exchanges, stat_exchange_frames, stat_max_exchange_frames;
+static uint64_t stat_boot_frames, stat_exchanges, stat_exchange_frames, stat_max_exchange_frames, stat_diagnostics;
 static uint32_t stat_runner_version, stat_capacity;
 static const char *stat_content = "";
 
@@ -612,8 +612,8 @@ static void write_run_stats(FILE *f) {
     fprintf(f, "\"boot_frames\": %llu, \"exchanges\": %llu, \"exchange_frames\": %llu, \"max_exchange_frames\": %llu, ",
             (unsigned long long)stat_boot_frames, (unsigned long long)stat_exchanges,
             (unsigned long long)stat_exchange_frames, (unsigned long long)stat_max_exchange_frames);
-    fprintf(f, "\"frames\": %llu, \"frames_presented\": %llu}", (unsigned long long)frames_run,
-            (unsigned long long)frames_presented);
+    fprintf(f, "\"frames\": %llu, \"frames_presented\": %llu, \"timed_out_waits\": %llu}", (unsigned long long)frames_run,
+            (unsigned long long)frames_presented, (unsigned long long)stat_diagnostics);
 }
 
 static void dump_ram(const char *path) {
@@ -692,6 +692,8 @@ static int mode_exe(const struct exe_args *a) {
         wr32(PSXW_MBX_OFF_PAYLOAD_LEN, len);
         wr32(PSXW_MBX_OFF_RESULT_LEN, 0);
         wr32(PSXW_MBX_OFF_ERROR, 0);
+        wr32(PSXW_MBX_OFF_DIAG_WHAT, 0);
+        wr32(PSXW_MBX_OFF_DIAG_VALUE, 0);
         wr32(PSXW_MBX_OFF_SEQ, ++seq);
         wr32(PSXW_MBX_OFF_STATE, PSXW_MBX_STATE_PENDING);
         uint64_t start = frames_run;
@@ -706,6 +708,15 @@ static int mode_exe(const struct exe_args *a) {
                 die(EXIT_EXCHANGE, "exchange %u: no answer after %llu frames (state %u)", i,
                     (unsigned long long)(frames_run - start), state);
             }
+        }
+        if (rd32(PSXW_MBX_OFF_DIAG_WHAT)) {
+            stat_diagnostics++;
+            if (log_file)
+                fprintf(log_file, "[host] exchange %u: runner wait %u timed out, last read %08x\n", i,
+                        rd32(PSXW_MBX_OFF_DIAG_WHAT), rd32(PSXW_MBX_OFF_DIAG_VALUE));
+            if (verbose)
+                fprintf(stderr, "psxw-emu-host: exchange %u: runner wait %u timed out, last read %08x\n", i,
+                        rd32(PSXW_MBX_OFF_DIAG_WHAT), rd32(PSXW_MBX_OFF_DIAG_VALUE));
         }
         uint64_t took = frames_run - start;
         stat_exchange_frames += took;

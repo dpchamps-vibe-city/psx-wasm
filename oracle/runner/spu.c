@@ -51,8 +51,10 @@ static void wait_samples(uint32_t samples) {
 }
 
 static uint32_t wait_spustat(uint16_t mask, uint16_t value) {
+    uint16_t s = 0;
     for (uint32_t i = 0; i < SPIN_LIMIT; i++)
-        if ((SPU_REG(R_SPUSTAT) & mask) == value) return PSXW_ERR_NONE;
+        if (((s = SPU_REG(R_SPUSTAT)) & mask) == value) return PSXW_ERR_NONE;
+    diag(PSXW_DIAG_SPUSTAT, s);
     return PSXW_ERR_TIMEOUT;
 }
 
@@ -74,8 +76,12 @@ static uint32_t spu_dma(uint32_t spu_addr, void *buf, uint32_t len, int to_spu) 
     DMA_BCR(4) = 4u | (len / 16u) << 16;
     DMA_CHCR(4) = to_spu ? 0x01000201u : 0x01000200u;
     for (uint32_t i = 0;; i++) {
-        if (!(DMA_CHCR(4) & (1u << 24))) break;
-        if (i == SPIN_LIMIT) return PSXW_ERR_TIMEOUT;
+        uint32_t c = DMA_CHCR(4);
+        if (!(c & (1u << 24))) break;
+        if (i == SPIN_LIMIT) {
+            diag(PSXW_DIAG_DMA4, c);
+            return PSXW_ERR_TIMEOUT;
+        }
     }
     if ((e = wait_spustat(0x0400, 0))) return e; /* transfer busy */
     return set_transfer(0);
@@ -175,7 +181,10 @@ uint32_t op_spu_run(const uint8_t *p, uint32_t len, uint8_t *res, uint32_t room,
         uint16_t cur = SPU_REG(R_SPUSTAT) & 0x800;
         if (cur && !prev) break;
         prev = cur;
-        if (timer_now() > 1100u * PSXW_SPU_CYCLES_PER_SAMPLE) return PSXW_ERR_TIMEOUT;
+        if (timer_now() > 1100u * PSXW_SPU_CYCLES_PER_SAMPLE) {
+            diag(PSXW_DIAG_SPU_SYNC, SPU_REG(R_SPUSTAT));
+            return PSXW_ERR_TIMEOUT;
+        }
     }
     timer_start();
     for (uint32_t i = 0; i < n_writes; i++) {

@@ -67,6 +67,13 @@
 /* Header field: incremented by the runner while it waits (liveness). */
 #define PSXW_MBX_OFF_HEARTBEAT 0x0000002Cu
 
+/* Header field: which device wait last timed out (a `DIAG_*` code); */
+/* the host clears it before each exchange and logs it when set. */
+#define PSXW_MBX_OFF_DIAG_WHAT 0x00000030u
+
+/* Header field: the register value that wait last read. */
+#define PSXW_MBX_OFF_DIAG_VALUE 0x00000034u
+
 /* Start of the data area (payload in, result out). */
 #define PSXW_MBX_OFF_DATA 0x00000040u
 
@@ -98,7 +105,7 @@
 /* bytes, padded to 4. After a failed op the rest are `ERR_SKIPPED`. */
 #define PSXW_BATCH_RES_HDR_SIZE 0x00000008u
 
-/* ---- Error codes (mailbox error field and op status) ---- */
+/* ---- Error codes (mailbox error field and op status) and diagnostics ---- */
 
 /* Success. */
 #define PSXW_ERR_NONE 0x00000000u
@@ -123,6 +130,21 @@
 
 /* The results would not fit in the mailbox. */
 #define PSXW_ERR_RESULT_OVERFLOW 0x00000016u
+
+/* Diagnostic: waiting on GPUSTAT (value: GPUSTAT). */
+#define PSXW_DIAG_GPUSTAT 0x00000001u
+
+/* Diagnostic: waiting for DMA channel 2 (value: its CHCR). */
+#define PSXW_DIAG_DMA2 0x00000002u
+
+/* Diagnostic: waiting for DMA channel 4 (value: its CHCR). */
+#define PSXW_DIAG_DMA4 0x00000003u
+
+/* Diagnostic: waiting on SPUSTAT (value: SPUSTAT). */
+#define PSXW_DIAG_SPUSTAT 0x00000004u
+
+/* Diagnostic: waiting for the SPU capture-half edge (value: SPUSTAT). */
+#define PSXW_DIAG_SPU_SYNC 0x00000005u
 
 /* ---- Runner operations ---- */
 
@@ -200,6 +222,10 @@
 /* Words the runner can hold for building a linked list (packets plus */
 /* one header word each). */
 #define PSXW_GPU_LIST_BUF_WORDS 0x00008000u
+
+/* Largest packet in port and block modes: the GP0 FIFO depth. Each */
+/* packet (and each linked-list node) must hold whole commands. */
+#define PSXW_GPU_PACKET_MAX_WORDS 0x00000010u
 
 /* GTE_EXEC payload size. */
 #define PSXW_GTE_EXEC_PAYLOAD_SIZE 0x00000104u

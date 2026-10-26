@@ -42,6 +42,13 @@
 /* Poll bound for device waits: far longer than any legitimate wait. */
 #define SPIN_LIMIT 0x01000000u
 
+/* Record a timed-out wait in the mailbox header (PSXW_DIAG_* code and the
+ * register value last read); the host logs it. */
+static inline void diag(uint32_t what, uint32_t value) {
+    ((volatile uint32_t *)PSXW_MBX_ADDR)[PSXW_MBX_OFF_DIAG_WHAT / 4u] = what;
+    ((volatile uint32_t *)PSXW_MBX_ADDR)[PSXW_MBX_OFF_DIAG_VALUE / 4u] = value;
+}
+
 static inline uint32_t cop0_sr(void) {
     uint32_t v;
     __asm__ volatile("mfc0 %0, $12\n\tnop" : "=r"(v));
