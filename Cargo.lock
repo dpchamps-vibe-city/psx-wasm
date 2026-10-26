@@ -737,6 +737,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx-spu"
+version = "0.0.0"
+
+[[package]]
 name = "psxw-abi"
 version = "0.0.0"
 
@@ -913,6 +917,7 @@ dependencies = [
  "anyhow",
  "psx-devices",
  "psx-gte",
+ "psx-spu",
  "psxw-abi",
  "psxw-inputs",
  "serde",

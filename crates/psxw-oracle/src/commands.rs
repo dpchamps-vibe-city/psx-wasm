@@ -10,6 +10,7 @@ use crate::handwritten;
 use crate::images;
 use crate::record::game_set;
 use crate::report::{Entry, Report, first_difference};
+use crate::spu;
 use crate::store::Store;
 use crate::target::{DockerTarget, Target, emulator_target_id, run_vectors};
 use crate::vector::{Kind, Vector, VectorId};
@@ -30,8 +31,9 @@ pub const SELFTEST_SET: &str = "selftest";
 /// …). `check` includes every such set.
 pub const SYNTHETIC_PREFIX: &str = "synthetic-";
 /// Devices whose milestone gate also fails on unresolved vectors (no
-/// golden): M4 exit criterion 1 wants every GTE vector matched.
-pub const UNRESOLVED_FAILS: [&str; 1] = ["gte"];
+/// golden): M4 exit criterion 1 wants every GTE vector matched, M6 exit
+/// criterion 1 every SPU vector.
+pub const UNRESOLVED_FAILS: [&str; 2] = ["gte", "spu"];
 
 /// Store the synthetic GTE vectors (default seed); the note for reports.
 fn install_gte(store: &Store) -> Result<String> {
@@ -48,6 +50,19 @@ fn install_xa(ws: &Workspace, store: &Store) -> Result<String> {
         Some(lba) => format!("XA vectors: {} (test file at LBA {lba})", crate::xa_disc::install(store, lba)?.len()),
         None => "XA vectors: none (the runner disc has no XA test file; run `psxw oracle images build`)".into(),
     })
+}
+
+/// Store the synthetic SPU vectors (default seed); the note for reports.
+fn install_spu(store: &Store) -> Result<String> {
+    let counts = spu::install(store, spu::DEFAULT_SEED)?;
+    let total: usize = counts.values().map(|c| c.0).sum();
+    let dropped: usize = counts.values().map(|c| c.1).sum();
+    let parts: Vec<String> = counts.iter().map(|(g, (n, _))| format!("{g} {n}")).collect();
+    Ok(format!(
+        "synthetic SPU vectors: {total} (seed {:#018x}; {}); {dropped} candidates dropped as timing-sensitive",
+        spu::DEFAULT_SEED,
+        parts.join(", ")
+    ))
 }
 
 pub fn store(ws: &Workspace) -> Store {
@@ -147,6 +162,7 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     handwritten::install(&store)?;
     let gte_note = install_gte(&store)?;
     let xa_note = install_xa(ws, &store)?;
+    let spu_note = if kind.is_none_or(|k| k == Kind::SpuRun) { Some(install_spu(&store)?) } else { None };
     let synthetic = gpu_synth::install(&store)?;
     let mut target = DockerTarget::open(ws)?;
     let tid = target.id().to_string();
@@ -166,6 +182,7 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     report.seed = Some(format!("{:#018x}", gte::DEFAULT_SEED));
     report.notes.push(gte_note);
     report.notes.push(xa_note);
+    report.notes.extend(spu_note);
     let (mut new, mut same, mut changed, mut moved) = (0usize, 0usize, 0usize, 0usize);
     for ((id, v), res) in vectors.iter().zip(results) {
         let group = groups.get(id).cloned().unwrap_or_else(|| "unlisted".into());
@@ -278,6 +295,9 @@ pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn Devi
     if device == "xa" {
         notes.push(install_xa(ws, &store)?);
     }
+    if device == "spu" {
+        notes.push(install_spu(&store)?);
+    }
     let synthetic: Vec<String> = store.set_names()?.into_iter().filter(|n| n.starts_with(SYNTHETIC_PREFIX)).collect();
     let mut ids = std::collections::BTreeSet::new();
     let mut group = BTreeMap::new();
@@ -302,6 +322,9 @@ pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn Devi
     let mut report = Report::new("check");
     if device == "gte" {
         report.seed = Some(format!("{:#018x}", gte::DEFAULT_SEED));
+    }
+    if device == "spu" {
+        report.seed = Some(format!("{:#018x}", spu::DEFAULT_SEED));
     }
     report.notes.extend(notes);
     let imp = impls.iter_mut().find(|i| i.device() == device);
@@ -485,8 +508,9 @@ mod tests {
 
 /// The oracle's part of `psxw ci`: the images still match `inputs.lock`
 /// and the local daemon, the selftest passes, every archived vector
-/// reproduces its golden, and psx-gte matches every GTE golden of every
-/// game (M4 exit criterion 1).
+/// reproduces its golden, psx-gte matches every GTE golden of every game
+/// (M4 exit criterion 1), and psx-spu every SPU golden (M6 exit criterion
+/// 1).
 /// `psxw oracle ci`: images, selftest, capture (determinism), then the
 /// check of every device in `impls` for every game.
 pub fn ci(ws: &Workspace, impls: &mut [Box<dyn DeviceUnderTest>]) -> Result<Vec<(Report, PathBuf)>> {

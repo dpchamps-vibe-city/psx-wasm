@@ -8,6 +8,7 @@ publish.workspace = true
 anyhow = "1.0.104"
 psx-gte = { path = "../psx-gte" }
 psx-devices = { path = "../psx-devices" }
+psx-spu = { path = "../psx-spu" }
 psxw-abi = { path = "../psxw-abi" }
 psxw-inputs = { path = "../psxw-inputs" }
 serde = { version = "1.0.229", features = ["derive"] }
