@@ -54,6 +54,15 @@ pub trait Resolver {
     /// Instructions to run at the start of a function (GCC's `main` calls
     /// `__main`).
     fn prologue(&mut self, func_symbol: Option<&str>) -> Result<Vec<I<'static>>>;
+    /// Instructions at the top of every loop body: the safepoint budget.
+    fn loop_entry(&mut self) -> Vec<I<'static>> {
+        Vec::new()
+    }
+    /// When set, the function (`(window offset) -> ()`) every load and
+    /// store calls first if its address is in the I/O window.
+    fn io_check(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 struct TypeMap<'r, R: Resolver> {
@@ -77,6 +86,7 @@ pub const DIRTY_PAGE_SHIFT: u32 = 12;
 /// Rewrite defined function `func` (index into `obj.funcs`).
 pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<Function> {
     let dirty = r.dirty_map();
+    let io = r.io_check();
     let f = &obj.funcs[func];
     let ty = &obj.types[f.ty as usize];
     let body = FunctionBody::new(BinaryReader::new(&obj.bytes[f.body.clone()], f.body.start as u64));
@@ -140,6 +150,9 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 }
                 out.instruction(&I::I32Const(WINDOW_MASK as i32));
                 out.instruction(&I::I32And);
+                if let Some(check) = io {
+                    io_guard(&mut out, t_addr, check);
+                }
                 out.instruction(&I::$ins(masked($memarg.align as u32)));
             }};
         }
@@ -153,6 +166,9 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 }
                 out.instruction(&I::I32Const(WINDOW_MASK as i32));
                 out.instruction(&I::I32And);
+                if let Some(check) = io {
+                    io_guard(&mut out, t_addr, check);
+                }
                 if dirty.is_some() {
                     out.instruction(&I::LocalTee(t_addr));
                 }
@@ -282,12 +298,34 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 if !here.is_empty() {
                     bail!("unhandled relocation {:?} on {other:?}", here[0].ty);
                 }
+                let is_loop = matches!(other, Operator::Loop { .. });
                 let ins = TypeMap { r: &mut *r }.instruction(other).map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 out.instruction(&ins);
+                if is_loop {
+                    for i in r.loop_entry() {
+                        out.instruction(&i);
+                    }
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// With the masked address on the stack: call `check` when it lies in the
+/// I/O window, leaving the address in place.
+fn io_guard(out: &mut Function, t_addr: u32, check: u32) {
+    let io = psxw_abi::phys::IO;
+    out.instruction(&I::LocalTee(t_addr));
+    out.instruction(&I::I32Const(io.start as i32));
+    out.instruction(&I::I32Sub);
+    out.instruction(&I::I32Const((io.end - io.start) as i32));
+    out.instruction(&I::I32LtU);
+    out.instruction(&I::If(wasm_encoder::BlockType::Empty));
+    out.instruction(&I::LocalGet(t_addr));
+    out.instruction(&I::Call(check));
+    out.instruction(&I::End);
+    out.instruction(&I::LocalGet(t_addr));
 }
 
 /// Mark `[dst, dst + n)` dirty, keeping `dst` (a wasm address) on the stack.

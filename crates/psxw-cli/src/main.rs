@@ -11,6 +11,10 @@
 //!                                       M1: translated == decompiled C
 //! psxw link-test <game> --function F    M1: link one pair, validate, run once
 //! psxw ci <game>                        every gate of every milestone in place
+//! psxw runtime build                    runtime.wasm (game-agnostic)
+//! psxw build <game> [--debug-io]        M2: out/<game>/game.wasm
+//! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose]
+//!                                       M2: run game.wasm headless
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! ```
 
@@ -18,6 +22,7 @@ use anyhow::{Result, bail};
 use psxw_inputs::{Workspace, snapshot, toolchain};
 
 mod ci;
+mod run;
 mod oracle;
 
 fn main() {
@@ -153,6 +158,27 @@ fn run() -> Result<()> {
             }
         }
         ["oracle", rest @ ..] => oracle::run(&ws, rest)?,
+        ["run", game, rest @ ..] => {
+            if !run::run(&ws, game, rest)? {
+                std::process::exit(2);
+            }
+        }
+        ["runtime", "build"] => {
+            let p = psxw_build::runtime::build(&ws)?;
+            eprintln!("runtime: {}", p.display());
+        }
+        ["build", game, rest @ ..] => {
+            let mut opts = psxw_build::game::Options::new(game);
+            for a in rest.iter() {
+                match *a {
+                    "--debug-io" => opts.debug_io = true,
+                    other => bail!("unknown build option {other}"),
+                }
+            }
+            let (report, json) = psxw_build::game::build(&ws, &opts)?;
+            println!("{}", serde_json::to_string_pretty(&report.tiers)?);
+            eprintln!("game.wasm: {} ({} bytes); report {}", report.wasm, report.game_bytes, json.display());
+        }
         ["ci", game] => {
             if !ci::run(&ws, game)? {
                 std::process::exit(2);

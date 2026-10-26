@@ -15,6 +15,8 @@
 //!
 //! [`AddressMap`]: psxw_inputs::AddressMap
 
+pub mod bodies;
+pub mod game;
 pub mod layout;
 pub mod link;
 pub mod marshal;

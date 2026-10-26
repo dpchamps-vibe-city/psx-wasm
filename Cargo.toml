@@ -14,3 +14,10 @@ publish = false
 #   wasmtime               – native host
 #   wgpu, cpal, winit      – native presentation/audio
 #   wasm-bindgen, web-sys  – browser host
+
+# runtime.wasm: `psxw runtime build`.
+[profile.runtime]
+inherits = "release"
+panic = "abort"
+lto = true
+codegen-units = 1

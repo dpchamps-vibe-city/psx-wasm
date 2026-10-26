@@ -7,4 +7,3 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-psx-runtime = { path = "../psx-runtime" }

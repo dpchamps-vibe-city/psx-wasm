@@ -633,29 +633,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             f.instruction(&I::End);
             (sig.clone(), f, name.clone())
         }
-        Synth::Support { name, sig } => {
-            let mut f = Function::new([]);
-            match name.as_str() {
-                "fabs" => {
-                    f.instruction(&I::LocalGet(0));
-                    f.instruction(&I::F64Abs);
-                }
-                _ => {
-                    // (x ^ (x >> 31)) - (x >> 31)
-                    f.instruction(&I::LocalGet(0));
-                    f.instruction(&I::LocalGet(0));
-                    f.instruction(&I::I32Const(31));
-                    f.instruction(&I::I32ShrS);
-                    f.instruction(&I::I32Xor);
-                    f.instruction(&I::LocalGet(0));
-                    f.instruction(&I::I32Const(31));
-                    f.instruction(&I::I32ShrS);
-                    f.instruction(&I::I32Sub);
-                }
-            }
-            f.instruction(&I::End);
-            (sig.clone(), f, name.clone())
-        }
+        Synth::Support { name, sig } => (sig.clone(), crate::bodies::support(name), name.clone()),
         Synth::MarkRange => {
             // for (p = (dst - BASE) >> S; p <= (dst - BASE + n - 1) >> S; p++) map[p] = 1
             let Mode::Harness { dirty, .. } = ctx.mode;
@@ -703,100 +681,16 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
         Synth::InlineCopy => {
             let Mode::Harness { dirty, .. } = ctx.mode;
             let mark = dirty.map(|_| ctx.synth(Synth::MarkRange));
-            let mut f = Function::new([(1, ValType::I32)]);
-            for l in [0, 1] {
-                f.instruction(&I::LocalGet(l));
-                marshal::mask(&mut f);
-                f.instruction(&I::I32Const(WINDOW_BASE as i32));
-                f.instruction(&I::I32Add);
-                if let (0, Some(m)) = (l, mark) {
-                    // dst (wasm address) stays on the stack for the copy.
-                    f.instruction(&I::LocalTee(3));
-                    f.instruction(&I::LocalGet(2));
-                    f.instruction(&I::Call(m));
-                    f.instruction(&I::LocalGet(3));
-                }
-            }
-            f.instruction(&I::LocalGet(2));
-            f.instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 0 });
-            f.instruction(&I::LocalGet(0));
-            f.instruction(&I::End);
             let sig = FuncType { params: vec![wasmparser::ValType::I32; 3], results: vec![wasmparser::ValType::I32] };
-            (sig, f, "builtin_memcpy".into())
+            (sig, crate::bodies::inline_copy(mark), "builtin_memcpy".into())
         }
         Synth::Division(op, conv) => {
-            // GCC checks a variable divisor: `break 7` on zero, and for
-            // signed division `break 6` on INT_MIN / -1; the R3000 then
-            // yields lo = n >= 0 ? -1 : 1 (signed) or ~0, hi = n.
             let brk = ctx.synth(Synth::Service {
                 name: "__psxw_break".into(),
                 sig: FuncType { params: vec![wasmparser::ValType::I32], results: vec![] },
             });
-            let signed = op.ends_with("_s");
-            let rem = op.starts_with("rem");
-            let mut f = Function::new([]);
-            let block = wasm_encoder::BlockType::Empty;
-            // d == 0
-            f.instruction(&I::LocalGet(1));
-            f.instruction(&I::I32Eqz);
-            f.instruction(&I::If(block));
-            f.instruction(&I::I32Const(conv.zero as i32));
-            f.instruction(&I::Call(brk));
-            if rem {
-                f.instruction(&I::LocalGet(0));
-            } else if signed {
-                f.instruction(&I::I32Const(1));
-                f.instruction(&I::I32Const(-1));
-                f.instruction(&I::LocalGet(0));
-                f.instruction(&I::I32Const(0));
-                f.instruction(&I::I32LtS);
-                f.instruction(&I::Select);
-            } else {
-                f.instruction(&I::I32Const(-1));
-            }
-            f.instruction(&I::Return);
-            f.instruction(&I::End);
-            if let (true, Some(code)) = (signed, conv.overflow) {
-                // n == INT_MIN && d == -1
-                f.instruction(&I::LocalGet(0));
-                f.instruction(&I::I32Const(i32::MIN));
-                f.instruction(&I::I32Eq);
-                f.instruction(&I::LocalGet(1));
-                f.instruction(&I::I32Const(-1));
-                f.instruction(&I::I32Eq);
-                f.instruction(&I::I32And);
-                f.instruction(&I::If(block));
-                f.instruction(&I::I32Const(code as i32));
-                f.instruction(&I::Call(brk));
-                f.instruction(&I::I32Const(if rem { 0 } else { i32::MIN }));
-                f.instruction(&I::Return);
-                f.instruction(&I::End);
-            }
-            if signed && conv.overflow.is_none() {
-                // Unchecked INT_MIN / -1: the R3000's lo = INT_MIN, hi = 0.
-                f.instruction(&I::LocalGet(0));
-                f.instruction(&I::I32Const(i32::MIN));
-                f.instruction(&I::I32Eq);
-                f.instruction(&I::LocalGet(1));
-                f.instruction(&I::I32Const(-1));
-                f.instruction(&I::I32Eq);
-                f.instruction(&I::I32And);
-                f.instruction(&I::If(block));
-                f.instruction(&I::I32Const(if rem { 0 } else { i32::MIN }));
-                f.instruction(&I::Return);
-                f.instruction(&I::End);
-            }
-            f.instruction(&I::LocalGet(0));
-            f.instruction(&I::LocalGet(1));
-            f.instruction(match *op {
-                "div_s" => &I::I32DivS,
-                "div_u" => &I::I32DivU,
-                "rem_s" => &I::I32RemS,
-                _ => &I::I32RemU,
-            });
-            f.instruction(&I::End);
             let sig = FuncType { params: vec![wasmparser::ValType::I32; 2], results: vec![wasmparser::ValType::I32] };
-            (sig, f, format!("r3000_{op}"))
+            (sig, crate::bodies::division(op, *conv, brk), format!("r3000_{op}"))
         }
         Synth::O32Wrap { input, func, name } => {
             let obj = &ctx.inputs[*input].obj;

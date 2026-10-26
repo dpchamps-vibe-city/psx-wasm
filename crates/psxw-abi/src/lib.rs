@@ -1,8 +1,20 @@
-//! The contract between `guest.wasm` (per game, built by `psxw-link`) and
-//! `runtime.wasm` (game-agnostic). Both sides depend on this crate; nothing
-//! here may depend on a particular game. See `docs/design.md` §1, §2, §7.
+//! The contract between the guest (per game, built by `psxw-link`), the
+//! runtime (game-agnostic, `psx-runtime`) and the host (wasmtime or a
+//! browser worker). All three depend on this crate; nothing here may depend
+//! on a particular game. See `docs/design.md` §1, §2, §7.
+//!
+//! `game.wasm` is the guest module and the runtime module merged: the
+//! guest's `psx.*` imports bind to the runtime's exports, the runtime's
+//! `guest.*` imports to the guest's exports. What remains imported is the
+//! host interface ([`host`]); what is exported is [`exports`].
 
 #![no_std]
+
+pub mod replay;
+
+/// Bumped whenever the host interface, the guest/runtime seam or the boot
+/// options change. `game.wasm` exports it; hosts refuse a mismatch.
+pub const ABI_VERSION: u32 = 1;
 
 /// wasm address of guest physical address 0. Folded into every guest
 /// load/store's `memarg` offset, so translation costs one `i32.and`.
@@ -12,7 +24,7 @@ pub const WINDOW_BASE: u32 = 0x0100_0000;
 /// physical view and keeps the scratchpad (`0x1F80_0000`) inside the window.
 pub const WINDOW_MASK: u32 = 0x00FF_FFFF;
 
-/// `runtime.wasm` is linked with `--global-base` here; everything Rust owns
+/// The runtime is linked with `--global-base` here; everything Rust owns
 /// lives above the guest window.
 pub const RUNTIME_BASE: u32 = 0x0200_0000;
 
@@ -57,27 +69,134 @@ pub mod indirect_abi {
     pub const STACK_ARG_OFFSET: u32 = 16;
 }
 
-/// Import module name for runtime services (`psx.DrawOTag`, `psx.safepoint`,
-/// ...). `replace`-tier SDK functions are imported under their SDK name.
-pub const IMPORT_MODULE: &str = "psx";
-
-/// Exports of `guest.wasm` that the runtime calls.
-pub mod guest_exports {
-    /// `() -> ()`: runs the game's `main` after the runtime's boot has
-    /// loaded the EXE into RAM.
-    pub const MAIN: &str = "guest_main";
-    /// `(addr, a0, a1, a2, a3) -> i64`: call a guest function pointer
-    /// (callbacks). Goes through the same dispatch table as guest code.
-    pub const INVOKE: &str = "guest_invoke";
-    /// Mutable i32 global: guest stack pointer (the PSX `$sp`).
-    pub const GUEST_SP: &str = "__guest_sp";
+/// The guest's view of the runtime: module `psx`.
+pub mod psx {
+    pub const MODULE: &str = "psx";
+    /// `() -> ()`: the loop-back-edge budget ran out; advance virtual time
+    /// by one quantum and deliver due events.
+    pub const SAFEPOINT: &str = "safepoint";
+    /// `(addr) -> i64`: control reached a guest address with no
+    /// implementation; traps with the address.
+    pub const UNTRANSLATED: &str = "untranslated";
+    /// `(table, fn, a0, a1, a2, a3) -> i64`: BIOS vector call.
+    pub const BIOS: &str = "bios";
+    /// `(a0, a1, a2, a3) -> i32`: `syscall`.
+    pub const SYSCALL: &str = "syscall";
+    /// `(code) -> ()`: `break`.
+    pub const BREAK: &str = "brk";
+    /// `(pc) -> !`: `add`/`sub` overflow exception.
+    pub const OVERFLOW: &str = "overflow";
+    /// `(pc, target) -> !`: a jump table read a target outside the table.
+    pub const BAD_JUMP: &str = "bad_jump";
+    /// `(addr, a0, a1, a2, a3) -> i64`: a call into BIOS kernel RAM.
+    pub const KERNEL_CALL: &str = "kernel_call";
+    pub const COP0_READ: &str = "cop0_read";
+    pub const COP0_WRITE: &str = "cop0_write";
+    pub const RFE: &str = "rfe";
+    pub const GTE_MFC2: &str = "gte_mfc2";
+    pub const GTE_CFC2: &str = "gte_cfc2";
+    pub const GTE_MTC2: &str = "gte_mtc2";
+    pub const GTE_CTC2: &str = "gte_ctc2";
+    pub const GTE_EXEC: &str = "gte_exec";
+    /// `(addr) -> ()`: debug builds trap on an access to the I/O window.
+    pub const IO_ACCESS: &str = "io_access";
+    /// Adapters are exported as `adapter.<function name>` with the o32
+    /// signature `(a0, a1, a2, a3) -> i64`.
+    pub const ADAPTER_PREFIX: &str = "adapter.";
 }
 
-/// Imports every guest module has regardless of boundary policy.
-pub mod runtime_imports {
-    /// Called when the loop-back-edge budget runs out: delivers due events
-    /// and advances virtual time by one quantum.
-    pub const SAFEPOINT: &str = "safepoint";
-    /// `(addr) -> !`: control reached a guest address with no translation.
-    pub const UNTRANSLATED: &str = "untranslated";
+/// The runtime's view of the guest: module `guest`.
+pub mod guest {
+    pub const MODULE: &str = "guest";
+    pub const MEMORY: &str = "memory";
+    /// Mutable i32 global: guest stack pointer (the PSX `$sp`).
+    pub const SP: &str = "__guest_sp";
+    /// Mutable i32 global: the PSX `$gp`.
+    pub const GP: &str = "__guest_gp";
+    /// `(addr, a0, a1, a2, a3) -> i64`: call a guest function pointer
+    /// through the dispatch table (boot, callbacks).
+    pub const INVOKE: &str = "guest_invoke";
+}
+
+/// What `game.wasm` imports from its host: module `host`. All pointers are
+/// wasm addresses in the runtime's memory.
+pub mod host {
+    pub const MODULE: &str = "host";
+    /// `(level, ptr, len) -> ()`.
+    pub const LOG: &str = "log";
+    /// `(code, ptr, len) -> !`: fatal, with a message.
+    pub const TRAP: &str = "trap";
+    /// `(frame: i64) -> ()`: pacing at each vblank; may trap to stop a run.
+    pub const WAIT_VBLANK: &str = "wait_vblank";
+    /// `(out_ptr) -> i32`: writes [`DiscInfo`](super::DiscInfo); 0 = no disc.
+    pub const DISC_INFO: &str = "disc_info";
+    /// `(lba, count, mode, dst_ptr) -> i32` status (0 = ok); mode 0 = raw
+    /// 2352-byte sectors, 1 = 2048-byte user data.
+    pub const DISC_READ: &str = "disc_read";
+    /// `(port, out_ptr) -> i32` bytes written: the pad's state this frame.
+    pub const PAD_STATE: &str = "pad_state";
+    /// `(name_ptr, name_len, dst, cap) -> i32` bytes read, or -1.
+    pub const STORAGE_READ: &str = "storage_read";
+    /// `(name_ptr, name_len, src, len) -> i32` status.
+    pub const STORAGE_WRITE: &str = "storage_write";
+    /// `(event_ptr, len) -> ()`: a structured run-report event (JSON).
+    pub const REPORT: &str = "report";
+}
+
+/// What `game.wasm` exports.
+pub mod exports {
+    pub const MEMORY: &str = "memory";
+    /// `() -> i32`.
+    pub const ABI_VERSION: &str = "psxw_abi_version";
+    /// `(options_ptr) -> ()`: boot the disc and run the game until the host
+    /// stops it (a trap from `wait_vblank`). `options_ptr` points at
+    /// [`BootOptions`](super::BootOptions) in memory the host wrote through
+    /// `psxw_alloc`.
+    pub const BOOT: &str = "psxw_boot";
+    /// `(len) -> ptr`: scratch memory for the host to pass data in.
+    pub const ALLOC: &str = "psxw_alloc";
+    /// `() -> i64`: FNV-1a of guest RAM.
+    pub const RAM_HASH: &str = "psxw_ram_hash";
+}
+
+/// Boot options, as the host writes them (little-endian `u32` fields).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BootOptions {
+    /// 0 = realistic CD timing, 1 = instant.
+    pub cd_timing: u32,
+    /// 0 = NTSC, 1 = PAL.
+    pub video: u32,
+    /// Instructions of guest loop iterations between safepoints.
+    pub safepoint_budget: u32,
+    /// CPU cycles of virtual time per safepoint.
+    pub safepoint_quantum: u32,
+    /// Bit 0: trap on I/O-window accesses; bit 1: verify resident overlays.
+    pub debug: u32,
+    /// Bit 0: report every BIOS and adapter call.
+    pub trace: u32,
+}
+
+impl BootOptions {
+    pub const DEBUG_IO: u32 = 1;
+    pub const DEBUG_OVERLAYS: u32 = 2;
+}
+
+/// Disc layout, as `disc_info` writes it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscInfo {
+    /// Number of tracks (1-based track `n` starts at `track_lba[n - 1]`).
+    pub tracks: u32,
+    /// Total sectors on the disc.
+    pub sectors: u32,
+    pub track_lba: [u32; 99],
+    /// 1 = data (mode 2), 0 = audio, per track.
+    pub track_data: [u8; 99],
+}
+
+impl Default for DiscInfo {
+    fn default() -> Self {
+        Self { tracks: 0, sectors: 0, track_lba: [0; 99], track_data: [0; 99] }
+    }
 }

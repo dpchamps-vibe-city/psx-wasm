@@ -3,5 +3,12 @@ name = "psxw-host-native"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
 [dependencies]
-psx-runtime = { path = "../psx-runtime" }
+anyhow = "1.0.104"
+psxw-abi = { path = "../psxw-abi" }
+psx-devices = { path = "../psx-devices" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+wasmtime = { version = "47.0.0", default-features = false, features = ["cranelift", "runtime", "parallel-compilation", "anyhow"] }

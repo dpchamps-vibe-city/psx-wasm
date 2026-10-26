@@ -1,0 +1,20 @@
+[package]
+name = "psxw-build"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+psxw-abi = { path = "../psxw-abi" }
+psxw-cc = { path = "../psxw-cc" }
+psxw-inputs = { path = "../psxw-inputs" }
+psxw-lift = { path = "../psxw-lift" }
+psxw-link = { path = "../psxw-link" }
+psxw-difftest = { path = "../psxw-difftest" }
+sdk-psyq = { path = "../sdk-psyq" }
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+wasm-encoder = "0.262.0"
+wasmparser = "0.262.0"

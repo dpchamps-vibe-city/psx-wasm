@@ -654,6 +654,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx-bios"
+version = "0.0.0"
+dependencies = [
+ "psx-devices",
+ "psxw-abi",
+]
+
+[[package]]
+name = "psx-devices"
+version = "0.0.0"
+dependencies = [
+ "psxw-abi",
+]
+
+[[package]]
 name = "psx-gte"
 version = "0.0.0"
 
@@ -661,13 +676,35 @@ version = "0.0.0"
 name = "psx-runtime"
 version = "0.0.0"
 dependencies = [
+ "psx-bios",
+ "psx-devices",
  "psx-gte",
  "psxw-abi",
+ "sdk-psyq",
 ]
 
 [[package]]
 name = "psxw-abi"
 version = "0.0.0"
+
+[[package]]
+name = "psxw-build"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "psxw-abi",
+ "psxw-cc",
+ "psxw-difftest",
+ "psxw-inputs",
+ "psxw-lift",
+ "psxw-link",
+ "rayon",
+ "sdk-psyq",
+ "serde",
+ "serde_json",
+ "wasm-encoder 0.262.0",
+ "wasmparser 0.262.0",
+]
 
 [[package]]
 name = "psxw-cc"
@@ -701,13 +738,18 @@ name = "psxw-cli"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "psxw-abi",
+ "psxw-build",
  "psxw-cc",
  "psxw-census",
  "psxw-difftest",
+ "psxw-host-native",
  "psxw-inputs",
  "psxw-lift",
  "psxw-oracle",
  "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -731,15 +773,18 @@ dependencies = [
 name = "psxw-host-native"
 version = "0.0.0"
 dependencies = [
- "psx-runtime",
+ "anyhow",
+ "psx-devices",
+ "psxw-abi",
+ "serde",
+ "serde_json",
+ "sha1",
+ "wasmtime",
 ]
 
 [[package]]
 name = "psxw-host-web"
 version = "0.0.0"
-dependencies = [
- "psx-runtime",
-]
 
 [[package]]
 name = "psxw-inputs"
@@ -919,6 +964,15 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "sdk-psyq"
+version = "0.0.0"
+dependencies = [
+ "psx-bios",
+ "psx-devices",
+ "psxw-abi",
+]
 
 [[package]]
 name = "semver"
