@@ -147,7 +147,10 @@ unverified.
     differences.
 11. [ ] Audio determinism: identical audio hashes across two runs, and
     across hosts once M5 is done. Add everything to `psxw ci`; docs,
-    README status.
+    README status. *(Both checks exist: `psxw run --check determinism`
+    adds `audio-determinism`, and `web-test game` compares the audio with
+    the native host's. Both are in `psxw ci` through the `boot` and
+    `web-game` gates, and their runs wait for the disc.)*
 
 ## Exit criteria (all automated)
 
