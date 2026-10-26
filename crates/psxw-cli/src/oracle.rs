@@ -22,10 +22,10 @@ use std::path::Path;
 pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images verify | selftest [--seed N] [--count N] \
                          | capture [--kind K] [--missing] | check <game> --device D | ci";
 
-/// psx-wasm's device implementations the oracle can check. Empty until the
-/// devices exist (gpu and gte in M4, spu in M6).
+/// psx-wasm's device implementations the oracle can check (gpu in M4, spu
+/// in M6 still to come).
 fn devices() -> Vec<Box<dyn DeviceUnderTest>> {
-    Vec::new()
+    vec![Box::new(psxw_oracle::gte::Device)]
 }
 
 fn finish(report: &Report, path: &Path) {

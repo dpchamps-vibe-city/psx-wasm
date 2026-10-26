@@ -831,6 +831,7 @@ name = "psxw-oracle"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "psx-gte",
  "psxw-inputs",
  "serde",
  "serde_json",
