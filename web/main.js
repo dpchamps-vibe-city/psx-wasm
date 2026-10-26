@@ -9,7 +9,7 @@
 // (and the .bin files it names, beside it) into OPFS first; ?post=NAME
 // POSTs the hashes to /result?browser=NAME when the run stops.
 
-import { exportCard, importCard } from "./cards.js";
+import { SaveQueue, cardName, exportCard, importCard } from "./cards.js";
 
 const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
@@ -126,6 +126,9 @@ function show(bitmap) {
   Atomics.add(pad, 4, 1);
 }
 
+// The cards the game saves, written into OPFS here (cards.js).
+const saves = new SaveQueue((name, e) => say(`saving ${name}: ${e}`));
+
 async function start(cue, audioRing) {
   const game = await gameInfo();
   const record = document.getElementById("record").checked || params.has("record");
@@ -148,6 +151,7 @@ async function start(cue, audioRing) {
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.type === "frame") show(m.bitmap);
+    else if (m.type === "save") saves.put(m.name, m.bytes);
     else if (m.type === "status") say(m.text);
     else if (m.type === "replay" && params.has("post")) {
       fetch(`/result?browser=${params.get("post") || params.get("browser")}-replay`, { method: "POST", body: m.bytes });
@@ -210,7 +214,7 @@ for (const slot of [0, 1]) {
     input.value = "";
   });
   document.getElementById(`export${slot}`).addEventListener("click", async () => {
-    const bytes = await exportCard(slot);
+    const bytes = saves.latest.get(cardName(slot)) || (await exportCard(slot));
     if (!bytes) return say(`slot ${slot + 1} has no card yet`);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));

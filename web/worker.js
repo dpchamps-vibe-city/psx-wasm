@@ -1,11 +1,15 @@
 // The browser host (M5): runs game.wasm in this Worker and implements its
 // host interface (crates/psxw-abi: `host.*`, plus the M4 render imports):
 // - pacing: `wait_vblank` sleeps with Atomics.wait until the frame's
-//   wall-clock deadline (no pacing in verify mode);
+//   wall-clock deadline (no pacing in verify mode). Where the browser has
+//   JSPI it first suspends the game and gives this Worker's event loop a
+//   turn: Chromium frees the frames posted to the page only there (without
+//   it, memory grows by a frame a vblank until the GPU process dies), and
+//   context-loss events land there;
 // - the disc: a .cue/.bin image in OPFS (`disc/`), sync access handles;
 // - pads: the main thread's SharedArrayBuffer, or a replay file;
 // - storage (memory cards): files in OPFS `saves/` (cards.js), loaded at
-//   start and written back as the game saves;
+//   start; each card the game changes goes to the page, which writes it;
 // - rendering: psxw-host-web's WebRenderer (psx-render-gl on WebGL2) on
 //   this Worker's own OffscreenCanvas. The game never returns to the
 //   event loop, so a canvas transferred from the page would never show a
@@ -22,14 +26,15 @@
 //   crosses JS);
 // - WebGL context loss: VRAM is shadowed every 60 frames and uploaded
 //   into the re-created renderer when the context is restored (the
-//   colour-table cache refills on the next table change).
+//   colour-table cache refills on the next table change). Without JSPI
+//   the events never arrive.
 //
 // Messages in: {type: "start", cue, padBuffer, audioRing, options}.
-// Messages out: {type: "status"|"report"|"log"|"frame"|"replay"|"hashes"|"stopped", ...}.
+// Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"stopped", ...}.
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
-import { loadSaves, persist, savesDir } from "./cards.js";
+import { loadSaves, savesDir } from "./cards.js";
 
 const ABI_VERSION = 6;
 const NOTHING_PRESSED = 0xffff;
@@ -158,8 +163,7 @@ async function run({ cue, padBuffer, audioRing, options }) {
 
   const root = await navigator.storage.getDirectory();
   const disc = await Disc.open(await root.getDirectoryHandle("disc"), cue);
-  const saveDir = await savesDir();
-  const saves = await loadSaves(saveDir);
+  const saves = await loadSaves(await savesDir());
   const replay = options.replay ? new Uint8Array(await (await fetch(options.replay)).arrayBuffer()) : null;
   // [seq, port 1 buttons, port 2 buttons or -1, save-replay requests, frames shown]
   const pad = new Int32Array(padBuffer);
@@ -191,38 +195,61 @@ async function run({ cue, padBuffer, audioRing, options }) {
   let t0 = 0;
   const raw = new Uint8Array(SECTOR);
 
+  // The game yields once a vblank where JSPI exists. Dev mode can't: its
+  // JS trampolines sit between the game and wait_vblank, and JSPI
+  // suspends wasm frames only.
+  const suspend = !options.dev && typeof WebAssembly.Suspending === "function" && typeof WebAssembly.promising === "function";
+  const turn = new MessageChannel();
+  const nextTask = () =>
+    new Promise((resolve) => {
+      turn.port1.onmessage = resolve;
+      turn.port2.postMessage(null);
+    });
+  const vblank = (f) => {
+    frame = Number(f);
+    const now = performance.now();
+    if (lastVblank) frameTimes.push(now - lastVblank);
+    if (frame % 60 === 0 && !lost) shadow = renderer.vram();
+    if (hashAt.has(frame)) {
+      ramHashes[frame] = (exports.psxw_ram_hash() & 0xffffffffffffffffn).toString(16).padStart(16, "0");
+      vramHashes[frame] = renderer.vram_hash();
+    }
+    if (options.frames && frame >= options.frames) throw new Error(FRAME_LIMIT);
+    if (recording) {
+      recording.frames = frame;
+      const asked = Atomics.load(pad, 3);
+      if (asked !== recording.saved) {
+        recording.saved = asked;
+        postReplay();
+      }
+    }
+  };
+  const pace = () => {
+    if (!options.verify) {
+      const wait = t0 + frame * period - performance.now();
+      if (wait > 0) Atomics.wait(sleeper, 0, 0, wait);
+      else if (wait < -period) lagFrames++;
+    }
+    lastVblank = performance.now();
+    if (frame % 60 === 0) postMessage({ type: "status", text: `frame ${frame}, ${lagFrames} late` });
+  };
+
   const host = {
+    wait_vblank: suspend
+      ? new WebAssembly.Suspending(async (f) => {
+          vblank(f);
+          await nextTask();
+          pace();
+        })
+      : (f) => {
+          vblank(f);
+          pace();
+        },
     log(level, p, n) {
       postMessage({ type: "log", level, frame, text: text(p, n) });
     },
     trap(code, p, n) {
       throw new Error(`runtime trap ${code}: ${text(p, n)}`);
-    },
-    wait_vblank(f) {
-      frame = Number(f);
-      const now = performance.now();
-      if (lastVblank) frameTimes.push(now - lastVblank);
-      if (frame % 60 === 0 && !lost) shadow = renderer.vram();
-      if (hashAt.has(frame)) {
-        ramHashes[frame] = (exports.psxw_ram_hash() & 0xffffffffffffffffn).toString(16).padStart(16, "0");
-        vramHashes[frame] = renderer.vram_hash();
-      }
-      if (options.frames && frame >= options.frames) throw new Error(FRAME_LIMIT);
-      if (recording) {
-        recording.frames = frame;
-        const asked = Atomics.load(pad, 3);
-        if (asked !== recording.saved) {
-          recording.saved = asked;
-          postReplay();
-        }
-      }
-      if (!options.verify) {
-        const wait = t0 + frame * period - performance.now();
-        if (wait > 0) Atomics.wait(sleeper, 0, 0, wait);
-        else if (wait < -period) lagFrames++;
-      }
-      lastVblank = performance.now();
-      if (frame % 60 === 0) postMessage({ type: "status", text: `frame ${frame}, ${lagFrames} late` });
     },
     disc_info(out) {
       disc.info(new DataView(mem()), out);
@@ -266,7 +293,8 @@ async function run({ cue, padBuffer, audioRing, options }) {
       const name = text(np, nl);
       const data = bytes(src, n).slice();
       saves.set(name, data);
-      persist(saveDir, name, data).catch((err) => postMessage({ type: "log", level: 3, frame, text: `saving ${name}: ${err}` }));
+      // The page writes it: its event loop runs, this Worker's may not.
+      postMessage({ type: "save", name, bytes: data });
       return 0;
     },
     report(p, n) {
@@ -331,10 +359,18 @@ async function run({ cue, padBuffer, audioRing, options }) {
   words.forEach((w, i) => new DataView(mem()).setUint32(opts + 4 * i, w, true));
 
   postMessage({ type: "status", text: `booting ${cue}` });
+  postMessage({
+    type: "log",
+    level: suspend ? 1 : 2,
+    frame: 0,
+    text: suspend
+      ? "the game yields to the Worker's event loop every vblank (JSPI)"
+      : "no JSPI here (or dev mode): the Worker never yields, so Chromium's memory grows with every frame shown",
+  });
   t0 = performance.now();
   let reason = "exited";
   try {
-    exports.psxw_boot(opts);
+    await (suspend ? WebAssembly.promising(exports.psxw_boot) : exports.psxw_boot)(opts);
   } catch (err) {
     const msg = String((err && err.message) || err);
     reason = msg.includes(FRAME_LIMIT) ? "frame limit" : msg;
@@ -347,6 +383,6 @@ async function run({ cue, padBuffer, audioRing, options }) {
   const pct = (p) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] * 100) / 100 : null);
   const frameMs = { p50: pct(50), p95: pct(95), p99: pct(99), max: pct(100) };
   const audio = { frames: audioFrames, hash: audioHash.hex() };
-  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs, audio });
+  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs, audio, yields: suspend });
   postMessage({ type: "stopped", reason, frame });
 }

@@ -3,9 +3,9 @@
 The browser host (M5), plain ES modules with no build step:
 
 - `index.html`, `main.js`: the page. It imports a disc (.cue and .bin) into OPFS, polls the keyboard and gamepads into a SharedArrayBuffer, sets up audio (an AudioWorklet playing silence until M6), and starts the Worker.
-- `worker.js`: runs `game.wasm` and implements its host interface: pacing with `Atomics.wait`, disc reads from OPFS, pads, saves in OPFS, and the renderer (`pkg/`, built from `crates/psxw-host-web`).
+- `worker.js`: runs `game.wasm` and implements its host interface: pacing with `Atomics.wait`, disc reads from OPFS, pads, saves, and the renderer (`pkg/`, built from `crates/psxw-host-web`). Where the browser has JSPI (`WebAssembly.Suspending`), the game suspends once a vblank and gives the Worker's event loop a turn. Chromium frees the frames the Worker hands the page only there: without it the tab's memory grows by a frame a vblank (gigabytes a minute) until the GPU process dies and the screen goes black. Dev mode can't suspend (its JS trampolines sit between the game and `wait_vblank`) and warns in the console.
 - `disc.js`: .cue/.bin over OPFS sync access handles, with the native host's rules.
-- `cards.js`: memory cards in OPFS `saves/` (`card0.mcr`, `card1.mcr`), imported and exported as raw 128 KiB images from the page (before Start), loaded and written back by the Worker.
+- `cards.js`: memory cards in OPFS `saves/` (`card0.mcr`, `card1.mcr`), imported as raw 128 KiB images from the page before Start, and exported any time (during a run, the game's latest card). The Worker loads them at start and posts each card the game changes to the page, which writes it (`SaveQueue`).
 - `audio.js`: the AudioWorklet.
 
 To try it:
@@ -42,4 +42,4 @@ The guest calls adapters by id, so it records the adapter table it was linked ag
 
 ## WebGL context loss
 
-The Worker keeps a copy of VRAM, taken every 60 frames. When the context is lost it stops drawing and reading back; the game runs on. When the context is restored it makes a new renderer and uploads the copy, so up to 60 frames of drawing are missing until the game redraws them. `psxw web-test gpu` loses and restores the context with `WEBGL_lose_context` and checks the restored VRAM hash. Headless Chromium on SwiftShader never restores a lost context, for any canvas kind, so the check runs in Firefox only.
+The Worker keeps a copy of VRAM, taken every 60 frames. When the context is lost it stops drawing and reading back; the game runs on. When the context is restored it makes a new renderer and uploads the copy (both events arrive only where the game yields, with JSPI), so up to 60 frames of drawing are missing until the game redraws them. `psxw web-test gpu` loses and restores the context with `WEBGL_lose_context` and checks the restored VRAM hash. Headless Chromium on SwiftShader never restores a lost context, for any canvas kind, so the check runs in Firefox only.

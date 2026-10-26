@@ -1,15 +1,14 @@
-// The Worker half of storage.js: worker.js's save handling (cards.js).
+// The Worker half of storage.js: worker.js's save handling. It loads every
+// save at start and posts the cards the game changes to the page.
 
-import { loadSaves, persist, savesDir } from "./cards.js";
+import { loadSaves, savesDir } from "./cards.js";
 
 onmessage = async (e) => {
   try {
-    const dir = await savesDir();
-    const loaded = Object.fromEntries(await loadSaves(dir));
-    const { name, data } = e.data.write;
-    await persist(dir, name, data);
-    postMessage({ loaded });
+    const loaded = Object.fromEntries(await loadSaves(await savesDir()));
+    for (const { name, bytes } of e.data.saves) postMessage({ type: "save", name, bytes });
+    postMessage({ type: "done", loaded });
   } catch (err) {
-    postMessage({ error: String((err && err.message) || err) });
+    postMessage({ type: "done", error: String((err && err.message) || err) });
   }
 };
