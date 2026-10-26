@@ -142,7 +142,6 @@ struct Rt {
     m: RefCell<Machine<Psyq>>,
     quantum: u64,
     adapters: Vec<(&'static str, sdk_psyq::Adapter)>,
-    gte: RefCell<psx_gte::GteRegs>,
     cop0: RefCell<[u32; 32]>,
 }
 
@@ -194,7 +193,6 @@ fn init(options: u32) {
         m: RefCell::new(m),
         quantum,
         adapters: sdk_psyq::adapters(),
-        gte: RefCell::new(Default::default()),
         cop0: RefCell::new([0; 32]),
     };
     RT.with(|c| {
@@ -348,30 +346,40 @@ pub extern "C" fn cop0_write(r: u32, v: u32) {
 #[unsafe(export_name = "rfe")]
 pub extern "C" fn rfe() {}
 
+/// The GTE's register file, in the runtime-private page of the guest
+/// window (psxw-abi `phys::RUNTIME_PRIVATE`): 64 words, data then control.
+fn gte() -> &'static mut psx_gte::Gte {
+    let words = window(psxw_abi::phys::RUNTIME_PRIVATE.start) as *mut [u32; 64];
+    // SAFETY: the page is runtime-private (no guest symbol lives there) and
+    // the runtime is single-threaded; each intrinsic takes the reference
+    // for one call.
+    psx_gte::Gte::view_mut(unsafe { &mut *words })
+}
+
 #[unsafe(export_name = "gte_mfc2")]
 pub extern "C" fn gte_mfc2(r: u32) -> u32 {
-    with(|rt| rt.gte.borrow().data[(r & 31) as usize])
+    gte().mfc2(r)
 }
 
 #[unsafe(export_name = "gte_cfc2")]
 pub extern "C" fn gte_cfc2(r: u32) -> u32 {
-    with(|rt| rt.gte.borrow().ctrl[(r & 31) as usize])
+    gte().cfc2(r)
 }
 
 #[unsafe(export_name = "gte_mtc2")]
 pub extern "C" fn gte_mtc2(r: u32, v: u32) {
-    with(|rt| rt.gte.borrow_mut().data[(r & 31) as usize] = v);
+    gte().mtc2(r, v)
 }
 
 #[unsafe(export_name = "gte_ctc2")]
 pub extern "C" fn gte_ctc2(r: u32, v: u32) {
-    with(|rt| rt.gte.borrow_mut().ctrl[(r & 31) as usize] = v);
+    gte().ctc2(r, v)
 }
 
-/// GTE commands: the GTE arrives with M4 (psx-gte).
+/// A GTE command (the COP2 instruction's low 25 bits).
 #[unsafe(export_name = "gte_exec")]
 pub extern "C" fn gte_exec(cmd: u32) {
-    with(|rt| rt.m.borrow_mut().count(&format!("gte.{:#04x}", cmd & 0x3F)));
+    gte().exec(cmd)
 }
 
 /// An SDK function replaced by an adapter (o32 arguments).

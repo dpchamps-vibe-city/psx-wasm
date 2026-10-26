@@ -185,8 +185,8 @@ golden.
 
 1. [x] `psx-gte`: register file and all commands, plus unit tests from
    spec examples (debug aids). Wire it into the runtime's private page and
-   the intrinsics. *(psx-gte is done; the wiring into `psx-runtime` is
-   pending, with M2's runtime work: see Findings.)*
+   the intrinsics. *(Wired: the runtime's `gte_*` intrinsics use psx-gte
+   over the runtime-private page through `Gte::view_mut`.)*
 2. [x] GTE recording hook. Synthetic GTE edge vectors: saturation
    boundaries, division overflow, every command with `sf`/`lm`
    combinations. Run `psxw oracle capture` for GTE, then
