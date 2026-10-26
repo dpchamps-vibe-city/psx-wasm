@@ -1,0 +1,10 @@
+[package]
+name = "psxw-link"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+[dependencies]
+anyhow = "1.0.104"
+psxw-abi = { path = "../psxw-abi" }
+psxw-inputs = { path = "../psxw-inputs" }
+wasmparser = "0.262.0"

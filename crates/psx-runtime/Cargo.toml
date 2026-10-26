@@ -1,0 +1,8 @@
+[package]
+name = "psx-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+[dependencies]
+psxw-abi = { path = "../psxw-abi" }
+psx-gte = { path = "../psx-gte" }

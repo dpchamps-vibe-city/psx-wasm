@@ -1,0 +1,10 @@
+[package]
+name = "psxw-host-web"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+psx-runtime = { path = "../psx-runtime" }

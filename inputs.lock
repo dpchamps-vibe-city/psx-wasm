@@ -1,0 +1,28 @@
+# Pinned inputs — see docs/design.md "Pinning the inputs".
+#
+# Each input repo is materialized read-only with `git archive <commit>` into
+# .inputs/<name>-<short>/; the local checkout is only used as the object
+# store, so its working tree and uncommitted work are never touched.
+
+[toolchain.clang]
+# Only clang is used (freestanding wasm32), not the WASI libc.
+dist = "wasi-sdk-34.0-x86_64-linux"
+url = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz"
+sha256 = "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+
+[game.btn]
+repo = "../btn-decompilation"
+remote = "git@github.com:software-factory-vibe-city/back-to-nature-decomp.git"
+commit = "3a159925fe0994ae43f11fd990eb6f5339f5833f"
+build = ["make", "check-all"]
+
+[game.btn.disc]
+# User-supplied; verified, never stored.
+exe = "SLUS_011.15"
+exe_sha256 = "34e3b35dcd3fb1cd9a7d4813b8a9ef987915826e3d436f1908ecbe2d4fdf1444"
+
+[sdk.psyq-470]
+repo = "../psyq-decomp"
+remote = "git@github.com:software-factory-vibe-city/psyq-decompilation.git"
+commit = "302b6ae6554c67feeb98620f97664f20461f04b1"
+build = ["npm", "run", "verify"]

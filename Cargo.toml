@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Intended external crates (not yet added):
+#   object                 – read matching ELFs and relocatable MIPS objects
+#   wasmparser, wasm-encoder, walrus – read objects, emit guest.wasm, guest passes
+#   serde, toml            – inputs.lock, game and boundary manifests
+#   wasmtime               – native host
+#   wgpu, cpal, winit      – native presentation/audio
+#   wasm-bindgen, web-sys  – browser host

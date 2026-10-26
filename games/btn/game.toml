@@ -1,0 +1,46 @@
+# Harvest Moon: Back to Nature (SLUS-01115).
+# Everything game-specific the toolchain needs that the pinned repo doesn't
+# already say. Paths under [containers], [c] and [probe] are relative to the
+# snapshot; [reference] is relative to the local checkout. Original bytes
+# come from each splat config's target_path/sha1 in the local checkout.
+
+[game]
+id = "btn"
+title = "Harvest Moon: Back to Nature"
+serial = "SLUS-01115"
+input = "btn"               # [game.btn] in inputs.lock
+sdk = "psyq-470"            # [sdk.psyq-470] in inputs.lock
+boundary = "boundary/psyq-470.toml"
+
+[containers]
+# One container per splat config; its id is the file stem.
+splat_dir = "configs/splat"
+# <id>.txt and <id>.names.txt per container (splat symbol_addrs format).
+symbols_dir = "configs/symbols"
+main = "exe"
+
+[c]
+include = ["include", "include/psyq"]
+defines = ["__GNUC__=2", "_LANGUAGE_C", "INCLUDE_ASM_USE_MACRO_INC=1"]
+
+[probe]
+# Every header under these dirs is probed for struct layout and global sizes.
+include_dirs = ["include"]
+# Always included ahead of the probed header.
+prelude = ["common.h", "game_types.h"]
+# m2c-only context headers that redefine game types.
+exclude = ["sdk_types.h", "functions.h"]
+
+[reference]
+# The matching compiler, used read-only as the layout oracle.
+cpp = "mips-linux-gnu-cpp"
+cppflags = ["-Iinclude", "-Iinclude/psyq", "-undef", "-D__GNUC__=2", "-DINCLUDE_ASM_USE_MACRO_INC=1", "-lang-c", "-D_LANGUAGE_C"]
+cc1 = "tools/vendor/old-gcc/build-gcc-2.95.2-psx/cc1"
+cc1flags = ["-O2", "-G8", "-mips1", "-mcpu=r3000", "-funsigned-char", "-fpeephole", "-ffunction-cse", "-fpcc-struct-return", "-fcommon", "-msoft-float", "-mgas", "-fgnu-linker", "-quiet"]
+
+[runtime]
+cd_timing = "realistic"
+
+# Per-function overrides of the boundary/tier choice.
+[tier]
+# "func_80012345" = "lift"
