@@ -33,6 +33,9 @@ pub enum Source {
     /// A word of initialized data pointing at the first instruction of
     /// code no known function reaches (a function table entry).
     DataPointer,
+    /// The return address of a `setjmp` call (BIOS A0h:13h): where a
+    /// longjmp to its buffer resumes, with the registers the buffer holds.
+    Continuation,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,6 +135,12 @@ impl Program {
             Some(code) if code.in_text(addr) => code.add(addr, name, None, source, boundary),
             _ => false,
         }
+    }
+
+    /// Mark an existing start with another source; returns whether it is
+    /// new to that start.
+    pub fn add_source(&mut self, container: &str, addr: u32, source: Source) -> bool {
+        self.containers.get_mut(container).and_then(|c| c.starts.get_mut(&addr)).is_some_and(|s| s.sources.insert(source))
     }
 
     /// Where `addr` lives as seen from code in `from`.

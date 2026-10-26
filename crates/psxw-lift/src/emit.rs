@@ -17,9 +17,33 @@ use std::fmt::Write;
 /// A register read redirected to another expression (the pre-load value).
 type Ov = Option<(u8, String)>;
 
+/// Calls lowered for non-local control flow (libetc's interrupt exit:
+/// `HookEntryInt` and `ReturnFromException`).
+///
+/// - A `setjmp` call (branch pc in `setjmp`) stores the caller's own
+///   registers into the buffer, which the BIOS can't see in translated
+///   code: ra (the return address), sp, fp, s0-s7, gp, as PsyQ's layout
+///   has them, and returns 0.
+/// - A `ReturnFromException` (B0h:17h; branch pc in `rfe`) calls
+///   `psxw_return_from_exception`, which unwinds to the runtime's
+///   interrupt entry (psxw-link `guest_invoke_irq`).
+/// - A `continuation` function is entered at a `setjmp` return address
+///   by a longjmp: `a0` is the buffer, `a1` the value `setjmp` returns.
+#[derive(Debug, Clone, Default)]
+pub struct Exceptions {
+    pub setjmp: BTreeSet<u32>,
+    pub rfe: BTreeSet<u32>,
+    pub continuation: bool,
+}
+
+/// `setjmp`'s buffer: register and byte offset.
+const JMP_BUF: [(u8, u32); 12] =
+    [(31, 0), (29, 4), (30, 8), (16, 12), (17, 16), (18, 20), (19, 24), (20, 28), (21, 32), (22, 36), (23, 40), (28, 44)];
+
 pub struct Emitter<'a> {
     g: &'a Graph,
     facts: &'a Facts,
+    x: Exceptions,
     preds: BTreeMap<Node, Vec<Node>>,
     skip: BTreeSet<Node>,
     temps: BTreeSet<String>,
@@ -43,12 +67,18 @@ impl<'a> Emitter<'a> {
         Ok(Self {
             g,
             facts,
+            x: Exceptions::default(),
             preds,
             skip: BTreeSet::new(),
             temps: BTreeSet::new(),
             externs: BTreeSet::new(),
             body: String::new(),
         })
+    }
+
+    pub fn exceptions(mut self, x: Exceptions) -> Self {
+        self.x = x;
+        self
     }
 
     /// The function's C definition.
@@ -78,8 +108,13 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(out, "/* {comment} */");
         let _ = writeln!(out, "uint64_t {cname}(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) {{");
         let mut decls = Vec::new();
+        let saved = |r: u32| JMP_BUF.iter().find(|(x, _)| *x as u32 == r).map(|(_, o)| format!("PSXW_LW(a0 + {o}u)"));
         for r in 1..32u32 {
             let init = match r {
+                _ if self.x.continuation => match r {
+                    2 => "a1".to_string(),
+                    _ => saved(r).unwrap_or_else(|| "0".to_string()),
+                },
                 4..=7 => format!("a{}", r - 4),
                 28 => "psxw_gp_get()".to_string(),
                 29 => "psxw_sp_get()".to_string(),
@@ -88,6 +123,9 @@ impl<'a> Emitter<'a> {
             decls.push(format!("r{r} = {init}"));
         }
         let _ = writeln!(out, "  uint32_t {};", decls.join(", "));
+        if self.x.continuation {
+            let _ = writeln!(out, "  psxw_sp_set(r29); psxw_gp_set(r28); /* resumed by a longjmp */");
+        }
         let mut temps = vec!["hi = 0".to_string(), "lo = 0".into(), "c_ = 0".into(), "t_ = 0".into()];
         temps.extend(self.temps.iter().map(|t| format!("{t} = 0")));
         let _ = writeln!(out, "  uint32_t {};", temps.join(", "));
@@ -184,6 +222,19 @@ impl<'a> Emitter<'a> {
         self.line(&format!("{s} /* {:08X}: {} (delay slot) */", b + 4, disasm(&slot.insn, b + 4)));
         let c = c_expr.unwrap_or_default();
         match slot.transfer {
+            Transfer::Jump(_) if self.x.rfe.contains(&b) => {
+                self.line(&format!("psxw_return_from_exception(); return 0; /* {b:08X}: {dis} */"));
+                None
+            }
+            Transfer::Call { next, .. } if self.x.rfe.contains(&b) => {
+                self.line(&format!("psxw_return_from_exception(); /* {b:08X}: {dis} */"));
+                self.fall(&next)
+            }
+            Transfer::Call { next, .. } if self.x.setjmp.contains(&b) => {
+                let saves: Vec<String> = JMP_BUF.iter().map(|(r, o)| format!("PSXW_SW(r4 + {o}u, r{r});")).collect();
+                self.line(&format!("{} r2 = 0; r3 = 0; /* {b:08X}: {dis} (setjmp) */", saves.join(" ")));
+                self.fall(&next)
+            }
             Transfer::Jump(d) => {
                 let d = self.dest(&d);
                 self.line(&format!("{d} /* {b:08X}: {dis} */"));

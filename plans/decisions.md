@@ -360,6 +360,44 @@ Node toolchain. The image is much smaller than Playwright's, which
 matters on this machine. The tests only need a page to load and report,
 not to be scripted.
 
+**D45. libetc runs as original code; the BIOS's custom exception exit and
+ReturnFromException are wasm exceptions** (M4). libetc's interrupt layer
+isn't a set of register writes. `startIntr` calls `setjmp`, points the
+saved sp at a private stack, and installs the buffer with `HookEntryInt`
+(B0h:19h). After the `SysEnqIntRP` chains, the BIOS longjmps there with
+r2 = 1. libetc's dispatcher runs the callbacks and ends in
+`ReturnFromException` (B0h:17h), which never returns (psx-spx "BIOS
+Interrupt/Exception Handling"). Translated code can follow this with
+three lowerings, keyed on BIOS function numbers, not names:
+- **`setjmp`** (a call to an A0h:13h trampoline, or the vector with
+  t1 = 13h): the caller stores its own ra, sp, fp, s0-s7 and gp into the
+  buffer, in PsyQ's layout, and gets 0. The BIOS can't see a translated
+  caller's registers.
+- **The return address becomes a continuation entry**, a lift-tier
+  function (`Source::Continuation`) entered with the buffer and the
+  longjmp value. It reloads those registers.
+- **`ReturnFromException`** calls `psx.return_from_exception` and then
+  throws the guest's one tag. `guest_invoke_irq` (psxw-link) catches it,
+  and restores `$sp`/`$gp` as the BIOS restores the interrupted context.
+
+The runtime runs each exception as `IrqStep`s: every chain element, then
+the exit. An RFE skips the rest of that exception; an exit that returns
+normally is a fault. The default exit (no hook) is to return.
+
+Like D40/D42, libetc became a device library and its 15 adapters were
+removed. Measured against them first, the original matched on every
+vblank count, wait, video-mode and callback observation in `psxw conform
+btn --lib libetc` (59 steps). The adapters differed only where they had
+cut corners: `ResetCallback`'s first return (libetc's environment
+pointer, not 0) and `GetIntrMask` (9, not 0).
+- **Cost:** ABI 4. Every host needs wasm exception handling (exnref):
+  wasmtime's `gc-drc` feature, and Chromium and Firefox ESR in the pinned
+  images both compile the module. One throw per delivered interrupt.
+
+*Why:* the same reason as D40/D42. The original decides every observable
+value, version-independently. The lowerings are generic BIOS semantics
+that any SDK using `HookEntryInt` gets for free.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.

@@ -92,6 +92,7 @@ const FEATURES: &[&str] = &[
     "--enable-multivalue",
     "--enable-reference-types",
     "--enable-call-indirect-overlong",
+    "--enable-exception-handling",
 ];
 
 fn run(cmd: &mut Command) -> Result<()> {

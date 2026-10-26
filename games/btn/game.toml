@@ -43,6 +43,13 @@ cc1flags = ["-O2", "-G8", "-mips1", "-mcpu=r3000", "-funsigned-char", "-fpeephol
 main_loop_symbol = "RunSceneUpdateLoop"
 cd_timing = "realistic"
 
+[conform]
+# libetc's scenario (psxw conform btn --lib libetc) installs this as its
+# interrupt callback: Rand steps the LCG in gRandomState and ignores its
+# argument for that.
+callback = "Rand"
+callback_state = "gRandomState"
+
 [oracle]
 # The whole-game RAM oracle aligns on this counter: RunSceneUpdateLoop adds
 # one to field +8 of the game state block every scene frame, and

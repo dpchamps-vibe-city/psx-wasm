@@ -41,6 +41,7 @@ unsafe extern "C" {
 #[link(wasm_import_module = "guest")]
 unsafe extern "C" {
     fn guest_invoke(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64;
+    fn guest_invoke_irq(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64;
     fn guest_sp_get() -> u32;
     fn guest_sp_set(v: u32);
     fn guest_gp_get() -> u32;
@@ -153,6 +154,10 @@ struct Guest;
 impl Invoke for Guest {
     fn invoke(&mut self, c: GuestCall) -> u64 {
         unsafe { guest_invoke(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) }
+    }
+
+    fn invoke_irq(&mut self, c: GuestCall) -> u64 {
+        unsafe { guest_invoke_irq(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) }
     }
 }
 
@@ -363,6 +368,20 @@ pub extern "C" fn cop0_write(r: u32, v: u32) {
 
 #[unsafe(export_name = "rfe")]
 pub extern "C" fn rfe() {}
+
+/// ReturnFromException (B0h:17h): the guest unwinds to the
+/// `guest_invoke_irq` that entered the exception handler.
+#[unsafe(export_name = "return_from_exception")]
+pub extern "C" fn return_from_exception() {
+    let in_irq = with(|rt| {
+        let mut m = rt.m.borrow_mut();
+        m.rfe = true;
+        m.in_irq
+    });
+    if !in_irq {
+        fatal(5, "ReturnFromException outside an exception handler");
+    }
+}
 
 /// The GTE's register file, in the runtime-private page of the guest
 /// window (psxw-abi `phys::RUNTIME_PRIVATE`): 64 words, data then control.

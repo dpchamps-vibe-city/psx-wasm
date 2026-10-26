@@ -12,7 +12,7 @@ pub mod io;
 pub mod kernel;
 pub mod machine;
 
-pub use machine::{Event, Flow, GuestCall, Host, Machine, Regs, Sdk, Wait};
+pub use machine::{Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, Wait};
 
 #[cfg(test)]
 pub mod testing {

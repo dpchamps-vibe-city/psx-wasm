@@ -56,6 +56,19 @@ pub struct GuestCall {
     pub args: [u32; 4],
 }
 
+/// One step of the BIOS exception handler (psx-spx "BIOS Interrupt/
+/// Exception Handling"): every `SysEnqIntRP` element, priority 0 to 3,
+/// then the exit. A ReturnFromException in an element skips the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqStep {
+    /// An element's first function, and its second to call with the
+    /// first's result when that is nonzero.
+    Chain(GuestCall, Option<u32>),
+    /// The end of the handler: the custom exit (`HookEntryInt`, B0h:19h)
+    /// if one is set, entered like a longjmp to its buffer with 1.
+    Exit,
+}
+
 /// Events on the virtual timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -119,9 +132,11 @@ pub struct Machine<S> {
     pub kernel: Kernel,
     /// Callbacks to run, in order.
     pub calls: VecDeque<GuestCall>,
-    /// Interrupt handler chains to run first: a verifier, and the handler
-    /// to call with its result when that is nonzero ([`crate::io`]).
-    pub irq_calls: VecDeque<(GuestCall, Option<u32>)>,
+    /// The exception handler's steps, run before anything else queued
+    /// ([`crate::io`]).
+    pub irq_calls: VecDeque<IrqStep>,
+    /// ReturnFromException ran in the guest call now unwinding.
+    pub rfe: bool,
     /// Register-level devices for original SDK code; `None` traps on I/O.
     pub io: Option<crate::io::Io>,
     /// Interrupts are disabled (critical section): events wait.
@@ -152,6 +167,7 @@ impl<S: Sdk> Machine<S> {
             kernel: Kernel::default(),
             calls: VecDeque::new(),
             irq_calls: VecDeque::new(),
+            rfe: false,
             io: None,
             crit: false,
             in_irq: false,

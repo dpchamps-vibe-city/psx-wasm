@@ -14,7 +14,7 @@
 //! (+08h) runs if set, and when it returns nonzero its handler (+04h) runs
 //! with that value in `a0`.
 
-use crate::machine::{GuestCall, Machine, Sdk};
+use crate::machine::{GuestCall, IrqStep, Machine, Sdk};
 use psx_devices::dma::{self, Dma};
 use psx_devices::gpu::Gpu;
 use psx_devices::irq::{self, Irq};
@@ -258,7 +258,8 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
-    /// The BIOS exception handler's walk of the `SysEnqIntRP` chains.
+    /// The BIOS exception handler's walk of the `SysEnqIntRP` chains,
+    /// then its exit.
     pub fn queue_irq_chains(&mut self) {
         for prio in 0..4u32 {
             let Some(chain) = self.kernel.int_handlers.get(&prio) else { continue };
@@ -266,10 +267,11 @@ impl<S: Sdk> Machine<S> {
                 let verifier = self.mem.r32(h + 8);
                 let handler = self.mem.r32(h + 4);
                 if verifier != 0 {
-                    self.irq_calls.push_back((GuestCall { addr: verifier, args: [0; 4] }, (handler != 0).then_some(handler)));
+                    self.irq_calls.push_back(IrqStep::Chain(GuestCall { addr: verifier, args: [0; 4] }, (handler != 0).then_some(handler)));
                 }
             }
         }
+        self.irq_calls.push_back(IrqStep::Exit);
     }
 }
 
@@ -283,6 +285,7 @@ fn no_bus(addr: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::machine::{GuestCall, IrqStep};
     use crate::testing::machine;
 
     #[test]
@@ -297,8 +300,8 @@ mod tests {
         m.kernel.int_handlers.entry(2).or_default().push(0x8000_1000);
         m.raise_irq(psx_devices::irq::VBLANK);
         assert_eq!(m.io_read(0x1F80_1070, 4).unwrap(), 1);
-        let (call, then) = m.irq_calls.pop_front().unwrap();
-        assert_eq!((call.addr, then), (0x8000_2000, Some(0x8000_3000)));
+        assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Chain(GuestCall { addr: 0x8000_2000, args: [0; 4] }, Some(0x8000_3000))));
+        assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Exit));
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
         assert!(m.io_read(0x1F80_1C00, 2).is_err(), "the SPU is not on the bus");

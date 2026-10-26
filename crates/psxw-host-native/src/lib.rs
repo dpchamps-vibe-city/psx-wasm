@@ -242,6 +242,9 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
 fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasmtime::Instance)> {
     let mut config = Config::new();
     config.epoch_interruption(opts.deadline_secs > 0);
+    // ReturnFromException unwinds guest frames with a wasm exception
+    // (libetc's interrupt exit; psxw-link `guest_invoke_irq`).
+    config.wasm_exceptions(true);
     let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, &opts.wasm).map_err(|e| anyhow::anyhow!("loading {}: {e}", opts.wasm.display()))?;
     let mut linker: Linker<State> = Linker::new(&engine);

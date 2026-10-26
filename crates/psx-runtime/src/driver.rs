@@ -5,32 +5,71 @@
 //! machine is borrowed only between guest calls, never across one, so a
 //! callback can call back into the runtime.
 
-use psx_bios::{Flow, GuestCall, Machine, Sdk, Wait};
+use psx_bios::{Flow, GuestCall, IrqStep, Machine, Sdk, Wait};
 use std::cell::RefCell;
 
 /// Calls into the guest (the dispatch table).
 pub trait Invoke {
     fn invoke(&mut self, call: GuestCall) -> u64;
+    /// The same in exception context: a ReturnFromException in the call
+    /// unwinds to here, and `Machine::rfe` says so.
+    fn invoke_irq(&mut self, call: GuestCall) -> u64 {
+        self.invoke(call)
+    }
 }
 
 /// Run queued callbacks, unless one is already running (no nesting:
 /// interrupts are disabled in a handler, as on hardware).
 pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
     loop {
-        let (call, then) = {
+        let (step, exception) = {
             let mut m = rt.borrow_mut();
             if m.in_irq || m.crit {
                 return;
             }
-            // Interrupt handler chains first (the exception handler runs
-            // them before anything the kernel queues).
-            let Some(c) = m.irq_calls.pop_front().or_else(|| m.calls.pop_front().map(|c| (c, None))) else { return };
+            // The exception handler's steps first (it runs before anything
+            // the kernel queues).
+            let step = match m.irq_calls.pop_front() {
+                Some(s) => (s, true),
+                None => match m.calls.pop_front() {
+                    Some(c) => (IrqStep::Chain(c, None), false),
+                    None => return,
+                },
+            };
+            if step.0 == IrqStep::Exit && m.kernel.custom_exit == 0 {
+                continue;
+            }
             m.in_irq = true;
-            c
+            m.rfe = false;
+            step
         };
-        let v = inv.invoke(call) as u32;
-        if let (Some(handler), true) = (then, v != 0) {
-            inv.invoke(GuestCall { addr: handler, args: [v, 0, 0, 0] });
+        let rfe = || std::mem::take(&mut rt.borrow_mut().rfe);
+        match step {
+            IrqStep::Chain(call, then) => {
+                let v = inv.invoke_irq(call) as u32;
+                let mut returned = rfe();
+                if let (Some(handler), true, false) = (then, v != 0, returned) {
+                    inv.invoke_irq(GuestCall { addr: handler, args: [v, 0, 0, 0] });
+                    returned = rfe();
+                }
+                // Returning from the exception skips the rest of it.
+                if returned && exception {
+                    let mut m = rt.borrow_mut();
+                    while let Some(s) = m.irq_calls.pop_front() {
+                        if s == IrqStep::Exit {
+                            break;
+                        }
+                    }
+                }
+            }
+            IrqStep::Exit => {
+                let buf = rt.borrow().kernel.custom_exit;
+                let resume = rt.borrow().mem.r32(buf);
+                inv.invoke_irq(GuestCall { addr: resume, args: [buf, 1, 0, 0] });
+                if !rfe() {
+                    panic!("the custom exception exit at {resume:#010x} returned instead of calling ReturnFromException");
+                }
+            }
         }
         rt.borrow_mut().in_irq = false;
     }
@@ -121,35 +160,84 @@ mod tests {
         fn set_gp(&mut self, _: u32) {}
     }
 
-    /// A guest whose callback re-enters the runtime (VSync(-1)).
+    /// A guest that records its calls; addresses in `rfe` return from the
+    /// exception (as `psx.return_from_exception` does before unwinding).
     struct Guest<'a> {
         rt: &'a RefCell<Machine<Psyq>>,
-        seen: Vec<(u32, u64)>,
+        rfe: Vec<u32>,
+        seen: Vec<(u32, [u32; 4])>,
     }
     impl Invoke for Guest<'_> {
         fn invoke(&mut self, call: GuestCall) -> u64 {
-            let vsync = sdk_psyq::adapters().into_iter().find(|(n, _)| *n == "VSync").unwrap().1;
-            let flow = vsync(&mut self.rt.borrow_mut(), [u32::MAX, 0, 0, 0]).unwrap();
-            let v = run(self.rt, self, flow);
-            self.seen.push((call.addr, v));
-            0
+            self.seen.push((call.addr, call.args));
+            if self.rfe.contains(&call.addr) {
+                self.rt.borrow_mut().rfe = true;
+            }
+            1
         }
     }
 
+    fn machine() -> RefCell<Machine<Psyq>> {
+        RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(Host), Box::new(Regs), Default::default(), Psyq::default()))
+    }
+
+    /// A `SysEnqIntRP` element at `at` (verifier, handler) in a chain.
+    fn element(rt: &RefCell<Machine<Psyq>>, prio: u32, at: u32, verifier: u32, handler: u32) {
+        let mut m = rt.borrow_mut();
+        m.mem.w32(at + 4, handler);
+        m.mem.w32(at + 8, verifier);
+        m.kernel.int_handlers.entry(prio).or_default().push(at);
+    }
+
     #[test]
-    fn callbacks_reenter_during_waits() {
-        let m = Machine::new(Box::new(VecMem::default()), Box::new(Host), Box::new(Regs), Default::default(), Psyq::default());
-        let rt = RefCell::new(m);
-        let adapters = sdk_psyq::adapters();
-        let get = |n: &str| adapters.iter().find(|(x, _)| *x == n).unwrap().1;
-        let mut g = Guest { rt: &rt, seen: vec![] };
-        let f = get("ResetCallback")(&mut rt.borrow_mut(), [0; 4]).unwrap();
-        run(&rt, &mut g, f);
-        let f = get("VSyncCallback")(&mut rt.borrow_mut(), [0x8001_0000, 0, 0, 0]).unwrap();
-        run(&rt, &mut g, f);
-        let f = get("VSync")(&mut rt.borrow_mut(), [3, 0, 0, 0]).unwrap();
-        run(&rt, &mut g, f);
-        assert_eq!(rt.borrow().vblanks, 3);
-        assert_eq!(g.seen, vec![(0x8001_0000, 1), (0x8001_0000, 2), (0x8001_0000, 3)]);
+    fn chains_then_the_custom_exit() {
+        let rt = machine();
+        element(&rt, 0, 0x8000_1000, 0x8001_0000, 0x8001_0100);
+        element(&rt, 2, 0x8000_1010, 0x8001_0200, 0);
+        // HookEntryInt's buffer: resume address first (setjmp's layout).
+        rt.borrow_mut().mem.w32(0x8000_2000, 0x8003_0000);
+        rt.borrow_mut().kernel.custom_exit = 0x8000_2000;
+        let mut g = Guest { rt: &rt, rfe: vec![0x8003_0000], seen: vec![] };
+        rt.borrow_mut().queue_irq_chains();
+        drain(&rt, &mut g);
+        assert_eq!(
+            g.seen,
+            vec![
+                (0x8001_0000, [0; 4]),
+                (0x8001_0100, [1, 0, 0, 0]),
+                (0x8001_0200, [0; 4]),
+                (0x8003_0000, [0x8000_2000, 1, 0, 0]),
+            ]
+        );
+        assert!(!rt.borrow().in_irq && !rt.borrow().rfe);
+    }
+
+    #[test]
+    fn return_from_exception_skips_the_rest() {
+        let rt = machine();
+        element(&rt, 0, 0x8000_1000, 0x8001_0000, 0x8001_0100);
+        element(&rt, 1, 0x8000_1010, 0x8001_0200, 0);
+        rt.borrow_mut().mem.w32(0x8000_2000, 0x8003_0000);
+        rt.borrow_mut().kernel.custom_exit = 0x8000_2000;
+        let mut g = Guest { rt: &rt, rfe: vec![0x8001_0000], seen: vec![] };
+        rt.borrow_mut().queue_irq_chains();
+        // A second exception queued behind the first: the skip ends at the
+        // first one's exit, so the second runs (and returns early too).
+        rt.borrow_mut().queue_irq_chains();
+        drain(&rt, &mut g);
+        let addrs: Vec<u32> = g.seen.iter().map(|c| c.0).collect();
+        assert_eq!(addrs, vec![0x8001_0000, 0x8001_0000]);
+        assert!(rt.borrow().irq_calls.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "returned instead of calling ReturnFromException")]
+    fn custom_exit_must_not_return() {
+        let rt = machine();
+        rt.borrow_mut().mem.w32(0x8000_2000, 0x8003_0000);
+        rt.borrow_mut().kernel.custom_exit = 0x8000_2000;
+        let mut g = Guest { rt: &rt, rfe: vec![], seen: vec![] };
+        rt.borrow_mut().queue_irq_chains();
+        drain(&rt, &mut g);
     }
 }

@@ -211,8 +211,10 @@ golden.
    conformance harness (register decoder). *(D42: libgpu runs as original
    code over the GPU front end and DMA, so it has no adapters.
    `psxw conform btn --lib libgpu` drives it end to end.)*
-8. [ ] libetc adapters (`VSync` modes 0, 1, n, −1; callbacks) and
-   conformance.
+8. [x] libetc adapters (`VSync` modes 0, 1, n, −1; callbacks) and
+   conformance. *(D45: libetc runs as original code over the IRQ
+   controller, DMA and timers, entered through the BIOS's custom exit;
+   `psxw conform btn --lib libetc`.)*
 9. [x] SIO pad device; libpad and libapi pad adapters; conformance (SIO0
    decoder); replay input path; optional native window input. *(D40:
    libpad runs as original code over the SIO0 device, so it has no
@@ -377,10 +379,37 @@ golden.
     an 8×2 tile at (4,1) as `0x085F`, through the original
     ResetGraph/PutDispEnv/PutDrawEnv/ClearOTagR/SetTile/AddPrim/DrawOTag/
     DrawSync/StoreImage.
+- **2026-10-26** (this commit): task 8, D45. libetc now runs as original
+  code. The wasm exception handling the Finding below asks for is in.
+  - **The lift tier:**
+    - a direct call to an A0h:13h trampoline is `setjmp`: the caller
+      stores its registers inline;
+    - its return address becomes a continuation entry (btn:
+      `0x80032F90` in `startIntr`);
+    - B0h:17h becomes a throw.
+  - **The link tier** has one tag, `psxw_return_from_exception`, and the
+    catching export `guest_invoke_irq`, which restores `$sp`/`$gp`.
+  - **The runtime** takes `HookEntryInt`'s exit after the chains
+    (`IrqStep::Exit`), and an RFE skips the rest of an exception.
+  - **`psxw conform btn --lib libetc`** installs the manifest's callback
+    (`[conform]`: btn's `Rand`, whose LCG word shows each call). It then
+    runs the video mode, the interrupt mask, 30 vblanks of `VSync(-1)`
+    and callback state, `VSync(0/1/3)`, removing the callback, and a GPU
+    DMA callback around `DrawOTag`.
+    - Against the adapters, 56 of 59 observations matched, every frame's
+      included. The three that didn't were adapter shortcuts:
+      `ResetCallback` returns libetc's environment (`0x8005650C`) the
+      first time, and `GetIntrMask` is 9.
+    - So the adapters were removed, as for libpad and libgpu. All four
+      scenarios pass with libetc original (libmcrd's goes through its
+      interrupts too).
 
 ## Findings
 
 ### libetc: why its adapters stay, and what conformance needs
+
+*(Resolved by D45: the exception-handling route below is implemented,
+and libetc runs as original code.)*
 
 The adapters for libetc's interrupt layer stay (task 8): its original
 code can't run over the devices the way libpad does (D40).

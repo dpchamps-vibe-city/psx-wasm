@@ -22,9 +22,10 @@ use psxw_abi::{TABLE_LEN, WINDOW_BASE, WINDOW_MASK, guest, psx, table_index};
 use psxw_inputs::AddressMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements, EntityType, ExportKind,
-    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction as I, MemArg,
-    MemorySection, MemoryType, Module, NameMap, NameSection, RefType, TableSection, TableType, TypeSection, ValType,
+    BlockType, Catch, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements, EntityType,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction as I,
+    MemArg, MemorySection, MemoryType, Module, NameMap, NameSection, RefType, TableSection, TableType, TagKind,
+    TagSection, TagType, TypeSection, ValType,
 };
 use wasmparser::ValType as V;
 
@@ -61,6 +62,9 @@ pub struct GameSpec {
 }
 
 /// The `psx.*` imports, in import order, with their signatures.
+/// The guest's one exception tag, `() -> ()`: ReturnFromException.
+const RFE_TAG: u32 = 0;
+
 fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
     let i = V::I32;
     vec![
@@ -84,6 +88,7 @@ fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::IO_TRAP, vec![i, i], vec![]),
         ("adapter", vec![i; 5], vec![V::I64]),
         (psx::PROBE, vec![i], vec![]),
+        (psx::RETURN_FROM_EXCEPTION, vec![], vec![]),
     ]
 }
 
@@ -121,6 +126,10 @@ enum Synth {
     ICall(FuncType),
     /// `psxw_call_indirect(addr, a0..a3)` and `guest_invoke`.
     Indirect,
+    /// `guest_invoke_irq`: `Indirect` catching ReturnFromException.
+    InvokeIrq,
+    /// `psxw_return_from_exception`: tell the runtime, then throw.
+    Throw,
     Support(String, FuncType),
     Division(&'static str, crate::link::Division),
     InlineCopy,
@@ -244,6 +253,7 @@ impl Resolver for R<'_, '_> {
             "psxw_gp_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.gp)])),
             "psxw_gp_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.gp)])),
             "psxw_call_indirect" => return Ok(Lowered::Call(self.ctx.synth(Synth::Indirect))),
+            "psxw_return_from_exception" => return Ok(Lowered::Call(self.ctx.synth(Synth::Throw))),
             _ => {}
         }
         if let Some(imp) = service(&name) {
@@ -539,6 +549,36 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             f.instruction(&I::End);
             (FuncType { params: vec![V::I32; 5], results: vec![V::I64] }, f, "call_indirect".into())
         }
+        Synth::InvokeIrq => {
+            // Locals 5 and 6: $sp and $gp at the call, restored when a
+            // ReturnFromException unwinds (it returns to the interrupted
+            // context, as the BIOS restores the saved registers).
+            let mut f = Function::new([(2, ValType::I32)]);
+            f.instruction(&I::GlobalGet(ctx.sp));
+            f.instruction(&I::LocalSet(5));
+            f.instruction(&I::GlobalGet(ctx.gp));
+            f.instruction(&I::LocalSet(6));
+            f.instruction(&I::Block(BlockType::Empty));
+            f.instruction(&I::TryTable(BlockType::Result(ValType::I64), vec![Catch::One { tag: RFE_TAG, label: 0 }].into()));
+            dispatch(&mut f, 0, [1, 2, 3, 4], ctx.import(psx::UNTRANSLATED), ctx.o32_ty);
+            f.instruction(&I::End);
+            f.instruction(&I::Return);
+            f.instruction(&I::End);
+            f.instruction(&I::LocalGet(5));
+            f.instruction(&I::GlobalSet(ctx.sp));
+            f.instruction(&I::LocalGet(6));
+            f.instruction(&I::GlobalSet(ctx.gp));
+            f.instruction(&I::I64Const(0));
+            f.instruction(&I::End);
+            (FuncType { params: vec![V::I32; 5], results: vec![V::I64] }, f, "invoke_irq".into())
+        }
+        Synth::Throw => {
+            let mut f = Function::new([]);
+            f.instruction(&I::Call(ctx.import(psx::RETURN_FROM_EXCEPTION)));
+            f.instruction(&I::Throw(RFE_TAG));
+            f.instruction(&I::End);
+            (FuncType { params: vec![], results: vec![] }, f, "return_from_exception".into())
+        }
         Synth::Support(name, sig) => (sig.clone(), crate::bodies::support(&name), name),
         Synth::Division(op, conv) => {
             let brk = ctx.import(psx::BREAK);
@@ -645,6 +685,8 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         elements.insert(table_index(addr), e);
     }
     let invoke = ctx.synth(Synth::Indirect);
+    let invoke_irq = ctx.synth(Synth::InvokeIrq);
+    let unit_ty = ctx.intern(&FuncType { params: vec![], results: vec![] });
     let reg_fns = [
         ("guest_sp_get", ctx.synth(Synth::SpGet)),
         ("guest_sp_set", ctx.synth(Synth::SpSet)),
@@ -690,6 +732,9 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     let mut memory = MemorySection::new();
     memory.memory(MemoryType { minimum: spec.min_pages, maximum: None, memory64: false, shared: false, page_size_log2: None });
     module.section(&memory);
+    let mut tags = TagSection::new();
+    tags.tag(TagType { kind: TagKind::Exception, func_type_idx: unit_ty });
+    module.section(&tags);
     let mut globals = GlobalSection::new();
     for init in [0, 0, spec.budget as i32] {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));
@@ -698,6 +743,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     let mut ex = ExportSection::new();
     ex.export(guest::MEMORY, ExportKind::Memory, 0);
     ex.export(guest::INVOKE, ExportKind::Func, invoke);
+    ex.export(guest::INVOKE_IRQ, ExportKind::Func, invoke_irq);
     for (n, f) in reg_fns {
         ex.export(n, ExportKind::Func, f);
     }

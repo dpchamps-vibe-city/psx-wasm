@@ -23,7 +23,10 @@ pub mod replay;
 /// - 3: device libraries' I/O (`psx.io_access`, `psx.io_trap`, D40) and the
 ///   disc-free entry points (`psxw_conform_init`, `psxw_call`,
 ///   `psxw_run_vblanks`).
-pub const ABI_VERSION: u32 = 3;
+/// - 4: non-local exits for the BIOS's interrupt exit (D45):
+///   `guest.guest_invoke_irq`, `psx.return_from_exception`, and wasm
+///   exception handling in the module.
+pub const ABI_VERSION: u32 = 4;
 
 /// wasm address of guest physical address 0. Folded into every guest
 /// load/store's `memarg` offset, so translation costs one `i32.and`.
@@ -117,6 +120,10 @@ pub mod psx {
     pub const IO_TRAP: &str = "io_trap";
     /// `(addr) -> ()`: a watched function was entered.
     pub const PROBE: &str = "probe";
+    /// `() -> ()`: ReturnFromException (B0h:17h) is about to unwind the
+    /// guest to `guest_invoke_irq`; the runtime notes it, or traps outside
+    /// an exception handler.
+    pub const RETURN_FROM_EXCEPTION: &str = "return_from_exception";
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
     pub const ADAPTER_PREFIX: &str = "adapter.";
@@ -133,6 +140,10 @@ pub mod guest {
     /// `(addr, a0, a1, a2, a3) -> i64`: call a guest function pointer
     /// through the dispatch table (boot, callbacks).
     pub const INVOKE: &str = "guest_invoke";
+    /// `(addr, a0, a1, a2, a3) -> i64`: the same, in exception context: a
+    /// ReturnFromException in the call unwinds to here (wasm `throw`), and
+    /// `$sp`/`$gp` are restored to their values at the call.
+    pub const INVOKE_IRQ: &str = "guest_invoke_irq";
 }
 
 /// What `game.wasm` imports from its host: module `host`. All pointers are

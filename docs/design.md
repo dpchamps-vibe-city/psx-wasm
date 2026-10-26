@@ -345,12 +345,13 @@ The PsyQ policy, measured on the 361 SDK members btn links:
 | Library | Policy |
 |---|---|
 | libapi | Translated. BIOS calls go to the Rust BIOS. Adapters for `counter.o` (`SetRCnt`… program the timers directly) and for `pad.o`, `patch.o` and `chclrpad.o` (they patch Sony BIOS internals in RAM). |
-| libetc | Adapters for `VSync`, callbacks and interrupt setup. To be audited per member, like libapi. |
+| libetc | Guest code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
 | libgpu | Guest code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
 | libcd | Adapters at the device edge: `CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`. Helpers such as `CdIntToPos` stay guest code. |
 | libspu | Adapters (register programming). Open question: register-level SPU emulation as the fallback for unknown versions. |
 | libpad | Guest code over the SIO0 device (D40). Its state machine is the behaviour games observe, and the device is a port of the oracle's. |
-| libmcrd, libmcx, libcard | Adapters. |
+| libmcrd | Guest code over the HLE BIOS card functions (D43). |
+| libmcx, libcard | Adapters. |
 | libsnd | Guest code. The sequencer *is* the game's music, so the original runs and only libspu beneath it is replaced. |
 | libgs | Guest code. It only writes packets into RAM; `DrawOTag` is the device step. |
 | libgte | Guest code, with COP2 through `psx-gte`. Hot wrappers may get adapters for speed. |

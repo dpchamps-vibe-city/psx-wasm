@@ -15,10 +15,10 @@ use psxw_host_native::{Conform, Options};
 use psxw_inputs::Workspace;
 use serde::Serialize;
 
-pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd [--frames N] [--render server] [--dump-frames DIR]";
+pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd|libetc [--frames N] [--render server] [--dump-frames DIR]";
 
 /// Libraries with a scenario (the `psxw ci` gate runs each).
-pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd"];
+pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd", "libetc"];
 
 /// Free RAM for scenario buffers: below the stack, above any game data.
 const SCRATCH: u32 = 0x801C_0000;
@@ -44,6 +44,18 @@ impl Ctx<'_> {
         let r = self.inputs.map.resolve(&self.inputs.map.main, name).with_context(|| format!("{name} is not in the main container"))?;
         Ok(r.addr)
     }
+
+    /// The manifest's `[conform]` callback and the word it changes.
+    fn callback(&self) -> Result<(u32, u32)> {
+        let c = &self.inputs.manifest.conform;
+        let f = c.callback.as_deref().context("game.toml [conform] has no callback")?;
+        let st = c.callback_state.as_deref().context("game.toml [conform] has no callback_state")?;
+        Ok((self.addr(f)?, self.addr(st)?))
+    }
+}
+
+fn word(b: &[u8]) -> u32 {
+    b.iter().rev().fold(0u32, |w, &x| w << 8 | x as u32)
 }
 
 impl Side {
@@ -185,6 +197,58 @@ fn libmcrd(ctx: &Ctx, s: &mut Side, _frames: u32) -> Result<()> {
     Ok(())
 }
 
+/// libetc (M4 task 8): the interrupt layer. `ResetCallback`, the video
+/// mode and interrupt mask, then the manifest's callback on vblank: each
+/// frame `VSync(-1)` and the callback's word; `VSync` waits of 0, 1 and n
+/// frames; the callback removed; then as a GPU DMA callback around a
+/// `DrawOTag`. On the original side every interrupt goes through the
+/// BIOS's custom exit into libetc's own dispatcher, which ends in
+/// ReturnFromException (D45).
+fn libetc(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
+    let (cb, state) = ctx.callback()?;
+    let ot = SCRATCH;
+    s.c.write(state, &0x1234_5678u32.to_le_bytes());
+    let observe_state = |s: &mut Side, what: String| {
+        let v = word(&s.c.read(state, 4));
+        s.observe(what, vec![format!("state {v:#010x}")]);
+    };
+    s.call(ctx, "ResetCallback", [0; 4])?;
+    s.call(ctx, "CheckCallback", [0; 4])?;
+    s.call(ctx, "GetVideoMode", [0; 4])?;
+    s.call(ctx, "SetVideoMode", [1, 0, 0, 0])?;
+    s.call(ctx, "GetVideoMode", [0; 4])?;
+    s.call(ctx, "SetVideoMode", [0, 0, 0, 0])?;
+    s.call(ctx, "GetIntrMask", [0; 4])?;
+    s.call(ctx, "VSync", [u32::MAX, 0, 0, 0])?;
+    s.call(ctx, "VSyncCallback", [cb, 0, 0, 0])?;
+    for f in 0..frames.min(30) {
+        s.c.run_vblanks(1)?;
+        let n = s.c.call(ctx.addr("VSync")?, [u32::MAX, 0, 0, 0])? as u32;
+        let v = word(&s.c.read(state, 4));
+        s.observe(format!("frame {f}"), vec![format!("VSync(-1) {n}"), format!("state {v:#010x}")]);
+    }
+    for mode in [0, 1, 3] {
+        s.call(ctx, "VSync", [mode, 0, 0, 0])?;
+        let n = s.c.call(ctx.addr("VSync")?, [u32::MAX, 0, 0, 0])? as u32;
+        s.observe(format!("after VSync({mode})"), vec![format!("VSync(-1) {n}")]);
+        observe_state(s, format!("after VSync({mode})"));
+    }
+    s.call(ctx, "VSyncCallback", [0; 4])?;
+    s.c.run_vblanks(3)?;
+    observe_state(s, "callback removed, 3 vblanks".into());
+    s.call(ctx, "ResetGraph", [0; 4])?;
+    s.call(ctx, "DMACallback", [2, cb, 0, 0])?;
+    s.call(ctx, "ClearOTagR", [ot, 8, 0, 0])?;
+    s.call(ctx, "DrawOTag", [ot + 4 * 7, 0, 0, 0])?;
+    s.call(ctx, "DrawSync", [0; 4])?;
+    s.c.run_vblanks(1)?;
+    observe_state(s, "GPU DMA callback".into());
+    s.call(ctx, "DMACallback", [2, 0, 0, 0])?;
+    s.call(ctx, "GetIntrMask", [0; 4])?;
+    s.call(ctx, "CheckCallback", [0; 4])?;
+    Ok(())
+}
+
 /// The scenario's pad input: nothing, then single buttons, chords and a
 /// long hold (port 1); port 2 idle.
 fn replay(frames: u32) -> Vec<u8> {
@@ -230,7 +294,8 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         "libpad" => libpad,
         "libgpu" => libgpu,
         "libmcrd" => libmcrd,
-        other => bail!("no conformance scenario for {other} yet (libpad, libgpu, libmcrd)"),
+        "libetc" => libetc,
+        other => bail!("no conformance scenario for {other} yet (libpad, libgpu, libmcrd, libetc)"),
     };
 
     let inputs = psxw_lift::run::load(ws, game)?;
