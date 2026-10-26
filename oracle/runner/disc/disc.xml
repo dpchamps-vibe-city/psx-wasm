@@ -2,7 +2,7 @@
 <!--
   The runner disc: OpenBIOS boots the runner from it (Beetle's PS-X EXE
   side-loading patches a Sony-BIOS address and cannot start a program under
-  OpenBIOS; see plans/M03-oracle-harness.md, Findings).
+  OpenBIOS; see plans/completed/M03-oracle-harness.md, Findings).
 
   The boot file is named in serial form (SLUS_000.00, no real product)
   because Beetle's CD-controller model only reads data from discs it

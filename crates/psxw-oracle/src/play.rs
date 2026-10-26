@@ -1,4 +1,4 @@
-//! The whole-game RAM oracle's emulator side (plans/M03-oracle-harness.md,
+//! The whole-game RAM oracle's emulator side (plans/completed/M03-oracle-harness.md,
 //! "Whole-game RAM oracle"): `psxw-emu-host play` runs the user's disc
 //! under the pinned emulator from a psx-wasm replay, tracing the game's
 //! frame counter and dumping RAM. The disc is mounted read-only; nothing

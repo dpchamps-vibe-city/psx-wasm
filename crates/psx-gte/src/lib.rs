@@ -8,7 +8,7 @@
 //! fields (including the far-colour bug and the garbage matrix), the UNR
 //! division, and FLAG with bit 31 as the summary of bits 30..23 and 18..13.
 //! Where psx-spx leaves a detail open, the device oracle settled it; each
-//! such point is recorded in plans/M04-pixels.md (Findings) and marked
+//! such point is recorded in plans/completed/M04-pixels.md (Findings) and marked
 //! "oracle:" below.
 //!
 //! One implementation serves every caller: the `gte_*` macro shims in C,
@@ -523,7 +523,7 @@ impl Exec<'_> {
     /// One accumulation step into MACn (n = 1..3): flag a result "larger
     /// than 43 bits" (>= 2^43 or < -2^43) and wrap it to 44 bits, as the
     /// hardware's adder does. (The device target's GPL flags 2^43-1 too; a
-    /// disputed point, see plans/M04-pixels.md Findings.)
+    /// disputed point, see plans/completed/M04-pixels.md Findings.)
     fn acc(&mut self, n: usize, v: i64) -> i64 {
         if v >= 1 << 43 {
             self.flag |= flag::mac_pos(n);

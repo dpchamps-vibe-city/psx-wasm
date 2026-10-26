@@ -1,6 +1,6 @@
 /*
  * psxw-emu-host: a headless libretro frontend for the psx-wasm device
- * oracle (plans/M03-oracle-harness.md, "Emulator host").
+ * oracle (plans/completed/M03-oracle-harness.md, "Emulator host").
  *
  * It dlopen()s a libretro core (Beetle PSX), answers the environment
  * callbacks with a fixed, accuracy-first set of core options, loads the

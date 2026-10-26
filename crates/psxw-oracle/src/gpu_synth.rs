@@ -787,7 +787,7 @@ fn build(name: &str, i: usize, b: &mut B) -> Result<()> {
             // Sample the page first, filling the texture cache. Then the
             // cache is always invalidated before sampling again: psx-wasm
             // does not model texels the cache keeps after VRAM under them
-            // changed (plans/M04-pixels.md, Findings), a behaviour psx-spx
+            // changed (plans/completed/M04-pixels.md, Findings), a behaviour psx-spx
             // reports only demos rely on.
             let warm = b.coin();
             if warm {

@@ -1,5 +1,5 @@
 //! psx-wasm's GPU as a device under test for `psxw oracle check --device
-//! gpu` (plans/M04-pixels.md, tasks 5–6).
+//! gpu` (plans/completed/M04-pixels.md, tasks 5–6).
 //!
 //! A vector is replayed exactly as the runner executes it on the device
 //! target (`psxw_oracle::script` compiles it into the same ops): GP1

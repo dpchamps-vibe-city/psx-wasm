@@ -1,5 +1,5 @@
 # psxw-browsers: Chromium (headless) and Firefox ESR (on Xvfb) for the browser host's
-# tests (plans/M05-browser.md, D44), from the Debian snapshot the oracle
+# tests (plans/completed/M05-browser.md, D44), from the Debian snapshot the oracle
 # images use, on the same base image. A page under test POSTs its result to
 # the in-container server (browser-serve.py); run-browsers.sh drives each
 # browser and waits for it. No network: everything is served from /www.

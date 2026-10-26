@@ -1,5 +1,5 @@
 //! `psxw oracle play` and `psxw oracle ramdiff`: the whole-game RAM oracle
-//! (plans/M03-oracle-harness.md, tasks 8 and 9).
+//! (plans/completed/M03-oracle-harness.md, tasks 8 and 9).
 //!
 //! ```text
 //! psxw oracle play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--check determinism]

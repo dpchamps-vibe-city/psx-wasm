@@ -1,4 +1,4 @@
-//! The SPU in the oracle (plans/M06-sound.md tasks 1–3).
+//! The SPU in the oracle (plans/completed/M06-sound.md tasks 1–3).
 //!
 //! [`Device`] is psx-spu as a [`DeviceUnderTest`] for SPU_RUN vectors. It
 //! reproduces the runner's ops (`oracle/runner/spu.c`) on a psx-spu device:
@@ -7,7 +7,7 @@
 //! not sample-aligned (writes that queue up behind each other, the register
 //! snapshot taken while the SPU keeps running, the captures DMA-read while
 //! it keeps running) follow [`Timing`], a model of the runner's CPU time
-//! calibrated against the emulator (plans/M06-sound.md, Findings).
+//! calibrated against the emulator (plans/completed/M06-sound.md, Findings).
 
 use crate::commands::DeviceUnderTest;
 use crate::script::MAX_OP_PAYLOAD;
@@ -317,7 +317,7 @@ pub fn run(r: &SpuRun, store: &Store, t: &Timing) -> Result<Vec<u8>> {
 }
 
 /// The runner's timing varies from vector to vector within these bounds
-/// (calibration, plans/M06-sound.md Findings): the snapshot and the
+/// (calibration, plans/completed/M06-sound.md Findings): the snapshot and the
 /// captures by up to about 75 cycles, queued writes by their poll loop,
 /// and the DMA's FIFO loads by a tick.
 pub const READ_MARGIN: f64 = 96.0;

@@ -8,7 +8,7 @@
 //! The specification is psx-spx, "Sound Processing Unit (SPU)". Where it is
 //! silent or ambiguous, the device oracle (`psxw oracle check <game>
 //! --device spu`, emulator goldens) settled the behaviour; those places are
-//! marked "oracle:" and recorded in plans/M06-sound.md (Findings).
+//! marked "oracle:" and recorded in plans/completed/M06-sound.md (Findings).
 //!
 //! Time: [`Spu::tick`] produces one 44.1 kHz sample (768 CPU cycles).
 //! Register writes made between two ticks take effect at the next tick,

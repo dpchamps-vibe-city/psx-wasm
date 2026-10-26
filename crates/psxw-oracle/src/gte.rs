@@ -1,4 +1,4 @@
-//! The GTE in the oracle (plans/M04-pixels.md tasks 1–2):
+//! The GTE in the oracle (plans/completed/M04-pixels.md tasks 1–2):
 //!
 //! - [`Device`]: psx-gte as a [`DeviceUnderTest`]. It runs a GTE_OP vector
 //!   exactly as the runner does (`oracle/runner/gte.c`): control registers
@@ -194,7 +194,7 @@ pub fn install(store: &Store, seed: u64) -> Result<BTreeMap<&'static str, usize>
 /// Where the device target and psx-spx disagree, so that only hardware
 /// (M10) can settle it. These vectors are captured like any other but kept
 /// out of `check`'s verdicts; `check` reports how psx-gte fares on them in a
-/// note. Each case is a Finding in plans/M04-pixels.md.
+/// note. Each case is a Finding in plans/completed/M04-pixels.md.
 pub const DISPUTED_SET: &str = "disputed-gte";
 
 /// The disputed vectors (fixed, not seeded).

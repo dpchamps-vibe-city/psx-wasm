@@ -110,7 +110,7 @@ real one.
 ## Findings
 
 - **GTE questions only hardware can settle (from M4).** See
-  M04-pixels.md Findings.
+  `completed/M04-pixels.md`, Findings.
   - The set `disputed-gte`: GPL's MAC overflow flag at exactly 2^43−1.
     The emulator flags it; psx-spx and psx-gte don't.
   - The N/A opcodes 00h and 1Ah, which the emulator runs as RTPS and DCPL.

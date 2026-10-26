@@ -1,4 +1,4 @@
-//! The GPU front end (docs/design.md "Runtime", gpu; plans/M04-pixels.md).
+//! The GPU front end (docs/design.md "Runtime", gpu; plans/completed/M04-pixels.md).
 //!
 //! It speaks the GPU's own vocabulary: GP0 words (as the port or DMA
 //! delivers them) and GP1 commands. It keeps the draw and display state,

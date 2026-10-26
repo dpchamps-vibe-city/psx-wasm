@@ -1,4 +1,4 @@
-//! Whole-game RAM comparison by symbol (plans/M03-oracle-harness.md,
+//! Whole-game RAM comparison by symbol (plans/completed/M03-oracle-harness.md,
 //! "Whole-game RAM oracle"). Two 2 MiB dumps taken at the same value of
 //! the game's frame counter are compared byte for byte; each differing byte
 //! is attributed to the symbol covering it (the main container's, or the

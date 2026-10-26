@@ -1,4 +1,4 @@
-# psxw-render-gl: the GPU backend's headless environment (plans/M04-pixels.md).
+# psxw-render-gl: the GPU backend's headless environment (plans/completed/M04-pixels.md).
 # Mesa's llvmpipe with EGL surfaceless, from the Debian snapshot the oracle
 # images use, on the same base image; and the pinned Rust toolchain, which
 # builds psxw-render-server from the workspace mounted read-only at run time.
