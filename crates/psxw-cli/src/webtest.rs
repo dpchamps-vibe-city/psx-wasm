@@ -132,7 +132,7 @@ fn encode(vs: &[(String, Vec<u32>, Vec<u8>)]) -> Vec<u8> {
 /// must agree.
 fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
-    let (mut timeout, mut frames) = (1800u32, 600u64);
+    let (mut timeout, mut frames) = (1800u32, None::<u64>);
     let mut replay_path: Option<String> = None;
     let mut hash: Vec<u64> = vec![60, 300, 600];
     let mut it = args.iter();
@@ -140,7 +140,7 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         match *a {
             "--browsers" => browsers = it.next().context("--browsers needs a value")?.split(',').map(str::to_string).collect(),
             "--timeout" => timeout = it.next().context("--timeout needs a value")?.parse()?,
-            "--frames" => frames = it.next().context("--frames needs a value")?.parse()?,
+            "--frames" => frames = Some(it.next().context("--frames needs a value")?.parse()?),
             "--replay" => replay_path = it.next().map(|s| s.to_string()),
             "--hash" => hash = it.next().context("--hash needs a value")?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             other => bail!("unknown option {other}"),
@@ -148,10 +148,12 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     }
     let disc = ws.disc(game)?;
     let bundle = psxw_build::web::build(ws, game)?;
+    // A named replay or file runs its length unless --frames says less.
     let replay = match &replay_path {
-        Some(p) => std::fs::read(p)?,
-        None => psxw_abi_replay_none(frames),
+        Some(p) => crate::wholegame::replay(ws, game, Some(p))?.0,
+        None => psxw_abi_replay_none(frames.unwrap_or(600)),
     };
+    let frames = frames.unwrap_or_else(|| psxw_abi::replay::Header::parse(&replay).map_or(600, |h| h.frames as u64));
     std::fs::write(bundle.join("replay.rpl"), &replay)?;
     // The disc's mount point inside the read-only bundle mount.
     std::fs::create_dir_all(bundle.join("disc"))?;

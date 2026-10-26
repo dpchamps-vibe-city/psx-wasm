@@ -48,6 +48,44 @@ pub struct SpuBus {
     pub line: bool,
     /// Mixed output not yet handed to the host.
     pub out: Vec<[i16; 2]>,
+    /// The SPU window being recorded, if any.
+    pub window: Option<SpuWindow>,
+}
+
+/// An SPU window for the recording hook (M6): the register writes that
+/// recreate the SPU's state at its start (voices sounding then are keyed
+/// on), the game's register writes during it, and SPU RAM at its start.
+#[derive(Debug, Clone, Default)]
+pub struct SpuWindow {
+    /// The SPU cycle it started at.
+    pub start: u64,
+    pub samples: u32,
+    pub regs: Vec<(u16, u16)>,
+    /// (sample, register offset, value).
+    pub writes: Vec<(u32, u16, u16)>,
+    pub ram: Vec<u8>,
+}
+
+/// SPU registers a window's start state writes: every voice register,
+/// volumes, PMON/NON/EON, the reverb base, the IRQ address, transfer
+/// control, CD and external volumes, the reverb set; then SPUCNT (with no
+/// transfer mode).
+fn spu_state_regs(spu: &psx_spu::Spu) -> Vec<(u16, u16)> {
+    let offs = (0..0x180)
+        .step_by(2)
+        .chain((0x180..0x188).step_by(2))
+        .chain((0x190..0x19C).step_by(2))
+        .chain([0x1A2, 0x1A4, 0x1AC])
+        .chain((0x1B0..0x1B8).step_by(2))
+        .chain((0x1C0..0x200).step_by(2));
+    let mut out: Vec<(u16, u16)> = offs.map(|o| (o as u16, spu.read(o))).collect();
+    out.push((0x1AA, spu.read(0x1AA) & !0x30));
+    let sounding = (0..24u32).filter(|v| spu.read(16 * v + 0xC) != 0).fold(0u32, |m, v| m | 1 << v);
+    if sounding != 0 {
+        out.push((0x188, sounding as u16));
+        out.push((0x18A, (sounding >> 16) as u16));
+    }
+    out
 }
 
 impl std::fmt::Debug for SpuBus {
@@ -144,19 +182,28 @@ impl<S: Sdk> Machine<S> {
         io.note(now, addr, size, v, true);
         if SPU.contains(&addr) {
             let off = addr - SPU.start;
-            match size {
-                4 => {
-                    io.spu.spu.write(off & !3, v as u16);
-                    io.spu.spu.write((off & !3) + 2, (v >> 16) as u16);
-                }
-                2 => io.spu.spu.write(off & !1, v as u16),
+            let halves = match size {
+                4 => vec![(off & !3, v as u16), ((off & !3) + 2, (v >> 16) as u16)],
+                2 => vec![(off & !1, v as u16)],
                 _ => {
                     // A byte store: the halfword with that byte replaced.
                     let o = off & !1;
                     let old = io.spu.spu.read(o);
                     let sh = 8 * (addr & 1);
-                    io.spu.spu.write(o, (old & !(0xFF << sh)) | ((v as u16 & 0xFF) << sh));
+                    vec![(o, (old & !(0xFF << sh)) | ((v as u16 & 0xFF) << sh))]
                 }
+            };
+            for (o, h) in halves {
+                if let Some(w) = io.spu.window.as_mut() {
+                    if o == 0x1A8 {
+                        // SPU RAM changes through the data port.
+                        io.spu.window = None;
+                    } else {
+                        let sample = ((io.spu.at - w.start) / psx_spu::CYCLES_PER_SAMPLE as u64) as u32;
+                        w.writes.push((sample, o as u16, h));
+                    }
+                }
+                io.spu.spu.write(o, h);
             }
             self.spu_irq();
         } else if Irq::handles(addr) {
@@ -285,6 +332,7 @@ impl<S: Sdk> Machine<S> {
                 let words: Vec<u32> = (0..d.words(ch)).map(|i| self.mem.r32(addr.wrapping_add(4 * i) & 0x1F_FFFC)).collect();
                 if let Some(io) = self.io.as_mut() {
                     io.spu.spu.dma_write(&words);
+                    io.spu.window = None;
                 }
                 addr = addr.wrapping_add(4 * words.len() as u32) & 0x1F_FFFC;
                 self.spu_irq();
@@ -342,7 +390,27 @@ impl<S: Sdk> Machine<S> {
             io.spu.out.push(f);
         }
         io.spu.at += n * CYCLES;
+        let done = io.spu.window.as_ref().is_some_and(|w| io.spu.at - w.start >= w.samples as u64 * CYCLES);
+        if done {
+            if let Some(w) = io.spu.window.take() {
+                self.host.spu_record(&w);
+            }
+        }
         self.spu_irq();
+    }
+
+    /// At a vblank, while the run records SPU windows and none is open:
+    /// open one if the host wants it.
+    pub fn spu_record_vblank(&mut self) {
+        if self.opts.trace & psxw_abi::BootOptions::TRACE_RECORD_SPU == 0 || self.io.as_ref().is_none_or(|io| io.spu.window.is_some()) {
+            return;
+        }
+        let samples = self.host.spu_record_begin();
+        let Some(io) = self.io.as_mut() else { return };
+        if samples > 0 {
+            let ram = io.spu.spu.ram().iter().flat_map(|h| h.to_le_bytes()).collect();
+            io.spu.window = Some(SpuWindow { start: io.spu.at, samples, regs: spu_state_regs(&io.spu.spu), writes: Vec::new(), ram });
+        }
     }
 
     /// The SPU's IRQ line rising raises IRQ9.

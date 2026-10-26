@@ -24,6 +24,16 @@ pub trait Recorder {
     fn record(&mut self, v: Vector) -> Result<Option<VectorId>>;
 }
 
+/// What a recording hook made of one thing it was offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Recorded(VectorId),
+    /// Already recorded (or over the recorder's budget).
+    Declined,
+    /// Not recordable as a vector, and why.
+    Skipped(String),
+}
+
 /// The set name a game's recorded vectors go to.
 pub fn game_set(game: &str) -> String {
     format!("game-{game}")

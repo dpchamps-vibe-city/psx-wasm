@@ -304,8 +304,10 @@ impl Spu {
         if mode == 3 {
             s |= 0x200;
         }
-        // oracle: bit 11 is the half of the capture index last written.
-        if self.capture.wrapping_sub(1) & 0x100 != 0 {
+        // oracle: bit 11 is the half of the capture index last written,
+        // reported only while the transfer control register holds 0004h
+        // (a recorded btn window with it 0 read the bit as clear).
+        if self.raw(0x1AC) == 0x0004 && self.capture.wrapping_sub(1) & 0x100 != 0 {
             s |= 0x800;
         }
         s

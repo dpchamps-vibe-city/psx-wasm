@@ -84,6 +84,10 @@ async function scenario(module, rec, ram, replay) {
       return 0;
     },
     gpu_record() {},
+    spu_record_begin() {
+      return 0;
+    },
+    spu_record() {},
     audio(p, frames) {
       audio.bytes(bytes(p, frames * 4));
       audioFrames += frames;

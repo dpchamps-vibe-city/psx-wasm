@@ -55,6 +55,28 @@ pub struct Options {
     /// Record GPU linked-list batches (M4's recording hook; needs a
     /// renderer with VRAM).
     pub record_gpu: Option<GpuRecording>,
+    /// Record SPU windows (M6's recording hook).
+    pub record_spu: Option<SpuRecording>,
+}
+
+/// Which SPU windows a run records: one of `samples` at the first vblank
+/// at least `every` frames after the last window started, up to `budget`
+/// windows. Windows in which SPU RAM changed are never sent.
+#[derive(Debug, Clone, Copy)]
+pub struct SpuRecording {
+    pub every: u64,
+    pub samples: u32,
+    pub budget: usize,
+}
+
+/// A recorded SPU window (`psxw_abi::host::SPU_RECORD`).
+#[derive(Debug, Clone)]
+pub struct SpuWindow {
+    pub frame: u64,
+    pub samples: u32,
+    pub regs: Vec<(u16, u16)>,
+    pub writes: Vec<(u32, u16, u16)>,
+    pub ram: Vec<u8>,
 }
 
 /// Which GPU batches a run records: the first linked-list transfer at
@@ -112,6 +134,8 @@ pub struct RunReport {
     pub audio: audio::AudioStats,
     #[serde(skip)]
     pub gpu_batches: Vec<GpuBatch>,
+    #[serde(skip)]
+    pub spu_windows: Vec<SpuWindow>,
 }
 
 /// A RAM dump written during the run.
@@ -148,6 +172,9 @@ struct State {
     /// VRAM taken at `gpu_record_begin`, for the batch now running.
     gpu_vram: Option<Vec<u16>>,
     gpu_batches: Vec<GpuBatch>,
+    spu_windows: Vec<SpuWindow>,
+    /// The frame the last SPU window was asked for.
+    spu_asked: Option<u64>,
 }
 
 impl State {
@@ -159,6 +186,8 @@ impl State {
             audio: None,
             gpu_vram: None,
             gpu_batches: vec![],
+            spu_windows: vec![],
+            spu_asked: None,
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -240,7 +269,9 @@ fn boot_options(store: &mut Store<State>, instance: &wasmtime::Instance, opts: &
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, psxw_abi::exports::ALLOC)?;
     let ptr = alloc.call(&mut *store, std::mem::size_of::<BootOptions>() as u32)?;
     let b = opts.boot;
-    let trace = b.trace | if opts.record_gpu.is_some() { BootOptions::TRACE_RECORD_GPU } else { 0 };
+    let trace = b.trace
+        | if opts.record_gpu.is_some() { BootOptions::TRACE_RECORD_GPU } else { 0 }
+        | if opts.record_spu.is_some() { BootOptions::TRACE_RECORD_SPU } else { 0 };
     let words = [b.cd_timing, b.video, b.safepoint_budget, b.safepoint_quantum, b.debug, trace];
     let memory = instance.get_memory(&mut *store, "memory").context("no memory")?;
     for (i, w) in words.iter().enumerate() {
@@ -273,6 +304,7 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
         vram_hashes: s.vram_hashes,
         audio: s.audio.map(audio::Sink::finish).unwrap_or_default(),
         gpu_batches: s.gpu_batches,
+        spu_windows: s.spu_windows,
     }
 }
 
@@ -541,6 +573,30 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
                 c.data_mut().vram_hashes.insert(frame, format!("{:016x}", fnv(&bytes)));
             }
         }
+        Ok(())
+    })?;
+    linker.func_wrap(h, host::SPU_RECORD_BEGIN, |mut c: Caller<'_, State>| -> wasmtime::Result<i32> {
+        let s = c.data_mut();
+        let Some(rec) = s.opts.record_spu else { return Ok(0) };
+        let due = s.spu_asked.is_none_or(|f| s.frame >= f + rec.every);
+        if s.spu_windows.len() >= rec.budget || !due {
+            return Ok(0);
+        }
+        s.spu_asked = Some(s.frame);
+        Ok(rec.samples as i32)
+    })?;
+    linker.func_wrap(h, host::SPU_RECORD, |mut c: Caller<'_, State>, ptr: u32, len: u32| -> wasmtime::Result<()> {
+        let bytes = read_bytes(&mut c, ptr, len);
+        let word = |i: usize| u32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]);
+        let samples = word(0);
+        let nr = word(1) as usize;
+        let regs: Vec<(u16, u16)> = (0..nr).map(|i| (word(2 + 2 * i) as u16, word(3 + 2 * i) as u16)).collect();
+        let at = 2 + 2 * nr;
+        let nw = word(at) as usize;
+        let writes: Vec<(u32, u16, u16)> = (0..nw).map(|i| (word(at + 1 + 3 * i), word(at + 2 + 3 * i) as u16, word(at + 3 + 3 * i) as u16)).collect();
+        let ram = bytes[4 * (at + 1 + 3 * nw)..].to_vec();
+        let s = c.data_mut();
+        s.spu_windows.push(SpuWindow { frame: s.frame, samples, regs, writes, ram });
         Ok(())
     })?;
     linker.func_wrap(h, host::AUDIO, |mut c: Caller<'_, State>, ptr: u32, frames: u32| -> wasmtime::Result<()> {

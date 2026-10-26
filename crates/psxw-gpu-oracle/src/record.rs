@@ -13,20 +13,12 @@
 
 use anyhow::Result;
 use psx_devices::gpu::command_len;
+pub use psxw_oracle::record::Outcome;
 use psxw_oracle::record::{Recorder, vram_rect};
 use psxw_oracle::script;
 use psxw_oracle::store::Store;
-use psxw_oracle::vector::{GpuDraw, GpuMode, Rect, Vector, VectorId};
+use psxw_oracle::vector::{GpuDraw, GpuMode, Rect, Vector};
 use psxw_oracle::wire;
-
-/// What became of a batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    Recorded(VectorId),
-    /// Already recorded (or over the recorder's budget).
-    Declined,
-    Skipped(String),
-}
 
 /// VRAM rectangles covering `(x, y, w, h)` as it wraps at 1024×512.
 fn wrapped(x: u32, y: u32, w: u32, h: u32) -> Vec<Rect> {

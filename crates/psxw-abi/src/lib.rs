@@ -27,9 +27,11 @@ pub mod replay;
 ///   `guest.guest_invoke_irq`, `psx.return_from_exception`, and wasm
 ///   exception handling in the module.
 /// - 5: audio output, `host.audio` (M6).
-/// - 6: GPU draw recording, [`render::imports`] `gpu_record_begin` and
-///   `gpu_record` (M4), offered when [`BootOptions::TRACE_RECORD_GPU`] is
-///   set.
+/// - 6: recording hooks: GPU draws ([`render::imports`]
+///   `gpu_record_begin`, `gpu_record`, M4) when
+///   [`BootOptions::TRACE_RECORD_GPU`] is set, and SPU windows
+///   (`host.spu_record_begin`, `host.spu_record`, M6) when
+///   [`BootOptions::TRACE_RECORD_SPU`] is.
 pub const ABI_VERSION: u32 = 6;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
@@ -181,6 +183,17 @@ pub mod host {
     /// i16 pairs (left, right). Called at each vblank with exactly the
     /// samples that fell due in virtual time.
     pub const AUDIO: &str = "audio";
+    /// `() -> i32`: asked at a vblank, while the run records SPU windows
+    /// ([`BootOptions::TRACE_RECORD_SPU`](super::BootOptions)) and none is
+    /// open: how many samples to record from now, 0 for none.
+    pub const SPU_RECORD_BEGIN: &str = "spu_record_begin";
+    /// `(ptr, len) -> ()`: a finished window, little-endian `u32`s: its
+    /// samples; the count of (register offset, value) pairs that recreate
+    /// the SPU's register state at its start, then the pairs; the count of
+    /// (sample, register offset, value) writes during it, then the writes;
+    /// then SPU RAM at its start (512 KiB). A window in which SPU RAM
+    /// changed (DMA4, the data port) is never sent.
+    pub const SPU_RECORD: &str = "spu_record";
 }
 
 /// What `game.wasm` exports.
@@ -224,7 +237,7 @@ pub struct BootOptions {
     /// Bit 0: trap on I/O-window accesses; bit 1: verify resident overlays.
     pub debug: u32,
     /// Bit 0: report every BIOS and adapter call; bit 1: offer GPU draw
-    /// batches for recording.
+    /// batches for recording; bit 2: offer SPU windows for recording.
     pub trace: u32,
 }
 
@@ -233,6 +246,7 @@ impl BootOptions {
     pub const DEBUG_OVERLAYS: u32 = 2;
     pub const TRACE_CALLS: u32 = 1;
     pub const TRACE_RECORD_GPU: u32 = 2;
+    pub const TRACE_RECORD_SPU: u32 = 4;
 }
 
 /// Disc layout, as `disc_info` writes it.

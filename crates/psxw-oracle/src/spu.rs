@@ -437,3 +437,47 @@ pub fn install(store: &Store, seed: u64) -> Result<std::collections::BTreeMap<&'
     }
     Ok(counts)
 }
+
+/// An SPU window from a game run (M6 task 6, `psxw oracle record`) as an
+/// SPU_RUN vector: SPU RAM as it was at the window's start (but the
+/// runner's reserved block), the register writes that recreate the SPU's
+/// state then at sample 0, the game's writes at their samples, and the
+/// capture buffers (SPU RAM 0-FFFh) as the result besides the registers.
+/// Like the generators' vectors, it is kept only if [`robust`].
+pub fn window_vector(
+    rec: &mut dyn crate::record::Recorder,
+    store: &Store,
+    samples: u32,
+    regs: &[(u16, u16)],
+    writes: &[(u32, u16, u16)],
+    ram: &[u8],
+) -> Result<crate::record::Outcome> {
+    use crate::record::Outcome;
+    use crate::vector::{SPU_RESERVED, SpuRam, SpuWrite};
+    if ram.len() != wire::SPU_RAM_SIZE as usize {
+        return Ok(Outcome::Skipped(format!("SPU RAM of {} bytes", ram.len())));
+    }
+    let mut ram_parts = Vec::new();
+    for (start, end) in [(0, SPU_RESERVED.start), (SPU_RESERVED.end, wire::SPU_RAM_SIZE)] {
+        ram_parts.push(SpuRam { addr: start, bytes: rec.blob(&ram[start as usize..end as usize])? });
+    }
+    let w: Vec<SpuWrite> = regs
+        .iter()
+        .map(|&(reg, value)| SpuWrite { sample: 0, reg: reg as u32, value })
+        .chain(writes.iter().map(|&(sample, reg, value)| SpuWrite { sample, reg: reg as u32, value }))
+        .collect();
+    let run = SpuRun { ram: ram_parts, writes: w, samples, captures: vec![(0, 0x1000)] };
+    let v = Vector::SpuRun(run.clone());
+    if let Err(e) = crate::script::compile(&v, store) {
+        return Ok(Outcome::Skipped(format!("{e:#}")));
+    }
+    // As the generators do: only a result the runner's timing can't move.
+    let (_, knowable) = robust(&run, store, &Timing::default())?;
+    if knowable != Knowable::Yes {
+        return Ok(Outcome::Skipped(format!("timing-sensitive ({knowable:?})")));
+    }
+    Ok(match rec.record(v)? {
+        Some(id) => Outcome::Recorded(id),
+        None => Outcome::Declined,
+    })
+}

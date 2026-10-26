@@ -232,11 +232,15 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
     present(p) {
       if (!lost) renderer.present(new Uint32Array(mem().slice(p, p + 20)));
     },
-    // GPU recording (ABI 6) is the native host's; the browser never asks.
+    // Recording (ABI 6) is the native host's; the browser never asks.
     gpu_record_begin() {
       return 0;
     },
     gpu_record() {},
+    spu_record_begin() {
+      return 0;
+    },
+    spu_record() {},
     audio(p, frames) {
       const b = bytes(p, frames * 4);
       audioHash.bytes(b);

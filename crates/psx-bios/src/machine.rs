@@ -47,6 +47,13 @@ pub trait Host {
     /// The recorded transfer: the GP0 state words it started from, and
     /// its nodes' words.
     fn gpu_record(&mut self, _state: &[u32], _nodes: &[Vec<u32>]) {}
+    /// At a vblank with no SPU window open: samples to record from now
+    /// (M6's recording hook), 0 for none.
+    fn spu_record_begin(&mut self) -> u32 {
+        0
+    }
+    /// A finished SPU window.
+    fn spu_record(&mut self, _w: &crate::io::SpuWindow) {}
     /// Audio frames (left, right) at `psxw_abi::AUDIO_HZ`.
     fn audio(&mut self, _frames: &[[i16; 2]]) {}
 }
@@ -288,6 +295,7 @@ impl<S: Sdk> Machine<S> {
             self.spu_run();
             let frames = self.io.as_mut().map(|io| std::mem::take(&mut io.spu.out)).unwrap_or_default();
             self.host.audio(&frames);
+            self.spu_record_vblank();
             return;
         }
         const CYCLES: u64 = psx_devices::clock::CPU_HZ / psxw_abi::AUDIO_HZ as u64;

@@ -42,6 +42,10 @@ unsafe extern "C" {
     fn host_gpu_record_begin() -> i32;
     #[link_name = "gpu_record"]
     fn host_gpu_record(ptr: *const u8, len: usize);
+    #[link_name = "spu_record_begin"]
+    fn host_spu_record_begin() -> i32;
+    #[link_name = "spu_record"]
+    fn host_spu_record(ptr: *const u8, len: usize);
 }
 
 #[link(wasm_import_module = "guest")]
@@ -120,6 +124,18 @@ impl Host for FfiHost {
             words.extend_from_slice(n);
         }
         unsafe { host_gpu_record(words.as_ptr().cast(), words.len() * 4) }
+    }
+    fn spu_record_begin(&mut self) -> u32 {
+        unsafe { host_spu_record_begin().max(0) as u32 }
+    }
+    fn spu_record(&mut self, w: &psx_bios::io::SpuWindow) {
+        let mut words = vec![w.samples, w.regs.len() as u32];
+        words.extend(w.regs.iter().flat_map(|&(o, v)| [o as u32, v as u32]));
+        words.push(w.writes.len() as u32);
+        words.extend(w.writes.iter().flat_map(|&(s, o, v)| [s, o as u32, v as u32]));
+        let mut bytes: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+        bytes.extend_from_slice(&w.ram);
+        unsafe { host_spu_record(bytes.as_ptr(), bytes.len()) }
     }
 }
 

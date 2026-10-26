@@ -184,6 +184,18 @@ fn spu(store: &Store) -> Result<Vec<Handwritten>> {
             name: "spu_square_voices_1_3",
             vector: Vector::SpuRun(SpuRun { ram: vec![SpuRam { addr, bytes: sample }], writes, samples: 512, captures }),
         },
+        // SPUSTAT bit 11 (the capture half) reads as set only while the
+        // transfer control register holds 0004h: 128 samples after the
+        // sync the capture index is mid-way through the upper half.
+        Handwritten {
+            name: "spu_status_transfer_control_0",
+            vector: Vector::SpuRun(SpuRun {
+                ram: vec![],
+                writes: vec![SpuWrite { sample: 0, reg: 0x1AC, value: 0x0000 }],
+                samples: 128,
+                captures: vec![],
+            }),
+        },
         Handwritten {
             name: "spu_noise_voice_3",
             vector: Vector::SpuRun(SpuRun {

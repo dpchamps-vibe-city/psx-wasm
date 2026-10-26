@@ -140,8 +140,10 @@ unverified.
    *(`psxw conform btn --lib libsnd`: `SsSeqCalledTbyT` runs exactly 60
    times over 60 vblanks under `SS_TICK60` and 240 under `SS_TICK240`. The
    sequences btn plays during gameplay run in the disc-gated runs.)*
-6. [ ] SPU recording hook; record btn vectors over `title-to-gameplay`;
-   capture; zero failures.
+6. [x] SPU recording hook; record btn vectors over `title-to-gameplay`;
+   capture; zero failures. *(`psxw oracle record btn --replay
+   title-to-gameplay --device spu`: 20 windows, all matching their
+   goldens after one psx-spu fix; see Findings.)*
 7. [x] XA: `ReadS`, filters, decoding, resampling, CD input, real-rate
    delivery. *(`psx_devices::xa` and the libcd adapters' stream. Decoding
    and resampling match the emulator exactly (task 8). The decoded frames
@@ -342,7 +344,45 @@ unverified.
     vector file recaptures it as "unlisted"; delete
     `.oracle/vectors/d61a8b7b…` and its golden there.
 
+- **2026-10-26** (this commit): task 6, the SPU recording hook (ABI 6).
+  - **In the runtime:** with `BootOptions::TRACE_RECORD_SPU`, the host is
+    asked at each vblank, while no window is open, whether to open one
+    and for how many samples (`host.spu_record_begin`). A window keeps:
+    - the register writes that recreate the SPU's state at its start
+      (every writable register, SPUCNT without a transfer mode, and KON
+      for the voices with a nonzero envelope);
+    - SPU RAM then;
+    - the game's register writes during it, at their samples.
+    
+    The finished window goes to `host.spu_record`. A DMA4 transfer or a
+    data-port write drops it, because an SPU_RUN vector can't change SPU
+    RAM mid-run. The browser hosts never record.
+  - **`psxw_oracle::spu::window_vector`:**
+    - makes an SPU_RUN vector: RAM around the runner's reserved block,
+      the state writes at sample 0, then the game's writes, capturing
+      SPU RAM 0-FFFh;
+    - keeps only vectors [`robust`] calls knowable, as the generators do.
+  - **`psxw oracle record`** gains `--device gpu|spu` (both by default).
+    An SPU window is 8,820 samples by default, every 300 frames, up to 24.
+  - **btn, `title-to-gameplay`:** two passes (every 300 and every 97
+    frames). 80 windows: 20 knowable, 59 timing-sensitive (24 readback,
+    35 writes), 1 duplicate.
+    - The first check failed one: SPUSTAT bit 11 was set where the
+      emulator had it clear (Findings). psx-spu is fixed, and a
+      handwritten vector, `spu_status_transfer_control_0`, keeps the
+      case in every store.
+    - `check btn --device spu`: 3,320 vectors provisional, 0 failed.
+
 ## Findings
+
+### SPUSTAT bit 11 follows the transfer control register
+
+A recorded btn window started while the game had the SPU off: SPUCNT 0,
+transfer control (1F801DACh) 0. psx-spu reported SPUSTAT bit 11, the
+capture half, as set; the emulator read it as clear. Beetle sets the bit
+only while the transfer control register holds 0004h, which libspu and
+the runner's reset always write. psx-spx doesn't say. The emulator
+decides (as elsewhere in this milestone), so psx-spu now does the same.
 
 ### From the SPU device and its vectors (2026-10-26)
 
