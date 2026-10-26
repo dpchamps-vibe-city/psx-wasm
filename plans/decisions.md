@@ -398,9 +398,20 @@ pointer, not 0) and `GetIntrMask` (9, not 0).
 value, version-independently. The lowerings are generic BIOS semantics
 that any SDK using `HookEntryInt` gets for free.
 
+**D46. Q1: browser tab only, for now** (M5). The default when nobody
+asks for a desktop shell, taken without the human's input as instructed
+(the human can reopen it). The bundle already runs in any
+cross-origin-isolated tab served with COOP/COEP (`psxw serve`). A Tauri
+shell would only add a window around the same bundle and a packaging
+toolchain to pin. M5 task 7 is not done.
+
+*Why:* nothing in M5-M8 needs a native window, and the native host
+(`psxw run`) covers headless use.
+
 ## Open questions (tracked)
 
-- **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.
+- **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser
+  tab only, for now (D46).
 - **Q2.** Register-level SPU fallback for unknown libspu versions.
   Decided: yes (D41).
 - **Q3.** The license for psx-wasm. Needed before any public release.

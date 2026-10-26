@@ -101,7 +101,7 @@ M0 ─► M1 ─► M2 ─┬─► M4 ─► M5
 | Disc image of the target game (`.cue` + raw `.bin`, MODE2/2352) | M2 | The human supplies the path in `psxw.local.toml`. Never search the filesystem for it. Its sha1 is pinned in `inputs.lock`. |
 | Approval of the emulator/BIOS choice if OpenBIOS can't boot Beetle PSX | M3 | Fallbacks are listed in M3; the human picks. |
 | A replay of real play (input log) for the long session | M7 | Recorded by the human playing the native or browser build. |
-| Webview shell decision (browser tab only, or Tauri) | M5 (optional task) | |
+| Webview shell decision (browser tab only, or Tauri) | M5 (optional task) | Defaulted to browser tab only (D46); the human may reopen it. |
 | Choice of second game | M9 | |
 | A hardware rig (PS1 with serial port, USB-serial, FreePSXBoot or Unirom) | M10 | Or a community member with one. |
 | License for psx-wasm | Before any public release | |

@@ -98,7 +98,7 @@ produces. Its devices are already gated by M4's oracles.
    and the replay.)*
 6. [x] Performance report: frame-time percentiles in the worker. Reported,
    not gating. *(`frameMs` in the Worker's `hashes` message.)*
-7. [ ] *(optional, if Q1 says yes)* Tauri shell serving the same bundle
+7. [ ] *(optional, if Q1 says yes; D46: no for now)* Tauri shell serving the same bundle
    with COOP/COEP.
 8. [x] Add the browser determinism tests to `psxw ci`. Docs, README
    status. *(Gates `web-gpu` and `web-game`.)*
