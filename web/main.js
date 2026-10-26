@@ -27,8 +27,8 @@ const KEYS = {
 // Standard Gamepad API layout to pad bits.
 const BUTTONS = { 8: 0, 10: 1, 11: 2, 9: 3, 12: 4, 15: 5, 13: 6, 14: 7, 6: 8, 7: 9, 4: 10, 5: 11, 3: 12, 1: 13, 0: 14, 2: 15 };
 
-// [seq, port 1 buttons, port 2 buttons or -1, save-replay requests]
-const padBuffer = new SharedArrayBuffer(16);
+// [seq, port 1 buttons, port 2 buttons or -1, save-replay requests, frames shown]
+const padBuffer = new SharedArrayBuffer(20);
 const pad = new Int32Array(padBuffer);
 Atomics.store(pad, 1, 0xffff);
 Atomics.store(pad, 2, -1);
@@ -102,11 +102,34 @@ async function gameInfo() {
 const saveReplay = document.getElementById("save-replay");
 saveReplay.addEventListener("click", () => Atomics.add(pad, 3, 1));
 
+// The Worker's frames, shown as they arrive. For the tests, every 30th one
+// is checked for a lit pixel (`display` in the posted result).
+const screen = document.getElementById("screen");
+const view = screen.getContext("bitmaprenderer");
+const display = { shown: 0, sampled: 0, lit: 0 };
+function show(bitmap) {
+  if (params.has("post") && display.shown % 30 === 0) {
+    const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const g = c.getContext("2d");
+    g.drawImage(bitmap, 0, 0);
+    const px = g.getImageData(0, 0, bitmap.width, bitmap.height).data;
+    display.sampled++;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i] | px[i + 1] | px[i + 2]) {
+        display.lit++;
+        break;
+      }
+    }
+  }
+  view.transferFromImageBitmap(bitmap);
+  display.shown++;
+  Atomics.add(pad, 4, 1);
+}
+
 async function start(cue, audioRing) {
   const game = await gameInfo();
   const record = document.getElementById("record").checked || params.has("record");
   if (record && game.frame_counter == null) say("this bundle names no frame counter; recording is off");
-  const canvas = document.getElementById("screen").transferControlToOffscreen();
   const worker = new Worker("worker.js", { type: "module" });
   const options = {
     instantCd: document.getElementById("instant").checked || params.has("instant"),
@@ -115,6 +138,8 @@ async function start(cue, audioRing) {
     replay: params.get("replay"),
     hashAt: (params.get("hash") || "").split(",").filter(Boolean).map(Number),
     dev: params.has("dev"),
+    width: screen.width,
+    height: screen.height,
     record: record && game.frame_counter != null,
     clock: game.frame_counter,
     gameId: game.id || "",
@@ -122,7 +147,8 @@ async function start(cue, audioRing) {
   saveReplay.disabled = !options.record;
   worker.onmessage = (e) => {
     const m = e.data;
-    if (m.type === "status") say(m.text);
+    if (m.type === "frame") show(m.bitmap);
+    else if (m.type === "status") say(m.text);
     else if (m.type === "replay" && params.has("post")) {
       fetch(`/result?browser=${params.get("post") || params.get("browser")}-replay`, { method: "POST", body: m.bytes });
     } else if (m.type === "replay") {
@@ -135,6 +161,7 @@ async function start(cue, audioRing) {
     }
     else if (m.type === "log") console.log(`[${m.frame}] ${m.text}`);
     else if (m.type === "hashes") {
+      m.display = display;
       window.psxwHashes = m;
       if (params.has("post")) {
         fetch(`/result?browser=${params.get("post") || params.get("browser")}`, { method: "POST", body: JSON.stringify(m) });
@@ -148,7 +175,7 @@ async function start(cue, audioRing) {
       }
     }
   };
-  worker.postMessage({ type: "start", canvas, cue, padBuffer, audioRing, options }, [canvas]);
+  worker.postMessage({ type: "start", cue, padBuffer, audioRing, options });
 }
 
 const discInput = document.getElementById("disc");

@@ -7,7 +7,11 @@
 // - storage (memory cards): files in OPFS `saves/` (cards.js), loaded at
 //   start and written back as the game saves;
 // - rendering: psxw-host-web's WebRenderer (psx-render-gl on WebGL2) on
-//   the OffscreenCanvas;
+//   this Worker's own OffscreenCanvas. The game never returns to the
+//   event loop, so a canvas transferred from the page would never show a
+//   frame; each presented frame goes to the page as an ImageBitmap
+//   instead (at most two in flight; the page counts what it shows in the
+//   shared buffer's word 4);
 // - audio: `host.audio` frames into the AudioWorklet's SharedArrayBuffer
 //   ring (audio.js), hashed as the native host does (FNV-1a over the
 //   frames' bytes).
@@ -20,8 +24,8 @@
 //   into the re-created renderer when the context is restored (the
 //   colour-table cache refills on the next table change).
 //
-// Messages in: {type: "start", canvas, cue, padBuffer, audioRing, options}.
-// Messages out: {type: "status"|"report"|"log"|"hashes"|"stopped", ...}.
+// Messages in: {type: "start", cue, padBuffer, audioRing, options}.
+// Messages out: {type: "status"|"report"|"log"|"frame"|"replay"|"hashes"|"stopped", ...}.
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
@@ -133,7 +137,8 @@ class Fnv64 {
   }
 }
 
-async function run({ canvas, cue, padBuffer, audioRing, options }) {
+async function run({ cue, padBuffer, audioRing, options }) {
+  const canvas = new OffscreenCanvas(options.width || 640, options.height || 480);
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
   let lost = false;
@@ -156,7 +161,10 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
   const saveDir = await savesDir();
   const saves = await loadSaves(saveDir);
   const replay = options.replay ? new Uint8Array(await (await fetch(options.replay)).arrayBuffer()) : null;
-  const pad = new Int32Array(padBuffer); // [seq, port 1 buttons, port 2 buttons or -1, save-replay requests]
+  // [seq, port 1 buttons, port 2 buttons or -1, save-replay requests, frames shown]
+  const pad = new Int32Array(padBuffer);
+  if (pad.length < 5) throw new Error("this page is older than the Worker (the bundle was rebuilt): reload the page");
+  let framesPosted = 0;
   const recording = options.record ? { clock: options.clock >>> 0, entries: [], frames: 0, saved: 0 } : null;
   const postReplay = () => {
     const bytes = encodeReplay(recording, options.gameId || "");
@@ -273,7 +281,14 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
       bytes(dst, px.byteLength).set(new Uint8Array(px.buffer, px.byteOffset, px.byteLength));
     },
     present(p) {
-      if (!lost) renderer.present(new Uint32Array(mem().slice(p, p + 20)));
+      if (lost) return;
+      renderer.present(new Uint32Array(mem().slice(p, p + 20)));
+      // A page that falls behind misses frames rather than queueing them.
+      if (framesPosted - Atomics.load(pad, 4) < 2) {
+        const bitmap = canvas.transferToImageBitmap();
+        framesPosted++;
+        postMessage({ type: "frame", frame, bitmap }, [bitmap]);
+      }
     },
     // Recording (ABI 6) is the native host's; the browser never asks.
     gpu_record_begin() {
