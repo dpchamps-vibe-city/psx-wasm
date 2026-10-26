@@ -228,10 +228,11 @@ golden.
     Reach zero differences.
 12. [ ] *(optional)* `asm-gte` normalizer rule; `difftest` on the
     functions that move to C.
-13. [ ] `psxw run btn --headless --replay … --dump-frames out/` writes
+13. [x] `psxw run btn --headless --replay … --dump-frames out/` writes
     PNGs for humans (not gating). Add the GPU and GTE checks to `psxw ci`.
-    Docs, README status. *(The GTE check is in: `psxw_oracle::commands::ci`
-    runs it for every game.)*
+    Docs, README status. *(`psxw_oracle::commands::ci` checks every device
+    the CLI registers, GTE and GPU, for every game; `--dump-frames` writes
+    PNGs through the server renderer.)*
 
 ## Exit criteria (all automated)
 
