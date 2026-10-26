@@ -142,6 +142,7 @@ impl DockerTarget {
             images: image_ids,
             binaries,
             generator: None,
+            hardware: std::collections::BTreeMap::new(),
             created: String::new(),
         };
         let work_root = images::oracle_dir(ws).join("work");

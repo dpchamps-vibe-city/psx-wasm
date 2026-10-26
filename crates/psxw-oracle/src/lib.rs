@@ -8,6 +8,7 @@
 //! Everything game-derived that this crate writes lives under `.oracle/`
 //! (gitignored); reports go under `out/oracle/`.
 
+pub mod batch;
 pub mod commands;
 pub mod exact;
 pub mod golden;

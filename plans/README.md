@@ -83,7 +83,7 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M7](M07-saves-and-play-session.md) | Saves and full play session | **in progress** (memory cards: device, HLE BIOS, libmcrd as guest code; native and OPFS storage) | M4, M6 | Card checksums; game accepts its saves; RAM by symbol over a day |
 | [M8](M08-sdk-generality.md) | SDK generality | **in progress** (identity, boundary, layouts, conformance; the .LIB converter and psyq-decomp C remain) | M2 (*parallel* with M4–M7) | Per-object adapter conformance; psyq-decomp C == translated |
 | [M9](M09-second-game.md) | Second game | not started | M7, M8 | All gates with only a manifest |
-| [M10](M10-hardware-oracle.md) | Hardware oracle | not started | M3; a rig | Vector archive replayed on hardware |
+| [M10](M10-hardware-oracle.md) | Hardware oracle | **in progress** (batch export/import, disagreement report; capture waits for a rig) | M3; a rig | Vector archive replayed on hardware |
 
 ```
 M0 ─► M1 ─► M2 ─┬─► M4 ─► M5
