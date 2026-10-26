@@ -166,7 +166,10 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     let synthetic = gpu_synth::install(&store)?;
     let mut target = DockerTarget::open(ws)?;
     let tid = target.id().to_string();
-    let ids: Vec<VectorId> = store.vector_ids()?;
+    // The archive is what the sets list: a vector no set names is left
+    // over from an earlier version of its generator.
+    let groups = set_index(&store)?;
+    let ids: Vec<VectorId> = store.vector_ids()?.into_iter().filter(|id| groups.contains_key(id)).collect();
     let mut vectors = Vec::new();
     for (id, v) in load(&store, ids)? {
         if kind.is_some_and(|k| k != v.kind()) || (missing && store.has_golden(&tid, &id)) {
@@ -176,7 +179,6 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     }
     eprintln!("capture: {} vectors on {tid}", vectors.len());
     let results = run_vectors(&mut target, &store, &vectors)?;
-    let groups = set_index(&store)?;
     let mut report = Report::new("capture");
     report.target = Some(tid.clone());
     report.seed = Some(format!("{:#018x}", gte::DEFAULT_SEED));
