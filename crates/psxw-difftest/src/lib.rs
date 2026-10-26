@@ -27,6 +27,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const SCHEMA_VERSION: u32 = 1;
 const PAIRS_PER_SHARD: usize = 48;
 const FUEL: u64 = 20_000_000;
+/// Fuel is a termination bound, not semantics: the translation keeps every
+/// guest register in a local and re-reads memory at loop heads, so it may
+/// take a few times the C's wasm instructions for the same work.
+const TRANSLATED_FUEL_SCALE: u64 = 4;
 /// The C side compiles each function as if alone: no automatic inlining,
 /// and no tail-call or tail-recursion rewriting of the calls it makes.
 const HARNESS_FLAGS: &[&str] = &["-fno-inline-functions", "-fno-optimize-sibling-calls"];
@@ -585,10 +589,10 @@ fn run_pair(
                 _ => *slot,
             };
         }
-        let c = h.run(&fc, seed, args, &scratch, &stack);
+        let c = h.run(&fc, seed, args, &scratch, &stack, 1);
         let c_pages: BTreeMap<usize, Vec<u8>> = c.dirty.iter().map(|&pg| (pg, h.page(pg).to_vec())).collect();
         h.restore(&c.dirty);
-        let t = h.run(&ft, seed, args, &scratch, &stack);
+        let t = h.run(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE);
         let verdict = compare(h, p, &c, &t, &c_pages, masks);
         let mut all = c.dirty.clone();
         all.extend(t.dirty.iter().copied());

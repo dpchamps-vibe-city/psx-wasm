@@ -83,7 +83,7 @@ fn guest_passes_and_adapters() {
     let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
     let f = h.func("c").unwrap();
     let b = 0x8001_5000u32;
-    let r = h.run(&f, 1, [5, b, 0, 0], &[], &[0; 8]);
+    let r = h.run(&f, 1, [5, b, 0, 0], &[], &[0; 8], 1);
     assert!(matches!(r.outcome, Outcome::Returned(_)), "{:?}", r.outcome);
 
     // Masked store at the original address.

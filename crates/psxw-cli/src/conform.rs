@@ -53,6 +53,18 @@ impl Side {
     fn observe(&mut self, step: String, values: Vec<String>) {
         self.log.push(Observation { step, values });
     }
+
+    /// Ends the run, writing its report (counters, recent I/O) next to
+    /// the conformance report; keeps the observations.
+    fn finish(self, dir: &std::path::Path, which: &str) -> Result<Finished> {
+        let r = self.c.finish();
+        std::fs::write(dir.join(format!("run-{which}.json")), serde_json::to_string_pretty(&r)?)?;
+        Ok(Finished { log: self.log })
+    }
+}
+
+struct Finished {
+    log: Vec<Observation>,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -131,13 +143,17 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let original = psxw_build::game::build(ws, &opts)?.0.wasm;
 
     let ctx = Ctx { inputs: &inputs };
+    let dir = ws.out_dir().join("conform").join(game);
+    std::fs::create_dir_all(&dir)?;
     let side = |wasm: &str, io: bool| -> Result<Side> {
-        let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), ..Default::default() };
+        let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, ..Default::default() };
         Ok(Side { c: Conform::new(&o, &ram, sp, exe.gp0, io)?, log: vec![] })
     };
     let mut a = side(&adapters, false)?;
     let mut o = side(&original, true)?;
+    eprintln!("conform: adapter side ({adapters})");
     let ra = scenario(&ctx, &mut a, frames);
+    eprintln!("conform: original side ({original})");
     let ro = scenario(&ctx, &mut o, frames);
     if let Err(e) = &ra {
         eprintln!("conform: the adapter side failed: {e:#}");
@@ -145,6 +161,7 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     if let Err(e) = &ro {
         eprintln!("conform: the original side failed: {e:#}");
     }
+    let (a, o) = (a.finish(&dir, "adapter")?, o.finish(&dir, "original")?);
     let diffs: Vec<(Observation, Observation)> =
         a.log.iter().zip(&o.log).filter(|(x, y)| x != y).take(16).map(|(x, y)| (x.clone(), y.clone())).collect();
     let pass = ra.is_ok() && ro.is_ok() && diffs.is_empty() && a.log.len() == o.log.len();
@@ -161,8 +178,6 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         adapter_log: a.log,
         original_log: o.log,
     };
-    let dir = ws.out_dir().join("conform").join(game);
-    std::fs::create_dir_all(&dir)?;
     let json = dir.join(format!("{lib}.json"));
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
     println!("conform {game} {lib}: {} ({} steps; {})", if pass { "PASS" } else { "FAIL" }, report.steps, json.display());

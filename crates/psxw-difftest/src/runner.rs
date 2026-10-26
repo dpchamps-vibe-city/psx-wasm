@@ -208,7 +208,17 @@ impl Harness {
     }
 
     /// Run one side: seed the scratch arena and stack arguments, call `f`.
-    pub fn run(&mut self, f: &TypedFunc<(i32, i32, i32, i32), i64>, seed: u64, args: [u32; 4], scratch: &[u8], stack_args: &[u32; 8]) -> Run {
+    /// Run `f` with `fuel` scaled by `fuel_scale` (translated code spends
+    /// more wasm instructions per guest instruction than compiled C).
+    pub fn run(
+        &mut self,
+        f: &TypedFunc<(i32, i32, i32, i32), i64>,
+        seed: u64,
+        args: [u32; 4],
+        scratch: &[u8],
+        stack_args: &[u32; 8],
+        fuel_scale: u64,
+    ) -> Run {
         let data = self.memory.data_mut(&mut self.store);
         let map = DIRTY_MAP as usize;
         data[map..map + PAGES].fill(0);
@@ -222,7 +232,7 @@ impl Harness {
         st.seed = seed;
         st.log.clear();
         let _ = self.sp.set(&mut self.store, wasmtime::Val::I32(STACK_TOP as i32));
-        let _ = self.store.set_fuel(self.fuel);
+        let _ = self.store.set_fuel(self.fuel * fuel_scale);
         let r = f.call(&mut self.store, (args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32));
         let outcome = match r {
             Ok(v) => Outcome::Returned(v as u64),

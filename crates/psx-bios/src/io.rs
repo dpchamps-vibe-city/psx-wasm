@@ -25,6 +25,19 @@ pub struct Io {
     pub sio0: Sio0,
     /// Memory-control words written, by address.
     pub memctrl: BTreeMap<u32, u32>,
+    /// The last [`RECENT`] accesses: (cycle, address, size, value, write).
+    pub recent: std::collections::VecDeque<(u64, u32, u32, u32, bool)>,
+}
+
+pub const RECENT: usize = 256;
+
+impl Io {
+    fn note(&mut self, now: u64, addr: u32, size: u32, v: u32, write: bool) {
+        if self.recent.len() == RECENT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((now, addr, size, v, write));
+    }
 }
 
 impl<S: Sdk> Machine<S> {
@@ -53,7 +66,11 @@ impl<S: Sdk> Machine<S> {
         } else {
             return Err(format!("read of unmodelled I/O register {addr:#010x} ({size} bytes)"));
         };
-        Ok(v & mask(size))
+        let v = v & mask(size);
+        if let Some(io) = self.io.as_mut() {
+            io.note(now, addr, size, v, false);
+        }
+        Ok(v)
     }
 
     /// Write `size` bytes of `v` to the register at `addr` (physical).
@@ -63,6 +80,7 @@ impl<S: Sdk> Machine<S> {
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
         io.sio0.update(now, &mut io.irq);
         let v = v & mask(size);
+        io.note(now, addr, size, v, true);
         if Irq::handles(addr) {
             io.irq.write(addr, size, v);
         } else if Sio0::handles(addr) {

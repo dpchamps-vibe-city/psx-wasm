@@ -284,10 +284,12 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         .arg(psxw_abi::guest::MODULE)
         .arg(&runtime_path)
         .arg(psxw_abi::psx::MODULE)
+        .arg("-g")
         .arg("-o")
         .arg(&merged))?;
     eprintln!("build: optimizing");
-    run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg("-O2").arg(&merged).arg("-o").arg(&game))?;
+    // `-g` keeps function names, so trap backtraces name guest functions.
+    run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg("-O2").arg("-g").arg(&merged).arg("-o").arg(&game))?;
     let bytes = std::fs::read(&game)?;
     validate(&bytes).context("game.wasm fails validation")?;
     check_abi(&bytes)?;

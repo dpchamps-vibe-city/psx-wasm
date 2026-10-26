@@ -38,6 +38,9 @@ pub struct Options {
     pub verbose: bool,
     /// Overlay images whose residency is checked at every vblank.
     pub overlays: Vec<Overlay>,
+    /// Wall-clock seconds a conformance call may run before it traps
+    /// (a runaway guest loop); 0 = no limit.
+    pub deadline_secs: u64,
 }
 
 /// An overlay's original text, by guest address.
@@ -100,6 +103,31 @@ struct State {
     /// Frame since which an overlay's first words are in RAM without the
     /// rest matching (a load in progress, or a bad load).
     partial_since: Vec<Option<u64>>,
+}
+
+impl State {
+    fn new(opts: &Options, disc: Option<Disc>) -> Self {
+        State {
+            disc,
+            opts: opts.clone(),
+            frame: 0,
+            logs: vec![],
+            events: vec![],
+            hashes: BTreeMap::new(),
+            trace: vec![],
+            boot: None,
+            boot_ok: None,
+            stop: None,
+            dumps: vec![],
+            counter_done: vec![false; opts.dump_counter.len()],
+            resident: vec![false; opts.overlays.len()],
+            partial_since: vec![None; opts.overlays.len()],
+        }
+    }
+
+    fn empty() -> Self {
+        State::new(&Options::default(), None)
+    }
 }
 
 /// A partial overlay older than this many frames is a bad load: longer
@@ -193,7 +221,8 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
 }
 
 fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasmtime::Instance)> {
-    let config = Config::new();
+    let mut config = Config::new();
+    config.epoch_interruption(opts.deadline_secs > 0);
     let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, &opts.wasm).map_err(|e| anyhow::anyhow!("loading {}: {e}", opts.wasm.display()))?;
     let mut linker: Linker<State> = Linker::new(&engine);
@@ -383,23 +412,12 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         c.data_mut().events.push(v);
     })?;
 
-    let state = State {
-        disc,
-        opts: opts.clone(),
-        frame: 0,
-        logs: vec![],
-        events: vec![],
-        hashes: BTreeMap::new(),
-        trace: vec![],
-        boot: None,
-        boot_ok: None,
-        stop: None,
-        dumps: vec![],
-        counter_done: vec![false; opts.dump_counter.len()],
-        resident: vec![false; opts.overlays.len()],
-        partial_since: vec![None; opts.overlays.len()],
-    };
+    let state = State::new(opts, disc);
     let mut store = Store::new(&engine, state);
+    if opts.deadline_secs > 0 {
+        // Armed per call by `Conform`; nothing traps before that.
+        store.set_epoch_deadline(1 << 40);
+    }
     let instance = linker.instantiate(&mut store, &module)?;
     let version = instance.get_typed_func::<(), u32>(&mut store, psxw_abi::exports::ABI_VERSION)?.call(&mut store, ())?;
     if version != psxw_abi::ABI_VERSION {
@@ -415,6 +433,17 @@ pub struct Conform {
     store: Store<State>,
     instance: wasmtime::Instance,
     memory: Memory,
+    deadline: u64,
+    /// Ticks the engine's epoch once a second while the run lives.
+    ticker: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for Conform {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.ticker {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl Conform {
@@ -434,17 +463,36 @@ impl Conform {
         let ptr = boot_options(&mut store, &instance, &opts)?;
         let init = instance.get_typed_func::<(u32, u32, u32, u32), ()>(&mut store, psxw_abi::exports::CONFORM_INIT)?;
         init.call(&mut store, (ptr, sp, gp, io as u32))?;
-        Ok(Conform { store, instance, memory })
+        let ticker = (opts.deadline_secs > 0).then(|| {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (engine, flag) = (store.engine().clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    engine.increment_epoch();
+                }
+            });
+            stop
+        });
+        Ok(Conform { store, instance, memory, deadline: opts.deadline_secs, ticker })
+    }
+
+    fn arm(&mut self) {
+        if self.deadline > 0 {
+            self.store.set_epoch_deadline(self.deadline);
+        }
     }
 
     /// Calls the guest function at `addr`; a trap is an error naming it.
     pub fn call(&mut self, addr: u32, args: [u32; 4]) -> Result<u64> {
         let f = self.instance.get_typed_func::<(u32, u32, u32, u32, u32), u64>(&mut self.store, psxw_abi::exports::CALL)?;
+        self.arm();
         f.call(&mut self.store, (addr, args[0], args[1], args[2], args[3])).map_err(|e| anyhow::anyhow!("call {addr:#010x}: {:?}", stop_of(e)))
     }
 
     pub fn run_vblanks(&mut self, n: u32) -> Result<()> {
         let f = self.instance.get_typed_func::<u32, ()>(&mut self.store, psxw_abi::exports::RUN_VBLANKS)?;
+        self.arm();
         f.call(&mut self.store, n).map_err(|e| anyhow::anyhow!("run_vblanks: {:?}", stop_of(e)))
     }
 
@@ -464,7 +512,11 @@ impl Conform {
     }
 
     /// Ends the run: its report (counters, logs).
-    pub fn finish(self) -> RunReport {
-        finish(self.store, &self.instance, Stop::Exited)
+    pub fn finish(mut self) -> RunReport {
+        if self.deadline > 0 {
+            self.store.set_epoch_deadline(1 << 40);
+        }
+        let store = std::mem::replace(&mut self.store, Store::new(&Engine::default(), State::empty()));
+        finish(store, &self.instance, Stop::Exited)
     }
 }

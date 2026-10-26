@@ -125,7 +125,7 @@ fn run(words: &[u32], args: [u32; 4], data: &[u8]) -> Option<Run> {
     );
     let program = Program {
         main: "test".into(),
-        containers: [("test".to_string(), Code { id: "test".into(), text: vec![text.clone()], starts })].into(),
+        containers: [("test".to_string(), Code { id: "test".into(), text: vec![text.clone()], data: vec![], starts })].into(),
     };
     let originals = Originals::from_images(vec![("test".into(), BASE, code.clone())]);
     let func = program.functions("test").remove(0);
@@ -156,7 +156,7 @@ fn run(words: &[u32], args: [u32; 4], data: &[u8]) -> Option<Run> {
     wasmparser::Validator::new().validate_all(&linked.wasm).expect("valid module");
     let mut h = Harness::new(&linked.wasm, &[(BASE, &code), (DATA, data)], BTreeMap::new(), 1_000_000).expect("instantiates");
     let f = h.func("t").expect("export");
-    let r = h.run(&f, 1, args, &[], &[0; 8]);
+    let r = h.run(&f, 1, args, &[], &[0; 8], 1);
     Some(Run { outcome: r.outcome, log: r.log, h })
 }
 

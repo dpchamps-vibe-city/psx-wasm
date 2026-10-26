@@ -5,7 +5,8 @@
 //! condition (or a jump's target) is read before its delay slot runs. A
 //! load whose next instruction reads the loaded register is emitted with
 //! that instruction inlined after it, reading the old value: the R3000 load
-//! delay.
+//! delay. Loop heads carry a compiler memory barrier, so every iteration
+//! performs its loads as the original does.
 
 use crate::analysis::Facts;
 use crate::decode::{Insn, Op, disasm};
@@ -108,7 +109,13 @@ impl<'a> Emitter<'a> {
         let pc = n.pc();
         let insn = self.g.nodes[&n].insn;
         if label {
-            let _ = writeln!(self.body, "L_{pc:08X}:;");
+            // A loop head: the original re-reads memory every iteration,
+            // and interrupt handlers and callbacks (run at safepoints the
+            // linker adds later) can change it, so clang must not keep
+            // loads in registers across iterations.
+            let head = self.preds.get(&n).is_some_and(|ps| ps.iter().any(|p| p.pc() >= pc));
+            let barrier = if head { " __asm__ __volatile__(\"\" ::: \"memory\");" } else { "" };
+            let _ = writeln!(self.body, "L_{pc:08X}:;{barrier}");
         }
         if insn.op.has_delay_slot() {
             return self.group(pc, &ov);

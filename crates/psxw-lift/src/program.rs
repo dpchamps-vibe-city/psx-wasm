@@ -30,6 +30,9 @@ pub enum Source {
     CallTarget,
     /// A code address materialized in a register (function pointer).
     CodePointer,
+    /// A word of initialized data pointing at the first instruction of
+    /// code no known function reaches (a function table entry).
+    DataPointer,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,6 +49,9 @@ pub struct Start {
 pub struct Code {
     pub id: String,
     pub text: Vec<Range<u32>>,
+    /// The container's loaded bytes outside its text (initialized and
+    /// read-only data), in guest addresses.
+    pub data: Vec<Range<u32>>,
     pub starts: BTreeMap<u32, Start>,
 }
 
@@ -85,7 +91,23 @@ impl Program {
     pub fn from_map(map: &AddressMap) -> Self {
         let mut containers = BTreeMap::new();
         for c in &map.containers {
-            let mut code = Code { id: c.id.clone(), text: c.text.clone(), starts: BTreeMap::new() };
+            let mut data = Vec::new();
+            for (file, vram) in &c.segments {
+                let seg = *vram..vram + (file.end - file.start);
+                let mut cuts: Vec<&Range<u32>> = c.text.iter().filter(|t| t.start < seg.end && seg.start < t.end).collect();
+                cuts.sort_by_key(|t| t.start);
+                let mut at = seg.start;
+                for t in cuts {
+                    if t.start > at {
+                        data.push(at..t.start);
+                    }
+                    at = at.max(t.end);
+                }
+                if at < seg.end {
+                    data.push(at..seg.end);
+                }
+            }
+            let mut code = Code { id: c.id.clone(), text: c.text.clone(), data, starts: BTreeMap::new() };
             for &a in &c.text_starts {
                 code.add(a, None, None, Source::Subsegment, true);
             }
@@ -219,7 +241,7 @@ mod tests {
     use super::*;
 
     fn program(starts: &[(u32, Option<u32>)]) -> Program {
-        let mut code = Code { id: "exe".into(), text: vec![0x8001_0000..0x8001_0100], starts: BTreeMap::new() };
+        let mut code = Code { id: "exe".into(), text: vec![0x8001_0000..0x8001_0100], data: vec![], starts: BTreeMap::new() };
         for &(a, size) in starts {
             code.add(a, None, size, Source::Symbol, true);
         }

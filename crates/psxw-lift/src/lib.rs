@@ -91,6 +91,53 @@ pub struct Outcome {
     pub inline_reasons: BTreeMap<(String, u32), String>,
 }
 
+/// Function tables in initialized data: words pointing at the first
+/// instruction of code nothing reaches yet, past only nops from reachable
+/// code or the start of a text range. (Jump-table entries point at
+/// reachable labels; chance data rarely lands exactly on a gap's start.)
+fn data_pointers(
+    program: &Program,
+    originals: &Originals,
+    reach: &BTreeMap<(String, u32), BTreeSet<u32>>,
+) -> BTreeSet<(String, u32)> {
+    let mut reachable: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
+    for ((c, _), pcs) in reach {
+        reachable.entry(c.as_str()).or_default().extend(pcs);
+    }
+    let empty = BTreeSet::new();
+    let mut out = BTreeSet::new();
+    for (id, code) in &program.containers {
+        for r in &code.data {
+            let mut a = (r.start + 3) & !3;
+            while a + 4 <= r.end {
+                let w = originals.word(id, a);
+                a += 4;
+                let Some(w) = w else { continue };
+                let Some(Located::Code(tc)) = program.locate(id, w) else { continue };
+                let Some(target) = program.code(&tc) else { continue };
+                let seen = reachable.get(tc.as_str()).unwrap_or(&empty);
+                if target.starts.contains_key(&w) || seen.contains(&w) || originals.word(&tc, w).is_none_or(|i| i == 0) {
+                    continue;
+                }
+                let mut p = w;
+                let gap_start = loop {
+                    if target.text.iter().any(|t| t.start == p) || seen.contains(&(p - 4)) {
+                        break true;
+                    }
+                    if originals.word(&tc, p - 4) != Some(0) {
+                        break false;
+                    }
+                    p -= 4;
+                };
+                if gap_start {
+                    out.insert((tc, w));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Translate to a fixed point over function starts and inline functions.
 ///
 /// A function with no C is inlined at its call sites (and fall-throughs)
@@ -130,6 +177,9 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
                     wanted.insert((c, a, Source::CodePointer));
                 }
             }
+        }
+        for (c, a) in data_pointers(program, originals, &reach) {
+            wanted.insert((c, a, Source::DataPointer));
         }
         let mut added = false;
         for (c, a, source) in wanted {

@@ -397,13 +397,20 @@ pub extern "C" fn psxw_report() {
         let m = unsafe { &*rt.m.as_ptr() };
         let counts: Vec<String> = m.counts.iter().map(|(k, v)| format!("{k:?}:{v}")).collect();
         let errors: Vec<String> = m.sdk.cd.edc_errors.iter().map(|e| format!("{e:?}")).collect();
+        let io: Vec<String> = m
+            .io
+            .iter()
+            .flat_map(|io| io.recent.iter())
+            .map(|(t, a, n, v, w)| format!("\"{t} {} {a:08x}/{n} {v:#x}\"", if *w { "W" } else { "R" }))
+            .collect();
         format!(
-            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"edc_errors\":[{}],\"counts\":{{{}}}}}",
+            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}]}}",
             m.vblanks,
             m.clock.now,
             m.sdk.cd.sectors,
             errors.join(","),
-            counts.join(",")
+            counts.join(","),
+            io.join(",")
         )
     });
     report(json);
