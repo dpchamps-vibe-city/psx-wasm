@@ -287,7 +287,8 @@ golden.
     `psxw-gpu-oracle`'s present test in the pinned image.
 - **2026-10-26** (`dac9bb6`): three generators exercising the plumbing
   rather than one feature: `mix` (20–60 primitives of every kind per
-  vector), `clut-many` (more colour-table reloads in one batch than there
+  vector, with fills, copies, uploads and state changes between them),
+  `clut-many` (more colour-table reloads in one batch than there
   are slots), `batch-big` (more primitives in one batch than one draw
   call holds); example `gpubisect`. Results:
   - `psxw oracle check btn --device gpu`: **2,493 vectors: 1,050
@@ -295,7 +296,8 @@ golden.
     generators), 0 unresolved, 0 failed.**
   - Soak: seed `0x50ac08` over all 36 generators (5,400 vectors), plus
     400 `mix`, 100 `clut-many` and 100 `batch-big` vectors from seeds
-    `0x50ac05`–`07`: 0 differ.
+    `0x50ac05`–`07`, and 600 `mix` vectors (with copies and uploads) from
+    `0x50ac09`: 0 differ.
 
 ## Findings
 
@@ -304,7 +306,7 @@ golden.
 - **Commands:** `psxw oracle selftest`, `psxw oracle capture --missing`,
   `psxw oracle check btn --device gpu` (counts in the Progress log). The
   gpu device builds its image and the render server on first use; the
-  whole check of 2,493 vectors takes about 3–4 s. In all, 40,650 soak
+  whole check of 2,493 vectors takes about 3–4 s. In all, 41,250 soak
   vectors (not archived) also match.
 - **Throughput** (`cargo run --release -p psxw-gpu-oracle --example
   gpubench`, Mesa llvmpipe in Docker, 3 repetitions):

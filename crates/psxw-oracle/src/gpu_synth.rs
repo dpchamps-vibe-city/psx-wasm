@@ -1016,10 +1016,28 @@ fn build(name: &str, i: usize, b: &mut B) -> Result<()> {
             for _ in 0..b.r(20, 60) {
                 let t = if b.coin() { t1 } else { t2 };
                 let semi = 2 * b.rng.below(2);
-                let p = match b.rng.below(8) {
+                let p = match b.rng.below(10) {
                     0 => {
                         let op = b.pick(&[0x20, 0x28, 0x30, 0x38]) | semi;
                         polygon(b, op, local(&d, 8), None)
+                    }
+                    8 => {
+                        // A copy within the destination (possibly
+                        // overlapping), reading what was just drawn.
+                        let (w, h) = (b.r(1, 40) as u32, b.r(1, 24) as u32);
+                        let mut at = || (d.x as u32 + b.rng.below(d.w as u32 - w + 1), d.y as u32 + b.rng.below(d.h as u32 - h + 1));
+                        let ((sx, sy), (dx, dy)) = (at(), at());
+                        vec![0x8000_0000, sy << 16 | sx, dy << 16 | dx, h << 16 | w]
+                    }
+                    9 => {
+                        // A small CPU→VRAM transfer within the destination.
+                        let (w, h) = (b.r(1, 6) as u32, b.r(1, 4) as u32);
+                        let (x, y) = (d.x as u32 + b.rng.below(d.w as u32 - w + 1), d.y as u32 + b.rng.below(d.h as u32 - h + 1));
+                        let mut words = vec![0xA000_0000, y << 16 | x, h << 16 | w];
+                        for _ in 0..(w * h).div_ceil(2) {
+                            words.push(b.rng.next_u64() as u32);
+                        }
+                        words
                     }
                     1 | 2 => {
                         let op = b.pick(&[0x24, 0x25, 0x2C, 0x2D, 0x34, 0x3C]) | semi;
