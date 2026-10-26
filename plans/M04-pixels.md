@@ -314,6 +314,31 @@ golden.
 
 ## Findings
 
+### libetc: why its adapters stay, and what conformance needs
+
+The adapters for libetc's interrupt layer stay (task 8): its original
+code can't run over the devices the way libpad does (D40).
+- **The pattern.** `ResetCallback`'s implementation (btn `0x80032F28`)
+  clears I_MASK and DMA DICR, then `setjmp`s a buffer. It installs that
+  buffer as the BIOS's custom exception exit (`HookEntryInt`, B0h:19h)
+  and starts its VSync and DMA handlers.
+- **On an interrupt** the BIOS longjmps into it. `setjmp` returns 1, and
+  the code calls libetc's dispatcher (btn `0x80033000`), which ends in
+  `ReturnFromException`.
+- **Why translated code can't follow.** It can't resume after a `setjmp`
+  with `v0 = 1`, nor abandon the dispatcher at `ReturnFromException`.
+  Returning normally would re-run the rest of `ResetCallback`.
+- **What it would take** is wasm exception handling:
+  - the link lowers a constant `B0h:17h` call to `throw`;
+  - the runtime's interrupt entry catches it;
+  - `setjmp` call sites get continuation entries that take `v0` and
+    restore the saved registers.
+
+  libetc could then run as a device library too, given DMA and GPUSTAT
+  on the bus.
+- **Until then**, the libetc adapters are checked by their unit tests
+  against psyq-decomp's code, and by the whole-game RAM oracle (task 11).
+
 ### Where psx-spx is open, and what the device oracle settled
 
 psx-gte implements psx-spx. Where its text is ambiguous, the emulator
