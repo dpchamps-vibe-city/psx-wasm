@@ -566,6 +566,21 @@ impl Renderer {
         Some(Frame { width: w, height: h, rgba: top_first })
     }
 
+    /// Scale the last presented frame into the default framebuffer (a
+    /// window's or a canvas's) of `w`×`h`; false before the first frame.
+    pub fn blit_to_screen(&mut self, w: u32, h: u32) -> bool {
+        let Some((_, fbo, fw, fh)) = self.out else { return false };
+        unsafe {
+            let gl = &self.gl;
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            gl.viewport(0, 0, w as i32, h as i32);
+            gl.blit_framebuffer(0, 0, fw as i32, fh as i32, 0, 0, w as i32, h as i32, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        true
+    }
+
     /// The last PRESENT's description.
     pub fn last_present(&self) -> Option<PresentDesc> {
         self.last_present

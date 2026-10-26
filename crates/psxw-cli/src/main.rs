@@ -18,6 +18,7 @@
 //! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose]
 //!                                       M2: run game.wasm headless
 //! psxw identity <game>                 M8: SDK object identity report
+//! psxw build-web <game>; psxw serve [dir] [--port N]   M5: the browser bundle
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! ```
 
@@ -28,6 +29,7 @@ mod ci;
 mod run;
 mod conform;
 mod render;
+mod serve;
 mod oracle;
 mod wholegame;
 
@@ -177,6 +179,22 @@ fn run() -> Result<()> {
                 println!("{:<14} size {:>3}, {} fields ({})", s.name, s.size, s.fields.len(), s.header);
             }
             eprintln!("wrote {}", out.display());
+        }
+        ["build-web", game] => {
+            let dir = psxw_build::web::build(&ws, game)?;
+            eprintln!("web bundle: {} (serve it with `psxw serve {}`)", dir.display(), dir.display());
+        }
+        ["serve", rest @ ..] => {
+            let mut root = ws.out_dir().join("web");
+            let mut port = 8080u16;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "--port" => port = it.next().context("--port needs a value")?.parse()?,
+                    dir => root = dir.into(),
+                }
+            }
+            serve::serve(root, port)?;
         }
         ["identity", game] => {
             let inputs = psxw_lift::run::load(&ws, game)?;

@@ -16,6 +16,13 @@ dist = "binaryen-version_133"
 url = "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz"
 sha256 = "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489"
 
+[toolchain.wasm-bindgen]
+# The wasm-bindgen CLI, the same version as the wasm-bindgen crate in
+# Cargo.lock (glow's web backend); generates the browser host's JS glue.
+dist = "wasm-bindgen-0.2.129-x86_64-unknown-linux-musl"
+url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/wasm-bindgen-0.2.129-x86_64-unknown-linux-musl.tar.gz"
+sha256 = "82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e"
+
 [toolchain.psyq-signatures]
 # PsyQ object signatures per SDK version (lab313ru/psx_psyq_signatures at
 # e9e46e7): byte patterns with relocated bytes masked, plus function

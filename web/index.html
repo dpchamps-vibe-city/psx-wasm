@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>psx-wasm</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #f4f4f2; --fg: #1d1d1f; --muted: #6b6b70; --panel: #ffffff; --line: #d8d8dc; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #111113; --fg: #ececee; --muted: #9a9aa0; --panel: #1b1b1e; --line: #2c2c31; } }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+    main { max-width: 980px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; }
+    canvas { width: 100%; aspect-ratio: 4 / 3; background: #000; image-rendering: pixelated; border-radius: 6px; }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    #status { color: var(--muted); font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; }
+    button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main>
+    <canvas id="screen" width="640" height="480"></canvas>
+    <section>
+      <label>Disc (.cue and its .bin files) <input id="disc" type="file" multiple accept=".cue,.bin"></label>
+      <label><input id="instant" type="checkbox"> Instant CD loading</label>
+      <button id="start" disabled>Start</button>
+    </section>
+    <div id="status">Import a disc. It is copied into this browser's private storage (OPFS) and never leaves it.</div>
+  </main>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
