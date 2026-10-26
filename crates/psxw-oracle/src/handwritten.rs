@@ -27,13 +27,14 @@ pub fn all(store: &Store) -> Result<Vec<Handwritten>> {
     Ok(v)
 }
 
-/// Store every handwritten vector and add them to the `handwritten` set.
+/// Store every handwritten vector and make them the `handwritten` set (a
+/// vector that changed leaves it).
 pub fn install(store: &Store) -> Result<Vec<(VectorId, &'static str)>> {
     let mut ids = Vec::new();
     for h in all(store)? {
         ids.push((store.put_vector(&h.vector)?, h.name));
     }
-    store.add_to_set(SET, ids.iter().map(|(id, _)| *id))?;
+    store.replace_set(SET, ids.iter().map(|(id, _)| *id))?;
     Ok(ids)
 }
 
@@ -163,18 +164,34 @@ fn spu(store: &Store) -> Result<Vec<Handwritten>> {
     let mut noise = writes.clone();
     writes.push(SpuWrite { sample: 2, reg: 0x188, value: 0x000A }); // KON voices 1, 3
     writes.push(SpuWrite { sample: 400, reg: 0x18C, value: 0x000A }); // KOFF
+    // Voice 3 plays noise. The noise generator's state carries over from
+    // whatever ran before (nothing resets it), so its output is never
+    // observed: the vector captures voice 1 only, which plays its square
+    // from sample 300 (every capture-buffer entry the readback can see was
+    // written during the run) and is cut to silence before the readback
+    // (the entries the readback races with read the same either way).
+    // Voice 3's envelope and ENDX, in the register snapshot, do not depend
+    // on the noise.
     noise.push(SpuWrite { sample: 1, reg: 0x1AA, value: 0xC000 | 0x0A << 8 }); // noise clock
     noise.push(SpuWrite { sample: 1, reg: 0x194, value: 0x0008 }); // NON: voice 3 plays noise
-    noise.push(SpuWrite { sample: 2, reg: 0x188, value: 0x000A });
+    noise.push(SpuWrite { sample: 300, reg: 0x188, value: 0x000A });
+    for (off, value) in [(0x8, 0x7F00), (0xA, 0x1FC0), (0xC, 0x0000)] {
+        noise.push(SpuWrite { sample: 650, reg: 0x10 + off, value }); // voice 1 cut: no envelope, level 0
+    }
     let captures = vec![(0x0000, 0x1000), (addr, 0x40)];
     Ok(vec![
         Handwritten {
             name: "spu_square_voices_1_3",
-            vector: Vector::SpuRun(SpuRun { ram: vec![SpuRam { addr, bytes: sample }], writes, samples: 512, captures: captures.clone() }),
+            vector: Vector::SpuRun(SpuRun { ram: vec![SpuRam { addr, bytes: sample }], writes, samples: 512, captures }),
         },
         Handwritten {
             name: "spu_noise_voice_3",
-            vector: Vector::SpuRun(SpuRun { ram: vec![SpuRam { addr, bytes: sample }], writes: noise, samples: 300, captures }),
+            vector: Vector::SpuRun(SpuRun {
+                ram: vec![SpuRam { addr, bytes: sample }],
+                writes: noise,
+                samples: 700,
+                captures: vec![(0x0800, 0x400), (addr, 0x40)],
+            }),
         },
     ])
 }

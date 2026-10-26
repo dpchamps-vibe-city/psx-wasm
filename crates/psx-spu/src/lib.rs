@@ -248,9 +248,11 @@ impl Spu {
     }
 
     /// Note an SPU RAM access at byte `addr` for the IRQ address.
+    /// oracle: only an access to the exact halfword at the IRQ address
+    /// triggers (a capture write one halfword later does not).
     fn touch(&mut self, addr: u32) {
         let c = self.cnt();
-        if c & cnt::IRQ_ENABLE != 0 && c & cnt::ENABLE != 0 && (addr & !7) == (self.raw(reg::IRQA) as u32) << 3 {
+        if c & cnt::IRQ_ENABLE != 0 && c & cnt::ENABLE != 0 && (addr & !1) == (self.raw(reg::IRQA) as u32) << 3 {
             self.irq_flag = true;
         }
     }
@@ -661,6 +663,16 @@ impl Spu {
                 self.key_on(vi);
             }
         }
+        // oracle: with the SPU disabled, every voice is silenced for good
+        // after this tick (level zero, in release; re-enabling does not
+        // bring it back).
+        if self.cnt() & cnt::ENABLE == 0 {
+            for v in self.voices.iter_mut() {
+                v.envx = 0;
+                v.phase = Phase::Release;
+                v.env_counter = 0;
+            }
+        }
         for vi in 0..VOICES {
             // oracle: a key off on a releasing voice changes nothing (its step
             // counter runs on).
@@ -693,7 +705,7 @@ impl Spu {
             }
         }
 
-        let (wl, wr) = reverb::Reverb::step(self, clamp16(rl), clamp16(rr));
+        let (wl, wr) = reverb::Reverb::step(self, idx, clamp16(rl), clamp16(rr));
         l += wl;
         r += wr;
 

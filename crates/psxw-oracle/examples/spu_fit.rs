@@ -54,6 +54,8 @@ fn main() -> Result<()> {
     let mut dump: Option<std::path::PathBuf> = None;
     let mut export: Option<std::path::PathBuf> = None;
     let mut limit = usize::MAX;
+    let mut export_all = false;
+    let mut only: Option<String> = None;
     let mut sources = Vec::new();
     while !args.is_empty() {
         let a = args.remove(0);
@@ -63,6 +65,11 @@ fn main() -> Result<()> {
             "--detail" => detail = true,
             "--dump" => dump = Some(args.remove(0).into()),
             "--export" => export = Some(args.remove(0).into()),
+            "--export-all" => {
+                export = Some(args.remove(0).into());
+                export_all = true;
+            }
+            "--only" => only = Some(args.remove(0)),
             "--limit" => limit = args.remove(0).parse()?,
             "--set" => sources.push((true, args.remove(0))),
             _ => sources.push((false, a)),
@@ -99,7 +106,10 @@ fn main() -> Result<()> {
             std::fs::write(d.join(format!("{i}.res")), &got)?;
         }
         total += 1;
-        if got == *want {
+        if only.as_ref().is_some_and(|o| !label.contains(o.as_str())) {
+            continue;
+        }
+        if got == *want && !export_all {
             continue;
         }
         bad += 1;

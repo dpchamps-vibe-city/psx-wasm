@@ -8,7 +8,9 @@
 //! - a captured voice is silent before its signal and cut to silence
 //!   before the readback ([`B::cut`]), so the entries the readback races
 //!   with the SPU's writes read the same either way;
-//! - SPU RAM a vector captures or plays from is RAM it wrote;
+//! - SPU RAM a vector captures, plays from or has the reverb unit read is
+//!   RAM it wrote, and a vector that turns reverb writes on sets ESA (which
+//!   resets the reverb's current address) first;
 //! - nothing depends on the noise generator's state (no register resets it)
 //!   or on registers SPU_RESET does not reset (1DA0h, 1DBCh, 1DBEh);
 //! - [`robust`] confirms the result does not change within the runner's
@@ -602,13 +604,17 @@ impl Gen<'_> {
             b.w(0, reg::SPUCNT, 0xC000);
             let size = self.pick(&[0x400u32, 0x800, 0x1000, 0x2000, 0x4000]);
             let base = 0x8_0000 - size;
-            let mut area = vec![0u8; size as usize];
+            // The work area, and the two sizes below it: offsets that wrap
+            // "negative" (dAPF above mAPF, [m-2] with m = 0) read there (see
+            // psx_spu's reverb addressing), so this RAM must be the
+            // vector's own too.
+            let mut area = vec![0u8; 3 * size as usize];
             if self.chance(2) {
                 for x in area.iter_mut() {
                     *x = self.rng.u16() as u8;
                 }
             }
-            b.ram(base, area);
+            b.ram(base - 2 * size, area);
             let units = (size / 8) as u16;
             let preset = PRESETS.iter().filter(|p| p.0 <= size).collect::<Vec<_>>();
             let regs: Vec<u16> = if !preset.is_empty() && self.chance(3) {
@@ -689,7 +695,8 @@ impl Gen<'_> {
                 b.captures.push((start, len));
             }
             if self.chance(4) {
-                b.captures.push((SAMPLES, 0x40));
+                // Voice 1's sample: RAM this vector wrote (at least 2 blocks).
+                b.captures.push((SAMPLES, 0x20));
             }
             self.keep(&b)?;
         }
@@ -728,6 +735,11 @@ impl Gen<'_> {
                 2 => (0x0200, self.int(20, n - 30)),
                 _ => (self.int(0, 0xFFFF), self.int(20, n - 30)),
             };
+            // The reverb unit reads its work area even while reverb is off;
+            // after SPU_RESET that is all of SPU RAM, at an address that
+            // depends on how long ago the reset was. Confine it to the last
+            // 16 bytes (writing ESA also resets the current address).
+            b.w(1, reg::ESA, 0xFFFE);
             b.w(1, reg::IRQA, irqa as u16);
             let enable = if self.chance(2) { hit.saturating_sub(self.int(0, 12)).max(2) } else { self.int(2, n - 4) };
             b.w(enable, reg::SPUCNT, 0xC040);
