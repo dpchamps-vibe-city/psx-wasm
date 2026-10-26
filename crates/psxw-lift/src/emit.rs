@@ -263,11 +263,20 @@ impl<'a> Emitter<'a> {
                 self.line("return ((uint64_t)r3 << 32) | r2;");
                 None
             }
-            Transfer::Table { base: _, targets, .. } | Transfer::InlineReturn { targets } => {
+            Transfer::Table { base: _, ref targets, .. } | Transfer::InlineReturn { ref targets } => {
+                let inline = matches!(slot.transfer, Transfer::InlineReturn { .. });
+                let targets = targets.clone();
                 self.line("switch (t_) {");
                 let set: BTreeSet<u32> = targets.into_iter().collect();
                 for t in set {
                     self.line(&format!("case 0x{t:08X}u: goto L_{t:08X};"));
+                }
+                // r31 starts at 0, standing for the caller's return
+                // address: a `jr ra` in code reached by a branch (a tail
+                // shared with another function) after `ra` was restored
+                // returns to the caller.
+                if inline {
+                    self.line("case 0x00000000u: return ((uint64_t)r3 << 32) | r2;");
                 }
                 self.line(&format!("default: psxw_bad_jump(0x{b:08X}u, t_);"));
                 self.line("}");

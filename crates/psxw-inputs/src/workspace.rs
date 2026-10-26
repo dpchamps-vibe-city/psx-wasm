@@ -39,6 +39,13 @@ impl Workspace {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// `games/<id>/replays/<name>.toml`, if there is one.
+    pub fn replay_spec(&self, id: &str, name: &str) -> Result<Option<crate::game::ReplaySpec>> {
+        let path = self.root.join("games").join(id).join("replays").join(format!("{name}.toml"));
+        let Ok(text) = std::fs::read_to_string(&path) else { return Ok(None) };
+        Ok(Some(toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?))
+    }
+
     pub fn game_pin(&self, manifest: &GameManifest) -> Result<&RepoPin> {
         self.lock
             .game

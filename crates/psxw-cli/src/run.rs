@@ -35,7 +35,7 @@ pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Ve
         match *a {
             "--headless" => {}
             "--frames" => o.frames = val()?.parse()?,
-            "--replay" => o.replay = Some(std::fs::read(val()?)?),
+            "--replay" => o.replay = Some(crate::wholegame::replay(ws, game, Some(&val()?))?.0),
             "--cd" => o.boot.cd_timing = if val()? == "instant" { 1 } else { 0 },
             "--hash-at" => o.hash_at = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             "--dump-at" => o.dump_at = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,

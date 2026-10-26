@@ -6,7 +6,9 @@
 //! psxw oracle ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--require-equal]
 //! ```
 //!
-//! Without `--replay`, the manifest's `[oracle.replay]` is used. Both sides
+//! `--replay R` takes a replay file or a named replay,
+//! `games/<game>/replays/R.toml` (the same press syntax as
+//! `[oracle.replay]`, which is used without `--replay`). Both sides
 //! trace the manifest's `[oracle] frame_counter` every frame; `ramdiff`
 //! dumps RAM on both at the same counter values (by default the counter at
 //! every 600th psx-wasm frame) and compares them by symbol.
@@ -28,24 +30,40 @@ fn list<T: std::str::FromStr>(s: Option<&&str>, what: &str) -> Result<Vec<T>> {
     s.split(',').map(|v| v.parse::<T>().map_err(|_| anyhow::anyhow!("{what}: bad value {v}"))).collect()
 }
 
-/// The replay to run: a file, or the manifest's.
-fn replay(ws: &Workspace, game: &str, path: Option<&str>) -> Result<(Vec<u8>, String)> {
-    if let Some(p) = path {
-        let bytes = std::fs::read(p).with_context(|| format!("reading {p}"))?;
-        ensure!(psxw_abi::replay::Header::parse(&bytes).is_some(), "{p} is not a replay");
-        return Ok((bytes, p.to_string()));
-    }
-    let manifest = ws.game(game)?;
-    let spec = manifest.oracle.replay.as_ref().with_context(|| format!("games/{game}/game.toml has no [oracle.replay]; pass --replay"))?;
+/// The replay to run: a replay file, a named replay
+/// (`games/<game>/replays/<name>.toml`), or the manifest's
+/// `[oracle.replay]`.
+pub fn replay(ws: &Workspace, game: &str, arg: Option<&str>) -> Result<(Vec<u8>, String)> {
+    let named = match arg {
+        Some(a) => match ws.replay_spec(game, a)? {
+            Some(spec) => Some((a.to_string(), spec)),
+            None => {
+                let bytes = std::fs::read(a).with_context(|| format!("{a} is neither a replay file nor games/{game}/replays/{a}.toml"))?;
+                ensure!(psxw_abi::replay::Header::parse(&bytes).is_some(), "{a} is not a replay");
+                return Ok((bytes, a.to_string()));
+            }
+        },
+        None => None,
+    };
+    let (name, spec) = match named {
+        Some(n) => n,
+        None => {
+            let manifest = ws.game(game)?;
+            let spec = manifest.oracle.replay.with_context(|| format!("games/{game}/game.toml has no [oracle.replay]; pass --replay"))?;
+            (String::new(), spec)
+        }
+    };
     // Presses are frame-counter values (the replay's clock), so both runs
     // see them at the same game state whatever their load times.
     let inputs = psxw_lift::run::load(ws, game)?;
     let clock = counter_addr(ws, game, &inputs)?;
-    let bytes = play::replay_from_presses(game, spec.frames, &spec.press, clock).map_err(|e| anyhow::anyhow!("[oracle.replay]: {e}"))?;
-    let path = ws.out_dir().join("oracle").join("replays").join(format!("{game}.rpl"));
+    let what = if name.is_empty() { "[oracle.replay]".to_string() } else { format!("replays/{name}.toml") };
+    let bytes = play::replay_from_presses(game, spec.frames, &spec.press, clock).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+    let file = if name.is_empty() { format!("{game}.rpl") } else { format!("{game}-{name}.rpl") };
+    let path = ws.out_dir().join("oracle").join("replays").join(file);
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(&path, &bytes)?;
-    Ok((bytes, format!("[oracle.replay] ({})", path.display())))
+    Ok((bytes, format!("{what} ({})", path.display())))
 }
 
 fn frames_of(replay: &[u8]) -> u64 {
