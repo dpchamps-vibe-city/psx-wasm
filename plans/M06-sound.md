@@ -35,6 +35,11 @@ The game sounds right, and every piece is checked against an oracle:
     running: provisional, refine here (and bump `RUNNER_VERSION`);
   - the Beetle option `spu_silent_voice` is forced off: on, it leaves SPU
     register state inexact.
+- From M4's Findings: SPU_RUN results depend on what ran before them in
+  the same emulator session. The handwritten `spu_noise_voice_3`
+  (`d61a8b7b…`) reproduces its golden alone, but differs (709 bytes) in a
+  full `capture` next to M4's 1,320 synthetic GPU vectors. Make SPU_RUN
+  independent of session history before trusting SPU goldens.
 - btn facts:
   - it reads the SPU's key status in 6 places;
   - it uses `SsSetTickMode` and `SsSeqCalledTbyT` (sequencer ticks from a
