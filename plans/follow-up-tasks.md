@@ -19,10 +19,14 @@ rewrite the `out/web/<game>/` bundle someone is serving.
   a full browser restart should clear it. If it recurs, the page could say
   so (restart, or check `chrome://gpu` / `about:support`).
 
-- **WebGL context loss in the real page.** The Worker now owns its
-  `OffscreenCanvas`. Its `webglcontextlost`/`restored` listeners only run
-  when the Worker returns to its event loop, which the game never lets it
-  do. `web-test gpu` covers recovery on its own canvas, not in the page.
+- **WebGL context loss in the real page.** With JSPI the game yields to
+  the Worker's event loop every vblank (`9fa7bfc`), so the
+  `webglcontextlost`/`restored` listeners can run now; recovery in the
+  page itself is still untested (`web-test gpu` uses its own canvas).
+- **Browsers without JSPI** (`WebAssembly.Suspending`) fall back to the
+  never-yielding Worker: Chromium leaks a frame a vblank there, and dev
+  mode always does (its JS trampolines can't be suspended). Chromium and
+  Firefox in the test image both have JSPI.
 
 ## Needs the human
 
@@ -67,6 +71,28 @@ differences.
   - `Vcount`.
 
 ## Gaps found along the way
+
+- **Interactions after the opening (talk, pick up, collide with NPCs,
+  the dog, weeds, stones):** reported broken while the opening event was
+  skipped. Recheck in the page now that it plays.
+- **`void` C that returns a value.** GCC compiles `void f(){ g(); }` and
+  `int f(){ return g(); }` identically, so a matching decomp can declare
+  `void` a function whose callers read its v0: btn's arrival-event
+  request (a `void` wrapper around an allocator) and the flashback's
+  opcode-82 handler (through the original's opcode table). The build now
+  translates such functions (`build.json` `void_results`, 62 in btn):
+  C callers declaring a result, translated callers reading v0, and
+  address-taken functions whose every exit leaves a callee's v0. Not
+  covered: a `void` function reached only by pointer whose v0 at return
+  is a temporary rather than a call's result; and the decomp's own
+  declarations, which upstream could fix.
+- **Emulator title-menu timing:** the menu appears about 10 counter steps
+  later on the emulator than natively, so a press recorded just after it
+  appears natively (`start-no-cutscene-interaction`, UP at 286) is lost
+  there. Loads also tick the counter differently (D48).
+- **Lifted SDK asm that reads temporaries on entry** (`_spu_pitch2note`
+  t1/t2, `func_80037470`/`94` t0–t2, `func_8003A2A4` t3): not inlined,
+  so their callers' values don't reach them. Audit each.
 
 - **Browser lag during loads.** Over a 60 s idle run, 495 (Chromium) and
   635 (Firefox) frames ended more than a period late, with frame-time

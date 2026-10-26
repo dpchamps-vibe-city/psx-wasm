@@ -585,4 +585,49 @@ mod tests {
         assert!(c(child).contains("r2 = psxw_chain_get()"), "{}", c(child));
         assert!(c(BASE).contains(&format!("(psxw_chain_set(r2), psxw_f_{child:08X}(r4, r5, r6, r7))")), "{}", c(BASE));
     }
+
+    /// A wrapper whose last act is a call returns that callee's v0, as a
+    /// dropped `return g();` does; writing v0 after the call doesn't.
+    #[test]
+    fn returns_callee_v0() {
+        const BASE: u32 = 0x8001_0000;
+        let callee = BASE + 0x40;
+        let jal = 0x0C00_0000 | (callee >> 2 & 0x03FF_FFFF);
+        let wrapper = |after: u32| -> Vec<u32> {
+            vec![
+                0x27BD_FFE8, // addiu sp, sp, -24
+                0xAFBF_0010, // sw ra, 16(sp)
+                jal,         // jal callee
+                0,           // nop
+                after,       // what follows the call
+                0x8FBF_0010, // lw ra, 16(sp)
+                0x03E0_0008, // jr ra
+                0x27BD_0018, // addiu sp, sp, 24
+            ]
+        };
+        for (after, expect) in [(0, true), (0x2402_0001 /* addiu v0, zero, 1 */, false)] {
+            let mut words = wrapper(after);
+            words.resize(0x10, 0);
+            words.extend([0x03E0_0008, 0x2402_0007]); // callee: jr ra; addiu v0, zero, 7
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let start = |size: u32| Start { name: None, size: Some(size), sources: [Source::Symbol].into(), boundary: true };
+            let mut program = Program {
+                main: "test".into(),
+                containers: [(
+                    "test".to_string(),
+                    Code {
+                        id: "test".into(),
+                        text: vec![BASE..BASE + code.len() as u32],
+                        data: vec![],
+                        starts: [(BASE, start(0x20)), (callee, start(8))].into(),
+                    },
+                )]
+                .into(),
+            };
+            let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
+            let out = translate_all(&mut program, &originals, &["test".into()]);
+            let t = out.ok.iter().find(|t| t.func.addr == BASE).expect("translated");
+            assert_eq!(t.facts.returns_callee_v0, expect, "after the call: {after:08X}");
+        }
+    }
 }

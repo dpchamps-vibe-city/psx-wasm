@@ -74,6 +74,9 @@ pub struct Report {
     /// themselves but have no adapter; none is reachable from guest code
     /// (that fails the build).
     pub hardware_unbound: Vec<String>,
+    /// Functions whose C is `void` but whose result C callers use: they
+    /// run translated (`void_results`).
+    pub void_results: Vec<String>,
     /// Functions per tier.
     pub tiers: BTreeMap<String, usize>,
     /// Per container and tier.
@@ -228,6 +231,11 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         }
     }
 
+    let void_used = void_results(&inputs.map, &inputs.originals, &link_inputs, &c_defs, &translations);
+    if !void_used.is_empty() {
+        eprintln!("build: {} void C functions whose result callers use run translated", void_used.len());
+    }
+
     // Tiers.
     let pinned: BTreeSet<&str> =
         inputs.manifest.tier.iter().filter(|(_, p)| p.tier == "lift").map(|(n, _)| n.as_str()).collect();
@@ -247,7 +255,9 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         }
         let tier = if let (Some(&id), true) = (adapter, object_ok) {
             Tier::Adapter(id)
-        } else if let (Some(&(input, func)), false) = (c_defs.get(&key), pinned.contains(t.func.name.as_str())) {
+        } else if let (Some(&(input, func)), false) =
+            (c_defs.get(&key), pinned.contains(t.func.name.as_str()) || void_used.contains(&key))
+        {
             debug_assert!(t.func.sources.contains(&Source::Defined));
             Tier::C { input, func }
         } else {
@@ -395,6 +405,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         commit,
         unvalidated_objects: unvalidated.into_iter().collect(),
         hardware_unbound: hardware.iter().map(|h| h.to_string()).collect(),
+        void_results: void_used.iter().map(|(c, a)| format!("{c} {a:#010x}")).collect(),
         tiers: counts,
         by_container,
         adapters: bound.into_iter().collect(),
@@ -477,6 +488,92 @@ impl std::fmt::Display for Unbound {
         let how = if self.reachable { "reachable" } else { "unreachable" };
         write!(f, "{} 0x{:08X} in {} ({}; {how})", self.name, self.addr, self.member, self.what)
     }
+}
+
+/// C functions defined `void` whose result a caller may read: C declaring
+/// it with a result, translated code reading v0 after calling it, or, for
+/// one whose address is taken (callers through function tables can't be
+/// seen), returning its last callee's v0. The original still returns that
+/// v0, and matching C keeps it, but clang's wasm can't. Such a function runs
+/// as its translation, which returns the original's v0.
+fn void_results(
+    map: &psxw_inputs::AddressMap,
+    originals: &psxw_inputs::originals::Originals,
+    link_inputs: &[Input],
+    c_defs: &BTreeMap<(String, u32), (usize, u32)>,
+    translations: &[psxw_lift::Translation],
+) -> BTreeSet<(String, u32)> {
+    let defined_void = |key: &(String, u32)| {
+        c_defs.get(key).is_some_and(|&(i, f)| {
+            let o = &link_inputs[i].obj;
+            o.types[o.funcs[f as usize].ty as usize].results.is_empty()
+        })
+    };
+    // Callers' uses as (caller's container, callee address).
+    let mut uses: Vec<(&str, u32)> = Vec::new();
+    for inp in link_inputs {
+        for s in inp.obj.symbols.iter().filter(|s| s.kind == SymbolKind::Function && !s.defined) {
+            let (Some(idx), NameClass::Guest(n)) = (s.index, classify_name(&s.name)) else { continue };
+            if inp.obj.func_type(idx).results.is_empty() {
+                continue;
+            }
+            if let Some(r) = map.resolve(&inp.container, n) {
+                uses.push((&inp.container, r.addr));
+            }
+        }
+    }
+    for t in translations.iter().filter(|t| !c_defs.contains_key(&(t.func.container.clone(), t.func.addr))) {
+        uses.extend(t.facts.result_uses.iter().map(|&a| (t.func.container.as_str(), a)));
+    }
+    // Function pointers reach C functions too, and nothing says whether
+    // their callers read v0. Addresses are taken in the original's data
+    // (function tables), as constants in translated code, or by C.
+    let mut taken: BTreeSet<u32> = BTreeSet::new();
+    for c in &map.containers {
+        if let Some(b) = originals.file(&c.id) {
+            taken.extend(b.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+        }
+    }
+    for t in translations {
+        taken.extend(&t.facts.code_consts);
+    }
+    for inp in link_inputs {
+        let o = &inp.obj;
+        let syms = o.data_relocs.iter().filter(|r| r.kind == psxw_link::object::RelocKind::TableIndexI32).map(|r| r.symbol).chain(
+            o.code_relocs
+                .iter()
+                .filter(|r| matches!(r.ty, wasmparser::RelocationType::TableIndexSleb | wasmparser::RelocationType::TableIndexI32))
+                .map(|r| r.symbol),
+        );
+        for i in syms {
+            if let Some(NameClass::Guest(n)) = o.symbols.get(i as usize).map(|s| classify_name(&s.name)) {
+                taken.extend(map.resolve(&inp.container, n).map(|r| r.addr));
+            }
+        }
+    }
+    // A void C function whose address is taken and whose every exit leaves
+    // its last callee's v0 (a dropped `return g();`, which GCC compiles
+    // identically) runs translated whoever calls it.
+    let mut out: BTreeSet<(String, u32)> = translations
+        .iter()
+        .filter(|t| t.facts.returns_callee_v0 && taken.contains(&t.func.addr))
+        .map(|t| (t.func.container.clone(), t.func.addr))
+        .filter(|k| defined_void(k))
+        .collect();
+    for (from, addr) in uses {
+        // The callee's home, as the linker finds it: the caller's own
+        // container, the main one, or any overlay holding the address.
+        let has = |c: &str| map.container(c).is_some_and(|k| k.text.iter().any(|t| t.contains(&addr)));
+        let homes: Vec<String> = if has(from) {
+            vec![from.to_string()]
+        } else if has(&map.main) {
+            vec![map.main.clone()]
+        } else {
+            map.containers.iter().filter(|c| has(&c.id)).map(|c| c.id.clone()).collect()
+        };
+        out.extend(homes.into_iter().map(|c| (c, addr)).filter(|k| defined_void(k)));
+    }
+    out
 }
 
 fn hardware_unbound(

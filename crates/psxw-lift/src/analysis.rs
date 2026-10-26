@@ -39,6 +39,11 @@ pub struct Facts {
     /// Calls after which a caller-saved register (other than v0/v1) is read
     /// before being written: (pc of the call, registers, direct callee).
     pub post_call_reads: Vec<(u32, u64, Option<u32>)>,
+    /// Direct callees whose result (v0) is read after a call to them.
+    pub result_uses: BTreeSet<u32>,
+    /// Every way out leaves v0 as a call set it: the function returns
+    /// what its last callee returned, whatever its C declares.
+    pub returns_callee_v0: bool,
     /// Loads whose next instruction reads the loaded register.
     pub hazards: BTreeMap<Node, u8>,
     /// Registers any instruction of the function writes.
@@ -54,7 +59,44 @@ pub fn analyze(g: &Graph, in_code: &dyn Fn(u32) -> bool) -> Facts {
     liveness(g, &mut f);
     hazards(g, &mut f);
     sites(g, &mut f);
+    f.returns_callee_v0 = returns_callee_v0(g);
     f
+}
+
+/// Forward over the graph: does v0 hold a callee's result on every exit
+/// (a return, or a tail call, which returns the callee's own)?
+fn returns_callee_v0(g: &Graph) -> bool {
+    use crate::graph::Dest;
+    // Per node: v0 on entry to it came from a call on every path so far.
+    let mut from_call: BTreeMap<Node, bool> = BTreeMap::new();
+    let mut work = VecDeque::from([(Node::Normal(g.entry), false)]);
+    while let Some((n, v)) = work.pop_front() {
+        let v = from_call.get(&n).map_or(v, |&c| c && v);
+        if from_call.get(&n) == Some(&v) {
+            continue;
+        }
+        from_call.insert(n, v);
+        let d = &g.nodes[&n];
+        let after = v && d.insn.writes() != Some(2);
+        match &d.transfer {
+            Transfer::Call { next: Dest::Local(a), .. } => work.push_back((Node::Normal(*a), true)),
+            _ => work.extend(g.succs(n).into_iter().map(|s| (s, after))),
+        }
+    }
+    let mut exits = 0;
+    for (n, &v) in &from_call {
+        let d = &g.nodes[n];
+        let ok = match &d.transfer {
+            Transfer::Return | Transfer::InlineReturn { .. } => v && d.insn.writes() != Some(2),
+            Transfer::Jump(Dest::Tail(_)) | Transfer::FallOff(_) | Transfer::Call { next: Dest::Tail(_), .. } => true,
+            _ => continue,
+        };
+        if !ok {
+            return false;
+        }
+        exits += 1;
+    }
+    exits > 0
 }
 
 fn sites(g: &Graph, f: &mut Facts) {
@@ -283,6 +325,9 @@ fn liveness(g: &Graph, f: &mut Facts) {
     for &n in &nodes {
         if let Transfer::Call { callee, .. } | Transfer::CondCall { callee, .. } = &g.nodes[&n].transfer {
             let after = succs[&n].iter().fold(0, |acc, s| acc | live_in[s]);
+            if let (true, Callee::Direct { addr, .. }) = (after & (1 << 2) != 0, callee) {
+                f.result_uses.insert(*addr);
+            }
             let bad = after & CALLER_SAVED & !((1 << 2) | (1 << 3) | (1 << 31));
             if bad != 0 {
                 let target = match callee {
