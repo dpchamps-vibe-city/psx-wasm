@@ -59,10 +59,12 @@ RUN mkdir -p /out/bin /out/lib /out/system /out/share \
  && cp /src/beetle/mednafen_psx_libretro.so /out/lib/ \
  && cp /src/redux/src/mips/openbios/openbios.bin /out/system/openbios.bin \
  && cp /src/redux/src/mips/openbios/openbios.elf /src/redux/src/mips/openbios/openbios.map /out/share/ \
- && printf '{"beetle": "%s", "pcsx_redux": "%s", "nugget": "%s", "debian_snapshot": "%s", "openbios_sha1": "%s", "mipsel_gcc": "%s", "host_gcc": "%s"}\n' \
+ && printf '{"beetle": "%s", "pcsx_redux": "%s", "nugget": "%s", "debian_snapshot": "%s", "openbios_sha1": "%s", "core_sha256": "%s", "host_sha256": "%s", "mipsel_gcc": "%s", "host_gcc": "%s"}\n' \
       "$(git -C /src/beetle rev-parse HEAD)" "$(git -C /src/redux rev-parse HEAD)" \
       "$(git -C /src/redux/src/mips rev-parse HEAD)" "$DEBIAN_SNAPSHOT" \
       "$(sha1sum /out/system/openbios.bin | cut -d' ' -f1)" \
+      "$(sha256sum /out/lib/mednafen_psx_libretro.so | cut -d' ' -f1)" \
+      "$(sha256sum /out/bin/psxw-emu-host | cut -d' ' -f1)" \
       "$(mipsel-linux-gnu-gcc -dumpfullversion)" "$(gcc -dumpfullversion)" > /out/share/sources.json \
  && dpkg-query -W -f '${Package} ${Version}\n' | sort > /out/share/build-packages.txt
 

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! psxw oracle gen-header                regenerate oracle/include/psxw_oracle_wire.h
-//! psxw oracle images build              build both images and the runner; record .oracle/images.json
+//! psxw oracle images build [--no-cache] build both images and the runner; record .oracle/images.json
 //! psxw oracle images verify             check the recorded images against inputs.lock and docker
 //! psxw oracle selftest [--seed N] [--count N]
 //!                                       exact-by-construction GPU vectors through the emulator
@@ -19,7 +19,7 @@ use psxw_oracle::report::Report;
 use psxw_oracle::{Kind, images};
 use std::path::Path;
 
-pub const USAGE: &str = "oracle gen-header | images build | images verify | selftest [--seed N] [--count N] \
+pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images verify | selftest [--seed N] [--count N] \
                          | capture [--kind K] [--missing] | check <game> --device D | ci";
 
 /// psx-wasm's device implementations the oracle can check. Empty until the
@@ -51,8 +51,13 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<()> {
             std::fs::write(&path, psxw_oracle::c_header())?;
             eprintln!("wrote {}", path.display());
         }
-        ["images", "build"] => {
-            let im = images::build(ws)?;
+        ["images", "build", rest @ ..] => {
+            let no_cache = match rest {
+                [] => false,
+                ["--no-cache"] => true,
+                _ => bail!("usage: psxw oracle images build [--no-cache]"),
+            };
+            let im = images::build(ws, no_cache)?;
             println!("psxw-oracle-emu  {}", im.emu.id);
             println!("psxw-psx-sdk     {}", im.sdk.id);
             println!("bios sha1        {}", im.emu_facts.bios_sha1);

@@ -116,9 +116,12 @@ pub fn docker_run(image: &str, user: &str, mounts: &[(PathBuf, &str, bool)], ent
     v
 }
 
-fn build_image(ws: &Workspace, dockerfile: &str, tag: &str, args: &[(&str, &str)], log: &Path) -> Result<()> {
+fn build_image(ws: &Workspace, dockerfile: &str, tag: &str, args: &[(&str, &str)], log: &Path, no_cache: bool) -> Result<()> {
     let mut cmd = Command::new("docker");
     cmd.arg("build").arg("-f").arg(ws.root.join("oracle/docker").join(dockerfile)).arg("-t").arg(tag).arg("--progress=plain");
+    if no_cache {
+        cmd.arg("--no-cache");
+    }
     for (k, v) in args {
         cmd.arg("--build-arg").arg(format!("{k}={v}"));
     }
@@ -155,8 +158,9 @@ pub fn parse_facts(info: &Value) -> Result<EmuFacts> {
     })
 }
 
-/// Build both images and the runner; record `.oracle/images.json`.
-pub fn build(ws: &Workspace) -> Result<Images> {
+/// Build both images and the runner; record `.oracle/images.json`. With
+/// `no_cache`, every layer is rebuilt from the pinned sources.
+pub fn build(ws: &Workspace, no_cache: bool) -> Result<Images> {
     let pins = ws.lock.oracle.as_ref().context("inputs.lock has no [oracle] section")?;
     ensure!(docker_available(), "docker is not available (docker version failed)");
     let header = ws.root.join(wire::C_HEADER_PATH);
@@ -183,6 +187,7 @@ pub fn build(ws: &Workspace) -> Result<Images> {
             ("NUGGET_COMMIT", &pins.openbios.nugget_commit),
         ],
         &logs.join("emu-build.log"),
+        no_cache,
     )?;
     let gcc = pins
         .psn00bsdk
@@ -203,6 +208,7 @@ pub fn build(ws: &Workspace) -> Result<Images> {
             ("PSN00BSDK_GCC", gcc),
         ],
         &logs.join("sdk-build.log"),
+        no_cache,
     )?;
 
     let user = {

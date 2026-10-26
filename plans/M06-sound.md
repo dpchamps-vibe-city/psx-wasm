@@ -22,6 +22,19 @@ The game sounds right, and every piece is checked against an oracle:
   root counters and events, plus stub SPU adapters.
 - M3 provides the `SPU_RUN` runner kind, the emulator target, and
   `ramdiff`. The `psxw-psx-sdk` image is where the test-disc tools go.
+- From M3's Findings:
+  - mkpsxiso is already in `psxw-psx-sdk` (bundled with PSn00bSDK v0.24),
+    and the runner itself boots from a disc built with it;
+  - Beetle's CD controller refuses data reads from a disc it does not
+    identify as licensed (SYSTEM.CNF boot name `S[CLI]xx_…`, or licence
+    text in sector 4), so test discs need the runner disc's naming;
+  - SPU_RUN starts at a capture-buffer half boundary (SPUSTAT bit 11,
+    which Beetle reports only while transfer control is 0004h). SPU_RESET
+    leaves ENDX = 00FFFFFFh and reserves SPU RAM 1000h–100Fh. Captures
+    are DMA-read right after the register snapshot while the SPU keeps
+    running: provisional, refine here (and bump `RUNNER_VERSION`);
+  - the Beetle option `spu_silent_voice` is forced off: on, it leaves SPU
+    register state inexact.
 - btn facts:
   - it reads the SPU's key status in 6 places;
   - it uses `SsSetTickMode` and `SsSeqCalledTbyT` (sequencer ticks from a

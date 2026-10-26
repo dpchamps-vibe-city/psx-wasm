@@ -120,6 +120,12 @@ impl DockerTarget {
         let mut image_ids = std::collections::BTreeMap::new();
         image_ids.insert(images.emu.tag.clone(), images.emu.id.clone());
         image_ids.insert(images.sdk.tag.clone(), images.sdk.id.clone());
+        let mut binaries = std::collections::BTreeMap::new();
+        for (key, file) in [("core_sha256", "mednafen_psx_libretro.so"), ("host_sha256", "psxw-emu-host")] {
+            if let Some(sha) = images.emu.sources.get(key).and_then(|v| v.as_str()) {
+                binaries.insert(file.to_string(), sha.to_string());
+            }
+        }
         let template = Provenance {
             schema_version: crate::golden::PROVENANCE_SCHEMA_VERSION,
             target: id.clone(),
@@ -134,6 +140,7 @@ impl DockerTarget {
             runner_version: Some(images.runner.version),
             runner: images.runner.files.clone(),
             images: image_ids,
+            binaries,
             generator: None,
             created: String::new(),
         };

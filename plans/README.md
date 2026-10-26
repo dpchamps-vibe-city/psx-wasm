@@ -76,7 +76,7 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M0](M00-census.md) | Census | **done** | — | GCC 2.95 vs clang layout probe; coverage; references |
 | [M1](M01-translator-and-linker-core.md) | Translator and linker core | not started | M0 | Translated == decompiled C, every function that has both |
 | [M2](M02-whole-game-link-and-boot.md) | Whole-game link and headless boot | not started | M1 | Boot RAM == EXE; CD sectors verify; overlays dispatch; main loop; determinism |
-| [M3](M03-oracle-harness.md) | Oracle harness (Docker) | not started | M0 (*parallel* with M1–M2) | Exact-by-construction vectors reproduce through the emulator |
+| [M3](M03-oracle-harness.md) | Oracle harness (Docker) | **in progress** (tasks 8–9 wait for M2) | M0 (*parallel* with M1–M2) | Exact-by-construction vectors reproduce through the emulator |
 | [M4](M04-pixels.md) | Pixels | not started | M2, M3 | GTE/GPU vectors byte-exact vs goldens; adapter conformance; RAM by symbol |
 | [M5](M05-browser.md) | Browser host | not started | M4 | Cross-host determinism (browser == native hashes) |
 | [M6](M06-sound.md) | Sound | not started | M2, M3 (*parallel* with M4–M5) | SPU/XA vectors vs goldens; libspu conformance |

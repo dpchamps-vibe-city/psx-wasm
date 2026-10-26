@@ -30,6 +30,20 @@ original libraries (original code).
   hardware-touching even though it looks pure.
 - M3 provides the vector store, the emulator target, the
   exact-by-construction generators and `ramdiff`.
+- From M3's Findings:
+  - register the GPU and GTE implementations in
+    `crates/psxw-cli/src/oracle.rs::devices()` (trait
+    `psxw_oracle::commands::DeviceUnderTest`); `psxw oracle check` then
+    judges them against exact, hardware and emulator goldens;
+  - record through `psxw_oracle::record::Recorder` into the set
+    `game-<id>`; `record::vram_rect` snapshots VRAM for GPU_DRAW's initial
+    state;
+  - GPU packets must hold whole commands: port and block packets at most
+    16 words, linked-list nodes at most 255 (`Vector::check` enforces). A
+    GPU vector starts with GP1 reset, its VRAM rectangles, a texture-cache
+    clear (GP0 01h), then its recorded state words;
+  - the 1,050 selftest vectors (set `selftest`, closed-form goldens under
+    `.oracle/goldens/exact`) are the verified subset.
 - btn facts (for scale, not code):
   - mostly sprites, plus GTE-projected polygons;
   - `StoreImage` at 8 call sites, `MoveImage` at 13;

@@ -60,6 +60,9 @@ pub struct Provenance {
     /// Docker image ids, by image name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub images: BTreeMap<String, String>,
+    /// sha256 of the target's own binaries (emulator core, host), by file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub binaries: BTreeMap<String, String>,
     /// For exact results: the generator and its seed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generator: Option<String>,
@@ -84,6 +87,7 @@ impl Provenance {
             runner_version: None,
             runner: BTreeMap::new(),
             images: BTreeMap::new(),
+            binaries: BTreeMap::new(),
             generator: Some(generator.to_string()),
             created: now_rfc3339(),
         }
