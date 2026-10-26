@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The runner disc: OpenBIOS boots the runner from it (Beetle's PS-X EXE
+  side-loading patches a Sony-BIOS address and cannot start a program under
+  OpenBIOS; see plans/M03-oracle-harness.md, Findings).
+
+  The boot file is named in serial form (SLUS_000.00, no real product)
+  because Beetle's CD-controller model only reads data from discs it
+  identifies as licensed, and it identifies them by the SYSTEM.CNF boot
+  name. Built by oracle/docker/build-runner.sh with fixed dates, so the
+  image is reproducible.
+-->
+<iso_project image_name="psxw-runner.bin" cue_sheet="psxw-runner.cue">
+	<track type="data">
+		<identifiers
+			system			="PLAYSTATION"
+			application		="PLAYSTATION"
+			volume			="PSXW_RUNNER"
+			volume_set		="PSXW_RUNNER"
+			publisher		="PSX-WASM"
+			data_preparer	="PSX-WASM ORACLE"
+			creation_date	="2000010100000000+0"
+			modification_date="2000010100000000+0"
+		/>
+		<directory_tree>
+			<file name="SYSTEM.CNF"		type="data" source="system.cnf" />
+			<file name="SLUS_000.00"	type="data" source="psxw-runner.exe" />
+			<dummy sectors="1024"/>
+		</directory_tree>
+	</track>
+</iso_project>

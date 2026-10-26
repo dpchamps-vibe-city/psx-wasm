@@ -1,0 +1,839 @@
+/*
+ * psxw-emu-host: a headless libretro frontend for the psx-wasm device
+ * oracle (plans/M03-oracle-harness.md, "Emulator host").
+ *
+ * It dlopen()s a libretro core (Beetle PSX), answers the environment
+ * callbacks with a fixed, accuracy-first set of core options, loads the
+ * runner as content, and exchanges batches with the runner through a RAM
+ * mailbox it reads and writes via retro_get_memory_data(SYSTEM_RAM),
+ * polling once per retro_run(). It knows nothing about vector kinds: the
+ * driver (crates/psxw-oracle) prepares the exchanges.
+ *
+ * Modes:
+ *   info                         print core, BIOS and option facts as JSON
+ *   exe (--disc R.cue | --exe R.exe) --vectors IN --out OUT [--provenance P]
+ *                                boot the runner, run every exchange in IN.
+ *                                Under OpenBIOS only --disc works: Beetle's
+ *                                PS-X EXE loader hooks a Sony-BIOS address.
+ *   play ...                     replayed game runs (M3 task 8, needs M2)
+ */
+
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#include "libretro.h"
+#include "psxw_oracle_wire.h"
+#include "sha1.h"
+
+#define HOST_VERSION 1
+
+#define EXIT_USAGE 1
+#define EXIT_BOOT 3
+#define EXIT_EXCHANGE 4
+#define EXIT_PROTOCOL 5
+
+/* ---- core options ------------------------------------------------------ */
+
+/*
+ * The oracle's fixed core options. `required` options must be declared by
+ * the core with this value among its allowed values, or the host refuses
+ * to run: an option rename on a Beetle bump must not silently fall back to
+ * a default. Optional ones only exist in some builds (hardware renderer,
+ * dynarec) and apply when declared. Everything else takes the core's
+ * declared default; the effective value of every option goes into the
+ * provenance.
+ */
+struct fixed_option {
+    const char *key;
+    const char *value;
+    bool required;
+};
+
+static const struct fixed_option FIXED_OPTIONS[] = {
+    /* No overclocking, no enhancements. */
+    {"beetle_psx_cpu_freq_scale", "100%", true},
+    {"beetle_psx_gpu_overclock", "1x(native)", true},
+    {"beetle_psx_gte_overclock", "disabled", true},
+    {"beetle_psx_internal_resolution", "1x(native)", true},
+    {"beetle_psx_dither_mode", "1x(native)", true},
+    {"beetle_psx_pgxp_mode", "disabled", true},
+    {"beetle_psx_widescreen_hack", "disabled", true},
+    /* The Line-to-Quad hack defaults on and rewrites thin triangles. */
+    {"beetle_psx_line_render", "disabled", true},
+    /* Skipping released voices leaves SPU register state inexact. */
+    {"beetle_psx_spu_silent_voice", "disabled", true},
+    /* Per-game settings must not override the above. */
+    {"beetle_psx_compatibility_settings", "disabled", true},
+    /* CD: native speed, synchronous access (maximum timing fidelity). */
+    {"beetle_psx_cd_access_method", "sync", true},
+    {"beetle_psx_cd_fastload", "2x(native)", true},
+    /* BIOS: OpenBIOS from the system directory; the Sony-BIOS skip patch
+     * would corrupt it. */
+    {"beetle_psx_override_bios", "openbios", true},
+    {"beetle_psx_skip_bios", "disabled", true},
+    {"beetle_psx_region", "ntsc-u", true},
+    /* Present only in some builds. */
+    {"beetle_psx_renderer", "software", false},
+    {"beetle_psx_depth", "16bpp(native)", false},
+    {"beetle_psx_cpu_dynarec", "disabled", false},
+    {"beetle_psx_pgxp_vertex", "disabled", false},
+    {"beetle_psx_pgxp_texture", "disabled", false},
+    {"beetle_psx_pgxp_nclip", "disabled", false},
+    {"beetle_psx_pgxp_2d_tol", "disabled", false},
+    {"beetle_psx_track_textures", "disabled", false},
+    {"beetle_psx_dump_textures", "disabled", false},
+    {"beetle_psx_replace_textures", "disabled", false},
+    {"beetle_psx_filter", "nearest", false},
+    {"beetle_psx_msaa", "1x", false},
+    {"beetle_psx_super_sampling", "disabled", false},
+    {"beetle_psx_mdec_yuv", "disabled", false},
+    {"beetle_psx_analog_toggle", "disabled", false},
+    {"beetle_psx_enable_multitap_port1", "disabled", false},
+    {"beetle_psx_enable_multitap_port2", "disabled", false},
+    {"beetle_psx_enable_memcard1", "disabled", false},
+    {"beetle_psx_pal_video_timing_override", "disabled", false},
+    {"beetle_psx_display_osd", "disabled", false},
+    {"beetle_psx_display_internal_fps", "disabled", false},
+};
+#define N_FIXED (sizeof FIXED_OPTIONS / sizeof FIXED_OPTIONS[0])
+
+#define MAX_DECLS 512
+#define MAX_VALUES 128
+struct decl {
+    char *key;
+    char *def;
+    char *values[MAX_VALUES];
+    int nvalues;
+    bool queried;
+};
+static struct decl decls[MAX_DECLS];
+static int ndecls;
+
+#define MAX_CLI_OPTIONS 64
+static char *cli_keys[MAX_CLI_OPTIONS], *cli_vals[MAX_CLI_OPTIONS];
+static int ncli;
+
+/* ---- host state -------------------------------------------------------- */
+
+static const char *core_path = "/opt/psxw/lib/mednafen_psx_libretro.so";
+static const char *system_dir = "/opt/psxw/system";
+static const char *work_dir = ".";
+static char save_dir[4096];
+static FILE *log_file;
+static bool verbose;
+static uint64_t frames_run;
+static uint64_t frames_presented;
+static unsigned unknown_env[64];
+static int nunknown_env;
+
+static void die(int code, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "psxw-emu-host: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    if (log_file) {
+        va_start(ap, fmt);
+        fprintf(log_file, "[host] fatal: ");
+        vfprintf(log_file, fmt, ap);
+        fprintf(log_file, "\n");
+        va_end(ap);
+        fflush(log_file);
+    }
+    exit(code);
+}
+
+static char *xstrdup(const char *s) {
+    char *d = strdup(s ? s : "");
+    if (!d) die(EXIT_USAGE, "out of memory");
+    return d;
+}
+
+static struct decl *find_decl(const char *key) {
+    for (int i = 0; i < ndecls; i++)
+        if (!strcmp(decls[i].key, key)) return &decls[i];
+    return NULL;
+}
+
+static void declare(const char *key, const char *def, const char *const *values, int nvalues) {
+    if (!key) return;
+    struct decl *d = find_decl(key);
+    if (!d) {
+        if (ndecls == MAX_DECLS) die(EXIT_PROTOCOL, "too many core options");
+        d = &decls[ndecls++];
+        d->key = xstrdup(key);
+    } else {
+        free(d->def);
+        for (int i = 0; i < d->nvalues; i++) free(d->values[i]);
+    }
+    d->nvalues = 0;
+    for (int i = 0; i < nvalues && i < MAX_VALUES; i++) d->values[d->nvalues++] = xstrdup(values[i]);
+    d->def = xstrdup(def ? def : (d->nvalues ? d->values[0] : ""));
+}
+
+static void declare_v1(const struct retro_core_option_definition *defs) {
+    for (; defs && defs->key; defs++) {
+        const char *vals[RETRO_NUM_CORE_OPTION_VALUES_MAX];
+        int n = 0;
+        for (; n < RETRO_NUM_CORE_OPTION_VALUES_MAX && defs->values[n].value; n++) vals[n] = defs->values[n].value;
+        declare(defs->key, defs->default_value, vals, n);
+    }
+}
+
+static void declare_v2(const struct retro_core_options_v2 *opts) {
+    if (!opts) return;
+    for (const struct retro_core_option_v2_definition *d = opts->definitions; d && d->key; d++) {
+        const char *vals[RETRO_NUM_CORE_OPTION_VALUES_MAX];
+        int n = 0;
+        for (; n < RETRO_NUM_CORE_OPTION_VALUES_MAX && d->values[n].value; n++) vals[n] = d->values[n].value;
+        declare(d->key, d->default_value, vals, n);
+    }
+}
+
+/* SET_VARIABLES: "Description; first|second|third", first is the default. */
+static void declare_variables(const struct retro_variable *vars) {
+    for (; vars && vars->key; vars++) {
+        const char *semi = vars->value ? strchr(vars->value, ';') : NULL;
+        if (!semi) continue;
+        char *list = xstrdup(semi + 1);
+        const char *vals[MAX_VALUES];
+        int n = 0;
+        for (char *tok = strtok(list, "|"); tok && n < MAX_VALUES; tok = strtok(NULL, "|")) {
+            while (*tok == ' ') tok++;
+            vals[n++] = tok;
+        }
+        declare(vars->key, n ? vals[0] : "", vals, n);
+        free(list);
+    }
+}
+
+/* The value the core gets for `key`: CLI override, fixed option, default. */
+static const char *option_value(const char *key) {
+    for (int i = ncli - 1; i >= 0; i--)
+        if (!strcmp(cli_keys[i], key)) return cli_vals[i];
+    for (size_t i = 0; i < N_FIXED; i++)
+        if (!strcmp(FIXED_OPTIONS[i].key, key)) return FIXED_OPTIONS[i].value;
+    struct decl *d = find_decl(key);
+    return d ? d->def : NULL;
+}
+
+static bool value_allowed(const struct decl *d, const char *v) {
+    if (d->nvalues == 0) return true;
+    for (int i = 0; i < d->nvalues; i++)
+        if (!strcmp(d->values[i], v)) return true;
+    return false;
+}
+
+/* Every required option must be declared and accept its fixed value. */
+static void check_options(void) {
+    for (size_t i = 0; i < N_FIXED; i++) {
+        const struct fixed_option *f = &FIXED_OPTIONS[i];
+        struct decl *d = find_decl(f->key);
+        if (!d) {
+            if (f->required) die(EXIT_PROTOCOL, "core does not declare required option %s", f->key);
+            continue;
+        }
+        if (!value_allowed(d, f->value))
+            die(EXIT_PROTOCOL, "core option %s does not accept the fixed value \"%s\"", f->key, f->value);
+    }
+    for (int i = 0; i < ncli; i++) {
+        struct decl *d = find_decl(cli_keys[i]);
+        if (!d) die(EXIT_USAGE, "--option %s: the core declares no such option", cli_keys[i]);
+        if (!value_allowed(d, cli_vals[i])) die(EXIT_USAGE, "--option %s: value \"%s\" not allowed", cli_keys[i], cli_vals[i]);
+    }
+}
+
+/* ---- libretro callbacks ------------------------------------------------ */
+
+static void core_log(enum retro_log_level level, const char *fmt, ...) {
+    static const char *names[] = {"debug", "info", "warn", "error"};
+    const char *name = level <= RETRO_LOG_ERROR ? names[level] : "?";
+    va_list ap;
+    if (log_file) {
+        va_start(ap, fmt);
+        fprintf(log_file, "[core:%s] ", name);
+        vfprintf(log_file, fmt, ap);
+        va_end(ap);
+    }
+    if (verbose || level >= RETRO_LOG_WARN) {
+        va_start(ap, fmt);
+        fprintf(stderr, "[core:%s] ", name);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+    }
+}
+
+static bool environment(unsigned cmd, void *data) {
+    switch (cmd) {
+    case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+        *(const char **)data = system_dir;
+        return true;
+    case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
+        *(const char **)data = save_dir;
+        return true;
+    case RETRO_ENVIRONMENT_GET_CORE_ASSETS_DIRECTORY:
+        *(const char **)data = work_dir;
+        return true;
+    case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
+        ((struct retro_log_callback *)data)->log = core_log;
+        return true;
+    case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
+        *(unsigned *)data = 2;
+        return true;
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
+        declare_v2((const struct retro_core_options_v2 *)data);
+        return true;
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
+        declare_v2(((const struct retro_core_options_v2_intl *)data)->us);
+        return true;
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
+        declare_v1((const struct retro_core_option_definition *)data);
+        return true;
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
+        declare_v1(((const struct retro_core_options_intl *)data)->us);
+        return true;
+    case RETRO_ENVIRONMENT_SET_VARIABLES:
+        declare_variables((const struct retro_variable *)data);
+        return true;
+    case RETRO_ENVIRONMENT_GET_VARIABLE: {
+        struct retro_variable *v = (struct retro_variable *)data;
+        if (!v || !v->key) return false;
+        struct decl *d = find_decl(v->key);
+        if (d) d->queried = true;
+        v->value = option_value(v->key);
+        return v->value != NULL;
+    }
+    case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+        *(bool *)data = false;
+        return true;
+    case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+        return true;
+    case RETRO_ENVIRONMENT_GET_LANGUAGE:
+        *(unsigned *)data = RETRO_LANGUAGE_ENGLISH;
+        return true;
+    case RETRO_ENVIRONMENT_GET_CAN_DUPE:
+        *(bool *)data = true;
+        return true;
+    case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE:
+        *(int *)data = 3; /* video and audio on; no fast savestates */
+        return true;
+    case RETRO_ENVIRONMENT_GET_FASTFORWARDING:
+        *(bool *)data = false;
+        return true;
+    case RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION:
+        *(unsigned *)data = 1;
+        return true;
+    case RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION:
+        *(unsigned *)data = 1;
+        return true;
+    case RETRO_ENVIRONMENT_SET_MESSAGE:
+        core_log(RETRO_LOG_INFO, "message: %s\n", ((const struct retro_message *)data)->msg);
+        return true;
+    case RETRO_ENVIRONMENT_SET_MESSAGE_EXT:
+        core_log(RETRO_LOG_INFO, "message: %s\n", ((const struct retro_message_ext *)data)->msg);
+        return true;
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK:
+    case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
+    case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
+    case RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO:
+    case RETRO_ENVIRONMENT_SET_MEMORY_MAPS:
+    case RETRO_ENVIRONMENT_SET_GEOMETRY:
+    case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
+    case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL:
+    case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS:
+    case RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS:
+    case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE:
+    case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
+    case RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE:
+        return true;
+    /* Refused: no hardware rendering, VFS, rumble, LEDs, HDR, perf. */
+    case RETRO_ENVIRONMENT_SET_HW_RENDER:
+    case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER:
+    case RETRO_ENVIRONMENT_GET_VFS_INTERFACE:
+    case RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE:
+    case RETRO_ENVIRONMENT_GET_LED_INTERFACE:
+    case RETRO_ENVIRONMENT_GET_PERF_INTERFACE:
+    case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
+    case RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER:
+        return false;
+    default: {
+        bool seen = false;
+        for (int i = 0; i < nunknown_env; i++) seen |= unknown_env[i] == cmd;
+        if (!seen && nunknown_env < 64) {
+            unknown_env[nunknown_env++] = cmd;
+            if (log_file) fprintf(log_file, "[host] environment command %u (0x%x) refused\n", cmd, cmd);
+        }
+        return false;
+    }
+    }
+}
+
+static void video_refresh(const void *data, unsigned width, unsigned height, size_t pitch) {
+    (void)data;
+    (void)width;
+    (void)height;
+    (void)pitch;
+    frames_presented++;
+}
+
+static void audio_sample(int16_t left, int16_t right) {
+    (void)left;
+    (void)right;
+}
+
+static size_t audio_sample_batch(const int16_t *data, size_t frames) {
+    (void)data;
+    return frames;
+}
+
+static void input_poll(void) {}
+
+static int16_t input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
+    (void)port;
+    (void)device;
+    (void)index;
+    (void)id;
+    return 0;
+}
+
+/* ---- the core ---------------------------------------------------------- */
+
+static struct {
+    void *handle;
+    void (*set_environment)(retro_environment_t);
+    void (*set_video_refresh)(retro_video_refresh_t);
+    void (*set_audio_sample)(retro_audio_sample_t);
+    void (*set_audio_sample_batch)(retro_audio_sample_batch_t);
+    void (*set_input_poll)(retro_input_poll_t);
+    void (*set_input_state)(retro_input_state_t);
+    void (*init)(void);
+    void (*deinit)(void);
+    unsigned (*api_version)(void);
+    void (*get_system_info)(struct retro_system_info *);
+    void (*get_system_av_info)(struct retro_system_av_info *);
+    void (*set_controller_port_device)(unsigned, unsigned);
+    void (*run)(void);
+    bool (*load_game)(const struct retro_game_info *);
+    void (*unload_game)(void);
+    void *(*get_memory_data)(unsigned);
+    size_t (*get_memory_size)(unsigned);
+} core;
+
+static void *sym(const char *name) {
+    void *p = dlsym(core.handle, name);
+    if (!p) die(EXIT_USAGE, "%s: missing symbol %s", core_path, name);
+    return p;
+}
+
+static void core_open(void) {
+    core.handle = dlopen(core_path, RTLD_NOW | RTLD_LOCAL);
+    if (!core.handle) die(EXIT_USAGE, "dlopen %s: %s", core_path, dlerror());
+    *(void **)&core.set_environment = sym("retro_set_environment");
+    *(void **)&core.set_video_refresh = sym("retro_set_video_refresh");
+    *(void **)&core.set_audio_sample = sym("retro_set_audio_sample");
+    *(void **)&core.set_audio_sample_batch = sym("retro_set_audio_sample_batch");
+    *(void **)&core.set_input_poll = sym("retro_set_input_poll");
+    *(void **)&core.set_input_state = sym("retro_set_input_state");
+    *(void **)&core.init = sym("retro_init");
+    *(void **)&core.deinit = sym("retro_deinit");
+    *(void **)&core.api_version = sym("retro_api_version");
+    *(void **)&core.get_system_info = sym("retro_get_system_info");
+    *(void **)&core.get_system_av_info = sym("retro_get_system_av_info");
+    *(void **)&core.set_controller_port_device = sym("retro_set_controller_port_device");
+    *(void **)&core.run = sym("retro_run");
+    *(void **)&core.load_game = sym("retro_load_game");
+    *(void **)&core.unload_game = sym("retro_unload_game");
+    *(void **)&core.get_memory_data = sym("retro_get_memory_data");
+    *(void **)&core.get_memory_size = sym("retro_get_memory_size");
+    if (core.api_version() != RETRO_API_VERSION)
+        die(EXIT_USAGE, "core API version %u, host built for %u", core.api_version(), RETRO_API_VERSION);
+    core.set_environment(environment);
+    core.set_video_refresh(video_refresh);
+    core.set_audio_sample(audio_sample);
+    core.set_audio_sample_batch(audio_sample_batch);
+    core.set_input_poll(input_poll);
+    core.set_input_state(input_state);
+    core.init();
+    check_options();
+}
+
+/* ---- files and JSON ---------------------------------------------------- */
+
+static uint8_t *read_file(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) die(EXIT_USAGE, "open %s: %s", path, strerror(errno));
+    if (fseek(f, 0, SEEK_END) != 0) die(EXIT_USAGE, "seek %s", path);
+    long n = ftell(f);
+    if (n < 0) die(EXIT_USAGE, "tell %s", path);
+    rewind(f);
+    uint8_t *buf = malloc(n ? (size_t)n : 1);
+    if (!buf) die(EXIT_USAGE, "out of memory reading %s", path);
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) die(EXIT_USAGE, "read %s", path);
+    fclose(f);
+    *len = (size_t)n;
+    return buf;
+}
+
+static void json_str(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\')
+            fprintf(f, "\\%c", c);
+        else if (c < 0x20)
+            fprintf(f, "\\u%04x", c);
+        else
+            fputc(c, f);
+    }
+    fputc('"', f);
+}
+
+static int cmp_decl(const void *a, const void *b) {
+    return strcmp(((const struct decl *)a)->key, ((const struct decl *)b)->key);
+}
+
+struct bios_info {
+    char path[4096];
+    char sha1[41];
+    size_t size;
+    bool present;
+};
+
+/* The BIOS Beetle loads with override_bios=openbios: openbios.bin in the
+ * system directory. */
+static struct bios_info bios_info(void) {
+    struct bios_info b = {0};
+    snprintf(b.path, sizeof b.path, "%s/openbios.bin", system_dir);
+    struct stat st;
+    if (stat(b.path, &st) != 0) return b;
+    uint8_t *data = read_file(b.path, &b.size);
+    sha1_hex(data, b.size, b.sha1);
+    free(data);
+    b.present = true;
+    return b;
+}
+
+/* Core, BIOS and options; `extra` writes more members (may be NULL). */
+static void write_facts(FILE *f, void (*extra)(FILE *)) {
+    struct retro_system_info si = {0};
+    core.get_system_info(&si);
+    struct bios_info b = bios_info();
+    qsort(decls, (size_t)ndecls, sizeof decls[0], cmp_decl);
+    fprintf(f, "{\n  \"host_version\": %d,\n  \"wire_version\": %u,\n", HOST_VERSION, PSXW_WIRE_VERSION);
+    fprintf(f, "  \"core\": {\"library_name\": ");
+    json_str(f, si.library_name);
+    fprintf(f, ", \"library_version\": ");
+    json_str(f, si.library_version);
+    fprintf(f, ", \"path\": ");
+    json_str(f, core_path);
+    fprintf(f, "},\n  \"bios\": {\"path\": ");
+    json_str(f, b.path);
+    fprintf(f, ", \"present\": %s, \"size\": %zu, \"sha1\": ", b.present ? "true" : "false", b.size);
+    json_str(f, b.present ? b.sha1 : "");
+    fprintf(f, "},\n  \"core_options\": {");
+    for (int i = 0; i < ndecls; i++) {
+        fprintf(f, "%s\n    ", i ? "," : "");
+        json_str(f, decls[i].key);
+        fprintf(f, ": ");
+        json_str(f, option_value(decls[i].key));
+    }
+    fprintf(f, "\n  },\n  \"fixed_options\": {");
+    int n = 0;
+    for (size_t i = 0; i < N_FIXED; i++) {
+        if (!find_decl(FIXED_OPTIONS[i].key)) continue;
+        fprintf(f, "%s\n    ", n++ ? "," : "");
+        json_str(f, FIXED_OPTIONS[i].key);
+        fprintf(f, ": ");
+        json_str(f, FIXED_OPTIONS[i].value);
+    }
+    fprintf(f, "\n  },\n  \"cli_options\": {");
+    for (int i = 0; i < ncli; i++) {
+        fprintf(f, "%s\n    ", i ? "," : "");
+        json_str(f, cli_keys[i]);
+        fprintf(f, ": ");
+        json_str(f, cli_vals[i]);
+    }
+    fprintf(f, "\n  }");
+    if (extra) extra(f);
+    fprintf(f, "\n}\n");
+}
+
+/* ---- the mailbox ------------------------------------------------------- */
+
+static uint8_t *ram;
+static size_t ram_size;
+static uint32_t mbx;
+
+static uint32_t rd32(uint32_t off) {
+    const uint8_t *p = ram + mbx + off;
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void wr32(uint32_t off, uint32_t v) {
+    uint8_t *p = ram + mbx + off;
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void put32(FILE *f, uint32_t v) {
+    uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
+    if (fwrite(b, 1, 4, f) != 4) die(EXIT_USAGE, "write failed");
+}
+
+static void run_frame(void) {
+    core.run();
+    frames_run++;
+}
+
+/* Statistics for the provenance's "run" member. */
+static uint64_t stat_boot_frames, stat_exchanges, stat_exchange_frames, stat_max_exchange_frames;
+static uint32_t stat_runner_version, stat_capacity;
+static const char *stat_content = "";
+
+static void write_run_stats(FILE *f) {
+    fprintf(f, ",\n  \"run\": {\"mode\": \"exe\", \"content\": \"%s\", \"mailbox\": %u, \"runner_version\": %u, \"capacity\": %u, ",
+            stat_content, mbx | 0x80000000u, stat_runner_version, stat_capacity);
+    fprintf(f, "\"boot_frames\": %llu, \"exchanges\": %llu, \"exchange_frames\": %llu, \"max_exchange_frames\": %llu, ",
+            (unsigned long long)stat_boot_frames, (unsigned long long)stat_exchanges,
+            (unsigned long long)stat_exchange_frames, (unsigned long long)stat_max_exchange_frames);
+    fprintf(f, "\"frames\": %llu, \"frames_presented\": %llu}", (unsigned long long)frames_run,
+            (unsigned long long)frames_presented);
+}
+
+static void dump_ram(const char *path) {
+    if (!path || !ram) return;
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(ram, 1, ram_size, f);
+    fclose(f);
+    fprintf(stderr, "psxw-emu-host: RAM dumped to %s\n", path);
+}
+
+struct exe_args {
+    const char *exe, *disc, *vectors, *out, *provenance, *dump_ram;
+    uint32_t mailbox;
+    uint64_t boot_frames, timeout_frames;
+};
+
+static int mode_exe(const struct exe_args *a) {
+    if ((!a->exe == !a->disc) || !a->vectors || !a->out)
+        die(EXIT_USAGE, "exe needs one of --disc and --exe, plus --vectors and --out");
+    const char *content = a->disc ? a->disc : a->exe;
+    stat_content = a->disc ? "disc" : "exe";
+    size_t in_len;
+    uint8_t *in = read_file(a->vectors, &in_len);
+    if (in_len < 16 || memcmp(in, PSXW_XCHG_IN_MAGIC, 8) != 0) die(EXIT_USAGE, "%s: not an exchange file", a->vectors);
+    if (le32(in + 8) != PSXW_XCHG_VERSION) die(EXIT_USAGE, "%s: exchange version %u", a->vectors, le32(in + 8));
+    uint32_t count = le32(in + 12);
+
+    struct retro_game_info game = {.path = content, .data = NULL, .size = 0, .meta = NULL};
+    if (!core.load_game(&game)) die(EXIT_USAGE, "the core refused %s", content);
+    core.set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+    core.set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
+    ram = core.get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+    ram_size = core.get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+    if (!ram || ram_size < 0x200000) die(EXIT_PROTOCOL, "core exposes %zu bytes of system RAM", ram_size);
+    mbx = a->mailbox & 0x1FFFFF;
+    if (mbx + PSXW_MBX_SIZE > ram_size) die(EXIT_USAGE, "mailbox outside RAM");
+
+    /* Boot: OpenBIOS starts, the runner is loaded, it marks the mailbox. */
+    for (;;) {
+        if (rd32(PSXW_MBX_OFF_MAGIC) == PSXW_MBX_MAGIC && rd32(PSXW_MBX_OFF_STATE) == PSXW_MBX_STATE_READY) break;
+        if (frames_run >= a->boot_frames) {
+            dump_ram(a->dump_ram);
+            die(EXIT_BOOT, "runner not ready after %llu frames (mailbox magic %08x state %u)",
+                (unsigned long long)frames_run, rd32(PSXW_MBX_OFF_MAGIC), rd32(PSXW_MBX_OFF_STATE));
+        }
+        run_frame();
+    }
+    stat_boot_frames = frames_run;
+    stat_runner_version = rd32(PSXW_MBX_OFF_RUNNER_VERSION);
+    stat_capacity = rd32(PSXW_MBX_OFF_CAPACITY);
+    if (rd32(PSXW_MBX_OFF_VERSION) != PSXW_WIRE_VERSION)
+        die(EXIT_PROTOCOL, "runner speaks wire version %u, host %u", rd32(PSXW_MBX_OFF_VERSION), PSXW_WIRE_VERSION);
+    if (stat_capacity > PSXW_MBX_CAPACITY) die(EXIT_PROTOCOL, "runner capacity %u too large", stat_capacity);
+    if (log_file) fprintf(log_file, "[host] runner %u ready after %llu frames\n", stat_runner_version,
+                          (unsigned long long)frames_run);
+
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s.partial", a->out);
+    FILE *out = fopen(tmp, "wb");
+    if (!out) die(EXIT_USAGE, "create %s: %s", tmp, strerror(errno));
+    fwrite(PSXW_XCHG_OUT_MAGIC, 1, 8, out);
+    put32(out, PSXW_XCHG_VERSION);
+    put32(out, count);
+
+    size_t pos = 16;
+    uint32_t seq = rd32(PSXW_MBX_OFF_ACK_SEQ);
+    for (uint32_t i = 0; i < count; i++) {
+        if (pos + 8 > in_len) die(EXIT_USAGE, "%s: truncated at exchange %u", a->vectors, i);
+        uint32_t kind = le32(in + pos), len = le32(in + pos + 4);
+        pos += 8;
+        if (len > stat_capacity || pos + len > in_len) die(EXIT_USAGE, "exchange %u: payload %u bytes", i, len);
+        memcpy(ram + mbx + PSXW_MBX_OFF_DATA, in + pos, len);
+        pos += (len + 3) & ~3u;
+        wr32(PSXW_MBX_OFF_KIND, kind);
+        wr32(PSXW_MBX_OFF_PAYLOAD_LEN, len);
+        wr32(PSXW_MBX_OFF_RESULT_LEN, 0);
+        wr32(PSXW_MBX_OFF_ERROR, 0);
+        wr32(PSXW_MBX_OFF_SEQ, ++seq);
+        wr32(PSXW_MBX_OFF_STATE, PSXW_MBX_STATE_PENDING);
+        uint64_t start = frames_run;
+        uint32_t state;
+        for (;;) {
+            run_frame();
+            state = rd32(PSXW_MBX_OFF_STATE);
+            if ((state == PSXW_MBX_STATE_DONE || state == PSXW_MBX_STATE_ERROR) && rd32(PSXW_MBX_OFF_ACK_SEQ) == seq) break;
+            if (frames_run - start >= a->timeout_frames) {
+                fclose(out);
+                dump_ram(a->dump_ram);
+                die(EXIT_EXCHANGE, "exchange %u: no answer after %llu frames (state %u)", i,
+                    (unsigned long long)(frames_run - start), state);
+            }
+        }
+        uint64_t took = frames_run - start;
+        stat_exchange_frames += took;
+        if (took > stat_max_exchange_frames) stat_max_exchange_frames = took;
+        stat_exchanges++;
+        uint32_t rlen = state == PSXW_MBX_STATE_DONE ? rd32(PSXW_MBX_OFF_RESULT_LEN) : 0;
+        if (rlen > stat_capacity) die(EXIT_PROTOCOL, "exchange %u: result length %u", i, rlen);
+        put32(out, state);
+        put32(out, rd32(PSXW_MBX_OFF_ERROR));
+        put32(out, rlen);
+        if (fwrite(ram + mbx + PSXW_MBX_OFF_DATA, 1, rlen, out) != rlen) die(EXIT_USAGE, "write failed");
+        static const uint8_t zero[3];
+        fwrite(zero, 1, ((rlen + 3) & ~3u) - rlen, out);
+    }
+    if (fclose(out) != 0 || rename(tmp, a->out) != 0) die(EXIT_USAGE, "finishing %s: %s", a->out, strerror(errno));
+    free(in);
+
+    if (a->provenance) {
+        FILE *f = fopen(a->provenance, "w");
+        if (!f) die(EXIT_USAGE, "create %s: %s", a->provenance, strerror(errno));
+        write_facts(f, write_run_stats);
+        fclose(f);
+    }
+    core.unload_game();
+    return 0;
+}
+
+/* ---- main -------------------------------------------------------------- */
+
+static void usage(void) {
+    fprintf(stderr,
+            "usage: psxw-emu-host info [common]\n"
+            "       psxw-emu-host exe (--disc R.cue | --exe R.exe) --vectors IN --out OUT [--provenance P.json]\n"
+            "                     [--mailbox ADDR] [--boot-frames N] [--timeout-frames N] [--dump-ram F] [common]\n"
+            "common: --core LIB --system DIR --work DIR --log FILE --option KEY=VALUE --verbose\n");
+    exit(EXIT_USAGE);
+}
+
+static uint64_t parse_num(const char *s) {
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (errno || *end) die(EXIT_USAGE, "bad number %s", s);
+    return v;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) usage();
+    const char *mode = argv[1];
+    const char *log_path = NULL;
+    struct exe_args ea = {.mailbox = PSXW_MBX_ADDR, .boot_frames = 3600, .timeout_frames = 600};
+    for (int i = 2; i < argc; i++) {
+        const char *k = argv[i];
+        const char *v = i + 1 < argc ? argv[i + 1] : NULL;
+#define TAKE()                                  \
+    do {                                        \
+        if (!v) die(EXIT_USAGE, "%s needs a value", k); \
+        i++;                                    \
+    } while (0)
+        if (!strcmp(k, "--verbose")) {
+            verbose = true;
+        } else if (!strcmp(k, "--core")) {
+            TAKE();
+            core_path = v;
+        } else if (!strcmp(k, "--system")) {
+            TAKE();
+            system_dir = v;
+        } else if (!strcmp(k, "--work")) {
+            TAKE();
+            work_dir = v;
+        } else if (!strcmp(k, "--log")) {
+            TAKE();
+            log_path = v;
+        } else if (!strcmp(k, "--option")) {
+            TAKE();
+            const char *eq = strchr(v, '=');
+            if (!eq || ncli == MAX_CLI_OPTIONS) die(EXIT_USAGE, "--option KEY=VALUE");
+            cli_keys[ncli] = strndup(v, (size_t)(eq - v));
+            cli_vals[ncli++] = xstrdup(eq + 1);
+        } else if (!strcmp(k, "--exe")) {
+            TAKE();
+            ea.exe = v;
+        } else if (!strcmp(k, "--disc")) {
+            TAKE();
+            ea.disc = v;
+        } else if (!strcmp(k, "--vectors")) {
+            TAKE();
+            ea.vectors = v;
+        } else if (!strcmp(k, "--out")) {
+            TAKE();
+            ea.out = v;
+        } else if (!strcmp(k, "--provenance")) {
+            TAKE();
+            ea.provenance = v;
+        } else if (!strcmp(k, "--dump-ram")) {
+            TAKE();
+            ea.dump_ram = v;
+        } else if (!strcmp(k, "--mailbox")) {
+            TAKE();
+            ea.mailbox = (uint32_t)parse_num(v);
+        } else if (!strcmp(k, "--boot-frames")) {
+            TAKE();
+            ea.boot_frames = parse_num(v);
+        } else if (!strcmp(k, "--timeout-frames")) {
+            TAKE();
+            ea.timeout_frames = parse_num(v);
+        } else {
+            usage();
+        }
+#undef TAKE
+    }
+    if (log_path) {
+        log_file = fopen(log_path, "w");
+        if (!log_file) die(EXIT_USAGE, "create %s: %s", log_path, strerror(errno));
+    }
+    snprintf(save_dir, sizeof save_dir, "%s/save", work_dir);
+    mkdir(save_dir, 0777);
+
+    if (!strcmp(mode, "play")) die(EXIT_USAGE, "play mode arrives with M3 task 8 (needs M2's replays)");
+    if (strcmp(mode, "info") && strcmp(mode, "exe")) usage();
+
+    core_open();
+    int rc = 0;
+    if (!strcmp(mode, "info"))
+        write_facts(stdout, NULL);
+    else
+        rc = mode_exe(&ea);
+    core.deinit();
+    if (log_file) fclose(log_file);
+    return rc;
+}

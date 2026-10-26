@@ -10,6 +10,35 @@ dist = "wasi-sdk-34.0-x86_64-linux"
 url = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz"
 sha256 = "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
 
+[oracle]
+# The device oracle's Docker images (plans/M03-oracle-harness.md). Both are
+# built on this base, and install Debian packages from the snapshot the base
+# image itself was built from. Built image IDs go to .oracle/images.json.
+base_image = "debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad"
+debian_snapshot = "20261020T213255Z"
+
+[oracle.beetle]
+# Beetle PSX (Mednafen's PlayStation core), software renderer, interpreter.
+repo = "https://github.com/libretro/beetle-psx-libretro"
+commit = "7fea57a541abb39b8c5035b6261c3e70962d221b"
+
+[oracle.openbios]
+# OpenBIOS is PCSX-Redux src/mips/openbios; src/mips is the nugget
+# submodule, whose commit is the gitlink at the PCSX-Redux commit (the image
+# build checks they agree).
+repo = "https://github.com/grumpycoders/pcsx-redux"
+commit = "8a86b7ec1d246eb5ae9b213cac27aa2f7854a176"
+nugget_repo = "https://github.com/pcsx-redux/nugget"
+nugget_commit = "4dc70d2931121a0fde858a0354192b6df4fa22e8"
+
+[oracle.psn00bsdk]
+# The release archive bundles the toolchain (GCC mipsel-none-elf) and
+# mkpsxiso; the image build checks the GCC version.
+release = "v0.24"
+url = "https://github.com/Lameguy64/PSn00bSDK/releases/download/v0.24/PSn00bSDK-0.24-Linux.zip"
+sha256 = "5ada7c9478d795b22bde96ee23d6869290c14a740bcde3d57c01c342a26ded35"
+toolchain = "gcc-mipsel-none-elf-12.3.0"
+
 [game.btn]
 repo = "../btn-decompilation"
 remote = "git@github.com:software-factory-vibe-city/back-to-nature-decomp.git"

@@ -5,10 +5,13 @@
 //! psxw inputs sync                      snapshot every pinned repo
 //! psxw census <game> [--only S] [--only-header S] [--no-probe]
 //!                                       M0: compile every TU, check vs original
+//! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! ```
 
 use anyhow::{Result, bail};
 use psxw_inputs::{Workspace, snapshot, toolchain};
+
+mod oracle;
 
 fn main() {
     if let Err(e) = run() {
@@ -50,7 +53,8 @@ fn run() -> Result<()> {
                 std::process::exit(2);
             }
         }
-        _ => bail!("usage: psxw toolchain fetch | inputs sync | census <game> [--only S] [--only-header S] [--no-probe]"),
+        ["oracle", rest @ ..] => oracle::run(&ws, rest)?,
+        _ => bail!("usage: psxw toolchain fetch | inputs sync | census <game> [--only S] [--only-header S] [--no-probe] | {}", oracle::USAGE),
     }
     Ok(())
 }
