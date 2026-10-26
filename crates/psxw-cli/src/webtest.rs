@@ -258,7 +258,12 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
             continue;
         };
         let r: serde_json::Value = serde_json::from_str(&text)?;
-        let ok = r["error"].is_null() && r["total"].as_u64() == Some(vs.len() as u64) && r["pass"] == r["total"];
+        // Headless Chromium on SwiftShader loses contexts but never
+        // restores them (any canvas kind, any thread): the recovery path
+        // can't run there, and the game keeps going without drawing.
+        let unrestorable = b == "chromium" && r["contextLoss"]["unrestored"].as_bool() == Some(true);
+        let restored = r["contextLoss"]["ok"].as_bool() == Some(true) || unrestorable;
+        let ok = r["error"].is_null() && r["total"].as_u64() == Some(vs.len() as u64) && r["pass"] == r["total"] && restored;
         pass &= ok;
         println!(
             "{b}: {} — {} of {} vectors equal their goldens in {} ms ({})",
@@ -272,6 +277,13 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
             for x in f.iter().take(8) {
                 println!("  {x}");
             }
+        }
+        if unrestorable {
+            println!("  context loss: not exercised (this browser never restores a lost context)");
+        } else if !restored {
+            println!("  context loss: VRAM not recovered ({})", r["contextLoss"]);
+        } else {
+            println!("  context loss: VRAM recovered from the shadow copy");
         }
     }
     Ok(pass)

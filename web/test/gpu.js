@@ -1,8 +1,11 @@
 // Cross-host check of the WebGL2 backend (M5): every GPU oracle vector
 // (vectors.bin: the renderer command stream and the golden readback, as
 // `psxw web-test gpu` exported them) runs through psxw-host-web's
-// WebRenderer, and the readback must equal the golden byte for byte. The
-// result is POSTed to /result?browser=NAME and shown on the page.
+// WebRenderer, and the readback must equal the golden byte for byte. Then
+// the context is lost and restored (WEBGL_lose_context) with the largest
+// vector's VRAM in it: a new WebRenderer given the shadow copy must hash
+// the same (worker.js's recovery). The result is POSTed to
+// /result?browser=NAME and shown on the page.
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 
@@ -22,6 +25,7 @@ async function main() {
   let at = 12;
   let pass = 0;
   const failures = [];
+  let largest = null;
   const t0 = performance.now();
   for (let i = 0; i < count; i++) {
     const idLen = dv.getUint32(at, true);
@@ -33,6 +37,7 @@ async function main() {
     const n = dv.getUint32(at, true);
     const want = new Uint8Array(buf, at + 4, n);
     at += 4 + ((n + 3) & ~3);
+    if (!largest || stream.length > largest.length) largest = stream;
     r.reset();
     const px = r.run(stream);
     const got = new Uint8Array(px.buffer, px.byteOffset, px.byteLength);
@@ -41,9 +46,46 @@ async function main() {
     if (diff < 0) pass++;
     else if (failures.length < 32) failures.push({ id, byte: diff, got: got[diff], want: want[diff] });
   }
-  const result = { browser, renderer: r.info(), total: count, pass, failures, ms: Math.round(performance.now() - t0) };
+  const ms = Math.round(performance.now() - t0);
+  const renderer = r.info();
+  const contextLoss = await loseAndRestore(canvas, r, largest);
+  const result = { browser, renderer, total: count, pass, failures, ms, contextLoss };
   out.textContent = JSON.stringify(result, null, 2);
   await fetch(`/result?browser=${browser}`, { method: "POST", body: JSON.stringify(result) });
+}
+
+async function loseAndRestore(canvas, r, stream) {
+  r.reset();
+  r.run(stream);
+  const before = r.vram_hash();
+  const shadow = r.vram();
+  const ext = canvas.getContext("webgl2").getExtension("WEBGL_lose_context");
+  if (!ext) return { ok: false, error: "no WEBGL_lose_context" };
+  // Resolves true on the event, false after 10 s without it.
+  const event = (name) =>
+    new Promise((res) => {
+      const timer = setTimeout(() => res(false), 10000);
+      canvas.addEventListener(
+        name,
+        (e) => {
+          e.preventDefault();
+          clearTimeout(timer);
+          res(true);
+        },
+        { once: true },
+      );
+    });
+  const lost = event("webglcontextlost");
+  ext.loseContext();
+  if (!(await lost)) return { ok: false, error: "no webglcontextlost event" };
+  const restored = event("webglcontextrestored");
+  ext.restoreContext();
+  if (!(await restored)) return { ok: false, unrestored: true, error: "no webglcontextrestored event" };
+  const fresh = new WebRenderer(canvas);
+  const empty = fresh.vram_hash();
+  fresh.upload_vram(shadow);
+  const after = fresh.vram_hash();
+  return { ok: after === before && empty !== before, before, after };
 }
 
 main().catch(async (e) => {

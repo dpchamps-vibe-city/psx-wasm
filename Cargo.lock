@@ -803,6 +803,7 @@ dependencies = [
  "psxw-lift",
  "psxw-oracle",
  "rayon",
+ "sdk-psyq",
  "serde",
  "serde_json",
 ]
@@ -855,6 +856,14 @@ dependencies = [
 [[package]]
 name = "psxw-host-web"
 version = "0.0.0"
+dependencies = [
+ "glow",
+ "js-sys",
+ "psx-render-gl",
+ "psxw-abi",
+ "wasm-bindgen",
+ "web-sys",
+]
 
 [[package]]
 name = "psxw-inputs"

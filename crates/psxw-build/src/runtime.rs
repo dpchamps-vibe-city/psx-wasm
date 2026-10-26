@@ -50,7 +50,7 @@ fn section(wasm: &[u8], name: &str) -> Result<Vec<String>> {
             }
         }
     }
-    bail!("runtime.wasm has no {name} section; rebuild it with `psxw runtime build`")
+    bail!("the module has no {name} section; rebuild it (`psxw runtime build`, `psxw build`)")
 }
 
 /// The adapter names stamped into a runtime module, in id order.

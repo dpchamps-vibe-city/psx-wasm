@@ -88,6 +88,19 @@ mod web {
             self.r.read_vram(0, 0, 1024, 512)
         }
 
+        /// Write all of VRAM (1024 × 512 pixels): a shadow copy back after
+        /// the context was lost and restored.
+        pub fn upload_vram(&mut self, px: &[u16]) -> Result<(), JsValue> {
+            if px.len() != 1024 * 512 {
+                return Err(js("upload_vram needs 1024 × 512 pixels"));
+            }
+            let mut c = Vec::with_capacity(4 + px.len() / 2);
+            c.push(header(op::UPLOAD, 3 + px.len() as u32 / 2));
+            c.extend_from_slice(&[0, 1024 | 512 << 16, 0]);
+            c.extend(px.chunks_exact(2).map(|p| p[0] as u32 | (p[1] as u32) << 16));
+            self.r.execute(&c).map_err(js)
+        }
+
         /// FNV-1a (64-bit, hex) of VRAM as little-endian bytes: the native
         /// host's `vram_hashes`.
         pub fn vram_hash(&mut self) -> String {

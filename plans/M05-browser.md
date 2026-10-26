@@ -1,6 +1,6 @@
 # M5 — Browser host
 
-**Status:** in progress (tasks 1–3 done; task 5's image and GPU check done, its game check waits for the disc)
+**Status:** in progress (tasks 1–4, 6 and 8 done; task 5's image and GPU check done, its game check waits for the disc)
 **Depends on:** M4. **Unlocks:** M7 (browser saves), a public demo.
 **Design refs:** design: Browser host, §6 (blocking), §7 (dev mode);
 decisions D16, D18, D20.
@@ -85,18 +85,19 @@ produces. Its devices are already gated by M4's oracles.
    interface is in `web/worker.js`; `psxw-host-web` is the renderer.)*
 2. [x] `psx-render-gl` running under WebGL2 on an OffscreenCanvas in the
    Worker. Handle context loss: re-create and re-upload VRAM from a shadow
-   copy. *(Runs and is exact; context-loss recovery is not written yet.)*
+   copy. *(Runs and is exact. Context loss: VRAM shadowed every 60
+   frames, uploaded into a new renderer on restore; checked in Firefox.)*
 3. [x] `web/` shell: UI, disc import, input polling, AudioWorklet
    playing silence; `psxw build-web`; `psxw serve`.
-4. [ ] Dev mode with the separate runtime module; document the hot-swap
-   workflow.
+4. [x] Dev mode with the separate runtime module; document the hot-swap
+   workflow. *(`?dev`; `web/README.md`.)*
 5. [ ] Playwright Docker image (pinned) and the cross-host determinism
    test for the `title-to-gameplay` replay, in both browsers. *(D44:
    `psxw-browsers` instead of Playwright. `psxw web-test gpu` passes in
    both browsers. `psxw web-test game` is written; it waits for the disc
    and the replay.)*
-6. [ ] Performance report: frame-time percentiles in the worker. Reported,
-   not gating.
+6. [x] Performance report: frame-time percentiles in the worker. Reported,
+   not gating. *(`frameMs` in the Worker's `hashes` message.)*
 7. [ ] *(optional, if Q1 says yes)* Tauri shell serving the same bundle
    with COOP/COEP.
 8. [x] Add the browser determinism tests to `psxw ci`. Docs, README
@@ -149,6 +150,31 @@ produces. Its devices are already gated by M4's oracles.
 
     Headless Firefox finds no GL driver ("Exhausted GL driver options"),
     so it runs under Xvfb, where GLX over llvmpipe works.
+- **2026-10-26** (this commit): tasks 2, 4 and 6.
+  - **Context loss:**
+    - The Worker shadows VRAM every 60 frames. While the context is
+      lost, it skips submit, readback and present.
+    - On `webglcontextrestored` it builds a new `WebRenderer` and calls
+      `upload_vram` (one `UPLOAD` of 1024×512).
+    - `psxw web-test gpu` now loses and restores the context with the
+      largest vector's VRAM in it. The new renderer must hash the same,
+      and does in Firefox.
+    - Headless Chromium on SwiftShader fires `webglcontextlost` but never
+      `webglcontextrestored`. A probe found the same for a plain canvas,
+      an OffscreenCanvas and a transferred one in a Worker, so the check
+      is reported as not exercised there.
+  - **Dev mode (`?dev`):**
+    - The Worker instantiates guest.wasm and then runtime.wasm, wired
+      through JS trampolines.
+    - The guest now carries the adapter table it was linked against
+      (`psxw.adapters`). Dev mode refuses a runtime with another table.
+    - `psxw build-web` copies both modules and checks the wiring (with
+      wasmparser): the guest's imports, the runtime's imports, the
+      table, and that the pair exports everything game.wasm exports.
+    - A Node mirror of `instantiateDev` against btn's bundle resolved
+      every import, with ABI 3.
+  - **Frame times:** p50, p95, p99 and max of the wall time between
+    vblanks, posted with the hashes.
 
 ## Findings
 

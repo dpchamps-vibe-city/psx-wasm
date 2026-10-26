@@ -9,6 +9,14 @@
 // - rendering: psxw-host-web's WebRenderer (psx-render-gl on WebGL2) on
 //   the OffscreenCanvas.
 //
+// - dev mode (`options.dev`): guest.wasm and runtime.wasm instantiated
+//   separately and wired through JS trampolines, so a rebuilt runtime is
+//   picked up without relinking the game (slower: every runtime call
+//   crosses JS);
+// - WebGL context loss: VRAM is shadowed every 60 frames and uploaded
+//   into the re-created renderer when the context is restored (the
+//   colour-table cache refills on the next table change).
+//
 // Messages in: {type: "start", canvas, cue, padBuffer, options}.
 // Messages out: {type: "status"|"report"|"log"|"hashes"|"stopped", ...}.
 
@@ -53,9 +61,52 @@ async function persist(dir, name, data) {
   h.close();
 }
 
+/**
+ * Dev mode: guest.wasm defines the memory and imports `psx.*` from the
+ * runtime; runtime.wasm imports `guest.*` (the guest's exports, memory
+ * included) and `host.*`. The guest goes first, its `psx.*` imports
+ * forwarding to the runtime once it exists.
+ */
+async function instantiateDev(host) {
+  const [guestModule, runtimeModule] = await Promise.all(
+    ["guest.wasm", "runtime.wasm"].map((f) => WebAssembly.compileStreaming(fetch(new URL(`./${f}`, import.meta.url)))),
+  );
+  // The guest calls adapters by id: a runtime with another table needs
+  // the game relinked.
+  const table = (m) => new TextDecoder().decode(WebAssembly.Module.customSections(m, "psxw.adapters")[0] || new ArrayBuffer(0));
+  if (table(guestModule) !== table(runtimeModule)) {
+    throw new Error("runtime.wasm's adapters differ from those guest.wasm was linked against: rebuild with `psxw build-web`");
+  }
+  let runtime = null;
+  const psx = {};
+  for (const imp of WebAssembly.Module.imports(guestModule)) {
+    if (imp.module === "psx") psx[imp.name] = (...args) => runtime.exports[imp.name](...args);
+  }
+  const guest = await WebAssembly.instantiate(guestModule, { psx });
+  const guestImports = {};
+  for (const imp of WebAssembly.Module.imports(runtimeModule)) {
+    if (imp.module === "guest") guestImports[imp.name] = guest.exports[imp.name];
+  }
+  runtime = await WebAssembly.instantiate(runtimeModule, { guest: guestImports, host });
+  return { ...guest.exports, ...runtime.exports, memory: guest.exports.memory };
+}
+
 async function run({ canvas, cue, padBuffer, options }) {
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
-  const renderer = new WebRenderer(canvas);
+  let renderer = new WebRenderer(canvas);
+  let lost = false;
+  let shadow = null;
+  canvas.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    lost = true;
+    postMessage({ type: "status", text: "WebGL context lost; waiting for it to come back" });
+  });
+  canvas.addEventListener("webglcontextrestored", () => {
+    renderer = new WebRenderer(canvas);
+    if (shadow) renderer.upload_vram(shadow);
+    lost = false;
+    postMessage({ type: "status", text: "WebGL context restored" });
+  });
   postMessage({ type: "status", text: `renderer: ${renderer.info()}` });
 
   const root = await navigator.storage.getDirectory();
@@ -70,6 +121,8 @@ async function run({ canvas, cue, padBuffer, options }) {
   const ramHashes = {};
   const vramHashes = {};
   let lagFrames = 0;
+  const frameTimes = [];
+  let lastVblank = 0;
 
   let exports = null;
   const mem = () => exports.memory.buffer;
@@ -88,6 +141,9 @@ async function run({ canvas, cue, padBuffer, options }) {
     },
     wait_vblank(f) {
       frame = Number(f);
+      const now = performance.now();
+      if (lastVblank) frameTimes.push(now - lastVblank);
+      if (frame % 60 === 0 && !lost) shadow = renderer.vram();
       if (hashAt.has(frame)) {
         ramHashes[frame] = (exports.psxw_ram_hash() & 0xffffffffffffffffn).toString(16).padStart(16, "0");
         vramHashes[frame] = renderer.vram_hash();
@@ -98,6 +154,7 @@ async function run({ canvas, cue, padBuffer, options }) {
         if (wait > 0) Atomics.wait(sleeper, 0, 0, wait);
         else if (wait < -period) lagFrames++;
       }
+      lastVblank = performance.now();
       if (frame % 60 === 0) postMessage({ type: "status", text: `frame ${frame}, ${lagFrames} late` });
     },
     disc_info(out) {
@@ -142,19 +199,19 @@ async function run({ canvas, cue, padBuffer, options }) {
       postMessage({ type: "report", json: text(p, n) });
     },
     render_submit(p, len) {
-      renderer.submit(new Uint32Array(mem().slice(p, p + len)));
+      if (!lost) renderer.submit(new Uint32Array(mem().slice(p, p + len)));
     },
     render_readback(x, y, w, h, dst) {
+      if (lost) return; // the game reads whatever its buffer held
       const px = renderer.readback(x, y, w, h);
       bytes(dst, px.byteLength).set(new Uint8Array(px.buffer, px.byteOffset, px.byteLength));
     },
     present(p) {
-      renderer.present(new Uint32Array(mem().slice(p, p + 20)));
+      if (!lost) renderer.present(new Uint32Array(mem().slice(p, p + 20)));
     },
   };
 
-  const { instance } = await WebAssembly.instantiateStreaming(fetch(new URL("./game.wasm", import.meta.url)), { host });
-  exports = instance.exports;
+  exports = options.dev ? await instantiateDev(host) : (await WebAssembly.instantiateStreaming(fetch(new URL("./game.wasm", import.meta.url)), { host })).instance.exports;
   const abi = exports.psxw_abi_version();
   if (abi !== ABI_VERSION) throw new Error(`game.wasm ABI ${abi}, host ABI ${ABI_VERSION}`);
 
@@ -175,6 +232,9 @@ async function run({ canvas, cue, padBuffer, options }) {
   }
   disc.close();
   const seconds = (performance.now() - t0) / 1000;
-  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames });
+  const sorted = frameTimes.slice().sort((a, b) => a - b);
+  const pct = (p) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] * 100) / 100 : null);
+  const frameMs = { p50: pct(50), p95: pct(95), p99: pct(99), max: pct(100) };
+  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs });
   postMessage({ type: "stopped", reason, frame });
 }

@@ -93,6 +93,7 @@ function start(cue) {
     verify: params.has("verify"),
     replay: params.get("replay"),
     hashAt: (params.get("hash") || "").split(",").filter(Boolean).map(Number),
+    dev: params.has("dev"),
   };
   worker.onmessage = (e) => {
     const m = e.data;

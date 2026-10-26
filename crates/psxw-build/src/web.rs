@@ -1,10 +1,12 @@
 //! `psxw build-web <game>` (M5): the browser bundle in `out/web/<game>/`:
 //! `web/`'s page, Worker and worklet, the game's `game.wasm`, and the
 //! renderer (`psxw-host-web` through the pinned wasm-bindgen CLI) in
-//! `pkg/`. Local only: `game.wasm` is game-derived.
+//! `pkg/`, and the unmerged guest.wasm and runtime.wasm for dev mode.
+//! Local only: the wasm modules are game-derived.
 
 use anyhow::{Context as _, Result, bail};
 use psxw_inputs::Workspace;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -25,7 +27,66 @@ pub fn build(ws: &Workspace, game: &str) -> Result<PathBuf> {
         }
     }
     std::fs::copy(&report.wasm, dir.join("game.wasm"))?;
+    // Dev mode (`?dev`): the unmerged modules, wired in the Worker.
+    std::fs::copy(crate::game::out_dir(ws, game).join("guest.wasm"), dir.join("guest.wasm"))?;
+    std::fs::copy(crate::runtime::path(ws), dir.join("runtime.wasm"))?;
+    check_dev(&dir)?;
     Ok(dir)
+}
+
+fn interface(path: &std::path::Path) -> Result<(Vec<(String, String)>, BTreeSet<String>)> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let (mut imports, mut exports) = (Vec::new(), BTreeSet::new());
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        match payload? {
+            wasmparser::Payload::ImportSection(r) => {
+                for i in r.into_imports() {
+                    let i = i?;
+                    imports.push((i.module.to_string(), i.name.to_string()));
+                }
+            }
+            wasmparser::Payload::ExportSection(r) => {
+                for e in r {
+                    exports.insert(e?.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((imports, exports))
+}
+
+/// Dev mode wires guest.wasm and runtime.wasm the way wasm-merge does
+/// (worker.js `instantiateDev`): the guest's `psx.*` imports are runtime
+/// exports, the runtime's `guest.*` imports are guest exports, everything
+/// else is `host.*`, the pair exports all that game.wasm does, and both
+/// carry the same adapter table.
+fn check_dev(dir: &std::path::Path) -> Result<()> {
+    let guest_table = crate::runtime::adapters(&std::fs::read(dir.join("guest.wasm"))?)?;
+    if guest_table != crate::runtime::adapters(&std::fs::read(dir.join("runtime.wasm"))?)? {
+        bail!("guest.wasm was linked against another runtime's adapter table");
+    }
+    let (gi, ge) = interface(&dir.join("guest.wasm"))?;
+    let (ri, re) = interface(&dir.join("runtime.wasm"))?;
+    let (_, game) = interface(&dir.join("game.wasm"))?;
+    let mut bad: Vec<String> = Vec::new();
+    for (m, n) in &gi {
+        if m != "psx" || !re.contains(n) {
+            bad.push(format!("guest.wasm imports {m}.{n}"));
+        }
+    }
+    for (m, n) in &ri {
+        match m.as_str() {
+            "guest" if ge.contains(n) => {}
+            "host" => {}
+            _ => bad.push(format!("runtime.wasm imports {m}.{n}")),
+        }
+    }
+    bad.extend(game.iter().filter(|n| !ge.contains(*n) && !re.contains(*n)).map(|n| format!("game.wasm exports {n}, the pair doesn't")));
+    if !bad.is_empty() {
+        bail!("dev mode can't wire guest.wasm and runtime.wasm: {}", bad.join("; "));
+    }
+    Ok(())
 }
 
 /// The renderer package (`psxw-host-web` and its wasm-bindgen glue) in
