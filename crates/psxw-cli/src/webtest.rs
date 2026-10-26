@@ -4,6 +4,9 @@
 //! (`vectors.bin`). `web/test/gpu.html` runs them through psxw-host-web's
 //! WebRenderer in headless Chromium and Firefox (the `psxw-browsers`
 //! image, D44), and each readback must equal the golden byte for byte.
+//!
+//! `psxw web-test storage` (M7): memory cards through OPFS
+//! (`web/cards.js`, `web/test/storage.html`).
 
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_inputs::Workspace;
@@ -13,6 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 pub const USAGE: &str = "web-test gpu [--browsers chromium,firefox] [--timeout SECONDS] \
+                         | web-test storage [--browsers ..] [--timeout S] \
                          | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--browsers ..] [--timeout S]";
 const IMAGE: &str = "psxw-browsers:local";
 
@@ -205,6 +209,53 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     Ok(pass)
 }
 
+/// Memory-card import and export and the Worker's save path, through OPFS
+/// in each browser: every check in `web/test/storage.js` must pass.
+fn storage(ws: &Workspace, args: &[&str]) -> Result<bool> {
+    let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
+    let mut timeout = 120u32;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--browsers" => browsers = it.next().context("--browsers needs a value")?.split(',').map(str::to_string).collect(),
+            "--timeout" => timeout = it.next().context("--timeout needs a value")?.parse()?,
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let id = image(ws)?;
+    let bundle = ws.out_dir().join("web").join("test-storage");
+    let _ = std::fs::remove_dir_all(&bundle);
+    std::fs::create_dir_all(&bundle)?;
+    std::fs::copy(ws.root.join("web/cards.js"), bundle.join("cards.js"))?;
+    for f in ["storage.html", "storage.js", "storage-worker.js"] {
+        std::fs::copy(ws.root.join("web/test").join(f), bundle.join(f))?;
+    }
+    let results = ws.out_dir().join("web").join("test-storage-results");
+    let _ = std::fs::remove_dir_all(&results);
+    std::fs::create_dir_all(&results)?;
+    let mut argv_args: Vec<String> = vec!["storage.html".into(), timeout.to_string()];
+    argv_args.extend(browsers.iter().cloned());
+    let argv = docker_run(&id, &owner_of(&results)?, &[(bundle, "/www", true), (results.clone(), "/out", false)], None, &argv_args);
+    ensure!(Command::new("docker").args(&argv).status()?.success(), "the browser container failed");
+    let mut pass = true;
+    for b in &browsers {
+        let Ok(text) = std::fs::read_to_string(results.join(format!("result-{b}.json"))) else {
+            println!("{b}: no result within {timeout} s");
+            pass = false;
+            continue;
+        };
+        let r: serde_json::Value = serde_json::from_str(&text)?;
+        let ok = r["pass"].as_bool() == Some(true);
+        pass &= ok;
+        let checks = r["checks"].as_array().map_or(0, Vec::len);
+        println!("{b}: {} — {checks} storage checks{}", if ok { "PASS" } else { "FAIL" }, r["error"].as_str().map(|e| format!(" ({e})")).unwrap_or_default());
+        for c in r["checks"].as_array().into_iter().flatten().filter(|c| c["pass"] != true) {
+            println!("  failed: {}", c["name"]);
+        }
+    }
+    Ok(pass)
+}
+
 /// A replay with nothing pressed for `frames` frames.
 fn psxw_abi_replay_none(frames: u64) -> Vec<u8> {
     psxw_oracle::play::replay_from_presses("none", frames as u32, &[]).expect("empty replay")
@@ -220,6 +271,7 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
             let g = it.next().context("web-test game needs a game")?;
             return game(ws, g, &args[2..]);
         }
+        Some(&"storage") => return storage(ws, &args[1..]),
         _ => bail!("usage: psxw {USAGE}"),
     }
     while let Some(a) = it.next() {

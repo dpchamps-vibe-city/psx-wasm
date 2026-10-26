@@ -78,10 +78,10 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M2](M02-whole-game-link-and-boot.md) | Whole-game link and headless boot | **in progress** (build passes; boot runs wait for the disc) | M1 | Boot RAM == EXE; CD sectors verify; overlays dispatch; main loop; determinism |
 | [M3](M03-oracle-harness.md) | Oracle harness (Docker) | **in progress** (tasks 8–9 implemented; exit criteria 4–5 wait for the disc) | M0 (*parallel* with M1–M2) | Exact-by-construction vectors reproduce through the emulator |
 | [M4](M04-pixels.md) | Pixels | **in progress** (GTE and GPU devices exact vs the oracle; the pad runs over SIO0, D40) | M2, M3 | GTE/GPU vectors byte-exact vs goldens; adapter conformance; RAM by symbol |
-| [M5](M05-browser.md) | Browser host | **in progress** (browser renderer exact in Chromium and Firefox; game determinism waits for the disc) | M4 | Cross-host determinism (browser == native hashes) |
-| [M6](M06-sound.md) | Sound | not started | M2, M3 (*parallel* with M4–M5) | SPU/XA vectors vs goldens; libspu conformance |
-| [M7](M07-saves-and-play-session.md) | Saves and full play session | **in progress** (memory cards: device, HLE BIOS, libmcrd as guest code) | M4, M6 | Card checksums; game accepts its saves; RAM by symbol over a day |
-| [M8](M08-sdk-generality.md) | SDK generality | not started | M2 (*parallel* with M4–M7) | Per-object adapter conformance; psyq-decomp C == translated |
+| [M5](M05-browser.md) | Browser host | **in progress** (browser renderer exact in Chromium and Firefox; context loss, dev mode; game determinism waits for the disc) | M4 | Cross-host determinism (browser == native hashes) |
+| [M6](M06-sound.md) | Sound | **in progress** (SPU device and vectors) | M2, M3 (*parallel* with M4–M5) | SPU/XA vectors vs goldens; libspu conformance |
+| [M7](M07-saves-and-play-session.md) | Saves and full play session | **in progress** (memory cards: device, HLE BIOS, libmcrd as guest code; native and OPFS storage) | M4, M6 | Card checksums; game accepts its saves; RAM by symbol over a day |
+| [M8](M08-sdk-generality.md) | SDK generality | **in progress** (identity, boundary, layouts, conformance; the .LIB converter and psyq-decomp C remain) | M2 (*parallel* with M4–M7) | Per-object adapter conformance; psyq-decomp C == translated |
 | [M9](M09-second-game.md) | Second game | not started | M7, M8 | All gates with only a manifest |
 | [M10](M10-hardware-oracle.md) | Hardware oracle | not started | M3; a rig | Vector archive replayed on hardware |
 

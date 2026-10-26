@@ -1,6 +1,6 @@
 # M7 — Saves and a full play session
 
-**Status:** in progress (tasks 1–2 and the native half of 3)
+**Status:** in progress (tasks 1–3; 4–6 wait for the disc and a human recording)
 **Depends on:** M4, M6 (and M5 for browser storage). **Unlocks:** M9.
 **Design refs:** design: Runtime (sio), Oracles (whole-game); decisions
 D21–D23.
@@ -59,8 +59,10 @@ absent).
 2. [x] Adapters plus conformance (SIO card decoder). *(D43: libmcrd runs
    as guest code over the HLE BIOS card functions, with no adapters;
    `psxw conform btn --lib libmcrd` checks it end to end.)*
-3. [ ] Host storage: native and OPFS. *(Native done: `card0.mcr` and
-   `card1.mcr` in the run's storage directory. OPFS comes with M5.)*
+3. [x] Host storage: native and OPFS. *(Native: `card0.mcr` and
+   `card1.mcr` in the run's storage directory. Browser: the same names in
+   OPFS `saves/`, imported and exported from the page; `psxw web-test
+   storage`.)*
 4. [ ] `save-and-reload` replay; checks: the frame checksums are valid,
    and the game reports a successful load with the expected save
    contents, as an assertion on save-data symbols.
@@ -124,5 +126,25 @@ absent).
     - `MemCardGetDirentry` goes through libapi's `firstfile`;
     - the conformance driver needed stack arguments
       (`Conform::call_args`).
+- **2026-10-26** (this commit): task 3, the browser half.
+  - **`web/cards.js`:** the page and the Worker share it. Cards are
+    `saves/card0.mcr` and `saves/card1.mcr` in OPFS, the names the
+    runtime uses natively.
+    - The page imports raw 128 KiB images and refuses any other size,
+      as `Card::from_image` does. It exports a card as a `.mcr`
+      download.
+    - Import is refused once the game has started: the Worker loaded
+      the cards at start and would overwrite the import.
+  - **`psxw web-test storage`** (gate `web-storage`) runs six checks in
+    Chromium and Firefox; all pass. They cover:
+    - import then export, byte-exact;
+    - a wrong-size image refused;
+    - an empty slot exporting nothing;
+    - the Worker (sync access handles, as `worker.js` uses them) loading
+      the imported card;
+    - a save the Worker persists exporting byte-exact;
+    - the directory holding just the two cards.
+
+    A Worker that drops one byte fails the check.
 
 ## Findings

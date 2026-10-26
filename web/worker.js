@@ -4,8 +4,8 @@
 //   wall-clock deadline (no pacing in verify mode);
 // - the disc: a .cue/.bin image in OPFS (`disc/`), sync access handles;
 // - pads: the main thread's SharedArrayBuffer, or a replay file;
-// - storage (memory cards): files in OPFS `saves/`, loaded at start and
-//   written back as the game saves;
+// - storage (memory cards): files in OPFS `saves/` (cards.js), loaded at
+//   start and written back as the game saves;
 // - rendering: psxw-host-web's WebRenderer (psx-render-gl on WebGL2) on
 //   the OffscreenCanvas.
 //
@@ -22,6 +22,7 @@
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
+import { loadSaves, persist, savesDir } from "./cards.js";
 
 const ABI_VERSION = 3;
 const NOTHING_PRESSED = 0xffff;
@@ -43,22 +44,6 @@ function replayButtons(replay, frame, port) {
   const frames = dv.getUint32(16, true);
   if (frame >= frames) return NOTHING_PRESSED;
   return dv.getUint16(REPLAY_HEADER + 4 * frame + 2 * port, true);
-}
-
-async function loadSaves(dir) {
-  const files = new Map();
-  for await (const [name, handle] of dir.entries()) {
-    if (handle.kind === "file") files.set(name, new Uint8Array(await (await handle.getFile()).arrayBuffer()));
-  }
-  return files;
-}
-
-async function persist(dir, name, data) {
-  const h = await (await dir.getFileHandle(name, { create: true })).createSyncAccessHandle();
-  h.truncate(0);
-  h.write(data, { at: 0 });
-  h.flush();
-  h.close();
 }
 
 /**
@@ -111,7 +96,7 @@ async function run({ canvas, cue, padBuffer, options }) {
 
   const root = await navigator.storage.getDirectory();
   const disc = await Disc.open(await root.getDirectoryHandle("disc"), cue);
-  const saveDir = await root.getDirectoryHandle("saves", { create: true });
+  const saveDir = await savesDir();
   const saves = await loadSaves(saveDir);
   const replay = options.replay ? new Uint8Array(await (await fetch(options.replay)).arrayBuffer()) : null;
   const pad = new Int32Array(padBuffer); // [seq, port 1 buttons, port 2 buttons or -1]

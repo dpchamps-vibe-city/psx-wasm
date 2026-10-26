@@ -106,6 +106,10 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         let ok = crate::webtest::run(ws, &["gpu"])?;
         Ok((ok, "every GPU vector through the browser renderer in Chromium and Firefox".into()))
     })());
+    gate(&mut gates, "web-storage", "M7", (|| {
+        let ok = crate::webtest::run(ws, &["storage"])?;
+        Ok((ok, "memory cards through OPFS in Chromium and Firefox".into()))
+    })());
     gate(&mut gates, "web-game", "M5", (|| {
         let ok = crate::webtest::run(ws, &["game", game])?;
         Ok((ok, "RAM and VRAM hashes, native vs browsers".into()))

@@ -5,6 +5,7 @@ The browser host (M5), plain ES modules with no build step:
 - `index.html`, `main.js`: the page. It imports a disc (.cue and .bin) into OPFS, polls the keyboard and gamepads into a SharedArrayBuffer, sets up audio (an AudioWorklet playing silence until M6), and starts the Worker.
 - `worker.js`: runs `game.wasm` and implements its host interface: pacing with `Atomics.wait`, disc reads from OPFS, pads, saves in OPFS, and the renderer (`pkg/`, built from `crates/psxw-host-web`).
 - `disc.js`: .cue/.bin over OPFS sync access handles, with the native host's rules.
+- `cards.js`: memory cards in OPFS `saves/` (`card0.mcr`, `card1.mcr`), imported and exported as raw 128 KiB images from the page (before Start), loaded and written back by the Worker.
 - `audio.js`: the AudioWorklet.
 
 To try it:

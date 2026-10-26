@@ -1,9 +1,11 @@
-// The main thread (M5): disc import into OPFS, input polling into a
-// SharedArrayBuffer, audio setup (silence until M6), and the Worker that
-// runs the game. Query parameters for tests: ?cue=NAME&frames=N&verify
+// The main thread (M5): disc import into OPFS, memory-card import and
+// export (cards.js), input polling into a SharedArrayBuffer, audio setup
+// (silence until M6), and the Worker that runs the game. Query parameters for tests: ?cue=NAME&frames=N&verify
 // &replay=URL&hash=F,F,...&autostart; ?discurl=URL imports the .cue at URL
 // (and the .bin files it names, beside it) into OPFS first; ?post=NAME
 // POSTs the hashes to /result?browser=NAME when the run stops.
+
+import { exportCard, importCard } from "./cards.js";
 
 const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
@@ -132,8 +134,35 @@ discInput.addEventListener("change", async () => {
     say(String(e));
   }
 });
+// Cards are read when the game starts and written as it saves: importing
+// one into a running game would be overwritten, so only before Start.
+let running = false;
+for (const slot of [0, 1]) {
+  const input = document.getElementById(`card${slot}`);
+  input.addEventListener("change", async () => {
+    try {
+      if (running) throw new Error("import cards before pressing Start");
+      await importCard(slot, new Uint8Array(await input.files[0].arrayBuffer()));
+      say(`imported ${input.files[0].name} into slot ${slot + 1}`);
+    } catch (e) {
+      say(String(e));
+    }
+    input.value = "";
+  });
+  document.getElementById(`export${slot}`).addEventListener("click", async () => {
+    const bytes = await exportCard(slot);
+    if (!bytes) return say(`slot ${slot + 1} has no card yet`);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    a.download = `card${slot + 1}.mcr`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+}
+
 startButton.addEventListener("click", async () => {
   startButton.disabled = true;
+  running = true;
   await startAudio();
   requestAnimationFrame(pollInput);
   start(cue);
