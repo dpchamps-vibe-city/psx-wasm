@@ -1,0 +1,17 @@
+[package]
+name = "psxw-gpu-oracle"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "psx-wasm's GPU (front end + GL backend in the pinned Mesa image) as an oracle device under test"
+
+[dependencies]
+anyhow = "1.0.104"
+psx-devices = { path = "../psx-devices" }
+psx-render-gl = { path = "../psx-render-gl" }
+psxw-abi = { path = "../psxw-abi" }
+psxw-inputs = { path = "../psxw-inputs" }
+psxw-oracle = { path = "../psxw-oracle" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"

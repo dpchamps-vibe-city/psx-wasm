@@ -10,11 +10,17 @@
 
 #![no_std]
 
+pub mod render;
 pub mod replay;
 
 /// Bumped whenever the host interface, the guest/runtime seam or the boot
 /// options change. `game.wasm` exports it; hosts refuse a mismatch.
-pub const ABI_VERSION: u32 = 1;
+///
+/// - 1: M2's host interface ([`host`]).
+/// - 2: adds the renderer command interface ([`render`], version
+///   [`render::RENDER_VERSION`]) and its host imports
+///   [`render::imports`] (`render_submit`, `render_readback`, `present`).
+pub const ABI_VERSION: u32 = 2;
 
 /// wasm address of guest physical address 0. Folded into every guest
 /// load/store's `memarg` offset, so translation costs one `i32.and`.

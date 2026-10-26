@@ -9,6 +9,7 @@
 
 pub mod cd;
 pub mod clock;
+pub mod gpu;
 pub mod mem;
 pub mod timers;
 
