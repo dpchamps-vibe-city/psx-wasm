@@ -308,7 +308,7 @@ mailbox, the store and the encoding end to end. It also supplies the
   recorder) and the CLI (`crates/psxw-cli/src/oracle.rs`). Runner fixes
   found by the selftest: per-packet GP0 pacing, DMA uploads, diagnostic
   mailbox fields.
-- **2026-10-26** (this commit): `images build --no-cache`; core and host
+- **2026-10-26** (`ab7d061`): `images build --no-cache`; core and host
   hashes in the image sources and in provenance; docs. Results, all from
   `psxw oracle …`:
   - `images build --no-cache` rebuilt both images from scratch: same
