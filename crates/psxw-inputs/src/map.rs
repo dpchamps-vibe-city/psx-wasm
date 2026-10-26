@@ -25,6 +25,10 @@ pub struct Container {
     pub sha1: Option<String>,
     /// File-offset ↔ guest-address mapping: (file range, vram start).
     pub segments: Vec<(Range<u32>, u32)>,
+    /// Code (`.text`) ranges in guest addresses, adjacent subsegments merged.
+    pub text: Vec<Range<u32>>,
+    /// Start of each object's or TU's `.text` (each begins with a function).
+    pub text_starts: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,10 +176,20 @@ impl AddressMap {
 fn container_from(cfg: &SplatConfig, is_main: bool) -> Container {
     let mut tus = Vec::new();
     let mut sdk = Vec::new();
+    let mut text: Vec<Range<u32>> = Vec::new();
+    let mut text_starts = Vec::new();
     let lo = cfg.code.iter().map(|s| s.vram).min().unwrap_or(0);
     let hi = cfg.code.iter().map(|s| s.vram_end()).max().unwrap_or(0);
     for seg in &cfg.code {
         for sub in &seg.subsegments {
+            if is_text(sub) && sub.rom_end > sub.rom_start {
+                let r = seg.vram_of(sub.rom_start)..seg.vram_of(sub.rom_end);
+                text_starts.push(r.start);
+                match text.last_mut() {
+                    Some(last) if last.end == r.start => last.end = r.end,
+                    _ => text.push(r),
+                }
+            }
             let Some(name) = &sub.name else { continue };
             match sub.kind.as_str() {
                 "c" => tus.push(TranslationUnit {
@@ -204,6 +218,18 @@ fn container_from(cfg: &SplatConfig, is_main: bool) -> Container {
         target_path: cfg.target_path.clone(),
         sha1: cfg.sha1.clone(),
         segments: cfg.code.iter().map(|s| (s.rom_start..s.rom_end, s.vram)).collect(),
+        text,
+        text_starts,
+    }
+}
+
+/// splat subsegment kinds that hold instructions. An `o` (object) entry with
+/// no section argument is that object's `.text`.
+fn is_text(sub: &splat::Subsegment) -> bool {
+    match sub.kind.as_str() {
+        "c" | "asm" | "hasm" => true,
+        "o" => sub.args.first().is_none_or(|s| s == ".text"),
+        _ => false,
     }
 }
 

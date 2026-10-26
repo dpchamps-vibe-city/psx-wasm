@@ -240,6 +240,7 @@ dependencies = [
  "anyhow",
  "psxw-census",
  "psxw-inputs",
+ "psxw-lift",
 ]
 
 [[package]]
@@ -274,7 +275,13 @@ dependencies = [
 name = "psxw-lift"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "psxw-cc",
  "psxw-inputs",
+ "psxw-link",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

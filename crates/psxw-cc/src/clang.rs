@@ -81,4 +81,18 @@ impl Clang {
         let out = cmd.arg(i_path).arg("-o").arg(obj).output().context("running clang -c")?;
         Ok((out.status.success(), diag::parse_clang(&String::from_utf8_lossy(&out.stderr))))
     }
+
+    /// Compile self-contained generated C (the lift tier) with the same
+    /// optimization and UB-containment flags as guest C. Returns success and
+    /// clang's diagnostics.
+    pub fn compile_generated(&self, src: &Path, obj: &Path, include: &Path) -> Result<(bool, String)> {
+        let mut cmd = self.base();
+        cmd.args(["-c", "-O2", "-fno-builtin", "-nostdinc", "-fno-caret-diagnostics"])
+            .args(["-Wno-unused-label", "-Wno-unused-variable", "-Wno-unused-but-set-variable"])
+            .args(crate::UB_CONTAINMENT_FLAGS)
+            .arg("-I")
+            .arg(include);
+        let out = cmd.arg(src).arg("-o").arg(obj).output().context("running clang -c")?;
+        Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+    }
 }

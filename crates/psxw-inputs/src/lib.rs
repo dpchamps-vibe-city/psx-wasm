@@ -8,6 +8,7 @@ pub mod game;
 pub mod lock;
 pub mod map;
 pub mod originals;
+pub mod psxexe;
 pub mod snapshot;
 pub mod splat;
 pub mod symbols;

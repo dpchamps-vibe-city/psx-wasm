@@ -36,6 +36,17 @@ impl Originals {
         Ok(out)
     }
 
+    /// The whole original file of a container.
+    pub fn file(&self, container: &str) -> Option<&[u8]> {
+        self.images.get(container).map(|img| img.bytes.as_slice())
+    }
+
+    /// Little-endian word at a guest address.
+    pub fn word(&self, container: &str, addr: u32) -> Option<u32> {
+        let b = self.read(container, addr, 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     /// Original bytes at a guest address in a container.
     pub fn read(&self, container: &str, addr: u32, len: usize) -> Option<&[u8]> {
         let img = self.images.get(container)?;
