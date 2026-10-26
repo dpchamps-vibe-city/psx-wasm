@@ -285,7 +285,7 @@ golden.
     vectors (150 and 300 per generator), 0 differ.
   - `cargo test` on the touched crates passes, including
     `psxw-gpu-oracle`'s present test in the pinned image.
-- **2026-10-26** (`dac9bb6`): three generators exercising the plumbing
+- **2026-10-26** (`dac9bb6`, `dc5e638`): three generators exercising the plumbing
   rather than one feature: `mix` (20–60 primitives of every kind per
   vector, with fills, copies, uploads and state changes between them),
   `clut-many` (more colour-table reloads in one batch than there
