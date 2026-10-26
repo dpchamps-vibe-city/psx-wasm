@@ -27,7 +27,7 @@ cargo build --release -p psxw-cli
 | `crates/psxw-census` | M0 census: coverage, references, data and layout checks, report |
 | `crates/psxw-lift` | MIPS → wasm, ahead of time (lift tier); not started |
 | `crates/psxw-link` | Final link of `guest.wasm`; the relocatable wasm object reader so far |
-| `crates/psx-gte` | GTE math library; not started |
+| `crates/psx-gte` | GTE, exact per psx-spx; checked by `psxw oracle check <game> --device gte` |
 | `crates/psx-runtime` | SDK services: kernel, clock, gpu, spu, cd, pad, memcard; not started |
 | `crates/psxw-host-native` | wasmtime host (tests, replays, headless); not started |
 | `crates/psxw-host-web` | Browser runtime (`runtime.wasm`); not started |
