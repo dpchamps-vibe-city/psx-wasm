@@ -402,6 +402,19 @@ Game-visible time is **virtual and deterministic**:
   input log always produce the same frames. That gives replays, golden-frame
   tests in CI, and bisection for free.
 
+**Interrupts are the BIOS's exception handler, run at safepoints** (D45).
+An IRQ becomes steps: every `SysEnqIntRP` element, priority 0 to 3, then
+the exit. The exit is the custom one `HookEntryInt` installed if there is
+one (libetc's), entered like a longjmp into the `setjmp` that made its
+buffer. `ReturnFromException` leaves from any depth.
+- **Translated code follows this** through wasm exceptions:
+  - a `setjmp` (A0h:13h) caller saves its registers inline;
+  - the return address is a continuation entry that reloads them;
+  - B0h:17h throws;
+  - the guest export `guest_invoke_irq` catches the throw and restores
+    `$sp`/`$gp`.
+- **So the SDK's own interrupt code runs unchanged.**
+
 Drawing is synchronous inside the runtime: the GPU finishes "instantly".
 Completion callbacks still arrive at the next safepoint, not re-entrantly
 inside `DrawOTag`. CD timing is a runtime toggle, with a per-game default in
@@ -432,7 +445,9 @@ care which of the two is in use.
   checks the merged module's exports and imports against it, and hosts
   refuse a mismatched `psxw_abi_version`.
 - **Dev mode can keep them separate.** Unmerged, the two modules share the
-  same memory and the host wires the seam at instantiation.
+  same memory and the host wires the seam at instantiation (the browser's
+  `?dev`). The guest records the adapter table it was linked against, so
+  a swapped runtime with another table is refused.
 - **The host interface is the only seam.** `game.wasm` imports a small host
   interface: frame pacing, audio output, input, disc reads, and the
   renderer command interface (see Runtime). The browser host implements it
@@ -575,17 +590,24 @@ a call into guest code.
   the clock.
 - **Presentation.** OffscreenCanvas inside the worker, drawing with the
   WebGL2 backend.
-- **Audio.** The SPU writes each frame's samples into a SharedArrayBuffer
-  ring, and an AudioWorklet drains it. The ring's fill level drives
-  frame-pacing correction, so audio is the master clock.
+- **Audio.** At each vblank the runtime hands the host the 44.1 kHz frames
+  that fell due in virtual time (`host.audio`). The worker writes them
+  into a SharedArrayBuffer ring, and an AudioWorklet drains it. Pacing
+  still waits for each frame's wall-clock deadline. Letting the ring's
+  fill level correct it, which would make audio the master clock, is not
+  done yet.
 - **Input.** The main thread polls the Gamepad API (it isn't available in
   workers) and keyboard state, and writes them into a SharedArrayBuffer.
 - **Disc.** The user drops a `.bin`/`.cue` file, which is copied into OPFS.
   The worker reads it synchronously through `FileSystemSyncAccessHandle`.
-  Memory cards are stored in OPFS too.
+  Memory cards are stored in OPFS too, as raw `.mcr` images the page
+  imports and exports.
+- **Context loss.** VRAM is shadowed every 60 frames and uploaded into a
+  new renderer when the WebGL context comes back.
 - **Cross-origin isolation.** `SharedArrayBuffer` requires COOP/COEP
-  headers. A webview shell such as Tauri/wry sets them on its custom
-  protocol; a static host needs them configured.
+  headers. `psxw serve` sets them; a static host needs them configured.
+  A webview shell (Tauri/wry) could set them on its custom protocol, but
+  for now the target is a browser tab only (D46).
 
 ## Oracles
 
