@@ -14,6 +14,19 @@ and turn every emulator–hardware disagreement into a documented finding.
 This also gives CD drive timing its first real oracle, and the BIOS its
 real one.
 
+## Context from M3
+
+- The mailbox protocol (`crates/psxw-oracle/src/wire.rs`, generated C
+  header) is transport-independent: batches of ops in, a result record
+  per op out. A serial transport frames the same batches.
+- On the emulator the runner boots from a disc; on hardware it is
+  uploaded. `oracle/runner/start.s` sets its own stack, turns interrupts
+  off and needs no BIOS state, except for BIOS_CALL.
+- GP0 is paced per packet (wait for GPUSTAT bit 26, then send whole
+  commands); never per word on bit 28.
+- Hardware goldens go in target directories named `hw-…`;
+  `psxw oracle check` already prefers them to emulator goldens.
+
 ## The rig
 
 - **Console:** an original PS1 model with the serial port (the later PSone

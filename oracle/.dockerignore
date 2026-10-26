@@ -1,0 +1,3 @@
+runner/build/
+**/*.o
+emulator-host/psxw-emu-host

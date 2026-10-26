@@ -1,6 +1,6 @@
 # M3 — Oracle harness (Docker)
 
-**Status:** not started
+**Status:** in progress (tasks 1–7, 10, 11 done; 8–9 wait for M2)
 **Depends on:** M0. Parallel with M1–M2; the whole-game tasks (8–9) need
 M2's runs. **Unlocks:** M4, M6, M7, M10.
 **Design refs:** design: Oracles (device harness, per-device status,
@@ -108,7 +108,9 @@ construction.
 - **Modes:**
   - `exe --exe runner.exe --vectors in.bin --out out.bin`: load the runner
     as content, run until the runner's mailbox says ready, then exchange
-    vectors.
+    vectors. *As built:* `exe --disc psxw-runner.cue …`, because Beetle's
+    EXE loader cannot start a program under OpenBIOS (Findings); `--exe`
+    remains for other BIOSes.
   - `play --cue disc.cue --replay r.bin --trace-u32 ADDR --dump-at F,… --out dir/`:
     run the original game with replayed pad input. Record the u32 at ADDR
     (the frame counter) every frame, and dump main RAM at the given
@@ -125,6 +127,15 @@ construction.
 
   Large state (VRAM or SPU RAM images) is streamed in chunks over several
   exchanges.
+
+  *As built* (`crates/psxw-oracle/src/wire.rs`): every exchange is a
+  batch of runner ops (ECHO, INFO, GPU_RESET, VRAM_WRITE, VRAM_READ,
+  GPU_EXEC, GTE_EXEC, SPU_RESET, SPU_RAM_WRITE, SPU_RUN, BIOS_CALL), and
+  the result holds one status and result per op. The driver
+  (`psxw-oracle::script`) compiles each vector kind into ops, chunks large
+  state, and packs as many ops into each exchange as fit. The header also
+  carries `seq`/`ack_seq`, the runner and wire versions, a heartbeat, and
+  two diagnostic fields naming the last device wait that timed out.
 
 ### Runner (`oracle/runner/`, C on PSn00bSDK)
 
@@ -222,11 +233,13 @@ mailbox, the store and the encoding end to end. It also supplies the
 
 ## Tasks
 
-1. [ ] Pin sources in `inputs.lock`: beetle-psx-libretro commit, PCSX-Redux
+1. [x] Pin sources in `inputs.lock`: beetle-psx-libretro commit, PCSX-Redux
    commit (OpenBIOS), PSn00bSDK release and toolchain, base image digests.
-2. [ ] `psxw-oracle-emu` Dockerfile: Beetle software build, OpenBIOS
+2. [x] `psxw-oracle-emu` Dockerfile: Beetle software build, OpenBIOS
    build, the emulator host. `psxw oracle images build`.
-3. [ ] **BIOS gate.** Boot a trivial PS-X EXE under Beetle with OpenBIOS.
+3. [x] **BIOS gate.** Boot a trivial PS-X EXE under Beetle with OpenBIOS.
+   (Outcome: OpenBIOS works; EXE side-loading doesn't, so the runner boots
+   from a disc as the risks section prescribes. See Findings.)
    - If Beetle refuses the BIOS or misbehaves, record the evidence in
      Findings.
    - Then evaluate, in order: Beetle options that relax BIOS checks; a
@@ -234,22 +247,24 @@ mailbox, the store and the encoding end to end. It also supplies the
      identification, never emulation; a human-supplied BIOS from their own
      console.
    - Stop and ask the human before taking a fallback.
-4. [ ] `psxw-psx-sdk` Dockerfile and the runner skeleton: mailbox, ready
+4. [x] `psxw-psx-sdk` Dockerfile and the runner skeleton: mailbox, ready
    and echo vector.
-5. [ ] `psxw-oracle` vector formats, store, provenance, C header
+5. [x] `psxw-oracle` vector formats, store, provenance, C header
    generation, the target driver for Docker.
-6. [ ] Runner kinds GPU_DRAW, GPU_TRANSFER, GTE_OP, SPU_RUN, BIOS_CALL;
+6. [x] Runner kinds GPU_DRAW, GPU_TRANSFER, GTE_OP, SPU_RUN, BIOS_CALL;
    one handwritten vector of each through the whole pipeline.
-7. [ ] Exact-by-construction generators plus `psxw oracle selftest`.
+7. [x] Exact-by-construction generators plus `psxw oracle selftest`.
 8. [ ] *(needs M2)* Replay format in `psxw-abi`; the emulator host's
    `play` mode; frame-counter tracing; RAM dumps; `psxw oracle play`.
 9. [ ] *(needs M2)* `psxw oracle ramdiff`: psx-wasm side (the M2 host
    gains `--replay`, `--trace-u32` and `--dump-at`), alignment,
    by-symbol comparison, report.
-10. [ ] Recorder interface (`psxw-oracle::record`) that devices call; the
+10. [x] Recorder interface (`psxw-oracle::record`) that devices call; the
     per-device hooks are done in M4/M6.
-11. [ ] Add the oracle self-test and image checks to `psxw ci`. Update
-    docs and the README status.
+11. [x] Add the oracle self-test and image checks to `psxw ci`. Update
+    docs and the README status. (`psxw ci` doesn't exist yet: the gate is
+    `psxw oracle ci` = `psxw_oracle::commands::ci`, for `psxw ci` to call;
+    see Findings.)
 
 ## Exit criteria (all automated)
 
@@ -281,4 +296,156 @@ mailbox, the store and the encoding end to end. It also supplies the
 
 ## Progress log
 
+- **2026-10-26** (`2483fcf`): pins in `inputs.lock` (`[oracle]`, parsed by
+  `psxw-inputs::lock`); `oracle/docker` (`psxw-oracle-emu`,
+  `psxw-psx-sdk`); `oracle/emulator-host` (`psxw-emu-host`);
+  `oracle/runner` with every v1 op; `psxw-oracle::wire` and the generated
+  `oracle/include/psxw_oracle_wire.h`. BIOS gate: OpenBIOS works, EXE
+  side-loading doesn't, so the runner boots from a disc (Findings).
+- **2026-10-26** (`9e869a2`): the `psxw-oracle` crate (vectors, stores,
+  provenance, verdicts, script compilation and packing, Docker target,
+  exact-by-construction generators, handwritten vectors, reports,
+  recorder) and the CLI (`crates/psxw-cli/src/oracle.rs`). Runner fixes
+  found by the selftest: per-packet GP0 pacing, DMA uploads, diagnostic
+  mailbox fields.
+- **2026-10-26** (`ab7d061`): `images build --no-cache`; core and host
+  hashes in the image sources and in provenance; docs. Results, all from
+  `psxw oracle …`:
+  - `images build --no-cache` rebuilt both images from scratch: same
+    commits, and bit-identical OpenBIOS (sha1 `8b344d0d…`), Beetle core
+    (sha256 `a24f8a70…`), host (`76b44760…`), runner EXE (`ae1204b7…`)
+    and runner disc (`628f75b7…`); only the local image ids differ.
+  - `selftest`: 1,050 vectors (seed `0x505358574d330001`, 150 per
+    generator; GP0 by port 298, block 293, linked list 309), all
+    verified; about 4 s including boot (44 exchanges of one frame each).
+  - `capture --missing` then `capture`: 24 handwritten vectors (13 GTE,
+    2 SPU, 5 BIOS, 3 GPU, 1 echo) captured with provenance; every one of
+    the 1,074 stored vectors reproduced byte for byte, across a
+    from-scratch image rebuild and across different batch compositions.
+  - `check btn --device gpu` reports the 1,053 GPU vectors unresolved
+    (no implementation yet) and exits non-zero; `ci` passes.
+  - `cargo test --workspace` passes (the Docker test skips when Docker or
+    the images are missing).
+
 ## Findings
+
+### The BIOS gate (exit criterion 6): OpenBIOS works; the runner boots from a disc
+
+- **Beetle accepts OpenBIOS as is.** The core option
+  `beetle_psx_override_bios = openbios` loads `openbios.bin` from the
+  system directory with no SHA-1 check (log: "Override firmware found …
+  SHA1 8B344D0D…"). No option relaxing BIOS checks and no identification
+  patch is needed. OpenBIOS is built from PCSX-Redux `8a86b7e` (nugget
+  `4dc70d2`) with Debian's `gcc-mipsel-linux-gnu` 14.2.0, in the default
+  configuration (ROM, shello shell, Release).
+- **Beetle's PS-X EXE side-loading cannot start a program under
+  OpenBIOS.** Evidence:
+  - Beetle's `LoadEXE` writes `jal 0xBF001000` at BIOS offset `0x6990`
+    (where the Sony BIOS calls its shell) and puts a loader in expansion-1
+    memory.
+  - In this OpenBIOS build, `0xBFC06990` is the delay slot of `jr ra` in
+    `loadExeHeader`, which a boot without a disc never executes.
+  - Loading the runner as EXE content for 1,800 frames: the mailbox never
+    came up, the runner's text never reached RAM (0x80010000 stayed
+    zero), and OpenBIOS was running its own shell, copied to 0x80030000.
+- **Options evaluated, in the plan's order.** Beetle options relaxing
+  BIOS checks: not applicable, because OpenBIOS is already accepted and no
+  option moves the EXE hook. A patch touching only BIOS identification:
+  not applicable, for the same reason. A human-supplied BIOS: excluded.
+  So the risks section's remedy applies: **the runner is wrapped in a
+  minimal disc built with mkpsxiso** (bundled with PSn00bSDK v0.24) and
+  OpenBIOS boots it from CD like a game. Ready after 445 frames. Neither
+  Beetle nor OpenBIOS is changed.
+- **Disc identification.** Beetle models the CD controller's licence
+  check: data reads fail unless it identifies the disc as licensed, from
+  the SYSTEM.CNF boot file name (an `S[CLI]xx_` serial) or licence text in
+  sector 4. The runner disc names its boot file `SLUS_000.00` (no real
+  product). This is identification only: no Sony data is on the disc.
+  **For the human to review:** if serial-style naming is unwelcome, the
+  alternative is an OpenBIOS build with its upstream `EMBED_PSEXE` option
+  set to a small loader that takes the runner over the mailbox. That needs
+  no disc identification, but changes the BIOS image.
+
+### Core options (printed in every golden's provenance)
+
+- **Beetle is built** with `HAVE_HW=0` (software renderer only) and
+  `HAVE_LIGHTREC=0` (interpreter only). `HAVE_CHD=0` does not link at
+  this commit, so the CHD disc reader stays in; it is not emulation.
+- **Fixed, required** (the host refuses to run if the core stops
+  declaring one): `cpu_freq_scale=100%`, `gpu_overclock=1x(native)`,
+  `gte_overclock=disabled`, `internal_resolution=1x(native)`,
+  `dither_mode=1x(native)`, `pgxp_mode=disabled`,
+  `widescreen_hack=disabled`, `cd_access_method=sync`,
+  `cd_fastload=2x(native)`, `override_bios=openbios`, `skip_bios=disabled`,
+  `region=ntsc-u`, plus three that matter more than they look:
+  - `line_render=disabled`: the default turns on a Line-to-Quad hack in
+    the software renderer;
+  - `spu_silent_voice=disabled`: by its own description the default
+    leaves SPU register state inexact;
+  - `compatibility_settings=disabled`: per-game overrides of the above.
+
+  `skip_bios` must stay off: its patch writes the same Sony-BIOS address
+  0x6990 and would corrupt OpenBIOS. Fast boot is therefore off.
+- **This Beetle master has an "idle virtualisation" optimisation** (GPU
+  and DMA events become virtual while idle). Results are deterministic in
+  every test so far. If timing-sensitive vectors (CD, SPU IRQ)
+  misbehave in M6, look here first.
+
+### Reproducibility and provenance
+
+- **Builds are bit-reproducible** from the pins: OpenBIOS, the Beetle
+  core, the host and the runner EXE and disc are identical after a
+  no-cache rebuild. Apt packages come from the snapshot the base image
+  itself was built from (`20261020T213255Z`).
+- **Image ids are local** (layers carry build timestamps). They are
+  recorded in `.oracle/images.json` and in each golden; `images verify`
+  checks them against the daemon, and the commits against `inputs.lock`.
+- **Target id:** `emu-beetle-7fea57a-openbios-8a86b7e-runner-1`.
+  `RUNNER_VERSION` (`wire.rs`) must be bumped whenever a runner change can
+  alter results.
+
+### Runner and protocol facts later milestones need
+
+- **The protocol is batches of ops** (`wire.rs`). The driver compiles
+  vector kinds into ops, chunks large state and packs exchanges; one
+  exchange takes one frame. Every vector starts with its device's reset op
+  (`GPU_RESET`, `SPU_RESET`), so results do not depend on what ran before
+  it. This was checked: identical results in different batch compositions.
+- **GP0 pacing.** GPUSTAT bit 28 ("ready for a DMA block") drops as soon
+  as the first word of a command is queued, and bit 25 means nothing in
+  DMA mode 1. So waiting per word deadlocks.
+  - The runner waits for bit 26 (idle) before each packet.
+  - Port and block packets are at most 16 words (the FIFO depth);
+    linked-list nodes at most 255.
+  - Each packet holds whole commands.
+  - VRAM uploads send the header by port and the pixels by DMA in blocks
+    of 16 words, as `LoadImage` does.
+- **GPU_EXEC** clears the texture cache (GP0 01h) before the state words.
+- **SPU:**
+  - SPU_RUN starts at a SPUSTAT bit 11 edge. Beetle reports bit 11 only
+    while transfer control is 0004h, which SPU_RESET sets.
+  - SPU_RESET leaves ENDX = 00FFFFFFh and reserves SPU RAM 1000h–100Fh.
+  - Captures are DMA-read right after the register snapshot while the
+    SPU keeps running. Deterministic, but provisional by design: M6
+    refines it.
+- **BIOS_CALL** works with OpenBIOS's kernel fully initialised (the
+  runner is booted by the BIOS itself). It is provisional, as planned.
+- **Diagnostics.** A timed-out device wait is recorded in the mailbox
+  header (`MBX_OFF_DIAG_*`) and logged by the host
+  (`out/oracle/runs/last-host.log`).
+
+### Integration points
+
+- **`psxw ci` does not exist yet.** The oracle's part is `psxw oracle ci`
+  (`psxw_oracle::commands::ci`): images verify, selftest, capture with
+  determinism. Whoever adds `psxw ci <game>` should call it.
+- **Device implementations** register in
+  `crates/psxw-cli/src/oracle.rs::devices()` (trait `DeviceUnderTest`).
+  `check` judges against exact, then hardware (`hw-…` target dirs), then
+  this pin's emulator goldens.
+- **Tasks 8–9 fit as designed.** The host stubs the `play` mode;
+  `input_state` and per-frame RAM reads are the hooks it needs, RAM dumps
+  go to the work dir, and `psxw oracle play`/`ramdiff` belong in
+  `commands.rs` next to `capture`.
+- **Disk.** The images are 92 MB (emu) and 370 MB (sdk); a no-cache
+  rebuild needs about 2 GB of build cache.

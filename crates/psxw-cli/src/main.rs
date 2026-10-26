@@ -9,10 +9,13 @@
 //!                                       M1: translate every function to C
 //! psxw difftest <game> [--only S] [--seeds N] [--keep]
 //!                                       M1: translated == decompiled C
+//! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! ```
 
 use anyhow::{Result, bail};
 use psxw_inputs::{Workspace, snapshot, toolchain};
+
+mod oracle;
 
 fn main() {
     if let Err(e) = run() {
@@ -146,8 +149,12 @@ fn run() -> Result<()> {
                 println!("{pc:08X}: {w:08X}  {}{mark}", psxw_lift::decode::disasm(&insn, pc));
             }
         }
+        ["oracle", rest @ ..] => oracle::run(&ws, rest)?,
         _ => bail!(
-            "usage: psxw toolchain fetch | inputs sync | census <game> [--only S] [--only-header S] [--no-probe] | lift <game> [--function F | --container C | --all]"
+            "usage: psxw toolchain fetch | inputs sync | census <game> [--only S] [--only-header S] [--no-probe] \
+             | lift <game> [--function F | --container C | --all] | difftest <game> [--only S] [--seeds N] \
+             | {}",
+            oracle::USAGE
         ),
     }
     Ok(())

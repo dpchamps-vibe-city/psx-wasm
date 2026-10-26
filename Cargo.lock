@@ -706,6 +706,7 @@ dependencies = [
  "psxw-difftest",
  "psxw-inputs",
  "psxw-lift",
+ "psxw-oracle",
  "rayon",
 ]
 
@@ -778,6 +779,18 @@ dependencies = [
  "serde",
  "wasm-encoder 0.262.0",
  "wasmparser 0.262.0",
+]
+
+[[package]]
+name = "psxw-oracle"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "psxw-inputs",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.11.1",
 ]
 
 [[package]]
