@@ -115,8 +115,21 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         Ok((ok, "memory cards through OPFS in Chromium and Firefox".into()))
     })());
     gate(&mut gates, "web-game", "M5", (|| {
-        let ok = crate::webtest::run(ws, &["game", game])?;
-        Ok((ok, "RAM and VRAM hashes, native vs browsers".into()))
+        // The milestones' title-to-gameplay replay when the game has one
+        // (recorded on the way, checking the recorder too); else idle.
+        let named = ["toml", "rpl"].iter().any(|x| ws.root.join("games").join(game).join("replays").join(format!("title-to-gameplay.{x}")).is_file());
+        let args: Vec<&str> = if named {
+            vec!["game", game, "--replay", "title-to-gameplay", "--hash", "300,1200,2400,3600,4800,6000", "--record", "--timeout", "3600"]
+        } else {
+            vec!["game", game]
+        };
+        let ok = crate::webtest::run(ws, &args)?;
+        let what = if named { "title-to-gameplay" } else { "600 idle frames" };
+        Ok((ok, format!("{what}: RAM, VRAM and audio, native vs browsers")))
+    })());
+    gate(&mut gates, "web-pacing", "M5", (|| {
+        let ok = crate::webtest::run(ws, &["pacing", game])?;
+        Ok((ok, "60 s idle at real time; gates once psxw.local.toml states the machine".into()))
     })());
     gate(&mut gates, "oracle", "M3", (|| {
         let reports = psxw_oracle::commands::ci(ws, &mut crate::oracle::devices(ws))?;
