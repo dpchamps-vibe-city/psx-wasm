@@ -348,7 +348,9 @@ would reimplement it; the original runs unchanged over `psx-bios::card`.
 page** (M5). Two deviations from the plan's Playwright image and
 TypeScript shell:
 - **The test image is `psxw-browsers`:** Chromium and Firefox ESR from the
-  pinned Debian snapshot, on the oracle images' base, with no network. A
+  pinned Debian snapshot, on the oracle images' base, with no network.
+  Chromium runs headless on SwiftShader. Firefox runs on Xvfb with GLX
+  over llvmpipe, because headless Firefox finds no GL driver. A
   test page runs on its own and POSTs its result to a small in-container
   server; a script opens each browser headless and waits for that file.
 - **The web shell is plain ES modules,** with no build step.

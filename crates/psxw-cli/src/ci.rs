@@ -102,6 +102,14 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         }
         Ok((pass, detail.join(", ")))
     })());
+    gate(&mut gates, "web-gpu", "M5", (|| {
+        let ok = crate::webtest::run(ws, &["gpu"])?;
+        Ok((ok, "every GPU vector through the browser renderer in Chromium and Firefox".into()))
+    })());
+    gate(&mut gates, "web-game", "M5", (|| {
+        let ok = crate::webtest::run(ws, &["game", game])?;
+        Ok((ok, "RAM and VRAM hashes, native vs browsers".into()))
+    })());
     gate(&mut gates, "oracle", "M3", (|| {
         let reports = psxw_oracle::commands::ci(ws, &mut crate::oracle::devices(ws))?;
         let pass = reports.iter().all(|(r, _)| r.pass);

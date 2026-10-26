@@ -1,4 +1,4 @@
-# psxw-browsers: headless Chromium and Firefox ESR for the browser host's
+# psxw-browsers: Chromium (headless) and Firefox ESR (on Xvfb) for the browser host's
 # tests (plans/M05-browser.md, D44), from the Debian snapshot the oracle
 # images use, on the same base image. A page under test POSTs its result to
 # the in-container server (browser-serve.py); run-browsers.sh drives each
@@ -12,7 +12,8 @@ SHELL ["/bin/sh", "-eu", "-c"]
 ARG DEBIAN_SNAPSHOT
 COPY docker/apt-snapshot.sh /usr/local/bin/apt-snapshot.sh
 RUN chmod +x /usr/local/bin/apt-snapshot.sh \
- && apt-snapshot.sh "$DEBIAN_SNAPSHOT" chromium firefox-esr python3 libgl1-mesa-dri libegl-mesa0
+ && apt-snapshot.sh "$DEBIAN_SNAPSHOT" chromium firefox-esr python3 \
+      libgl1-mesa-dri libegl-mesa0 libegl1 libgl1 libgles2 xvfb xauth
 
 COPY docker/browser-serve.py docker/run-browsers.sh /opt/psxw/
 RUN chmod +x /opt/psxw/run-browsers.sh \
@@ -21,6 +22,8 @@ RUN chmod +x /opt/psxw/run-browsers.sh \
       "$(dpkg-query -W -f '${Version}' firefox-esr)" "$(dpkg-query -W -f '${Version}' libegl-mesa0)" \
       > /opt/psxw/sources.json
 
-ENV HOME=/tmp LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MOZ_HEADLESS=1
+# Firefox finds no GL in headless mode, so it runs on a virtual X server
+# (Xvfb, GLX over llvmpipe); Chromium runs headless on SwiftShader.
+ENV HOME=/tmp LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
 LABEL org.psxw.image="psxw-browsers"
 ENTRYPOINT ["/opt/psxw/run-browsers.sh"]

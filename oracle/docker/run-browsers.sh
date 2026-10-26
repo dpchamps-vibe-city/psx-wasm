@@ -21,8 +21,17 @@ for b in "$@"; do
       ;;
     firefox)
       mkdir -p /tmp/firefox
-      printf 'user_pref("webgl.force-enabled", true);\nuser_pref("browser.shell.checkDefaultBrowser", false);\n' > /tmp/firefox/user.js
-      firefox-esr --headless --no-remote --profile /tmp/firefox "$url" > "/out/$b.log" 2>&1 &
+      # Software GL (llvmpipe) counts as a "major performance caveat",
+      # which makes WebGL creation fail unless told otherwise; and there
+      # is no GPU process in a container.
+      cat > /tmp/firefox/user.js <<'PREFS'
+user_pref("webgl.force-enabled", true);
+user_pref("webgl.disable-fail-if-major-performance-caveat", true);
+user_pref("webgl.out-of-process", false);
+user_pref("layers.gpu-process.enabled", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+PREFS
+      xvfb-run -a -s "-screen 0 1280x1024x24" firefox-esr --no-remote --profile /tmp/firefox "$url" > "/out/$b.log" 2>&1 &
       ;;
     *) echo "unknown browser $b" > "/out/$b.log"; continue ;;
   esac

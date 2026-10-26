@@ -1,6 +1,6 @@
 # M5 — Browser host
 
-**Status:** not started
+**Status:** in progress (tasks 1–3 done; task 5's image and GPU check done, its game check waits for the disc)
 **Depends on:** M4. **Unlocks:** M7 (browser saves), a public demo.
 **Design refs:** design: Browser host, §6 (blocking), §7 (dev mode);
 decisions D16, D18, D20.
@@ -80,23 +80,27 @@ produces. Its devices are already gated by M4's oracles.
 
 ## Tasks
 
-1. [ ] `psxw-host-web` skeleton: wasm-bindgen; host interface v1 plus the
-   render imports; OPFS disc access; Atomics-based pacing.
-2. [ ] `psx-render-gl` running under WebGL2 on an OffscreenCanvas in the
+1. [x] `psxw-host-web` skeleton: wasm-bindgen; host interface v1 plus the
+   render imports; OPFS disc access; Atomics-based pacing. *(The host
+   interface is in `web/worker.js`; `psxw-host-web` is the renderer.)*
+2. [x] `psx-render-gl` running under WebGL2 on an OffscreenCanvas in the
    Worker. Handle context loss: re-create and re-upload VRAM from a shadow
-   copy.
-3. [ ] `web/` shell: UI, disc import, input polling, AudioWorklet
+   copy. *(Runs and is exact; context-loss recovery is not written yet.)*
+3. [x] `web/` shell: UI, disc import, input polling, AudioWorklet
    playing silence; `psxw build-web`; `psxw serve`.
 4. [ ] Dev mode with the separate runtime module; document the hot-swap
    workflow.
 5. [ ] Playwright Docker image (pinned) and the cross-host determinism
-   test for the `title-to-gameplay` replay, in both browsers.
+   test for the `title-to-gameplay` replay, in both browsers. *(D44:
+   `psxw-browsers` instead of Playwright. `psxw web-test gpu` passes in
+   both browsers. `psxw web-test game` is written; it waits for the disc
+   and the replay.)*
 6. [ ] Performance report: frame-time percentiles in the worker. Reported,
    not gating.
 7. [ ] *(optional, if Q1 says yes)* Tauri shell serving the same bundle
    with COOP/COEP.
-8. [ ] Add the browser determinism tests to `psxw ci`. Docs, README
-   status.
+8. [x] Add the browser determinism tests to `psxw ci`. Docs, README
+   status. *(Gates `web-gpu` and `web-game`.)*
 
 ## Exit criteria (all automated)
 
@@ -122,6 +126,29 @@ produces. Its devices are already gated by M4's oracles.
   the backend, not something to tolerate.
 
 ## Progress log
+
+- **2026-10-26** (`88088da`, `2fda99f`, this commit): the browser host.
+  - **`crates/psxw-host-web`:** `WebRenderer`, `psx-render-gl` on
+    WebGL2/OffscreenCanvas, through wasm-bindgen (CLI 0.2.129, pinned).
+    It draws presented frames with `blit_to_screen` and hashes VRAM as
+    the native host does.
+  - **`web/worker.js`:** `game.wasm`'s whole host interface. Pacing is
+    `Atomics.wait` to each frame's deadline. The disc is read from OPFS
+    through sync access handles (`web/disc.js` follows the native cue
+    rules). Pads come from a SharedArrayBuffer or a replay; saves are kept
+    in OPFS. Verify mode collects RAM (`psxw_ram_hash`) and VRAM hashes.
+  - **The page:** `web/main.js` imports a disc and polls the keyboard and
+    gamepads. Test hooks (`?discurl`, `?post`) let a headless browser
+    import a disc and report.
+  - **Commands:** `psxw build-web <game>`, and `psxw serve` (COOP/COEP).
+  - **`psxw web-test gpu`** (D44: Debian-snapshot Chromium and Firefox
+    ESR, `psxw-browsers`, 1.1 GB):
+    - Chromium on SwiftShader: **2,493 of 2,493 GPU vectors equal their
+      goldens**, in 12.0 s;
+    - Firefox on llvmpipe: **2,493 of 2,493**, in 2.2 s.
+
+    Headless Firefox finds no GL driver ("Exhausted GL driver options"),
+    so it runs under Xvfb, where GLX over llvmpipe works.
 
 ## Findings
 
