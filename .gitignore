@@ -1,7 +1,9 @@
 /target/
 /.inputs/
 /.toolchain/
+/.oracle/
 /out/
+/psxw.local.toml
 *.bin
 *.cue
 *.iso

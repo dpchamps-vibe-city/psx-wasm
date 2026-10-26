@@ -206,17 +206,24 @@ How each tier is produced:
   `psx-gte`. When a function body contains real inline asm or a GNU nested
   function, `psxw-cc` blanks that body, so the function falls to the lift
   tier.
-- **Lift tier: generated C.** The translator works one function at a time
-  from *relocatable* objects: the per-TU `.o` files of the game's matching
-  build, and the SDK's `.LIB`/`.a` members. It emits C, the approach
-  N64Recomp and PSXRecomp use, rather than wasm directly:
+- **Lift tier: generated C.** The translator works one function at a time.
+  For a game, it reads the **original container images** directly: the
+  address space is kept exactly, so absolute addresses in placed code are
+  already valid. Calls resolve through the address map, and jump tables are
+  bounded by analysis. No relocatable objects, and no build of the decomp
+  repo, are needed. Relocatable `.LIB` members are used only to build the
+  reusable translated-SDK cache (below). The translator emits C, the
+  approach N64Recomp and PSXRecomp use, rather than wasm directly:
   - **One pipeline.** Generated C goes through the same clang flags,
-    prelude and guest memory model as decompiled C. The linker can't tell
-    the two apart.
-  - **Interchangeable with decompiled C.** Each function carries the
-    prototype from its header, so decompiled C calls it directly and vice
-    versa. When a decomp finishes a function, its readable C replaces the
-    generated one.
+    prelude and guest memory model as decompiled C.
+  - **One calling convention for generated code.** Every generated
+    function has the o32 form `u64 f(a0, a1, a2, a3)`: the result packs
+    `v0 | v1 << 32`, and further arguments go on the guest stack. Wherever C
+    and generated code call each other, the linker inserts an adapter
+    derived from the C side's wasm signature. Prototype facts from
+    `psxw-cc` cover structs passed by value and variadic calls. So a
+    function can move from translated to decompiled C without its callers
+    changing.
   - **clang optimizes it.** Guest registers become locals that clang
     promotes to SSA form. `#line` directives point back at the original
     instructions for debugging.
@@ -224,8 +231,7 @@ How each tier is produced:
     explicit sign extension and masked shifts, so clang has no undefined
     behaviour to exploit.
 
-  Relocations give the translator symbolic call targets, data references
-  and jump tables. Delay slots are resolved statically, and load-delay
+  Delay slots are resolved statically, and load-delay
   hazards are modelled where a consumer sits in the slot. Other instructions
   are routed as follows:
   - COP2 maps onto `psx-gte`.
@@ -457,19 +463,26 @@ a call into guest code.
     in the browser and native GLES for the test host. This is a
     GPU-accelerated renderer from the start, built the way emulators build
     theirs:
-    - **VRAM is one 1024×512 texture.** Primitives render into it, and the
-      fragment shader samples textures from it, decoding 4/8-bit texels
-      through their colour lookup tables itself. It has to be, because games
-      render into VRAM and then texture from the result. It is stored as
-      RGBA8, with the mask bit in alpha, because WebGL2 can't blend into
-      integer textures.
+    - **VRAM is one 1024×512 `R16UI` texture** holding the exact 16-bit
+      pixel values. Primitives render into it, and the fragment shader
+      samples textures from it, decoding 4/8-bit texels through their colour
+      lookup tables itself. It has to be, because games render into VRAM and
+      then texture from the result.
+    - **All pixel maths is integer shader code,** so 1× output can be
+      byte-exact against the oracle (§Oracles):
+      - Each primitive draws a covering quad. The fragment shader evaluates
+        the PS1's edge functions, fill rules, and Gouraud and texture
+        interpolation in integers.
+      - Semi-transparency and the mask-bit check need the destination
+        pixel. WebGL2 has no framebuffer fetch and can't blend into integer
+        textures, so the shader reads the destination from a read copy of
+        VRAM instead of using fixed-function blending.
+      - Batches split where a primitive overlaps an earlier write it must
+        read. The written region is copied into the read copy first.
     - **Feedback hazards.** A primitive that samples the area it draws into
-      first gets a snapshot copy of that region.
-    - **Semi-transparency** maps onto standard blend equations. Per-texel
-      semi-transparency needs two passes, because WebGL2 has no dual-source
-      blending. The mask bit uses the stencil buffer.
-    - **The rest of the pixel pipeline is shader work:** affine texturing
-      (`noperspective`), colour modulation, dithering, texture windows.
+      reads from the read copy, which holds the pre-draw contents.
+    - **The rest of the pixel pipeline is shader work too:** colour
+      modulation, the 4×4 dither matrix, texture windows.
     - **CPU transfers.** `StoreImage` (8 call sites in btn) is a
       synchronous `readPixels`, which is fine in the worker. `MoveImage` (13
       sites) is a GPU-side copy.
@@ -586,20 +599,22 @@ emulators now, a real console when one is available.
   EXE, run headless, and dump main RAM. On a console, vectors and results
   travel over the serial port instead.
 - **Targets:**
-  - *Emulators now:* Mednafen through its Beetle PSX libretro core driven
-    by a small Rust host, DuckStation's headless regression-test runner,
-    and PCSX-Redux (headless, with OpenBIOS). They are pinned in
-    `inputs.lock`, built from source, and run as external tools. They are
-    never linked into psx-wasm, so their licenses don't touch it.
+  - *An emulator now:* Beetle PSX (Mednafen's PlayStation core), driven by
+    a small headless libretro host. It is built from source at a pinned
+    commit inside a Docker image, with OpenBIOS (also built from source) as
+    the BIOS, so no BIOS dump is needed. It runs as an external tool and is
+    never linked into psx-wasm, so its license doesn't touch it.
   - *Hardware later:* an original PS1 with a serial port, a USB-serial
     adapter, and FreePSXBoot or Unirom to run the runner. Anyone with such
     a rig can run a batch of vectors, since the harness is data in, data
     out.
 - **Every golden result records its provenance:** "hardware" or "emulator
   X at commit Y". Verdicts against emulator results are provisional.
-- **The consensus rule.** An emulator result counts only when two
-  independent emulators agree bit for bit. Otherwise the vector is
-  *unresolved* and needs hardware.
+- **One emulator.** The stand-in is Mednafen's PlayStation core (Beetle
+  PSX). It's the most accurate available, though no PS1 emulator is fully
+  cycle-accurate. Where it is known to be weak (CD drive timing), vectors
+  stay *unresolved* until hardware. Its known inaccuracies are recorded as
+  limits of the oracle.
 - **The upgrade path.** When hardware is available, the whole vector
   archive runs on it once. Every verdict is recomputed, and every place an
   emulator disagrees with hardware becomes a documented finding.
@@ -608,7 +623,7 @@ emulators now, a real console when one is available.
 
 | Device | Oracle | Strength today |
 |---|---|---|
-| GTE | Device target (exact results and FLAG) | Provisional, strong: leading emulators match hardware test results bit for bit |
+| GTE | Device target (exact results and FLAG) | Provisional, strong: Mednafen matches hardware test results bit for bit |
 | GPU: fills, transfers, copies, 1:1 sprites, colour tables | Exact by construction | Verified |
 | GPU: polygons, lines, blending, dithering, mask bit | Device target (VRAM readback, byte for byte at 1×) | Provisional, strong |
 | SPU: voices, envelopes, interpolation, reverb | Device target (SPU RAM capture buffers, reverb work area, status registers) | Provisional, good |
@@ -668,18 +683,22 @@ consumes:
 
 ## Roadmap
 
-Each milestone has an exit criterion. The riskiest assumptions are tested
-first.
+The execution plan, one file per milestone, is in [`plans/`](../plans/README.md).
+Each milestone's exit is gated by an automated oracle.
 
-| # | Milestone | Exit criterion |
+| # | Milestone | Gating oracle |
 |---|---|---|
-| M0 | **Census** (`psxw census <game>`). Pinned snapshots, the address map from splat configs and symbol files, and every game TU compiled to wasm objects. | Every TU compiles, with each normalization rule counted. Every function is placed exactly once, every reference resolves, and C-defined data matches the original bytes. **Layout probe:** GCC 2.95 and clang agree on the size, alignment and field offsets of every struct and global in every header the game includes. **Done for btn, 2026-10-25** (see below). |
-| M1 | **Headless boot.** `psxw-link` (including the precompiled runtime archive), the guest passes, the BIOS dispatcher, a native wasmtime host, and every adapter stubbed (log and return 0). | `guest_main` runs from the runtime's boot to the main loop and through 600 vblanks without trapping. |
-| M2 | **Lift tier.** The MIPS → generated C translator (ABI mode, jump tables, COP2 through `psx-gte`, BIOS jumps to the dispatcher). The translated SDK cache. | No traps on the path to gameplay. Translated matches decompiled C for every function that has both. |
-| M3 | **Pixels.** The GPU front end, the WebGL2 backend at 1×, the GTE and the pad. | GTE and packet/VRAM-transfer spec tests pass. The title screen and first in-game frames are dumped as PNGs headless, with stable frame hashes across runs. |
-| M4 | **Browser.** Worker, OPFS disc import, OffscreenCanvas, input. | Playable at full speed in Chrome and Firefox. |
-| M5 | **Sound and saves.** SPU and libsnd, XA streaming, memory cards. | Play one in-game day with sound, save it, reload it. |
-| M6 | **Second game.** Another decompilation through the same pipeline. | It runs with only a game manifest and boundary overrides. |
+| M0 | Census | **Done** (see below) |
+| M1 | Translator and linker core | Translated matches decompiled C for every function that has both |
+| M2 | Whole-game link and headless boot | RAM equals the EXE image after boot; CD reads verify; overlays dispatch; main loop reached; deterministic |
+| M3 | Oracle harness (Docker image: Beetle PSX + OpenBIOS; PS1 runner; vector recorder; golden store) | Exact-by-construction vectors reproduce through the emulator; deterministic captures |
+| M4 | Pixels: GTE, GPU front end, WebGL2 backend (exact at 1×), pad, libgpu/libetc/libpad adapters | GTE and GPU vectors byte-exact against goldens; adapters match the original libraries; RAM by symbol through a replay |
+| M5 | Browser host | Identical frame and RAM hashes to the native host for the same replay |
+| M6 | Sound: SPU, XA, libspu adapters, translated libsnd | SPU and XA vectors against goldens; adapters match libspu; RAM including sound-driver symbols |
+| M7 | Saves and a full play session | Card checksums; the game accepts its own saves; RAM by symbol over an in-game day |
+| M8 | SDK generality: object-keyed adapters, layout generation, translated SDK cache, psyq-decomp C | Adapter conformance per object; psyq-decomp C matches translated |
+| M9 | Second game | The same oracles pass with only a manifest |
+| M10 | Hardware oracle (when a rig exists) | The vector archive replayed on a real console |
 
 ### M0 result: btn @ 3a15992 (2026-10-25)
 
@@ -726,7 +745,7 @@ first.
 | Handwritten SDK asm uses non-ABI register conventions | Full-state lifting mode, chosen automatically when the lifter's analysis sees a boundary violation. |
 | PSX RAM mirroring (`0x80200000` aliasing `0x80000000`) is relied on | The aux region occupies the mirrors. If a game needs mirroring, it can be enabled by masking with `0x1FFFFF` for that game. |
 | Browser constraints: COOP/COEP, Gamepad API only on the main thread, Safari gaps | Worker plus SharedArrayBuffer as the primary design, JSPI as the fallback, and a desktop webview shell. |
-| WebGL2 limits: no blending into integer textures, no dual-source blending, no framebuffer fetch | VRAM stored as RGBA8 with the mask bit in alpha; two-pass per-texel semi-transparency; stencil for the mask bit. |
+| WebGL2 limits: no blending into integer textures, no framebuffer fetch | `R16UI` VRAM with all blending and mask logic in integer shader code; the destination is read from a read copy of VRAM; batches split on overlap. |
 | An SDK object with no adapter (new version, patched library) | Translate it and cut one level lower, down to the BIOS calls; failing that, the build names the objects that need adapters. |
 
 ## Open questions
