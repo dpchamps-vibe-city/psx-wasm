@@ -1,0 +1,77 @@
+//! The SDK objects the adapters were written against and tested on, as
+//! (member, identity key): `psxw-inputs::identity` keys, the sha256 of the
+//! member's placed text with relocated bytes masked (M8). The build binds
+//! an adapter only to a function of one of these objects; any other object
+//! is translated (or the build fails, if the function itself touches
+//! hardware). Add an object here once its adapters pass conformance (or
+//! the oracles) against it.
+//!
+//! PsyQ 4.7 (btn's link; signature database `470`). Validated by the
+//! adapters' unit tests against psyq-decomp's 4.7 sources, `psxw conform`
+//! where a scenario exists, and the whole-game oracles.
+
+pub const VALIDATED: &[(&str, &str)] = &[
+    ("libapi/c112", "6d011673eb04bf3a24a7326b3e0c93884881d829922f15cd3c1829b2c7dcbd4f"),
+    ("libapi/counter", "d336fc039bbcdedbcc156aa2f3ebdb2e6c1a67b68441f518221b39f8ef47f398"),
+    ("libapi/first", "5a9847288fd7f6e40001cc523db9cb8a8ac4b81b273d4f2e930ece31f539cbac"),
+    ("libapi/pad", "ac0ecfda8db404c439851e8b7220e92c5db0f7db5e7968d68661768e1c1b5529"),
+    ("libapi/patch", "331463f1e79c46d81eef446547cb5b3045c3acbd526f1ad3a132e6aa1113747a"),
+    ("libcard/a74", "7cfd68eefaba92fdc3389626a5aa4ef88237b50ad00d42c9a2ae8f28d70f1333"),
+    ("libcard/a75", "3201dbd265d1f569cf4baf14ae09238125f26cc61e03ebfe31e51f5faf83600d"),
+    ("libcard/a76", "dc68b38cc61ea46be7fd2afa6debf2528cfbc6fd5b9ec83e656fe9279c58a244"),
+    ("libcard/init", "faeec493734cf307852f58fd8f8bd00fc02705d4ad36037985866770dd821dc6"),
+    ("libcd/cdr_1", "804326710f09169461dc40687088a55ba76c0edbe0fc3af1ed41606a36bd9057"),
+    ("libcd/event", "06bd6e87bc79b295e0989b21d2d9bc98faf092a8ea6a76d6bf7a25886881e9f1"),
+    ("libcd/iso9660", "81115b193d15274c432059634ccb97f73b11326970b25d9b720f2416d93c766d"),
+    ("libcd/s_003", "b0e38e7630ef5cae3f21348c977fa6390de99a81c9eb8f6a4ae706c99b69eb4a"),
+    ("libcd/s_004", "b0e38e7630ef5cae3f21348c977fa6390de99a81c9eb8f6a4ae706c99b69eb4a"),
+    ("libcd/s_005", "b0e38e7630ef5cae3f21348c977fa6390de99a81c9eb8f6a4ae706c99b69eb4a"),
+    ("libcd/s_008", "20c3a8daad2ca1ef691428fa27cad0dd0e0113eeae8224c3066e369cf4b7a5f1"),
+    ("libcd/s_012", "20c3a8daad2ca1ef691428fa27cad0dd0e0113eeae8224c3066e369cf4b7a5f1"),
+    ("libcd/s_013", "20c3a8daad2ca1ef691428fa27cad0dd0e0113eeae8224c3066e369cf4b7a5f1"),
+    ("libcd/s_014", "100629d4c181bd660bac7db13ece1132c4c83240a601a5cb6810cd1311173f0d"),
+    ("libcd/s_015", "100629d4c181bd660bac7db13ece1132c4c83240a601a5cb6810cd1311173f0d"),
+    ("libcd/s_016", "c8ffe171bb7dd796ed6aa5a789a0074384655ca3c3401a37d7e7755bbc887ec4"),
+    ("libcd/s_021", "d765636c71f72f252321924479ff32eed4b8fdb1a9b842d109995c6ec86bbbb6"),
+    ("libcd/s_022", "d765636c71f72f252321924479ff32eed4b8fdb1a9b842d109995c6ec86bbbb6"),
+    ("libcd/s_023", "b551454f7b9bbe671b4e68d1d7f67f69159c213379a4620c901f0428df98e823"),
+    ("libcd/s_024", "20c3a8daad2ca1ef691428fa27cad0dd0e0113eeae8224c3066e369cf4b7a5f1"),
+    ("libetc/intr", "09b0feea2c632554bb610534332bc10cf1708c337d9cfd65247ac9400a35799e"),
+    ("libetc/intr_dma", "479a3d80051fe7ecd6d7f6b2b1465954486870a5ee3a155fa6cb5f4dfa411dc0"),
+    ("libetc/intr_vb", "7b35e33a415638f9396475a83bf48b047cc266021f5786193fb1489853dbea09"),
+    ("libetc/vmode", "410b8618d26d58e4bdf9d37e44e41605f853ac321bfc5cf5bf1d028315ff86c9"),
+    ("libetc/vsync", "5ced3e577ea12a54481e823fd26a28b831c29d427c4728d4c35233f3c46095a8"),
+    ("libgpu/sys", "02b22171147b3ca173f009f2cd944c513074ba6db33d956ed051c67cdba18e04"),
+    ("libmcrd/init", "f9161d47ddf227edab85fa17d7de2dba2dee02e4941580ae1227c45b98c23eb5"),
+    ("libmcrd/libmcrd", "46f60baec8cd294aed0958245214ed7781696c7653f25b870c7f823d07f93e47"),
+    ("libmcrd/unformat", "d4e6c6260f3bfdc091ef1cf4f5d504625ce3404c9b70945e38979eebc02b156d"),
+    ("libmcx/mcxcmd2", "58e691a13329379c176821716b5baf24e9e9c75b1429e4970cd620e00efc6d5e"),
+    ("libmcx/mcxcmd23", "92804c396fb540fcda4c0e0081118fd7ebd1ca6bc816cefd95be8b1ac8a9a7bc"),
+    ("libmcx/mcxcmd24", "9926ec52d6649a8cebb51eaca0bad13eb020056a15b5bdf8b8e5b989a2c16f02"),
+    ("libmcx/mcxinit", "207348a4d4a238743aeaa735bfdac5f1d7899a7c87d4c6039159e40685919d65"),
+    ("libmcx/mcxmain", "0613d35f2626d3c3fd435be6119f3483c4cf1aa6035b98b1c130317047025d55"),
+    ("libspu/s_crwa", "22ffea2f7966911ec5b09aca92b14b44c52f902776c1fa4c8138a17e71c3cb11"),
+    ("libspu/s_gks", "6a0fb10c7f836fcc0b6980f86928efcf72b41d797db1597187192903cf56258c"),
+    ("libspu/s_gnv", "e79efae1085fb3c161341da7af2471d4eeb290cd9b955633ee044ae21d358c93"),
+    ("libspu/s_grv", "8bf8a343d22e0a3d4ef511cd8734ec321c7d01cd9cb057094127d0f7c15d5fec"),
+    ("libspu/s_gvex", "8d3f6c69b1d31d32c6ba2ef9b26aa92ded93accdf90a9248673a4fd49208b780"),
+    ("libspu/s_i", "8e8e3d85e0fcbf5c1d0ca504577e8aab51d9ef00cd2eab1795cecf3f1ee5478b"),
+    ("libspu/s_ini", "034162a6651963d21fe6de03b9b5b7f60ce843baa336288dd6a73d79230e09ac"),
+    ("libspu/s_itc", "8edcb3aebafed1a5b751f0d43dad8aae8ee428509564369346621dd1008780ce"),
+    ("libspu/s_m_f", "ce937303a55bcbcb467ed3598a25c7651f352c97045c62bd33f5d284ae9cf866"),
+    ("libspu/s_m_init", "4ae30d3025073fb797f75fc46d01775806cb633aa06e3c5a92888e9d40fdb70e"),
+    ("libspu/s_m_m", "cfb203c896b954a31d1f7e239cde50f69614d71d7bc8b2823a6f7ffea29eb71f"),
+    ("libspu/s_sca", "3520a784e7242531e9cf435201c10e789e880721a665764566051ccb6940d3f1"),
+    ("libspu/s_sk", "6ba0eca047b8852818567755fbccfc8587b02b2bf7afe6047ce8914ff4dc3fd9"),
+    ("libspu/s_snc", "5263840dc1f1230445e84789866eccd6c5acfc115a61642f961d10452bf8378b"),
+    ("libspu/s_snv", "99105034bfaa2fdb95e8a194b405315809faaef1f7032a903189e4c731aa3eb0"),
+    ("libspu/s_sr", "56b55896784e60dcd54988b27d607851085731e66b6c3a81bc0996f0b04d31bb"),
+    ("libspu/s_srd", "5496f68936862251b67182fd2444fe225d5667fa9a84d9c663f4a9b9ea3a1dad"),
+    ("libspu/s_srmp", "d2ba143eb7e41794ae7252409db56c6b0dbf98c53358501f40076e5678af028e"),
+    ("libspu/s_srv", "214d58011cb72d499a5fd7bc5a1d2966472578b3e93ebd0f882cc63121625867"),
+    ("libspu/s_stm", "c7386b020364d1c47ea8c7da881cbc485dace4557833a4a277848bdd2ce20c41"),
+    ("libspu/s_stsa", "b6bf745cc9ddcd185a534bb8c02fa5552c65af84f90110a8d71ced1ff99edbae"),
+    ("libspu/s_sva", "0465001e4b8c2256cba4cb60c71cc447789eb43a1e496a9d032fc68352b7d495"),
+    ("libspu/s_wp", "f3e81608db3d71ae53832f83a1084c5e35165873111ad3d66b15e7544f13d2f6"),
+    ("libspu/sr_gaks", "ec8c372747bf8fee9cfd0121bb56f4489fca7930a639dbb59fff940f6767f07e"),
+];

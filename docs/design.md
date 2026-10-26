@@ -369,9 +369,20 @@ adapters and on a build where `L` is its original code over the devices.
 The two must agree on what the game can observe.
 
 Adapters declare their C prototypes. The build checks them against the SDK
-headers, so a signature drift fails at link time, not at run time. The
-manifest is `boundary/psyq-470.toml` today. It becomes version-keyed, with
-per-object overrides, when adapters are first written.
+headers, so a signature drift fails at link time, not at run time.
+
+**The boundary file is `boundary/psyq.toml`** (M8). It gives each library
+a policy (`adapter`, `device` or `guest`), with per-object overrides.
+- **Identity.** Objects are identified by `psxw identity <game>`: placed
+  text is matched against a pinned signature database, and the key is the
+  sha256 of the text with relocated bytes masked.
+- **Binding.** An adapter binds only to an object listed in sdk-psyq's
+  `validated.rs` as (member, key). A function of any other object runs as
+  guest code, cutting down to whatever lower functions do have adapters.
+- **The build fails** if a function that itself touches I/O or kernel RAM
+  is reachable from game code, through direct calls that never pass an
+  adapter, with no validated adapter. Unreachable ones are listed in
+  `build.json`.
 
 ### 6. Time, interrupts and blocking
 

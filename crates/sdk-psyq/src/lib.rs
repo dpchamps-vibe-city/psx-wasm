@@ -20,6 +20,7 @@ pub mod libetc;
 pub mod libgpu;
 pub mod libmc;
 pub mod libspu;
+pub mod validated;
 
 use psx_bios::{Flow, Machine, Sdk};
 

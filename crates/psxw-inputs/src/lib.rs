@@ -4,6 +4,7 @@
 //! out; everything downstream sees the model. See `docs/design.md`
 //! "Pinning the inputs".
 
+pub mod boundary;
 pub mod game;
 pub mod identity;
 pub mod local;

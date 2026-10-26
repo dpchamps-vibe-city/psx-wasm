@@ -74,7 +74,7 @@ PSX address space (D5).
 
 - Add `psxw census` to `psxw ci` (M1 creates `psxw ci`).
 - The SDK census, over psyq-decomp's C, moves to M8.
-- `boundary/psyq-470.toml` becomes version- and object-keyed in M8.
+- `boundary/psyq-470.toml` becomes version- and object-keyed in M8 (now `boundary/psyq.toml`).
 
 ## Progress log
 

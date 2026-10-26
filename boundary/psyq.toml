@@ -1,0 +1,61 @@
+# The PsyQ boundary (docs/design.md §5; M8): for every SDK library, how
+# its functions run. Game-agnostic and version-independent: objects are
+# told apart by identity (`psxw identity <game>`), and adapters bind only
+# to objects they are validated for (sdk-psyq `validated.rs`).
+#
+# policy = "adapter"  functions with a runtime adapter for this exact
+#                     object run it; the rest are guest code. A function
+#                     that touches hardware itself and has no validated
+#                     adapter fails the build.
+# policy = "device"   guest code whose I/O reaches the runtime's
+#                     register-level devices (D40); no adapters.
+# policy = "guest"    guest code only (decompiled C or translated);
+#                     adapters must not claim these.
+#
+# [object."<library>/<member>"] overrides a library's policy for one
+# member.
+
+[library.libapi]   # BIOS trampolines go to the Rust BIOS; counter.o, pad.o,
+policy = "adapter" # patch.o, first.o patch BIOS internals or program timers
+
+[library.libetc]   # VSync, callbacks, interrupt setup
+policy = "adapter"
+
+[library.libgpu]   # the device edge (ResetGraph, DrawOTag, LoadImage, …)
+policy = "adapter"
+
+[library.libcd]    # the drive (CdInit, CdControl*, CdRead*, CdSearchFile, …)
+policy = "adapter"
+
+[library.libspu]   # register programming
+policy = "adapter"
+
+[library.libpad]   # D40: original over SIO0
+policy = "device"
+
+[library.libmcrd]
+policy = "adapter"
+
+[library.libmcx]
+policy = "adapter"
+
+[library.libcard]
+policy = "adapter"
+
+[library.libsnd]   # the sequencer is the game's music: original code
+policy = "guest"
+
+[library.libgs]    # packet building into RAM
+policy = "guest"
+
+[library.libgte]   # COP2 through psx-gte
+policy = "guest"
+
+[library.libc]
+policy = "guest"
+
+[library.libc2]
+policy = "guest"
+
+[library.libmath]
+policy = "guest"

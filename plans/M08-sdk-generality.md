@@ -1,6 +1,6 @@
 # M8 — SDK generality
 
-**Status:** in progress (task 1)
+**Status:** in progress (tasks 1–3)
 **Depends on:** M2. Parallel with M4–M7. **Unlocks:** M9.
 **Design refs:** design §4 (the translated SDK cache), §5 (devices, BIOS,
 adapters keyed by object identity; layout generation); decisions D12–D15,
@@ -89,9 +89,10 @@ belongs to whichever milestone first needs them (M9).
 
 1. [x] Object identity and hashing; pin the signature database (source
    commit) in `inputs.lock`; an identity report per game.
-2. [ ] Adapter registry macro, linker resolution, the cut-lower fallback,
-   and the missing-adapter error.
-3. [ ] Migrate the boundary policy to `boundary/psyq.toml`.
+2. [x] Adapter registry macro, linker resolution, the cut-lower fallback,
+   and the missing-adapter error. *(A table rather than a macro:
+   `sdk_psyq::validated::VALIDATED`, (member, identity key).)*
+3. [x] Migrate the boundary policy to `boundary/psyq.toml`.
 4. [ ] Layout generator; regenerate the accessors for btn's adapters;
    drive the conformance diffs to zero.
 5. [ ] The PsyQ `.LIB` converter in Docker, pinned; `psxw-lift`
@@ -152,5 +153,29 @@ belongs to whichever milestone first needs them (M9).
     two components (`<library>/<member>`). btn names two libgte pieces
     `build/sdk/lib/470/libgte/…`, which had broken library lookups
     (device libraries, `--original`).
+
+- **2026-10-26:** tasks 2–3.
+  - **The boundary:** `boundary/psyq.toml` replaces `psyq-470.toml`
+    (`psxw-inputs::boundary`). Each library gets a policy (`adapter`,
+    `device`, `guest`), with `[object."lib/member"]` overrides. The
+    device libraries come from it, checked against the runtime's support.
+  - **The registry:** sdk-psyq's `validated.rs` lists the 63 objects
+    btn's adapters were written against and tested on, as (member, key).
+    It was generated from btn's identity report.
+  - **Binding:** the build binds an adapter only when the placed object's
+    key is listed. Otherwise the function is translated and calls down to
+    lower adapters (`unvalidated_objects` in `build.json`).
+  - **The error:** the build fails if a function that touches I/O or
+    kernel RAM itself is reachable from game code by direct calls that
+    pass no adapter. Unreachable ones are listed in `hardware_unbound`.
+  - **btn:** every adapter's object validates, and the tiers are
+    unchanged. 9 functions touch hardware with no adapter, all
+    unreachable: libcard `patch`, libapi `first` and libmcx internals,
+    reached only through replaced entry points.
+  - **Task 6 is parked:** psyq-decomp's C names data relative to its
+    member (`D_000031F0`, `RO_STR_00003064`, `func_0000046C`) in a layout
+    its gitignored build defines. Placing that C in a game means mapping
+    those offsets onto the member's section placements, which needs that
+    layout.
 
 ## Findings

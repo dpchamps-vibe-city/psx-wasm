@@ -10,7 +10,7 @@ title = "Harvest Moon: Back to Nature"
 serial = "SLUS-01115"
 input = "btn"               # [game.btn] in inputs.lock
 sdk = "psyq-470"            # [sdk.psyq-470] in inputs.lock
-boundary = "boundary/psyq-470.toml"
+boundary = "boundary/psyq.toml"
 
 [containers]
 # One container per splat config; its id is the file stem.

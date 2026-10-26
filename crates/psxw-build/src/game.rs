@@ -5,6 +5,8 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_cc::protos::Proto;
 use psxw_inputs::Workspace;
+use psxw_inputs::boundary::{Boundary, Policy};
+use psxw_inputs::identity::SigDb;
 use psxw_lift::program::Source;
 use psxw_link::game::{GameSpec, Tier};
 use psxw_link::object::{NameClass, SymbolKind, WasmObject, classify_name};
@@ -59,6 +61,13 @@ pub struct Report {
     pub schema_version: u32,
     pub game: String,
     pub commit: String,
+    /// Objects with adapters whose identity isn't validated (their
+    /// functions were translated instead).
+    pub unvalidated_objects: Vec<String>,
+    /// SDK functions in adapter-policy libraries that touch hardware
+    /// themselves but have no adapter; none is reachable from guest code
+    /// (that fails the build).
+    pub hardware_unbound: Vec<String>,
     /// Functions per tier.
     pub tiers: BTreeMap<String, usize>,
     /// Per container and tier.
@@ -108,14 +117,29 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;
     let adapters = crate::runtime::adapters(&runtime)?;
-    // Libraries whose own code runs over the runtime's devices (D40), and
-    // those built from their original code on request.
-    let mut device_libs = crate::runtime::devices(&runtime)?;
-    device_libs.extend(opts.original.iter().cloned());
 
     let mut inputs = psxw_lift::run::load(ws, &opts.game)?;
     let commit = inputs.commit.clone();
     eprintln!("build: {} @ {}", opts.game, &commit[..7]);
+
+    // The SDK boundary (M8): policy per library and object; adapters bind
+    // only to objects they are validated for.
+    let boundary = match &inputs.manifest.game.boundary {
+        Some(p) => Boundary::load(&ws.root.join(p))?,
+        None => Boundary::default(),
+    };
+    let runtime_devices = crate::runtime::devices(&runtime)?;
+    let mut device_libs = boundary.device_libraries();
+    if let Some(l) = device_libs.iter().find(|l| !runtime_devices.contains(l)) {
+        bail!("the boundary runs {l} over devices, but the runtime has no device support for it");
+    }
+    // Libraries built from their original code on request.
+    device_libs.extend(opts.original.iter().cloned());
+    let db = SigDb::pinned(ws)?;
+    let identity = psxw_inputs::identity::identify(&opts.game, &inputs.map, &inputs.originals, &db);
+    let keys: BTreeMap<&str, &str> =
+        identity.identities.iter().filter_map(|i| Some((i.member.as_str(), i.key.as_deref()?))).collect();
+    let validated: BTreeSet<(&str, &str)> = sdk_psyq::validated::VALIDATED.iter().copied().collect();
     let (translations, _, _, _, _) = psxw_lift::run::translate(&mut inputs);
     let lift_dir = psxw_lift::run::out_dir(ws, &inputs);
 
@@ -190,14 +214,18 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let adapter_id: BTreeMap<&str, u32> = adapters.iter().enumerate().map(|(i, n)| (n.as_str(), i as u32)).collect();
     let mut tiers: BTreeMap<(String, u32), Tier> = BTreeMap::new();
     let mut lifted = Vec::new();
+    let mut unvalidated: BTreeSet<String> = BTreeSet::new();
     for t in &translations {
         let key = (t.func.container.clone(), t.func.addr);
-        let in_sdk = inputs.map.sdk_at(&t.func.container, t.func.addr).is_some();
-        let original = inputs
-            .map
-            .sdk_at(&t.func.container, t.func.addr)
-            .is_some_and(|p| opts.original.iter().any(|l| p.member.split('/').next() == Some(l.as_str())));
-        let tier = if let (true, Some(&id), false) = (in_sdk, adapter_id.get(t.func.name.as_str()), original) {
+        let member = inputs.map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
+        let original = member.is_some_and(|m| device_libs.iter().any(|l| m.split('/').next() == Some(l.as_str())));
+        let policy = member.map(|m| boundary.policy(m).unwrap_or(Policy::Adapter));
+        let adapter = adapter_id.get(t.func.name.as_str()).filter(|_| policy == Some(Policy::Adapter) && !original);
+        let object_ok = member.is_some_and(|m| keys.get(m).is_some_and(|k| validated.contains(&(m, *k))));
+        if let (Some(_), Some(m), false) = (adapter, member, object_ok) {
+            unvalidated.insert(format!("{m} ({})", keys.get(m).unwrap_or(&"no identity key")));
+        }
+        let tier = if let (Some(&id), true) = (adapter, object_ok) {
             Tier::Adapter(id)
         } else if let (Some(&(input, func)), false) = (c_defs.get(&key), pinned.contains(t.func.name.as_str())) {
             debug_assert!(t.func.sources.contains(&Source::Defined));
@@ -207,6 +235,14 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             continue;
         };
         tiers.insert(key, tier);
+    }
+    let hardware = hardware_unbound(&inputs.map, &boundary, &translations, &tiers);
+    if let Some(bad) = Some(hardware.iter().filter(|h| h.reachable).map(|h| h.to_string()).collect::<Vec<_>>()).filter(|v| !v.is_empty()) {
+        bail!(
+            "functions that touch hardware themselves are reachable from guest code with no validated adapter \
+             (their objects need adapters, or a device policy):\n  {}",
+            bad.join("\n  ")
+        );
     }
     bios_calls(&out_dir(ws, &opts.game), &lifted)?;
     let failures = psxw_lift::run::write_and_compile(ws, &lift_dir, &lifted)?;
@@ -325,6 +361,8 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         schema_version: SCHEMA_VERSION,
         game: opts.game.clone(),
         commit,
+        unvalidated_objects: unvalidated.into_iter().collect(),
+        hardware_unbound: hardware.iter().map(|h| h.to_string()).collect(),
         tiers: counts,
         by_container,
         adapters: bound.into_iter().collect(),
@@ -388,6 +426,78 @@ fn check_abi(wasm: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// An SDK function that accesses I/O or kernel RAM itself but runs as
+/// guest code in an adapter-policy library.
+struct Unbound {
+    name: String,
+    member: String,
+    addr: u32,
+    what: &'static str,
+    /// Reachable from game code by direct calls that never pass through an
+    /// adapter.
+    reachable: bool,
+}
+
+impl std::fmt::Display for Unbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let how = if self.reachable { "reachable" } else { "unreachable" };
+        write!(f, "{} 0x{:08X} in {} ({}; {how})", self.name, self.addr, self.member, self.what)
+    }
+}
+
+fn hardware_unbound(
+    map: &psxw_inputs::AddressMap,
+    boundary: &Boundary,
+    translations: &[psxw_lift::Translation],
+    tiers: &BTreeMap<(String, u32), Tier>,
+) -> Vec<Unbound> {
+    // Direct calls, from game code, stopping at adapters.
+    let by_key: BTreeMap<(&str, u32), &psxw_lift::Translation> =
+        translations.iter().map(|t| ((t.func.container.as_str(), t.func.addr), t)).collect();
+    let is_adapter = |c: &str, a: u32| matches!(tiers.get(&(c.to_string(), a)), Some(Tier::Adapter(_)));
+    let mut seen: BTreeSet<(&str, u32)> = BTreeSet::new();
+    let mut work: Vec<(&str, u32)> = translations
+        .iter()
+        .filter(|t| map.sdk_at(&t.func.container, t.func.addr).is_none())
+        .map(|t| (t.func.container.as_str(), t.func.addr))
+        .collect();
+    while let Some(k) = work.pop() {
+        if !seen.insert(k) || is_adapter(k.0, k.1) {
+            continue;
+        }
+        let Some(t) = by_key.get(&k) else { continue };
+        for &(_, target, _) in &t.facts.call_sites {
+            for c in [k.0, map.main.as_str()] {
+                if by_key.contains_key(&(c, target)) {
+                    work.push((c, target));
+                    break;
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for t in translations {
+        let Some(p) = map.sdk_at(&t.func.container, t.func.addr) else { continue };
+        if boundary.policy(&p.member).unwrap_or(Policy::Adapter) != Policy::Adapter || is_adapter(&t.func.container, t.func.addr) {
+            continue;
+        }
+        let what = match (!t.facts.io.is_empty(), !t.facts.kernel.is_empty()) {
+            (true, true) => "I/O and kernel RAM",
+            (true, false) => "I/O",
+            (false, true) => "kernel RAM",
+            (false, false) => continue,
+        };
+        out.push(Unbound {
+            name: t.func.name.clone(),
+            member: p.member.clone(),
+            addr: t.func.addr,
+            what,
+            reachable: seen.contains(&(t.func.container.as_str(), t.func.addr)),
+        });
+    }
+    out
 }
 
 /// The BIOS calls translated code makes (M2 task 8), by table and number,
