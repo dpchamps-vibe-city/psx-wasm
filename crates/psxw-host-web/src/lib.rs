@@ -45,6 +45,18 @@ mod web {
             format!("{:?}", self.r.info())
         }
 
+        /// Zero VRAM and the colour-table slots (tests).
+        pub fn reset(&mut self) {
+            self.r.reset_vram();
+        }
+
+        /// Execute a command stream; its READBACK pixels, in order (tests:
+        /// the GPU oracle's vectors, as the render server runs them).
+        pub fn run(&mut self, words: &[u32]) -> Result<Vec<u16>, JsValue> {
+            self.r.execute(words).map_err(js)?;
+            Ok(self.r.take_readbacks())
+        }
+
         /// `render_submit`: execute renderer commands.
         pub fn submit(&mut self, words: &[u32]) -> Result<(), JsValue> {
             self.r.execute(words).map_err(js)

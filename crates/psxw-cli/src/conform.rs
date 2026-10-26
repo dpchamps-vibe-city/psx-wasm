@@ -200,6 +200,9 @@ struct Report {
     schema_version: u32,
     game: String,
     library: String,
+    /// The library's objects in this game (member, identity key): what
+    /// the verdict covers (M8 task 7).
+    objects: Vec<(String, String)>,
     steps: usize,
     pass: bool,
     first_differences: Vec<(Observation, Observation)>,
@@ -269,10 +272,19 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     for (x, y) in diffs.iter().take(8) {
         println!("differs at {}:\n  adapter  {:?}\n  original {:?}", x.step, x.values, y.values);
     }
+    let db = psxw_inputs::identity::SigDb::pinned(ws)?;
+    let ident = psxw_inputs::identity::identify(game, &inputs.map, &inputs.originals, &db);
+    let objects = ident
+        .identities
+        .iter()
+        .filter(|i| i.member.split('/').next() == Some(lib.as_str()))
+        .map(|i| (i.member.clone(), i.key.clone().unwrap_or_else(|| "(subsegment only)".into())))
+        .collect();
     let report = Report {
         schema_version: 1,
         game: game.into(),
         library: lib.clone(),
+        objects,
         steps: a.log.len().max(o.log.len()),
         pass,
         first_differences: diffs,

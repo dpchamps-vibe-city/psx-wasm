@@ -16,8 +16,22 @@ pub fn build(ws: &Workspace, game: &str) -> Result<PathBuf> {
     let (report, _) = crate::game::build(ws, &crate::game::Options::new(game))?;
     let dir = out_dir(ws, game);
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("pkg"))?;
+    std::fs::create_dir_all(&dir)?;
+    pkg(ws, &dir.join("pkg"))?;
+    for e in std::fs::read_dir(ws.root.join("web"))? {
+        let p = e?.path();
+        if p.is_file() {
+            std::fs::copy(&p, dir.join(p.file_name().unwrap_or_default()))?;
+        }
+    }
+    std::fs::copy(&report.wasm, dir.join("game.wasm"))?;
+    Ok(dir)
+}
 
+/// The renderer package (`psxw-host-web` and its wasm-bindgen glue) in
+/// `out`.
+pub fn pkg(ws: &Workspace, out: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(out)?;
     eprintln!("build-web: psxw-host-web for wasm32");
     let ok = Command::new("cargo")
         .current_dir(&ws.root)
@@ -31,7 +45,7 @@ pub fn build(ws: &Workspace, game: &str) -> Result<PathBuf> {
     let wasm = ws.root.join("target/wasm32-unknown-unknown/release/psxw_host_web.wasm");
     let ok = Command::new(ws.tool("wasm-bindgen", "wasm-bindgen")?)
         .args(["--target", "web", "--no-typescript", "--out-dir"])
-        .arg(dir.join("pkg"))
+        .arg(out)
         .arg(&wasm)
         .status()
         .context("running wasm-bindgen")?
@@ -39,12 +53,5 @@ pub fn build(ws: &Workspace, game: &str) -> Result<PathBuf> {
     if !ok {
         bail!("wasm-bindgen failed");
     }
-    for e in std::fs::read_dir(ws.root.join("web"))? {
-        let p = e?.path();
-        if p.is_file() {
-            std::fs::copy(&p, dir.join(p.file_name().unwrap_or_default()))?;
-        }
-    }
-    std::fs::copy(&report.wasm, dir.join("game.wasm"))?;
-    Ok(dir)
+    Ok(())
 }

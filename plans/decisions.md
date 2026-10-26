@@ -344,6 +344,20 @@ would reimplement it; the original runs unchanged over `psx-bios::card`.
 - **libcard's thin BIOS wrappers keep adapters**: their `_patch_card`
   patches Sony BIOS code in kernel RAM.
 
+**D44. Browser tests: Debian-snapshot browsers, results POSTed by the
+page** (M5). Two deviations from the plan's Playwright image and
+TypeScript shell:
+- **The test image is `psxw-browsers`:** Chromium and Firefox ESR from the
+  pinned Debian snapshot, on the oracle images' base, with no network. A
+  test page runs on its own and POSTs its result to a small in-container
+  server; a script opens each browser headless and waits for that file.
+- **The web shell is plain ES modules,** with no build step.
+
+*Why:* it reuses the pins the oracle images already have and needs no
+Node toolchain. The image is much smaller than Playwright's, which
+matters on this machine. The tests only need a page to load and report,
+not to be scripted.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided in M5.

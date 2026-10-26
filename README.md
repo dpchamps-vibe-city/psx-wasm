@@ -6,33 +6,48 @@ browser or webview. It is not an emulator: the game's C is compiled to wasm,
 the PSX memory map is preserved, and Rust services replace the hardware at
 the SDK boundary.
 
-Status: M0 (the census) works. The design is in
-[docs/design.md](docs/design.md).
+Status: M0, M1 done; M2–M8 in progress. The game builds into
+`game.wasm`; booting it waits for the disc image (`psxw.local.toml`).
+Milestones and their state: [plans/README.md](plans/README.md). The design
+is in [docs/design.md](docs/design.md); decisions in
+[plans/decisions.md](plans/decisions.md).
 
 ```sh
 cargo build --release -p psxw-cli
-./target/release/psxw toolchain fetch      # pinned clang (wasi-sdk), sha256-verified
+./target/release/psxw toolchain fetch      # pinned clang, binaryen, wasm-bindgen, signatures
 ./target/release/psxw inputs sync          # snapshot pinned repos into .inputs/
-./target/release/psxw census btn           # M0: compile every TU, check vs original
+./target/release/psxw ci btn               # every gate of every milestone so far
+./target/release/psxw build btn            # out/btn/game.wasm
+./target/release/psxw run btn --check boot # needs [game.btn] disc in psxw.local.toml
+./target/release/psxw build-web btn && ./target/release/psxw serve out/web/btn
 ```
 
 | Path | What |
 |---|---|
-| `inputs.lock` | Pinned commits of the decomp repos, and the pinned clang |
-| `boundary/` | Per-SDK-version HLE boundary manifests |
+| `inputs.lock` | Pinned commits of the decomp repos, toolchains, oracle images |
+| `boundary/` | The SDK boundary: per-library policy (adapter, device, guest), object identities |
 | `games/` | Per-game manifests: the only place game-specific facts live |
-| `crates/psxw-abi` | Memory layout and the guest/runtime contract |
-| `crates/psxw-inputs` | Lockfile, snapshots, splat configs, symbol files, address map, originals |
-| `crates/psxw-cc` | clang → wasm objects (C tier): prelude, GCC 2.95 normalization, layout probe |
-| `crates/psxw-census` | M0 census: coverage, references, data and layout checks, report |
-| `crates/psxw-lift` | MIPS → wasm, ahead of time (lift tier); not started |
-| `crates/psxw-link` | Final link of `guest.wasm`; the relocatable wasm object reader so far |
-| `crates/psx-gte` | GTE, exact per psx-spx; checked by `psxw oracle check <game> --device gte` |
-| `crates/psx-runtime` | SDK services: kernel, clock, gpu, spu, cd, pad, memcard; not started |
-| `crates/psxw-host-native` | wasmtime host (tests, replays, headless); not started |
-| `crates/psxw-host-web` | Browser runtime (`runtime.wasm`); not started |
-| `crates/psxw-cli` | `psxw` driver |
-| `web/` | Worker, AudioWorklet and UI glue; not started |
+| `crates/psxw-abi` | Memory layout, the guest/runtime/host contract, renderer commands, replays |
+| `crates/psxw-inputs` | Lockfile, snapshots, splat configs, address map, originals, SDK identity |
+| `crates/psxw-cc` | clang → wasm objects (C tier): prelude, normalization, layout probe |
+| `crates/psxw-census` | M0 census; SDK struct layouts for adapters |
+| `crates/psxw-lift` | MIPS → C translation (lift tier) |
+| `crates/psxw-link` | Links `guest.wasm`: placement, dispatch, overlays, guest passes |
+| `crates/psxw-difftest` | M1: decompiled C vs translation, function by function |
+| `crates/psxw-build` | `psxw build` (game.wasm = guest + runtime via wasm-merge), `build-web` |
+| `crates/psx-runtime` | The runtime module: boot, driver, FFI to guest and host |
+| `crates/psx-bios` | The HLE BIOS: A0/B0/C0, events, files, memory cards, the I/O bus |
+| `crates/psx-devices` | Clock, timers, CD, GPU front end, DMA, IRQ, SIO0 pad, memory card |
+| `crates/psx-gte` | GTE, exact per psx-spx and the oracle |
+| `crates/sdk-psyq` | PsyQ adapters, validated objects, generated struct layouts |
+| `crates/psx-render-gl` | The WebGL2/GLES backend, render server |
+| `crates/psxw-host-native` | wasmtime host: headless runs, replays, conformance driver |
+| `crates/psxw-host-web` | The browser renderer (wasm-bindgen) |
+| `crates/psxw-oracle` | Device oracle: vectors, goldens, Docker emulator, play and ramdiff |
+| `crates/psxw-gpu-oracle` | The GPU as an oracle device (render server in Docker) |
+| `crates/psxw-cli` | The `psxw` driver |
+| `web/` | The browser host: page, Worker, OPFS disc, AudioWorklet |
+| `oracle/` | Emulator host, runner, Docker images |
 
 The layout probe's end-to-end test runs the real reference compiler when
 both variables are set:

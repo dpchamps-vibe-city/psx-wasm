@@ -30,6 +30,7 @@ mod run;
 mod conform;
 mod render;
 mod serve;
+mod webtest;
 mod oracle;
 mod wholegame;
 
@@ -183,6 +184,11 @@ fn run() -> Result<()> {
         ["build-web", game] => {
             let dir = psxw_build::web::build(&ws, game)?;
             eprintln!("web bundle: {} (serve it with `psxw serve {}`)", dir.display(), dir.display());
+        }
+        ["web-test", rest @ ..] => {
+            if !webtest::run(&ws, rest)? {
+                std::process::exit(2);
+            }
         }
         ["serve", rest @ ..] => {
             let mut root = ws.out_dir().join("web");

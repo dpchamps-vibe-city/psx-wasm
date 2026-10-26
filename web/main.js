@@ -1,7 +1,9 @@
 // The main thread (M5): disc import into OPFS, input polling into a
 // SharedArrayBuffer, audio setup (silence until M6), and the Worker that
-// runs the game. Query parameters for tests: ?cue=NAME&frames=N&verify=1
-// &replay=URL&hash=F,F,... (verify: no pacing; hashes posted at the end).
+// runs the game. Query parameters for tests: ?cue=NAME&frames=N&verify
+// &replay=URL&hash=F,F,...&autostart; ?discurl=URL imports the .cue at URL
+// (and the .bin files it names, beside it) into OPFS first; ?post=NAME
+// POSTs the hashes to /result?browser=NAME when the run stops.
 
 const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
@@ -55,6 +57,19 @@ async function importDisc(files) {
   return cue;
 }
 
+/** Fetch a .cue and its .bin files over HTTP into OPFS (test hook). */
+async function importDiscUrl(url) {
+  const cueText = await (await fetch(url)).text();
+  const base = new URL(url, location.href);
+  const names = [...cueText.matchAll(/^\s*FILE\s+"?([^"]+?)"?\s+\S+\s*$/gm)].map((m) => m[1]);
+  const files = [new File([cueText], base.pathname.split("/").pop())];
+  for (const n of names) {
+    say(`fetching ${n}…`);
+    files.push(new File([await (await fetch(new URL(n, base))).blob()], n));
+  }
+  return importDisc(files);
+}
+
 async function startAudio() {
   // Silence until M6 fills the ring; the worklet's clock drives nothing yet.
   try {
@@ -83,10 +98,18 @@ function start(cue) {
     const m = e.data;
     if (m.type === "status") say(m.text);
     else if (m.type === "log") console.log(`[${m.frame}] ${m.text}`);
-    else if (m.type === "hashes") window.psxwHashes = m;
+    else if (m.type === "hashes") {
+      window.psxwHashes = m;
+      if (params.has("post")) {
+        fetch(`/result?browser=${params.get("post") || params.get("browser")}`, { method: "POST", body: JSON.stringify(m) });
+      }
+    }
     else if (m.type === "stopped") {
       say(`stopped at frame ${m.frame ?? "?"}: ${m.reason}`);
       window.psxwStopped = m;
+      if (params.has("post") && !window.psxwHashes) {
+        fetch(`/result?browser=${params.get("post") || params.get("browser")}`, { method: "POST", body: JSON.stringify({ error: m.reason, frame: m.frame }) });
+      }
     }
   };
   worker.postMessage({ type: "start", canvas, cue, padBuffer, options }, [canvas]);
@@ -114,4 +137,15 @@ startButton.addEventListener("click", async () => {
   requestAnimationFrame(pollInput);
   start(cue);
 });
-if (params.has("autostart") && cue) startButton.click();
+if (params.has("discurl")) {
+  importDiscUrl(params.get("discurl"))
+    .then((c) => {
+      cue = c;
+      startButton.disabled = false;
+      if (params.has("autostart")) startButton.click();
+    })
+    .catch((e) => {
+      say(String(e));
+      if (params.has("post")) fetch(`/result?browser=${params.get("post") || params.get("browser")}`, { method: "POST", body: JSON.stringify({ error: String(e) }) });
+    });
+} else if (params.has("autostart") && cue) startButton.click();
