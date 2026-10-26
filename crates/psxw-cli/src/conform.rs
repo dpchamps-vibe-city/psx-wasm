@@ -160,12 +160,14 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let mut lib = None;
     let mut frames = 120u32;
     let mut server = false;
+    let mut dump: Option<std::path::PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {
             "--lib" => lib = it.next().map(|s| s.to_string()),
             "--frames" => frames = it.next().context("--frames needs a value")?.parse()?,
             "--render" => server = it.next().is_some_and(|r| *r == "server"),
+            "--dump-frames" => dump = it.next().map(|d| std::path::PathBuf::from(*d)),
             other => bail!("unknown conform option {other}"),
         }
     }
@@ -192,7 +194,8 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     std::fs::create_dir_all(&dir)?;
     let side = |wasm: &str| -> Result<Side> {
         let render = server.then(|| crate::render::server(ws));
-        let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, render, ..Default::default() };
+        let dump_frames = dump.clone().map(|d| (d.join(if wasm.ends_with("game.wasm") { "adapter" } else { "original" }), 1));
+        let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, render, dump_frames, ..Default::default() };
         Ok(Side { c: Conform::new(&o, &ram, sp, exe.gp0)?, log: vec![] })
     };
     let mut a = side(&adapters)?;

@@ -32,6 +32,9 @@ impl Render for ServerRender {
     fn vram(&mut self) -> Result<Option<Vec<u16>>> {
         self.readback(Rect { x: 0, y: 0, w: 1024, h: 512 }).map(Some)
     }
+    fn frame(&mut self) -> Result<Option<(u32, u32, Vec<u8>)>> {
+        self.dev.frame().map(Some)
+    }
 }
 
 pub fn server(ws: &Workspace) -> SharedRender {

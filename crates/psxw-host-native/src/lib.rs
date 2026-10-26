@@ -46,6 +46,9 @@ pub struct Options {
     pub render: Option<render::SharedRender>,
     /// Frames at which to hash VRAM (needs a renderer with VRAM).
     pub vram_hash_at: Vec<u64>,
+    /// Write every `.1`th presented frame to `.0` as `frame_NNNNNN.png`
+    /// (needs a renderer that draws).
+    pub dump_frames: Option<(PathBuf, u64)>,
 }
 
 /// An overlay's original text, by guest address.
@@ -437,9 +440,16 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         s.render.last_present = Some([w[0], w[1], w[2], w[3], w[4]]);
         let frame = s.frame + 1;
         let want_vram = s.opts.vram_hash_at.contains(&frame);
+        let dump = s.opts.dump_frames.clone().filter(|(_, every)| frame % (*every).max(1) == 0);
         let r = s.renderer.clone();
         let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
         r.present(&desc).map_err(|e| wasmtime::Error::msg(format!("present: {e:#}")))?;
+        if let Some((dir, _)) = dump {
+            if let Some((w, h, rgba)) = r.frame().map_err(|e| wasmtime::Error::msg(format!("frame: {e:#}")))? {
+                std::fs::create_dir_all(&dir).ok();
+                std::fs::write(dir.join(format!("frame_{frame:06}.png")), render::png(w, h, &rgba)).ok();
+            }
+        }
         if want_vram {
             if let Some(v) = r.vram().map_err(|e| wasmtime::Error::msg(format!("vram: {e:#}")))? {
                 let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_le_bytes()).collect();

@@ -43,6 +43,19 @@ pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Ve
             "--wasm" => o.wasm = val()?.into(),
             "--check" => checks.push(val()?),
             "--verbose" => o.verbose = true,
+            "--render" => {
+                if val()? == "server" {
+                    o.render = Some(crate::render::server(ws));
+                }
+            }
+            "--vram-hash-at" => o.vram_hash_at = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
+            "--dump-frames" => o.dump_frames = Some((val()?.into(), 1)),
+            "--dump-every" => {
+                let n: u64 = val()?.parse()?;
+                if let Some(d) = &mut o.dump_frames {
+                    d.1 = n;
+                }
+            }
             other => bail!("unknown run option {other}"),
         }
     }
