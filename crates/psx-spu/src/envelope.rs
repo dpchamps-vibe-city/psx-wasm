@@ -67,3 +67,64 @@ pub fn step(level: i16, counter: &mut u16, r: Rate) -> (i16, bool) {
     };
     (next as i16, true)
 }
+
+/// Advance a volume register's sweep by one tick (psx-spx "Sweep Volume
+/// Mode"), as the device oracle showed it behaves:
+/// - oracle: the level saturates on every tick, not only on steps;
+/// - oracle: exponential decrease ignores the phase bit for its step (it
+///   always moves the level towards zero), and in negative phase it does
+///   not clamp at zero (a negative level decays towards zero from below);
+/// - oracle: exponential increase slows down when the low 15 bits of the
+///   level (inverted in negative phase) reach 6000h, so with positive
+///   phase a level slows down from -2000h upwards as well as from 6000h.
+///
+/// The step counter is not reset by writing the register; it starts at
+/// zero after a step.
+pub fn sweep(level: i16, counter: &mut u16, raw: u16) -> i16 {
+    let shift = ((raw >> 2) & 0x1F) as i32;
+    let stepv = (raw & 3) as i32;
+    let exponential = raw & 0x4000 != 0;
+    let decreasing = raw & 0x2000 != 0;
+    let negative = raw & 0x1000 != 0;
+    let lvl = level as i32;
+    let mut step: i32 = 7 - stepv;
+    if decreasing ^ (negative && !(exponential && decreasing)) {
+        step = !step;
+    }
+    step <<= (11 - shift).max(0);
+    let mut inc: u32 = 0x8000 >> (shift - 11).max(0).min(16);
+    if exponential && !decreasing {
+        let x = if negative { !lvl } else { lvl } & 0x7FFF;
+        if x >= 0x6000 {
+            if shift < 10 {
+                step >>= 2;
+            } else if shift >= 11 {
+                inc >>= 2;
+            } else {
+                step >>= 1;
+                inc >>= 1;
+            }
+        }
+    } else if exponential && decreasing {
+        step = (step * lvl) >> 15;
+    }
+    if (stepv | shift << 2) != 0x7F {
+        inc = inc.max(1);
+    }
+    let c = *counter as u32 + inc;
+    let mut next = lvl;
+    if c & 0x8000 != 0 {
+        *counter = 0;
+        next += step;
+    } else {
+        *counter = c as u16;
+    }
+    let next = if !decreasing || (exponential && negative) {
+        next.clamp(-0x8000, 0x7FFF)
+    } else if negative {
+        next.clamp(-0x8000, 0)
+    } else {
+        next.clamp(0, 0x7FFF)
+    };
+    next as i16
+}

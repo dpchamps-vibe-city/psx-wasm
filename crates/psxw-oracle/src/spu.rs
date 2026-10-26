@@ -331,6 +331,9 @@ pub enum Knowable {
     NotReadback,
     /// The result changes within the queued writes' timing tolerance.
     NotWrites,
+    /// The result depends on state no reset clears (the volume sweeps'
+    /// step counters).
+    NotHistory,
 }
 
 /// The result of `r` and whether it is the same under every timing the
@@ -349,6 +352,13 @@ pub fn robust(r: &SpuRun, store: &Store, t: &Timing) -> Result<(Vec<u8>, Knowabl
     for (v, why) in &variants {
         if readback(written(edge.clone(), r, v), r, v) != nominal {
             return Ok((nominal, *why));
+        }
+    }
+    for counters in [0x4000, 0x7FFF] {
+        let mut s = edge.clone();
+        s.set_sweep_counters(counters);
+        if readback(written(s, r, t), r, t) != nominal {
+            return Ok((nominal, Knowable::NotHistory));
         }
     }
     Ok((nominal, Knowable::Yes))

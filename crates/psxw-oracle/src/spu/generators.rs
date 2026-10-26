@@ -26,7 +26,10 @@ use psx_spu::reg;
 pub const DEFAULT_SEED: u64 = 0x5053_5857_4D36_0001;
 
 /// The generators, in order.
-pub const GENERATORS: [&str; 9] = ["adpcm", "adpcm-reserved", "loop", "pitch", "attack", "decay", "sustain", "release", "kon"];
+pub const GENERATORS: [&str; 18] = [
+    "adpcm", "adpcm-reserved", "loop", "pitch", "attack", "decay", "sustain", "release", "kon", "pmon", "sweep", "mainvol", "noise", "reverb",
+    "capture", "irq", "mute", "registers",
+];
 
 /// Where generated samples go in SPU RAM.
 const SAMPLES: u32 = 0x2000;
@@ -188,7 +191,7 @@ impl Gen<'_> {
                     self.out.push(Vector::SpuRun(run));
                     return Ok(true);
                 }
-                Knowable::NotWrites => break,
+                Knowable::NotWrites | Knowable::NotHistory => break,
                 Knowable::NotReadback => {}
             }
         }
@@ -429,6 +432,372 @@ impl Gen<'_> {
         }
         Ok(())
     }
+
+    /// A random level for a held voice (never 7FFFh: attack at the top
+    /// moves on to decay).
+    fn level(&mut self) -> u16 {
+        self.pick(&[0x7FFE, 0x4000, 0x1234, 0x0800]) - self.int(0, 0x7F) as u16
+    }
+
+    /// Pitch modulation: voice 0 modulates voice 1, voice 2 voice 3, with
+    /// every pitch (above 7FFFh too, where psx-spx describes a glitch).
+    fn pmon(&mut self) -> Result<()> {
+        for _ in 0..200 {
+            let (n, a, cut) = self.window(150, 400);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            for v in 0..4usize {
+                let addr = SAMPLES + 0x200 * v as u32;
+                let blocks = self.int(2, 8) as usize;
+                let data = self.sample(blocks, &[0, 1, 2, 3, 4, 5, 6], &[0, 1, 2, 3, 4]);
+                b.ram(addr, data);
+                let pitch = if v % 2 == 0 {
+                    self.pick(&[0x0200, 0x0400, 0x0800, 0x1000, 0x2000, 0x3FFF]) as u32
+                } else {
+                    match self.int(0, 3) {
+                        0 => self.int(0, 0x3FFF),
+                        1 => self.int(0x4000, 0x7FFF),
+                        2 => self.int(0x8000, 0xFFFF),
+                        _ => self.pick(&[0x1000, 0x2000, 0x4000, 0x7FFF, 0x8000, 0xFFFF]),
+                    }
+                } as u16;
+                b.voice(1, v, V { pitch, ssa: addr, adsr1: HOLD.0, adsr2: HOLD.1, vol: [0, 0] });
+                let level = self.level();
+                b.w(a + 1, reg::voice(v, reg::ENVX), level);
+            }
+            let mut pmon = 0u16;
+            for bit in [0u16, 1, 2, 3] {
+                if self.chance(2) {
+                    pmon |= 1 << bit;
+                }
+            }
+            b.w(2, reg::PMON, pmon);
+            if self.chance(4) {
+                b.w(self.int(a + 2, cut - 1), reg::PMON, self.rng.u16() & 0xF);
+            }
+            b.kon(a, 0b1111);
+            b.cut(cut, 1);
+            b.cut(cut, 3);
+            b.capture_voices();
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// A random sweep mode word (bit 15 set).
+    fn sweep_word(&mut self) -> u16 {
+        let mut w = 0x8000 | (self.rng.u16() & 0x707F);
+        if self.chance(6) {
+            w |= self.rng.u16() & 0x0F80;
+        }
+        w
+    }
+
+    /// Volume sweeps on voices, observed in the current-volume registers.
+    fn sweeps(&mut self) -> Result<()> {
+        for _ in 0..240 {
+            let n = self.int(640, 3000);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            for v in 0..23usize {
+                if self.chance(3) {
+                    b.w(1, reg::voice(v, reg::VOLL + 2 * self.int(0, 1)), self.rng.u16() & 0x7FFF);
+                }
+            }
+            for _ in 0..self.int(1, 3) {
+                let v = self.int(0, 22) as usize;
+                let r = reg::voice(v, reg::VOLL + 2 * self.int(0, 1));
+                let s0 = self.int(3, n - 300);
+                // A sweep that steps every tick zeroes the step counter,
+                // which no register write resets.
+                b.w(s0 - 1, r, 0x8000);
+                b.w(s0, r, self.rng.u16() & 0x7FFF);
+                let s1 = self.int(s0 + 2, n - 2);
+                let w = self.sweep_word();
+                b.w(s1, r, w);
+            }
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// Main volume (direct and sweeps) and the plain volume registers.
+    fn mainvol(&mut self) -> Result<()> {
+        for _ in 0..160 {
+            let n = self.int(640, 3000);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            for r in [reg::EVOLL, reg::EVOLR, reg::AVOLL, reg::AVOLR, reg::BVOLL, reg::BVOLR] {
+                if self.chance(2) {
+                    b.w(1, r, self.rng.u16());
+                }
+            }
+            for r in [reg::MVOLL, reg::MVOLR] {
+                let s0 = self.int(3, n - 300);
+                b.w(s0 - 1, r, 0x8000);
+                b.w(s0, r, self.rng.u16() & 0x7FFF);
+                if self.chance(3) {
+                    let s1 = self.int(s0 + 2, n - 2);
+                    let w = self.sweep_word();
+                    b.w(s1, r, w);
+                }
+            }
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// Noise mode on voices that are not captured: their envelopes, ENDX
+    /// and repeat addresses (the noise level itself is not knowable: no
+    /// register resets the generator); voices 1 and 3 play ADPCM alongside.
+    fn noise(&mut self) -> Result<()> {
+        for _ in 0..120 {
+            let (n, a, cut) = self.window(150, 400);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000 | (self.rng.u16() & 0x3F00));
+            let mut non = 0u32;
+            let mut keyed = 0b1010u32;
+            for (i, v) in [1usize, 3, 4, 6, 8, 12, 20].into_iter().enumerate() {
+                let addr = SAMPLES + 0x200 * i as u32;
+                let blocks = self.int(1, 6) as usize;
+                let data = self.sample(blocks, &[0, 1, 2], &[0, 1]);
+                b.ram(addr, data);
+                b.voice(1 + i as u32, v, V { pitch: self.pick(&[0x1000, 0x0800, 0x3000, 0x0123]), ssa: addr, adsr1: self.rng.u16(), adsr2: self.rng.u16() & 0xDFFF, vol: [0, 0] });
+                if v != 1 && v != 3 {
+                    keyed |= 1 << v;
+                    if self.chance(3) {
+                        non |= 1 << v;
+                    }
+                }
+            }
+            b.w(1, reg::NON, non as u16);
+            b.w(1, reg::NON + 2, (non >> 16) as u16);
+            b.kon(a, keyed);
+            if self.chance(2) {
+                b.w(self.int(a + 1, cut), reg::SPUCNT, 0xC000 | (self.rng.u16() & 0x3F00));
+            }
+            b.cut(cut, 1);
+            b.cut(cut, 3);
+            b.capture_voices();
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// The reverb unit: a work area the vector initialises, random or
+    /// preset configurations, voices 1 and 3 (and 5) as input; reverb
+    /// writes stop before the readback so the area is read whole.
+    fn reverb(&mut self) -> Result<()> {
+        const PRESETS: [(u32, [u16; 32]); 3] = [
+            (0x26C0, [0x007D, 0x005B, 0x6D80, 0x54B8, 0xBED0, 0x0000, 0x0000, 0xBA80, 0x5800, 0x5300, 0x04D6, 0x0333, 0x03F0, 0x0227, 0x0374, 0x01EF,
+                      0x0334, 0x01B5, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x01B4, 0x0136, 0x00B8, 0x005C, 0x8000, 0x8000]),
+            (0x1F40, [0x0033, 0x0025, 0x70F0, 0x4FA8, 0xBCE0, 0x4410, 0xC0F0, 0x9C00, 0x5280, 0x4EC0, 0x03E4, 0x031B, 0x03A4, 0x02AF, 0x0372, 0x0266,
+                      0x031C, 0x025D, 0x025C, 0x018E, 0x022F, 0x0135, 0x01D2, 0x00B7, 0x018F, 0x00B5, 0x00B4, 0x0080, 0x004C, 0x0026, 0x8000, 0x8000]),
+            (0x3C00, [0x0017, 0x0013, 0x70F0, 0x4FA8, 0xBCE0, 0x4510, 0xBEF0, 0x8500, 0x5F80, 0x54C0, 0x0371, 0x02AF, 0x02E5, 0x01DF, 0x02B0, 0x01D7,
+                      0x0358, 0x026A, 0x01D6, 0x011E, 0x012D, 0x00B1, 0x011F, 0x0059, 0x01A0, 0x00E3, 0x0058, 0x0040, 0x0028, 0x0014, 0x8000, 0x8000]),
+        ];
+        for _ in 0..160 {
+            let (n, a, cut) = self.window(200, 400);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            let size = self.pick(&[0x400u32, 0x800, 0x1000, 0x2000, 0x4000]);
+            let base = 0x8_0000 - size;
+            let mut area = vec![0u8; size as usize];
+            if self.chance(2) {
+                for x in area.iter_mut() {
+                    *x = self.rng.u16() as u8;
+                }
+            }
+            b.ram(base, area);
+            let units = (size / 8) as u16;
+            let preset = PRESETS.iter().filter(|p| p.0 <= size).collect::<Vec<_>>();
+            let regs: Vec<u16> = if !preset.is_empty() && self.chance(3) {
+                let p = preset[self.rng.below(preset.len() as u32) as usize];
+                p.1.to_vec()
+            } else {
+                (0..32)
+                    .map(|k| match k {
+                        // Volumes (vIIR..vAPF2, vLIN, vRIN).
+                        2..=9 | 30 | 31 => match self.int(0, 5) {
+                            0 => self.pick(&[0x7FFF, 0x8000, 0x8001, 0, 0x4000, 0xC000]),
+                            _ => self.rng.u16(),
+                        },
+                        // Displacements and addresses, in 8-byte units.
+                        _ => self.int(0, units as u32 - 1) as u16,
+                    })
+                    .collect()
+            };
+            for (k, val) in regs.iter().enumerate() {
+                b.w(1 + (k / 8) as u32, reg::REVERB + 2 * k as u32, *val);
+            }
+            let mut eon = 0u32;
+            for (i, v) in [1usize, 3, 5].into_iter().enumerate() {
+                let addr = SAMPLES + 0x200 * i as u32;
+                let blocks = self.int(2, 6) as usize;
+                let data = self.sample(blocks, &[0, 1, 2, 3], &[0, 1, 2]);
+                b.ram(addr, data);
+                let vol = [self.rng.u16() & 0x7FFF, self.rng.u16() & 0x7FFF];
+                b.voice(6 + i as u32, v, V { pitch: self.pick(&[0x1000, 0x0800, 0x1800]), ssa: addr, adsr1: HOLD.0, adsr2: HOLD.1, vol });
+                let level = self.level();
+                b.w(a + 1, reg::voice(v, reg::ENVX), level);
+                if self.chance(4) != (v == 5) {
+                    eon |= 1 << v;
+                }
+            }
+            b.w(10, reg::EON, eon as u16);
+            // The work area's start (and current address), then reverb on.
+            let e0 = self.int(11, a);
+            b.w(e0, reg::ESA, (base >> 3) as u16);
+            let e1 = self.int(e0, a + 40);
+            b.w(e1, reg::SPUCNT, 0xC080);
+            b.kon(a, 0b10_1010);
+            b.cut(cut, 1);
+            b.cut(cut, 3);
+            b.cut(cut, 5);
+            // Reverb writes off before the readback.
+            let off = self.int(cut + 1, n - 2);
+            b.w(off, reg::SPUCNT, 0xC000);
+            b.captures.push((base, size));
+            b.capture_voices();
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// The capture buffers themselves: layouts of captures over them (and
+    /// the CD buffers, silent), at every buffer position.
+    fn capture(&mut self) -> Result<()> {
+        for _ in 0..100 {
+            let (n, a, cut) = self.window(100, 400);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            for (i, v) in [1usize, 3].into_iter().enumerate() {
+                let addr = SAMPLES + 0x400 * i as u32;
+                let blocks = self.int(2, 8) as usize;
+                let data = self.sample(blocks, &[0, 1, 2, 3, 4], &[0, 1, 2, 3, 4]);
+                b.ram(addr, data);
+                b.voice(1 + i as u32, v, V { pitch: self.pick(&[0x1000, 0x0800, 0x0C00, 0x2000]), ssa: addr, adsr1: HOLD.0, adsr2: HOLD.1, vol: [0, 0] });
+                let level = self.level();
+                b.w(a + 1, reg::voice(v, reg::ENVX), level);
+            }
+            b.kon(a, 0b1010);
+            b.cut(cut, 1);
+            b.cut(cut, 3);
+            for _ in 0..self.int(1, 4) {
+                let start = 16 * self.int(0, 255);
+                let len = 16 * self.int(1, (0x1000 - start) / 16);
+                b.captures.push((start, len));
+            }
+            if self.chance(4) {
+                b.captures.push((SAMPLES, 0x40));
+            }
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// The IRQ address: capture-buffer writes, voices reading ADPCM data
+    /// (the silent block every idle voice plays too), enable and
+    /// acknowledge, all observed in SPUSTAT bit 6.
+    fn irq(&mut self) -> Result<()> {
+        for _ in 0..240 {
+            let n = self.int(640, 1400);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            let mode = self.int(0, 3);
+            let (irqa, hit) = match mode {
+                0 => {
+                    // A capture buffer: index i is written by run tick m with
+                    // (256 + m) mod 512 == i.
+                    let region = self.pick(&[0x000u32, 0x400, 0x800, 0xC00]);
+                    let m = self.int(40, n - 30);
+                    let idx = (256 + m) % 512;
+                    ((region + 2 * idx) >> 3, m)
+                }
+                1 => {
+                    // Voice 1 reading its sample.
+                    let blocks = self.int(2, 8) as usize;
+                    let data = self.sample(blocks, &[0, 1, 2], &[0, 1]);
+                    b.ram(SAMPLES, data);
+                    b.voice(1, 1, V { pitch: self.pick(&[0x1000, 0x0800, 0x2000, 0x0400]), ssa: SAMPLES, adsr1: HOLD.0, adsr2: HOLD.1, vol: [0, 0] });
+                    let a = self.int(20, n - 300);
+                    b.kon(a, 0b10);
+                    let word = self.int(0, 8 * blocks as u32 - 1);
+                    ((SAMPLES + 2 * word) >> 3, a + 8 + 4 * word)
+                }
+                2 => (0x0200, self.int(20, n - 30)),
+                _ => (self.int(0, 0xFFFF), self.int(20, n - 30)),
+            };
+            b.w(1, reg::IRQA, irqa as u16);
+            let enable = if self.chance(2) { hit.saturating_sub(self.int(0, 12)).max(2) } else { self.int(2, n - 4) };
+            b.w(enable, reg::SPUCNT, 0xC040);
+            if self.chance(4) {
+                let ack = self.int(enable, n - 2);
+                b.w(ack, reg::SPUCNT, 0xC000);
+                if self.chance(2) {
+                    b.w(self.int(ack, n - 1), reg::SPUCNT, 0xC040);
+                }
+            }
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// SPUCNT's mute and enable bits while voices 1 and 3 play.
+    fn mute(&mut self) -> Result<()> {
+        for _ in 0..100 {
+            let (n, a, cut) = self.window(150, 400);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            for (i, v) in [1usize, 3].into_iter().enumerate() {
+                let addr = SAMPLES + 0x400 * i as u32;
+                let blocks = self.int(2, 6) as usize;
+                let data = self.sample(blocks, &[0, 1, 2], &[0, 1]);
+                b.ram(addr, data);
+                b.voice(1 + i as u32, v, V { pitch: 0x1000, ssa: addr, adsr1: 0x00FF, adsr2: self.pick(&[HOLD.1, 0x0FC0, 0x1F80]), vol: [0x3FFF, 0x3FFF] });
+            }
+            b.kon(a, 0b1010);
+            let mut t = a + 1;
+            while t < cut - 2 {
+                b.w(t, reg::SPUCNT, self.pick(&[0xC000, 0x8000, 0x4000, 0x0000]));
+                t += self.int(1, 80);
+            }
+            b.w(cut - 1, reg::SPUCNT, 0xC000);
+            b.cut(cut, 1);
+            b.cut(cut, 3);
+            b.capture_voices();
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
+
+    /// Register read-back: every register SPU_RESET resets, written with
+    /// random values (keys and IRQs kept out of the way).
+    fn registers(&mut self) -> Result<()> {
+        for _ in 0..160 {
+            let n = self.int(640, 1000);
+            let mut b = B::new(n);
+            b.w(0, reg::SPUCNT, 0xC000);
+            for _ in 0..self.int(5, 60) {
+                let s = self.int(1, n - 1);
+                let (r, val) = match self.int(0, 9) {
+                    0 => (reg::voice(self.int(0, 22) as usize, self.pick(&[reg::PITCH, reg::ADSR1, reg::ADSR2, reg::LSAX])), self.rng.u16()),
+                    1 => (reg::voice(self.int(0, 22) as usize, self.pick(&[reg::VOLL, reg::VOLR])), self.rng.u16() & 0x7FFF),
+                    2 => (self.pick(&[reg::MVOLL, reg::MVOLR]), self.rng.u16() & 0x7FFF),
+                    3 => (self.pick(&[reg::EVOLL, reg::EVOLR, reg::AVOLL, reg::AVOLR, reg::BVOLL, reg::BVOLR]), self.rng.u16()),
+                    4 => (self.pick(&[reg::PMON, reg::PMON + 2, reg::NON, reg::NON + 2, reg::EON, reg::EON + 2]), self.rng.u16()),
+                    5 => (self.pick(&[reg::ESA, reg::TSA]), self.rng.u16()),
+                    6 => (reg::IRQA, self.rng.u16()),
+                    7 => (reg::REVERB + 2 * self.int(0, 31), self.rng.u16()),
+                    8 => (reg::SPUCNT, 0x8000 | (self.rng.u16() & 0x7F0F)),
+                    _ => (self.pick(&[reg::KON, reg::KOFF, reg::KON + 2, reg::KOFF + 2]), 0),
+                };
+                b.w(s, r, val);
+            }
+            self.keep(&b)?;
+        }
+        Ok(())
+    }
 }
 
 /// Every synthetic vector for `seed`, generator by generator, and how many
@@ -453,7 +822,16 @@ pub fn generate(store: &Store, seed: u64, timing: &Timing) -> Result<(Vec<Genera
             "decay" => g.adsr(1)?,
             "sustain" => g.adsr(2)?,
             "release" => g.adsr(3)?,
-            _ => g.kon()?,
+            "kon" => g.kon()?,
+            "pmon" => g.pmon()?,
+            "sweep" => g.sweeps()?,
+            "mainvol" => g.mainvol()?,
+            "noise" => g.noise()?,
+            "reverb" => g.reverb()?,
+            "capture" => g.capture()?,
+            "irq" => g.irq()?,
+            "mute" => g.mute()?,
+            _ => g.registers()?,
         }
         dropped.push((*name, g.dropped));
         out.extend(g.out.into_iter().map(|vector| Generated { generator: name, vector }));

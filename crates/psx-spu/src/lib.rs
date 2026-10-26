@@ -526,14 +526,17 @@ impl Spu {
             *level = (raw << 1) as i16;
             return;
         }
-        let r = Rate {
-            shift: ((raw >> 2) & 0x1F) as u8,
-            step: (raw & 3) as u8,
-            exponential: raw & 0x4000 != 0,
-            decreasing: raw & 0x2000 != 0,
-            negative: raw & 0x1000 != 0,
-        };
-        *level = envelope::step(*level, counter, r).0;
+        *level = envelope::sweep(*level, counter, raw);
+    }
+
+    /// Test hook for the device oracle: set every volume sweep's step
+    /// counter. No register write resets them (only a step does), so a
+    /// run's result must not depend on what earlier runs left in them.
+    pub fn set_sweep_counters(&mut self, value: u16) {
+        for v in self.voices.iter_mut() {
+            v.vol_counter = [value; 2];
+        }
+        self.main_counter = [value; 2];
     }
 
     fn noise_tick(&mut self) {
