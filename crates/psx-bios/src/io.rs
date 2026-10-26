@@ -1,9 +1,15 @@
-//! Register-level I/O for device libraries (D40, D42) and conformance
-//! runs: guest accesses to the I/O window reach the interrupt controller,
-//! SIO0, the root counters, the DMA controller and the GPU here, and
-//! interrupts run the kernel's `SysEnqIntRP` chains as the BIOS exception
-//! handler does. Without a bus, an I/O access is a runtime trap: the
-//! function needs an adapter.
+//! Register-level I/O for device libraries (D40, D42, D45, D47) and
+//! conformance runs: guest accesses to the I/O window reach the interrupt
+//! controller, SIO0, the root counters, the DMA controller, the GPU and the
+//! SPU here, and interrupts run the kernel's `SysEnqIntRP` chains as the
+//! BIOS exception handler does. Without a bus, an I/O access is a runtime
+//! trap: the function needs an adapter.
+//!
+//! The SPU runs on its own 44.1 kHz clock (`psx_spu::Spu::tick`, one
+//! sample per 768 cycles). It is brought up to the current cycle before
+//! every access to it, every DMA4 transfer and every vblank. Each tick
+//! takes the next frame of the CD's output as its CD input, and the mixed
+//! output goes to the host at the vblank.
 //!
 //! DMA transfers complete instantly in virtual time. The GPU front end's
 //! output goes to the host renderer at each vblank, and whenever a
@@ -22,6 +28,9 @@ use psx_devices::sio::Sio0;
 use std::collections::BTreeMap;
 
 const TIMERS: std::ops::Range<u32> = 0x1F80_1100..0x1F80_1130;
+const SPU: std::ops::Range<u32> = 0x1F80_1C00..0x1F80_2000;
+/// DMA channel 4: SPU RAM transfers.
+const DMA_SPU: usize = 4;
 const GP0: u32 = 0x1F80_1810;
 const GP1: u32 = 0x1F80_1814;
 /// Linked-list nodes one GPU DMA may walk before it is called a loop.
@@ -29,12 +38,31 @@ const MAX_NODES: u32 = 1 << 20;
 /// Memory control (expansion bases and delays, RAM size): kept, no effect.
 const MEMCTRL: [std::ops::Range<u32>; 2] = [0x1F80_1000..0x1F80_1024, 0x1F80_1060..0x1F80_1064];
 
+/// The SPU and its clock.
+#[derive(Clone, Default)]
+pub struct SpuBus {
+    pub spu: psx_spu::Spu,
+    /// The cycle the SPU has run up to.
+    pub at: u64,
+    /// Its IRQ line at the last look (for the rising edge).
+    pub line: bool,
+    /// Mixed output not yet handed to the host.
+    pub out: Vec<[i16; 2]>,
+}
+
+impl std::fmt::Debug for SpuBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpuBus").field("at", &self.at).field("line", &self.line).field("out", &self.out.len()).finish()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Io {
     pub irq: Irq,
     pub sio0: Sio0,
     pub dma: Dma,
     pub gpu: Gpu,
+    pub spu: SpuBus,
     /// GPU words received (GP0 port and DMA), for the run report.
     pub gp0_words: u64,
     /// Memory-control words written, by address.
@@ -59,9 +87,19 @@ impl<S: Sdk> Machine<S> {
     pub fn io_read(&mut self, addr: u32, size: u32) -> Result<u32, String> {
         let now = self.clock.now;
         let video = self.clock.video;
+        if SPU.contains(&addr) {
+            self.spu_run();
+        }
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
         io.sio0.update(now, &mut io.irq);
-        let v = if Irq::handles(addr) {
+        let v = if SPU.contains(&addr) {
+            let off = addr - SPU.start;
+            let half = |o: u32| io.spu.spu.read(o) as u32;
+            match size {
+                4 => half(off & !3) | half((off & !3) + 2) << 16,
+                _ => half(off & !1) >> (8 * (addr & 1)),
+            }
+        } else if Irq::handles(addr) {
             io.irq.read(addr)
         } else if Sio0::handles(addr) {
             io.sio0.read(addr, now, &mut io.irq)
@@ -97,11 +135,31 @@ impl<S: Sdk> Machine<S> {
     pub fn io_write(&mut self, addr: u32, size: u32, v: u32) -> Result<(), String> {
         let now = self.clock.now;
         let video = self.clock.video;
+        if SPU.contains(&addr) {
+            self.spu_run();
+        }
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
         io.sio0.update(now, &mut io.irq);
         let v = v & mask(size);
         io.note(now, addr, size, v, true);
-        if Irq::handles(addr) {
+        if SPU.contains(&addr) {
+            let off = addr - SPU.start;
+            match size {
+                4 => {
+                    io.spu.spu.write(off & !3, v as u16);
+                    io.spu.spu.write((off & !3) + 2, (v >> 16) as u16);
+                }
+                2 => io.spu.spu.write(off & !1, v as u16),
+                _ => {
+                    // A byte store: the halfword with that byte replaced.
+                    let o = off & !1;
+                    let old = io.spu.spu.read(o);
+                    let sh = 8 * (addr & 1);
+                    io.spu.spu.write(o, (old & !(0xFF << sh)) | ((v as u16 & 0xFF) << sh));
+                }
+            }
+            self.spu_irq();
+        } else if Irq::handles(addr) {
             io.irq.write(addr, size, v);
         } else if Sio0::handles(addr) {
             io.sio0.write(addr, size, v, now, &mut io.irq);
@@ -162,6 +220,9 @@ impl<S: Sdk> Machine<S> {
     }
 
     fn dma_transfer(&mut self, ch: usize) -> Result<(), String> {
+        if ch == DMA_SPU {
+            self.spu_run();
+        }
         let Some(io) = self.io.as_ref() else { return Ok(()) };
         let d = io.dma;
         let c = d.chcr[ch];
@@ -212,6 +273,25 @@ impl<S: Sdk> Machine<S> {
                     addr = addr.wrapping_add(step) & 0x1F_FFFC;
                 }
             }
+            (DMA_SPU, 0 | 1, true) => {
+                let words: Vec<u32> = (0..d.words(ch)).map(|i| self.mem.r32(addr.wrapping_add(4 * i) & 0x1F_FFFC)).collect();
+                if let Some(io) = self.io.as_mut() {
+                    io.spu.spu.dma_write(&words);
+                }
+                addr = addr.wrapping_add(4 * words.len() as u32) & 0x1F_FFFC;
+                self.spu_irq();
+            }
+            (DMA_SPU, 0 | 1, false) => {
+                let mut words = vec![0u32; d.words(ch) as usize];
+                if let Some(io) = self.io.as_mut() {
+                    io.spu.spu.dma_read(&mut words);
+                }
+                for w in words {
+                    self.mem.w32(addr, w);
+                    addr = addr.wrapping_add(4) & 0x1F_FFFC;
+                }
+                self.spu_irq();
+            }
             (ch, mode, from_ram) => {
                 return Err(format!("DMA channel {ch} (sync mode {mode}, from RAM {from_ram}) is not modelled"));
             }
@@ -223,6 +303,34 @@ impl<S: Sdk> Machine<S> {
             }
         }
         Ok(())
+    }
+
+    /// Run the SPU up to the current cycle: one tick per 768 cycles, each
+    /// with the CD's next output frame as its CD input.
+    pub fn spu_run(&mut self) {
+        let now = self.clock.now;
+        let Some(io) = self.io.as_mut() else { return };
+        const CYCLES: u64 = psx_spu::CYCLES_PER_SAMPLE as u64;
+        let n = now.saturating_sub(io.spu.at) / CYCLES;
+        for _ in 0..n {
+            let [l, r] = self.cd_audio.pop_front().unwrap_or([0, 0]);
+            io.spu.spu.set_cd_input(l, r);
+            let f = io.spu.spu.tick();
+            io.spu.out.push(f);
+        }
+        io.spu.at += n * CYCLES;
+        self.spu_irq();
+    }
+
+    /// The SPU's IRQ line rising raises IRQ9.
+    fn spu_irq(&mut self) {
+        let Some(io) = self.io.as_mut() else { return };
+        let line = io.spu.spu.irq();
+        let rising = line && !io.spu.line;
+        io.spu.line = line;
+        if rising {
+            self.raise_irq(irq::SPU);
+        }
     }
 
     /// At each vblank: the frame so far to the renderer, and the display.
@@ -304,7 +412,11 @@ mod tests {
         assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Exit));
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
-        assert!(m.io_read(0x1F80_1C00, 2).is_err(), "the SPU is not on the bus");
+        // The SPU: main volume left reads back; the CD controller isn't on
+        // the bus (libcd has adapters).
+        m.io_write(0x1F80_1D80, 2, 0x3FFF).unwrap();
+        assert_eq!(m.io_read(0x1F80_1D80, 2).unwrap(), 0x3FFF);
+        assert!(m.io_read(0x1F80_1800, 1).is_err(), "the CD controller is not on the bus");
         // GP1(08h) display mode, read back in GPUSTAT bits 17-22.
         m.io_write(0x1F80_1814, 4, 0x0800_0001).unwrap();
         assert_eq!((m.io_read(0x1F80_1814, 4).unwrap() >> 17) & 3, 1);

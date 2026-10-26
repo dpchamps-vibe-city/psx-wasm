@@ -701,6 +701,7 @@ name = "psx-bios"
 version = "0.0.0"
 dependencies = [
  "psx-devices",
+ "psx-spu",
  "psxw-abi",
 ]
 

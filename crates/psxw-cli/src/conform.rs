@@ -15,10 +15,10 @@ use psxw_host_native::{Conform, Options};
 use psxw_inputs::Workspace;
 use serde::Serialize;
 
-pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd|libetc|libsnd [--frames N] [--render server] [--dump-frames DIR]";
+pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd|libetc|libsnd|libspu [--frames N] [--render server] [--dump-frames DIR]";
 
 /// Libraries with a scenario (the `psxw ci` gate runs each).
-pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd", "libetc", "libsnd"];
+pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd", "libetc", "libsnd", "libspu"];
 
 /// Functions a scenario counts calls to (build probes): libsnd's tick.
 pub fn probes(lib: &str) -> &'static [&'static str] {
@@ -151,7 +151,8 @@ impl Side {
             let files: Vec<String> = card.iter().flat_map(|c| c.files()).map(|f| format!("{} {} bytes", f.name, f.size)).collect();
             self.log.push(Observation { step: format!("{name} written back"), values: vec![format!("valid {valid}"), format!("files {files:?}")] });
         }
-        Ok(Finished { log: self.log, cards_valid })
+        self.log.push(Observation { step: "audio".into(), values: vec![format!("{} frames, {} audible, {}", r.audio.frames, r.audio.audible_frames, r.audio.hash)] });
+        Ok(Finished { log: self.log, cards_valid, audible: r.audio.audible_frames })
     }
 }
 
@@ -159,6 +160,8 @@ struct Finished {
     log: Vec<Observation>,
     /// Every card image the run wrote back has valid checksums.
     cards_valid: bool,
+    /// Audio frames with sound in them.
+    audible: u64,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -328,6 +331,51 @@ fn libetc(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
     Ok(())
 }
 
+/// libspu (D47): the original library over the SPU. A looping square-wave
+/// ADPCM sample goes to SPU RAM by DMA (`SpuWritePartly`); the master
+/// volume and voice 0 are set (`SpuSetCommonAttr`, `SpuSetVoiceAttr`); the
+/// voice is keyed on for 30 vblanks. The key status is observed, and the
+/// run's audio must be audible (checked when the run ends).
+fn libspu(ctx: &Ctx, s: &mut Side, _frames: u32) -> Result<()> {
+    use sdk_psyq::layout::{spu_common_attr as common, spu_voice_attr as voice};
+    let (data, cattr, vattr) = (SCRATCH, SCRATCH + 0x100, SCRATCH + 0x200);
+    // Four 16-byte blocks: shift 0, filter 0; the first marks the loop
+    // start, the last ends and repeats. Seven then minus eight, 8 samples
+    // each: a loud square wave.
+    let mut adpcm = Vec::new();
+    for b in 0..4u8 {
+        adpcm.extend([0x00, if b == 0 { 0x04 } else if b == 3 { 0x03 } else { 0x00 }]);
+        adpcm.extend([0x77, 0x77, 0x77, 0x77, 0x88, 0x88, 0x88, 0x88, 0x77, 0x77, 0x77, 0x77, 0x88, 0x88]);
+    }
+    s.c.write(data, &adpcm);
+    s.call(ctx, "ResetCallback", [0; 4])?;
+    s.call(ctx, "SpuInit", [0; 4])?;
+    s.call(ctx, "SpuSetTransferMode", [0, 0, 0, 0])?;
+    s.call(ctx, "SpuSetTransferStartAddr", [0x1010, 0, 0, 0])?;
+    s.call(ctx, "SpuWritePartly", [data, adpcm.len() as u32, 0, 0])?;
+    s.call(ctx, "SpuIsTransferCompleted", [1, 0, 0, 0])?;
+    let mut c = vec![0u8; common::SIZEOF as usize];
+    c[common::MASK as usize..][..4].copy_from_slice(&3u32.to_le_bytes());
+    c[common::MVOL as usize..][..4].copy_from_slice(&[0xFF, 0x3F, 0xFF, 0x3F]);
+    s.c.write(cattr, &c);
+    s.call(ctx, "SpuSetCommonAttr", [cattr, 0, 0, 0])?;
+    let mut v = vec![0u8; voice::SIZEOF as usize];
+    let mask: u32 = 0x1 | 0x2 | 0x10 | 0x80 | 1 << 17 | 1 << 18;
+    v[voice::VOICE as usize..][..4].copy_from_slice(&1u32.to_le_bytes());
+    v[voice::MASK as usize..][..4].copy_from_slice(&mask.to_le_bytes());
+    v[voice::VOLUME as usize..][..4].copy_from_slice(&[0xFF, 0x3F, 0xFF, 0x3F]);
+    v[voice::PITCH as usize..][..2].copy_from_slice(&0x1000u16.to_le_bytes());
+    v[voice::ADDR as usize..][..4].copy_from_slice(&0x1010u32.to_le_bytes());
+    v[voice::ADSR1 as usize..][..2].copy_from_slice(&0x000Fu16.to_le_bytes());
+    v[voice::ADSR2 as usize..][..2].copy_from_slice(&0u16.to_le_bytes());
+    s.c.write(vattr, &v);
+    s.call(ctx, "SpuSetVoiceAttr", [vattr, 0, 0, 0])?;
+    s.call(ctx, "SpuSetKey", [1, 1, 0, 0])?;
+    s.c.run_vblanks(30)?;
+    s.call(ctx, "SpuGetKeyStatus", [1, 0, 0, 0])?;
+    Ok(())
+}
+
 /// libsnd (M6 task 5): the sequencer's tick, which libsnd drives itself
 /// from the vblank (`SS_TICK60` on NTSC) or from root counter 2's events
 /// (`SS_TICK240`). With libetc's interrupts and the BIOS events under it,
@@ -371,6 +419,7 @@ fn scenario_for(lib: &str) -> Result<Scenario> {
         "libmcrd" => libmcrd,
         "libetc" => libetc,
         "libsnd" => libsnd,
+        "libspu" => libspu,
         other => bail!("no conformance scenario for {other} yet ({})", LIBRARIES.join(", ")),
     })
 }
@@ -528,7 +577,9 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let (a, o) = (a.finish(&dir, "adapter")?, o.finish(&dir, "original")?);
     let diffs: Vec<(Observation, Observation)> =
         a.log.iter().zip(&o.log).filter(|(x, y)| x != y).take(16).map(|(x, y)| (x.clone(), y.clone())).collect();
-    let pass = ra.is_ok() && ro.is_ok() && diffs.is_empty() && a.log.len() == o.log.len() && a.cards_valid && o.cards_valid;
+    // libspu's scenario plays a voice: silence means the SPU path is broken.
+    let sound = lib != "libspu" || (a.audible > 0 && o.audible > 0);
+    let pass = ra.is_ok() && ro.is_ok() && diffs.is_empty() && a.log.len() == o.log.len() && a.cards_valid && o.cards_valid && sound;
     for (x, y) in diffs.iter().take(8) {
         println!("differs at {}:\n  adapter  {:?}\n  original {:?}", x.step, x.values, y.values);
     }

@@ -273,9 +273,15 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// Hand the host the audio that fell due since the last vblank: one
-    /// frame per 768 cycles of virtual time. The source is the CD's output
-    /// until the SPU mixes it (M6); an empty source is silence.
+    /// frame per 768 cycles of virtual time, the SPU's mix (with the CD's
+    /// output as its CD input). Without a bus, the CD's output alone.
     fn audio_vblank(&mut self) {
+        if self.io.is_some() {
+            self.spu_run();
+            let frames = self.io.as_mut().map(|io| std::mem::take(&mut io.spu.out)).unwrap_or_default();
+            self.host.audio(&frames);
+            return;
+        }
         const CYCLES: u64 = psx_devices::clock::CPU_HZ / psxw_abi::AUDIO_HZ as u64;
         let n = (self.clock.now - self.audio_at) / CYCLES;
         self.audio_at += n * CYCLES;

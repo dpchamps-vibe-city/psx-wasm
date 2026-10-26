@@ -27,8 +27,8 @@ policy = "device"
 [library.libcd]    # the drive (CdInit, CdControl*, CdRead*, CdSearchFile, …)
 policy = "adapter"
 
-[library.libspu]   # register programming
-policy = "adapter"
+[library.libspu]   # D47: original over the register-level SPU and DMA4
+policy = "device"
 
 [library.libpad]   # D40: original over SIO0
 policy = "device"
@@ -42,8 +42,8 @@ policy = "adapter"
 [library.libcard]
 policy = "adapter"
 
-[library.libsnd]   # the sequencer is the game's music: original code
-policy = "guest"
+[library.libsnd]   # D47: the sequencer is the game's music: original code,
+policy = "device"  # its direct SPU register writes routed to the SPU
 
 [library.libgs]    # packet building into RAM
 policy = "guest"

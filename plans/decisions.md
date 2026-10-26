@@ -408,6 +408,30 @@ toolchain to pin. M5 task 7 is not done.
 *Why:* nothing in M5-M8 needs a native window, and the native host
 (`psxw run`) covers headless use.
 
+**D47. libspu and libsnd run as original code over the register-level
+SPU** (M6). `psx-spu` matches the oracle's SPU vectors. It sits on the bus
+at 1F801C00h, with DMA4 and IRQ9, and runs on its own 44.1 kHz clock. It
+is brought up to the current cycle before every access, every DMA4
+transfer and every vblank, and each tick takes the CD's output frame as
+its CD input. Its mix is what `host.audio` carries.
+- **libspu:** its 26 stub adapters (transfers "complete", keys report
+  off) are removed, and its own code programs the SPU. D41 made that
+  the fallback for unknown libspu versions; with an exact device it is
+  simply the way.
+- **libsnd** stays original code, as before, but becomes a device
+  library: `_SsInit` and others write SPU registers directly, and those
+  writes must reach the SPU.
+- **Checks:**
+  - `psxw conform btn --lib libspu` uploads a looping sample with
+    `SpuWritePartly`, sets master and voice attributes, and keys the
+    voice on. The run must be audible (22,085 of 22,117 frames are).
+  - The libsnd tick check still finds 60 and 240 ticks.
+  - `web-test conform` replays libspu in both browsers with the same
+    audio hash.
+
+*Why:* as D40/D42/D45. With the device exact, the original library
+decides everything a game can observe, and nothing is reimplemented.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser

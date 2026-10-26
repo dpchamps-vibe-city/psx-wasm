@@ -8,8 +8,7 @@
 //! psyq-decomp records it.
 //!
 //! Scope: libapi's `counter.o`/`pad.o`/`patch.o`/`first.o`, the libcd data
-//! path; libspu and libcard/libmcx as plausible stubs until their devices
-//! exist (M6, M7).
+//! path, and libcard/libmcx's thin BIOS wrappers.
 //!
 //! Some libraries need no adapters: they run as the game's own code over
 //! register-level devices ([`DEVICE_LIBRARIES`], decision D40).
@@ -18,7 +17,6 @@ pub mod libapi;
 pub mod libcd;
 pub mod libmc;
 pub mod layout;
-pub mod libspu;
 pub mod validated;
 
 use psx_bios::{Flow, Machine, Sdk};
@@ -40,7 +38,10 @@ pub type Adapter = fn(&mut M, [u32; 4]) -> Result;
 ///   custom exception exit (a longjmp into `startIntr`'s `setjmp`) and
 ///   leaves with ReturnFromException; both are non-local exits the lift
 ///   and link tiers lower to wasm exceptions.
-pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc"];
+/// - libspu and libsnd (D47): the SPU is register-level (`psx-spu`, exact
+///   against the oracle), so libspu's own code programs it, and libsnd's
+///   few direct register writes reach it too.
+pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd"];
 
 /// Event kinds the adapters schedule.
 pub mod ev {
@@ -61,7 +62,6 @@ pub mod cond {
 #[derive(Debug, Default)]
 pub struct Psyq {
     pub cd: libcd::Cd,
-    pub spu: libspu::Spu,
     pub mc: libmc::Mc,
 }
 
@@ -101,7 +101,6 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     let mut v: Vec<(&'static str, Adapter)> = Vec::new();
     v.extend(libapi::ADAPTERS);
     v.extend(libcd::ADAPTERS);
-    v.extend(libspu::ADAPTERS);
     v.extend(libmc::ADAPTERS);
     v
 }

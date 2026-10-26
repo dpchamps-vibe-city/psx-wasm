@@ -125,7 +125,11 @@ unverified.
 3. [ ] SPU synthetic vectors, each isolating one feature at a time on
    voices 1 and 3. Capture goldens; reach zero failures in
    `psxw oracle check --device spu`.
-4. [ ] libspu adapters and conformance (register decoder).
+4. [x] libspu adapters and conformance (register decoder). *(D47: libspu,
+   and libsnd for its direct writes, run as original code over the
+   register-level SPU, so there are no adapters to decode.
+   `psxw conform btn --lib libspu` plays a voice through the original
+   library and must be audible.)*
 5. [x] libsnd tick path through root-counter events. The libsnd functions
    btn uses must run as translated or C guest code with no traps.
    *(`psxw conform btn --lib libsnd`: `SsSeqCalledTbyT` runs exactly 60
