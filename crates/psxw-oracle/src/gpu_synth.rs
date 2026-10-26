@@ -59,6 +59,9 @@ pub const GENERATORS: &[&str] = &[
     "rect-big",
     "tex-mode3",
     "poly-sliver",
+    "mix",
+    "clut-many",
+    "batch-big",
 ];
 
 /// A generated vector.
@@ -989,6 +992,112 @@ fn build(name: &str, i: usize, b: &mut B) -> Result<()> {
                     }
                 }
                 b.packet(words);
+            }
+        }
+        "mix" => {
+            // Dozens of primitives of every kind over each other: batching,
+            // hazard syncs, merged dirty regions and colour-table reloads
+            // together. Two pages and their tables in the other half.
+            let half = b.rng.below(2);
+            let (d1, d2) = (b.rng.below(3), b.rng.below(3));
+            let t1 = texture(b, d1, half)?;
+            let t2 = texture(b, d2, half)?;
+            let other = 1 - half as i32;
+            let (w, h) = (b.r(64, 200), b.r(64, 160));
+            let d = b.dest(w, h, other * 256, other * 256 + 256)?;
+            let dither = b.coin();
+            let (abr, mask) = (b.rng.below(4), b.rng.below(4));
+            b.state(e1(t1.tpx, t1.tpy, abr, t1.depth, dither, 0), 0, (d.x as i32, d.y as i32), mask);
+            // Drawing stays in the destination, as a game's stays in its
+            // draw buffer: a primitive spilling into a page sampled
+            // earlier would meet the unmodelled texture cache.
+            b.state[2] = e3(d.x as u32, d.y as u32);
+            b.state[3] = e4((d.x + d.w - 1) as u32, (d.y + d.h - 1) as u32);
+            for _ in 0..b.r(20, 60) {
+                let t = if b.coin() { t1 } else { t2 };
+                let semi = 2 * b.rng.below(2);
+                let p = match b.rng.below(8) {
+                    0 => {
+                        let op = b.pick(&[0x20, 0x28, 0x30, 0x38]) | semi;
+                        polygon(b, op, local(&d, 8), None)
+                    }
+                    1 | 2 => {
+                        let op = b.pick(&[0x24, 0x25, 0x2C, 0x2D, 0x34, 0x3C]) | semi;
+                        let abr = b.rng.below(4);
+                        polygon(b, op, local(&d, 8), Some((&t, abr)))
+                    }
+                    3 => {
+                        let op = b.pick(&[0x60, 0x68, 0x70, 0x78]) | semi;
+                        rect(b, op, local(&d, 8), None)
+                    }
+                    4 => {
+                        // Rectangles use the draw mode's page.
+                        let op = b.pick(&[0x64, 0x65, 0x74, 0x7C]) | semi;
+                        let flip = b.rng.below(4);
+                        let abr = b.rng.below(4);
+                        b.packet(vec![e1(t.tpx, t.tpy, abr, t.depth, dither, flip)]);
+                        rect(b, op, local(&d, 8), Some(&t))
+                    }
+                    5 => {
+                        let op = b.pick(&[0x40, 0x50]) | semi;
+                        line(b, op, 2, local(&d, 8))
+                    }
+                    6 => {
+                        let mask = b.rng.below(4);
+                        vec![0xE600_0000 | mask]
+                    }
+                    _ => {
+                        // Fills ignore the drawing area; keep them inside.
+                        let x = (d.x as u32).next_multiple_of(16) + 16 * b.rng.below((d.w as u32).saturating_sub(32) / 16 + 1);
+                        let y = d.y as u32 + b.rng.below(d.h as u32 - 8);
+                        let c = b.rgb();
+                        vec![0x0200_0000 | c, y << 16 | x, 8 << 16 | 16]
+                    }
+                };
+                b.packet(p);
+            }
+        }
+        "clut-many" => {
+            // More colour-table reloads than the backend has slots, all in
+            // one batch of non-overlapping sprites: the front end must end
+            // the batch before a slot it still uses comes round again.
+            let half = b.rng.below(2);
+            let t = texture(b, 0, half)?;
+            // Eight 16-entry tables in a row beside the page's own.
+            let (cx, cy) = ((t.clut & 0x3F) * 16, t.clut >> 6);
+            let row = Rect::new(if cx + 128 <= 1024 { cx } else { cx - 112 } as u16, cy as u16, 128, 1);
+            if !(row.x as u32 + 128 <= t.tpx * 64 || row.x as u32 >= t.tpx * 64 + 64) {
+                // The row would overlap the page; use the page's table only.
+                b.random_area(Rect::new(cx as u16, cy as u16, 16, 1))?;
+            } else {
+                b.area(row, |g| if g.chance(8) { 0 } else { g.u16() })?;
+            }
+            let tables: Vec<u32> = if row.x as u32 + 128 <= t.tpx * 64 || row.x as u32 >= t.tpx * 64 + 64 {
+                (0..8).map(|k| cy << 6 | (row.x as u32 / 16 + k)).collect()
+            } else {
+                vec![t.clut]
+            };
+            let other = 1 - half as i32;
+            let d = b.dest(128, 96, other * 256, other * 256 + 256)?;
+            b.state(e1(t.tpx, t.tpy, 0, 0, false, 0), 0, (d.x as i32, d.y as i32), 0);
+            let n = b.r(1100, 1300);
+            for k in 0..n {
+                let clut = tables[k as usize % tables.len()];
+                let (x, y) = ((k % 128) as i32, (k / 128) as i32 * 4);
+                let uv = b.rng.below(65536);
+                b.packet(vec![0x6500_0000, xy(x, y), clut << 16 | uv, 4 << 16 | 1]);
+            }
+        }
+        "batch-big" => {
+            // More primitives in one batch than one draw call holds.
+            let d = b.dest(256, 128, 0, 512)?;
+            b.state(e1(0, 0, 0, 0, false, 0), 0, (d.x as i32, d.y as i32), 0);
+            let n = b.r(2700, 3200);
+            for k in 0..n {
+                let c = b.rgb();
+                let (x, y) = (b.r(0, 255), b.r(0, 127));
+                let p = if k % 3 == 0 { vec![0x6800_0000 | c, xy(x, y)] } else { vec![0x6000_0000 | c, xy(x, y), 2 << 16 | 3] };
+                b.packet(p);
             }
         }
         other => anyhow::bail!("unknown GPU generator {other}"),

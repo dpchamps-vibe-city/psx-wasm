@@ -129,11 +129,10 @@ impl Server {
         let output = BufReader::new(child.stdout.take().context("server stdout")?);
         let mut s = Server { child, input, output, info: String::new() };
         let info = s.call(server::INFO, &[]).context("render server did not answer; see out/oracle/runs/render-server.log")?;
-        let mesa = rec.sources.get("mesa").and_then(|v| v.as_str()).unwrap_or("?").to_string();
         let info: serde_json::Value = serde_json::from_slice(&info)?;
         let field = |k: &str| info.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
         s.info = format!(
-            "{} + psx-devices gpu front end, on {} ({}, Mesa {mesa}) in {} {}",
+            "{} + psx-devices gpu front end, on {} ({}) in {} {}",
             field("backend"),
             field("gl_renderer"),
             field("gl_version"),
