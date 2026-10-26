@@ -15,8 +15,13 @@ pub fn out_dir(ws: &Workspace, game: &str) -> PathBuf {
 }
 
 pub fn build(ws: &Workspace, game: &str) -> Result<PathBuf> {
+    build_into(ws, game, out_dir(ws, game))
+}
+
+/// The bundle in `dir`, which it replaces. The browser tests build their
+/// own, so a run never rewrites a bundle someone is serving.
+pub fn build_into(ws: &Workspace, game: &str, dir: PathBuf) -> Result<PathBuf> {
     let (report, _) = crate::game::build(ws, &crate::game::Options::new(game))?;
-    let dir = out_dir(ws, game);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     pkg(ws, &dir.join("pkg"))?;

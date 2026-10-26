@@ -150,7 +150,7 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         }
     }
     let disc = ws.disc(game)?;
-    let bundle = psxw_build::web::build(ws, game)?;
+    let bundle = psxw_build::web::build_into(ws, game, ws.out_dir().join("web").join(format!("test-{game}")))?;
     // A named replay or file runs its length unless --frames says less.
     let replay = match &replay_path {
         Some(p) => crate::wholegame::replay(ws, game, Some(p))?.0,
@@ -277,7 +277,7 @@ fn pacing(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         }
     }
     let disc = ws.disc(game)?;
-    let bundle = psxw_build::web::build(ws, game)?;
+    let bundle = psxw_build::web::build_into(ws, game, ws.out_dir().join("web").join(format!("test-{game}")))?;
     std::fs::create_dir_all(bundle.join("disc"))?;
     // NTSC, as the worker paces it (`web/worker.js`).
     let hz = 59.826;

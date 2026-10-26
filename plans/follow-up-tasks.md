@@ -7,18 +7,18 @@ with the same RAM, VRAM and audio on all three.
 
 ## Check first
 
-- **The browser display fix** (`282b413`). The Worker now posts each frame
-  to the page as an ImageBitmap; before that the visible canvas stayed
-  black. It is confirmed by hand in a real browser, but not yet by the new
-  headless check (`web-test game` requires a lit frame among those the
-  page showed). Run:
+The browser display fix (`282b413`) passes the headless check:
+`web-test game btn --replay title-to-gameplay --frames 1500` showed 1496
+(Chromium) and 1500 (Firefox) frames, 37 of 50 sampled lit. `web-test game`
+and `web-test pacing` now build into `out/web/test-<game>/`, so they never
+rewrite the `out/web/<game>/` bundle someone is serving.
 
-  ```sh
-  psxw web-test game btn --replay title-to-gameplay --frames 1500 --hash 600,1500
-  ```
+- **"WebGL2 is not available" in a real browser** after a test run rebuilt
+  the served bundle mid-session. The rebuilt files were byte-identical, so
+  it was most likely the browser blocking WebGL after a GPU-process reset;
+  a full browser restart should clear it. If it recurs, the page could say
+  so (restart, or check `chrome://gpu` / `about:support`).
 
-  The last attempt failed at `docker run` with a usage error, before any
-  browser started, and wasn't investigated.
 - **WebGL context loss in the real page.** The Worker now owns its
   `OffscreenCanvas`. Its `webglcontextlost`/`restored` listeners only run
   when the Worker returns to its event loop, which the game never lets it
