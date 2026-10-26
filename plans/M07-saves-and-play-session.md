@@ -1,6 +1,6 @@
 # M7 — Saves and a full play session
 
-**Status:** in progress (tasks 1–3; 4–6 wait for the disc and a human recording)
+**Status:** in progress (tasks 1–3 and 7 done; 4–5 wait for the human's recordings, 6 is blocked on CD timing, D48)
 **Depends on:** M4, M6 (and M5 for browser storage). **Unlocks:** M9.
 **Design refs:** design: Runtime (sio), Oracles (whole-game); decisions
 D21–D23.
@@ -65,17 +65,29 @@ absent).
    storage`.)*
 4. [ ] `save-and-reload` replay; checks: the frame checksums are valid,
    and the game reports a successful load with the expected save
-   contents, as an assertion on save-data symbols.
+   contents, as an assertion on save-data symbols. *(Waits for the
+   human's recordings. The tools are ready:
+   - the browser page records sessions (Record a replay, Save replay;
+     `web/README.md`);
+   - `games/<game>/replays/<name>.rpl` is found by `--replay <name>`;
+   - `psxw run <game> --replay R --check card` validates every card
+     image's directory and frame checksums and lists its files.
+   
+   Wanted: a session that saves (`save`) and one that boots and loads it
+   (`load`), with the card from the first. Scripting them from frame
+   dumps was tried and dropped: it costs far more than a recording.)*
 5. [ ] Ask the human to record `one-day`. Store it in
-   `games/btn/replays/`.
+   `games/btn/replays/`. *(Recorded the same way, as `one-day.rpl`.
+   `psxw web-test game btn --replay title-to-gameplay --record` checks
+   the recorder: in both browsers, the recording played natively
+   reaches the same RAM as the replay it recorded.)*
 6. [ ] `psxw oracle ramdiff btn --replay one-day`: drive it to zero
    differences, fixing devices and adapters (never adding exclusions).
    *(Blocked on CD timing, D48.)*
-7. [ ] Document the CD timing envelope as unresolved (hardware only), with
+7. [x] Document the CD timing envelope as unresolved (hardware only), with
    evidence of how long loads take under realistic timing, for M10 to
-   compare against. *(Documented below, under Findings. The evidence is
-   collected: every run report's `cd_loads` lists the reads. The numbers
-   wait for the disc.)*
+   compare against. *(Findings: the model, btn's loads over
+   `title-to-gameplay`, and the emulator's stalls for the same loads.)*
 8. [ ] Add everything to `psxw ci`; docs, README status.
 
 ## Exit criteria (all automated)
@@ -185,4 +197,31 @@ ms). With the disc, `psxw run btn --frames N` on a replay gives the
 model's figure for each load. M10 compares those with the same loads
 timed on hardware, and only then can the model be called right or
 tuned.
+
+**btn over `title-to-gameplay` (realistic timing):**
+- 42 `CdRead`s, 1,407 sectors, 12.8 s of drive time, of which 0.96 s
+  was seeking.
+- The longest reads:
+
+  | LBA | sectors | ms | seeking (ms) |
+  |---|---|---|---|
+  | 59,503 | 236 | 1,996 | 25 |
+  | 267 | 146 | 1,244 | 20 |
+  | 445 | 110 | 942 | 20 |
+  | 56,564 | 91 | 769 | 7 |
+
+  Several more 91-sector reads near LBA 56,500–59,000 also take 769 ms
+  each.
+
+The emulator takes longer for the same loads (D48). The game's frame
+counter stalls while it waits:
+
+| counter | psx-wasm stall (frames) | emulator stall (frames) |
+|---|---|---|
+| 728 | 33 | 95 |
+| 791 | 110 | 182 |
+| 1003 | 10 | 99 + 157 |
+
+Beetle is itself a model, with seeded jitter on each command. Neither
+side is the truth until M10 times these loads on hardware.
 

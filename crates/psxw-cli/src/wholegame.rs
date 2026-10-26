@@ -6,9 +6,10 @@
 //! psxw oracle ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--require-equal]
 //! ```
 //!
-//! `--replay R` takes a replay file or a named replay,
-//! `games/<game>/replays/R.toml` (the same press syntax as
-//! `[oracle.replay]`, which is used without `--replay`). Both sides
+//! `--replay R` takes a replay file or a named replay: a press list,
+//! `games/<game>/replays/R.toml` (the same syntax as `[oracle.replay]`,
+//! which is used without `--replay`), or a recording from the browser
+//! page, `games/<game>/replays/R.rpl`. Both sides
 //! trace the manifest's `[oracle] frame_counter` every frame; `ramdiff`
 //! dumps RAM on both at the same counter values (by default the counter at
 //! every 600th psx-wasm frame) and compares them by symbol.
@@ -37,6 +38,13 @@ pub fn replay(ws: &Workspace, game: &str, arg: Option<&str>) -> Result<(Vec<u8>,
     let named = match arg {
         Some(a) => match ws.replay_spec(game, a)? {
             Some(spec) => Some((a.to_string(), spec)),
+            // A recorded replay (`games/<game>/replays/<name>.rpl`).
+            None if ws.root.join("games").join(game).join("replays").join(format!("{a}.rpl")).is_file() => {
+                let p = ws.root.join("games").join(game).join("replays").join(format!("{a}.rpl"));
+                let bytes = std::fs::read(&p)?;
+                ensure!(psxw_abi::replay::Header::parse(&bytes).is_some(), "{} is not a replay", p.display());
+                return Ok((bytes, format!("replays/{a}.rpl")));
+            }
             None => {
                 let bytes = std::fs::read(a).with_context(|| format!("{a} is neither a replay file nor games/{game}/replays/{a}.toml"))?;
                 ensure!(psxw_abi::replay::Header::parse(&bytes).is_some(), "{a} is not a replay");
@@ -72,10 +80,7 @@ fn frames_of(replay: &[u8]) -> u64 {
 
 /// The guest address of `[oracle] frame_counter`.
 fn counter_addr(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs) -> Result<u32> {
-    let manifest = ws.game(game)?;
-    let expr = manifest.oracle.frame_counter.as_deref().with_context(|| format!("games/{game}/game.toml [oracle] frame_counter is unset"))?;
-    let r = inputs.map.resolve(&inputs.map.main, expr).with_context(|| format!("[oracle] frame_counter {expr} does not resolve"))?;
-    Ok(r.addr)
+    psxw_build::game::frame_counter(ws, game, inputs)
 }
 
 /// Symbols of every container, residency probes for overlays, and the

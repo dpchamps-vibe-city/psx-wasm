@@ -27,6 +27,10 @@ pub fn build(ws: &Workspace, game: &str) -> Result<PathBuf> {
         }
     }
     std::fs::copy(&report.wasm, dir.join("game.wasm"))?;
+    // What the page needs to record replays: the clock they index by.
+    let inputs = psxw_lift::run::load(ws, game)?;
+    let clock = crate::game::frame_counter(ws, game, &inputs).ok();
+    std::fs::write(dir.join("game.json"), serde_json::to_string(&serde_json::json!({ "id": game, "frame_counter": clock }))?)?;
     // Dev mode (`?dev`): the unmerged modules, wired in the Worker.
     std::fs::copy(crate::game::out_dir(ws, game).join("guest.wasm"), dir.join("guest.wasm"))?;
     std::fs::copy(crate::runtime::path(ws), dir.join("runtime.wasm"))?;

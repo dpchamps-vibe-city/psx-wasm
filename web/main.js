@@ -1,6 +1,10 @@
 // The main thread (M5): disc import into OPFS, memory-card import and
 // export (cards.js), input polling into a SharedArrayBuffer, audio setup
-// (silence until M6), and the Worker that runs the game. Query parameters for tests: ?cue=NAME&frames=N&verify
+// (silence until M6), and the Worker that runs the game. With "Record a
+// replay" ticked, the Worker records the pads against the game's frame
+// counter (game.json, from the manifest); "Save replay" downloads it as a
+// psxw-abi replay, which `psxw run`, the oracle and `web-test` take from
+// games/<id>/replays/<name>.rpl. Query parameters for tests: ?cue=NAME&frames=N&verify
 // &replay=URL&hash=F,F,...&autostart; ?discurl=URL imports the .cue at URL
 // (and the .bin files it names, beside it) into OPFS first; ?post=NAME
 // POSTs the hashes to /result?browser=NAME when the run stops.
@@ -23,7 +27,8 @@ const KEYS = {
 // Standard Gamepad API layout to pad bits.
 const BUTTONS = { 8: 0, 10: 1, 11: 2, 9: 3, 12: 4, 15: 5, 13: 6, 14: 7, 6: 8, 7: 9, 4: 10, 5: 11, 3: 12, 1: 13, 0: 14, 2: 15 };
 
-const padBuffer = new SharedArrayBuffer(12);
+// [seq, port 1 buttons, port 2 buttons or -1, save-replay requests]
+const padBuffer = new SharedArrayBuffer(16);
 const pad = new Int32Array(padBuffer);
 Atomics.store(pad, 1, 0xffff);
 Atomics.store(pad, 2, -1);
@@ -86,7 +91,21 @@ async function startAudio() {
   }
 }
 
-function start(cue, audioRing) {
+async function gameInfo() {
+  try {
+    return await (await fetch("game.json")).json();
+  } catch {
+    return {};
+  }
+}
+
+const saveReplay = document.getElementById("save-replay");
+saveReplay.addEventListener("click", () => Atomics.add(pad, 3, 1));
+
+async function start(cue, audioRing) {
+  const game = await gameInfo();
+  const record = document.getElementById("record").checked || params.has("record");
+  if (record && game.frame_counter == null) say("this bundle names no frame counter; recording is off");
   const canvas = document.getElementById("screen").transferControlToOffscreen();
   const worker = new Worker("worker.js", { type: "module" });
   const options = {
@@ -96,10 +115,24 @@ function start(cue, audioRing) {
     replay: params.get("replay"),
     hashAt: (params.get("hash") || "").split(",").filter(Boolean).map(Number),
     dev: params.has("dev"),
+    record: record && game.frame_counter != null,
+    clock: game.frame_counter,
+    gameId: game.id || "",
   };
+  saveReplay.disabled = !options.record;
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.type === "status") say(m.text);
+    else if (m.type === "replay" && params.has("post")) {
+      fetch(`/result?browser=${params.get("post") || params.get("browser")}-replay`, { method: "POST", body: m.bytes });
+    } else if (m.type === "replay") {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([m.bytes], { type: "application/octet-stream" }));
+      a.download = `${options.gameId || "game"}-${new Date().toISOString().replace(/[:.]/g, "-")}.rpl`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      say(`replay saved: ${m.frames} frames`);
+    }
     else if (m.type === "log") console.log(`[${m.frame}] ${m.text}`);
     else if (m.type === "hashes") {
       window.psxwHashes = m;
@@ -165,7 +198,7 @@ startButton.addEventListener("click", async () => {
   running = true;
   const ring = await startAudio();
   requestAnimationFrame(pollInput);
-  start(cue, ring);
+  await start(cue, ring);
 });
 if (params.has("discurl")) {
   importDiscUrl(params.get("discurl"))

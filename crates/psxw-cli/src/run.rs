@@ -211,15 +211,33 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
     if checks.iter().any(|c| c == "no-trap") {
         results.push(Check { name: "no-trap", pass: r.stop == Stop::FrameLimit, detail: format!("{:?}", r.stop) });
     }
+    if checks.iter().any(|c| c == "card") {
+        results.extend(card_checks(&o)?);
+    }
     for c in &checks {
-        if !["boot", "determinism", "no-trap"].contains(&c.as_str()) {
-            bail!("unknown check {c} (boot, determinism, no-trap)");
+        if !["boot", "determinism", "no-trap", "card"].contains(&c.as_str()) {
+            bail!("unknown check {c} (boot, determinism, no-trap, card)");
         }
     }
     if !results.is_empty() {
         std::fs::write(dir.join("checks.json"), serde_json::to_string_pretty(&results)?)?;
     }
     Ok((r, results))
+}
+
+/// `--check card` (M7 exit criterion 1): every memory card image in the
+/// run's storage validates (the "MC" header and every directory frame's
+/// checksum), and the files on it are listed.
+fn card_checks(o: &Options) -> Result<Vec<Check>> {
+    let Some(dir) = &o.storage_dir else { return Ok(vec![]) };
+    let mut out = Vec::new();
+    for name in ["card0.mcr", "card1.mcr"] {
+        let Ok(bytes) = std::fs::read(dir.join(name)) else { continue };
+        let card = psx_devices::memcard::Card::from_image(&bytes);
+        let files: Vec<String> = card.iter().flat_map(|c| c.files()).filter(|f| !f.deleted).map(|f| format!("{} ({} bytes)", f.name, f.size)).collect();
+        out.push(Check { name: "card", pass: card.is_some_and(|c| c.valid()), detail: format!("{name}: {}", if files.is_empty() { "no files".to_string() } else { files.join(", ") }) });
+    }
+    Ok(out)
 }
 
 pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {

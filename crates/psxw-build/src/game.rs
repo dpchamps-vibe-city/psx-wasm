@@ -566,3 +566,12 @@ fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
 pub fn game_path(ws: &Workspace, game: &str) -> PathBuf {
     out_dir(ws, game).join("game.wasm")
 }
+
+/// The guest address of the manifest's `[oracle] frame_counter`: the clock
+/// version 2 replays index by.
+pub fn frame_counter(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs) -> Result<u32> {
+    let manifest = ws.game(game)?;
+    let expr = manifest.oracle.frame_counter.as_deref().with_context(|| format!("games/{game}/game.toml [oracle] frame_counter is unset"))?;
+    let r = inputs.map.resolve(&inputs.map.main, expr).with_context(|| format!("[oracle] frame_counter {expr} does not resolve"))?;
+    Ok(r.addr)
+}

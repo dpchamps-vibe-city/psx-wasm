@@ -14,9 +14,19 @@ To try it:
 2. `psxw serve out/web/<game>` serves it with the cross-origin isolation headers that SharedArrayBuffer needs.
 3. Open `http://127.0.0.1:8080/`.
 
-Test hooks (query): `?cue=NAME&autostart&frames=N&verify&hash=60,300&replay=URL`.
+Test hooks (query): `?cue=NAME&autostart&frames=N&verify&hash=60,300&replay=URL&record`.
 
 At the end of a run the Worker posts frame times (the wall time between vblanks, after pacing): `frameMs` with p50, p95, p99 and max, next to `lagFrames` (frames more than a period late). They are reported, not gated.
+
+## Recording a replay
+
+Tick **Record a replay** before Start, play, then press **Save replay** (any time; the recording also goes out when the run stops). The download is a psxw-abi replay (version 2): its entries are indexed by the game's frame counter, the manifest's `[oracle] frame_counter`, which `psxw build-web` writes to `game.json`. Entry `c` holds the pads the game saw at the last vblank its counter read `c`, so the native host and the emulator replay the session at the same game frames, whatever their load times.
+
+Keyboard: arrows, Enter = Start, Right Shift = Select, Z = Square, S = Cross, X = Circle, W = Triangle, A/D = L1/R1, Q/E = L2/R2; or a gamepad.
+
+Put the file at `games/<game>/replays/<name>.rpl`; then `--replay <name>` finds it for `psxw run`, `psxw oracle play|ramdiff|record` and `psxw web-test game`. `psxw web-test game <game> --replay R --record` checks the recorder: the page records while it plays R, and the recording, played natively, must reach the same RAM.
+
+Cards persist in this browser's OPFS between runs, so a session that saves can be followed by one that loads; export the card to keep it.
 
 ## Dev mode
 

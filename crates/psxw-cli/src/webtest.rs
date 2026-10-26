@@ -24,7 +24,7 @@ use std::process::Command;
 pub const USAGE: &str = "web-test gpu [--browsers chromium,firefox] [--timeout SECONDS] \
                          | web-test storage [--browsers ..] [--timeout S] \
                          | web-test conform <game> [--browsers ..] [--timeout S] \
-                         | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--browsers ..] [--timeout S] \
+                         | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--record] [--browsers ..] [--timeout S] \
                          | web-test pacing <game> [--seconds N] [--browsers ..]";
 const IMAGE: &str = "psxw-browsers:local";
 
@@ -136,6 +136,7 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let (mut timeout, mut frames) = (1800u32, None::<u64>);
     let mut replay_path: Option<String> = None;
     let mut hash: Vec<u64> = vec![60, 300, 600];
+    let mut record = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {
@@ -144,6 +145,7 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
             "--frames" => frames = Some(it.next().context("--frames needs a value")?.parse()?),
             "--replay" => replay_path = it.next().map(|s| s.to_string()),
             "--hash" => hash = it.next().context("--hash needs a value")?.split(',').map(str::parse).collect::<Result<_, _>>()?,
+            "--record" => record = true,
             other => bail!("unknown option {other}"),
         }
     }
@@ -176,7 +178,10 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     std::fs::create_dir_all(&results)?;
     let cue = disc.file_name().context("disc name")?.to_string_lossy().into_owned();
     let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
-    let page = format!("index.html?discurl=disc/{cue}&autostart&verify&frames={frames}&hash={}&replay=replay.rpl&post", list(&hash));
+    let mut page = format!("index.html?discurl=disc/{cue}&autostart&verify&frames={frames}&hash={}&replay=replay.rpl&post", list(&hash));
+    if record {
+        page += "&record";
+    }
     let mut args: Vec<String> = vec![page, timeout.to_string()];
     args.extend(browsers.iter().cloned());
     let disc_dir = disc.parent().context("disc directory")?.to_path_buf();
@@ -213,6 +218,25 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         let (na, ba) = (&native.audio, &r["audio"]);
         if ba["hash"].as_str() != Some(na.hash.as_str()) || ba["frames"].as_u64() != Some(na.frames) {
             diffs.push(format!("audio: native {} frames {}, browser {} frames {}", na.frames, na.hash, ba["frames"], ba["hash"]));
+        }
+        // --record: the page recorded the session; played natively, the
+        // recording must reach the same RAM.
+        if record {
+            match std::fs::read(results.join(format!("result-{b}-replay.json"))) {
+                Ok(rec) if psxw_abi::replay::Header::parse(&rec).is_some() => {
+                    let (mut o, _) = crate::run::options(ws, game, &[])?;
+                    o.frames = frames;
+                    o.replay = Some(rec);
+                    o.hash_at = hash.clone();
+                    let again = psxw_host_native::run(o)?;
+                    for f in &hash {
+                        if again.ram_hashes.get(f) != native.ram_hashes.get(f) {
+                            diffs.push(format!("recording, frame {f}: RAM {:?}, the replay gave {:?}", again.ram_hashes.get(f), native.ram_hashes.get(f)));
+                        }
+                    }
+                }
+                _ => diffs.push("no recorded replay".into()),
+            }
         }
         pass &= diffs.is_empty();
         println!("{b}: {} ({} frames compared, {} s in the browser)", if diffs.is_empty() { "PASS" } else { "FAIL" }, hash.len(), r["seconds"]);

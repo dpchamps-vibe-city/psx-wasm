@@ -58,6 +58,29 @@ function replayButtons(replay, frame, port, readU32) {
 }
 
 /**
+ * A recorded session as a version 2 replay (psxw-abi replay): entry `c`
+ * holds the pads the game saw at the last vblank its frame counter (the
+ * clock) read `c`, which is the state it polls.
+ */
+function encodeReplay(rec, gameId) {
+  const n = Math.max(rec.frames, rec.entries.length);
+  const out = new Uint8Array(64 + 4 * n);
+  const dv = new DataView(out.buffer);
+  out.set(new TextEncoder().encode("PSXWRPL\0"), 0);
+  dv.setUint32(8, 2, true);
+  dv.setUint32(12, 0x41, true);
+  dv.setUint32(16, n, true);
+  out.set(new TextEncoder().encode(gameId.slice(0, 15)), 20);
+  dv.setUint32(56, rec.clock, true);
+  for (let i = 0; i < n; i++) {
+    const e = rec.entries[i] || [NOTHING_PRESSED, NOTHING_PRESSED];
+    dv.setUint16(64 + 4 * i, e[0], true);
+    dv.setUint16(66 + 4 * i, e[1], true);
+  }
+  return out;
+}
+
+/**
  * Dev mode: guest.wasm defines the memory and imports `psx.*` from the
  * runtime; runtime.wasm imports `guest.*` (the guest's exports, memory
  * included) and `host.*`. The guest goes first, its `psx.*` imports
@@ -133,7 +156,12 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
   const saveDir = await savesDir();
   const saves = await loadSaves(saveDir);
   const replay = options.replay ? new Uint8Array(await (await fetch(options.replay)).arrayBuffer()) : null;
-  const pad = new Int32Array(padBuffer); // [seq, port 1 buttons, port 2 buttons or -1]
+  const pad = new Int32Array(padBuffer); // [seq, port 1 buttons, port 2 buttons or -1, save-replay requests]
+  const recording = options.record ? { clock: options.clock >>> 0, entries: [], frames: 0, saved: 0 } : null;
+  const postReplay = () => {
+    const bytes = encodeReplay(recording, options.gameId || "");
+    postMessage({ type: "replay", bytes, frames: recording.frames }, [bytes.buffer]);
+  };
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   const period = options.pal ? 1000 / 49.761 : 1000 / 59.826;
   const hashAt = new Set(options.hashAt || []);
@@ -172,6 +200,14 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
         vramHashes[frame] = renderer.vram_hash();
       }
       if (options.frames && frame >= options.frames) throw new Error(FRAME_LIMIT);
+      if (recording) {
+        recording.frames = frame;
+        const asked = Atomics.load(pad, 3);
+        if (asked !== recording.saved) {
+          recording.saved = asked;
+          postReplay();
+        }
+      }
       if (!options.verify) {
         const wait = t0 + frame * period - performance.now();
         if (wait > 0) Atomics.wait(sleeper, 0, 0, wait);
@@ -197,10 +233,17 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
     pad_state(port, out) {
       let buttons;
       if (replay) buttons = replayButtons(replay, frame, port & 1, (a) => new DataView(mem()).getUint32(WINDOW_BASE + (a & 0x1ffffc), true));
-      else {
-        buttons = Atomics.load(pad, 1 + (port & 1));
-        if (buttons < 0) return 0;
+      else buttons = Atomics.load(pad, 1 + (port & 1));
+      if (recording) {
+        // Before the game zeroes its counter the word is garbage; a
+        // replay reads such values as nothing pressed too.
+        const c = new DataView(mem()).getUint32(WINDOW_BASE + (recording.clock & 0x1ffffc), true);
+        if (c <= frame) {
+          const e = (recording.entries[c] ||= [NOTHING_PRESSED, NOTHING_PRESSED]);
+          e[port & 1] = buttons < 0 ? NOTHING_PRESSED : buttons & 0xffff;
+        }
       }
+      if (buttons < 0) return 0;
       new DataView(mem()).setUint16(out, buttons & 0xffff, true);
       return 2;
     },
@@ -282,6 +325,8 @@ async function run({ canvas, cue, padBuffer, audioRing, options }) {
     reason = msg.includes(FRAME_LIMIT) ? "frame limit" : msg;
   }
   disc.close();
+  // A recording outlives its run: hand it over when the run stops.
+  if (recording && recording.entries.length) postReplay();
   const seconds = (performance.now() - t0) / 1000;
   const sorted = frameTimes.slice().sort((a, b) => a - b);
   const pct = (p) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] * 100) / 100 : null);
