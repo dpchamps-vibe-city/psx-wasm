@@ -103,7 +103,7 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         Ok((pass, detail.join(", ")))
     })());
     gate(&mut gates, "oracle", "M3", (|| {
-        let reports = psxw_oracle::commands::ci(ws)?;
+        let reports = psxw_oracle::commands::ci(ws, &mut crate::oracle::devices(ws))?;
         let pass = reports.iter().all(|(r, _)| r.pass);
         let detail: Vec<String> = reports.iter().map(|(r, _)| format!("{}: {}", r.command, if r.pass { "pass" } else { "FAIL" })).collect();
         Ok((pass, detail.join(", ")))

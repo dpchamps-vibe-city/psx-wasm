@@ -451,17 +451,21 @@ mod tests {
 /// and the local daemon, the selftest passes, every archived vector
 /// reproduces its golden, and psx-gte matches every GTE golden of every
 /// game (M4 exit criterion 1).
-pub fn ci(ws: &Workspace) -> Result<Vec<(Report, PathBuf)>> {
+/// `psxw oracle ci`: images, selftest, capture (determinism), then the
+/// check of every device in `impls` for every game.
+pub fn ci(ws: &Workspace, impls: &mut [Box<dyn DeviceUnderTest>]) -> Result<Vec<(Report, PathBuf)>> {
     let imgs = images::load(ws)?;
     images::verify(ws, &imgs)?;
     eprintln!("ci: images match inputs.lock ({}, {})", imgs.emu.id, imgs.sdk.id);
     let st = selftest(ws, DEFAULT_SEED, DEFAULT_SELFTEST)?;
     let cap = capture(ws, None, false)?;
     let mut out = vec![st, cap];
+    let devices: Vec<String> = impls.iter().map(|i| i.device().to_string()).collect();
     for game in ws.lock.game.keys() {
-        let mut impls: Vec<Box<dyn DeviceUnderTest>> = vec![Box::new(gte::Device)];
-        let checked = check(ws, game, "gte", &mut impls)?;
-        out.push((checked.report, checked.path));
+        for d in &devices {
+            let checked = check(ws, game, d, impls)?;
+            out.push((checked.report, checked.path));
+        }
     }
     Ok(out)
 }
