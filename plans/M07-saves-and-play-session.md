@@ -149,6 +149,16 @@ absent).
 
     A Worker that drops one byte fails the check.
 
+- **2026-10-26** (this commit): exit criterion 1, checked without the
+  disc.
+  - **Each conformance side** now gets its own storage directory. After
+    the run, every card image the runtime wrote back must have valid
+    checksums, and its file list is part of the comparison.
+  - **In the libmcrd scenario**, `card0.mcr` comes back valid, holding
+    the file the scenario created (`BASLUS-00000PSXW`, 8,192 bytes).
+  - **The game's own saves** wait for the disc and the `save-and-reload`
+    replay (task 4).
+
 ## Findings
 
 ### The CD timing envelope is unresolved (hardware only)

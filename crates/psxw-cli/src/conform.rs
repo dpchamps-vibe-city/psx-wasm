@@ -133,15 +133,32 @@ impl Side {
 
     /// Ends the run, writing its report (counters, recent I/O) next to
     /// the conformance report; keeps the observations.
-    fn finish(self, dir: &std::path::Path, which: &str) -> Result<Finished> {
+    fn finish(mut self, dir: &std::path::Path, which: &str) -> Result<Finished> {
         let r = self.c.c.finish();
         std::fs::write(dir.join(format!("run-{which}.json")), serde_json::to_string_pretty(&r)?)?;
-        Ok(Finished { log: self.log })
+        // Memory cards written back: every directory frame's checksum must
+        // validate, and the files listed are part of what both sides saw.
+        let mut cards_valid = true;
+        let mut cards: Vec<_> = std::fs::read_dir(dir.join(format!("storage-{which}")))
+            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "mcr")).collect())
+            .unwrap_or_default();
+        cards.sort();
+        for p in cards {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let card = psx_devices::memcard::Card::from_image(&std::fs::read(&p)?);
+            let valid = card.as_ref().is_some_and(|c| c.valid());
+            cards_valid &= valid;
+            let files: Vec<String> = card.iter().flat_map(|c| c.files()).map(|f| format!("{} {} bytes", f.name, f.size)).collect();
+            self.log.push(Observation { step: format!("{name} written back"), values: vec![format!("valid {valid}"), format!("files {files:?}")] });
+        }
+        Ok(Finished { log: self.log, cards_valid })
     }
 }
 
 struct Finished {
     log: Vec<Observation>,
+    /// Every card image the run wrote back has valid checksums.
+    cards_valid: bool,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -478,14 +495,26 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let ctx = Ctx { inputs: &inputs };
     let dir = ws.out_dir().join("conform").join(game);
     std::fs::create_dir_all(&dir)?;
-    let side = |wasm: &str| -> Result<Side> {
+    // Each side gets its own storage, so the memory cards the runtime
+    // writes back can be checked after the run (M7 exit criterion 1).
+    let side = |wasm: &str, which: &str| -> Result<Side> {
         let render = server.then(|| crate::render::server(ws));
-        let dump_frames = dump.clone().map(|d| (d.join(if wasm.ends_with("game.wasm") { "adapter" } else { "original" }), 1));
-        let o = Options { wasm: wasm.into(), replay: Some(replay(frames)), deadline_secs: 20, render, dump_frames, ..Default::default() };
+        let dump_frames = dump.clone().map(|d| (d.join(which), 1));
+        let storage = dir.join(format!("storage-{which}"));
+        let _ = std::fs::remove_dir_all(&storage);
+        let o = Options {
+            wasm: wasm.into(),
+            replay: Some(replay(frames)),
+            deadline_secs: 20,
+            render,
+            dump_frames,
+            storage_dir: Some(storage),
+            ..Default::default()
+        };
         Ok(Side { c: Traced { c: Conform::new(&o, &ram, sp, gp)?, trace: Default::default() }, log: vec![] })
     };
-    let mut a = side(&adapters)?;
-    let mut o = side(&original)?;
+    let mut a = side(&adapters, "adapter")?;
+    let mut o = side(&original, "original")?;
     eprintln!("conform: adapter side ({adapters})");
     let ra = scenario(&ctx, &mut a, frames);
     eprintln!("conform: original side ({original})");
@@ -499,7 +528,7 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let (a, o) = (a.finish(&dir, "adapter")?, o.finish(&dir, "original")?);
     let diffs: Vec<(Observation, Observation)> =
         a.log.iter().zip(&o.log).filter(|(x, y)| x != y).take(16).map(|(x, y)| (x.clone(), y.clone())).collect();
-    let pass = ra.is_ok() && ro.is_ok() && diffs.is_empty() && a.log.len() == o.log.len();
+    let pass = ra.is_ok() && ro.is_ok() && diffs.is_empty() && a.log.len() == o.log.len() && a.cards_valid && o.cards_valid;
     for (x, y) in diffs.iter().take(8) {
         println!("differs at {}:\n  adapter  {:?}\n  original {:?}", x.step, x.values, y.values);
     }
