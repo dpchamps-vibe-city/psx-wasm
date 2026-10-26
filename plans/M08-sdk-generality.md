@@ -1,6 +1,6 @@
 # M8 — SDK generality
 
-**Status:** not started
+**Status:** in progress (task 1)
 **Depends on:** M2. Parallel with M4–M7. **Unlocks:** M9.
 **Design refs:** design §4 (the translated SDK cache), §5 (devices, BIOS,
 adapters keyed by object identity; layout generation); decisions D12–D15,
@@ -87,7 +87,7 @@ belongs to whichever milestone first needs them (M9).
 
 ## Tasks
 
-1. [ ] Object identity and hashing; pin the signature database (source
+1. [x] Object identity and hashing; pin the signature database (source
    commit) in `inputs.lock`; an identity report per game.
 2. [ ] Adapter registry macro, linker resolution, the cut-lower fallback,
    and the missing-adapter error.
@@ -128,5 +128,29 @@ belongs to whichever milestone first needs them (M9).
   guards it.
 
 ## Progress log
+
+- **2026-10-26:** task 1.
+  - **The pin:** the signature database is lab313ru/psx_psyq_signatures
+    at `e9e46e7`, pinned by archive sha256 as
+    `[toolchain.psyq-signatures]` (`psxw toolchain fetch`).
+  - **The report:** `psxw identity <game>` writes
+    `out/identity/<game>.json` (`psxw-inputs::identity`).
+  - **Matching:** each SDK member's placed text is matched against every
+    version's signature for its object. A decomp-split piece
+    (`<object>__<function>`) is matched against its function's slice.
+  - **The key:** the sha256 of the text with the relocated bytes zeroed.
+  - **btn:** 358 members.
+    - 356 match by signature, all of them PsyQ 4.7 (fewer in older
+      versions: 349 in 4.6, 36 in 2.6).
+    - 2 are identified by subsegment only (`libgte/smp_00_1__OuterProduct0`
+      and `__Lzc`): no version has a signature for `SMP_00_1`.
+    - None fail to match.
+    - 8 functions are named differently by the database (`InitCARD` vs
+      the decomp's `InitCARD2`, `Snd_play` vs `_SsSndPlay`, …). That is
+      naming only.
+  - **A fix it needed:** splat member paths are normalized to their last
+    two components (`<library>/<member>`). btn names two libgte pieces
+    `build/sdk/lib/470/libgte/…`, which had broken library lookups
+    (device libraries, `--original`).
 
 ## Findings

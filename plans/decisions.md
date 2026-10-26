@@ -305,4 +305,9 @@ library's logic is the behaviour.)
 - **Q2.** Register-level SPU fallback for unknown libspu versions.
   Decided in M8.
 - **Q3.** The license for psx-wasm. Needed before any public release.
+  Constraint so far: `psx-devices::sio` is a close Rust port of Beetle
+  PSX's `frontio.c` (GPLv2), made so SIO0 matches the oracle bit for bit.
+  A license that isn't GPL-compatible means re-implementing it from a
+  behavioural description. Everything else is written from psx-spx, with
+  the emulator used only as an oracle.
 - **Q4.** The second game. Decided in M9.

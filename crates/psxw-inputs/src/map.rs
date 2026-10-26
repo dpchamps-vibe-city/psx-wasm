@@ -213,7 +213,13 @@ fn container_from(cfg: &SplatConfig, is_main: bool) -> Container {
                     path: cfg.src_path.join(format!("{name}.c")),
                 }),
                 "o" => {
-                    let member = name.trim_start_matches("../").trim_start_matches("lib/").to_string();
+                    // `<library>/<member>`: the last two path components,
+                    // whatever directory the config keeps them in.
+                    let parts: Vec<&str> = name.rsplitn(3, '/').collect();
+                    let member = match parts.as_slice() {
+                        [m, l, ..] => format!("{l}/{m}"),
+                        _ => name.clone(),
+                    };
                     sdk.push(SdkPlacement {
                         member,
                         section: sub.args.first().cloned(),

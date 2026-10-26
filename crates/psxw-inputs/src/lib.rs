@@ -5,6 +5,7 @@
 //! "Pinning the inputs".
 
 pub mod game;
+pub mod identity;
 pub mod local;
 pub mod lock;
 pub mod map;

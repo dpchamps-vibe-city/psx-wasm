@@ -15,6 +15,15 @@ sha256 = "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
 dist = "binaryen-version_133"
 url = "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz"
 sha256 = "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489"
+
+[toolchain.psyq-signatures]
+# PsyQ object signatures per SDK version (lab313ru/psx_psyq_signatures at
+# e9e46e7): byte patterns with relocated bytes masked, plus function
+# offsets. M8's object identity matches linked SDK members against them.
+dist = "psx_psyq_signatures-e9e46e7e133ef275a79bfce650924f98edb086bc"
+url = "https://codeload.github.com/lab313ru/psx_psyq_signatures/tar.gz/e9e46e7e133ef275a79bfce650924f98edb086bc"
+sha256 = "3e06ce2bdd4e6ed215a9f465856d5406554f1281c119075f8489a18d774896ac"
+
 [oracle]
 # The device oracle's Docker images (plans/M03-oracle-harness.md). Both are
 # built on this base, and install Debian packages from the snapshot the base

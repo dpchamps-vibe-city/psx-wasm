@@ -17,6 +17,7 @@
 //! psxw report tiers <game>              each function's tier, by library
 //! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose]
 //!                                       M2: run game.wasm headless
+//! psxw identity <game>                 M8: SDK object identity report
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! ```
 
@@ -160,6 +161,28 @@ fn run() -> Result<()> {
                 };
                 println!("{pc:08X}: {w:08X}  {}{mark}", psxw_lift::decode::disasm(&insn, pc));
             }
+        }
+        ["identity", game] => {
+            let inputs = psxw_lift::run::load(&ws, game)?;
+            let db = psxw_inputs::identity::SigDb::pinned(&ws)?;
+            let r = psxw_inputs::identity::identify(game, &inputs.map, &inputs.originals, &db);
+            let dir = ws.out_dir().join("identity");
+            std::fs::create_dir_all(&dir)?;
+            let json = dir.join(format!("{game}.json"));
+            std::fs::write(&json, serde_json::to_string_pretty(&r)?)?;
+            println!(
+                "{game}: {} SDK members; {} identified by signature, {} by subsegment only ({} with no matching version)",
+                r.members,
+                r.by_signature,
+                r.by_subsegment_only,
+                r.unmatched.len()
+            );
+            for (v, n) in &r.versions {
+                println!("  PsyQ {v}: {n} members match");
+            }
+            let names: usize = r.identities.iter().map(|i| i.names_differ.len()).sum();
+            println!("  functions the signatures name differently: {names}");
+            eprintln!("report: {}", json.display());
         }
         ["oracle", rest @ ..] => oracle::run(&ws, rest)?,
         ["conform", game, rest @ ..] => {
