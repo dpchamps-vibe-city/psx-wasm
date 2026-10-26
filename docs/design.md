@@ -127,7 +127,7 @@ What this buys:
 |---|---|
 | `0x0000_0000`–`0x00FF_FFFF` | Unused. This keeps null out of both the guest and the runtime. |
 | `0x0100_0000`–`0x01FF_FFFF` | **Guest window.** Window offsets `0x000000`–`0x1FFFFF` are RAM, `0x200000`–`0x7FFFFF` hold auxiliary data (literals and constant pools that only clang emits), `0x800000` is the scratchpad, `0x801000` is I/O (debug builds trap here), and `0xF00000` is a runtime-private page (GTE registers, safepoint budget). |
-| `0x0200_0000`– | Data, stack and heap of `runtime.wasm`, set with `--global-base`. |
+| `0x0200_0000`– | The runtime's own data, stack and heap, placed there by the linker. |
 
 The guest stack is the PSX stack. clang's shadow stack pointer for guest
 code is renamed to a separate `__guest_sp` global, initialized from the EXE
@@ -162,7 +162,7 @@ call_indirect $dispatch ((fp & 0x003F_FFFC) >> 2)
 
 ### 3. Overlays: the bytes in RAM decide
 
-Each overlay's functions are compiled into `guest.wasm` alongside the EXE.
+Each overlay's functions are compiled into `game.wasm` alongside the EXE.
 An address that more than one overlay defines gets a dispatch stub:
 
 1. Read the first word or two of guest RAM at that address.
@@ -180,71 +180,142 @@ which code runs. It doesn't matter how the bytes arrived: CD DMA, a game
 an overlay are direct and unchecked. Caching the check against a
 region-write epoch is a later optimization.
 
-### 4. Every function gets one tier
+### 4. Every function gets exactly one implementation
 
 Each function at each guest address is implemented exactly once. `psxw`
-chooses the implementation per build:
+applies one rule per function, game and SDK alike:
 
-| Tier | Source | When it's used |
+1. **Adapter**, if the function touches hardware registers or BIOS
+   internals. This is a thin Rust function in the runtime (§5).
+2. Otherwise **decompiled C**, if the decomp has it and it compiles under
+   the host prelude.
+3. Otherwise **translated**: the original MIPS, translated ahead of time
+   into C by `psxw-lift` and compiled by the same clang pipeline.
+
+| Tier | Source | Produced by |
 |---|---|---|
-| `c` | Decompiled C, compiled by clang | The default when C exists and compiles cleanly under the host prelude. |
-| `replace` | A Rust runtime import | The boundary manifest says so. These are the hardware edge, chosen per SDK version and per function. |
-| `lift` | Original MIPS from the matching build's relocatable objects, translated ahead of time | `INCLUDE_ASM`, functions with real inline asm, and SDK members that have no C yet. |
+| `adapter` | Rust, in the runtime | Chosen per function and per object identity by the boundary manifest |
+| `c` | Decompiled C | `psxw-cc` |
+| `lift` | Original MIPS from relocatable objects, translated ahead of time to C | `psxw-lift`, then `psxw-cc` |
 
 How each tier is produced:
 
 - **C tier.** A prelude, injected with `-include`, neutralizes MIPS-isms.
-  It strips register-pinning asm. It redefines `INCLUDE_ASM(dir, f)` to emit
-  a lift marker. It maps the `gte_*` macros onto `psx-gte`. When a function
-  body contains real inline asm, `psxw-cc` blanks that body, so the function
-  falls to the lift tier.
-- **Lift tier.** The lifter works one function at a time, from *relocatable*
-  objects:
-  - The per-TU `.o` files of the game's matching build.
-  - The SDK `.a` members.
+  The normalizer strips register-pinning asm and recognizes any splat-style
+  `INCLUDE_ASM` expansion as a lift marker. The `gte_*` macros map onto
+  `psx-gte`. When a function body contains real inline asm or a GNU nested
+  function, `psxw-cc` blanks that body, so the function falls to the lift
+  tier.
+- **Lift tier: generated C.** The translator works one function at a time
+  from *relocatable* objects: the per-TU `.o` files of the game's matching
+  build, and the SDK's `.LIB`/`.a` members. It emits C, the approach
+  N64Recomp and PSXRecomp use, rather than wasm directly:
+  - **One pipeline.** Generated C goes through the same clang flags,
+    prelude and guest memory model as decompiled C. The linker can't tell
+    the two apart.
+  - **Interchangeable with decompiled C.** Each function carries the
+    prototype from its header, so decompiled C calls it directly and vice
+    versa. When a decomp finishes a function, its readable C replaces the
+    generated one.
+  - **clang optimizes it.** Guest registers become locals that clang
+    promotes to SSA form. `#line` directives point back at the original
+    instructions for debugging.
+  - **UB discipline.** The output uses wrapping unsigned arithmetic,
+    explicit sign extension and masked shifts, so clang has no undefined
+    behaviour to exploit.
 
-  Relocations give it symbolic call targets, data references and jump
-  tables. Delay slots are resolved statically. Load-delay hazards are
-  modelled where a consumer sits in the slot. COP2 instructions map onto
-  `psx-gte`. COP0, `syscall` and `break` become runtime calls.
+  Relocations give the translator symbolic call targets, data references
+  and jump tables. Delay slots are resolved statically, and load-delay
+  hazards are modelled where a consumer sits in the slot. Other instructions
+  are routed as follows:
+  - COP2 maps onto `psx-gte`.
+  - Jumps to the BIOS tables (`0xA0`/`0xB0`/`0xC0`, function number in
+    `$t1`) and `syscall` become calls to the runtime's BIOS dispatcher.
+  - COP0 and `break` become runtime calls.
+  - A hardware register access is a build error: that code must have an
+    adapter.
 
-  The default is *ABI mode*: the lifter assumes o32 at function boundaries,
-  so registers become wasm locals. Clusters of handwritten asm that pass
-  values in non-argument registers fall back to *full-state mode*, where
-  every register lives in memory.
+  The default is *ABI mode*, which assumes o32 at function boundaries.
+  Clusters of handwritten asm that pass values in non-argument registers
+  fall back to *full-state mode*, where every register lives in memory.
+- **A translated SDK is reusable.** Games link SDK members byte for byte, so
+  the translated C is cached per SDK release, keyed by member hash, and
+  reused by every game linking that member. It is derived from Sony's
+  binaries, so it is built locally from the user's inputs and never
+  distributed.
 - **The tier report.** `psxw report tiers` lists every function's tier and
   how it changed since the last lock. At run time, the profiler reports the
-  share of executed code that comes from each tier. The lift tier is a
-  migration aid that shrinks as the decompilations progress. The lifted
-  share of executed code is a number to drive toward zero.
+  share of executed code that comes from each tier. For game code, the lift
+  tier is a migration aid that shrinks as the decompilations progress. The
+  SDK's handwritten asm (BIOS trampolines, GTE wrappers, `mem*`) never
+  becomes C, so translation is permanent there.
 
-### 5. The SDK boundary sits at the hardware edge
+### 5. The SDK: replace only what touches hardware
 
-The game's matching link fixes the set of SDK functions. Each one is
-compiled or lifted like game code *unless* the boundary manifest
-(`boundary/psyq-470.toml`) replaces it. The manifest belongs to the SDK
-version, not the game, so the next PsyQ 4.7 game reuses it. Games can still
-override entries.
+The game's matching link fixes the set of SDK functions. The rule from §4
+applies to each one individually, never to a whole library. An SDK
+function gets an adapter only if its code touches hardware registers or
+BIOS internals. Everything else runs as guest code, as decompiled C or
+translated, exactly like game code.
 
-The rule is to replace the lowest function that has a clean semantic
-contract, and run everything above it as the game's own code:
+**The runtime splits into three layers**, so that SDK versions stay cheap:
+
+```
+ guest code (game + SDK code that runs as-is: libsnd, libgs, libc …)
+        │ calls a replaced SDK function         │ BIOS jump / syscall
+        ▼                                       ▼
+ SDK adapters (thin, versioned)          BIOS (A0/B0/C0, syscall)
+        └──────────────────┬────────────────────┘
+                           ▼
+ devices (stable, hardware-defined): gpu, spu, cd, sio, clock, gte
+```
+
+- **Devices** speak the hardware's own vocabulary: GPU packets, `Cdl` drive
+  commands, SPU voice parameters, pad report bytes. That vocabulary is the
+  same for PsyQ 3.x, PsyQ 4.7, PSn00bSDK or a custom engine. Nearly all the
+  hard work lives here.
+- **The BIOS** is the console's ROM, so it is identical for every SDK
+  version. libapi is translated like any other library: 33 of the 39
+  members btn links are four-instruction trampolines (`li t2,0xB0; jr t2;
+  li t1,N`). The translator routes them to the Rust BIOS dispatcher.
+- **Adapters** are thin. Each one translates a particular version's PsyQ
+  call into device and BIOS calls: unpacking that version's structs and
+  return codes, and maintaining any SDK globals that guest code reads. What
+  varies between versions (struct layouts, function sets, internal globals,
+  bug fixes) is confined to them.
+
+**Adapters are keyed by object identity, not by "the SDK version".**
+- **Games mix versions.** A game may link libsnd from one release and
+  libgpu from another, sometimes patched.
+- **Every linked member is identified exactly,** by hash and signature.
+  Each adapter declares the object hashes it is validated against.
+- **Struct layouts are generated** from that SDK version's headers. The M0
+  layout probe showed clang's wasm32 layouts equal GCC's o32 layouts.
+- **An object with no adapter** is translated and cut one level lower, down
+  to the BIOS call level if necessary. Failing that, the build fails, naming
+  the objects that need adapters.
+- **Other SDK families**, such as PSn00bSDK or Net Yaroze, would be sibling
+  adapter sets over the same devices and BIOS.
+
+The PsyQ policy, measured on the 361 SDK members btn links:
 
 | Library | Policy |
 |---|---|
-| libapi | Replaced. These are BIOS A0/B0/C0 stubs: events, heap, file I/O, critical sections and `FlushCache`. |
-| libetc | Replaced. This covers `VSync`, the callbacks, root counters and interrupt setup. |
-| libgpu | Replaced at the device edge: `ResetGraph`, `DrawOTag`, `DrawSync`, `LoadImage`, `StoreImage`, `MoveImage`, `ClearImage`, `PutDrawEnv`, `PutDispEnv` and `SetDispMask`. Primitive setup, OT helpers and `GetTPage`-style helpers stay guest code. |
-| libgs | Guest code. It only builds packets on top of libgpu and libgte. |
-| libgte | Lifted or C by default, using `psx-gte` for COP2. Hot entry points can be replaced in Rust for speed. |
-| libcd | Replaced at the device edge: `CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks and `CdSearchFile`. Helpers such as `CdIntToPos` stay guest code. |
-| libspu | Replaced, because it is register programming. |
-| libsnd | Guest code: the SEQ/VAB sequencer runs on top of the replaced libspu, ticked by the runtime's timer callbacks. |
-| libpad, libmcrd, libmcx, libcard | Replaced. |
-| libc, libmath | Guest code. A few hot functions (`memcpy`, `memset`) can be replaced for speed. |
+| libapi | Translated. BIOS calls go to the Rust BIOS. Adapters for `counter.o` (`SetRCnt`… program the timers directly) and for `pad.o`, `patch.o` and `chclrpad.o` (they patch Sony BIOS internals in RAM). |
+| libetc | Adapters for `VSync`, callbacks and interrupt setup. To be audited per member, like libapi. |
+| libgpu | Adapters at the device edge: `ResetGraph`, `DrawOTag`, `DrawSync`, `LoadImage`, `StoreImage`, `MoveImage`, `ClearImage`, `PutDrawEnv`, `PutDispEnv`, `SetDispMask`. Primitive setup and OT helpers stay guest code. |
+| libcd | Adapters at the device edge: `CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`. Helpers such as `CdIntToPos` stay guest code. |
+| libspu | Adapters (register programming). Open question: register-level SPU emulation as the fallback for unknown versions. |
+| libpad, libmcrd, libmcx, libcard | Adapters. |
+| libsnd | Guest code. The sequencer *is* the game's music, so the original runs and only libspu beneath it is replaced. |
+| libgs | Guest code. It only writes packets into RAM; `DrawOTag` is the device step. |
+| libgte | Guest code, with COP2 through `psx-gte`. Hot wrappers may get adapters for speed. |
+| libmath, libc | Guest code. `rand` must be the original, or the game plays differently. `memcpy` and `memset` may get adapters for speed. |
 
-Rust replacements declare their C prototypes. The build checks those
-prototypes against the SDK headers, so a signature drift fails at link
-time, not at run time.
+Adapters declare their C prototypes. The build checks them against the SDK
+headers, so a signature drift fails at link time, not at run time. The
+manifest is `boundary/psyq-470.toml` today. It becomes version-keyed, with
+per-object overrides, when adapters are first written.
 
 ### 6. Time, interrupts and blocking
 
@@ -265,9 +336,9 @@ Game-visible time is **virtual and deterministic**:
 
 Drawing is synchronous inside the runtime: the GPU finishes "instantly".
 Completion callbacks still arrive at the next safepoint, not re-entrantly
-inside `DrawOTag`. CD timing is configurable:
-- *realistic*, the default, because loading screens animate while reads are
-  in flight;
+inside `DrawOTag`. CD timing is a runtime toggle, with a per-game default in
+`game.toml`:
+- *realistic*, because loading screens animate while reads are in flight;
 - *instant*, an enhancement.
 
 The game thread runs in a **Web Worker** and blocks with `Atomics.wait`,
@@ -276,33 +347,41 @@ which matches the PSX model exactly: the main loop blocks in `VSync`. JSPI
 without `SharedArrayBuffer`. "Block" is a host trait, so the runtime doesn't
 care which of the two is in use.
 
-### 7. Two modules sharing one memory
+### 7. One linked module, with a precompiled runtime
 
-- **`guest.wasm`** is per game and built by `psxw-link`. It holds the game,
-  the SDK's C, the lifted code, adapters and dispatch stubs. It imports
-  memory and the `psx.*` runtime functions, and exports `guest_main` and
-  `guest_invoke(addr, a0..a3) -> i64`. The runtime uses `guest_invoke` to
-  run guest callbacks.
-- **`runtime.wasm`** is game-agnostic Rust, built with `--import-memory
-  --global-base=0x02000000`. It reads and writes guest memory through the
-  window and never hands host pointers to the guest.
-
-Calls in either direction are wasm-to-wasm import calls, so no JavaScript
-sits on the hot path. The same `psx-runtime` crate is also built natively
-and embedded with `guest.wasm` in **wasmtime**. That headless host is what
-runs tests, CI, replays and profiling. The browser is the product, not the
-debugging environment.
+- **The runtime is precompiled once per runtime version.** It is
+  game-agnostic Rust, built as a wasm32 static library (relocatable
+  objects). Its data, stack and heap sit above the guest window. It reads
+  and writes guest memory through the window and never hands host pointers
+  to the guest.
+- **`psxw-link` links it with the game's cached objects** into one
+  `game.wasm`. That puts the GTE math in the same module as the game's hot
+  transform loops, where cross-module call overhead would hurt most.
+- **The runtime is hot-swappable by relinking.** A new runtime archive means
+  a relink of a few seconds, with no game code recompiled. `psxw-abi`
+  carries an ABI version, and the linker refuses mismatched pairs.
+- **Dev mode keeps them separate.** The runtime stays its own module sharing
+  the same memory, so it can be swapped at page load without relinking. The
+  ABI is the same; the linker just leaves the runtime imports unresolved.
+- **The host interface is the only seam.** `game.wasm` imports a small host
+  interface: frame pacing, audio output, input, disc reads, and the
+  renderer command interface (see Runtime). The browser host implements it
+  in the Web Worker. A native **wasmtime** host implements it for tests, CI,
+  replays and profiling. Tests therefore run exactly the wasm that ships.
+  The browser is the product, not the debugging environment.
 
 ### 8. psx-wasm owns the final link
 
 Most of the job is *placement*: data at fixed addresses, function addresses
-that are MIPS addresses, overlay stubs, the split between guest and host,
-and lifted functions spliced in. wasm-ld can't express any of that.
+that are MIPS addresses, overlay stubs, and the split between guest and
+runtime. wasm-ld can't express any of that.
 
 `psxw-link` reads relocatable wasm objects as described in the
-tool-conventions `Linking.md`, using `wasmparser` and `wasm-encoder`. It
-resolves symbols against the address map and emits the module. The guest
-passes follow, using walrus:
+tool-conventions `Linking.md`, using `wasmparser` and `wasm-encoder`. Its
+inputs are the game's objects, both decompiled and generated C, plus the
+precompiled runtime archive. It resolves symbols against the address map
+and emits the module. The guest passes then run over guest functions only,
+using walrus:
 1. Address masking, including `memory.copy` and `memory.fill`.
 2. The `__guest_sp` split.
 3. Safepoints.
@@ -327,54 +406,95 @@ Two alternatives are held in reserve:
                  ▼
           psxw-inputs ──► ProjectModel (containers, AddressMap, overlay slots,
                  │                       per-function tier candidates)
-     ┌───────────┼──────────────────────────┐
-     ▼           ▼                          ▼
- psxw-cc     psxw-lift                 boundary manifest
- clang →     MIPS .o →                 (replace → psx.* imports)
- wasm .o     wasm functions
-     └───────────┬──────────────────────────┘
-                 ▼
-            psxw-link ── place data/funcs at original addresses, verify data
-                 │       image vs original, adapters, overlay stubs, table
+                 │ per function: adapter │ decompiled C │ translated
+     ┌───────────┴──────────┐            boundary manifest (adapters)
+     ▼                      ▼                         │
+ psxw-lift              decompiled C                  │
+ MIPS .o → generated C       │                        │
+     └──────────┬───────────┘                         │
+                ▼                                     │
+            psxw-cc: clang → wasm objects             │
+                ▼                                     ▼
+            psxw-link ◄── precompiled runtime archive (devices, BIOS, adapters)
+                 │  place data/funcs at original addresses, dispatch table,
+                 │  o32 adapters, overlay stubs, interior entries
                  ▼
             guest passes (mask, guest SP, safepoints) → wasm-opt
                  ▼
-            guest.wasm  +  runtime.wasm (game-agnostic)  +  web shell
+            game.wasm  +  host (browser Worker shell, or wasmtime for tests)
 ```
 
-## Runtime (`psx-runtime`, host-agnostic)
+## Runtime
 
-- **kernel.** Events (`OpenEvent`, `EnableEvent`, `TestEvent`,
-  `WaitEvent`, `DeliverEvent`), the callback registry, critical sections,
-  heap (`InitHeap`), the BIOS file API on top of the CD, and `setjmp`
-  support. Guest `setjmp` and `longjmp` use wasm exception handling.
-- **clock.** The virtual timeline, vblank (NTSC 59.94 Hz, PAL 50 Hz), root
-  counters and the safepoint quantum.
-- **gpu.** A 1024×512×16bpp VRAM model and a software rasterizer that
-  covers all primitive types, texture modes, CLUTs, semi-transparency,
-  dithering, mask bit and texture windows. It also does the VRAM transfers,
-  and turns the display area into an RGBA frame.
-  - Software rendering comes first because the game reads VRAM back
-    (`StoreImage`, 8 call sites) and copies within it (`MoveImage`, 13 call
-    sites), and that needs exact pixels.
-  - A wgpu hardware renderer with upscaling is a later, optional backend.
-- **gte.** Re-exported from `psx-gte`. Its register file lives in the
-  runtime-private page of the guest window, so C macros, lifted COP2 code
-  and Rust libgte replacements all see the same state.
+The runtime is the PlayStation's operating system and devices,
+reimplemented as a Rust library that the compiled game calls into. It never
+steps anything. The game's own `main` loop is in charge, and game-visible
+time moves only inside runtime calls (§6). Callbacks re-enter it: guest
+calls runtime, runtime runs a guest callback, and the callback calls the
+runtime again. So the runtime never holds a borrow of its own state across
+a call into guest code.
+
+- **Boot.** Does the BIOS's startup job: reads `SYSTEM.CNF` from the disc,
+  loads the PS-X EXE into RAM, zeroes BSS, sets `__guest_sp`, and calls
+  `guest_main`.
+- **BIOS.** The A0/B0/C0 call tables and `syscall`: events (`OpenEvent`,
+  `EnableEvent`, `TestEvent`, `WaitEvent`, `DeliverEvent`), the callback
+  registry, critical sections, the heap, the file API on top of the CD,
+  exception hooks, and `setjmp` support (guest `setjmp`/`longjmp` use wasm
+  exception handling). The pure parts (heap, the string table) could come
+  from OpenBIOS's C, compiled as guest code.
+- **clock.** The virtual timeline: vblank (NTSC 59.94 Hz, PAL 50 Hz),
+  timers, a queue of pending device events, and the safepoint quantum. It
+  delivers events in a fixed order by calling guest callbacks.
+- **gpu.** Split in two at a renderer command interface, so the PS1
+  semantics stay host-agnostic:
+  - **Front end, in the runtime.** Walks the ordering table in guest RAM,
+    decodes packets, and tracks draw/display environments, texture pages and
+    windows. It batches primitives and tracks VRAM hazards. It emits
+    renderer commands: draw batch, VRAM upload, VRAM copy, VRAM readback,
+    present.
+  - **WebGL2 backend, in the host.** Rust over `glow`, which targets WebGL2
+    in the browser and native GLES for the test host. This is a
+    GPU-accelerated renderer from the start, built the way emulators build
+    theirs:
+    - **VRAM is one 1024×512 texture.** Primitives render into it, and the
+      fragment shader samples textures from it, decoding 4/8-bit texels
+      through their colour lookup tables itself. It has to be, because games
+      render into VRAM and then texture from the result. It is stored as
+      RGBA8, with the mask bit in alpha, because WebGL2 can't blend into
+      integer textures.
+    - **Feedback hazards.** A primitive that samples the area it draws into
+      first gets a snapshot copy of that region.
+    - **Semi-transparency** maps onto standard blend equations. Per-texel
+      semi-transparency needs two passes, because WebGL2 has no dual-source
+      blending. The mask bit uses the stencil buffer.
+    - **The rest of the pixel pipeline is shader work:** affine texturing
+      (`noperspective`), colour modulation, dithering, texture windows.
+    - **CPU transfers.** `StoreImage` (8 call sites in btn) is a
+      synchronous `readPixels`, which is fine in the worker. `MoveImage` (13
+      sites) is a GPU-side copy.
+    - **Exactness.** It starts at 1× resolution, with upscaling later. The
+      remaining inexactness is 1-pixel rasterization differences on edges,
+      which only presentation sees.
+- **gte.** `psx-gte`: exact fixed-point math. Its register file lives in the
+  runtime-private page of the guest window, so C macros, translated COP2
+  code and adapters all see the same state.
 - **spu.** 512 KB of SPU RAM, 24 voices with ADPCM, ADSR, pitch and noise,
   plus reverb and CD-input mixing. It renders one vblank's worth of samples
   per frame.
 - **cd.** Disc images (`.bin`/`.cue`, `.iso`), the ISO9660 lookup that
-  `CdSearchFile` needs, sector reads scheduled on the clock, and XA-ADPCM
-  streaming into the SPU's CD input.
-- **pad / memcard.** The digital pad and DualShock buffers that
-  `PadInitDirect` and `PadGetState` expect, and 128 KB card images.
+  `CdSearchFile` needs, sector reads scheduled on the clock (with the
+  timing toggle from §6), and XA-ADPCM streaming into the SPU's CD input.
+- **sio.** The digital pad and DualShock buffers that `PadInitDirect` and
+  `PadGetState` expect, and 128 KB memory card images.
+- **SDK adapters.** The thin, object-keyed layer from §5.
 
 ## Browser host
 
-- **Worker.** Runs `runtime.wasm` and `guest.wasm` and owns the clock.
-- **Presentation.** OffscreenCanvas inside the worker, drawing with WebGPU,
-  or WebGL2 where WebGPU isn't available.
+- **Worker.** Runs `game.wasm` and the host interface it imports, and owns
+  the clock.
+- **Presentation.** OffscreenCanvas inside the worker, drawing with the
+  WebGL2 backend.
 - **Audio.** The SPU writes each frame's samples into a SharedArrayBuffer
   ring, and an AudioWorklet drains it. The ring's fill level drives
   frame-pacing correction, so audio is the master clock.
@@ -387,38 +507,77 @@ Two alternatives are held in reserve:
   headers. A webview shell such as Tauri/wry sets them on its custom
   protocol; a static host needs them configured.
 
-## Validation
+## Validation: sources of truth
 
-1. **Build-time invariants**
-   - Each guest address has exactly one implementation.
-   - The data image equals the original bytes.
-   - Every cross-tier call agrees on its prototype.
-   - The resident-code fingerprints match the user's disc.
-2. **Lifter conformance**
-   - Instruction-level tests against a reference interpreter that exists
-     only in the test suite and never ships.
-   - Function-level differential tests of **lifted vs C** for every
-     function that has both. That covers thousands of functions across the
-     two repos, and the matching decompilations are the oracle (this is the
-     idea in btn-decompilation `plans/static-recompilation-project`).
-3. **The C tier under clang**
-   - Matched C is tuned to GCC 2.95 and can rely on undefined behaviour:
-     signed overflow, uninitialized locals used to steer register
-     allocation, type punning, and out-of-bounds indexing into neighbouring
-     fields.
-   - Compile with `-std=gnu89 -fwrapv -fno-strict-aliasing
-     -fno-delete-null-pointer-checks -funsigned-char -ffreestanding
-     -ftrivial-auto-var-init=zero`.
-   - Test builds add `-fsanitize=undefined` with trap handlers that the
-     runtime implements.
-   - Differential tests of C vs lifted catch whatever the flags miss.
-4. **Services**
-   - Run Amidog's `psxtest_gte` against `psx-gte`.
-   - Run the ps1-tests GPU and SPU suites against the rasterizer and the
-     mixer.
-5. **The whole game.** Deterministic input replays run under wasmtime in
-   CI and are checked against golden frame hashes. Key frames are compared
-   against emulator screenshots, with a tolerance.
+Every check needs an oracle that we didn't write. The design keeps
+emulators and test ROMs out of the verification path by being precise
+about what the truth is for each layer.
+
+**1. Above the device interface, the truth is the original code, and we
+have all of it.** The matching decomp plus the original objects define the
+behaviour of the game and every SDK library completely. These checks need
+nothing external:
+- **Translated vs decompiled C**, for every function that has both:
+  thousands of functions across the two repos. This is the idea in
+  btn-decompilation `plans/static-recompilation-project`.
+- **Adapters vs the translated original library.** Each adapter runs on the
+  same inputs as the translated PsyQ function it replaces, and the device
+  commands and SDK globals each produces are compared. A test-only decoder
+  turns the original's register writes back into device commands; for the
+  GPU that's free, since packets are the vocabulary. Every SDK version gets
+  this conformance test automatically.
+- **Build-time invariants:**
+  - each guest address has exactly one implementation;
+  - C-defined data equals the original bytes;
+  - struct layouts agree between GCC and clang (the M0 probe);
+  - every cross-tier call agrees on its prototype;
+  - resident-code fingerprints match the user's disc.
+- **The C tier under clang.** Matched C is tuned to GCC 2.95 and may rely
+  on undefined behaviour: signed overflow, uninitialized locals used to
+  steer register allocation, type punning, out-of-bounds indexing into
+  neighbouring fields. Mitigations:
+  - compile with `-std=gnu89 -fwrapv -fno-strict-aliasing
+    -fno-delete-null-pointer-checks -funsigned-char -ffreestanding
+    -ftrivial-auto-var-init=zero`;
+  - test builds add `-fsanitize=undefined`, with trap handlers the runtime
+    implements;
+  - translated-vs-C tests catch whatever the flags miss.
+
+**2. At the device interface, the truth is the hardware's defined
+behaviour.** For the parts that are exact arithmetic or fixed formats, the
+specification is the oracle, written down from hardware research (psx-spx).
+Spec-derived unit tests cover:
+- GTE operations, including saturation and the FLAG register;
+- ADPCM and XA decoding;
+- CD sector formats and ISO9660;
+- BIOS call semantics;
+- packet decoding and VRAM transfer semantics;
+- pad report and memory card formats.
+
+**3. The game only needs what it can observe.** Anything that flows back
+into guest RAM or return values must be right: VRAM readback, SPU key
+status, CD status, pad data, timer values. Pixels on screen and audio
+samples are presentation, which only the player sees.
+- **Timing has a range, not a value.** The hardware itself varied: CD seek
+  times differed from read to read. Games were written to tolerate that,
+  so "realistic" CD timing needs to fall within the hardware's envelope,
+  not match one console.
+- **Exact rasterization and SPU interpolation are presentation details.**
+  Real hardware is their only true reference. The target is "spec-faithful
+  and looks right", and upscaling deliberately departs from exactness
+  anyway. Where exactness matters, hardware captures are kept as data: test
+  images and recordings, not programs to run.
+
+**4. The game checks itself.**
+- **Deterministic replays** (same disc, build and input log) give golden
+  frame hashes and audio hashes for regressions.
+- **RAM invariants:** no guest access into the I/O range, and the stack
+  within bounds.
+- **The game's own integrity checks**, such as save checksums, pass.
+- **RAM is comparable by symbol.** The memory layout is the original's, so
+  guest RAM can be diffed against any reference capture of the original by
+  symbol name, if one ever exists. That reference is optional, not
+  required.
 
 ## Pinning the inputs
 
@@ -449,9 +608,9 @@ first.
 | # | Milestone | Exit criterion |
 |---|---|---|
 | M0 | **Census** (`psxw census <game>`). Pinned snapshots, the address map from splat configs and symbol files, and every game TU compiled to wasm objects. | Every TU compiles, with each normalization rule counted. Every function is placed exactly once, every reference resolves, and C-defined data matches the original bytes. **Layout probe:** GCC 2.95 and clang agree on the size, alignment and field offsets of every struct and global in every header the game includes. **Done for btn, 2026-10-25** (see below). |
-| M1 | **Headless boot.** `psxw-link`, the guest passes, a native wasmtime host, and every `replace` function stubbed (log and return 0). | `guest_main` runs from the runtime's boot to the main loop and through 600 vblanks without trapping. |
-| M2 | **Lift tier.** ABI-mode lifter, jump tables, COP2 through `psx-gte`. | No traps on the path to gameplay. Lifted matches C for every function that has both. |
-| M3 | **Pixels.** The GPU service, software rasterizer, GTE and pad. | The title screen and first in-game frames are dumped as PNGs headless, and their frame hashes are stable across runs. |
+| M1 | **Headless boot.** `psxw-link` (including the precompiled runtime archive), the guest passes, the BIOS dispatcher, a native wasmtime host, and every adapter stubbed (log and return 0). | `guest_main` runs from the runtime's boot to the main loop and through 600 vblanks without trapping. |
+| M2 | **Lift tier.** The MIPS → generated C translator (ABI mode, jump tables, COP2 through `psx-gte`, BIOS jumps to the dispatcher). The translated SDK cache. | No traps on the path to gameplay. Translated matches decompiled C for every function that has both. |
+| M3 | **Pixels.** The GPU front end, the WebGL2 backend at 1×, the GTE and the pad. | GTE and packet/VRAM-transfer spec tests pass. The title screen and first in-game frames are dumped as PNGs headless, with stable frame hashes across runs. |
 | M4 | **Browser.** Worker, OPFS disc import, OffscreenCanvas, input. | Playable at full speed in Chrome and Firefox. |
 | M5 | **Sound and saves.** SPU and libsnd, XA streaming, memory cards. | Play one in-game day with sound, save it, reload it. |
 | M6 | **Second game.** Another decompilation through the same pipeline. | It runs with only a game manifest and boundary overrides. |
@@ -501,6 +660,8 @@ first.
 | Handwritten SDK asm uses non-ABI register conventions | Full-state lifting mode, chosen automatically when the lifter's analysis sees a boundary violation. |
 | PSX RAM mirroring (`0x80200000` aliasing `0x80000000`) is relied on | The aux region occupies the mirrors. If a game needs mirroring, it can be enabled by masking with `0x1FFFFF` for that game. |
 | Browser constraints: COOP/COEP, Gamepad API only on the main thread, Safari gaps | Worker plus SharedArrayBuffer as the primary design, JSPI as the fallback, and a desktop webview shell. |
+| WebGL2 limits: no blending into integer textures, no dual-source blending, no framebuffer fetch | VRAM stored as RGBA8 with the mask bit in alpha; two-pass per-texel semi-transparency; stencil for the mask bit. |
+| An SDK object with no adapter (new version, patched library) | Translate it and cut one level lower, down to the BIOS calls; failing that, the build names the objects that need adapters. |
 
 ## Open questions
 
@@ -513,6 +674,6 @@ first.
    each repo's build itself, which needs their vendored toolchains and their
    untracked inputs (`extracted/`, `tools/vendor/`). The bundle keeps the
    contract small, and pinning becomes a SHA plus a content hash.
-3. **Distribution posture.** `guest.wasm` contains compiled game code but
+3. **Distribution posture.** `game.wasm` contains compiled game code but
    no disc data. Will it be distributed, or only built locally from the
    user's own checkouts?
