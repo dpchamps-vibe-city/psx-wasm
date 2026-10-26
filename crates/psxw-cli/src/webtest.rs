@@ -24,7 +24,8 @@ use std::process::Command;
 pub const USAGE: &str = "web-test gpu [--browsers chromium,firefox] [--timeout SECONDS] \
                          | web-test storage [--browsers ..] [--timeout S] \
                          | web-test conform <game> [--browsers ..] [--timeout S] \
-                         | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--browsers ..] [--timeout S]";
+                         | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--browsers ..] [--timeout S] \
+                         | web-test pacing <game> [--seconds N] [--browsers ..]";
 const IMAGE: &str = "psxw-browsers:local";
 
 #[derive(Serialize, Deserialize)]
@@ -222,6 +223,75 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     Ok(pass)
 }
 
+/// `web-test pacing`: M5 exit criterion 3. The game runs idle at real
+/// time for `--seconds` (default 60) in each browser; the frames it reached
+/// must be within one of wall time × the frame rate. The report always
+/// prints; it gates only when `psxw.local.toml` states the machine
+/// (`machine = "…"`), since pacing says nothing about an unknown one.
+fn pacing(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
+    let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
+    let mut seconds = 60u64;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--browsers" => browsers = it.next().context("--browsers needs a value")?.split(',').map(str::to_string).collect(),
+            "--seconds" => seconds = it.next().context("--seconds needs a value")?.parse()?,
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let disc = ws.disc(game)?;
+    let bundle = psxw_build::web::build(ws, game)?;
+    std::fs::create_dir_all(bundle.join("disc"))?;
+    // NTSC, as the worker paces it (`web/worker.js`).
+    let hz = 59.826;
+    let frames = (seconds as f64 * hz).round() as u64;
+    let id = image(ws)?;
+    let results = ws.out_dir().join("web").join(format!("test-{game}-pacing"));
+    let _ = std::fs::remove_dir_all(&results);
+    std::fs::create_dir_all(&results)?;
+    let cue = disc.file_name().context("disc name")?.to_string_lossy().into_owned();
+    let page = format!("index.html?discurl=disc/{cue}&autostart&frames={frames}&post");
+    let mut argv_args: Vec<String> = vec![page, (seconds * 3 + 120).to_string()];
+    argv_args.extend(browsers.iter().cloned());
+    let disc_dir = disc.parent().context("disc directory")?.to_path_buf();
+    let argv = docker_run(
+        &id,
+        &owner_of(&results)?,
+        &[(bundle.clone(), "/www", true), (disc_dir, "/www/disc", true), (results.clone(), "/out", false)],
+        None,
+        &argv_args,
+    );
+    ensure!(Command::new("docker").args(&argv).status()?.success(), "the browser container failed");
+    let machine = ws.local()?.machine;
+    let mut pass = true;
+    let mut report = Vec::new();
+    for b in &browsers {
+        let Ok(text) = std::fs::read_to_string(results.join(format!("result-{b}.json"))) else {
+            println!("{b}: no result");
+            pass = false;
+            continue;
+        };
+        let r: serde_json::Value = serde_json::from_str(&text)?;
+        let (reached, wall) = (r["frames"].as_u64().unwrap_or(0), r["seconds"].as_f64().unwrap_or(0.0));
+        let drift = reached as f64 - wall * hz;
+        let ok = r["error"].is_null() && reached == frames && drift.abs() <= 1.0;
+        pass &= ok;
+        println!(
+            "{b}: {} frames in {wall:.3} s, drift {drift:+.2} frames, {} late; frame ms {}",
+            reached, r["lagFrames"], r["frameMs"]
+        );
+        report.push(serde_json::json!({ "browser": b, "frames": reached, "seconds": wall, "drift": drift, "late": r["lagFrames"], "frame_ms": r["frameMs"], "within_one_frame": ok }));
+    }
+    let path = ws.out_dir().join("web").join(format!("pacing-{game}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&serde_json::json!({ "game": game, "seconds": seconds, "hz": hz, "machine": machine, "browsers": report }))?)?;
+    match &machine {
+        Some(m) => println!("pacing on {m}: {}", if pass { "PASS" } else { "FAIL" }),
+        None => println!("pacing: {} (reported only: psxw.local.toml states no machine)", if pass { "within one frame" } else { "outside one frame" }),
+    }
+    eprintln!("report: {}", path.display());
+    Ok(pass || machine.is_none())
+}
+
 /// Memory-card import and export and the Worker's save path, through OPFS
 /// in each browser: every check in `web/test/storage.js` must pass.
 fn storage(ws: &Workspace, args: &[&str]) -> Result<bool> {
@@ -367,6 +437,10 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
             return game(ws, g, &args[2..]);
         }
         Some(&"storage") => return storage(ws, &args[1..]),
+        Some(&"pacing") => {
+            let g = it.next().context("web-test pacing needs a game")?;
+            return pacing(ws, g, &args[2..]);
+        }
         Some(&"conform") => {
             let g = it.next().context("web-test conform needs a game")?;
             return conform(ws, g, &args[2..]);

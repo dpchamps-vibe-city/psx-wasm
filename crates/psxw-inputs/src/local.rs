@@ -14,6 +14,10 @@ pub const FILE: &str = "psxw.local.toml";
 pub struct Local {
     #[serde(default)]
     pub game: BTreeMap<String, LocalGame>,
+    /// A description of this machine (CPU, browser host). Timing checks
+    /// that only mean something on a known machine, such as M5's pacing,
+    /// gate only when it is stated.
+    pub machine: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

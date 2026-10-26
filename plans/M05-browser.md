@@ -1,6 +1,6 @@
 # M5 — Browser host
 
-**Status:** in progress (tasks 1–4, 6 and 8 done; task 5's image and GPU check done, its game check waits for the disc)
+**Status:** done (task 7 optional and declined by D46; pacing is reported, and gates once `psxw.local.toml` states the machine)
 **Depends on:** M4. **Unlocks:** M7 (browser saves), a public demo.
 **Design refs:** design: Browser host, §6 (blocking), §7 (dev mode);
 decisions D16, D18, D20.
@@ -91,11 +91,11 @@ produces. Its devices are already gated by M4's oracles.
    playing silence; `psxw build-web`; `psxw serve`.
 4. [x] Dev mode with the separate runtime module; document the hot-swap
    workflow. *(`?dev`; `web/README.md`.)*
-5. [ ] Playwright Docker image (pinned) and the cross-host determinism
+5. [x] Playwright Docker image (pinned) and the cross-host determinism
    test for the `title-to-gameplay` replay, in both browsers. *(D44:
-   `psxw-browsers` instead of Playwright. `psxw web-test gpu` and
-   `web-test conform` pass in both browsers. `psxw web-test game` is
-   written; it waits for the disc and the replay.)*
+   `psxw-browsers` instead of Playwright. `psxw web-test game btn
+   --replay title-to-gameplay` passes in Chromium and Firefox: RAM, VRAM
+   and audio equal the native host's.)*
 6. [x] Performance report: frame-time percentiles in the worker. Reported,
    not gating. *(`frameMs` in the Worker's `hashes` message.)*
 7. [ ] *(optional, if Q1 says yes; D46: no for now)* Tauri shell serving the same bundle
@@ -189,6 +189,26 @@ produces. Its devices are already gated by M4's oracles.
     wasm exceptions (D45) in both browsers.
   - **The check works:** a tampered return value in the recording is
     reported (`got 0x8005650c, want 0x12345`).
+
+- **2026-10-26** (this commit): the disc runs.
+  - **Exit criterion 2:** `psxw web-test game btn --replay
+    title-to-gameplay --hash 300,1200,2400,3600,4800,6000` passes:
+    - every RAM and VRAM hash equals the native host's;
+    - so does the audio (frames and hash);
+    - unpaced runs take 53 s in Chromium and 27 s in Firefox for the
+      6,000 frames.
+    
+    `web-test game` takes named replays and runs their length.
+  - **Exit criterion 3:** `psxw web-test pacing btn` runs idle at real
+    time for 60 s.
+    - Frames reached against wall time × 59.826 Hz: drift +0.85 frames
+      in Chromium, +0.66 in Firefox.
+    - Both fall behind during loads, then catch up: 495 and 635 frames
+      ended more than a period late, with frame-time peaks of 128 and
+      172 ms.
+    - The report (`out/web/pacing-<game>.json`) gates only once
+      `psxw.local.toml` states the machine (`machine = "…"`), and none
+      is stated here.
 
 ## Findings
 
