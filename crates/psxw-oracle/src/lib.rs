@@ -20,6 +20,7 @@ pub mod ramdiff;
 pub mod record;
 pub mod report;
 pub mod script;
+pub mod spu;
 pub mod store;
 pub mod target;
 pub mod vector;

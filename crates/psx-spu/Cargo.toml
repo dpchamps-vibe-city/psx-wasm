@@ -1,0 +1,5 @@
+[package]
+name = "psx-spu"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true

@@ -25,10 +25,10 @@ pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images 
                          | capture [--kind K] [--missing] | check <game> --device D | ci \
                          | play <game> … | ramdiff <game> …";
 
-/// psx-wasm's device implementations the oracle can check (gpu in M4, spu
-/// in M6 still to come).
+/// psx-wasm's device implementations the oracle can check (gpu in M4 still
+/// to come).
 fn devices() -> Vec<Box<dyn DeviceUnderTest>> {
-    vec![Box::new(psxw_oracle::gte::Device)]
+    vec![Box::new(psxw_oracle::gte::Device), Box::new(psxw_oracle::spu::Device::default())]
 }
 
 fn finish(report: &Report, path: &Path) {
