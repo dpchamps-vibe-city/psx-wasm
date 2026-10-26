@@ -139,14 +139,19 @@ pub struct Voice {
     /// Ticks left before the envelope and the pitch counter start after a
     /// key on.
     delay: u8,
+    /// Ticks since the last key on (saturating).
+    kon_age: u8,
     /// Output after the envelope, for pitch modulation of the next voice.
     out: i32,
 }
 
-/// oracle: ticks, counting the key-on tick, during which a keyed-on voice
-/// holds its first sample and its envelope level (the emulator's voices
-/// output their first sample five times before advancing).
+/// oracle: after a key on, the voice skips this many envelope and pitch
+/// updates (its first sample plays six times, the key-on tick included).
 pub const KEY_ON_DELAY: u8 = 5;
+
+/// oracle: the decoder decodes another data halfword when fewer than this
+/// many samples are buffered ahead of the playback position.
+pub const DECODE_AHEAD: u64 = 7;
 
 /// The noise generator (psx-spx "SPU Noise Generator").
 #[derive(Clone, Copy, Debug, Default)]
@@ -179,9 +184,6 @@ pub struct Spu {
     reverb: reverb::Reverb,
     /// CD audio input for the next tick (left, right).
     cd_in: [i16; 2],
-    /// What the capture buffers receive at the next tick: the CD input
-    /// and voices 1 and 3 of the tick before.
-    capture_data: [i16; 4],
 }
 
 impl Default for Spu {
@@ -214,7 +216,6 @@ impl Spu {
             noise: Noise::default(),
             reverb: reverb::Reverb::default(),
             cd_in: [0; 2],
-            capture_data: [0; 4],
         }
     }
 
@@ -325,10 +326,12 @@ impl Spu {
             return;
         }
         match off {
-            reg::KON => self.kon |= value as u32,
-            0x18A => self.kon |= (value as u32 & 0xFF) << 16,
-            reg::KOFF => self.koff |= value as u32,
-            0x18E => self.koff |= (value as u32 & 0xFF) << 16,
+            // oracle: KON and KOFF latch the last value written before the
+            // tick that processes them.
+            reg::KON => self.kon = (self.kon & !0xFFFF) | value as u32,
+            0x18A => self.kon = (self.kon & 0xFFFF) | (value as u32 & 0xFF) << 16,
+            reg::KOFF => self.koff = (self.koff & !0xFFFF) | value as u32,
+            0x18E => self.koff = (self.koff & 0xFFFF) | (value as u32 & 0xFF) << 16,
             reg::ESA => self.reverb.set_base(value),
             reg::TSA => self.transfer_addr = (value as u32) << 3,
             reg::DATA => {
@@ -408,8 +411,8 @@ impl Spu {
         self.ram[((addr & (RAM_BYTES - 1)) >> 1) as usize]
     }
 
-    /// The decoder reached the end of the block it was decoding: apply its
-    /// loop flags and move to the next block.
+    /// The decoder finished a block: apply its loop flags and move to the
+    /// next block.
     fn end_of_block(&mut self, vi: usize) {
         let flags = self.voices[vi].flags;
         if flags & 1 != 0 {
@@ -426,14 +429,13 @@ impl Spu {
         }
     }
 
-    /// Decode the voice's next sample into its ring.
-    fn decode_sample(&mut self, vi: usize) {
+    /// Decode the voice's next data halfword (4 samples) into its ring:
+    /// the block's header with its first word, the block's loop flags with
+    /// its last.
+    fn decode_word(&mut self, vi: usize) {
         let k = (self.voices[vi].decoded % 28) as u32;
+        let addr = self.voices[vi].addr & (RAM_BYTES - 1) & !1;
         if k == 0 {
-            if self.voices[vi].decoded > 0 {
-                self.end_of_block(vi);
-            }
-            let addr = self.voices[vi].addr & (RAM_BYTES - 1) & !1;
             self.touch(addr);
             let hdr = self.ram_at(addr);
             let v = &mut self.voices[vi];
@@ -444,11 +446,8 @@ impl Spu {
                 v.lsa = (addr >> 3) as u16;
             }
         }
-        let addr = self.voices[vi].addr & (RAM_BYTES - 1) & !1;
         let waddr = (addr + 2 + 2 * (k / 4)) & (RAM_BYTES - 1);
-        if k % 4 == 0 {
-            self.touch(waddr);
-        }
+        self.touch(waddr);
         let word = self.ram_at(waddr);
         let v = &mut self.voices[vi];
         let mut shift = v.shift as u32;
@@ -459,13 +458,19 @@ impl Spu {
         let filter = (v.filter & 7) as usize;
         // oracle: filters 5..7 (not in psx-spx's table).
         let (f0, f1) = if filter < 5 { (FILTER_POS[filter], FILTER_NEG[filter]) } else { (0, 0) };
-        let nib = ((word >> (4 * (k % 4))) & 0xF) as i32;
-        let t = ((nib << 28) >> 28) << 12;
-        let s = clamp16((t >> shift) + ((v.prev[0] * f0 + v.prev[1] * f1 + 32) >> 6));
-        v.prev[1] = v.prev[0];
-        v.prev[0] = s;
-        v.ring[(v.decoded % 32) as usize] = s as i16;
-        v.decoded += 1;
+        for i in 0..4 {
+            let nib = ((word >> (4 * i)) & 0xF) as i32;
+            let t = ((nib << 28) >> 28) << 12;
+            // oracle: each prediction product is shifted (floored) on its own.
+            let s = clamp16((t >> shift) + ((v.prev[0] * f0) >> 6) + ((v.prev[1] * f1) >> 6));
+            v.prev[1] = v.prev[0];
+            v.prev[0] = s;
+            v.ring[(v.decoded % 32) as usize] = s as i16;
+            v.decoded += 1;
+        }
+        if k + 4 == 28 {
+            self.end_of_block(vi);
+        }
     }
 
     fn key_on(&mut self, vi: usize) {
@@ -478,12 +483,19 @@ impl Spu {
         v.phase = Phase::Attack;
         v.prev = [0; 2];
         v.delay = KEY_ON_DELAY;
+        v.kon_age = 0;
         self.endx &= !(1 << vi);
     }
 
     fn adsr(&mut self, vi: usize) {
         let v = &mut self.voices[vi];
         let (a1, a2) = (v.adsr1, v.adsr2);
+        // oracle: an attack at the top level moves on to decay on any
+        // update, before stepping (even when its own rate never steps).
+        if v.phase == Phase::Attack && v.envx == 0x7FFF {
+            v.phase = Phase::Decay;
+            v.env_counter = 0;
+        }
         let rate = match v.phase {
             Phase::Attack => Rate { shift: ((a1 >> 10) & 0x1F) as u8, step: ((a1 >> 8) & 3) as u8, exponential: a1 & 0x8000 != 0, decreasing: false, negative: false },
             Phase::Decay => Rate { shift: ((a1 >> 4) & 0xF) as u8, step: 0, exponential: true, decreasing: true, negative: false },
@@ -492,20 +504,12 @@ impl Spu {
         };
         let (level, stepped) = envelope::step(v.envx, &mut v.env_counter, rate);
         v.envx = level;
-        // oracle: the phase changes only on a tick where the envelope steps.
-        if !stepped {
-            return;
-        }
-        match v.phase {
-            Phase::Attack if v.envx == 0x7FFF => {
-                v.phase = Phase::Decay;
-                v.env_counter = 0;
-            }
-            Phase::Decay if (v.envx as i32) <= ((a1 as i32 & 0xF) + 1) << 11 => {
-                v.phase = Phase::Sustain;
-                v.env_counter = 0;
-            }
-            _ => {}
+        // oracle: decay moves on to sustain only on an update that steps, once
+        // the level is below the sustain level (psx-spx: "until Sustain
+        // Level").
+        if stepped && v.phase == Phase::Decay && (v.envx as i32) < ((a1 as i32 & 0xF) + 1) << 11 {
+            v.phase = Phase::Sustain;
+            v.env_counter = 0;
         }
     }
 
@@ -545,9 +549,16 @@ impl Spu {
     /// One voice's output for this tick, after the envelope.
     fn voice_output(&mut self, vi: usize) -> i32 {
         let noise_on = self.mask(reg::NON) & (1 << vi) != 0;
+        // oracle: the decoder runs ahead of the playback position, one data
+        // halfword per tick whenever fewer than DECODE_AHEAD samples are
+        // buffered (so a block's loop flags take effect ten samples before
+        // its end at pitch 1000h).
         let p = self.voices[vi].counter >> 12;
+        if self.voices[vi].decoded < p + DECODE_AHEAD {
+            self.decode_word(vi);
+        }
         while self.voices[vi].decoded < p + 4 {
-            self.decode_sample(vi);
+            self.decode_word(vi);
         }
         let noise = self.noise.level as i16 as i32;
         let v = &mut self.voices[vi];
@@ -585,6 +596,8 @@ impl Spu {
         let koff = core::mem::take(&mut self.koff);
         let kon = core::mem::take(&mut self.kon);
         for vi in 0..VOICES {
+            let v = &mut self.voices[vi];
+            v.kon_age = v.kon_age.saturating_add(1);
             if kon & (1 << vi) != 0 {
                 self.key_on(vi);
             }
@@ -598,14 +611,6 @@ impl Spu {
         let mut v1 = 0;
         let mut v3 = 0;
         for vi in 0..VOICES {
-            // oracle: the envelope and the pitch counter advance at the start
-            // of a tick, so ENVX reads back the level of the last output.
-            if self.voices[vi].delay > 0 {
-                self.voices[vi].delay -= 1;
-            } else {
-                self.adsr(vi);
-                self.voice_advance(vi, prev_out);
-            }
             let out = self.voice_output(vi);
             if vi == 1 {
                 v1 = out;
@@ -621,24 +626,32 @@ impl Spu {
                 rl += vl;
                 rr += vr;
             }
+            // The envelope and the pitch counter advance after the output,
+            // except during the key-on delay.
+            if self.voices[vi].delay > 0 {
+                self.voices[vi].delay -= 1;
+            } else {
+                self.adsr(vi);
+                self.voice_advance(vi, prev_out);
+            }
             prev_out = out;
             let v = &mut self.voices[vi];
             Self::volume(v.vol[0], &mut v.volx[0], &mut v.vol_counter[0]);
             Self::volume(v.vol[1], &mut v.volx[1], &mut v.vol_counter[1]);
         }
-        // oracle: key off takes effect after this tick's envelope step.
+        // oracle: key off takes effect after this tick's envelope step, and
+        // not at all in the tick after a key on.
         for vi in 0..VOICES {
-            if koff & (1 << vi) != 0 {
+            if koff & (1 << vi) != 0 && self.voices[vi].kon_age > 1 {
                 self.voices[vi].phase = Phase::Release;
                 self.voices[vi].env_counter = 0;
             }
         }
 
-        // Capture buffers: CD L/R, voice 1, voice 3. oracle: they receive
-        // the previous tick's samples.
+        // Capture buffers: CD L/R, voice 1, voice 3.
         let idx = self.capture;
         let cd = self.cd_in;
-        let data = core::mem::replace(&mut self.capture_data, [cd[0], cd[1], clamp16(v1) as i16, clamp16(v3) as i16]);
+        let data = [cd[0], cd[1], clamp16(v1) as i16, clamp16(v3) as i16];
         for (base, val) in [0x000u32, 0x400, 0x800, 0xC00].into_iter().zip(data) {
             let a = base + 2 * idx;
             self.touch(a);

@@ -52,6 +52,9 @@ pub struct Timing {
     /// Robustness checks: move every FIFO load this many ticks (the
     /// emulator's loads land a tick early or late now and then).
     pub capture_slip: f64,
+    /// Robustness checks: move the whole readback (snapshot and captures)
+    /// this many cycles.
+    pub read_shift: f64,
 }
 
 impl Default for Timing {
@@ -68,6 +71,7 @@ impl Default for Timing {
             capture_start: 105.0,
             capture_gap: 2.0,
             capture_slip: 0.0,
+            read_shift: 0.0,
         }
     }
 }
@@ -90,6 +94,7 @@ impl Timing {
                 "capture_start" => self.capture_start = v,
                 "capture_gap" => self.capture_gap = v,
                 "capture_slip" => self.capture_slip = v,
+                "read_shift" => self.read_shift = v,
                 _ => bail!("unknown timing field {k}"),
             }
         }
@@ -255,10 +260,11 @@ pub fn readback(w: Written, r: &SpuRun, t: &Timing) -> Vec<u8> {
     let Written { clock: mut c, last } = w;
     c.phase = t.phase;
     let end = 768.0 * r.samples as f64 + t.end;
-    let start = match last {
-        Some(p) if p + t.end_after_write > end => p + t.end_after_write,
-        _ => end,
-    };
+    let start = t.read_shift
+        + match last {
+            Some(p) if p + t.end_after_write > end => p + t.end_after_write,
+            _ => end,
+        };
     let mut out = vec![0u8; wire::SPU_SNAPSHOT_SIZE as usize];
     let mut now = start;
     for j in 0..(wire::SPU_SNAPSHOT_SIZE / 2) {
@@ -310,6 +316,44 @@ pub fn run(r: &SpuRun, store: &Store, t: &Timing) -> Result<Vec<u8>> {
     Ok(readback(written(spu, r, t), r, t))
 }
 
+/// The runner's timing varies from vector to vector within these bounds
+/// (calibration, plans/M06-sound.md Findings): the snapshot and the
+/// captures by up to about 75 cycles, queued writes by their poll loop,
+/// and the DMA's FIFO loads by a tick.
+pub const READ_MARGIN: f64 = 96.0;
+pub const WRITE_MARGIN: f64 = 64.0;
+
+/// Whether a vector's result is knowable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Knowable {
+    Yes,
+    /// The result changes within the readback's timing tolerance.
+    NotReadback,
+    /// The result changes within the queued writes' timing tolerance.
+    NotWrites,
+}
+
+/// The result of `r` and whether it is the same under every timing the
+/// runner can take: a vector whose result is not is unknowable, and the
+/// generators drop it.
+pub fn robust(r: &SpuRun, store: &Store, t: &Timing) -> Result<(Vec<u8>, Knowable)> {
+    let edge = at_edge(r, store)?;
+    let nominal = readback(written(edge.clone(), r, t), r, t);
+    let variants = [
+        (Timing { write: t.write + WRITE_MARGIN, ..*t }, Knowable::NotWrites),
+        (Timing { read_shift: -READ_MARGIN, ..*t }, Knowable::NotReadback),
+        (Timing { read_shift: READ_MARGIN, ..*t }, Knowable::NotReadback),
+        (Timing { capture_slip: -1.0, ..*t }, Knowable::NotReadback),
+        (Timing { capture_slip: 1.0, ..*t }, Knowable::NotReadback),
+    ];
+    for (v, why) in &variants {
+        if readback(written(edge.clone(), r, v), r, v) != nominal {
+            return Ok((nominal, *why));
+        }
+    }
+    Ok((nominal, Knowable::Yes))
+}
+
 /// psx-spu as the oracle's `spu` device.
 #[derive(Default)]
 pub struct Device {
@@ -348,4 +392,38 @@ impl Written {
     pub fn last_write(&self) -> Option<f64> {
         self.last
     }
+}
+
+// ---- synthetic vectors ------------------------------------------------------
+
+pub mod generators;
+
+pub use generators::{DEFAULT_SEED, GENERATORS};
+
+/// The set a generator's vectors go to (`check` includes every set named
+/// with [`crate::commands::SYNTHETIC_PREFIX`]).
+pub fn set_name(generator: &str) -> String {
+    format!("{}spu-{generator}", crate::commands::SYNTHETIC_PREFIX)
+}
+
+/// Vectors where the device target and psx-spx disagree in a way only
+/// hardware can settle: captured, kept out of the verdicts (M6 Findings).
+pub const DISPUTED_SET: &str = "disputed-spu";
+
+/// Store the synthetic vectors and replace their sets. Returns, per
+/// generator, how many vectors it made and how many candidates it dropped
+/// as not knowable.
+pub fn install(store: &Store, seed: u64) -> Result<std::collections::BTreeMap<&'static str, (usize, usize)>> {
+    let (generated, dropped) = generators::generate(store, seed, &Timing::default())?;
+    let mut sets: std::collections::BTreeMap<&'static str, Vec<crate::vector::VectorId>> = std::collections::BTreeMap::new();
+    for g in &generated {
+        sets.entry(g.generator).or_default().push(store.put_vector(&g.vector)?);
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for (name, d) in dropped {
+        let ids = sets.remove(name).unwrap_or_default();
+        counts.insert(name, (ids.len(), d));
+        store.replace_set(&set_name(name), ids)?;
+    }
+    Ok(counts)
 }

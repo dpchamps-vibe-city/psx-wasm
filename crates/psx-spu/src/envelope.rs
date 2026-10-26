@@ -34,7 +34,9 @@ pub fn step(level: i16, counter: &mut u16, r: Rate) -> (i16, bool) {
     step <<= (11 - shift).max(0);
     let mut inc: u32 = 0x8000 >> (shift - 11).max(0).min(16);
     let lvl = level as i32;
-    if r.exponential && !r.decreasing && lvl > 0x6000 {
+    // oracle: the slower exponential increase starts at 6000h itself
+    // (psx-spx: "AdsrLevel>6000h").
+    if r.exponential && !r.decreasing && lvl >= 0x6000 {
         if shift < 10 {
             step >>= 2;
         } else if shift >= 11 {
