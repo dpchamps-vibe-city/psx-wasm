@@ -552,6 +552,48 @@ still trap or hang the game. ABI 8 adds the queueing export.
 runtime while its machine is mutably borrowed. Existing symbol addresses
 suffice for references; debugging source maps are a separate concern.
 
+**D53. A debug build carries the C's DWARF to the browser, at addresses a
+debugger can read.** `psxw build <game> --debug` gives `game-debug.wasm`,
+and `psxw build-web <game> --debug` gives `out/web/<game>-debug`.
+- **The C is compiled with `-g`** into its own directories
+  (`out/<game>/debug/`), lifted C included. A translated function then
+  shows its generated C, one MIPS instruction a line. `-g` doesn't change
+  clang's code (sampled: 95 of 95 objects identical).
+- **psxw-link carries the DWARF through the guest passes**
+  (`psxw_link::dwarf`). The rewrite records where each input instruction
+  lands. Every code address, length, range, location list and line row
+  goes through that map, data addresses are written as the link placed
+  them, and `__stack_pointer` becomes `$sp`.
+- **The window moves to `DEBUG_WINDOW_BASE` = `0x8000_0000`.** Every KSEG0
+  address is then its own wasm address, so a DWARF debugger reads globals,
+  stack slots and what pointers point at where the game put them. The
+  memory is declared from 0 to the window's end (33,024 pages, about
+  2 GiB). Nothing touches the gap, and hosts don't commit it: a native
+  boot peaked at 163 MB, against 184 MB for the plain build. The guest
+  exports `guest_window` (ABI 9); the runtime and both hosts read it, and
+  the JS host treats pointers as unsigned, since the runtime's heap now
+  starts above 2 GiB.
+- **psxw-link merges the modules, not binaryen** (`psxw_link::merge`).
+  Binaryen 133 rejects DWARF 5. With DWARF 4, `wasm-merge` zeroes every
+  address, and `wasm-opt -O2` invalidates DWARF anyway. Our merge does
+  what `wasm-merge` does with these two modules. It re-encodes the guest's
+  code changing only call targets, maps where it moved, and applies that
+  map to the DWARF. No `wasm-opt` runs: clang already optimized the C.
+- The debug build's guest RAM and audio hashes equal the plain build's
+  at frames 60, 300 and 600.
+
+Limits:
+- **Some pointers still read wrong in the debugger.** Scratchpad
+  (`0x1F80_xxxx`) and KUSEG/KSEG1 pointers point into the unused gap, so
+  the debugger shows zeros. The game itself runs correctly.
+- **`-O2` C steps unevenly**, and some variables are optimized out.
+- **It doesn't combine with `--moddable`, `--ubsan` or mods yet.**
+
+*Why:* the human wants C-level debugging in DevTools, variables included.
+Source maps carry only lines, so they were rejected. Chrome's C/C++
+DevTools Support extension (DWARF) reads pointers as wasm addresses,
+which only this layout makes true.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser

@@ -460,7 +460,7 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             let proto = m.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
             let (words, _) = marshal::words(&kinds, variadic);
-            let f = marshal::c_to_o32(&sig, &words, sp, &|_| {}, &|_, _| {}, &|f| {
+            let f = marshal::c_to_o32(&sig, &words, sp, WINDOW_BASE, &|_| {}, &|_, _| {}, &|f| {
                 f.instruction(&I::Call(target));
             });
             (sig, f, format!("o32_call:{name}"))
@@ -472,7 +472,7 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             helper.params.push(V::I32);
             let target = sig.params.len() as u32;
             let o32_ty = m.o32_ty;
-            let f = marshal::c_to_o32(&helper, &words, sp, &|_| {}, &|_, _| {}, &|f| {
+            let f = marshal::c_to_o32(&helper, &words, sp, WINDOW_BASE, &|_| {}, &|_, _| {}, &|f| {
                 f.instruction(&I::LocalGet(target));
                 dispatch_call(f, o32_ty);
             });
@@ -491,14 +491,14 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
         S::Support(name, sig) => (sig.clone(), crate::bodies::support(&name), name),
         S::CLayer { befores, core, afters, sig, input, name } => {
             let proto = m.inputs[input].protos.get(&name);
-            (sig.clone(), c_layer(m.g_mod_sp, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
+            (sig.clone(), c_layer(m.g_mod_sp, WINDOW_BASE, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
         }
         S::O32Layer { befores, core, afters, returns } => (o32(), o32_layer(&befores, core, &afters, returns), "hook:o32".into()),
         S::ModWrap { input, func, hook } => {
             let sig = m.func_sig(input, func);
             let name = guest_name(m, input, func);
             let proto = m.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: hook.map(|id| (m.g_hook_sp, m.g_hook_id, id)) };
+            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: hook.map(|id| (m.g_hook_sp, m.g_hook_id, id)), window: WINDOW_BASE };
             let callee = m.guest[&(input, func)];
             (o32(), marshal::o32_to_c_with(&sig, proto, callee, marshal::Shape::O32, g), format!("o32:mod:{name}"))
         }
@@ -506,7 +506,7 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             let sig = m.func_sig(input, func);
             let name = guest_name(m, input, func);
             let proto = m.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: None };
+            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: None, window: WINDOW_BASE };
             let callee = m.guest[&(input, func)];
             let mut params = if result { vec![V::I64] } else { vec![] };
             params.extend([V::I32; 4]);
@@ -516,7 +516,7 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             let proto = m.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
             let (words, _) = marshal::words(&kinds, variadic);
-            (sig.clone(), marshal::c_to_o32_transparent(&sig, &words, sp, (m.g_hook_sp, m.g_hook_id, id), next), format!("original:{name}"))
+            (sig.clone(), marshal::c_to_o32_transparent(&sig, &words, sp, WINDOW_BASE, (m.g_hook_sp, m.g_hook_id, id), next), format!("original:{name}"))
         }
         S::Init { fresh } => (FuncType { params: vec![], results: vec![] }, init(m, fresh)?, if fresh { names::INIT.into() } else { names::RESUME.into() }),
         S::Loaded => (FuncType { params: vec![V::I32; 2], results: vec![] }, loaded(m)?, names::LOADED.into()),
@@ -548,7 +548,7 @@ fn patch(m: &M, f: &mut Function, d: &DataPatch) -> Result<()> {
     match &d.value {
         PatchValue::Bytes(b) => {
             for (k, x) in b.iter().enumerate() {
-                store_byte(f, d.addr + k as u32, *x);
+                store_byte(f, WINDOW_BASE, d.addr + k as u32, *x);
             }
         }
         PatchValue::FnPtr(imp) => {

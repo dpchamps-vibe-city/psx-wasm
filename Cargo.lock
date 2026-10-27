@@ -982,6 +982,7 @@ name = "psxw-link"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "gimli",
  "psxw-abi",
  "psxw-cc",
  "psxw-inputs",

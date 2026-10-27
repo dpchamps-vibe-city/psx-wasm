@@ -42,6 +42,10 @@ pub struct Options {
     /// checks a hook slot that mods loaded at run time fill
     /// (`game-moddable.wasm`).
     pub moddable: bool,
+    /// A debug build (D53, `game-debug.wasm`): the C with DWARF, the window
+    /// at psxw-abi `DEBUG_WINDOW_BASE` so a debugger's addresses are the
+    /// game's, merged without binaryen.
+    pub debug: bool,
 }
 
 /// What the modkit links into a build (plans/M11).
@@ -56,7 +60,17 @@ pub struct ModPlan {
 
 impl Options {
     pub fn new(game: &str) -> Self {
-        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![], probes: vec![], mods: None, moddable: false }
+        Self {
+            game: game.into(),
+            debug_io: false,
+            budget: 1000,
+            ubsan: false,
+            original: vec![],
+            probes: vec![],
+            mods: None,
+            moddable: false,
+            debug: false,
+        }
     }
 
     /// The output name's suffix: `-ubsan`, `-orig-libpad+libetc`.
@@ -73,6 +87,9 @@ impl Options {
         }
         if self.moddable {
             s += "-moddable";
+        }
+        if self.debug {
+            s += "-debug";
         }
         s
     }
@@ -180,6 +197,10 @@ pub struct Prepared {
 
 /// A build's inputs and tiers.
 pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
+    ensure!(
+        !opts.debug || (!opts.ubsan && !opts.moddable && opts.mods.is_none()),
+        "a debug build doesn't combine with --ubsan, --moddable or mods yet"
+    );
     // Incremental: cheap when the runtime hasn't changed.
     let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;
@@ -246,6 +267,12 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         ubsan_flags.push(format!("-fsanitize-ignorelist={}", ignorelist.display()));
     }
     let ubsan_flags: Vec<&str> = ubsan_flags.iter().map(String::as_str).collect();
+    // A debug build's objects carry DWARF; their sources' relative paths
+    // are the decomp's.
+    let debug_dir = out_dir(ws, &opts.game).join("debug");
+    let snap = psxw_inputs::snapshot::ensure(ws, &inputs.manifest.game.input, ws.game_pin(&inputs.manifest)?)?;
+    let debug_flags = ["-g".to_string(), format!("-fdebug-compilation-dir={}", snap.display())];
+    let debug_flags: Vec<&str> = debug_flags.iter().map(String::as_str).collect();
     // GCC 2.95's call structure (D50): every non-inline function weak and
     // noinline, as GCC at -O2 left every call to one. Each call the
     // original makes is then a call here (a mod's hook sees it), and
@@ -264,7 +291,13 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
                 .collect();
             let text = std::fs::read_to_string(o.with_extension("i"))?;
             let variant = psxw_cc::ast::hook_variant(&text, &names);
-            let (dir, flags): (PathBuf, &[&str]) = if opts.ubsan { (ubsan_dir.join(c), &ubsan_flags) } else { (calls_dir.join(c), &[]) };
+            let (dir, flags): (PathBuf, &[&str]) = if opts.ubsan {
+                (ubsan_dir.join(c), &ubsan_flags)
+            } else if opts.debug {
+                (debug_dir.join(c), &debug_flags)
+            } else {
+                (calls_dir.join(c), &[])
+            };
             std::fs::create_dir_all(&dir)?;
             let vi = dir.join(format!("{stem}.i"));
             let vo = dir.join(format!("{stem}.o"));
@@ -361,8 +394,13 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     if !failures.is_empty() {
         bail!("{} translations don't compile; run `psxw lift {}`", failures.len(), opts.game);
     }
+    if opts.debug {
+        debug_lift(&clang, &lift_dir, &debug_dir.join("lift"), &lifted)?;
+    }
     for t in &lifted {
-        let path = lift_dir.join(&t.func.container).join(format!("{:08X}.o", t.func.addr));
+        let path = if opts.debug { debug_dir.join("lift") } else { lift_dir.clone() }
+            .join(&t.func.container)
+            .join(format!("{:08X}.o", t.func.addr));
         let obj = WasmObject::read(&path)?;
         let local = obj
             .symbols
@@ -411,7 +449,9 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
             .cloned()
             .collect(),
         main: inputs.map.main.clone(),
-        min_pages: 1024,
+        min_pages: if opts.debug { psxw_abi::window_pages(psxw_abi::DEBUG_WINDOW_BASE) } else { 1024 },
+        window_base: if opts.debug { psxw_abi::DEBUG_WINDOW_BASE } else { psxw_abi::WINDOW_BASE },
+        debug_info: opts.debug,
         mods: None,
         // Every function a mod can hook, by (container, address): not the
         // ones the translator expands into its callers.
@@ -450,6 +490,34 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         overlays,
         spec,
     })
+}
+
+/// The translations again with DWARF, into `dir` (a debug build): each
+/// object is rebuilt when its generated C is newer.
+fn debug_lift(clang: &psxw_cc::Clang, lift_dir: &Path, dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
+    let failed: Vec<String> = lifted
+        .par_iter()
+        .map(|t| -> Result<Option<String>> {
+            let name = format!("{:08X}", t.func.addr);
+            let src = lift_dir.join(&t.func.container).join(format!("{name}.c"));
+            let obj = dir.join(&t.func.container).join(format!("{name}.o"));
+            let fresh = match (std::fs::metadata(&src).and_then(|m| m.modified()), std::fs::metadata(&obj).and_then(|m| m.modified())) {
+                (Ok(s), Ok(o)) => o >= s,
+                _ => false,
+            };
+            if fresh {
+                return Ok(None);
+            }
+            std::fs::create_dir_all(obj.parent().context("object directory")?)?;
+            let (ok, stderr) = clang.compile_generated(&src, &obj, lift_dir, &["-g"])?;
+            Ok((!ok).then(|| format!("{}: {}", src.display(), stderr.lines().next().unwrap_or_default())))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    ensure!(failed.is_empty(), "translations don't compile with -g:\n  {}", failed.join("\n  "));
+    Ok(())
 }
 
 /// The link, the merge with the runtime, and the reports.
@@ -501,19 +569,34 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
     std::fs::write(&guest, &guest_bytes)?;
     let merged = dir.join("merged.wasm");
     let game = dir.join(format!("game{suffix}.wasm"));
-    eprintln!("build: merging with {}", runtime_path.display());
-    run(Command::new(ws.tool("binaryen", "bin/wasm-merge")?)
-        .args(FEATURES)
-        .arg(&guest)
-        .arg(psxw_abi::guest::MODULE)
-        .arg(&runtime_path)
-        .arg(psxw_abi::psx::MODULE)
-        .arg("-g")
-        .arg("-o")
-        .arg(&merged))?;
-    eprintln!("build: optimizing");
-    // `-g` keeps function names, so trap backtraces name guest functions.
-    run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg("-O2").arg("-g").arg(&merged).arg("-o").arg(&game))?;
+    if opts.debug {
+        // Binaryen can't carry DWARF through a merge: our own, then the
+        // guest's DWARF to where the merge put its code.
+        eprintln!("build: merging with {} (debug)", runtime_path.display());
+        let m = psxw_link::merge::merge(&guest_bytes, &std::fs::read(&runtime_path)?)?;
+        let mut dwarf = psxw_link::dwarf::Dwarf::new();
+        dwarf.add_module(&psxw_link::dwarf::sections(&guest_bytes)?, &m.code)?;
+        let mut bytes = m.wasm;
+        for (name, data) in dwarf.finish()? {
+            use wasm_encoder::Section;
+            wasm_encoder::CustomSection { name: name.into(), data: data.into() }.append_to(&mut bytes);
+        }
+        std::fs::write(&game, &bytes)?;
+    } else {
+        eprintln!("build: merging with {}", runtime_path.display());
+        run(Command::new(ws.tool("binaryen", "bin/wasm-merge")?)
+            .args(FEATURES)
+            .arg(&guest)
+            .arg(psxw_abi::guest::MODULE)
+            .arg(&runtime_path)
+            .arg(psxw_abi::psx::MODULE)
+            .arg("-g")
+            .arg("-o")
+            .arg(&merged))?;
+        eprintln!("build: optimizing");
+        // `-g` keeps function names, so trap backtraces name guest functions.
+        run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg("-O2").arg("-g").arg(&merged).arg("-o").arg(&game))?;
+    }
     let mut bytes = std::fs::read(&game)?;
     validate(&bytes).context("game.wasm fails validation")?;
     check_abi(&bytes)?;

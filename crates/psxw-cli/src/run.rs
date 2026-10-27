@@ -42,6 +42,8 @@ pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Ve
             "--dump-dir" => o.dump_dir = Some(val()?.into()),
             "--trace-u32" => o.trace_u32 = psxw_inputs::parse_u32(&val()?),
             "--wasm" => o.wasm = val()?.into(),
+            // `psxw build <game> --debug`'s module.
+            "--debug" => o.wasm = psxw_build::game::out_dir(ws, game).join("game-debug.wasm"),
             // A moddable base's mods (plans/M11 phase 2).
             "--load-mod" => o.mods.push(val()?.into()),
             "--swap-mod" => {

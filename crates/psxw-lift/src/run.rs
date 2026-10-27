@@ -201,7 +201,7 @@ pub fn write_and_compile(ws: &Workspace, dir: &Path, translations: &[&Translatio
                 return Ok(None);
             }
             std::fs::write(&src, &text)?;
-            let (ok, stderr) = clang.compile_generated(&src, &obj, dir)?;
+            let (ok, stderr) = clang.compile_generated(&src, &obj, dir, &[])?;
             Ok((!ok).then(|| CompileFailure {
                 function: format!("{} 0x{:08X} {}", t.func.container, t.func.addr, t.func.name),
                 source: src.display().to_string(),

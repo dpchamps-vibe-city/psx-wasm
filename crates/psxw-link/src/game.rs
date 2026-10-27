@@ -19,7 +19,7 @@ use crate::mods::{Impl, Layer, ModSpec, PatchValue};
 use crate::object::{FuncType, NameClass, SymbolKind, WasmObject, classify_name};
 use crate::rewrite::{self, Lowered, Resolver};
 use anyhow::{Context as _, Result, bail, ensure};
-use psxw_abi::{TABLE_LEN, WINDOW_BASE, WINDOW_MASK, guest, psx, table_index};
+use psxw_abi::{TABLE_LEN, WINDOW_MASK, guest, psx, table_index};
 use psxw_inputs::AddressMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use wasm_encoder::{
@@ -58,6 +58,13 @@ pub struct GameSpec {
     pub main: String,
     /// Initial guest memory pages (the runtime grows it).
     pub min_pages: u64,
+    /// The guest window's wasm address: psxw-abi `WINDOW_BASE`, or
+    /// `DEBUG_WINDOW_BASE` in a debug build (`min_pages` must reach past
+    /// its end).
+    pub window_base: u32,
+    /// Carry the inputs' DWARF into the module, through the guest passes
+    /// ([`crate::dwarf`]).
+    pub debug_info: bool,
     /// Functions whose entry calls `psx.probe(addr)`.
     pub probes: Vec<(String, u32)>,
     /// Mods (plans/M11): their inputs, hook chains and data patches.
@@ -178,6 +185,8 @@ enum Synth {
     SpSet,
     GpGet,
     GpSet,
+    /// `guest.guest_window`: the window's wasm address.
+    Window,
     /// o32 wrapper around the C-typed function index `callee` (signature
     /// `sig`), with the prototype facts of `name` in input `input`.
     O32WrapOf { callee: u32, sig: FuncType, input: usize, name: String },
@@ -596,6 +605,10 @@ impl Resolver for R<'_, '_> {
         self.ctx.intern(&t)
     }
 
+    fn window_base(&self) -> u32 {
+        self.ctx.spec.window_base
+    }
+
     fn dirty_map(&self) -> Option<u32> {
         None
     }
@@ -758,12 +771,13 @@ fn dispatch(f: &mut Function, a: u32, args: [u32; 4], untranslated: u32, o32_ty:
 
 fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
     let sp = ctx.sp;
+    let window = ctx.spec.window_base;
     Ok(match s.clone() {
         Synth::ToO32 { input, name, sig, target } => {
             let proto = ctx.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
             let (words, _) = marshal::words(&kinds, variadic);
-            let f = marshal::c_to_o32(&sig, &words, sp, &|_| {}, &|_, _| {}, &|f| {
+            let f = marshal::c_to_o32(&sig, &words, sp, window, &|_| {}, &|_, _| {}, &|f| {
                 f.instruction(&I::Call(target));
             });
             (sig, f, format!("o32_call:{name}"))
@@ -778,7 +792,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             };
             let proto = ctx.inputs[input].protos.get(&guest_name);
             let callee = ctx.guest[&(input, func)];
-            (o32(), marshal::o32_to_c(&sig, proto, callee, sp), format!("o32:{guest_name}"))
+            (o32(), marshal::o32_to_c(&sig, proto, callee, sp, window), format!("o32:{guest_name}"))
         }
         Synth::AdapterThunk(id) => {
             let mut f = Function::new([]);
@@ -803,7 +817,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let mut f = Function::new([]);
             let word = |f: &mut Function, off: u32| {
                 f.instruction(&I::I32Const(((addr + off) & WINDOW_MASK) as i32));
-                f.instruction(&I::I32Load(MemArg { offset: WINDOW_BASE as u64, align: 2, memory_index: 0 }));
+                f.instruction(&I::I32Load(MemArg { offset: window as u64, align: 2, memory_index: 0 }));
             };
             for (w, e) in entries {
                 word(&mut f, 0);
@@ -835,7 +849,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let (unt, o32_ty) = (ctx.import(psx::UNTRANSLATED), ctx.o32_ty);
             // The o32 arguments are already pushed when `call` runs; spill
             // them to fresh locals so the dispatch can push them again.
-            let f = marshal::c_to_o32(&helper, &words, sp, &|_| {}, &|_, _| {}, &|f| {
+            let f = marshal::c_to_o32(&helper, &words, sp, window, &|_| {}, &|_, _| {}, &|f| {
                 // stack: a0 a1 a2 a3 — leave them for the indirect call.
                 f.instruction(&I::LocalGet(target));
                 f.instruction(&I::I32Const(0x003F_FFFC));
@@ -901,7 +915,13 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
         }
         Synth::InlineCopy => {
             let sig = FuncType { params: vec![V::I32; 3], results: vec![V::I32] };
-            (sig, crate::bodies::inline_copy(None), "builtin_memcpy".into())
+            (sig, crate::bodies::inline_copy(window, None), "builtin_memcpy".into())
+        }
+        Synth::Window => {
+            let mut f = Function::new([]);
+            f.instruction(&I::I32Const(window as i32));
+            f.instruction(&I::End);
+            (FuncType { params: vec![], results: vec![V::I32] }, f, "guest_window".into())
         }
         Synth::SpGet | Synth::GpGet => {
             let g = if *s == Synth::SpGet { ctx.sp } else { ctx.gp };
@@ -920,18 +940,18 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
         }
         Synth::O32WrapOf { callee, sig, input, name } => {
             let proto = ctx.inputs[input].protos.get(&name);
-            (o32(), marshal::o32_to_c(&sig, proto, callee, sp), format!("o32:hook:{name}"))
+            (o32(), marshal::o32_to_c(&sig, proto, callee, sp, window), format!("o32:hook:{name}"))
         }
         Synth::CLayer { befores, core, afters, sig, input, name } => {
             let proto = ctx.inputs[input].protos.get(&name);
-            (sig.clone(), c_layer(ctx.mod_sp, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
+            (sig.clone(), c_layer(ctx.mod_sp, window, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
         }
         Synth::O32Layer { befores, core, afters, returns } => (o32(), o32_layer(&befores, core, &afters, returns), "hook:o32".into()),
         Synth::ModWrap { input, func, hook } => {
             let sig = ctx.func_sig(input, func);
             let name = guest_name(ctx, input, func);
             let proto = ctx.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: hook.map(|id| (ctx.hook_sp, ctx.hook_id, id)) };
+            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: hook.map(|id| (ctx.hook_sp, ctx.hook_id, id)), window };
             let callee = ctx.guest[&(input, func)];
             (o32(), marshal::o32_to_c_with(&sig, proto, callee, marshal::Shape::O32, g), format!("o32:mod:{name}"))
         }
@@ -939,7 +959,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let sig = ctx.func_sig(input, func);
             let name = guest_name(ctx, input, func);
             let proto = ctx.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: None };
+            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: None, window };
             let callee = ctx.guest[&(input, func)];
             let mut params = if result { vec![V::I64] } else { vec![] };
             params.extend([V::I32; 4]);
@@ -950,7 +970,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let proto = ctx.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
             let (words, _) = marshal::words(&kinds, variadic);
-            let f = marshal::c_to_o32_transparent(&sig, &words, sp, (ctx.hook_sp, ctx.hook_id, id), next);
+            let f = marshal::c_to_o32_transparent(&sig, &words, sp, window, (ctx.hook_sp, ctx.hook_id, id), next);
             (sig, f, format!("original:{name}"))
         }
         Synth::SlotC { slot, callee, sig } => {
@@ -1045,8 +1065,9 @@ pub(crate) fn o32_layer(befores: &[u32], core: u32, afters: &[u32], returns: boo
 /// A C-typed hook layer: the befores, then `core` (with copies of structs
 /// passed by value, so the afters see the arguments as passed), then the
 /// afters, each after taking the result first. `mod_sp`: the mod stack's
-/// global; `proto`: the hooked function's prototype facts.
-pub(crate) fn c_layer(mod_sp: u32, proto: Option<&psxw_cc::protos::Proto>, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)], sig: &FuncType) -> Function {
+/// global; `window`: the guest window's wasm address; `proto`: the hooked
+/// function's prototype facts.
+pub(crate) fn c_layer(mod_sp: u32, window: u32, proto: Option<&psxw_cc::protos::Proto>, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)], sig: &FuncType) -> Function {
     let n = sig.params.len() as u32;
     let (kinds, _) = marshal::param_kinds(sig, proto);
     let byval: Vec<(u32, u32)> = if afters.iter().all(|(_, bare)| *bare) {
@@ -1089,7 +1110,7 @@ pub(crate) fn c_layer(mod_sp: u32, proto: Option<&psxw_cc::protos::Proto>, befor
                 f.instruction(&I::LocalGet(l));
                 f.instruction(&I::I32Const(WINDOW_MASK as i32));
                 f.instruction(&I::I32And);
-                f.instruction(&I::I32Const(WINDOW_BASE as i32));
+                f.instruction(&I::I32Const(window as i32));
                 f.instruction(&I::I32Add);
             }
             f.instruction(&I::I32Const(size as i32));
@@ -1140,10 +1161,10 @@ fn patch_bytes(ctx: &Ctx, v: &PatchValue) -> Result<Vec<u8>> {
     })
 }
 
-pub(crate) fn store_byte(f: &mut Function, addr: u32, b: u8) {
+pub(crate) fn store_byte(f: &mut Function, window: u32, addr: u32, b: u8) {
     f.instruction(&I::I32Const((addr & WINDOW_MASK) as i32));
     f.instruction(&I::I32Const(b as i32));
-    f.instruction(&I::I32Store8(MemArg { offset: WINDOW_BASE as u64, align: 0, memory_index: 0 }));
+    f.instruction(&I::I32Store8(MemArg { offset: window as u64, align: 0, memory_index: 0 }));
 }
 
 /// `psxmod_init`: the executable's data patches, in load order.
@@ -1155,7 +1176,7 @@ fn mod_init(ctx: &mut Ctx) -> Result<Function> {
     let mut f = Function::new([]);
     for d in ctx.spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_none()) {
         for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
-            store_byte(&mut f, d.addr + k as u32, b);
+            store_byte(&mut f, ctx.spec.window_base, d.addr + k as u32, b);
         }
     }
     f.instruction(&I::End);
@@ -1238,9 +1259,10 @@ fn mod_loaded(ctx: &mut Ctx) -> Result<Function> {
         f.instruction(&I::GlobalSet(g));
         f.instruction(&I::End);
     }
+    let window = ctx.spec.window_base;
     let load = |f: &mut Function, a: u32| {
         f.instruction(&I::I32Const((a & WINDOW_MASK) as i32));
-        f.instruction(&I::I32Load(MemArg { offset: WINDOW_BASE as u64, align: 2, memory_index: 0 }));
+        f.instruction(&I::I32Load(MemArg { offset: window as u64, align: 2, memory_index: 0 }));
     };
     let mut by: BTreeMap<String, Vec<(&crate::mods::DataPatch, u32)>> = BTreeMap::new();
     for &(d, g) in &patches {
@@ -1260,7 +1282,7 @@ fn mod_loaded(ctx: &mut Ctx) -> Result<Function> {
             f.instruction(&I::GlobalGet(g));
             f.instruction(&I::If(BlockType::Empty));
             for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
-                store_byte(&mut f, d.addr + k as u32, b);
+                store_byte(&mut f, ctx.spec.window_base, d.addr + k as u32, b);
             }
             f.instruction(&I::I32Const(0));
             f.instruction(&I::GlobalSet(g));
@@ -1555,14 +1577,21 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
 
     let mut bodies = Vec::new();
     let mut names: Vec<(u32, String)> = Vec::new();
+    // With debug info: where each input instruction landed, per function.
+    let mut moved: HashMap<(usize, u32), Vec<(u32, u32)>> = HashMap::new();
     for &(i, f) in &ctx.guest_order.clone() {
         let obj = &inputs[i].obj;
         let ty = obj.types[obj.funcs[f as usize].ty as usize].clone();
         let tix = ctx.intern(&ty);
         let index = f + obj.num_imported_funcs();
         let name = obj.func_symbol(index).map_or_else(|| format!("{}#{f}", inputs[i].label), |s| s.name.clone());
-        let b = rewrite::rewrite(obj, f as usize, &mut R { ctx: &mut ctx, input: i, func: f })
+        let mut ops = Vec::new();
+        let track = spec.debug_info && !obj.debug.is_empty();
+        let b = rewrite::rewrite_mapped(obj, f as usize, &mut R { ctx: &mut ctx, input: i, func: f }, track.then_some(&mut ops))
             .with_context(|| format!("{}: {name}", inputs[i].label))?;
+        if track {
+            moved.insert((i, f), ops);
+        }
         names.push((ctx.guest[&(i, f)], format!("{}:{name}", inputs[i].container)));
         bodies.push((tix, b));
     }
@@ -1592,6 +1621,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         ("guest_sp_set", ctx.synth(Synth::SpSet)),
         ("guest_gp_get", ctx.synth(Synth::GpGet)),
         ("guest_gp_set", ctx.synth(Synth::GpSet)),
+        (guest::WINDOW, ctx.synth(Synth::Window)),
     ];
 
     let mut si = 0;
@@ -1728,7 +1758,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             ctx.map.resolve(&ctx.inputs[input].container, n).map(|r| r.addr).context("function without address")
         };
         let bytes = ctx.layout.bytes_of(&ctx.view, map, i, si, &fa)?;
-        data.active(0, &ConstExpr::i32_const((WINDOW_BASE + (addr & WINDOW_MASK)) as i32), bytes);
+        data.active(0, &ConstExpr::i32_const((spec.window_base + (addr & WINDOW_MASK)) as i32), bytes);
         aux.push((inputs[i].label.clone(), inputs[i].obj.symbols[si as usize].name.clone(), addr));
     }
     module.section(&data);
@@ -1742,7 +1772,45 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     module.section(&ns);
     module.section(&CustomSection { name: "psxw.abi".into(), data: psxw_abi::ABI_VERSION.to_le_bytes().to_vec().into() });
     let matched = ctx.layout.defined.values().filter(|p| p.how == crate::layout::How::Matched).count();
-    Ok(Linked { wasm: module.finish(), aux, matched, abi_mismatches: ctx.abi_mismatches.iter().cloned().collect() })
+    let mut wasm = module.finish();
+    if spec.debug_info {
+        debug_info(&ctx, &moved, &mut wasm)?;
+    }
+    Ok(Linked { wasm, aux, matched, abi_mismatches: ctx.abi_mismatches.iter().cloned().collect() })
+}
+
+/// The inputs' DWARF, for where the guest passes put their code
+/// ([`crate::dwarf`]), appended to `wasm`.
+fn debug_info(ctx: &Ctx, moved: &HashMap<(usize, u32), Vec<(u32, u32)>>, wasm: &mut Vec<u8>) -> Result<()> {
+    use wasm_encoder::Section;
+    let starts = crate::dwarf::body_starts(wasm)?;
+    let mut by_input: BTreeMap<usize, Vec<crate::dwarf::FuncMap>> = BTreeMap::new();
+    for (&(i, f), ops) in moved {
+        let obj = &ctx.inputs[i].obj;
+        let out = ctx.guest[&(i, f)] - ctx.nimports;
+        by_input.entry(i).or_default().push(crate::dwarf::FuncMap {
+            from: (obj.funcs[f as usize].body.start - obj.code_start) as u32,
+            to: starts[out as usize],
+            ops: ops.clone(),
+        });
+    }
+    let mut dwarf = crate::dwarf::Dwarf::new();
+    for (i, funcs) in by_input {
+        let code = crate::dwarf::CodeMap::new(funcs);
+        let (view, map, layout) = (&ctx.view, ctx.map, &ctx.layout);
+        let mut data_addr = |sym: u32| layout.data_addr(view, map, i, sym).ok();
+        let (sp, mod_sp, is_mod) = (ctx.sp, ctx.mod_sp, ctx.mod_of[i].is_some());
+        let obj = &ctx.inputs[i].obj;
+        let mut global = |sym: u32| match obj.symbols.get(sym as usize).map(|s| s.name.as_str()) {
+            Some("__stack_pointer") => Some(if is_mod { mod_sp } else { sp }),
+            _ => None,
+        };
+        dwarf.add_object(obj, &code, &mut data_addr, &mut global).with_context(|| format!("{}: debug info", ctx.inputs[i].label))?;
+    }
+    for (name, data) in dwarf.finish()? {
+        CustomSection { name: name.into(), data: data.into() }.append_to(wasm);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

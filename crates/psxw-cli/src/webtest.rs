@@ -24,7 +24,7 @@ use std::process::Command;
 pub const USAGE: &str = "web-test gpu [--browsers chromium,firefox] [--timeout SECONDS] \
                          | web-test storage [--browsers ..] [--timeout S] \
                          | web-test conform <game> [--browsers ..] [--timeout S] \
-                         | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--record] [--browsers ..] [--timeout S] \
+                         | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--record] [--debug] [--browsers ..] [--timeout S] \
                          | web-test pacing <game> [--seconds N] [--browsers ..]";
 const IMAGE: &str = "psxw-browsers:local";
 
@@ -132,6 +132,12 @@ fn encode(vs: &[(String, Vec<u32>, Vec<u8>)]) -> Vec<u8> {
 /// imported into OPFS), and every requested frame's RAM and VRAM hashes
 /// must agree.
 fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
+    // --debug: the debug build (D53), its 2 GiB memory in each browser.
+    if args.contains(&"--debug") {
+        let rest: Vec<&str> = args.iter().copied().filter(|a| *a != "--debug").collect();
+        let (r, _) = psxw_build::game::build(ws, &psxw_build::game::Options { debug: true, ..psxw_build::game::Options::new(game) })?;
+        return game_with(ws, game, &rest, Some(&r), &[]);
+    }
     game_with(ws, game, args, None, &[])
 }
 

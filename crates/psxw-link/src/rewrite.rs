@@ -4,7 +4,7 @@
 //!
 //! 1. **Masking.** Every load, store, `memory.copy` and `memory.fill`
 //!    address becomes `(addr + offset) & WINDOW_MASK`, with the memarg
-//!    offset set to `WINDOW_BASE`.
+//!    offset set to the window's base (`WINDOW_BASE`, or a debug build's).
 //! 2. **Guest SP.** `__stack_pointer` becomes the guest's `$sp` global.
 //! 3. **Calls** are resolved by the linker, which may lower intrinsics to
 //!    plain instructions.
@@ -76,6 +76,10 @@ pub trait Resolver {
     fn func_rel(&mut self, _symbol: u32) -> Result<Option<(u32, u32)>> {
         Ok(None)
     }
+    /// The wasm address of the guest window (psxw-abi `guest::WINDOW`).
+    fn window_base(&self) -> u32 {
+        WINDOW_BASE
+    }
 }
 
 struct TypeMap<'r, R: Resolver> {
@@ -89,8 +93,8 @@ impl<R: Resolver> Reencode for TypeMap<'_, R> {
     }
 }
 
-fn masked(align: u32) -> MemArg {
-    MemArg { offset: WINDOW_BASE as u64, align, memory_index: 0 }
+fn masked(window: u32, align: u32) -> MemArg {
+    MemArg { offset: window as u64, align, memory_index: 0 }
 }
 
 /// `kind` bit of an I/O hook call for stores.
@@ -101,7 +105,21 @@ pub const DIRTY_PAGE_SHIFT: u32 = 12;
 
 /// Rewrite defined function `func` (index into `obj.funcs`).
 pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<Function> {
+    rewrite_mapped(obj, func, r, None)
+}
+
+/// [`rewrite`], also recording where each input instruction landed:
+/// (offset in the input body, offset in the output body), both from the
+/// body's start (its locals), ascending, ending with both bodies' lengths.
+/// Debug information follows the code through it ([`crate::dwarf`]).
+pub fn rewrite_mapped<R: Resolver>(
+    obj: &WasmObject,
+    func: usize,
+    r: &mut R,
+    mut offsets: Option<&mut Vec<(u32, u32)>>,
+) -> Result<Function> {
     let dirty = r.dirty_map();
+    let window = r.window_base();
     let io = r.io_check();
     let f = &obj.funcs[func];
     let ty = &obj.types[f.ty as usize];
@@ -133,6 +151,9 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
     let mut ops = body.get_operators_reader()?;
     while !ops.eof() {
         let pos = ops.original_position() as u32;
+        if let Some(v) = offsets.as_deref_mut() {
+            v.push((pos - f.body.start as u32, out.byte_len() as u32));
+        }
         let op = ops.read()?;
         let end = ops.original_position() as u32;
         let base = obj.code_start as u32;
@@ -180,7 +201,7 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 if let Some(check) = io {
                     io_guard(&mut out, t_addr, check, $size);
                 }
-                out.instruction(&I::$ins(masked($memarg.align as u32)));
+                out.instruction(&I::$ins(masked(window, $memarg.align as u32)));
             }};
         }
         macro_rules! store {
@@ -194,7 +215,7 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                     out.instruction(&I::LocalTee(t_addr));
                 }
                 out.instruction(&I::LocalGet($tmp));
-                out.instruction(&I::$ins(masked($memarg.align as u32)));
+                out.instruction(&I::$ins(masked(window, $memarg.align as u32)));
                 if let Some(check) = io {
                     io_after_store(&mut out, t_addr, check, $size);
                 }
@@ -284,12 +305,12 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 // [dst, src, n]
                 out.instruction(&I::LocalSet(t_i32b));
                 out.instruction(&I::LocalSet(t_i32));
-                mask_plus_base(&mut out);
+                mask_plus_base(&mut out, window);
                 if dirty.is_some() {
                     mark(&mut out, t_addr, t_i32b, r.mark_range());
                 }
                 out.instruction(&I::LocalGet(t_i32));
-                mask_plus_base(&mut out);
+                mask_plus_base(&mut out, window);
                 out.instruction(&I::LocalGet(t_i32b));
                 out.instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 0 });
             }
@@ -297,7 +318,7 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 // [dst, value, n]
                 out.instruction(&I::LocalSet(t_i32b));
                 out.instruction(&I::LocalSet(t_i32));
-                mask_plus_base(&mut out);
+                mask_plus_base(&mut out, window);
                 if dirty.is_some() {
                     mark(&mut out, t_addr, t_i32b, r.mark_range());
                 }
@@ -343,6 +364,9 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
             }
         }
     }
+    if let Some(v) = offsets {
+        v.push(((f.body.end - f.body.start) as u32, out.byte_len() as u32));
+    }
     Ok(out)
 }
 
@@ -384,10 +408,10 @@ fn mark(out: &mut Function, t_addr: u32, n: u32, helper: u32) {
     out.instruction(&I::LocalGet(t_addr));
 }
 
-/// `(addr & WINDOW_MASK) + WINDOW_BASE`, for bulk-memory operands.
-fn mask_plus_base(out: &mut Function) {
+/// `(addr & WINDOW_MASK) + window`, for bulk-memory operands.
+fn mask_plus_base(out: &mut Function, window: u32) {
     out.instruction(&I::I32Const(WINDOW_MASK as i32));
     out.instruction(&I::I32And);
-    out.instruction(&I::I32Const(WINDOW_BASE as i32));
+    out.instruction(&I::I32Const(window as i32));
     out.instruction(&I::I32Add);
 }

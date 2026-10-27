@@ -87,13 +87,14 @@ impl Clang {
     }
 
     /// Compile self-contained generated C (the lift tier) with the same
-    /// optimization and UB-containment flags as guest C. Returns success and
-    /// clang's diagnostics.
-    pub fn compile_generated(&self, src: &Path, obj: &Path, include: &Path) -> Result<(bool, String)> {
+    /// optimization and UB-containment flags as guest C, plus `extra` (a
+    /// debug build's `-g`). Returns success and clang's diagnostics.
+    pub fn compile_generated(&self, src: &Path, obj: &Path, include: &Path, extra: &[&str]) -> Result<(bool, String)> {
         let mut cmd = self.base();
         cmd.args(["-c", "-O2", "-fno-builtin", "-nostdinc", "-fno-caret-diagnostics"])
             .args(["-Wno-unused-label", "-Wno-unused-variable", "-Wno-unused-but-set-variable"])
             .args(crate::UB_CONTAINMENT_FLAGS)
+            .args(extra)
             .arg("-I")
             .arg(include);
         let out = cmd.arg(src).arg("-o").arg(obj).output().context("running clang -c")?;

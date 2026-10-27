@@ -60,6 +60,26 @@ game or corrupt its state; there is no rollback. It calls code already in
 the build; source maps are for debugging and are not needed for this API.
 There are no persistent hooks or game-state wrappers yet.
 
+## Debugging the C in DevTools
+
+A debug bundle carries DWARF for every C function, decompiled or lifted (D53):
+
+```sh
+psxw build-web <game> --debug
+psxw serve out/web/<game>-debug
+```
+
+Chrome reads DWARF through the **C/C++ DevTools Support (DWARF)** extension. Without it, DevTools shows only the wasm. Open the page and start the game. DevTools → Sources then lists the C files:
+- the decomp's `src/` and `include/`, at their paths on the build machine;
+- `out/lift/…/<address>.c` for translated functions. These are generated C, one MIPS instruction a line, with the original instruction in a comment.
+
+Set a breakpoint on a C line. When it hits, the Scope pane shows the C locals and parameters with their types, and pointers expand into the game's structs. The Console evaluates C expressions.
+
+- **Stepping is uneven.** The C is compiled at `-O2`: stepping jumps between lines, a breakpoint may land on the nearest line with code, and some variables show as optimized out.
+- **The extension may need file access.** If DevTools can't load a source, turn on "Allow access to file URLs" on the extension's page in `chrome://extensions`.
+- **Not every pointer reads right.** The guest's window is at `0x8000_0000`, so the game's KSEG0 pointers (`0x80xx_xxxx`) are wasm addresses the debugger reads directly. Scratchpad (`0x1F80_xxxx`) and mirror pointers (`0x00xx_xxxx`, `0xA0xx_xxxx`) show zeros. The module declares about 2 GiB of memory to put the window there; the browser doesn't commit the unused part.
+- **No mods yet.** Debug bundles don't take mods.
+
 ## Dev mode
 
 `?dev` runs the unmerged `guest.wasm` and `runtime.wasm` instead of `game.wasm`. The Worker instantiates the guest first (it defines the memory), with its `psx.*` imports forwarding to the runtime's exports, then the runtime with the guest's exports as `guest.*`. Every guest call into the runtime crosses JS, so it is slower than the merged module.

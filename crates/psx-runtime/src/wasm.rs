@@ -9,6 +9,7 @@ use psx_devices::mem::Mem;
 use psxw_abi::{BootOptions, WINDOW_BASE, WINDOW_MASK};
 use sdk_psyq::Psyq;
 use std::cell::{Cell, OnceCell, RefCell};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
@@ -58,6 +59,7 @@ unsafe extern "C" {
     fn guest_gp_set(v: u32);
     fn psxmod_init();
     fn psxmod_loaded(addr: u32, len: u32);
+    fn guest_window() -> u32;
 }
 
 fn fatal(code: u32, msg: &str) -> ! {
@@ -158,11 +160,13 @@ impl Regs for FfiRegs {
     }
 }
 
-/// The guest window, at its fixed place in linear memory.
+/// The guest window, where the guest put it (psxw-abi `guest::WINDOW`).
 struct Window;
 
+static WINDOW: AtomicU32 = AtomicU32::new(WINDOW_BASE);
+
 fn window(addr: u32) -> *mut u8 {
-    ((WINDOW_BASE + (addr & WINDOW_MASK)) as usize) as *mut u8
+    ((WINDOW.load(Relaxed) + (addr & WINDOW_MASK)) as usize) as *mut u8
 }
 
 impl Mem for Window {
@@ -263,6 +267,7 @@ pub extern "C" fn psxw_ram_hash() -> u64 {
 }
 
 fn init(options: u32) {
+    WINDOW.store(unsafe { guest_window() }, Relaxed);
     std::panic::set_hook(Box::new(|info| {
         let msg = info.to_string();
         fatal(2, &msg);

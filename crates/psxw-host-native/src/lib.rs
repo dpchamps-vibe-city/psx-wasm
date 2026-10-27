@@ -212,6 +212,8 @@ struct State {
     watched: Vec<Vec<u32>>,
     /// Mods loaded at run time.
     loader: Option<mods::Loader>,
+    /// The guest window's wasm address (psxw-abi `guest::WINDOW`).
+    window: u32,
 }
 
 impl State {
@@ -227,6 +229,7 @@ impl State {
             spu_asked: None,
             watched: vec![],
             loader: None,
+            window: WINDOW_BASE,
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -264,8 +267,17 @@ fn read_bytes(caller: &mut Caller<'_, State>, ptr: u32, len: u32) -> Vec<u8> {
     m.data(&caller)[ptr as usize..(ptr + len) as usize].to_vec()
 }
 
-fn guest_ram(data: &[u8]) -> &[u8] {
-    &data[WINDOW_BASE as usize..WINDOW_BASE as usize + 0x20_0000]
+/// The guest's 2 MiB of RAM in linear memory, its window at `window`.
+fn guest_ram(data: &[u8], window: u32) -> &[u8] {
+    &data[window as usize..window as usize + 0x20_0000]
+}
+
+/// The window a module put its guest at (psxw-abi `guest::WINDOW`).
+fn window_of(store: &mut Store<State>, instance: &wasmtime::Instance) -> Result<u32> {
+    match instance.get_typed_func::<(), u32>(&mut *store, psxw_abi::guest::WINDOW) {
+        Ok(f) => Ok(f.call(&mut *store, ())?),
+        Err(_) => Ok(WINDOW_BASE),
+    }
 }
 
 pub fn fnv(bytes: &[u8]) -> u64 {
@@ -392,9 +404,10 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             let s = c.data();
             (s.opts.hash_at.contains(&frame), s.opts.dump_at.contains(&frame), s.opts.trace_u32)
         };
+        let window = c.data().window;
         if want_hash || want_dump || trace.is_some() {
             let data = m.data(&c);
-            let ram = guest_ram(data);
+            let ram = guest_ram(data, window);
             let hash = want_hash.then(|| format!("{:016x}", fnv(ram)));
             let word = trace.map(|a| {
                 let o = (a & 0x1F_FFFC) as usize;
@@ -432,7 +445,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             }
         }
         if !c.data().opts.watch.is_empty() {
-            let ram = guest_ram(m.data(&c));
+            let ram = guest_ram(m.data(&c), window);
             let row: Vec<u32> = c
                 .data()
                 .opts
@@ -447,8 +460,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         }
         // Overlay residency: whenever an overlay's first words are in RAM,
         // its whole text must be.
-        let data = m.data(&c).to_vec();
-        let ram = guest_ram(&data);
+        let ram = guest_ram(m.data(&c), window).to_vec();
         let mut events = Vec::new();
         let n = c.data().opts.overlays.len();
         for i in 0..n {
@@ -558,8 +570,9 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             Some(Some(h)) => {
                 let frame = c.data().frame;
                 let m = mem(&mut c);
+                let window = c.data().window as usize;
                 let at = h.entry(frame, |addr| {
-                    let o = (addr & 0x1F_FFFC) as usize + psxw_abi::WINDOW_BASE as usize;
+                    let o = (addr & 0x1F_FFFC) as usize + window;
                     m.data(&c).get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 });
                 c.data().opts.replay.as_deref().map_or(replay::NOTHING_PRESSED, |r| replay::frame(r, at)[port as usize & 1])
@@ -718,7 +731,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             let (t_addr, t_size) = (v["t_addr"].as_u64().unwrap_or(0) as u32, v["t_size"].as_u64().unwrap_or(0) as usize);
             let want = c.data_mut().disc.as_mut().and_then(|d| disc_exe_text(d, &exe));
             let m = mem(&mut c);
-            let at = (t_addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
+            let at = (t_addr & 0x00FF_FFFF) as usize + c.data().window as usize;
             let ok = want.is_some_and(|w| m.data(&c)[at..at + t_size] == w[..]);
             let s = c.data_mut();
             s.boot_ok = Some(ok);
@@ -741,6 +754,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
     if version != psxw_abi::ABI_VERSION {
         bail!("game.wasm ABI {version}, host ABI {}", psxw_abi::ABI_VERSION);
     }
+    store.data_mut().window = window_of(&mut store, &instance)?;
     Ok((store, instance))
 }
 
@@ -776,8 +790,9 @@ impl Conform {
         }
         let (mut store, instance) = instantiate(&opts, None)?;
         let memory = instance.get_memory(&mut store, "memory").context("no memory")?;
+        let window = store.data().window as usize;
         for (addr, bytes) in ram {
-            let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
+            let at = (addr & 0x00FF_FFFF) as usize + window;
             memory.data_mut(&mut store)[at..at + bytes.len()].copy_from_slice(bytes);
         }
         let ptr = boot_options(&mut store, &instance, &opts)?;
@@ -827,12 +842,12 @@ impl Conform {
     }
 
     pub fn read(&self, addr: u32, len: usize) -> Vec<u8> {
-        let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
+        let at = (addr & 0x00FF_FFFF) as usize + self.store.data().window as usize;
         self.memory.data(&self.store)[at..at + len].to_vec()
     }
 
     pub fn write(&mut self, addr: u32, bytes: &[u8]) {
-        let at = (addr & 0x00FF_FFFF) as usize + WINDOW_BASE as usize;
+        let at = (addr & 0x00FF_FFFF) as usize + self.store.data().window as usize;
         self.memory.data_mut(&mut self.store)[at..at + bytes.len()].copy_from_slice(bytes);
     }
 

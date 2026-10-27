@@ -539,6 +539,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 sig,
                 &words,
                 sp,
+                WINDOW_BASE,
                 &|f| {
                     f.instruction(&I::I32Const(callout::CALL as i32));
                     f.instruction(&I::I32Const(addr as i32));
@@ -581,6 +582,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 &helper,
                 &words,
                 sp,
+                WINDOW_BASE,
                 &|f| {
                     f.instruction(&I::I32Const(callout::INDIRECT as i32));
                     f.instruction(&I::LocalGet(target));
@@ -690,7 +692,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             let Mode::Harness { dirty, .. } = ctx.mode;
             let mark = dirty.map(|_| ctx.synth(Synth::MarkRange));
             let sig = FuncType { params: vec![wasmparser::ValType::I32; 3], results: vec![wasmparser::ValType::I32] };
-            (sig, crate::bodies::inline_copy(mark), "builtin_memcpy".into())
+            (sig, crate::bodies::inline_copy(WINDOW_BASE, mark), "builtin_memcpy".into())
         }
         Synth::Division(op, conv) => {
             let brk = ctx.synth(Synth::Service {
@@ -705,7 +707,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             let sig = obj.types[obj.funcs[*func as usize].ty as usize].clone();
             let proto = ctx.inputs[*input].protos.get(name);
             let callee = ctx.guest[&(*input, *func)];
-            let body = marshal::o32_to_c(&sig, proto, callee, sp);
+            let body = marshal::o32_to_c(&sig, proto, callee, sp, WINDOW_BASE);
             (o32_sig(), body, format!("o32:{name}"))
         }
     })

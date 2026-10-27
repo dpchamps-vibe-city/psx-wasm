@@ -121,6 +121,17 @@ pub struct WasmObject {
     pub segments: Vec<Segment>,
     pub data_relocs: Vec<Reloc>,
     pub code_relocs: Vec<CodeReloc>,
+    /// DWARF sections (`.debug_*`) as ranges of `bytes`, with their
+    /// relocations (offsets within the section).
+    pub debug: Vec<DebugSection>,
+}
+
+/// A custom section holding DWARF.
+#[derive(Debug, Clone)]
+pub struct DebugSection {
+    pub name: String,
+    pub range: std::ops::Range<usize>,
+    pub relocs: Vec<CodeReloc>,
 }
 
 impl WasmObject {
@@ -134,6 +145,7 @@ impl WasmObject {
         let mut segment_info: Vec<(String, u32)> = Vec::new();
         let mut saw_linking = false;
         let mut func_types: Vec<u32> = Vec::new();
+        let mut debug_relocs: Vec<(String, Vec<CodeReloc>)> = Vec::new();
 
         for payload in Parser::new(0).parse_all(&bytes) {
             match payload? {
@@ -217,6 +229,23 @@ impl WasmObject {
                             });
                         }
                     }
+                    KnownCustom::Reloc(relocs) if reader.name().starts_with("reloc..debug_") => {
+                        let target = &reader.name()["reloc.".len()..];
+                        let mut v = Vec::new();
+                        for entry in relocs.entries() {
+                            let entry = entry?;
+                            v.push(CodeReloc { ty: entry.ty, offset: entry.offset, symbol: entry.index, addend: entry.addend });
+                        }
+                        debug_relocs.push((target.to_string(), v));
+                    }
+                    KnownCustom::Unknown if reader.name().starts_with(".debug_") => {
+                        let start = reader.data_offset() as usize;
+                        obj.debug.push(DebugSection {
+                            name: reader.name().to_string(),
+                            range: start..start + reader.data().len(),
+                            relocs: Vec::new(),
+                        });
+                    }
                     KnownCustom::Reloc(relocs) if reader.name() == "reloc.CODE" => {
                         for entry in relocs.entries() {
                             let entry = entry?;
@@ -241,6 +270,11 @@ impl WasmObject {
             seg.align_log2 = align;
         }
         obj.code_relocs.sort_by_key(|r| r.offset);
+        for (target, relocs) in debug_relocs {
+            if let Some(d) = obj.debug.iter_mut().find(|d| d.name == target) {
+                d.relocs = relocs;
+            }
+        }
         obj.bytes = bytes;
         Ok(obj)
     }

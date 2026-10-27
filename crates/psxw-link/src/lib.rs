@@ -16,10 +16,12 @@
 //! [`AddressMap`]: psxw_inputs::AddressMap
 
 pub mod bodies;
+pub mod dwarf;
 pub mod game;
 pub mod layout;
 pub mod link;
 pub mod marshal;
+pub mod merge;
 pub mod mods;
 pub mod module;
 pub mod object;

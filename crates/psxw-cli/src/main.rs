@@ -12,13 +12,14 @@
 //! psxw link-test <game> --function F    M1: link one pair, validate, run once
 //! psxw ci <game>                        every gate of every milestone in place
 //! psxw runtime build                    runtime.wasm (game-agnostic)
-//! psxw build <game> [--debug-io] [--ubsan] [--original libpad,…]
-//!                                       M2: out/<game>/game.wasm
+//! psxw build <game> [--debug-io] [--ubsan] [--original libpad,…] [--debug]
+//!                                       M2: out/<game>/game.wasm (--debug: game-debug.wasm, DWARF)
 //! psxw report tiers <game>              each function's tier, by library
-//! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose]
+//! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose] [--debug]
 //!                                       M2: run game.wasm headless
 //! psxw identity <game>                 M8: SDK object identity report
-//! psxw build-web <game> [--mods D,…]; psxw serve [dir] [--port N]   M5: the browser bundle
+//! psxw build-web <game> [--mods D,…] [--moddable] [--debug]; psxw serve [dir] [--port N]
+//!                                       M5: the browser bundle (--debug: C source in DevTools)
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
 //! psxw mod …                            M11: the modkit (mods.rs)
 //! psxw record <game> --mod D…           M11: serve the bundle with mods to record replays
@@ -229,8 +230,16 @@ fn run() -> Result<()> {
         ["build-web", game, rest @ ..] => {
             let (dirs, rest) = mod_args(rest)?;
             let moddable = rest.iter().any(|a| a == "--moddable");
-            if let Some(o) = rest.iter().find(|a| *a != "--moddable") {
+            let debug = rest.iter().any(|a| a == "--debug");
+            if let Some(o) = rest.iter().find(|a| *a != "--moddable" && *a != "--debug") {
                 bail!("unknown build-web option {o}");
+            }
+            if debug {
+                ensure!(dirs.is_empty() && !moddable, "a debug bundle links no mods yet");
+                let (r, _) = psxw_build::game::build(&ws, &psxw_build::game::Options { debug: true, ..psxw_build::game::Options::new(game) })?;
+                let dir = psxw_build::web::bundle(&ws, game, &r, ws.out_dir().join("web").join(format!("{game}-debug")))?;
+                eprintln!("debug web bundle: {} (serve it with `psxw serve {}`; the C is in DevTools' Sources)", dir.display(), dir.display());
+                return Ok(());
             }
             if moddable {
                 ensure!(dirs.is_empty(), "a moddable bundle links no mods; load them in the page");
@@ -342,6 +351,7 @@ fn run() -> Result<()> {
                     "--debug-io" => opts.debug_io = true,
                     "--ubsan" => opts.ubsan = true,
                     "--moddable" => opts.moddable = true,
+                    "--debug" => opts.debug = true,
                     "--original" => match it.next() {
                         Some(l) => opts.original.extend(l.split(',').map(str::to_string)),
                         None => bail!("--original needs a library list"),

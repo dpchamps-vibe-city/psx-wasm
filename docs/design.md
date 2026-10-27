@@ -438,8 +438,9 @@ care which of the two is in use.
 - **The runtime is prebuilt once per runtime version** (D38). It is
   game-agnostic Rust, built by cargo as a wasm32 `cdylib` that imports the
   guest's memory and keeps its data, stack and heap above the guest window
-  (`RUNTIME_BASE`). It reads and writes guest memory through the window and
-  never hands host pointers to the guest.
+  (`RUNTIME_BASE`; a debug build's window sits above them, §9). It reads
+  and writes guest memory through the window, wherever the guest says it
+  is (`guest.guest_window`), and never hands host pointers to the guest.
 - **binaryen `wasm-merge` joins it with the linked guest** into one
   `game.wasm`: the guest's `psx.*` imports bind to runtime exports, the
   runtime's `guest.*` imports to guest exports, and `wasm-opt` then inlines
@@ -484,6 +485,28 @@ Two alternatives are held in reserve:
   linker costs more than expected.
 - An LLVM-IR rewriting pass, if masking overhead ever matters. LLVM could
   then hoist and CSE the masks.
+
+### 9. Debug builds: the C in DevTools, variables included (D53)
+
+`psxw build-web <game> --debug` builds a bundle whose `game.wasm` carries
+DWARF for every C function, decompiled or lifted. Chrome DevTools (with
+the C/C++ DevTools Support extension) or lldb then shows the C, sets
+breakpoints on its lines, and reads its variables. Three things make the
+debugger's view true:
+- **The DWARF follows the guest passes.** clang compiles with `-g`, and
+  psxw-link records where each input instruction lands while it rewrites.
+  It rewrites every code address, range and line row through that record
+  (`psxw_link::dwarf`). Data addresses are where the link put them, and
+  the stack pointer is the guest's `$sp`.
+- **The window is at `0x8000_0000`.** Every KSEG0 address is then its own
+  wasm address. A debugger dereferences the game's pointers, reads its
+  globals and finds its stack frames without knowing about the mask.
+  Hosts don't commit the 2 GiB below the window, which nothing touches.
+  Scratchpad, KUSEG and KSEG1 pointers still read wrong in the debugger.
+- **psxw-link merges the guest with the runtime**, since binaryen can't
+  carry DWARF through `wasm-merge` (`psxw_link::merge`). The merged code
+  isn't optimized further: clang optimized the C, so stepping follows
+  `-O2` code.
 
 ## Pipeline
 

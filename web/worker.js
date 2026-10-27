@@ -44,8 +44,10 @@ import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, savesDir } from "./cards.js";
 import { ModLoader, takeMod } from "./mods.js";
 
-const ABI_VERSION = 8;
+const ABI_VERSION = 9;
 const NOTHING_PRESSED = 0xffff;
+// Where the guest's window is, unless the module says (psxw-abi
+// guest::WINDOW; a debug build's is at 2 GiB).
 const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";
 
@@ -222,8 +224,10 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   let lastVblank = 0;
 
   let exports = null;
+  let windowBase = WINDOW_BASE;
   const mem = () => exports.memory.buffer;
-  const bytes = (p, n) => new Uint8Array(mem(), p, n);
+  // Pointers arrive as i32; a debug build's runtime heap lies above 2 GiB.
+  const bytes = (p, n) => new Uint8Array(mem(), p >>> 0, n);
   const text = (p, n) => new TextDecoder().decode(bytes(p, n).slice());
   let frame = 0;
   let t0 = 0;
@@ -308,11 +312,11 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       throw new Error(`runtime trap ${code}: ${text(p, n)}`);
     },
     disc_info(out) {
-      disc.info(new DataView(mem()), out);
+      disc.info(new DataView(mem()), out >>> 0);
       return 1;
     },
     disc_read(lba, count, mode, dst) {
-      let at = dst;
+      let at = dst >>> 0;
       for (let i = 0; i < count; i++) {
         if (!disc.readRaw(lba + i, raw)) return -1;
         const src = mode === 0 ? raw : userData(raw);
@@ -323,19 +327,19 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
     },
     pad_state(port, out) {
       let buttons;
-      if (replay) buttons = replayButtons(replay, frame, port & 1, (a) => new DataView(mem()).getUint32(WINDOW_BASE + (a & 0x1ffffc), true));
+      if (replay) buttons = replayButtons(replay, frame, port & 1, (a) => new DataView(mem()).getUint32(windowBase + (a & 0x1ffffc), true));
       else buttons = Atomics.load(pad, 1 + (port & 1));
       if (recording) {
         // Before the game zeroes its counter the word is garbage; a
         // replay reads such values as nothing pressed too.
-        const c = new DataView(mem()).getUint32(WINDOW_BASE + (recording.clock & 0x1ffffc), true);
+        const c = new DataView(mem()).getUint32(windowBase + (recording.clock & 0x1ffffc), true);
         if (c <= frame) {
           const e = (recording.entries[c] ||= [NOTHING_PRESSED, NOTHING_PRESSED]);
           e[port & 1] = buttons < 0 ? NOTHING_PRESSED : buttons & 0xffff;
         }
       }
       if (buttons < 0) return 0;
-      new DataView(mem()).setUint16(out, buttons & 0xffff, true);
+      new DataView(mem()).setUint16(out >>> 0, buttons & 0xffff, true);
       return 2;
     },
     storage_read(np, nl, dst, cap) {
@@ -361,7 +365,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       else postMessage({ type: "report", json });
     },
     render_submit(p, len) {
-      if (!lost) renderer.submit(new Uint32Array(mem().slice(p, p + len)));
+      if (!lost) renderer.submit(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + len)));
     },
     render_readback(x, y, w, h, dst) {
       if (lost) return; // the game reads whatever its buffer held
@@ -370,7 +374,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
     },
     present(p) {
       if (lost) return;
-      renderer.present(new Uint32Array(mem().slice(p, p + 20)));
+      renderer.present(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20)));
       // A page that falls behind misses frames rather than queueing them.
       if (framesPosted - Atomics.load(pad, 4) < 2) {
         const bitmap = canvas.transferToImageBitmap();
@@ -417,6 +421,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   }
   const abi = exports.psxw_abi_version();
   if (abi !== ABI_VERSION) throw new Error(`game.wasm ABI ${abi}, host ABI ${ABI_VERSION}`);
+  if (exports.guest_window) windowBase = exports.guest_window() >>> 0;
   if (suspend) {
     enqueueExecution = ({ id, address, args }) => {
       const a = (i) => args[i] ?? 0;
@@ -444,7 +449,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
 
   // psxw-abi BootOptions: cd_timing, video, safepoint_budget,
   // safepoint_quantum, debug, trace (u32 each).
-  const opts = exports.psxw_alloc(24);
+  const opts = exports.psxw_alloc(24) >>> 0;
   const words = [options.instantCd ? 1 : 0, options.pal ? 1 : 0, 0, 0, 0, 0];
   words.forEach((w, i) => new DataView(mem()).setUint32(opts + 4 * i, w, true));
 

@@ -37,7 +37,10 @@ pub mod replay;
 ///   `psx.mod_log`.
 /// - 8: one-shot scripting: `psxw_execute` queues a guest call; its result
 ///   is an `execute` event through `host.report`.
-pub const ABI_VERSION: u32 = 8;
+/// - 9: the guest's window is where the guest says (`guest.guest_window`):
+///   [`WINDOW_BASE`], or [`DEBUG_WINDOW_BASE`] in a debug build. The
+///   runtime and hosts read it; host pointers may lie above 2 GiB.
+pub const ABI_VERSION: u32 = 9;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -46,12 +49,24 @@ pub const AUDIO_HZ: u32 = 44_100;
 /// load/store's `memarg` offset, so translation costs one `i32.and`.
 pub const WINDOW_BASE: u32 = 0x0100_0000;
 
+/// A debug build's window (D53): every KSEG0 address (`0x80xx_xxxx`) is its
+/// own wasm address, so a debugger reading DWARF finds globals, the stack
+/// and what pointers point at where the game put them. The memory spans
+/// 2 GiB below it, which nothing touches.
+pub const DEBUG_WINDOW_BASE: u32 = 0x8000_0000;
+
+/// Initial memory pages for a window at `base`: the window's 16 MiB end it.
+pub const fn window_pages(base: u32) -> u64 {
+    (base as u64 + WINDOW_MASK as u64 + 1).div_ceil(65536)
+}
+
 /// Applied to every guest effective address. Folds KUSEG/KSEG0/KSEG1 onto one
 /// physical view and keeps the scratchpad (`0x1F80_0000`) inside the window.
 pub const WINDOW_MASK: u32 = 0x00FF_FFFF;
 
 /// The runtime is linked with `--global-base` here; everything Rust owns
-/// lives above the guest window.
+/// lives above the default guest window (below a debug build's, its heap
+/// above it).
 pub const RUNTIME_BASE: u32 = 0x0200_0000;
 
 /// Guest physical layout inside the window.
@@ -85,7 +100,7 @@ pub const fn table_index(fp: u32) -> u32 {
 }
 pub const TABLE_LEN: u32 = 0x0010_0000;
 
-/// Translate a guest pointer to its wasm address.
+/// Translate a guest pointer to its wasm address (the default window).
 #[inline]
 pub const fn guest_to_wasm(addr: u32) -> u32 {
     (addr & WINDOW_MASK) + WINDOW_BASE
@@ -176,6 +191,10 @@ pub mod guest {
     /// now resident and whose patched bytes that range covered are applied
     /// (M11). Empty without mods.
     pub const MOD_LOADED: &str = "psxmod_loaded";
+    /// `() -> i32`: the window's wasm address ([`super::WINDOW_BASE`] or
+    /// [`super::DEBUG_WINDOW_BASE`]). Hosts read it from the module's
+    /// exports; a module without it has the default.
+    pub const WINDOW: &str = "guest_window";
 }
 
 /// What `game.wasm` imports from its host: module `host`. All pointers are
