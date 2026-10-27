@@ -617,22 +617,61 @@ a call into guest code.
   `PadGetState` expect, and 128 KB memory card images.
 - **SDK adapters.** The thin, object-keyed layer from §5.
 
-### One-shot host scripting
+### Host scripting
 
-`psxw_execute(id, addr, a0..a3)` queues one call into the existing guest
-code (D52). The request slot is separate from the machine: the browser
-can fill it while JSPI has suspended `wait_vblank`, even though that stack
-still holds a mutable machine borrow. Once the driver has released the
+`psxw_execute(id, addr, a0..a3)` queues one call into the guest (D52). The
+request slot is separate from the machine: the browser can fill it while
+JSPI has suspended `wait_vblank`, or from `host.vblank`, even though those
+stacks hold a mutable machine borrow. Once the driver has released the
 borrow and drained interrupts and callbacks, it executes the request on
 the normal guest stack, preserving `$sp`/`$gp`. Completion is an `execute`
-event through `host.report`, with the request id and the raw o32 result
-as a decimal string. Calls cannot nest; a trapping call stops the run.
+event through `host.report`, with the request id and the raw o32 result as
+a decimal string. Calls cannot nest; a trapping call stops the run.
 
-The page exposes only `window.wasmPsxScripting.execute(address, ...args)`,
-a Promise-based bridge to that slot. It requires JSPI and the merged
-module. This is a developer tool to call existing code, not a script
-loader, persistent hook system or typed game-state API. The build's symbol
-addresses are the references; source maps are not part of the contract.
+The page's `window.wasmPsxScripting.execute(address, ...args)` is a
+Promise-based bridge to that slot; `cmd(name, ...args)` and `load(url)`
+reach script mods. Commands and `psx.run` callbacks of script mods run
+through the same slot, at synthetic addresses. The build's symbol
+addresses, and the snapshots below, are the references; source maps are
+not part of the contract.
+
+### Script mods (D54, D55)
+
+A script mod is one ES module whose default export, `mod(factory)`, given
+the mod's `game` and the mod API, returns its hooks (`before`, `after`,
+`replace`, `around`), data patches and commands. It loads into a moddable
+base (D51) beside compiled mods, with no build step (`web/script.js`).
+
+- **A shim makes it a layer.** The loader writes a small wasm module for
+  each script mod (`web/shims.js`): `hook.<k>` for each slot it hooks, in
+  the slot's own type, which joins the slot's chain in load order like a
+  compiled layer; `next.<k>` for `around`'s `original`; o32 entries for its
+  commands and `fnptr` values at synthetic addresses. i64 values cross as
+  two i32 words, so no BigInt crosses per call.
+- **The runtime holds the host's vblank wait while JS is on the stack**
+  (ABI 10). JSPI can't suspend through a JS frame, and a vblank can be
+  delivered at any safepoint in any game code a hook calls. So the host's
+  vblank is two imports:
+  - `host.vblank(n)` never suspends, and carries everything the guest can
+    see (the frame counter replay input is keyed on, swaps, queued calls);
+  - `host.wait_vblank(n)` only paces and yields.
+
+  Shims bracket each call into JS with `psxw_js_enter`/`psxw_js_leave`.
+  While any is open the runtime holds `wait_vblank` calls, and makes them
+  in order once the outermost returns (`psx-runtime` `hold`). The guest
+  can't see the hold; only the page's pacing slips. The run report counts
+  held waits.
+- **Game calls happen inside the game:** in hooks, commands, `init` and
+  `psx.run`, never from the host's vblank. Memory reads and writes work
+  anywhere.
+- **Names and types come from snapshots** keyed by the game binary (D55):
+  neutral JSON, one source's view of the binary, produced by frontends
+  (symbol lists, C headers with the layout probe, DWARF). `game` and the
+  editor's `game.d.ts` are generated from snapshots, never from a source
+  directly.
+- **Tests run in the browsers.** The native host runs no JS; a script
+  mod's tests run in headless Chromium and Firefox and report in the
+  native host's shapes, so M11's expectations read them alike.
 
 ## Browser host
 

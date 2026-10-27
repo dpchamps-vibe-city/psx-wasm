@@ -294,14 +294,8 @@ fn read(text: &str, header_path: &str, rel: &str, context: &[String]) -> (Vec<(S
     (funcs, data)
 }
 
-/// Build the index over a game's headers in snapshot `snap`.
-pub fn index(
-    clang: &psxw_cc::Clang,
-    snap: &Path,
-    manifest: &psxw_inputs::GameManifest,
-    map: &psxw_inputs::AddressMap,
-    work: &Path,
-) -> Result<HeaderIndex> {
+/// The headers the census probes: (include dir, path under it), sorted.
+pub fn list(snap: &Path, manifest: &psxw_inputs::GameManifest) -> Result<Vec<(String, String)>> {
     let mut headers: Vec<(String, String)> = Vec::new();
     for dir in &manifest.probe.include_dirs {
         let root = snap.join(dir);
@@ -322,6 +316,18 @@ pub fn index(
         }
     }
     headers.sort();
+    Ok(headers)
+}
+
+/// Build the index over a game's headers in snapshot `snap`.
+pub fn index(
+    clang: &psxw_cc::Clang,
+    snap: &Path,
+    manifest: &psxw_inputs::GameManifest,
+    map: &psxw_inputs::AddressMap,
+    work: &Path,
+) -> Result<HeaderIndex> {
+    let headers = list(snap, manifest)?;
     let contexts = psxw_census::include_contexts(snap, map);
     std::fs::create_dir_all(work)?;
     type Read = (Vec<(String, Decl)>, Vec<(String, DataDecl)>, usize);

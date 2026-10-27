@@ -35,6 +35,10 @@ pub trait Builds {
     fn game(&self) -> &str;
     /// The game with these compiled mods linked in.
     fn linked(&self, mods: &[Mod]) -> Result<Report>;
+    /// The snapshot script mods' `game` comes from (the bundle's when none).
+    fn snapshot(&self) -> Option<PathBuf> {
+        None
+    }
     /// Each mod as a module (M11 phase 2), in order.
     fn modules(&self, mods: &[Mod]) -> Result<Vec<PathBuf>>;
 }
@@ -43,6 +47,9 @@ pub trait Builds {
 /// once per run.
 #[derive(Default)]
 pub struct Cache {
+    /// Tests compare nothing with `same_as` (a base other mods' modules
+    /// weren't built for).
+    pub skip_same_as: bool,
     base: RefCell<Option<Report>>,
     plain: RefCell<Option<Report>>,
     linked: RefCell<BTreeMap<String, Report>>,
@@ -50,6 +57,11 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// A cache whose moddable base is `base`.
+    pub fn with_base(base: Report, skip_same_as: bool) -> Self {
+        Cache { skip_same_as, base: RefCell::new(Some(base)), ..Default::default() }
+    }
+
     pub fn base(&self, ws: &Workspace, game: &str) -> Result<Report> {
         if let Some(r) = self.base.borrow().clone() {
             return Ok(r);
@@ -145,7 +157,6 @@ struct Run {
     hashes: String,
     /// Every hash asked for is there.
     complete: bool,
-    report: Option<serde_json::Value>,
 }
 
 impl Run {
@@ -160,7 +171,6 @@ impl Run {
             logs: r.logs.clone(),
             hashes: format!("ram {:?} vram {:?} audio {} {}", r.ram_hashes, r.vram_hashes, r.audio.frames, r.audio.hash),
             complete: r.ram_hashes.len() == n,
-            report: r.report.clone(),
         }
     }
 
@@ -175,7 +185,6 @@ impl Run {
             logs: r.logs.clone(),
             hashes: r.hashes(),
             complete: r.ram_hashes.len() == n && r.vram_hashes.len() == n,
-            report: r.report().cloned(),
         }
     }
 
@@ -202,7 +211,21 @@ fn one_test(b: &dyn Builds, cache: &Cache, table: &SymbolTable, sel: &[AnyMod], 
         if let Some(i) = watch.iter().position(|(k, t, _)| *k == key && *t == ty) {
             return Ok(i);
         }
-        let (_, addr, size, _) = table.resolve_data(&Target { symbol: Some(sym.to_string()), ..Default::default() })?;
+        // `SYMBOL+0xOFFSET`, as a trace's key spells it.
+        let (sym, offset) = match sym.split_once('+') {
+            Some((b, o)) => (b, offset + psxw_inputs::parse_u32(o).with_context(|| format!("{sym}: offset {o}"))?),
+            None => (sym, offset),
+        };
+        // A trace reads any RAM: a splat auto-name (`D_<address>`) outside
+        // every container's data (a work area past the executable's bss)
+        // reads where it says.
+        let (addr, size) = match table.resolve_data(&Target { symbol: Some(sym.to_string()), ..Default::default() }) {
+            Ok((_, addr, size, _)) => (addr, size),
+            Err(e) => match sym.rsplit_once('_').and_then(|(_, h)| u32::from_str_radix(h, 16).ok()).filter(|a| (0x8000_0000..0x8020_0000).contains(a)) {
+                Some(a) if sym.len() > 9 => (a, None),
+                _ => return Err(e),
+            },
+        };
         // An offset reaches past the symbol on purpose (a work area).
         if let (Some(s), 0) = (size, offset) {
             ensure!(ty.size() <= s, "{sym} is {s} bytes; {ty:?} reads {}", ty.size());
@@ -234,17 +257,30 @@ fn one_test(b: &dyn Builds, cache: &Cache, table: &SymbolTable, sel: &[AnyMod], 
             AnyMod::load(&d).with_context(|| format!("same_as {id}: no mod beside {} ({})", m.id(), d.display()))
         })
         .transpose()?;
-    let in_browser = m.is_script() || same_as.as_ref().is_some_and(AnyMod::is_script);
+    let in_browser = m.is_script() || (!cache.skip_same_as && same_as.as_ref().is_some_and(AnyMod::is_script));
     let compare = spec.expect.iter().any(|e| matches!(e, Expect::Deterministic | Expect::SameAs { .. }));
     let hash: Vec<u64> = [1, 2, 3, 4].iter().map(|k| (spec.frames * k / 4).max(1)).collect();
 
-    // Runs the selection with `with` in `m`'s place (or as is).
+    // The test's swaps: mods beside this one, in its place at vblanks.
+    let index = sel.iter().position(|x| x.id() == m.id()).unwrap_or(0);
+    let swaps: Vec<(u64, usize, AnyMod)> = spec
+        .swap
+        .iter()
+        .map(|w| {
+            let d = m.dir().parent().unwrap_or(Path::new(".")).join(&w.with);
+            Ok((w.at, index, AnyMod::load(&d).with_context(|| format!("swap {}: no mod beside {}", w.with, m.id()))?))
+        })
+        .collect::<Result<_>>()?;
+    let in_browser = in_browser || swaps.iter().any(|w| w.2.is_script());
+    // Runs the selection with `with` in `m`'s place throughout (no swaps),
+    // or as the test says.
     let run = |with: Option<&AnyMod>, tag: &str| -> Result<Vec<Run>> {
         let mods: Vec<AnyMod> = sel.iter().map(|x| if x.id() == m.id() { with.cloned().unwrap_or_else(|| x.clone()) } else { x.clone() }).collect();
+        let swaps: &[(u64, usize, AnyMod)] = if with.is_some() { &[] } else { &swaps };
         if in_browser {
-            browser_run(b, cache, &mods, spec, &replay, &hash, &watch, &format!("{}-{}-{tag}", m.id(), t.name))
+            browser_run(b, cache, &mods, swaps, spec, &replay, &hash, &watch, &format!("{}-{}-{tag}", m.id(), t.name))
         } else {
-            native_run(b, cache, &mods, spec, &replay, &hash, &watch, compare, &dir.join(format!("storage-{tag}")))
+            native_run(b, cache, &mods, swaps, spec, &replay, &hash, &watch, compare, &dir.join(format!("storage-{tag}")))
         }
     };
     let first = run(None, "1")?;
@@ -268,6 +304,7 @@ fn one_test(b: &dyn Builds, cache: &Cache, table: &SymbolTable, sel: &[AnyMod], 
                     checks.push((a.name("deterministic"), same, format!("{} / {}", a.hashes, b.hashes)));
                 }
             }
+            Expect::SameAs { .. } if cache.skip_same_as => {}
             Expect::SameAs { with } => {
                 let other = run(same_as.as_ref(), "same-as")?;
                 for (a, b) in first.iter().zip(&other) {
@@ -351,6 +388,7 @@ fn native_run(
     b: &dyn Builds,
     cache: &Cache,
     mods: &[AnyMod],
+    swaps: &[(u64, usize, AnyMod)],
     spec: &psxw_modkit::test::TestSpec,
     replay: &[u8],
     hash: &[u64],
@@ -361,12 +399,17 @@ fn native_run(
     let (ws, game) = (b.ws(), b.game());
     let compiled = psxw_modkit::script::compiled(mods);
     let (mut o, _) = crate::run::options(ws, game, &[])?;
-    if spec.load_at.is_some() || !spec.commands.is_empty() {
+    if spec.load_at.is_some() || !spec.commands.is_empty() || !swaps.is_empty() {
         o.wasm = cache.base(ws, game)?.wasm.into();
         let modules = b.modules(&compiled)?;
         match spec.load_at {
             Some(at) => o.swaps = modules.iter().enumerate().map(|(i, p)| psxw_host_native::ModSwap { frame: at, index: i, path: p.clone() }).collect(),
             None => o.mods = modules,
+        }
+        for (at, i, w) in swaps {
+            let AnyMod::Compiled(c) = w else { anyhow::bail!("a native run swaps in compiled mods only") };
+            let path = b.modules(std::slice::from_ref(c))?.remove(0);
+            o.swaps.push(psxw_host_native::ModSwap { frame: *at, index: *i, path });
         }
     } else {
         o.wasm = b.linked(&compiled)?.wasm.into();
@@ -398,6 +441,7 @@ fn browser_run(
     b: &dyn Builds,
     cache: &Cache,
     mods: &[AnyMod],
+    test_swaps: &[(u64, usize, AnyMod)],
     spec: &psxw_modkit::test::TestSpec,
     replay: &[u8],
     hash: &[u64],
@@ -415,13 +459,23 @@ fn browser_run(
                 k += 1;
                 PageMod::Module(modules[k - 1].clone())
             }
-            AnyMod::Script(s) => PageMod::Script(s.dir.clone()),
+            AnyMod::Script(s) => PageMod::Script(s.dir.clone(), s.snapshot.clone().or_else(|| b.snapshot())),
         });
     }
-    let (start, swaps) = match spec.load_at {
+    let (start, mut swaps): (Vec<PageMod>, Vec<(u64, usize, PageMod)>) = match spec.load_at {
         Some(at) => (vec![], page_mods.into_iter().enumerate().map(|(i, p)| (at, i, p)).collect()),
         None => (page_mods, vec![]),
     };
+    for (at, i, w) in test_swaps {
+        swaps.push((
+            *at,
+            *i,
+            match w {
+                AnyMod::Compiled(c) => PageMod::Module(b.modules(std::slice::from_ref(c))?.remove(0)),
+                AnyMod::Script(s) => PageMod::Script(s.dir.clone(), s.snapshot.clone().or_else(|| b.snapshot())),
+            },
+        ));
+    }
     let page = PageRun {
         tag: tag.replace('/', "-"),
         mods: start,

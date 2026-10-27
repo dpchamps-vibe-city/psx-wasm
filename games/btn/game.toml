@@ -92,6 +92,11 @@ BeginSoundBankBodyTransfer = "array-bounds: the decomp declares gSoundArchiveOff
 # Named hook points for mods (plans/M11): real function boundaries many
 # mods want. A hook with "target": { "point": "frame" } is an `after` hook
 # on PollPadInputs, which RunSceneUpdateLoop calls once per scene frame.
+[mod]
+# The decomp's previous pin (census built): the mods gate checks script
+# mods across decomp iterations against its snapshot (plans/M12 phase 3).
+previous_decomp = "3a159925fe0994ae43f11fd990eb6f5339f5833f"
+
 [mod.points]
 frame = { after = "PollPadInputs", doc = "once per scene frame, after the pads are read" }
 boot = { before = "main", doc = "once, when the executable starts" }

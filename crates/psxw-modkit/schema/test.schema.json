@@ -239,6 +239,28 @@
           }
         }
       }
+    },
+    "swap": {
+      "type": "array",
+      "description": "Mods swapped into the tested mod's place at vblanks: a reload when it names the mod itself. A same_as run has none.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "at",
+          "mod"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mod": {
+            "type": "string",
+            "description": "A mod beside this one."
+          }
+        }
+      }
     }
   }
 }

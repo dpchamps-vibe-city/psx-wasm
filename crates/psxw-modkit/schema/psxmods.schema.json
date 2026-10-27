@@ -4,10 +4,50 @@
   "title": "psx-wasm mods workspace (psxmods.json)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["game", "psx_wasm"],
+  "required": [
+    "game",
+    "psx_wasm"
+  ],
   "properties": {
-    "$schema": { "type": "string" },
-    "game": { "type": "string" },
-    "psx_wasm": { "type": "string", "description": "The psx-wasm checkout, relative to the workspace." }
+    "$schema": {
+      "type": "string"
+    },
+    "game": {
+      "type": "string"
+    },
+    "psx_wasm": {
+      "type": "string",
+      "description": "The psx-wasm checkout, relative to the workspace."
+    },
+    "sources": {
+      "type": "array",
+      "description": "Where script mods' names and types come from (D55), in order of precedence. Default: types/ (if any), then c.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "c",
+              "dwarf",
+              "symbols",
+              "file",
+              "local"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "A file source's snapshot; a local source's directory (default types/)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Its name in warnings and provenance."
+          }
+        }
+      }
+    }
   }
 }

@@ -35,6 +35,11 @@ pub struct ModSection {
     /// many mods want, such as once per frame.
     #[serde(default)]
     pub points: BTreeMap<String, PointSpec>,
+    /// An earlier commit of the decomp (its census objects built), whose
+    /// snapshot the `mods` gate compares with the pinned one: script mods
+    /// across decomp iterations (plans/M12 phase 3).
+    #[serde(default)]
+    pub previous_decomp: Option<String>,
 }
 
 /// A named hook point: before or after one function.

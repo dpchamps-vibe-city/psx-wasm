@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://psx-wasm.invalid/schema/types.schema.json",
+  "title": "psx-wasm workspace declarations (types/*.json)",
+  "description": "A mods workspace's own names and types (plans/M12 phase 3), the most local source: snapshot entries for memory no decomp has typed. Addresses are numbers or 0x strings; a container defaults to the executable's.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "functions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "address",
+          "names"
+        ],
+        "properties": {
+          "container": {
+            "type": "string"
+          },
+          "address": {
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "The first is the name shown; the rest are aliases."
+          },
+          "signature": {
+            "$ref": "snapshot.schema.json#/$defs/signature"
+          }
+        }
+      }
+    },
+    "globals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "address",
+          "names"
+        ],
+        "properties": {
+          "container": {
+            "type": "string"
+          },
+          "address": {
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "The first is the name shown; the rest are aliases."
+          },
+          "type": {
+            "$ref": "snapshot.schema.json#/$defs/type"
+          },
+          "size": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "types": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "snapshot.schema.json#/$defs/typedef"
+      }
+    }
+  }
+}

@@ -46,6 +46,10 @@ pub struct Options {
     /// at psxw-abi `DEBUG_WINDOW_BASE` so a debugger's addresses are the
     /// game's, merged without binaryen.
     pub debug: bool,
+    /// More functions, by name, built at their translated tier besides the
+    /// manifest's `[tier]` pins (`game-lift-<names>.wasm`): a moddable base
+    /// whose slot for one is o32 instead of C-typed (plans/M12).
+    pub lift: Vec<String>,
 }
 
 /// What the modkit links into a build (plans/M11).
@@ -70,6 +74,7 @@ impl Options {
             mods: None,
             moddable: false,
             debug: false,
+            lift: vec![],
         }
     }
 
@@ -87,6 +92,9 @@ impl Options {
         }
         if self.moddable {
             s += "-moddable";
+        }
+        if !self.lift.is_empty() {
+            s += &format!("-lift-{}", self.lift.join("+"));
         }
         if self.debug {
             s += "-debug";
@@ -361,8 +369,14 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     }
 
     // Tiers.
-    let pinned: BTreeSet<&str> =
-        inputs.manifest.tier.iter().filter(|(_, p)| p.tier == "lift").map(|(n, _)| n.as_str()).collect();
+    let pinned: BTreeSet<&str> = inputs
+        .manifest
+        .tier
+        .iter()
+        .filter(|(_, p)| p.tier == "lift")
+        .map(|(n, _)| n.as_str())
+        .chain(opts.lift.iter().map(String::as_str))
+        .collect();
     let adapter_id: BTreeMap<&str, u32> = adapters.iter().enumerate().map(|(i, n)| (n.as_str(), i as u32)).collect();
     let mut tiers: BTreeMap<(String, u32), Tier> = BTreeMap::new();
     let mut lifted = Vec::new();

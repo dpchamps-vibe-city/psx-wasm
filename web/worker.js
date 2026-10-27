@@ -94,7 +94,7 @@ onmessage = async (e) => {
     } else if (!session?.scripts) {
       answer(`${m.type}-result`, m.id, Promise.reject(new Error("script mods need a moddable bundle (psxw build-web --moddable) and its game running")));
     } else if (m.type === "cmd") answer("cmd-result", m.id, session.scripts.command(m.name, m.args, true));
-    else answer("load-result", m.id, m.reload ? session.scripts.reload(m.reload, m.url) : session.scripts.load(m.url));
+    else answer("load-result", m.id, m.reload ? session.scripts.reload(m.reload, m.url) : session.scripts.load(m.pack || m.url));
     return;
   }
   if (m.type !== "start") return;
@@ -520,6 +520,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   // Mods, in order, before boot; swaps fetched now, applied at their vblank.
   const fetchBytes = async (u) => new Uint8Array(await (await fetch(new URL(u, location.href))).arrayBuffer());
   const isScript = (u) => /\.m?js(\?|$)/.test(u);
+  const isPack = (u) => /\.psxpack\.json(\?|$)/.test(u);
   loader = baseModule && ModLoader.forBase(baseModule, exports);
   if (loader) {
     let snapshot = null;
@@ -542,15 +543,18 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   }
   const script = async (u) => {
     if (!scripts) throw new Error(`${u}: script mods need the bundle's snapshot.json (psxw build-web --moddable)`);
+    if (isPack(u)) return scripts.importPack(await (await fetch(new URL(u, location.href))).json());
     return scripts.importMod(new URL(u, location.href).href);
   };
   const wanted = [];
-  for (const u of options.mods || []) wanted.push(isScript(u) ? { name: u, script: await script(u) } : { name: u, bytes: await fetchBytes(u) });
+  for (const u of options.mods || []) wanted.push(isScript(u) || isPack(u) ? { name: u, script: await script(u) } : { name: u, bytes: await fetchBytes(u) });
   if (options.modsFromOpfs) {
-    // A single-file script mod in OPFS imports from a blob.
+    // A single-file script mod in OPFS imports from a blob; a pack brings
+    // its snapshot.
     for (const m of await opfsMods()) {
       const blob = () => URL.createObjectURL(new Blob([m.bytes], { type: "text/javascript" }));
-      wanted.push(isScript(m.name) ? { name: m.name, script: await script(blob()) } : m);
+      if (isPack(m.name)) wanted.push({ name: m.name, script: await scripts.importPack(JSON.parse(new TextDecoder().decode(m.bytes))) });
+      else wanted.push(isScript(m.name) ? { name: m.name, script: await script(blob()) } : m);
     }
   }
   for (const w of options.swaps || []) {

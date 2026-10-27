@@ -14,8 +14,11 @@
 //!   source's view of the binary, from which `game` and `game.d.ts` come.
 
 pub mod build;
+pub mod cfront;
 pub mod compile;
 pub mod decl;
+pub mod dts;
+pub mod dwarf;
 pub mod genfiles;
 pub mod headers;
 pub mod plan;
@@ -36,4 +39,6 @@ pub const SCHEMAS: &[(&str, &str)] = &[
     ("test.schema.json", include_str!("../schema/test.schema.json")),
     ("psxmods.schema.json", include_str!("../schema/psxmods.schema.json")),
     ("set.schema.json", include_str!("../schema/set.schema.json")),
+    ("snapshot.schema.json", include_str!("../schema/snapshot.schema.json")),
+    ("types.schema.json", include_str!("../schema/types.schema.json")),
 ];

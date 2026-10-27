@@ -28,6 +28,25 @@ pub struct Manifest {
     pub game: String,
     /// The psx-wasm checkout, relative to the workspace.
     pub psx_wasm: String,
+    /// Where script mods' names and types come from (D55), in order of
+    /// precedence. Default: the workspace's `types/` (if any), then `c`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceSpec>,
+}
+
+/// One source of names and types.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSpec {
+    /// `c` (the decomp's headers), `dwarf` (a debug build's DWARF over
+    /// them), `symbols` (the address map), `file` (a snapshot at `path`)
+    /// or `local` (fragments in `path`, default `types/`).
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Its name in warnings and provenance (default: its kind, or path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// `sets/<name>.json`: mods applied together, in this order.
@@ -52,6 +71,10 @@ pub struct Lock {
     /// Each mod's resolved function targets, so a bump can say what a
     /// renamed one became.
     pub targets: BTreeMap<String, Vec<LockedTarget>>,
+    /// The snapshot script mods resolve names through (D55), by hash:
+    /// `.psxw/sdk/snapshots/<hash>.json`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub snapshot: String,
 }
 
 /// The game's files, by hash (no game bytes).
@@ -185,6 +208,15 @@ impl ModsWorkspace {
     pub fn select(&self, name: Option<&str>) -> Result<(String, Vec<Mod>)> {
         let (label, mods) = self.select_any(name)?;
         Ok((label, crate::script::compiled(&mods)))
+    }
+
+    /// The snapshot the lock pins (`psxw mod sdk`).
+    pub fn snapshot_path(&self) -> Result<PathBuf> {
+        let lock = self.lock()?.with_context(|| format!("no {LOCK}: run psxw mod sdk"))?;
+        ensure!(!lock.snapshot.is_empty(), "{LOCK} pins no snapshot: run psxw mod sdk");
+        let p = self.sdk_dir().join("snapshots").join(format!("{}.json", lock.snapshot));
+        ensure!(p.is_file(), "no {}: run psxw mod sdk", p.display());
+        Ok(p)
     }
 
     pub fn table(&self) -> Result<SymbolTable> {
@@ -326,11 +358,16 @@ pub struct SdkOutcome {
     /// Targets a bump lost, each with what is at its old address now.
     pub moved: Vec<String>,
     pub lock: Lock,
+    /// With `--bump`: the snapshots compared by address.
+    pub bump: Option<crate::snapshot::Bump>,
+    /// Where the workspace's sources disagree (each names the winner).
+    pub merge_warnings: Vec<String>,
 }
 
 /// `psxw mod sdk [--bump]`: export the mod SDK at psx-wasm's pins, check
 /// every mod against it, and record it in `psxmods.lock.json`.
 pub fn sdk(ws: &ModsWorkspace, bump: bool) -> Result<SdkOutcome> {
+    let bump_asked = bump;
     let psx = ws.psx()?;
     let game = ws.game().to_string();
     let (decomp, identity) = pins(&psx, &game)?;
@@ -344,6 +381,8 @@ pub fn sdk(ws: &ModsWorkspace, bump: bool) -> Result<SdkOutcome> {
             );
         }
     }
+    // The snapshot the lock pinned, before the SDK is rewritten.
+    let old_snapshot = ws.snapshot_path().ok().and_then(|p| crate::snapshot::Snapshot::load(&p).ok());
     let table = sdk_into(ws, &psx)?;
 
     // Every mod against it.
@@ -383,12 +422,79 @@ pub fn sdk(ws: &ModsWorkspace, bump: bool) -> Result<SdkOutcome> {
             }
         }
     }
-    let lock = Lock { game: game.clone(), psx_wasm: psx_commit(&psx), decomp, identity, targets };
+    let (snapshot, bump, merge_warnings) = sdk_types(ws, &psx, old_snapshot.as_ref())?;
+    let lock = Lock { game: game.clone(), psx_wasm: psx_commit(&psx), decomp, identity, targets, snapshot };
     std::fs::write(ws.root.join(LOCK), serde_json::to_string_pretty(&lock)? + "\n")?;
     if plan.ok() {
         ws.generate(&table, &mods, &plan)?;
     }
-    Ok(SdkOutcome { plan, mods, moved, lock })
+    Ok(SdkOutcome { plan, mods, moved, lock, bump: bump.filter(|_| bump_asked), merge_warnings })
+}
+
+/// Script mods' side of the SDK (plans/M12): the workspace's snapshot
+/// (the C-header frontend's), named by its hash, and the editor's
+/// `game.d.ts` and `psx.d.ts`. Returns the snapshot's hash.
+/// `old`, the snapshot the lock pinned before: its names stay aliases of
+/// what is at their addresses now (`--bump`'s comparison, D55).
+pub fn sdk_types(ws: &ModsWorkspace, psx: &Workspace, old: Option<&crate::snapshot::Snapshot>) -> Result<(String, Option<crate::snapshot::Bump>, Vec<String>)> {
+    let (_, table) = crate::build::table(psx, ws.game())?;
+    let (mut snap, warnings) = ws.merged_snapshot(psx)?;
+    let bump = old.map(|o| crate::snapshot::bump(o, &mut snap));
+    Ok((write_types(&ws.sdk_dir(), &snap, &table)?, bump, warnings))
+}
+
+impl ModsWorkspace {
+    /// The workspace's sources (`psxmods.json` `sources`), merged by
+    /// address (D55), with the merge's warnings.
+    pub fn merged_snapshot(&self, psx: &Workspace) -> Result<(crate::snapshot::Snapshot, Vec<String>)> {
+        let game = self.game();
+        let (symbols, c) = crate::build::snapshots(psx, game)?;
+        let specs = if self.manifest.sources.is_empty() {
+            let mut d = Vec::new();
+            if self.root.join("types").is_dir() {
+                d.push(SourceSpec { kind: "local".into(), path: None, name: None });
+            }
+            d.push(SourceSpec { kind: "c".into(), path: None, name: None });
+            d
+        } else {
+            self.manifest.sources.clone()
+        };
+        let mut list = Vec::new();
+        for spec in &specs {
+            let name = spec.name.clone().or_else(|| spec.path.clone()).unwrap_or_else(|| spec.kind.clone());
+            let snap = match spec.kind.as_str() {
+                "c" => c.clone(),
+                "symbols" => symbols.clone(),
+                "dwarf" => crate::build::dwarf_snapshot(psx, game, &c)?,
+                "file" => crate::snapshot::Snapshot::load(&self.root.join(spec.path.as_deref().context("a file source names its path")?))?,
+                "local" => match crate::snapshot::from_fragments(&self.root.join(spec.path.as_deref().unwrap_or("types")), &c)? {
+                    Some(s) => s,
+                    None => continue,
+                },
+                other => bail!("psxmods.json sources: unknown kind {other} (c, dwarf, symbols, file, local)"),
+            };
+            list.push((name, snap));
+        }
+        if list.len() == 1 {
+            return Ok((list.remove(0).1, vec![]));
+        }
+        crate::snapshot::merge(&list)
+    }
+}
+
+/// `snapshots/<hash>.json`, `game.d.ts` and `psx.d.ts` in `dir`.
+pub fn write_types(dir: &Path, snap: &crate::snapshot::Snapshot, table: &SymbolTable) -> Result<String> {
+    let hash = snap.hash();
+    std::fs::create_dir_all(dir.join("snapshots"))?;
+    std::fs::write(dir.join("snapshots").join(format!("{hash}.json")), snap.to_json())?;
+    let tiers: BTreeMap<(String, u32), String> = table
+        .functions
+        .iter()
+        .map(|f| ((f.container.clone(), f.addr), serde_json::to_value(f.tier).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()))
+        .collect();
+    std::fs::write(dir.join("game.d.ts"), crate::dts::game_dts(snap, &tiers, &hash))?;
+    std::fs::write(dir.join("psx.d.ts"), crate::dts::PSX_DTS)?;
+    Ok(hash)
 }
 
 /// Export the mod SDK at psx-wasm's pins into the workspace's state

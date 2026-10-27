@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 pub const USAGE: &str = "mod <command>; in a mods workspace (psxmods.json): \
     mod sdk [--bump] | mod check [mod|set] | mod build [mod|set] [--modules] | mod test [mod|set] \
     | mod play <mod|set> [--dynamic] [--port N] [--test] | mod watch <mod|set> [--port N] \
-    | mod new <id> | mod show <symbol> | mod writers <symbol>; \
+    | mod new <id> [--script] | mod pack <id> | mod show <symbol> | mod writers <symbol>; \
     in psx-wasm: mod check <game> <dir>… | mod build <game> <dir>… [--modules] [--out D] | mod test <game> <dir>… \
     | mod watch <game> <dir>… [--port N] | mod ci <game> \
-    | mod new <game> <id> [--dir D] | mod show <game> <symbol> | mod writers <game> <symbol> \
-    | mod pass-through <game> --out <dir>";
+    | mod new <game> <id> [--dir D] [--script] | mod show <game> <symbol> | mod writers <game> <symbol> \
+    | mod pass-through <game> --out <dir> [--script] | mod pack <game> <dir> [--out F] | mod snapshot <game> [--source symbols|c|dwarf] [--at COMMIT] [--out F] [--verify] [--agree]";
 
 pub fn run(args: &[&str]) -> Result<bool> {
     match ModsWorkspace::discover()? {
@@ -83,14 +83,36 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
             for mv in &out.moved {
                 println!("error: {mv}");
             }
+            for w in &out.merge_warnings {
+                println!("warning: {w}");
+            }
+            if let Some(b) = &out.bump {
+                println!("snapshot {}: {} renamed, {} layout changes, {} removed", out.lock.snapshot, b.renames.len(), b.layouts.len(), b.removals.len());
+                for (o, n, c, a) in &b.renames {
+                    println!("renamed: {o} -> {n} ({c} 0x{a:08X}); {o} stays a deprecated alias");
+                }
+                for l in &b.layouts {
+                    println!("layout: {l}");
+                }
+                for r in &b.removals {
+                    println!("gone: {r}");
+                }
+            }
             let ok = print_plan(&out.plan, &out.mods) && out.moved.is_empty();
             Ok(ok)
         }
         ["check", rest @ ..] => {
             let (_, any) = m.select_any(rest.first().copied())?;
             let table = m.table()?;
-            let (plan, mods) = plan_any(&m.psx()?, &table, &any)?;
-            let ok = print_plan(&plan, &mods);
+            let psx = m.psx()?;
+            let snap = m.snapshot_path().ok().and_then(|p| psxw_modkit::snapshot::Snapshot::load(&p).ok());
+            let (plan, mods) = plan_any_in(&psx, &table, &any, snap.as_ref())?;
+            let mut ok = print_plan(&plan, &mods);
+            let scripts = scripts_of(&any);
+            for e in typecheck(&psx, &m.sdk_dir(), &scripts)? {
+                println!("error: {e}");
+                ok = false;
+            }
             if ok {
                 // clangd's view: every mod's mod.h and compile commands.
                 let all = m.all()?;
@@ -135,7 +157,7 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
                 let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--dynamic").collect();
                 let modules = modules_ws(m, &psx, &label, &psxw_modkit::script::compiled(&any))?;
                 let (base, _) = psxw_build::game::build(&psx, &Options { moddable: true, ..Options::new(m.game()) })?;
-                return play(&psx, m.game(), &base, &m.state.join("web").join(format!("{label}-dynamic")), &rest, &page_mods(&any, &modules));
+                return play(&psx, m.game(), &base, &m.state.join("web").join(format!("{label}-dynamic")), &rest, &page_mods(&any, &modules, Some(&m.snapshot_path()?)));
             }
             let (psx, _, built, label) = build_ws(m, Some(name))?;
             summary(&built);
@@ -151,7 +173,8 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
             };
             let (label, _) = m.select_any(Some(name))?;
             let dir = m.state.join("web").join(format!("{label}-watch"));
-            watch(&psx, m.game(), &dir, port, &|| {
+            let snapshot = m.snapshot_path().ok();
+            watch(&psx, m.game(), &dir, port, snapshot.as_deref(), &|| {
                 let (_, any) = m.select_any(Some(name))?;
                 let modules = modules_ws(m, &psx, &label, &psxw_modkit::script::compiled(&any))?;
                 Ok((any, modules))
@@ -172,6 +195,13 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
             }
             println!("created {}; write its hooks in mod.js, then psxw mod check {id}", dir.display());
             Ok(true)
+        }
+        ["pack", id] => {
+            let any = AnyMod::load(&m.mods_dir().join(id))?;
+            let AnyMod::Script(s) = any else { bail!("{id} is a compiled mod: psxw mod build --modules makes its module") };
+            let snap = psxw_modkit::snapshot::Snapshot::load(&m.snapshot_path()?)?;
+            let out = m.state.join("packs").join(format!("{id}.psxpack.json"));
+            write_pack(&s, &snap, &out)
         }
         ["show", sym] => show(&m.table()?, sym),
         ["writers", sym] => crate::writers::run(&m.psx()?, m.game(), sym),
@@ -205,9 +235,146 @@ pub fn script_defs(ws: &Workspace, scripts: &[&psxw_modkit::script::ScriptMod]) 
         .collect()
 }
 
+/// Type-check script mods (plans/M12): `tsc --noEmit` with `checkJs` over
+/// each mod's JavaScript, against `psx.d.ts` and `game.d.ts` in `sdk`, in
+/// the browsers image. Returns tsc's errors, with host paths.
+pub fn typecheck(ws: &Workspace, sdk: &Path, scripts: &[&psxw_modkit::script::ScriptMod]) -> Result<Vec<String>> {
+    if scripts.is_empty() {
+        return Ok(vec![]);
+    }
+    let image = crate::webtest::image(ws)?;
+    let mut files: Vec<String> = vec!["/sdk/psx.d.ts".into(), "/sdk/game.d.ts".into()];
+    let mut mounts = vec![(std::path::absolute(sdk)?, "/sdk".to_string(), true)];
+    for (i, s) in scripts.iter().enumerate() {
+        let dir = std::path::absolute(&s.dir)?;
+        for f in walk_js(&dir) {
+            files.push(format!("/mods/{i}/{}", f.strip_prefix(&dir)?.to_string_lossy()));
+        }
+        mounts.push((dir, format!("/mods/{i}"), true));
+    }
+    let config = serde_json::json!({
+        "compilerOptions": {
+            "checkJs": true, "allowJs": true, "noEmit": true, "module": "esnext", "target": "es2022",
+            "moduleResolution": "node", "lib": ["es2022"], "types": [], "strict": false
+        },
+        "files": files,
+    });
+    let check = sdk.join("check");
+    std::fs::create_dir_all(&check)?;
+    std::fs::write(check.join("tsconfig.json"), serde_json::to_string_pretty(&config)?)?;
+    let m: Vec<(PathBuf, &str, bool)> = mounts.iter().map(|(h, g, ro)| (h.clone(), g.as_str(), *ro)).collect();
+    let user = psxw_oracle::images::owner_of(sdk)?;
+    let argv = psxw_oracle::images::docker_run(&image, &user, &m, Some("tsc"), &["-p".into(), "/sdk/check/tsconfig.json".into(), "--pretty".into(), "false".into()]);
+    let out = std::process::Command::new("docker").args(&argv).output().context("running tsc in the browsers image")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut errors: Vec<String> = text.lines().filter(|l| l.contains(": error TS")).map(str::to_string).collect();
+    // tsc names files relative to its working directory, `/`.
+    for e in &mut errors {
+        let path = e.trim_start_matches('/').to_string();
+        for (i, s) in scripts.iter().enumerate() {
+            if let Some(rest) = path.strip_prefix(&format!("mods/{i}/")) {
+                *e = format!("{}/{rest}", s.dir.display());
+            }
+        }
+        if let Some(rest) = path.strip_prefix("sdk/") {
+            *e = format!("{}/{rest}", sdk.display());
+        }
+    }
+    if !out.status.success() && errors.is_empty() {
+        bail!("tsc failed: {}{}", text.trim(), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(errors)
+}
+
+/// A script mod's JavaScript files, its tests left out.
+fn walk_js(dir: &Path) -> Vec<PathBuf> {
+    js_files(dir).into_iter().filter(|p| p.extension().is_some_and(|x| x == "js" || x == "mjs")).collect()
+}
+
+/// Phase 2 exit criterion 2 (plans/M12): the snapshot against the
+/// census's layout probe and the address map.
+pub fn verify_snapshot(ws: &Workspace, game: &str, snap: &psxw_modkit::snapshot::Snapshot) -> Result<psxw_modkit::cfront::Agreement> {
+    let manifest = ws.game(game)?;
+    let pin = ws.game_pin(&manifest)?;
+    let checkout = ws.checkout(pin);
+    let tool = |p: &Path| if p.components().count() > 1 { checkout.join(p) } else { p.to_path_buf() };
+    let reference = psxw_cc::probe::Reference {
+        cpp: tool(&manifest.reference.cpp),
+        cppflags: manifest.reference.cppflags.clone(),
+        cc1: tool(&manifest.reference.cc1),
+        cc1flags: manifest.reference.cc1flags.clone(),
+    };
+    let src = build::snapshot(ws, game)?;
+    let map = psxw_inputs::AddressMap::load(&src, &manifest)?;
+    let work = ws.out_dir().join("modkit").join(game).join("verify");
+    let clang = psxw_cc::Clang::new(ws.clang()?, src.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    psxw_modkit::cfront::verify(snap, &clang, &reference, &src, &manifest, &map, &work.join("probe"))
+}
+
+/// A definition's names that `snap` keeps only as deprecated aliases: each
+/// becomes what it is now, with a warning.
+fn aliases(def: &mut psxw_modkit::script::Definition, snap: &psxw_modkit::snapshot::Snapshot, id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let targets = def.hooks.iter_mut().map(|h| &mut h.target).chain(def.data.iter_mut().map(|d| &mut d.target));
+    for t in targets {
+        let Some(name) = t.symbol.clone() else { continue };
+        if let Some(now) = psxw_modkit::snapshot::renamed(snap, &name) {
+            out.push(format!("{id}: {name} was renamed {now} (snapshot {}); {name} still works, as a deprecated alias", snap.hash()));
+            t.symbol = Some(now.to_string());
+        }
+    }
+    out
+}
+
+/// `psxw mod pack`: the mod and the part of `snap` it uses, in one file.
+fn write_pack(s: &psxw_modkit::script::ScriptMod, snap: &psxw_modkit::snapshot::Snapshot, out: &Path) -> Result<bool> {
+    let pack = psxw_modkit::script::pack(s, snap)?;
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(out, serde_json::to_string(&pack)?)?;
+    let sub = &pack["snapshot"];
+    println!(
+        "packed {}: {} ({} functions, {} globals, {} types from snapshot {}); load it in the page's mod panel",
+        s.id,
+        out.display(),
+        sub["functions"].as_array().map_or(0, Vec::len),
+        sub["globals"].as_array().map_or(0, Vec::len),
+        sub["types"].as_object().map_or(0, |o| o.len()),
+        snap.hash()
+    );
+    Ok(true)
+}
+
+/// The script mods of a selection.
+fn scripts_of(any: &[AnyMod]) -> Vec<&psxw_modkit::script::ScriptMod> {
+    any.iter()
+        .filter_map(|m| match m {
+            AnyMod::Script(s) => Some(s),
+            AnyMod::Compiled(_) => None,
+        })
+        .collect()
+}
+
+/// The script mod SDK at psx-wasm's pin, outside a workspace:
+/// `out/modkit/<game>/sdk/` (snapshot, `game.d.ts`, `psx.d.ts`).
+pub fn direct_sdk(ws: &Workspace, game: &str) -> Result<PathBuf> {
+    let dir = std::path::absolute(ws.out_dir().join("modkit").join(game).join("sdk"))?;
+    let (_, table) = build::table(ws, game)?;
+    let (_, snap) = build::snapshots(ws, game)?;
+    psxw_modkit::workspace::write_types(&dir, &snap, &table)?;
+    Ok(dir)
+}
+
 /// Plan a selection of either kind: script mods' definitions (from their
 /// factories) with compiled mods' declarations, in order (plans/M12).
 pub fn plan_any(ws: &Workspace, table: &SymbolTable, any: &[AnyMod]) -> Result<(Plan, Vec<Mod>)> {
+    plan_any_in(ws, table, any, None)
+}
+
+/// The same, script mods' names resolved through `snapshot` (D55): a name
+/// it keeps only as a deprecated alias warns, naming what it is now.
+pub fn plan_any_in(ws: &Workspace, table: &SymbolTable, any: &[AnyMod], snapshot: Option<&psxw_modkit::snapshot::Snapshot>) -> Result<(Plan, Vec<Mod>)> {
     let scripts: Vec<&psxw_modkit::script::ScriptMod> = any
         .iter()
         .filter_map(|m| match m {
@@ -218,11 +385,17 @@ pub fn plan_any(ws: &Workspace, table: &SymbolTable, any: &[AnyMod]) -> Result<(
     let mut defs = script_defs(ws, &scripts)?.into_iter();
     let mut mods = Vec::new();
     let mut errors = Vec::new();
+    let mut warnings = Vec::new();
     for m in any {
         match m {
             AnyMod::Compiled(c) => mods.push(c.clone()),
             AnyMod::Script(s) => match defs.next().context("a definition per script mod")? {
-                Ok(def) => match s.as_mod(&def, &table.game, &table.main) {
+                Ok(mut def) => match {
+                    if let Some(snap) = snapshot {
+                        warnings.extend(aliases(&mut def, snap, &s.id));
+                    }
+                    s.as_mod(&def, &table.game, &table.main)
+                } {
                     Ok(x) => mods.push(x),
                     Err(e) => errors.push(format!("{}: {e:#}", s.id)),
                 },
@@ -232,24 +405,23 @@ pub fn plan_any(ws: &Workspace, table: &SymbolTable, any: &[AnyMod]) -> Result<(
     }
     let mut plan = psxw_modkit::plan::plan(table, &mods);
     plan.errors.extend(errors);
+    plan.warnings.extend(warnings);
     Ok((plan, mods))
 }
 
-/// The web bundle around a moddable base, with the names script mods
-/// resolve (plans/M12): the symbol-list frontend's snapshot,
-/// `snapshot.json`.
+/// The web bundle around a moddable base, with the names and types script
+/// mods resolve (plans/M12): `snapshot.json`.
 pub fn moddable_bundle(ws: &Workspace, game: &str, base: &Report, dir: PathBuf) -> Result<PathBuf> {
     let dir = psxw_build::web::bundle(ws, game, base, dir)?;
     write_snapshot(ws, game, &dir)?;
     Ok(dir)
 }
 
-/// `snapshot.json` in a bundle: the game's names (the symbol-list
-/// frontend).
+/// `snapshot.json` in a bundle: the game's names and types at psx-wasm's
+/// pin (the C-header frontend's snapshot), which script mods without one
+/// of their own resolve through.
 pub fn write_snapshot(ws: &Workspace, game: &str, dir: &Path) -> Result<()> {
-    let (_, table) = build::table(ws, game)?;
-    let (_, identity) = psxw_modkit::workspace::pins(ws, game)?;
-    let snap = psxw_modkit::snapshot::from_symbols(&table, identity);
+    let (_, snap) = build::snapshots(ws, game)?;
     std::fs::write(dir.join("snapshot.json"), snap.to_json())?;
     Ok(())
 }
@@ -269,7 +441,7 @@ fn modules_ws(m: &ModsWorkspace, psx: &Workspace, label: &str, mods: &[Mod]) -> 
 /// script mod's do, it is published at a new versioned URL
 /// (`mods/<id>@<seq>/mod.js`, so its relative imports reload with it), and
 /// the page reloads it in place (plans/M12).
-fn watch(ws: &Workspace, game: &str, dir: &Path, port: u16, rebuild: &dyn Fn() -> Result<(Vec<AnyMod>, Vec<PathBuf>)>) -> Result<bool> {
+fn watch(ws: &Workspace, game: &str, dir: &Path, port: u16, snapshot: Option<&Path>, rebuild: &dyn Fn() -> Result<(Vec<AnyMod>, Vec<PathBuf>)>) -> Result<bool> {
     let (mods, modules) = rebuild()?;
     let (base, _) = psxw_build::game::build(ws, &Options { moddable: true, ..Options::new(game) })?;
     let dir = moddable_bundle(ws, game, &base, dir.to_path_buf())?;
@@ -277,7 +449,7 @@ fn watch(ws: &Workspace, game: &str, dir: &Path, port: u16, rebuild: &dyn Fn() -
     let script_url = |id: &str, seq: u64| -> Result<String> {
         let at = format!("{id}@{seq}");
         let m = mods.iter().find(|m| m.id() == id).context("script mod")?;
-        crate::webtest::copy_js(m.dir(), &dir.join("mods").join(&at))?;
+        crate::webtest::place_script(m.dir(), snapshot, &dir, &dir.join("mods").join(&at))?;
         Ok(format!("mods/{at}/mod.js"))
     };
     let mut urls = Vec::new();
@@ -386,8 +558,9 @@ fn js_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The page's mods: compiled ones as their modules (`modules`, in order).
-fn page_mods(any: &[AnyMod], modules: &[PathBuf]) -> Vec<crate::webtest::PageMod> {
+/// The page's mods: compiled ones as their modules (`modules`, in order),
+/// script ones with `snapshot`.
+fn page_mods(any: &[AnyMod], modules: &[PathBuf], snapshot: Option<&Path>) -> Vec<crate::webtest::PageMod> {
     let mut k = 0;
     any.iter()
         .map(|m| match m {
@@ -395,7 +568,7 @@ fn page_mods(any: &[AnyMod], modules: &[PathBuf]) -> Vec<crate::webtest::PageMod
                 k += 1;
                 crate::webtest::PageMod::Module(modules[k - 1].clone())
             }
-            AnyMod::Script(s) => crate::webtest::PageMod::Script(s.dir.clone()),
+            AnyMod::Script(s) => crate::webtest::PageMod::Script(s.dir.clone(), snapshot.map(Path::to_path_buf)),
         })
         .collect()
 }
@@ -443,7 +616,16 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
             let any = load_any(dirs)?;
             let (_, table) = build::table(ws, game)?;
             let (plan, mods) = plan_any(ws, &table, &any)?;
-            Ok(print_plan(&plan, &mods))
+            let mut ok = print_plan(&plan, &mods);
+            let scripts = scripts_of(&any);
+            if !scripts.is_empty() {
+                let sdk = direct_sdk(ws, game)?;
+                for e in typecheck(ws, &sdk, &scripts)? {
+                    println!("error: {e}");
+                    ok = false;
+                }
+            }
+            Ok(ok)
         }
         ["build", game, rest @ ..] => {
             let modules = rest.contains(&"--modules");
@@ -462,7 +644,7 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
             let mods = load_any(dirs)?;
             let (_, table) = build::table(ws, game)?;
             let cache = Cache::default();
-            let b = Direct { ws, game, out_root: None, cache: &cache };
+            let b = Direct { ws, game, out_root: None, cache: &cache, snapshot: None };
             let out = psxw_build::game::out_dir(ws, game).join("mods").join(label_any(&mods)).join("tests");
             crate::modtest::run_tests(&b, &cache, &table, &mods, None, &std::path::absolute(out)?)
         }
@@ -491,7 +673,7 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
                 }
             }
             let dir = ws.out_dir().join("web").join(format!("{game}-watch"));
-            watch(ws, game, &dir, port, &|| {
+            watch(ws, game, &dir, port, None, &|| {
                 let any = load_any(&dirs)?;
                 let built = build_modules_direct(ws, game, &psxw_modkit::script::compiled(&any), None)?;
                 print_modules(&built);
@@ -499,10 +681,88 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
             })
         }
         ["writers", game, sym] => crate::writers::run(ws, game, sym),
+        ["pack", game, dir, rest @ ..] => {
+            let out = match rest {
+                ["--out", o] => PathBuf::from(o),
+                [] => ws.out_dir().join("modkit").join(game).join("packs").join(format!("{}.psxpack.json", Path::new(dir).file_name().unwrap_or_default().to_string_lossy())),
+                _ => bail!("usage: psxw mod pack <game> <dir> [--out F]"),
+            };
+            let s = psxw_modkit::script::ScriptMod::load(Path::new(dir))?;
+            let (_, snap) = build::snapshots(ws, game)?;
+            write_pack(&s, &snap, &out)
+        }
+        ["snapshot", game, rest @ ..] => {
+            let mut source = "c";
+            let mut out: Option<PathBuf> = None;
+            let mut check = false;
+            let mut agree = false;
+            let mut at: Option<&str> = None;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "--source" => source = it.next().context("--source symbols|c|dwarf")?,
+                    "--out" => out = Some(PathBuf::from(it.next().context("--out needs a file")?)),
+                    "--verify" => check = true,
+                    "--agree" => agree = true,
+                    "--at" => at = Some(it.next().context("--at needs a decomp commit")?),
+                    other => bail!("unknown snapshot option {other}"),
+                }
+            }
+            let (symbols, c) = match at {
+                Some(commit) => build::snapshots_at(ws, game, commit)?,
+                None => build::snapshots(ws, game)?,
+            };
+            if agree {
+                let view = build::dwarf_view(ws, game)?;
+                let (n, d) = psxw_modkit::dwarf::agree(&c, &view);
+                println!("DWARF ({} units) and the headers agree on {n} records and globals both describe; {} disagreements", view.units, d.len());
+                for x in d.iter().take(30) {
+                    println!("  {x}");
+                }
+                return Ok(d.is_empty());
+            }
+            let snap = match source {
+                "symbols" => symbols,
+                "c" => c,
+                "dwarf" => build::dwarf_snapshot(ws, game, &c)?,
+                other => bail!("--source {other}: symbols, c or dwarf"),
+            };
+            let records = snap.types.values().filter(|t| matches!(t, psxw_modkit::snapshot::TypeDef::Struct { .. } | psxw_modkit::snapshot::TypeDef::Union { .. })).count();
+            println!(
+                "snapshot {} ({} {}): {} functions ({} with signatures), {} globals ({} typed), {} records, {} dropped",
+                snap.hash(),
+                snap.source.kind,
+                &snap.source.version[..7.min(snap.source.version.len())],
+                snap.functions.len(),
+                snap.functions.iter().filter(|f| f.signature.is_some()).count(),
+                snap.globals.len(),
+                snap.globals.iter().filter(|g| g.ty.is_some()).count(),
+                records,
+                snap.dropped.len()
+            );
+            if let Some(o) = out {
+                std::fs::write(&o, snap.to_json())?;
+                println!("wrote {}", o.display());
+            }
+            if check {
+                let a = verify_snapshot(ws, game, &snap)?;
+                println!("agrees with the census probe on {} layouts and the address map on {} addresses; {} disagreements", a.layouts, a.addresses, a.disagreements.len());
+                for d in a.disagreements.iter().take(20) {
+                    println!("  {d}");
+                }
+                return Ok(a.disagreements.is_empty());
+            }
+            Ok(true)
+        }
         ["ci", game] => {
             let (pass, detail) = ci(ws, game)?;
             println!("mods gate: {} ({detail})", if pass { "PASS" } else { "FAIL" });
             Ok(pass)
+        }
+        ["pass-through", game, "--out", out, "--script"] => {
+            let n = crate::passthrough::generate_script(ws, game, Path::new(out))?;
+            println!("script pass-through mod on {n} functions: {out}");
+            Ok(true)
         }
         ["pass-through", game, "--out", out, rest @ ..] => {
             let tiers: Option<Vec<&str>> = match rest {
@@ -540,7 +800,7 @@ const JSCONFIG: &str = r#"{
     "noEmit": true,
     "module": "esnext",
     "target": "es2022",
-    "moduleResolution": "bundler",
+    "moduleResolution": "node",
     "types": []
   },
   "include": ["mods/**/*.js", ".psxw/sdk/psx.d.ts", ".psxw/sdk/game.d.ts"]
@@ -628,7 +888,7 @@ fn play(ws: &Workspace, game: &str, report: &Report, dir: &Path, rest: &[&str], 
         for m in mods {
             match m {
                 crate::webtest::PageMod::Module(p) => modules.push(p.clone()),
-                crate::webtest::PageMod::Script(_) => bail!("--test compares the browsers with the native host, which runs no script mods: test them with psxw mod test"),
+                crate::webtest::PageMod::Script(..) => bail!("--test compares the browsers with the native host, which runs no script mods: test them with psxw mod test"),
             }
         }
         return crate::webtest::game_with(ws, game, &args, Some(report), &modules);
@@ -684,11 +944,16 @@ pub struct Direct<'a> {
     pub game: &'a str,
     pub out_root: Option<PathBuf>,
     pub cache: &'a Cache,
+    /// The snapshot script mods' `game` comes from (the bundle's when none).
+    pub snapshot: Option<PathBuf>,
 }
 
 impl Builds for Direct<'_> {
     fn ws(&self) -> &Workspace {
         self.ws
+    }
+    fn snapshot(&self) -> Option<PathBuf> {
+        self.snapshot.clone()
     }
     fn game(&self) -> &str {
         self.game
@@ -714,6 +979,9 @@ pub struct InWorkspace<'a> {
 impl Builds for InWorkspace<'_> {
     fn ws(&self) -> &Workspace {
         self.psx
+    }
+    fn snapshot(&self) -> Option<PathBuf> {
+        self.m.snapshot_path().ok()
     }
     fn game(&self) -> &str {
         self.m.game()
@@ -803,7 +1071,7 @@ pub fn ci(ws: &Workspace, game: &str) -> Result<(bool, String)> {
     let mods_dir = ws.root.join("games").join(game).join("mods");
     let (a, b) = (mods_dir.join("conflict-a"), mods_dir.join("conflict-b"));
     let cache = Cache::default();
-    let direct = Direct { ws, game, out_root: Some(dir.clone()), cache: &cache };
+    let direct = Direct { ws, game, out_root: Some(dir.clone()), cache: &cache, snapshot: None };
     if a.is_dir() && b.is_dir() {
         let (_, table) = build::table(ws, game)?;
         for (first, last) in [(&a, &b), (&b, &a)] {
@@ -877,6 +1145,11 @@ pub fn ci(ws: &Workspace, game: &str) -> Result<(bool, String)> {
         }
     }
 
+    // M12: script mods, in Chromium and Firefox.
+    if mods_dir.is_dir() {
+        script_gate(ws, game, &dir, &mods_dir, &cache, &mut note)?;
+    }
+
     // The pinned mods repository: check, build and test, against this
     // psx-wasm.
     if let Some(pin) = ws.lock.mods.get(game) {
@@ -893,6 +1166,264 @@ pub fn ci(ws: &Workspace, game: &str) -> Result<(bool, String)> {
         b.linked(&compiled)?;
         let ok = crate::modtest::run_tests(&b, &cache, &sdk, &mods, None, &m.build_dir(&label).join("tests"))?;
         note(ok, format!("{game} mods @ {}: build and tests", pin.short()));
+        // Script mods (plans/M12): the repo's types, and every mod outside
+        // that selection tested alone (script twins in the browsers, each
+        // `same_as` its compiled mod).
+        psxw_modkit::workspace::sdk_types(&m, ws, None)?;
+        let all = m.all_any()?;
+        let scripts = scripts_of(&all);
+        let errors = typecheck(ws, &m.sdk_dir(), &scripts)?;
+        note(errors.is_empty(), format!("{game} mods @ {}: {} script mods type-check{}", pin.short(), scripts.len(), errors.first().map(|e| format!(": {e}")).unwrap_or_default()));
+        for x in all.iter().filter(|x| !mods.iter().any(|y| y.id() == x.id())) {
+            let ok = crate::modtest::run_tests(&b, &cache, &sdk, std::slice::from_ref(x), None, &m.build_dir(x.id()).join("tests"))?;
+            note(ok, format!("{game} mods @ {}: {}'s tests{}", pin.short(), x.id(), if x.is_script() { " in both browsers" } else { "" }));
+        }
     }
     Ok((pass, detail.join("; ")))
+}
+
+/// The `mods` gate's script part (plans/M12), in Chromium and Firefox. Every
+/// game fact comes from the game's test mods and their tests:
+///
+/// - phase 2: the C snapshot against the census probe and the address map;
+///   the script mods type-check, the fixture (`fixtures/bad-types`) fails
+///   with exactly its marked errors;
+/// - the script twins' tests (each `same_as` its compiled mod), pinned to
+///   the symbol-list snapshot: names alone are enough;
+/// - the script pass-through over title-to-gameplay;
+/// - conflicts across both kinds (the `conflict-a`/`conflict-b` pairs);
+/// - phase 3: decomp iterations (`iterations/`), the DWARF and C frontends
+///   agreeing, and a twin's tests on a base where its target's slot is o32.
+fn script_gate(ws: &Workspace, game: &str, dir: &Path, mods_dir: &Path, cache: &Cache, note: &mut dyn FnMut(bool, String)) -> Result<()> {
+    use crate::webtest::{PageMod, PageRun};
+    let (_, table) = build::table(ws, game)?;
+    let mut twins: Vec<PathBuf> = std::fs::read_dir(mods_dir)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.join("mod.js").is_file()).collect();
+    twins.sort();
+    if twins.is_empty() {
+        return Ok(());
+    }
+
+    // Phase 2: snapshots and types.
+    let (symbols, snap) = build::snapshots(ws, game)?;
+    let a = verify_snapshot(ws, game, &snap)?;
+    if !a.disagreements.is_empty() {
+        std::fs::write(dir.join("snapshot-disagreements.txt"), a.disagreements.join("\n"))?;
+    }
+    note(
+        a.disagreements.is_empty() && a.layouts > 0,
+        format!("C snapshot {}: agrees with the census probe on {} layouts and the address map on {} addresses ({} disagreements)", snap.hash(), a.layouts, a.addresses, a.disagreements.len()),
+    );
+    let sdk = direct_sdk(ws, game)?;
+    let scripts: Vec<psxw_modkit::script::ScriptMod> = twins.iter().map(|t| psxw_modkit::script::ScriptMod::load(t)).collect::<Result<_>>()?;
+    let errors = typecheck(ws, &sdk, &scripts.iter().collect::<Vec<_>>())?;
+    note(errors.is_empty(), format!("{} script mods type-check against game.d.ts{}", scripts.len(), errors.first().map(|e| format!(": {e}")).unwrap_or_default()));
+    let fixture = ws.root.join("games").join(game).join("fixtures").join("bad-types");
+    if fixture.join("mod.js").is_file() {
+        let f = psxw_modkit::script::ScriptMod::load(&fixture)?;
+        let text = std::fs::read_to_string(fixture.join("mod.js"))?;
+        let marked: Vec<usize> = text.lines().enumerate().filter(|(_, l)| l.contains("// error:")).map(|(i, _)| i + 1).collect();
+        let errors = typecheck(ws, &sdk, &[&f])?;
+        let lines: Vec<usize> = errors.iter().filter_map(|e| e.split_once(".js(").and_then(|(_, r)| r.split(',').next()).and_then(|n| n.parse().ok())).collect();
+        let ok = errors.len() == marked.len() && lines == marked;
+        note(ok, format!("the type-check fixture fails with exactly its {} marked errors (got {}: lines {lines:?})", marked.len(), errors.len()));
+        if !ok {
+            std::fs::write(dir.join("typecheck-fixture.txt"), errors.join("\n"))?;
+        }
+    }
+
+    // The twins' tests, pinned to the symbol-list snapshot (phase 3: names
+    // alone are enough); a conflict twin with its pair applied first.
+    let snaps = dir.join("snapshots");
+    std::fs::create_dir_all(&snaps)?;
+    let symbols_path = snaps.join(format!("{}.json", symbols.hash()));
+    std::fs::write(&symbols_path, symbols.to_json())?;
+    let names_only = Direct { ws, game, out_root: Some(dir.to_path_buf()), cache, snapshot: Some(symbols_path.clone()) };
+    let pair = |id: &str| -> Option<String> {
+        let rest = id.strip_prefix("conflict-")?;
+        let (x, suffix) = rest.split_once('-').map_or((rest, ""), |(x, s)| (x, s));
+        let other = if x == "a" { "b" } else { "a" };
+        Some(if suffix.is_empty() { format!("conflict-{other}") } else { format!("conflict-{other}-{suffix}") })
+    };
+    for t in &twins {
+        let m = AnyMod::load(t)?;
+        let id = m.id().to_string();
+        let mut sel = vec![m];
+        if let Some(p) = pair(&id).map(|p| mods_dir.join(p)).filter(|p| p.is_dir()) {
+            sel.insert(0, AnyMod::load(&p)?);
+        }
+        let ok = crate::modtest::run_tests(&names_only, cache, &table, &sel, Some(&id), &dir.join(format!("script-{id}")).join("tests"))?;
+        note(ok, format!("{id}: its tests in both browsers, by names alone (symbol-list snapshot {})", symbols.hash()));
+    }
+
+    let base = cache.base(ws, game)?;
+    let (replay, _) = crate::wholegame::replay(ws, game, Some("title-to-gameplay"))?;
+    let frames = psxw_abi::replay::Header::parse(&replay).map_or(6000, |h| h.frames as u64);
+    let at: Vec<u64> = (1..=4).map(|k| frames * k / 4).collect();
+    let browsers: Vec<String> = crate::modtest::BROWSERS.iter().map(|s| s.to_string()).collect();
+    let page = |tag: &str, mods: Vec<PageMod>, frames: u64, at: Vec<u64>| PageRun {
+        tag: format!("gate-{tag}"),
+        mods,
+        swaps: vec![],
+        replay: replay.clone(),
+        frames,
+        hash_at: at,
+        watch: vec![],
+        commands: vec![],
+        browsers: browsers.clone(),
+        timeout: (frames / 4 + 600) as u32,
+    };
+
+    // The pass-through on every hookable function: bit-identical to the
+    // plain build, with waits held while JS was on the stack.
+    let pt_dir = dir.join("pass-through-js");
+    let n = crate::passthrough::generate_script(ws, game, &pt_dir)?;
+    let plain = cache.plain(ws, game)?;
+    let (s0, want) = hashes(ws, game, &plain.wasm, &replay, frames, &at, dir.join("storage-plain-js"))?;
+    for r in &crate::webtest::page_runs(ws, game, &base, &page("pass-through", vec![PageMod::script(pt_dir.clone())], frames, at.clone()))? {
+        let same = r.reached_limit() && s0 == Stop::FrameLimit && r.hashes() == want;
+        let held = r.report().and_then(|e| e["held_waits"].as_u64()).unwrap_or(0);
+        if !same {
+            std::fs::write(dir.join(format!("pass-through-js-{}.txt", r.browser)), format!("plain {s0:?} {want}\n{} {} {}\n", r.browser, r.stop, r.hashes()))?;
+        }
+        note(same, format!("{}: script pass-through on {n} functions: title-to-gameplay ({frames} frames) {} ({:.0} s)", r.browser, if same { "bit-identical to the plain build" } else { "differs" }, r.seconds));
+        note(held > 0, format!("{}: {held} vblank waits held while JS was on the stack", r.browser));
+    }
+
+    // Conflicts: script over script, and script over compiled. The check
+    // and the loader each warn naming both mods; the last applied runs
+    // (its own tests, with its pair applied first).
+    for (first, last) in [("conflict-a-js", "conflict-b-js"), ("conflict-a", "conflict-b-js")] {
+        let (fd, ld) = (mods_dir.join(first), mods_dir.join(last));
+        if !fd.is_dir() || !ld.is_dir() {
+            continue;
+        }
+        let sel = vec![AnyMod::load(&fd)?, AnyMod::load(&ld)?];
+        let warned = |w: &str| w.contains(first) && w.contains(last) && w.contains(&format!("{last}'s runs"));
+        let (plan, _) = plan_any(ws, &table, &sel)?;
+        note(plan.warnings.iter().any(|w| warned(w)), format!("{first} then {last}: psxw mod check warns naming both, {last} wins"));
+        let page_mods = page_mods(&sel, &direct_modules(ws, game, dir, cache, &sel)?, None);
+        for r in &crate::webtest::page_runs(ws, game, &base, &page(&format!("conflict-{first}"), page_mods, 60, vec![60]))? {
+            let w = r.events.iter().filter(|e| e["event"] == "mods").flat_map(|e| e["warnings"].as_array().cloned().unwrap_or_default()).any(|w| warned(w.as_str().unwrap_or("")));
+            note(w, format!("{}: {first} then {last}: the loader warns naming both, {last} wins", r.browser));
+        }
+        let ok = crate::modtest::run_tests(&names_only, cache, &table, &sel, Some(last), &dir.join(format!("conflict-{first}")).join("tests"))?;
+        note(ok, format!("{first} then {last}: {last}'s replacement is the one that runs"));
+    }
+
+    phase3_gate(ws, game, dir, mods_dir, &twins, &table, &snap, cache, note)
+}
+
+/// The compiled mods of a selection as modules, for the gate's page runs.
+fn direct_modules(ws: &Workspace, game: &str, dir: &Path, cache: &Cache, sel: &[AnyMod]) -> Result<Vec<PathBuf>> {
+    let d = Direct { ws, game, out_root: Some(dir.to_path_buf()), cache, snapshot: None };
+    d.modules(&psxw_modkit::script::compiled(sel))
+}
+
+/// Phase 3 of the gate: decomp iterations, the frontends agreeing, slot
+/// flavours.
+#[allow(clippy::too_many_arguments)]
+fn phase3_gate(
+    ws: &Workspace,
+    game: &str,
+    dir: &Path,
+    mods_dir: &Path,
+    twins: &[PathBuf],
+    table: &SymbolTable,
+    snap: &psxw_modkit::snapshot::Snapshot,
+    cache: &Cache,
+    note: &mut dyn FnMut(bool, String),
+) -> Result<()> {
+    let manifest = ws.game(game)?;
+    let pin = ws.game_pin(&manifest)?.commit.clone();
+    let snaps = dir.join("snapshots");
+
+    // Iterations: the previous decomp pin's snapshot against this one's.
+    let iterations = ws.root.join("games").join(game).join("iterations");
+    if let (Some(prev), true) = (manifest.mods.previous_decomp.clone(), iterations.is_dir()) {
+        let (_, old) = build::snapshots_at(ws, game, &prev)?;
+        let mut bumped = snap.clone();
+        let b = psxw_modkit::snapshot::bump(&old, &mut bumped);
+        note(
+            !b.renames.is_empty(),
+            format!("--bump {} -> {}: {} renamed (old names kept as aliases), {} layout changes, {} gone", &prev[..7], &pin[..7], b.renames.len(), b.layouts.len(), b.removals.len()),
+        );
+        let save = |s: &psxw_modkit::snapshot::Snapshot| -> Result<PathBuf> {
+            let p = snaps.join(format!("{}.json", s.hash()));
+            std::fs::write(&p, s.to_json())?;
+            Ok(p)
+        };
+        let (old_path, new_path, bumped_path) = (save(&old)?, save(snap)?, save(&bumped)?);
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&iterations)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.join("mod.js").is_file()).collect();
+        dirs.sort();
+        let pinned = |p: &Path, to: &Path| -> Result<AnyMod> {
+            let mut s = psxw_modkit::script::ScriptMod::load(p)?;
+            s.snapshot = Some(to.to_path_buf());
+            Ok(AnyMod::Script(s))
+        };
+        let olds: Vec<&PathBuf> = dirs.iter().filter(|d| d.file_name().is_some_and(|n| n.to_string_lossy().starts_with("old-"))).collect();
+        // A mod using an old name: its check warns, and it runs on the
+        // bumped snapshot, the old name an alias.
+        for d in &olds {
+            let m = pinned(d, &bumped_path)?;
+            let (plan, _) = plan_any_in(ws, table, std::slice::from_ref(&m), Some(&bumped))?;
+            note(plan.warnings.iter().any(|w| w.contains("was renamed")), format!("{}: its check warns its old name was renamed ({})", m.id(), plan.warnings.join("; ")));
+            let ok = crate::modtest::run_tests(&Direct { ws, game, out_root: Some(dir.to_path_buf()), cache, snapshot: None }, cache, table, &[m.clone()], None, &dir.join(format!("iter-{}", m.id())).join("tests"))?;
+            note(ok, format!("{}: runs on the current snapshot, by its old name", m.id()));
+        }
+        // Mods pinned to each snapshot, loaded together.
+        let sel: Vec<AnyMod> = dirs
+            .iter()
+            .map(|d| if olds.contains(&d) { pinned(d, &old_path) } else { pinned(d, &new_path) })
+            .collect::<Result<_>>()?;
+        let ok = crate::modtest::run_tests(&Direct { ws, game, out_root: Some(dir.to_path_buf()), cache, snapshot: None }, cache, table, &sel, None, &dir.join("iterations").join("tests"))?;
+        note(ok, format!("mods pinned to snapshots {} ({}) and {} ({}) load together and pass their tests", old.hash(), &prev[..7], snap.hash(), &pin[..7]));
+    }
+
+    // The DWARF and C frontends agree.
+    let view = build::dwarf_view(ws, game)?;
+    let (n, d) = psxw_modkit::dwarf::agree(snap, &view);
+    note(d.is_empty() && n > 0, format!("DWARF ({} units) and the C frontend agree on the {n} records and globals both describe{}", view.units, d.first().map(|x| format!(": {x}")).unwrap_or_default()));
+
+    // Slot flavours: the first twin hooking a C-typed function passes its
+    // tests on a base built with that function translated (its slot o32).
+    let defs = script_defs(ws, &twins.iter().map(|t| psxw_modkit::script::ScriptMod::load(t)).collect::<Result<Vec<_>>>()?.iter().collect::<Vec<_>>())?;
+    let base = cache.base(ws, game)?;
+    let slots = |wasm: &str| -> Result<std::collections::BTreeMap<(String, u32), String>> {
+        let bytes = std::fs::read(wasm)?;
+        let mut out = std::collections::BTreeMap::new();
+        for p in wasmparser::Parser::new(0).parse_all(&bytes) {
+            if let wasmparser::Payload::CustomSection(c) = p? {
+                if c.name() == psxw_link::game::exports::SLOTS_SECTION {
+                    for l in String::from_utf8_lossy(c.data()).lines() {
+                        let mut it = l.splitn(3, ' ');
+                        if let (Some(c), Some(a), Some(f)) = (it.next(), it.next(), it.next()) {
+                            out.insert((c.to_string(), psxw_inputs::parse_u32(a).unwrap_or(0)), f.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    };
+    let normal = slots(&base.wasm)?;
+    let found = twins.iter().zip(&defs).find_map(|(t, def)| {
+        let def = def.as_ref().ok()?;
+        def.hooks.iter().find_map(|h| {
+            let name = h.target.symbol.clone()?;
+            let f = table.resolve_func(&h.target).ok()?;
+            normal.get(&(f.container.clone(), f.addr)).filter(|fl| fl.starts_with("c ")).map(|_| (t.clone(), name, f.container.clone(), f.addr))
+        })
+    });
+    if let Some((twin, name, c, addr)) = found {
+        let (lift, _) = psxw_build::game::build(ws, &Options { moddable: true, lift: vec![name.clone()], ..Options::new(game) })?;
+        let flavour = slots(&lift.wasm)?.get(&(c.clone(), addr)).cloned().unwrap_or_default();
+        note(flavour == "o32", format!("a base built with {name} translated: its slot is {flavour:?} (C-typed in the moddable base)"));
+        let lift_cache = Cache::with_base(lift, true);
+        let m = AnyMod::load(&twin)?;
+        let id = m.id().to_string();
+        let ok = crate::modtest::run_tests(&Direct { ws, game, out_root: Some(dir.join("lift")), cache: &lift_cache, snapshot: None }, &lift_cache, table, &[m], None, &dir.join(format!("lift-{id}")).join("tests"))?;
+        note(ok, format!("{id}: its tests pass on both bases ({name}'s slot C-typed, then o32)"));
+    }
+    let _ = mods_dir;
+    Ok(())
 }

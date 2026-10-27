@@ -30,6 +30,19 @@ pub struct TestSpec {
     /// called at vblanks, inside the game.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<Command>,
+    /// Mods swapped into the tested mod's place at vblanks (a reload when
+    /// it names the mod itself). A `same_as` run has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swap: Vec<Swap>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Swap {
+    pub at: u64,
+    /// A mod beside this one (the same mods directory).
+    #[serde(rename = "mod")]
+    pub with: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +138,8 @@ pub enum Expect {
     /// contains this.
     Log { contains: String },
     /// The run's RAM, VRAM and audio hashes equal a run with mod `mod` in
-    /// this mod's place, with the same commands at the same vblanks.
+    /// this mod's place throughout (no swaps), with the same commands at
+    /// the same vblanks.
     SameAs {
         #[serde(rename = "mod")]
         with: String,

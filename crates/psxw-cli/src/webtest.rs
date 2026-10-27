@@ -26,7 +26,7 @@ pub const USAGE: &str = "web-test gpu [--browsers chromium,firefox] [--timeout S
                          | web-test storage [--browsers ..] [--timeout S] \
                          | web-test conform <game> [--browsers ..] [--timeout S] \
                          | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--record] [--debug] [--browsers ..] [--timeout S] \
-                         | web-test pacing <game> [--seconds N] [--browsers ..]";
+                         | web-test pacing <game> [--seconds N | --replay R] [--moddable] [--mod DIR].. [--tag T] [--browsers ..]";
 const IMAGE: &str = "psxw-browsers:local";
 
 #[derive(Serialize, Deserialize)]
@@ -317,16 +317,48 @@ pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_
 }
 
 /// A mod as the page loads it: a module (compiled, M11 phase 2), or a
-/// script mod's directory, with its `mod.js` (plans/M12).
+/// script mod's directory, with its `mod.js` (plans/M12), and the snapshot
+/// its `game` comes from (the bundle's when none).
 #[derive(Debug, Clone)]
 pub enum PageMod {
     Module(PathBuf),
-    Script(PathBuf),
+    Script(PathBuf, Option<PathBuf>),
+}
+
+impl PageMod {
+    pub fn script(dir: PathBuf) -> Self {
+        PageMod::Script(dir, None)
+    }
+}
+
+/// A script mod copied for the page, with its `psxmod.json` naming its
+/// snapshot (copied into the bundle's `snapshots/`).
+pub fn place_script(dir: &std::path::Path, snapshot: Option<&std::path::Path>, bundle: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    copy_js(dir, to)?;
+    if let Some(snap) = snapshot {
+        let name = snap.file_name().context("snapshot file")?.to_string_lossy().into_owned();
+        std::fs::create_dir_all(bundle.join("snapshots"))?;
+        let dst = bundle.join("snapshots").join(&name);
+        if !dst.is_file() {
+            std::fs::copy(snap, &dst)?;
+        }
+        let rel = to.strip_prefix(bundle).map(|r| r.components().count()).unwrap_or(2);
+        let up = "../".repeat(rel);
+        std::fs::write(to.join("psxmod.json"), serde_json::json!({ "snapshot": format!("{up}snapshots/{name}") }).to_string())?;
+    }
+    Ok(())
 }
 
 impl PageMod {
     /// Into the bundle's `mods/`; the URL the page loads it from.
     pub fn place(&self, bundle: &std::path::Path) -> Result<String> {
+        self.place_as(bundle, "")
+    }
+
+    /// The same, a script mod at its own URL (`<dir><suffix>/mod.js`): a
+    /// module the page imported once is never imported again from the same
+    /// URL.
+    pub fn place_as(&self, bundle: &std::path::Path, suffix: &str) -> Result<String> {
         let mods = bundle.join("mods");
         std::fs::create_dir_all(&mods)?;
         match self {
@@ -335,9 +367,9 @@ impl PageMod {
                 std::fs::copy(p, mods.join(&name))?;
                 Ok(format!("mods/{name}"))
             }
-            PageMod::Script(dir) => {
-                let name = dir.file_name().context("script mod directory")?.to_string_lossy().into_owned();
-                copy_js(dir, &mods.join(&name))?;
+            PageMod::Script(dir, snapshot) => {
+                let name = format!("{}{suffix}", std::path::absolute(dir)?.file_name().context("script mod directory")?.to_string_lossy());
+                place_script(dir, snapshot.as_deref(), bundle, &mods.join(&name))?;
                 Ok(format!("mods/{name}/mod.js"))
             }
         }
@@ -428,8 +460,8 @@ pub fn page_runs(ws: &Workspace, game: &str, base: &psxw_build::game::Report, ru
         urls.push(m.place(&bundle)?);
     }
     let mut swaps = Vec::new();
-    for (f, i, m) in &run.swaps {
-        swaps.push(format!("&swap={f}:{i}:{}", m.place(&bundle)?));
+    for (k, (f, i, m)) in run.swaps.iter().enumerate() {
+        swaps.push(format!("&swap={f}:{i}:{}", m.place_as(&bundle, &format!("@swap{k}"))?));
     }
     let test = serde_json::json!({
         "watch": run.watch.iter().map(|&(a, n)| serde_json::json!([a, n])).collect::<Vec<_>>(),
@@ -503,26 +535,58 @@ pub fn page_runs(ws: &Workspace, game: &str, base: &psxw_build::game::Report, ru
 fn pacing(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
     let mut seconds = 60u64;
+    // Cost (plans/M12 task 13): a replay instead of idling, on the
+    // moddable base, with mods loaded at start.
+    let mut replay_name: Option<String> = None;
+    let mut moddable = false;
+    let mut mods: Vec<PageMod> = Vec::new();
+    let mut tag = String::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {
             "--browsers" => browsers = it.next().context("--browsers needs a value")?.split(',').map(str::to_string).collect(),
             "--seconds" => seconds = it.next().context("--seconds needs a value")?.parse()?,
+            "--replay" => replay_name = Some(it.next().context("--replay needs a value")?.to_string()),
+            "--moddable" => moddable = true,
+            "--mod" => {
+                let d = std::path::PathBuf::from(it.next().context("--mod needs a mod directory or module")?);
+                mods.push(if d.join("mod.js").is_file() { PageMod::script(d) } else { PageMod::Module(d) });
+                moddable = true;
+            }
+            "--tag" => tag = format!("-{}", it.next().context("--tag needs a value")?),
             other => bail!("unknown option {other}"),
         }
     }
     let disc = ws.disc(game)?;
-    let bundle = psxw_build::web::build_into(ws, game, ws.out_dir().join("web").join(format!("test-{game}")))?;
+    let dir = ws.out_dir().join("web").join(format!("test-{game}{tag}"));
+    let bundle = if moddable {
+        let (base, _) = psxw_build::game::build(ws, &psxw_build::game::Options { moddable: true, ..psxw_build::game::Options::new(game) })?;
+        crate::mods::moddable_bundle(ws, game, &base, dir)?
+    } else {
+        psxw_build::web::build_into(ws, game, dir)?
+    };
     std::fs::create_dir_all(bundle.join("disc"))?;
     // NTSC, as the worker paces it (`web/worker.js`).
     let hz = 59.826;
-    let frames = (seconds as f64 * hz).round() as u64;
+    let mut frames = (seconds as f64 * hz).round() as u64;
+    let mut extra = String::new();
+    if let Some(r) = &replay_name {
+        let replay = crate::wholegame::replay(ws, game, Some(r))?.0;
+        frames = psxw_abi::replay::Header::parse(&replay).map_or(frames, |h| h.frames as u64);
+        seconds = (frames as f64 / hz).ceil() as u64;
+        std::fs::write(bundle.join("replay.rpl"), &replay)?;
+        extra += "&replay=replay.rpl";
+    }
+    if !mods.is_empty() {
+        let urls = mods.iter().map(|m| m.place(&bundle)).collect::<Result<Vec<_>>>()?;
+        extra += &format!("&mods={}", urls.join(","));
+    }
     let id = image(ws)?;
-    let results = ws.out_dir().join("web").join(format!("test-{game}-pacing"));
+    let results = ws.out_dir().join("web").join(format!("test-{game}-pacing{tag}"));
     let _ = std::fs::remove_dir_all(&results);
     std::fs::create_dir_all(&results)?;
     let cue = disc.file_name().context("disc name")?.to_string_lossy().into_owned();
-    let page = format!("index.html?discurl=disc/{cue}&autostart&frames={frames}&post");
+    let page = format!("index.html?discurl=disc/{cue}&autostart&frames={frames}&post{extra}");
     let mut argv_args: Vec<String> = vec![page, (seconds * 3 + 120).to_string()];
     argv_args.extend(browsers.iter().cloned());
     let disc_dir = disc.parent().context("disc directory")?.to_path_buf();
@@ -554,8 +618,11 @@ fn pacing(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         );
         report.push(serde_json::json!({ "browser": b, "frames": reached, "seconds": wall, "drift": drift, "late": r["lagFrames"], "frame_ms": r["frameMs"], "within_one_frame": ok }));
     }
-    let path = ws.out_dir().join("web").join(format!("pacing-{game}.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(&serde_json::json!({ "game": game, "seconds": seconds, "hz": hz, "machine": machine, "browsers": report }))?)?;
+    let path = ws.out_dir().join("web").join(format!("pacing-{game}{tag}.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::json!({ "game": game, "seconds": seconds, "hz": hz, "machine": machine, "replay": replay_name, "moddable": moddable, "browsers": report }))?,
+    )?;
     match &machine {
         Some(m) => println!("pacing on {m}: {}", if pass { "PASS" } else { "FAIL" }),
         None => println!("pacing: {} (reported only: psxw.local.toml states no machine)", if pass { "within one frame" } else { "outside one frame" }),

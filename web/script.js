@@ -19,6 +19,7 @@
 //   never while game code runs.
 
 import { calls as callsModule, layer, slotType } from "./shims.js";
+import { Types } from "./types.js";
 
 const MOD = Symbol.for("psxw.mod");
 const TARGET = Symbol.for("psxw.target");
@@ -107,10 +108,11 @@ export class Calls {
   }
 }
 
-/** A snapshot's indexes, for its `game`s. */
+/** A snapshot's indexes and types, for its `game`s. */
 class Names {
-  constructor(snapshot) {
+  constructor(snapshot, mem, window) {
     this.snapshot = snapshot;
+    this.types = new Types(snapshot, mem, window);
     this.main = snapshot.main;
     this.containers = new Map(snapshot.containers.map((c) => [c.id, c]));
     this.functions = new Map();
@@ -194,7 +196,8 @@ export class ScriptHost {
     this.hostDepth = 0;
     // Errors that came out of game code, which handlers pass on.
     this.fromGame = new WeakSet();
-    this.names = new Names(snapshot);
+    this.dv = () => new DataView(this.x.memory.buffer);
+    this.names = new Names(snapshot, this.dv, windowBase);
     this.snapshots = new Map([[snapshot.source?.version ?? "bundle", this.names]]);
     this.records = new Map();
     this.pending = [];
@@ -209,6 +212,7 @@ export class ScriptHost {
     this.runAddress = loader.synthetic(1);
     exports.psxmod_dispatch.set(this.loader.tableIndex(this.runAddress), this.helpers.run);
     this.game = this.makeGame(this.names);
+    this.names.game = this.game;
     this.mem = this.makeMem();
   }
 
@@ -273,9 +277,18 @@ export class ScriptHost {
     if (!this.inGame()) {
       throw new Error(`${t.name}: game functions run only inside the game (in a hook, a command, init, or psx.run(() => …))`);
     }
+    const ty = t.flavour ? slotType(t.flavour) : slotType("o32");
+    if (t.typed === undefined) t.typed = (t.sig && t.types.signature(t.sig, ty, this.hi, () => this.x.__guest_sp.value)) || null;
+    const typed = t.typed;
+    if (typed) {
+      return this.intoGame(() => {
+        if (t.slot !== undefined && !ty.o32) return typed.value(this.helpers[`c:${t.flavour}`](t.slot, ...typed.words(args)));
+        const [v0] = this.o32Call(t.address, typed.list(args));
+        return typed.value(v0);
+      });
+    }
     return this.intoGame(() => {
       if (t.slot !== undefined && t.flavour !== "o32") {
-        const ty = slotType(t.flavour);
         const words = [];
         ty.params.forEach((p, i) => {
           const v = args[i] ?? 0;
@@ -368,6 +381,8 @@ export class ScriptHost {
       flavour: s?.flavour,
       tier: s?.tier,
       snapshot: names.snapshot,
+      sig: f.signature || null,
+      types: names.types,
     };
     const call = (...args) => this.callGame(t, args);
     Object.defineProperties(call, {
@@ -429,10 +444,12 @@ export class ScriptHost {
         throw unknown("game", key);
       }),
     );
+    const types = names.types;
     Object.defineProperties(game, {
       addr: { value: Object.freeze(addr), enumerable: true },
       points: { value: Object.freeze(points), enumerable: true },
       snapshot: { value: names.snapshot.source, enumerable: true },
+      types: { enumerable: true, get: () => types.records() },
       at: {
         enumerable: true,
         /** A function by container and address (or name in that container). */
@@ -447,6 +464,17 @@ export class ScriptHost {
         },
       },
     });
+    // Typed globals: scalars as values, arrays and records as views.
+    for (const [n, list] of names.globals) {
+      if (list.length !== 1 || !list[0].type || n in game) continue;
+      const g = list[0];
+      const a = g.address >>> 0;
+      Object.defineProperty(game, n, {
+        enumerable: true,
+        get: () => types.get(g.type, a),
+        set: (v) => types.set(g.type, a, v, n),
+      });
+    }
     for (const [n, list] of names.functions) {
       if (list.length !== 1 || n in game) continue;
       Object.defineProperty(game, n, {
@@ -487,12 +515,55 @@ export class ScriptHost {
 
   // --- loading -------------------------------------------------------------
 
-  /** Import a script mod's module; its factory runs when it is installed. */
+  /**
+   * Import a script mod's module; its factory runs when it is installed.
+   * A `psxmod.json` beside it ({ "snapshot": URL }) names the snapshot its
+   * `game` comes from (D55); else the bundle's.
+   */
   async importMod(url, as) {
     const module = await import(url);
     const d = module.default;
     if (!d || !d[MOD]) throw new Error(`${url}: its default export isn't mod(factory)`);
-    return { url, factory: d[MOD], as };
+    let names = null;
+    let meta = null;
+    try {
+      const r = await fetch(new URL("psxmod.json", url), { cache: "no-store" });
+      if (r.ok) meta = await r.json();
+    } catch {}
+    if (meta && meta.snapshot) names = await this.snapshotAt(new URL(meta.snapshot, url).href);
+    return { url, factory: d[MOD], as, names };
+  }
+
+  /**
+   * A packed mod (`psxw mod pack`): its module, imported from a blob, and
+   * the part of its snapshot it uses, which must describe this binary.
+   */
+  async importPack(pack) {
+    if (!pack || pack.psxpack !== 1 || typeof pack.mod !== "string" || !pack.snapshot) throw new Error("not a mod pack (psxw mod pack)");
+    if (JSON.stringify(pack.snapshot.game) !== JSON.stringify(this.names.snapshot.game)) {
+      throw new Error(`${pack.id}: packed for another game binary than this bundle's`);
+    }
+    const url = URL.createObjectURL(new Blob([pack.mod], { type: "text/javascript" }));
+    const module = await import(url);
+    const d = module.default;
+    if (!d || !d[MOD]) throw new Error(`${pack.id}: its default export isn't mod(factory)`);
+    return { url, factory: d[MOD], names: new Names(pack.snapshot, this.dv, this.window) };
+  }
+
+  /** A snapshot by URL, read once. */
+  async snapshotAt(url) {
+    if (!this.snapshots.has(url)) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`${url}: ${r.status}`);
+      this.snapshots.set(url, new Names(await r.json(), this.dv, this.window));
+    }
+    return this.snapshots.get(url);
+  }
+
+  /** A snapshot's `game` (one per snapshot). */
+  gameOf(names) {
+    if (!names.game) names.game = names === this.names ? this.game : this.makeGame(names);
+    return names.game;
   }
 
   /** Install an imported mod at the next vblank: `op` load, reload or swap at `index`. */
@@ -530,8 +601,9 @@ export class ScriptHost {
   }
 
   /** Run a mod's factory, check its definition, build its layer and wire it in. */
-  install({ url, factory, as, index }) {
-    const m = { kind: "script", url, id: null, disabling: false, game: this.game, names: this.names };
+  install({ url, factory, as, index, names }) {
+    const own = names || this.names;
+    const m = { kind: "script", url, id: null, disabling: false, game: this.gameOf(own), names: own };
     m.id = as || "(loading)";
     const def = this.asHost(() => factory(this.api(m)));
     if (!def || typeof def !== "object") throw new Error(`${url}: the factory returned no definition`);
@@ -716,7 +788,7 @@ export class ScriptHost {
   /** The JS functions a layer's shim imports for slot `k`. */
   handlers(m, L, k, instance) {
     const ty = slotType(L.t.flavour);
-    const conv = convert(ty, this.hi);
+    const conv = (L.t.sig && L.t.types.signature(L.t.sig, ty, this.hi, () => this.x.__guest_sp.value)) || convert(ty, this.hi);
     const out = {};
     const name = L.t.name;
     if (L.before.length) {
@@ -768,13 +840,24 @@ export class ScriptHost {
         out[`${k}.core`] = (...w) => {
           this.inside++;
           let last = null;
+          const received = bare ? [] : conv.args(w);
+          // The arguments it was given pass on as the words they came in.
+          const same = (args) => args.length === received.length && args.every((a, i) => Object.is(a, received[i]));
           const original = (...args) => {
-            const words = args.length ? conv.words(args) : w;
+            const words = !args.length || same(args) ? w : conv.words(args);
             last = [next(words), this.hi.value];
             return conv.value(last[0]);
           };
           try {
-            return conv.out(bare ? fn(original) : fn(original, ...conv.args(w)));
+            const r = bare ? fn(original) : fn(original, ...received);
+            // Undefined passes the original's result on, whole.
+            if (r === undefined && last) {
+              this.hi.value = last[1];
+              return last[0];
+            }
+            // An o32 result keeps the last original's v1 unless the handler
+            // returns a bigint.
+            return conv.out(r, last ? last[1] : 0);
           } catch (e) {
             this.fault(m, `${name} around`, e);
             if (last) {
@@ -828,9 +911,11 @@ export class ScriptHost {
     return this.psx;
   }
 
-  /** Load a script mod by URL, after the others, at the next vblank. */
+  /** Load a script mod (its mod.js URL, or a pack), after the others, at the next vblank. */
   async load(url) {
+    if (typeof url === "object") return this.queue(await this.importPack(url));
     const abs = new URL(url, location.href).href;
+    if (/\.psxpack\.json(\?|$)/.test(abs)) return this.queue(await this.importPack(await (await fetch(abs)).json()));
     return this.queue(await this.importMod(abs));
   }
 
@@ -874,14 +959,14 @@ export class ScriptHost {
   }
 }
 
-/** A JS value as an o32 result word (its high word into `hi`). */
-function word(v, hi) {
+/** A JS value as an o32 result word (its high word into `hi`: a bigint's, else `v1`). */
+function word(v, hi, v1 = 0) {
   if (typeof v === "bigint") {
     const b = BigInt.asUintN(64, v);
     hi.value = Number(b >> 32n) | 0;
     return Number(b & 0xffffffffn) | 0;
   }
-  hi.value = 0;
+  hi.value = v1;
   if (v === undefined || v === null) return 0;
   if (typeof v === "boolean") return v ? 1 : 0;
   return Number(v) | 0;
@@ -933,9 +1018,9 @@ function convert(ty, hi) {
       if (r === "i64") return i64(lo, hi.value);
       return r ? lo : undefined;
     },
-    /** A handler's result as the shim takes it. */
-    out(v) {
-      if (ty.o32) return word(v, hi);
+    /** A handler's result as the shim takes it (`v1`: an o32 result's high word). */
+    out(v, v1 = 0) {
+      if (ty.o32) return word(v, hi, v1);
       if (r === "i64") {
         const [lo, h] = split64(v);
         hi.value = h;

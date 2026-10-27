@@ -46,8 +46,8 @@ export function scripting(worker) {
   return Object.freeze({
     /** A script mod's command or a compiled mod's global function, by name; its result. */
     cmd: (name, ...args) => ask("cmd", { name, args }),
-    /** Load a script mod (its mod.js URL) after the others, at the next vblank; its id. */
-    load: (url) => ask("load", { url: new URL(url, location.href).href }),
+    /** Load a script mod (its mod.js URL, or a pack's JSON) after the others, at the next vblank; its id. */
+    load: (url) => ask("load", typeof url === "object" ? { pack: url } : { url: new URL(url, location.href).href }),
     /** Re-import loaded script mod `id` (from `url`, or where it came from). */
     reload: (id, url) => ask("load", { reload: id, url: url && new URL(url, location.href).href }),
     async execute(address, ...args) {

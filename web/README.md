@@ -3,10 +3,11 @@
 The browser host (M5), plain ES modules with no build step:
 
 - `index.html`, `main.js`: the page. It imports a disc (.cue and .bin) into OPFS, polls the keyboard and gamepads into a SharedArrayBuffer, sets up audio (an AudioWorklet playing silence until M6), and starts the Worker.
-- `worker.js`: runs `game.wasm` and implements its host interface: pacing with `Atomics.wait`, disc reads from OPFS, pads, saves, and the renderer (`pkg/`, built from `crates/psxw-host-web`). Where the browser has JSPI (`WebAssembly.Suspending`), the game suspends once a vblank and gives the Worker's event loop a turn. Chromium frees the frames the Worker hands the page only there: without it the tab's memory grows by a frame a vblank (gigabytes a minute) until the GPU process dies and the screen goes black. Dev mode can't suspend (its JS trampolines sit between the game and `wait_vblank`) and warns in the console.
+- `worker.js`: runs `game.wasm` and implements its host interface (ABI 10: `vblank` for everything the guest sees, `wait_vblank` for pacing): pacing with `Atomics.wait`, disc reads from OPFS, pads, saves, and the renderer (`pkg/`, built from `crates/psxw-host-web`). Where the browser has JSPI (`WebAssembly.Suspending`), the game suspends once a vblank and gives the Worker's event loop a turn. Chromium frees the frames the Worker hands the page only there: without it the tab's memory grows by a frame a vblank (gigabytes a minute) until the GPU process dies and the screen goes black. Dev mode can't suspend (its JS trampolines sit between the game and `wait_vblank`) and warns in the console.
 - `disc.js`: .cue/.bin over OPFS sync access handles, with the native host's rules.
 - `cards.js`: memory cards in OPFS `saves/` (`card0.mcr`, `card1.mcr`), imported as raw 128 KiB images from the page before Start, and exported any time (during a run, the game's latest card). The Worker loads them at start and posts each card the game changes to the page, which writes it (`SaveQueue`).
 - `audio.js`: the AudioWorklet.
+- `mods.js`, `script.js`, `shims.js`: mods loaded at run time into a moddable base (M11 phase 2, M12): compiled mod modules, and script mods, whose wasm shims `shims.js` writes. See [Script mods](#script-mods) below.
 
 To try it:
 
@@ -28,7 +29,7 @@ Put the file at `games/<game>/replays/<name>.rpl`; then `--replay <name>` finds 
 
 Cards persist in this browser's OPFS between runs, so a session that saves can be followed by one that loads; export the card to keep it.
 
-## One-shot console scripting
+## Console scripting
 
 After Start and the first vblank, the browser console can call an existing
 compiled game function:
@@ -42,23 +43,80 @@ const v0 = Number(result & 0xffffffffn);
 
 `execute(address, ...args)` accepts up to four unsigned 32-bit o32 argument
 words and returns a Promise of the raw `v0 | (v1 << 32)` BigInt. It queues
-one call, runs it once outside runtime borrows, interrupt handlers and
-critical sections, and returns its result. Only one call may be pending.
-It requires JSPI and the merged module (not `?dev`); rebuild the bundle for
-ABI 8. Errors before readiness, while busy, or after stop reject the Promise.
+one call, runs it outside runtime borrows, interrupt handlers and critical
+sections, and returns its result. Calls queue in the Worker and run one at
+a time. It requires the merged module (not `?dev`). Errors before
+readiness or after stop reject the Promise.
 
-A mod loaded into a moddable bundle (`psxw mod watch`, the mod panel) can
-also be called by the name of one of its global functions, such as
-`execute("RotateWorld", 1)`. The console logs each one's synthetic address
+A loaded mod's commands (a script mod's) and global functions (a compiled
+mod's) can be called by name: `execute("RotateWorld", 1)`, or
+`cmd("RotateWorld", 1)`, which gives a script command its JS arguments and
+resolves with its JS result. The console logs each one's synthetic address
 when mods load or swap. `psxw run --execute FRAME:FUNC[:ARG,..]` does the
-same headless.
+same headless for compiled mods.
 
 This is an unsafe developer tool, not a sandbox: choose a valid function,
 the right arguments and a resident overlay. A bad call can trap or hang the
-game or corrupt its state; there is no rollback. It calls code already in
-`game.wasm`, not newly injected JS or wasm. Symbol lookup already exists in
-the build; source maps are for debugging and are not needed for this API.
-There are no persistent hooks or game-state wrappers yet.
+game or corrupt its state; there is no rollback.
+
+## Script mods
+
+A script mod (plans/M12) is one ES module, with no build step:
+
+```js
+// mods/gold-rush/mod.js
+export default mod(({ game, mem, hook, log }) => {
+  let rush = false;
+  return {
+    id: "gold-rush",
+    version: "0.1.0",
+    hooks: [
+      hook(game.AddGold, { around(original, amount, reason) { return original(rush ? amount * 10 : amount, reason); } }),
+      hook(game.points.frame, { after() { /* once a frame */ } }),
+    ],
+    data: [{ target: game.addr.gEnemyStats, offset: 4, type: "u16", value: 10 }],
+    commands: { GoldRush(on) { rush = !!on; return rush; } },
+  };
+});
+```
+
+- **Loading.** A moddable bundle (`psxw build-web <game> --moddable`, `psxw mod
+  play`, `psxw mod watch`) carries the game's names (`snapshot.json`).
+  `?mods=` takes `.js` URLs beside `.mod.wasm` ones, in load order; the mod
+  panel takes single-file `.js` mods; `wasmPsxScripting.load(url)` loads one
+  while the game runs. A mod is installed at the next vblank. `psxw mod
+  watch` publishes each saved script mod at a new URL
+  (`mods/<id>@<seq>/mod.js`), and the page reloads it in place.
+- **Hooks** take `before(...args)`, `after(result, ...args)`,
+  `replace(...args)` and `around(original, ...args)`. Each script mod's
+  shim is a layer in the hooked function's chain, beside compiled mods',
+  in load order; a later `replace` hides earlier layers, and the page
+  warns naming both mods. Arguments are the slot's raw values until the
+  snapshot types them: a C function's wasm values, an o32 function's
+  `a0`–`a3` (and `v0` for its result).
+- **Inside the game.** Game calls (`game.F(...)`) work in hooks, commands,
+  `init` and `psx.run(() => …)`; memory (`mem.u32(a)`, `mem.setU16(a, v)`)
+  anywhere. While JS runs, the runtime holds the host's vblank wait (ABI
+  10), so the picture may pause during a hook that waits for frames; the
+  game's own state is unaffected.
+- **Errors.** A handler that throws is logged; the call passes to the next
+  link and the mod is disabled at the next vblank.
+
+In the game Worker's console (DevTools: pick the Worker as the context):
+
+```js
+await psx.cmd("GoldRush", 1)                 // a command, inside the game
+psx.reload("gold-rush")                      // re-import mod.js at the next vblank
+psx.mods()                                   // loaded mods of both kinds, with their hooks
+const h = psx.hook(game.Rand, { after(r, limit) { console.log(limit, r); } });
+h.remove();
+psx.mem.u32(game.addr.gRandomState)          // memory reads work any time
+await psx.run(() => game.Rand(10))           // game calls run inside the game
+```
+
+`psxw mod test` runs a script mod's tests in headless Chromium and Firefox
+(`web-test`), and `psxw mod check` runs its factory against a stub API in
+Node to plan it with compiled mods.
 
 ## Debugging the C in DevTools
 

@@ -177,7 +177,7 @@ async function renderMods() {
       await writeOrder(order);
     };
     const name = document.createElement("span");
-    const at = loadedMods.indexOf(m.file.replace(/(\.mod)?\.(wasm|js)$/, ""));
+    const at = loadedMods.indexOf(m.file.replace(/(\.mod)?\.(wasm|js)$|\.psxpack\.json$/, ""));
     name.textContent = m.file + (at >= 0 ? `  (loaded, #${at + 1})` : "");
     const button = (label, fn, disabled) => {
       const b = document.createElement("button");
@@ -203,6 +203,11 @@ async function renderMods() {
         renderMods();
       }, running),
       button("Swap in", async () => {
+        if (m.file.endsWith(".psxpack.json")) {
+          const pack = JSON.parse(new TextDecoder().decode(await modBytes(m.file)));
+          say(`${m.file}: ${await window.wasmPsxScripting.load(pack).catch((e) => e.message)} (at the next vblank)`);
+          return;
+        }
         if (m.file.endsWith(".js")) {
           const url = URL.createObjectURL(new Blob([await modBytes(m.file)], { type: "text/javascript" }));
           const id = m.file.replace(/\.js$/, "");

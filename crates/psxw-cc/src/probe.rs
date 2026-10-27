@@ -110,7 +110,16 @@ pub fn probe_header(
     if entries.is_empty() {
         return Ok(Outcome::Probed { entries: Vec::new(), bitfields });
     }
+    probe_entries(clang, Some(reference), &head, &stem, entries, bitfields, work)
+}
 
+/// `head` (the includes a probe TU starts with), then each entry's value
+/// under clang for wasm32 and, given one, the reference compiler. Entries
+/// either compiler rejects are dropped and recorded, then the probe reruns.
+/// Without a reference compiler, `reference` stays `None`.
+pub fn probe_entries(clang: &Clang, reference: Option<&Reference>, head: &str, stem: &str, entries: Vec<Entry>, bitfields: u32, work: &Path) -> Result<Outcome> {
+    std::fs::create_dir_all(work)?;
+    let src = work.join(format!("{stem}.c"));
     let mut results: Vec<EntryResult> = entries
         .into_iter()
         .map(|entry| EntryResult { entry, reference: None, clang: None, reference_error: None, clang_error: None })
@@ -120,7 +129,7 @@ pub fn probe_header(
         if live.is_empty() {
             break;
         }
-        let mut probe = head.clone();
+        let mut probe = head.to_string();
         probe.push_str("#ifdef PSXW_GCC\n#define PSXW_OFF(T, f) ((unsigned int)&((T *)0)->f)\n#else\n#define PSXW_OFF(T, f) __builtin_offsetof(T, f)\n#endif\n");
         let mut line_of = BTreeMap::new();
         let mut line = probe.lines().count() as u32;
@@ -137,7 +146,10 @@ pub fn probe_header(
         let file_name = format!("{stem}.c");
 
         // Reference compiler.
-        let gcc = run_reference(reference, clang, &src, work, &stem)?;
+        let gcc = match reference {
+            Some(r) => run_reference(r, clang, &src, work, stem)?,
+            None => RefRun::Values(BTreeMap::new()),
+        };
         let mut progress = false;
         match gcc {
             RefRun::Values(values) => {
@@ -157,7 +169,7 @@ pub fn probe_header(
         }
 
         // clang.
-        let c = crate::compile::compile(clang, &src, work, &stem, &["PSXW_CLANG"], Some(&file_name))?;
+        let c = crate::compile::compile(clang, &src, work, stem, &["PSXW_CLANG"], Some(&file_name))?;
         if c.ok {
             let obj = c.object.as_ref().context("clang object")?;
             let values = read_clang_values(obj)?;
@@ -187,7 +199,9 @@ pub fn probe_header(
     Ok(Outcome::Probed { entries: results, bitfields })
 }
 
-fn entry(expr: String, ty: &str, field: Option<&String>) -> Entry {
+/// A probe entry: the C expression whose value is wanted, the type (or
+/// global) it belongs to, and the field it measures.
+pub fn entry(expr: String, ty: &str, field: Option<&String>) -> Entry {
     Entry { expr, ty: ty.to_string(), field: field.cloned(), line: 0 }
 }
 

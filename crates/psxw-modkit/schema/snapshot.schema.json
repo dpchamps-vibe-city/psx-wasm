@@ -1,0 +1,534 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://psx-wasm.invalid/schema/snapshot.schema.json",
+  "title": "psx-wasm snapshot (D55)",
+  "description": "One source's view of one game binary: identity hashes, functions and globals by container and address with names and types, record layouts, and type expressions as data. psxw mod sdk writes the workspace's; script mods' `game` and game.d.ts come from snapshots.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "game",
+    "source",
+    "main",
+    "containers",
+    "functions",
+    "globals"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "game": {
+      "type": "object",
+      "description": "The binary's identity hashes (identity.json).",
+      "required": [
+        "exe_sha256",
+        "containers",
+        "disc"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "exe_sha256": {
+          "type": "string"
+        },
+        "containers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "disc": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      }
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "main": {
+      "type": "string",
+      "description": "The executable's container."
+    },
+    "containers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "loaded",
+          "text"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "main": {
+            "type": "boolean"
+          },
+          "loaded": {
+            "$ref": "#/$defs/range"
+          },
+          "text": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/range"
+            }
+          }
+        }
+      }
+    },
+    "functions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "container",
+          "address",
+          "names"
+        ],
+        "properties": {
+          "container": {
+            "type": "string"
+          },
+          "address": {
+            "type": "integer"
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "The first is the name shown; the rest are aliases."
+          },
+          "deprecated": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Old or other sources' names: aliases."
+          },
+          "signature": {
+            "$ref": "#/$defs/signature"
+          },
+          "provenance": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source"
+            ],
+            "description": "Where a declaration came from; never read for meaning.",
+            "properties": {
+              "source": {
+                "type": "string"
+              },
+              "file": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "globals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "container",
+          "address",
+          "names"
+        ],
+        "properties": {
+          "container": {
+            "type": "string"
+          },
+          "address": {
+            "type": "integer"
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "The first is the name shown; the rest are aliases."
+          },
+          "deprecated": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "size": {
+            "type": "integer"
+          },
+          "type": {
+            "$ref": "#/$defs/type"
+          },
+          "provenance": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source"
+            ],
+            "description": "Where a declaration came from; never read for meaning.",
+            "properties": {
+              "source": {
+                "type": "string"
+              },
+              "file": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "types": {
+      "type": "object",
+      "description": "Records, enums and typedefs, by id (`struct Tag`, a typedef's name, `Parent.field` for a record inline in a field).",
+      "additionalProperties": {
+        "$ref": "#/$defs/typedef"
+      }
+    },
+    "points": {
+      "type": "object",
+      "description": "The manifest's named hook points.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "before": {
+            "type": "string"
+          },
+          "after": {
+            "type": "string"
+          },
+          "doc": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "dropped": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "What a frontend dropped, and why."
+    },
+    "unchecked": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "What a frontend kept with less evidence than usual, and why."
+    }
+  },
+  "$defs": {
+    "range": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "[start, end)."
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "symbols",
+            "c",
+            "dwarf",
+            "local",
+            "merged",
+            "file"
+          ]
+        },
+        "version": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "merged": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/source"
+          }
+        }
+      }
+    },
+    "type": {
+      "description": "A type, as data.",
+      "oneOf": [
+        {
+          "enum": [
+            "u8",
+            "s8",
+            "u16",
+            "s16",
+            "u32",
+            "s32",
+            "u64",
+            "s64",
+            "f32",
+            "f64",
+            "void"
+          ],
+          "description": "A width."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ptr"
+          ],
+          "properties": {
+            "ptr": {
+              "$ref": "#/$defs/type"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "array",
+            "count"
+          ],
+          "properties": {
+            "array": {
+              "$ref": "#/$defs/type"
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "0: unknown."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "record"
+          ],
+          "properties": {
+            "record": {
+              "type": "string",
+              "description": "A record's id in `types`."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "named"
+          ],
+          "properties": {
+            "named": {
+              "type": "string",
+              "description": "An enum or typedef in `types`."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fn"
+          ],
+          "properties": {
+            "fn": {
+              "$ref": "#/$defs/signature"
+            }
+          }
+        }
+      ]
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "params",
+        "result"
+      ],
+      "properties": {
+        "params": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "$ref": "#/$defs/type"
+              }
+            }
+          }
+        },
+        "result": {
+          "$ref": "#/$defs/type"
+        },
+        "variadic": {
+          "type": "boolean"
+        }
+      }
+    },
+    "typedef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "size",
+            "align",
+            "fields"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "struct",
+                "union"
+              ]
+            },
+            "size": {
+              "type": "integer"
+            },
+            "align": {
+              "type": "integer"
+            },
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "name",
+                  "offset",
+                  "type"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "type": {
+                    "$ref": "#/$defs/type"
+                  },
+                  "bits": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "A bitfield: bit offset in the word at `offset`, width."
+                  }
+                }
+              }
+            },
+            "provenance": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source"
+              ],
+              "description": "Where a declaration came from; never read for meaning.",
+              "properties": {
+                "source": {
+                  "type": "string"
+                },
+                "file": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "size",
+            "values"
+          ],
+          "properties": {
+            "kind": {
+              "const": "enum"
+            },
+            "size": {
+              "type": "integer"
+            },
+            "values": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "type"
+          ],
+          "properties": {
+            "kind": {
+              "const": "typedef"
+            },
+            "type": {
+              "$ref": "#/$defs/type"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

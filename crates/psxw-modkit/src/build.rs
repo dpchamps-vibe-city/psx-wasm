@@ -65,6 +65,64 @@ pub fn header_index(ws: &Workspace, prep: &Prepared) -> Result<HeaderIndex> {
     Ok(idx)
 }
 
+/// The game's snapshots (D55, plans/M12), cached per decomp commit in
+/// `out/modkit/<game>/`: the symbol-list frontend's, and the C-header
+/// frontend's (the symbol list with types).
+pub fn snapshots(ws: &Workspace, game: &str) -> Result<(crate::snapshot::Snapshot, crate::snapshot::Snapshot)> {
+    let (prep, table) = table(ws, game)?;
+    let (_, identity) = crate::workspace::pins(ws, game)?;
+    let symbols = crate::snapshot::from_symbols(&table, identity);
+    let dir = ws.out_dir().join("modkit").join(game);
+    let path = dir.join(format!("snapshot-c-v{}-{}.json", crate::cfront::FRONTEND_VERSION, &prep.commit[..7]));
+    if let Ok(s) = crate::snapshot::Snapshot::load(&path) {
+        if s.game == symbols.game {
+            return Ok((symbols, s));
+        }
+    }
+    let snap = snapshot(ws, game)?;
+    let manifest = &prep.inputs.manifest;
+    let work = dir.join("cfront");
+    let clang = psxw_cc::Clang::new(ws.clang()?, snap.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    let pin = ws.game_pin(manifest)?;
+    let checkout = ws.checkout(pin);
+    let tool = |p: &Path| if p.components().count() > 1 { checkout.join(p) } else { p.to_path_buf() };
+    let reference = psxw_cc::probe::Reference {
+        cpp: tool(&manifest.reference.cpp),
+        cppflags: manifest.reference.cppflags.clone(),
+        cc1: tool(&manifest.reference.cc1),
+        cc1flags: manifest.reference.cc1flags.clone(),
+    };
+    let reference = reference.cc1.is_file().then_some(reference);
+    eprintln!("snapshot: reading {}'s headers (C frontend)", game);
+    let c = crate::cfront::snapshot(symbols.clone(), &clang, reference.as_ref(), &snap, manifest, &prep.inputs.map, &work)?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&path, c.to_json())?;
+    Ok((symbols, c))
+}
+
+/// The DWARF frontend's snapshot (plans/M12 phase 3): the C-header
+/// frontend's `c` with the debug build's layouts (D53, built when needed).
+pub fn dwarf_snapshot(ws: &Workspace, game: &str, c: &crate::snapshot::Snapshot) -> Result<crate::snapshot::Snapshot> {
+    Ok(crate::dwarf::merge(c, &dwarf_view(ws, game)?))
+}
+
+/// What the debug build's DWARF says.
+pub fn dwarf_view(ws: &Workspace, game: &str) -> Result<crate::dwarf::DwarfView> {
+    let (r, _) = psxw_build::game::build(ws, &Options { debug: true, ..Options::new(game) })?;
+    let bytes = std::fs::read(&r.wasm)?;
+    crate::dwarf::read(&psxw_link::dwarf::sections(&bytes)?)
+}
+
+/// The game's snapshots at another commit of its decomp (plans/M12 phase
+/// 3): psx-wasm's pins with that commit (its census objects must exist).
+pub fn snapshots_at(ws: &Workspace, game: &str, commit: &str) -> Result<(crate::snapshot::Snapshot, crate::snapshot::Snapshot)> {
+    let manifest = ws.game(game)?;
+    let mut other = ws.clone();
+    let pin = other.lock.game.get_mut(&manifest.game.input).with_context(|| format!("inputs.lock has no [game.{}]", manifest.game.input))?;
+    pin.commit = commit.to_string();
+    snapshots(&other, game)
+}
+
 /// The game as mods see it, from a fresh build preparation.
 pub fn table(ws: &Workspace, game: &str) -> Result<(Prepared, SymbolTable)> {
     let prep = psxw_build::game::prepare(ws, &Options::new(game))?;

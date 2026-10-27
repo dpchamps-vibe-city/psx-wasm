@@ -1,0 +1,9 @@
+{
+  "replay": { "name": "title-to-gameplay" },
+  "frames": 900,
+  "swap": [{ "at": 300, "mod": "conflict-a-js" }],
+  "expect": [
+    { "kind": "no_trap" },
+    { "kind": "same_as", "mod": "conflict-a-js" }
+  ]
+}

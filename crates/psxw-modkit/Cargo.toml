@@ -22,3 +22,4 @@ wasmparser = "0.262.0"
 psxw-census = { path = "../psxw-census" }
 wasm-encoder = "0.262.0"
 bindgen = "0.73.2"
+gimli = "0.33.0"
