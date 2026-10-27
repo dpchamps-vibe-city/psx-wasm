@@ -424,7 +424,7 @@ D54 records this design.
     - a generated script pass-through: `before`, `after` and an `around`
       that calls `original`, on every hookable function;
     - the `mods` gate runs them in Chromium and Firefox.
-13. [ ] **Cost.** Measure frame time in Chromium and Firefox over
+13. [x] **Cost.** Measure frame time in Chromium and Firefox over
     `title-to-gameplay` with `web-test pacing`, for:
     - the plain bundle;
     - the moddable base (the number M11's exit criteria still owe);
@@ -793,3 +793,72 @@ export default mod(({ game, hook }) => {
   with their command at the same vblank; all four type-check.
 
 ## Findings
+
+- **Cost** (task 13; 2026-10-27, `web-test pacing --replay
+  title-to-gameplay`, 6000 vblanks paced at real time, this machine;
+  frame time is the wall time between vblanks less the pacing sleep):
+
+  | Bundle | Chromium p50 / p95 / p99 ms | Firefox p50 / p95 / p99 ms | Late frames (C / F) |
+  |---|---|---|---|
+  | Plain | 2.61 / 20.94 / 25.88 | 4.38 / 7.90 / 11.02 | 59 / 108 |
+  | Moddable base, no mods | 2.54 / 21.53 / 26.71 | 4.06 / 7.30 / 9.52 | 52 / 86 |
+  | Base, a no-op script `before` on `_padChkRC2wait` (~4,000 calls a vblank) | 3.01 / 21.81 / 30.54 | 4.82 / 8.18 / 11.50 | 159 / 97 |
+  | Base, a no-op script `after` on the `frame` point (once a frame) | 2.43 / 20.20 / 24.89 | 4.30 / 7.38 / 9.48 | 49 / 98 |
+
+  - The moddable base costs nothing measurable (the number M11's exit
+    criteria owed), nor does a once-a-frame hook.
+  - The hot hook adds about 0.4 ms a frame at the median in both
+    browsers: about 100 ns a call, the 16 ns shim-to-JS crossing plus the
+    wrapper (arguments, the bracket's two calls). Chromium fell behind
+    more often (159 late frames, 33 frames of drift that the 250 ms
+    resync absorbed).
+  - Firefox ends about 15 frames behind wall time over the replay in
+    every variant, the plain bundle included: its pacing, not M12's.
+  - A first set of runs overlapped a compile; its outliers (a 1 s
+    Firefox frame, 300 frames of Chromium drift) are discarded.
+- **ABI 10 changes nothing without JS.** Natively, `title-to-gameplay`,
+  `card-load`, `frozen-cutscene` and `start-no-cutscene-interaction` (6000
+  vblanks each) give the same RAM and VRAM hashes at 1500/3000/4500/6000
+  and the same audio under ABI 9 (`ed0e85a`, built in a worktree) and
+  ABI 10; the browsers equal the native host over `title-to-gameplay`
+  (`web-game`).
+- **Exactness needs two rules for `around`.** Calling `original` with the
+  arguments it was given passes the original words on (an o32 call's pad
+  words, a value typed narrower than its register), and returning
+  `undefined` passes the original's result on whole, `v1` included: some
+  functions declared `void` have callers that read `v0` (the build's
+  `void_results`). With both, a pass-through is bit-identical.
+- **Hottest hookable function in btn:** libpad's `_padChkRC2wait`, about
+  4,000 calls a vblank in gameplay; the next is `GsSetWorkBase` at about
+  47 (counted by a script mod with a `before` on all 3,375 hookable
+  functions, the same counts in both browsers). That run (3000 vblanks,
+  unpaced) took 28 s in Chromium and 16 s in Firefox.
+- **The C frontend on btn** (`b37ae28`): 3,387 functions (2,742 with
+  signatures), 1,197 globals (1,025 typed), 839 records. 34 entries are
+  dropped (layouts the two compilers can't both compute; PsyQ headers
+  that need types their context doesn't include, such as `MATRIX` and
+  `u_short`). Eight headers the reference compiler can't compile in their
+  include context (the census skips them too) keep clang's layouts,
+  listed as `unchecked`. Types a header uses that its context doesn't
+  define (m2c's, which the decomp defines in C files; 32 in `ovl_11.h`)
+  get opaque declarations, enough for their pointer uses.
+- **Plain `char` is unsigned** in psx-wasm's C (`-funsigned-char`, as the
+  reference compiler's flags). The first C frontend read it as signed;
+  the DWARF frontend caught it (490 disagreements, all `char`).
+- **A symbol several declarations view.** The decomp declares some
+  globals under other C names with `__asm__` labels, at other types (three
+  declarations of `gCalendarYear`). A snapshot types each symbol once: the
+  declaration under its own name, else the first.
+- **Decomp iterations.** Between btn's previous pin (`3a15992`) and the
+  current one, 587 functions were renamed, every one from a splat
+  auto-name to a real name, and none between real names. The iterations
+  test uses one of them (`ovl_27_func_800B7EEC`, now
+  `Ovl27DispatchTitleScenePhase`); a rename between real names would need
+  a census at another commit.
+- **Not every toy shows over the replay.** `title-to-gameplay` walks into
+  nothing, and the clock doesn't run on the opening day, so noclip's and
+  freeze-time's effects aren't visible; their twins are held to their
+  compiled mods by `same_as` (the flag writes around each call included).
+- **Traces read any RAM.** A work area past the executable's bss (btn's
+  `D_8007AFF0`) is in no container, so trace entries fall back to the
+  address an auto-name spells.

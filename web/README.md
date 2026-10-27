@@ -116,7 +116,20 @@ await psx.run(() => game.Rand(10))           // game calls run inside the game
 
 `psxw mod test` runs a script mod's tests in headless Chromium and Firefox
 (`web-test`), and `psxw mod check` runs its factory against a stub API in
-Node to plan it with compiled mods.
+Node to plan it with compiled mods, and type-checks it (`tsc`).
+
+**Names and types** come from a snapshot of the game binary (D55): the
+bundle's `snapshot.json`, or the one a mod's `psxmod.json` names (a mods
+workspace pins one; mods pinned to different snapshots load together).
+With types, `game.gGold` reads and writes a global at its width,
+`game.gPlayer.hp` and `game.types.Player.at(address)` are views, and
+handlers get the declared parameters; without, raw values. `psxw mod
+sdk` writes the editor's `game.d.ts` and `psx.d.ts`.
+
+**Packs:** `psxw mod pack <id>` writes one `.psxpack.json` holding a
+single-module script mod and the part of its snapshot it uses. The mod
+panel and `?mods=` take packs; a pack loads only into a bundle of the same
+game binary.
 
 ## Debugging the C in DevTools
 

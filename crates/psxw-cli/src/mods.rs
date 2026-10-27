@@ -134,6 +134,17 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
                 print_modules(&build::build_modules(&psx, m.game(), &mods, &layout)?);
                 return Ok(true);
             }
+            // Script mods load at run time: the moddable base, and the
+            // compiled mods as modules beside them.
+            let (label, any) = m.select_any(name)?;
+            if any.iter().any(AnyMod::is_script) {
+                let psx = m.psx()?;
+                m.check_pins(&psx)?;
+                modules_ws(m, &psx, &label, &psxw_modkit::script::compiled(&any))?;
+                let (base, _) = psxw_build::game::build(&psx, &Options { moddable: true, ..Options::new(m.game()) })?;
+                println!("moddable base: {} ({} bytes); script mods need no build", base.wasm, base.game_bytes);
+                return Ok(true);
+            }
             let (_, _, built, _) = build_ws(m, name)?;
             summary(&built);
             Ok(true)

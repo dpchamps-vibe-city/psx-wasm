@@ -89,7 +89,7 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M9](M09-second-game.md) | Second game | not started | M7, M8 | All gates with only a manifest |
 | [M10](M10-hardware-oracle.md) | Hardware oracle | **in progress** (batch export/import, disagreement report; capture waits for a rig) | M3; a rig | Vector archive replayed on hardware |
 | [M11](M11-modkit.md) | Modkit | **done** (browser runs of acceptance 5 and 7 waived) | M2 (phase 1), M5 (phase 2) | Example mods' effects by replay; empty mod set == plain build; static and dynamic backends agree |
-| [M12](M12-script-mods.md) | Script mods | not started | M11 | Script twins == compiled mods bit for bit in both browsers; a script pass-through on every hookable function == plain build |
+| [M12](M12-script-mods.md) | Script mods | **in progress** (phases 1–3 built; acceptance passes in both browsers; `psxw ci btn` remains) | M11 | Script twins == compiled mods bit for bit in both browsers; a script pass-through on every hookable function == plain build |
 
 ```
 M0 ─► M1 ─► M2 ─┬─► M4 ─► M5
