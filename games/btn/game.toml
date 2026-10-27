@@ -16,6 +16,8 @@ boundary = "boundary/psyq.toml"
 # One container per splat config; its id is the file stem.
 splat_dir = "configs/splat"
 # <id>.txt and <id>.names.txt per container (splat symbol_addrs format).
+# A container also sees the names in another container's file when its
+# splat config lists that file in symbol_addrs_path.
 symbols_dir = "configs/symbols"
 main = "exe"
 

@@ -2,7 +2,7 @@
 //! not edit. Byte offsets and sizes, equal under the matching compiler
 //! (GCC 2.95, MIPS o32) and clang (wasm32).
 //!
-//! From btn @ 3a15992, headers psyq/libgpu.h, psyq/libcd.h, psyq/libspu.h (boundary/psyq.toml).
+//! From btn @ b37ae28, headers psyq/libgpu.h, psyq/libcd.h, psyq/libspu.h (boundary/psyq.toml).
 
 /// `RECT` (psyq/libgpu.h).
 pub mod rect {

@@ -71,7 +71,7 @@ toolchain = "gcc-mipsel-none-elf-12.3.0"
 [game.btn]
 repo = "../btn-decompilation"
 remote = "git@github.com:software-factory-vibe-city/back-to-nature-decomp.git"
-commit = "3a159925fe0994ae43f11fd990eb6f5339f5833f"
+commit = "b37ae28cea7b245cba53607c01cd8c3e49ba4add"
 build = ["make", "check-all"]
 
 [game.btn.disc]

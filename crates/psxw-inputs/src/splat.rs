@@ -16,6 +16,9 @@ pub struct SplatConfig {
     pub target_path: Option<PathBuf>,
     /// `sha1` of the original file.
     pub sha1: Option<String>,
+    /// `options.symbol_addrs_path`: the symbol files splat reads for this
+    /// config, relative to the repo root.
+    pub symbol_addrs: Vec<PathBuf>,
     pub code: Vec<CodeSegment>,
 }
 
@@ -93,11 +96,18 @@ pub fn load(path: &Path) -> Result<SplatConfig> {
             subsegments: subs,
         });
     }
+    // One path or a list of them.
+    let symbol_addrs = match &doc["options"]["symbol_addrs_path"] {
+        Value::String(s) => vec![PathBuf::from(s)],
+        Value::Sequence(v) => v.iter().filter_map(Value::as_str).map(PathBuf::from).collect(),
+        _ => Vec::new(),
+    };
     Ok(SplatConfig {
         id,
         src_path,
         target_path: doc["options"]["target_path"].as_str().map(PathBuf::from),
         sha1: doc["sha1"].as_str().map(str::to_lowercase),
+        symbol_addrs,
         code,
     })
 }

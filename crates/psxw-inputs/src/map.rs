@@ -54,6 +54,9 @@ pub struct SdkPlacement {
 pub enum Via {
     /// Named in the container's own symbol file.
     Own,
+    /// Named in another container's symbol file that the container's splat
+    /// config lists (`symbol_addrs_path`): an overlay using another's.
+    Listed,
     /// Named in the main executable's symbol file (an overlay importing it).
     Main,
     /// Named in an overlay's symbol file (the executable importing it).
@@ -78,6 +81,9 @@ pub struct AddressMap {
     pub containers: Vec<Container>,
     symbols: HashMap<String, Vec<SymEntry>>,
     by_name: HashMap<String, HashMap<String, usize>>,
+    /// Per container, the other containers whose symbol files its splat
+    /// config lists, in the config's order.
+    listed: HashMap<String, Vec<String>>,
 }
 
 impl AddressMap {
@@ -116,12 +122,38 @@ impl AddressMap {
                 (id.clone(), names)
             })
             .collect();
-        Ok(Self { main, containers, symbols, by_name })
+        // Listed files that aren't a container's (the decomp's own build
+        // outputs, such as a copy of the executable's symbols) aren't in the
+        // snapshot; the main container's symbols resolve from it anyway.
+        let dir = &manifest.containers.symbols_dir;
+        let listed = configs
+            .iter()
+            .map(|cfg| {
+                let others = cfg
+                    .symbol_addrs
+                    .iter()
+                    .filter_map(|p| {
+                        configs.iter().find(|o| {
+                            o.id != cfg.id && ["txt", "names.txt"].iter().any(|s| *p == dir.join(format!("{}.{s}", o.id)))
+                        })
+                    })
+                    .map(|o| o.id.clone())
+                    .collect();
+                (cfg.id.clone(), others)
+            })
+            .collect();
+        Ok(Self { main, containers, symbols, by_name, listed })
     }
 
     /// A map with containers but no symbols (tests and synthetic inputs).
     pub fn synthetic(main: &str, containers: Vec<Container>) -> Self {
-        Self { main: main.to_string(), containers, symbols: HashMap::new(), by_name: HashMap::new() }
+        Self {
+            main: main.to_string(),
+            containers,
+            symbols: HashMap::new(),
+            by_name: HashMap::new(),
+            listed: HashMap::new(),
+        }
     }
 
     pub fn container(&self, id: &str) -> Option<&Container> {
@@ -145,6 +177,11 @@ impl AddressMap {
         }
         if let Some(r) = self.lookup(container, name, Via::Own) {
             return Some(r);
+        }
+        for other in self.listed.get(container).into_iter().flatten() {
+            if let Some(r) = self.lookup(other, name, Via::Listed) {
+                return Some(r);
+            }
         }
         if container != self.main {
             if let Some(r) = self.lookup(&self.main, name, Via::Main) {

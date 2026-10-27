@@ -18,15 +18,19 @@ answers v0 = 0.
   half-finished event state. `ovl_11_func_800DBC04` is defined
   `void` but `ovl_11_func_800F12D0.c` declares it `void *` and uses the
   request slot it returns (`ovl_11_func_800DBD78`'s result). Read as
-  NULL, request 116 was never queued.
+  NULL, request 116 was never queued. Fixed in btn by b37ae28: it is now
+  `s16 *Ovl11ReserveFirstRecordSlotIfAbsent`, declared that way
+  everywhere.
 - The opening flashback froze after the kid walks. The director program
   waits at step 0x0E on opcode 82, whose handler
   `ovl_11_func_800EADB8` is `void` in C but is called through
   `gOvl11ObjectOpcodeHandlers`, typed `s32 (*)(s16, s16, s32, s32)`, and
   returns `ovl_11_func_800E5704`'s "arrived" result. It never read 1.
+  Still `void` at b37ae28.
 
 **Current state: a stopgap to remove.** `36764d8` routes these functions
-to the translated tier (`build.json` `void_results`, 62 in btn). It works,
+to the translated tier (`build.json` `void_results`: 62 in btn at
+3a15992, 54 at b37ae28). It works,
 but it hides a decomp defect by swapping code. Replace it with:
 
 1. **A normalizer rule in psxw-cc** (like the existing GCC-idiom rules).
@@ -71,11 +75,12 @@ struct return) on one side only, or variadic on one side only, sends the
 call through the o32 boundary, which converts exactly as the PS1 does.
 Unprototyped declarations and narrow-integer differences still call
 directly. Each such edge is listed in `build.json` `abi_mismatches`;
-btn has one.
+btn had one at 3a15992.
 
-**Decomp follow-up.** The two declarations should agree (the comment in
-`collision_query_budget.c` keeps them apart on purpose). Either spelling
-matches; calling through an incompatible declaration is undefined in C.
+**Decomp follow-up: done in btn by b37ae28.** Both sides now declare
+`Ovl11DispatchCollisionProbes` (was `ovl_11_func_800BEB28`) with the tag
+by value, and `abi_mismatches` is empty. The linker rule stays for other
+decomps.
 
 ## 3. Loading and saving hang at "Searching the MEMORY CARD."
 
