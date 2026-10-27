@@ -471,6 +471,27 @@ frame counter was meant to absorb CD load time (M3). For btn it can't.
 *Why:* exact whole-game equality would compare two drive models, not the
 port. The machinery to force it would cost more than it tells us.
 
+**D49. Mods hook function boundaries, declared outside the code** (M11).
+- **Declarations:** a mod's `mod.toml` states every hook: target, kind
+  and implementing function. Mod code is ordinary functions; nothing in
+  it marks a hook.
+- **Hooks:**
+  - kinds are `before`, `after` and `patch` (optionally with
+    `original`);
+  - `before`/`after` are a `patch` with `original` that the build writes;
+  - `from` limits a hook to one caller;
+  - data patches can store a mod function's address.
+- **No runtime events:** names such as `frame` are game-manifest aliases
+  for real function boundaries.
+- **No memory watches.**
+- **Any language:** mods in any language that compiles to wasm get the
+  same guest pass as game code (address masking, their own area of the
+  window).
+
+*Why:* every hook and every conflict between mods can be found without
+running anything. Every hook has the semantics the game itself defines,
+and the API is the same in every language.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser
