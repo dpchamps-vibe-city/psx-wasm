@@ -35,82 +35,111 @@ live under `games/<id>/`.
 
 ```
 better-rand/
-  mod.toml          identity, ordering, and every declaration
+  mod.json          identity, load order, and every declaration
   src/
     random.c
     gold.c
 ```
 
-```toml
-[mod]
-id      = "better-rand"
-version = "0.1.0"
-game    = "<id>"            # games/<id>; a built mod records the game's file hashes
-after   = ["other-mod"]     # load-order constraints
-```
-
 ### Declarations
 
-Hooks are stated only in `mod.toml`. Mod code is ordinary functions and
+Hooks are stated only in `mod.json`. Mod code is ordinary functions and
 nothing in it marks a hook. A source file may define any number of
 functions; only those a declaration names become hooks, and they may be
 `static` (the build exports them).
 
-```toml
-[[patch]]                         # replace a function
-target = "rand"
-impl   = "src/random.c:better_rand"
+Every distinct aspect is its own field. No value packs several facts into
+one string. A JSON Schema shipped with psx-wasm describes the file.
 
-[[patch]]                         # replace it, keeping access to the original
-target   = "CheckCollision"
-impl     = "src/noclip.c:check"
-original = "check_original"
-
-[[before]]                        # run before every call
-target = "VSync"
-impl   = "src/timing.c:on_vsync"
-
-[[after]]                         # run after every call
-target = "AddGold"
-impl   = "src/gold.c:on_gold"
-
-[[before]]                        # only calls made from inside SpawnEnemy
-target = "rand"
-impl   = "src/luck.c:on_rand"
-from   = "SpawnEnemy"
-
-[[data]]                          # write data when its container is loaded
-target = "gEnemyStats"
-offset = 4
-type   = "u16"
-value  = 10
-
-[[data]]                          # put a mod function into a game table
-target = "gOpcodeHandlers"
-offset = 0x148
-type   = "fnptr"
-value  = "src/opcodes.c:my_opcode"
+```json
+{
+  "id": "better-rand",
+  "version": "0.1.0",
+  "game": "<id>",
+  "load_after": ["other-mod"],
+  "hooks": [
+    {
+      "kind": "patch",
+      "target": { "symbol": "rand" },
+      "impl": { "file": "src/random.c", "function": "better_rand" }
+    },
+    {
+      "kind": "patch",
+      "target": { "symbol": "CheckCollision" },
+      "impl": { "file": "src/noclip.c", "function": "check" },
+      "original": "check_original"
+    },
+    {
+      "kind": "before",
+      "target": { "symbol": "VSync" },
+      "impl": { "file": "src/timing.c", "function": "on_vsync" }
+    },
+    {
+      "kind": "after",
+      "target": { "symbol": "AddGold" },
+      "impl": { "file": "src/gold.c", "function": "on_gold" }
+    },
+    {
+      "kind": "before",
+      "target": { "symbol": "rand" },
+      "from": { "symbol": "SpawnEnemy" },
+      "impl": { "file": "src/luck.c", "function": "on_rand" }
+    },
+    {
+      "kind": "after",
+      "target": { "point": "frame" },
+      "impl": { "file": "src/hud.c", "function": "on_frame" }
+    },
+    {
+      "kind": "patch",
+      "target": { "container": "ovl_02", "address": "0x800C1C90" },
+      "signature": { "returns": "void", "params": [] },
+      "impl": { "file": "src/menu.c", "function": "menu_init" }
+    }
+  ],
+  "data": [
+    {
+      "target": { "symbol": "gEnemyStats" },
+      "offset": 4,
+      "type": "u16",
+      "value": 10
+    },
+    {
+      "target": { "symbol": "gOpcodeHandlers" },
+      "offset": 328,
+      "type": "fnptr",
+      "value": { "file": "src/opcodes.c", "function": "my_opcode" }
+    }
+  ]
+}
 ```
 
-**Targets** are game symbols. Other forms:
-- **A name more than one overlay defines** takes its container:
-  `ovl_02:InitMenu`.
-- **An unnamed function** uses its splat auto-name or a raw address:
-  `ovl_02:0x800C1C90`.
-- **A target no header declares** also needs `signature = "void (void)"`.
-- **A named hook point** from the game manifest (below), such as
-  `frame`.
+**Fields:**
+- **`game`:** a built mod also records the game's file hashes.
+- **`load_after`:** ordering constraints; see Composition.
+- **`target` and `from`:** exactly one of these forms:
+  - `symbol`: a game symbol, including splat auto-names;
+  - `container` + `symbol`: a name more than one overlay defines;
+  - `container` + `address`: a function with no name;
+  - `point`: a named hook point from the game manifest.
+
+  Addresses are hex strings, since JSON has no hex numbers.
+- **`signature`:** required when no header declares the target. Each
+  parameter is `{ "name", "type" }`, and each type is one C type.
 
 ### Hooks
 
-| Kind | Implementation type | Can |
+| `kind` | Implementation type | Can |
 |---|---|---|
 | `before` | `void (params)` | observe calls; write through pointer arguments |
 | `after` | `void (R result, params)`; `void (params)` for a `void` target | observe the result |
 | `patch` | `R (params)` | replace the function |
-| `patch` + `original` | `R (params)`; calls `original` | wrap it with full control: skip, change arguments, change the result |
-| `from = G` | any of the above | limit the hook to calls made inside `G` |
-| `data`, `type = "fnptr"` | — | store a mod function's address in game data |
+| `patch` with `original` | `R (params)`; calls `original` | wrap it with full control: skip, change arguments, change the result |
+
+**Modifiers and data:**
+- **`from`** limits any hook to calls made inside one caller.
+- **A `data` entry with `"type": "fnptr"`** stores a mod function's
+  address in game data.
 
 **`before` and `after` are a `patch` with `original` that the build
 writes:**
@@ -134,21 +163,31 @@ its result, not its locals. `after` sees the arguments as passed even if
 is game memory, so `after` sees what `F` wrote there. An exit by
 `longjmp` skips `after`.
 
-**Composition.** Every hooked target gets one generated entry:
+**Composition.** Mods are applied in load order: `load_after`
+constraints first, then the order the user lists them. Each applied mod
+wraps what is already there, so the last applied mod is outermost:
 
 ```
-entry(F)   = layer(first mod) ∘ layer(second mod) ∘ … ∘ F's own implementation
+entry(F)   = layer(last applied) ∘ … ∘ layer(first applied) ∘ F's own implementation
 layer(mod) = { its befores; its patch, or the next layer; its afters }
 ```
 
-- **Load order:** mods stack in load order, the first outermost. Order
-  comes from `after` constraints, then from the user's list.
-- **Full replacements:** a `patch` without `original` ends the chain.
-  Anything below it is unreachable: the game's code and other mods' hooks.
-  - **Two full replacements:** of the same target, in overlapping `from`
-    scopes, they are an error naming both mods.
-  - **A full replacement above another mod's `before`/`after`:** a warning
-    naming both mods.
+**Conflicts warn, and the last applied mod wins.** They are never errors:
+
+| Conflict | Outcome |
+|---|---|
+| Two full replacements of one target (a `patch` without `original`), in overlapping `from` scopes | The last applied runs; the earlier is unreachable. |
+| A full replacement applied over an earlier mod's `before`/`after` on that target | Those hooks are unreachable. |
+| Overlapping data patches | The last applied value is written. |
+
+Each warning names both mods, the target, and which one wins. All of them
+go into `mods.json`.
+
+**Errors** are reserved for a mod's own defects, and fail the build:
+- a target that doesn't exist;
+- a kind that doesn't fit its target;
+- an implementation missing from its file, or with the wrong signature;
+- a data patch over code.
 
 **Which calls fire a hook.** A hook fires on every call the original
 program makes to the target's address:
@@ -201,20 +240,20 @@ generated entry, so its inlining keeps the hooks.
   disagrees fails with `conflicting types`.
 
   ```c
-  /* mod.h: generated from mod.toml by psxw mod build. Do not edit. */
+  /* mod.h: generated from mod.json by psxw mod build. Do not edit. */
   #pragma once
   #include "libc.h"             /* declares rand */
   #include "collision.h"        /* declares CheckCollision */
   #include "economy.h"          /* declares AddGold */
 
-  /* patch rand <- src/random.c:better_rand */
+  /* patch rand <- src/random.c: better_rand */
   __typeof__(rand) better_rand;
 
-  /* patch CheckCollision <- src/noclip.c:check */
+  /* patch CheckCollision <- src/noclip.c: check */
   __typeof__(CheckCollision) check;
   __typeof__(CheckCollision) check_original;    /* the next link in the chain */
 
-  /* after AddGold <- src/gold.c:on_gold */
+  /* after AddGold <- src/gold.c: on_gold */
   void on_gold(int result, int amount, int reason);
   ```
 
@@ -244,25 +283,8 @@ frame = { after = "ReadInput" }   # the main loop calls it once per frame
 boot  = { before = "main" }
 ```
 
-A mod's `[[after]] target = "frame"` resolves statically to that
+A hook with `"target": { "point": "frame" }` resolves statically to that
 boundary.
-
-### Responding to a value
-
-There are no memory watches: one would mean instrumenting every store the
-game makes. A mod responds to a value in one of two ways:
-
-- **Hook the function that changes it** (`after AddGold`). This gives the
-  event with its reason (amount, outcome, and the caller with `from`).
-  Code that writes the value directly, such as a save being loaded, is
-  missed.
-- **Compare it at a known point** (an `after` hook on `frame` that checks
-  `gGold` against the last value). This catches every change, at the
-  point's granularity. The mod library provides a helper for it.
-
-`psxw mod writers <game> <symbol>` lists the functions that store to a
-symbol's address, to find what to hook. It reports where it lost track
-(stores through computed pointers) rather than implying a complete list.
 
 ### Static checks
 
@@ -271,11 +293,11 @@ compiling):
 - every target exists, and an overlay name that needs its container has
   one;
 - each kind fits its target. A runtime adapter can be wrapped (`before`,
-  `after`, `patch` + `original`) but not fully replaced. A function the
+  `after`, `patch` with `original`) but not fully replaced. A function the
   translator expands into its callers can't be hooked;
 - data patches land in data ranges, never code;
-- across mods: full replacements that conflict, overlapping data patches,
-  unreachable hooks, and the chain table for every hooked target.
+- across mods: the conflicts above, each with its winner, and the chain
+  table for every hooked target.
 
 From the compiled objects:
 - each `impl` is defined in the file the declaration names;
@@ -319,10 +341,13 @@ or whose game identity doesn't match the running game.
 
 ### Tasks
 
-1. [ ] **`psxw-modkit` crate:** parse `mod.toml`; resolve targets
-   through the address map and `[mod.points]`; the declaration-only
-   checks; `psxw mod check <game> <mods…>` prints the chain table and
-   exits non-zero on errors.
+1. [ ] **`psxw-modkit` crate:**
+   - the JSON Schema for `mod.json`;
+   - parse and validate `mod.json`;
+   - resolve targets through the address map and `[mod.points]`;
+   - the declaration-only checks;
+   - `psxw mod check <game> <mods…>` prints the chain table and the
+     warnings, and exits non-zero only on errors.
 2. [ ] **Header index:** for each symbol, the header that declares it and
    its parameter types as spelled (clang's AST over the headers the census
    already parses). Generate `mod.h` and `compile_commands.json`.
@@ -353,7 +378,7 @@ or whose game identity doesn't match the running game.
    `games/<id>/mods/`:
    - a full replacement of an SDK function (`rand`);
    - a `patch` with `original`;
-   - an `after` hook that watches a value;
+   - an `after` hook that reacts to a value;
    - a `fnptr` patch.
 
    Each comes with a replay and a RAM-by-symbol check that shows its
@@ -366,8 +391,10 @@ or whose game identity doesn't match the running game.
     the overlay's range, then the stubs' comparison of the overlay's
     original words) and record overlays that arrive another way
     (`memcpy`, decompression) in Findings.
-12. [ ] **`psxw mod writers <game> <symbol>`,** reporting the functions
-    where it lost track.
+12. [ ] **`psxw mod writers <game> <symbol>`:** lists the functions that
+    store to a symbol's address, to find what to hook. It reports the
+    functions where it lost track (stores through computed pointers)
+    rather than implying a complete list.
 
 ### Exit criteria (all automated)
 
@@ -376,8 +403,9 @@ or whose game identity doesn't match the running game.
    byte-identical to the plain build.
 3. Every example mod's replay shows its effect, and a two-mod set runs
    with the chain table `mods.json` reports.
-4. Two full replacements of one target make `psxw mod check` exit
-   non-zero, naming both mods (a test).
+4. Two full replacements of one target make `psxw mod check` warn,
+   naming both mods, and the last applied replacement is the one that
+   runs (a test).
 
 ## Phase 2: dynamic mods
 
@@ -426,17 +454,17 @@ or whose game identity doesn't match the running game.
 3. **Cost is recorded:** the moddable build's frame-time cost is in
    Findings.
 
-## Open questions
+## Not planned
 
-- **Declaration syntax:** TOML (as above) or one line per hook
-  (`PATCH(rand, ./src/random.c, better_rand)`). The content is the same.
-- **Two full replacements of one target:** an error (as above) or decided
-  by load order.
-- **Value watching:** as a declaration kind (`changed = "gGold"`), or a
-  helper in the mod library only (as above).
-- **Hooks inside a function** for translated functions, at an original
-  instruction's address: not planned. They stop working once the decomp
-  writes that function in C.
+- **Memory or value watches.** One would mean instrumenting every store
+  the game makes. A mod reacts to a value with ordinary hooks: an `after`
+  on the function that changes it, or a check in an `after` on a point
+  that runs often enough.
+- **Runtime events.** Named hook points cover them with real function
+  boundaries.
+- **Hooks inside a function**, at an original instruction's address. They
+  could only work for translated functions, and would stop working once
+  the decomp writes that function in C.
 
 ## Progress log
 

@@ -472,9 +472,13 @@ frame counter was meant to absorb CD load time (M3). For btn it can't.
 port. The machinery to force it would cost more than it tells us.
 
 **D49. Mods hook function boundaries, declared outside the code** (M11).
-- **Declarations:** a mod's `mod.toml` states every hook: target, kind
-  and implementing function. Mod code is ordinary functions; nothing in
-  it marks a hook.
+- **Declarations:** a mod's `mod.json` states every hook: target, kind
+  and implementing function, each distinct aspect its own field (no value
+  packs several facts into one string). Mod code is ordinary functions;
+  nothing in it marks a hook.
+- **Conflicts warn, and the last applied mod wins:** each applied mod
+  wraps what is already there, so the last applied is outermost. Errors
+  are reserved for a mod's own defects.
 - **Hooks:**
   - kinds are `before`, `after` and `patch` (optionally with
     `original`);
@@ -483,7 +487,8 @@ port. The machinery to force it would cost more than it tells us.
   - data patches can store a mod function's address.
 - **No runtime events:** names such as `frame` are game-manifest aliases
   for real function boundaries.
-- **No memory watches.**
+- **No memory or value watches:** a mod reacts to a value with ordinary
+  hooks.
 - **Any language:** mods in any language that compiles to wasm get the
   same guest pass as game code (address masking, their own area of the
   window).
