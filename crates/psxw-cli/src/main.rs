@@ -96,6 +96,10 @@ fn run() -> Result<()> {
                 let dir = snapshot::ensure(&ws, name, pin)?;
                 eprintln!("{name}: {} → {}", pin.short(), dir.display());
             }
+            for (game, pin) in &ws.lock.mods {
+                let dir = snapshot::ensure(&ws, &format!("{game}-mods"), pin)?;
+                eprintln!("{game} mods: {} → {}", pin.short(), dir.display());
+            }
         }
         ["census", game, rest @ ..] => {
             let mut opts = psxw_census::Options { game: game.to_string(), only: None, probe: true, only_header: None };
@@ -329,6 +333,7 @@ fn run() -> Result<()> {
                 match *a {
                     "--debug-io" => opts.debug_io = true,
                     "--ubsan" => opts.ubsan = true,
+                    "--moddable" => opts.moddable = true,
                     "--original" => match it.next() {
                         Some(l) => opts.original.extend(l.split(',').map(str::to_string)),
                         None => bail!("--original needs a library list"),

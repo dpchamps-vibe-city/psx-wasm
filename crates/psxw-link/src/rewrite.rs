@@ -66,6 +66,16 @@ pub trait Resolver {
     fn io_check(&mut self) -> Option<u32> {
         None
     }
+    /// A data symbol whose address is relative to a global's value (a
+    /// dynamically loaded mod's own data, placed when it loads): (global,
+    /// offset). `None`: [`Resolver::data_addr`] is absolute.
+    fn data_rel(&mut self, _symbol: u32) -> Result<Option<(u32, u32)>> {
+        Ok(None)
+    }
+    /// The same for a function's address (a mod's own functions).
+    fn func_rel(&mut self, _symbol: u32) -> Result<Option<(u32, u32)>> {
+        Ok(None)
+    }
 }
 
 struct TypeMap<'r, R: Resolver> {
@@ -141,19 +151,30 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 last_const = Some(value);
             }
         }
-        let mem_reloc = |r: &mut R| -> Result<Option<u64>> {
+        // A memarg's relocated offset: absolute, or relative to a global.
+        let mem_reloc = |r: &mut R| -> Result<Option<(u64, Option<u32>)>> {
             match reloc_of(RelocationType::MemoryAddrLeb) {
-                Some(rl) => Ok(Some(r.data_addr(rl.symbol)?.wrapping_add(rl.addend as u32) as u64)),
+                Some(rl) => match r.data_rel(rl.symbol)? {
+                    Some((g, o)) => Ok(Some((o.wrapping_add(rl.addend as u32) as u64, Some(g)))),
+                    None => Ok(Some((r.data_addr(rl.symbol)?.wrapping_add(rl.addend as u32) as u64, None))),
+                },
                 None => Ok(None),
+            }
+        };
+        let add_off = |out: &mut Function, off: u64, rel: Option<u32>| {
+            if off != 0 {
+                out.instruction(&I::I32Const(off as u32 as i32));
+                out.instruction(&I::I32Add);
+            }
+            if let Some(g) = rel {
+                out.instruction(&I::GlobalGet(g));
+                out.instruction(&I::I32Add);
             }
         };
         macro_rules! load {
             ($memarg:expr, $ins:ident, $size:expr) => {{
-                let off = mem_reloc(r)?.unwrap_or($memarg.offset);
-                if off != 0 {
-                    out.instruction(&I::I32Const(off as u32 as i32));
-                    out.instruction(&I::I32Add);
-                }
+                let (off, rel) = mem_reloc(r)?.unwrap_or(($memarg.offset, None));
+                add_off(&mut out, off, rel);
                 out.instruction(&I::I32Const(WINDOW_MASK as i32));
                 out.instruction(&I::I32And);
                 if let Some(check) = io {
@@ -164,12 +185,9 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
         }
         macro_rules! store {
             ($memarg:expr, $ins:ident, $tmp:expr, $size:expr) => {{
-                let off = mem_reloc(r)?.unwrap_or($memarg.offset);
+                let (off, rel) = mem_reloc(r)?.unwrap_or(($memarg.offset, None));
                 out.instruction(&I::LocalSet($tmp));
-                if off != 0 {
-                    out.instruction(&I::I32Const(off as u32 as i32));
-                    out.instruction(&I::I32Add);
-                }
+                add_off(&mut out, off, rel);
                 out.instruction(&I::I32Const(WINDOW_MASK as i32));
                 out.instruction(&I::I32And);
                 if dirty.is_some() || io.is_some() {
@@ -220,14 +238,24 @@ pub fn rewrite<R: Resolver>(obj: &WasmObject, func: usize, r: &mut R) -> Result<
                 out.instruction(&I::GlobalSet(g));
             }
             Operator::I32Const { value } => {
-                let v = if let Some(rl) = reloc_of(RelocationType::MemoryAddrSleb) {
-                    r.data_addr(rl.symbol)?.wrapping_add(rl.addend as u32) as i32
+                let (v, rel) = if let Some(rl) = reloc_of(RelocationType::MemoryAddrSleb) {
+                    match r.data_rel(rl.symbol)? {
+                        Some((g, o)) => (o.wrapping_add(rl.addend as u32) as i32, Some(g)),
+                        None => (r.data_addr(rl.symbol)?.wrapping_add(rl.addend as u32) as i32, None),
+                    }
                 } else if let Some(rl) = reloc_of(RelocationType::TableIndexSleb) {
-                    r.func_addr(rl.symbol)? as i32
+                    match r.func_rel(rl.symbol)? {
+                        Some((g, o)) => (o as i32, Some(g)),
+                        None => (r.func_addr(rl.symbol)? as i32, None),
+                    }
                 } else {
-                    value
+                    (value, None)
                 };
                 out.instruction(&I::I32Const(v));
+                if let Some(g) = rel {
+                    out.instruction(&I::GlobalGet(g));
+                    out.instruction(&I::I32Add);
+                }
             }
             Operator::I32Load { memarg } => load!(memarg, I32Load, 4),
             Operator::I64Load { memarg } => load!(memarg, I64Load, 8),

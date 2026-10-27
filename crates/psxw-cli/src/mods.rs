@@ -91,7 +91,17 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
             Ok(ok)
         }
         ["build", rest @ ..] => {
-            let (_, _, built, _) = build_ws(m, rest.first().copied())?;
+            let name = rest.iter().find(|a| !a.starts_with("--")).copied();
+            if rest.contains(&"--modules") {
+                let psx = m.psx()?;
+                m.check_pins(&psx)?;
+                let (label, mods) = m.select(name)?;
+                let inc = m.state.join("mods");
+                let layout = Layout { out: m.build_dir(&label).join("modules"), include: Box::new(move |id| inc.join(id).join("include")), flags: Some(m.flags()?) };
+                print_modules(&build::build_modules(&psx, m.game(), &mods, &layout)?);
+                return Ok(true);
+            }
+            let (_, _, built, _) = build_ws(m, name)?;
             summary(&built);
             Ok(true)
         }
@@ -142,6 +152,20 @@ pub fn build_direct(ws: &Workspace, game: &str, mods: &[Mod], out: Option<PathBu
     build::build(ws, &Options::new(game), mods, &layout)
 }
 
+fn print_modules(built: &[build::BuiltModule]) {
+    for b in built {
+        println!("{}: {} ({} bytes, {} hooked functions)", b.id, b.path.display(), b.bytes, b.targets);
+    }
+}
+
+/// Each mod as its own module (phase 2), into `out/<game>/modules/`.
+pub fn build_modules_direct(ws: &Workspace, game: &str, mods: &[Mod], out: Option<PathBuf>) -> Result<Vec<build::BuiltModule>> {
+    let out = std::path::absolute(out.unwrap_or_else(|| psxw_build::game::out_dir(ws, game).join("modules")))?;
+    let inc = out.join("mods");
+    let layout = Layout { out, include: Box::new(move |id| inc.join(id).join("include")), flags: None };
+    build::build_modules(ws, game, mods, &layout)
+}
+
 fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
     match args {
         ["check", game, dirs @ ..] => {
@@ -150,8 +174,15 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
             Ok(print_plan(&psxw_modkit::plan::plan(&table, &mods), &mods))
         }
         ["build", game, rest @ ..] => {
-            let (dirs, out) = split_out(rest)?;
-            let built = build_direct(ws, game, &load(&dirs)?, out)?;
+            let modules = rest.contains(&"--modules");
+            let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--modules").collect();
+            let (dirs, out) = split_out(&rest)?;
+            let mods = load(&dirs)?;
+            if modules {
+                print_modules(&build_modules_direct(ws, game, &mods, out)?);
+                return Ok(true);
+            }
+            let built = build_direct(ws, game, &mods, out)?;
             summary(&built);
             Ok(true)
         }
@@ -175,6 +206,11 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
         }
         ["show", game, sym] => show(&build::table(ws, game)?.1, sym),
         ["writers", game, sym] => crate::writers::run(ws, game, sym),
+        ["ci", game] => {
+            let (pass, detail) = ci(ws, game)?;
+            println!("mods gate: {} ({detail})", if pass { "PASS" } else { "FAIL" });
+            Ok(pass)
+        }
         ["pass-through", game, "--out", out, rest @ ..] => {
             let tiers: Option<Vec<&str>> = match rest {
                 ["--tiers", t] => Some(t.split(',').collect()),

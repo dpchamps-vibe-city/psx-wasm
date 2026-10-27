@@ -20,3 +20,4 @@ tree-sitter = "0.27.1"
 tree-sitter-c = "0.24.2"
 wasmparser = "0.262.0"
 psxw-census = { path = "../psxw-census" }
+wasm-encoder = "0.262.0"

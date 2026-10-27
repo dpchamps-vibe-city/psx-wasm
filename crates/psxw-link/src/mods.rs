@@ -24,7 +24,18 @@
 //!   writes the patched bytes and the overlay's first code words are
 //!   resident.
 
+use crate::object::FuncType;
 use std::collections::BTreeMap;
+
+/// The custom section a moddable base and a built mod carry the game's
+/// identity in (JSON: its id and its files' hashes).
+pub const GAME_SECTION: &str = "psxmod.game";
+
+/// A wasm signature as text: `i32,i32->i64`.
+pub fn sig_text(t: &FuncType) -> String {
+    let v = |x: &[wasmparser::ValType]| x.iter().map(|t| format!("{t}").to_lowercase()).collect::<Vec<_>>().join(",");
+    format!("{}->{}", v(&t.params), v(&t.results))
+}
 
 /// A mod function named by a declaration: its object and symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

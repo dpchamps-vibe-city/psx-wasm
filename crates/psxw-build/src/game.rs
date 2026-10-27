@@ -38,6 +38,10 @@ pub struct Options {
     pub probes: Vec<String>,
     /// Mods to link in (plans/M11), as psxw-modkit planned them.
     pub mods: Option<ModPlan>,
+    /// A moddable base (plans/M11 phase 2): every function a mod can hook
+    /// checks a hook slot that mods loaded at run time fill
+    /// (`game-moddable.wasm`).
+    pub moddable: bool,
 }
 
 /// What the modkit links into a build (plans/M11).
@@ -52,7 +56,7 @@ pub struct ModPlan {
 
 impl Options {
     pub fn new(game: &str) -> Self {
-        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![], probes: vec![], mods: None }
+        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![], probes: vec![], mods: None, moddable: false }
     }
 
     /// The output name's suffix: `-ubsan`, `-orig-libpad+libetc`.
@@ -66,6 +70,9 @@ impl Options {
         }
         if !self.probes.is_empty() {
             s += "-probed";
+        }
+        if self.moddable {
+            s += "-moddable";
         }
         s
     }
@@ -406,6 +413,9 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         main: inputs.map.main.clone(),
         min_pages: 1024,
         mods: None,
+        // Every function a mod can hook, by (container, address): not the
+        // ones the translator expands into its callers.
+        slots: opts.moddable.then(|| tiers.keys().filter(|k| !expanded.contains(*k)).cloned().collect()),
         probes: inputs
             .manifest
             .run
@@ -504,9 +514,30 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
     eprintln!("build: optimizing");
     // `-g` keeps function names, so trap backtraces name guest functions.
     run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg("-O2").arg("-g").arg(&merged).arg("-o").arg(&game))?;
-    let bytes = std::fs::read(&game)?;
+    let mut bytes = std::fs::read(&game)?;
     validate(&bytes).context("game.wasm fails validation")?;
     check_abi(&bytes)?;
+    // A moddable base names its slots and the game it is, for the loader.
+    if let Some(slots) = &spec.slots {
+        use wasm_encoder::Section;
+        let mut lines = String::new();
+        for (c, a) in slots {
+            let flavour = match tiers.get(&(c.clone(), *a)) {
+                Some(Tier::C { input, func }) => {
+                    let o = &link_inputs[*input].obj;
+                    let t = &o.types[o.funcs[*func as usize].ty as usize];
+                    format!("c {}", psxw_link::mods::sig_text(t))
+                }
+                _ => "o32".to_string(),
+            };
+            lines += &format!("{c} 0x{a:08X} {flavour}\n");
+        }
+        wasm_encoder::CustomSection { name: psxw_link::game::exports::SLOTS_SECTION.into(), data: lines.into_bytes().into() }.append_to(&mut bytes);
+        let identity = identity_json(ws, &inputs)?;
+        wasm_encoder::CustomSection { name: psxw_link::mods::GAME_SECTION.into(), data: identity.into_bytes().into() }.append_to(&mut bytes);
+        std::fs::write(&game, &bytes)?;
+        validate(&bytes).context("game.wasm fails validation")?;
+    }
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_container: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
@@ -565,6 +596,17 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
     let _ = std::fs::remove_file(&merged);
     Ok((report, json))
+}
+
+/// The game's identity, as mods record it: its id and its files' hashes.
+pub fn identity_json(ws: &Workspace, inputs: &psxw_lift::run::Inputs) -> Result<String> {
+    let pin = ws.game_pin(&inputs.manifest)?;
+    let containers: BTreeMap<&str, Option<&str>> = inputs.map.containers.iter().map(|c| (c.id.as_str(), c.sha1.as_deref())).collect();
+    Ok(serde_json::to_string(&serde_json::json!({
+        "game": inputs.manifest.game.id,
+        "exe_sha256": pin.disc.as_ref().map(|d| d.exe_sha256.clone()),
+        "containers": containers,
+    }))?)
 }
 
 /// `game.wasm` must export the entry points the host calls and import only

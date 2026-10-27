@@ -108,7 +108,10 @@ impl SymbolTable {
         let mut names: BTreeMap<(String, u32), Vec<String>> = BTreeMap::new();
         for c in &map.containers {
             for e in map.symbols(&c.id) {
-                names.entry((c.id.clone(), e.addr)).or_default().push(e.name.clone());
+                let n = names.entry((c.id.clone(), e.addr)).or_default();
+                if !n.contains(&e.name) {
+                    n.push(e.name.clone());
+                }
             }
         }
         let funcs: BTreeSet<(String, u32)> = prep.tiers.keys().cloned().collect();
@@ -156,13 +159,17 @@ impl SymbolTable {
                 callers: callers.get(&(c.clone(), *a)).map(|s| s.iter().cloned().collect()).unwrap_or_default(),
             });
         }
-        let mut data = Vec::new();
+        let mut data: Vec<DataInfo> = Vec::new();
+        let mut seen: BTreeSet<(String, String, u32)> = BTreeSet::new();
         for c in &map.containers {
             for e in map.symbols(&c.id) {
                 if e.is_func() || funcs.contains(&(c.id.clone(), e.addr)) {
                     continue;
                 }
-                data.push(DataInfo { name: e.name.clone(), container: c.id.clone(), addr: e.addr, size: e.size });
+                // A container's two symbol files may both name it.
+                if seen.insert((e.name.clone(), c.id.clone(), e.addr)) {
+                    data.push(DataInfo { name: e.name.clone(), container: c.id.clone(), addr: e.addr, size: e.size });
+                }
             }
         }
         Ok(Self {

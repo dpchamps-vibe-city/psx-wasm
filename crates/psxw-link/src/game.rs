@@ -62,13 +62,50 @@ pub struct GameSpec {
     pub probes: Vec<(String, u32)>,
     /// Mods (plans/M11): their inputs, hook chains and data patches.
     pub mods: Option<ModSpec>,
+    /// A moddable base (plans/M11 phase 2): each of these functions'
+    /// entries checks its hook slot (its index here), which mods loaded at
+    /// run time fill.
+    pub slots: Option<Vec<(String, u32)>>,
+}
+
+/// A moddable base's tables, by index.
+pub mod tables {
+    pub const DISPATCH: u32 = 0;
+    /// Hook slots, then the next links mods' layers call (funcref; grows).
+    pub const CHAIN: u32 = 1;
+    /// Each slot's function entry, hooks included, in its own type: what a
+    /// mod's call to a game function goes through.
+    pub const ENTRIES: u32 = 2;
+    /// Each slot's function without hooks: the bottom of its chain.
+    pub const RAW: u32 = 3;
+    /// Mods' `psxmod_init` and `psxmod_loaded`, called in load order.
+    pub const ON_INIT: u32 = 4;
+    pub const ON_LOADED: u32 = 5;
+    /// Room for this many mods' init and loaded functions.
+    pub const MAX_MODS: u32 = 256;
+}
+
+/// A moddable base's exports (plans/M11 phase 2).
+pub mod exports {
+    pub const DISPATCH: &str = "psxmod_dispatch";
+    pub const CHAIN: &str = "psxmod_chain";
+    pub const ENTRIES: &str = "psxmod_entries";
+    pub const RAW: &str = "psxmod_raw";
+    pub const ON_INIT: &str = "psxmod_on_init";
+    pub const ON_LOADED: &str = "psxmod_on_loaded";
+    /// Mutable i32 globals: how many entries of the two tables are used.
+    pub const N_INIT: &str = "psxmod_n_init";
+    pub const N_LOADED: &str = "psxmod_n_loaded";
+    /// The custom section listing the slots, one line each:
+    /// `<container> <address> c <params>-><results>` or `... o32`.
+    pub const SLOTS_SECTION: &str = "psxmod.slots";
 }
 
 /// The `psx.*` imports, in import order, with their signatures.
 /// The guest's one exception tag, `() -> ()`: ReturnFromException.
 const RFE_TAG: u32 = 0;
 
-fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
+pub(crate) fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
     let i = V::I32;
     vec![
         (psx::SAFEPOINT, vec![], vec![]),
@@ -97,7 +134,7 @@ fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
 }
 
 /// C names of the runtime services, and the `psx` import each lowers to.
-fn service(name: &str) -> Option<&'static str> {
+pub(crate) fn service(name: &str) -> Option<&'static str> {
     Some(match name {
         "psxw_bios" => psx::BIOS,
         "psxw_syscall" => psx::SYSCALL,
@@ -161,6 +198,11 @@ enum Synth {
     ModInit,
     /// `guest.psxmod_loaded(addr, len)`: data patches to overlays.
     ModLoaded,
+    /// A moddable base's C-typed slot entry: the hook in slot `slot`, else
+    /// the function `callee`.
+    SlotC { slot: u32, callee: u32, sig: FuncType },
+    /// The same for an o32 function.
+    SlotO32 { slot: u32, raw: u32 },
 }
 
 /// A hooked function's entries.
@@ -229,6 +271,8 @@ struct Ctx<'a> {
     bindings: HashMap<(usize, String), Bound>,
     /// Each game function's (container, address), for `from` scopes.
     caller_of: HashMap<(usize, u32), (String, u32)>,
+    /// A moddable base's hook-count globals (init, loaded).
+    moddable: Option<(u32, u32)>,
 }
 
 impl Ctx<'_> {
@@ -681,7 +725,7 @@ pub fn abi_differs(declared: &psxw_cc::protos::Proto, defined: &psxw_cc::protos:
     params || declared.variadic != defined.variadic
 }
 
-fn o32() -> FuncType {
+pub(crate) fn o32() -> FuncType {
     FuncType { params: vec![V::I32; 4], results: vec![V::I64] }
 }
 
@@ -879,35 +923,10 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             (o32(), marshal::o32_to_c(&sig, proto, callee, sp), format!("o32:hook:{name}"))
         }
         Synth::CLayer { befores, core, afters, sig, input, name } => {
-            (sig.clone(), c_layer(ctx, &befores, core, &afters, &sig, input, &name), format!("hook:{name}"))
+            let proto = ctx.inputs[input].protos.get(&name);
+            (sig.clone(), c_layer(ctx.mod_sp, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
         }
-        Synth::O32Layer { befores, core, afters, returns } => {
-            let mut f = Function::new([(1, ValType::I64)]);
-            for b in befores {
-                for l in 0..4 {
-                    f.instruction(&I::LocalGet(l));
-                }
-                f.instruction(&I::Call(b));
-                f.instruction(&I::Drop);
-            }
-            for l in 0..4 {
-                f.instruction(&I::LocalGet(l));
-            }
-            f.instruction(&I::Call(core));
-            f.instruction(&I::LocalSet(4));
-            for a in afters {
-                if returns {
-                    f.instruction(&I::LocalGet(4));
-                }
-                for l in 0..4 {
-                    f.instruction(&I::LocalGet(l));
-                }
-                f.instruction(&I::Call(a));
-            }
-            f.instruction(&I::LocalGet(4));
-            f.instruction(&I::End);
-            (o32(), f, "hook:o32".into())
-        }
+        Synth::O32Layer { befores, core, afters, returns } => (o32(), o32_layer(&befores, core, &afters, returns), "hook:o32".into()),
         Synth::ModWrap { input, func, hook } => {
             let sig = ctx.func_sig(input, func);
             let name = guest_name(ctx, input, func);
@@ -934,6 +953,49 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let f = marshal::c_to_o32_transparent(&sig, &words, sp, (ctx.hook_sp, ctx.hook_id, id), next);
             (sig, f, format!("original:{name}"))
         }
+        Synth::SlotC { slot, callee, sig } => {
+            let tix = ctx.intern(&sig);
+            let mut f = Function::new([]);
+            let n = sig.params.len() as u32;
+            f.instruction(&I::I32Const(slot as i32));
+            f.instruction(&I::TableGet(tables::CHAIN));
+            f.instruction(&I::RefIsNull);
+            let bt = sig.results.first().map_or(BlockType::Empty, |&t| BlockType::Result(marshal::val(t)));
+            f.instruction(&I::If(bt));
+            for l in 0..n {
+                f.instruction(&I::LocalGet(l));
+            }
+            f.instruction(&I::Call(callee));
+            f.instruction(&I::Else);
+            for l in 0..n {
+                f.instruction(&I::LocalGet(l));
+            }
+            f.instruction(&I::I32Const(slot as i32));
+            f.instruction(&I::CallIndirect { type_index: tix, table_index: tables::CHAIN });
+            f.instruction(&I::End);
+            f.instruction(&I::End);
+            (sig, f, format!("slot:{slot}"))
+        }
+        Synth::SlotO32 { slot, raw } => {
+            let mut f = Function::new([]);
+            f.instruction(&I::I32Const(slot as i32));
+            f.instruction(&I::TableGet(tables::CHAIN));
+            f.instruction(&I::RefIsNull);
+            f.instruction(&I::If(BlockType::Result(ValType::I64)));
+            for l in 0..4 {
+                f.instruction(&I::LocalGet(l));
+            }
+            f.instruction(&I::Call(raw));
+            f.instruction(&I::Else);
+            for l in 0..4 {
+                f.instruction(&I::LocalGet(l));
+            }
+            f.instruction(&I::I32Const(slot as i32));
+            f.instruction(&I::CallIndirect { type_index: ctx.o32_ty, table_index: tables::CHAIN });
+            f.instruction(&I::End);
+            f.instruction(&I::End);
+            (o32(), f, format!("slot:{slot}"))
+        }
         Synth::ModInit => (FuncType { params: vec![], results: vec![] }, mod_init(ctx)?, "psxmod_init".into()),
         Synth::ModLoaded => (FuncType { params: vec![V::I32; 2], results: vec![] }, mod_loaded(ctx)?, "psxmod_loaded".into()),
     })
@@ -949,12 +1011,43 @@ fn guest_name(ctx: &Ctx, input: usize, func: u32) -> String {
     }
 }
 
+/// An o32 hook layer: each before (an o32 wrapper, result dropped), then
+/// `core`, then each after (taking the result first when `returns`), with
+/// `a0..a3` and the guest `$sp` passed through untouched.
+pub(crate) fn o32_layer(befores: &[u32], core: u32, afters: &[u32], returns: bool) -> Function {
+    let mut f = Function::new([(1, ValType::I64)]);
+    for &b in befores {
+        for l in 0..4 {
+            f.instruction(&I::LocalGet(l));
+        }
+        f.instruction(&I::Call(b));
+        f.instruction(&I::Drop);
+    }
+    for l in 0..4 {
+        f.instruction(&I::LocalGet(l));
+    }
+    f.instruction(&I::Call(core));
+    f.instruction(&I::LocalSet(4));
+    for &a in afters {
+        if returns {
+            f.instruction(&I::LocalGet(4));
+        }
+        for l in 0..4 {
+            f.instruction(&I::LocalGet(l));
+        }
+        f.instruction(&I::Call(a));
+    }
+    f.instruction(&I::LocalGet(4));
+    f.instruction(&I::End);
+    f
+}
+
 /// A C-typed hook layer: the befores, then `core` (with copies of structs
 /// passed by value, so the afters see the arguments as passed), then the
-/// afters, each after taking the result first.
-fn c_layer(ctx: &Ctx, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)], sig: &FuncType, input: usize, name: &str) -> Function {
+/// afters, each after taking the result first. `mod_sp`: the mod stack's
+/// global; `proto`: the hooked function's prototype facts.
+pub(crate) fn c_layer(mod_sp: u32, proto: Option<&psxw_cc::protos::Proto>, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)], sig: &FuncType) -> Function {
     let n = sig.params.len() as u32;
-    let proto = ctx.inputs[input].protos.get(name);
     let (kinds, _) = marshal::param_kinds(sig, proto);
     let byval: Vec<(u32, u32)> = if afters.iter().all(|(_, bare)| *bare) {
         Vec::new()
@@ -983,15 +1076,15 @@ fn c_layer(ctx: &Ctx, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)]
         f.instruction(&I::Call(b));
     }
     if !byval.is_empty() {
-        f.instruction(&I::GlobalGet(ctx.mod_sp));
+        f.instruction(&I::GlobalGet(mod_sp));
         f.instruction(&I::LocalSet(save));
         for (j, &(p, size)) in byval.iter().enumerate() {
             let at = copy + j as u32;
-            f.instruction(&I::GlobalGet(ctx.mod_sp));
+            f.instruction(&I::GlobalGet(mod_sp));
             f.instruction(&I::I32Const(size.div_ceil(8) as i32 * 8));
             f.instruction(&I::I32Sub);
             f.instruction(&I::LocalTee(at));
-            f.instruction(&I::GlobalSet(ctx.mod_sp));
+            f.instruction(&I::GlobalSet(mod_sp));
             for (l, _) in [(at, 0), (p, 0)] {
                 f.instruction(&I::LocalGet(l));
                 f.instruction(&I::I32Const(WINDOW_MASK as i32));
@@ -1015,7 +1108,7 @@ fn c_layer(ctx: &Ctx, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)]
     }
     if !byval.is_empty() {
         f.instruction(&I::LocalGet(save));
-        f.instruction(&I::GlobalSet(ctx.mod_sp));
+        f.instruction(&I::GlobalSet(mod_sp));
     }
     for &(a, bare) in afters {
         if !bare {
@@ -1047,14 +1140,18 @@ fn patch_bytes(ctx: &Ctx, v: &PatchValue) -> Result<Vec<u8>> {
     })
 }
 
-fn store_byte(f: &mut Function, addr: u32, b: u8) {
+pub(crate) fn store_byte(f: &mut Function, addr: u32, b: u8) {
     f.instruction(&I::I32Const((addr & WINDOW_MASK) as i32));
     f.instruction(&I::I32Const(b as i32));
     f.instruction(&I::I32Store8(MemArg { offset: WINDOW_BASE as u64, align: 0, memory_index: 0 }));
 }
 
 /// `psxmod_init`: the executable's data patches, in load order.
-fn mod_init(ctx: &Ctx) -> Result<Function> {
+fn mod_init(ctx: &mut Ctx) -> Result<Function> {
+    if let Some((n, _)) = ctx.moddable {
+        let t = ctx.intern(&FuncType { params: vec![], results: vec![] });
+        return Ok(call_registered(n, tables::ON_INIT, t, 0));
+    }
     let mut f = Function::new([]);
     for d in ctx.spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_none()) {
         for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
@@ -1063,6 +1160,34 @@ fn mod_init(ctx: &Ctx) -> Result<Function> {
     }
     f.instruction(&I::End);
     Ok(f)
+}
+
+/// A moddable base's `psxmod_init`/`psxmod_loaded`: call each mod's,
+/// registered in `table` (type `ty`, `params` i32 parameters passed on),
+/// in load order; global `n` counts them.
+fn call_registered(n: u32, table: u32, ty: u32, params: u32) -> Function {
+    let i = params;
+    let mut f = Function::new([(1, ValType::I32)]);
+    f.instruction(&I::Block(BlockType::Empty));
+    f.instruction(&I::Loop(BlockType::Empty));
+    f.instruction(&I::LocalGet(i));
+    f.instruction(&I::GlobalGet(n));
+    f.instruction(&I::I32GeU);
+    f.instruction(&I::BrIf(1));
+    for p in 0..params {
+        f.instruction(&I::LocalGet(p));
+    }
+    f.instruction(&I::LocalGet(i));
+    f.instruction(&I::CallIndirect { type_index: ty, table_index: table });
+    f.instruction(&I::LocalGet(i));
+    f.instruction(&I::I32Const(1));
+    f.instruction(&I::I32Add);
+    f.instruction(&I::LocalSet(i));
+    f.instruction(&I::Br(0));
+    f.instruction(&I::End);
+    f.instruction(&I::End);
+    f.instruction(&I::End);
+    f
 }
 
 /// The overlay data patches, in order: each with its pending flag's global.
@@ -1081,7 +1206,11 @@ fn overlay_patches<'a>(ctx: &Ctx<'a>) -> Vec<(&'a crate::mods::DataPatch, u32)> 
 /// marks it pending; a pending patch is applied once its overlay's first
 /// code words are resident (the write that brings them may come before or
 /// after the patch's, in another sector).
-fn mod_loaded(ctx: &Ctx) -> Result<Function> {
+fn mod_loaded(ctx: &mut Ctx) -> Result<Function> {
+    if let Some((_, n)) = ctx.moddable {
+        let t = ctx.intern(&FuncType { params: vec![V::I32; 2], results: vec![] });
+        return Ok(call_registered(n, tables::ON_LOADED, t, 2));
+    }
     let mut f = Function::new([(2, ValType::I32)]);
     let (phys, end) = (2, 3);
     let patches = overlay_patches(ctx);
@@ -1331,6 +1460,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         heads: HashMap::new(),
         bindings: HashMap::new(),
         caller_of: HashMap::new(),
+        moddable: None,
         o32_ty: 0,
         device: spec
             .device_funcs
@@ -1390,6 +1520,37 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             }
         }
         build_chains(&mut ctx)?;
+    }
+    // A moddable base: every slot's entries check it.
+    let mut slot_sigs: Vec<Option<FuncType>> = Vec::new();
+    let mut entries_raw: Vec<(u32, u32)> = Vec::new();
+    if let Some(slots) = &spec.slots {
+        ensure!(!has_mods, "a moddable base links no mods itself");
+        ctx.moddable = Some((4, 5));
+        for (s, (c, a)) in slots.iter().enumerate() {
+            let s = s as u32;
+            let tier = *spec.tiers.get(&(c.clone(), *a)).with_context(|| format!("slot {c} {a:#010x} is not a function"))?;
+            let head = match tier {
+                Tier::C { input, func } => {
+                    let callee = ctx.guest[&(input, func)];
+                    let sig = ctx.func_sig(input, func);
+                    let entry = ctx.synth(Synth::SlotC { slot: s, callee, sig: sig.clone() });
+                    let name = guest_name(&ctx, input, func);
+                    let o32 = ctx.synth(Synth::O32WrapOf { callee: entry, sig: sig.clone(), input, name });
+                    slot_sigs.push(Some(sig.clone()));
+                    entries_raw.push((entry, callee));
+                    Head { c: Some((entry, sig)), o32 }
+                }
+                _ => {
+                    let raw = ctx.entry_raw(c, *a).context("slot without an entry")?;
+                    let entry = ctx.synth(Synth::SlotO32 { slot: s, raw });
+                    slot_sigs.push(None);
+                    entries_raw.push((entry, raw));
+                    Head { c: None, o32: entry }
+                }
+            };
+            ctx.heads.insert((c.clone(), *a, None), head);
+        }
     }
 
     let mut bodies = Vec::new();
@@ -1467,6 +1628,12 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         table64: false,
         shared: false,
     });
+    if let Some(slots) = &spec.slots {
+        let n = slots.len() as u64;
+        for (min, max) in [(n, None), (n, Some(n)), (n, Some(n)), (tables::MAX_MODS as u64, Some(tables::MAX_MODS as u64)), (tables::MAX_MODS as u64, Some(tables::MAX_MODS as u64))] {
+            tables.table(TableType { element_type: RefType::FUNCREF, minimum: min, maximum: max, table64: false, shared: false });
+        }
+    }
     module.section(&tables);
     let mut memory = MemorySection::new();
     memory.memory(MemoryType { minimum: spec.min_pages, maximum: None, memory64: false, shared: false, page_size_log2: None });
@@ -1481,6 +1648,10 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         // a pending flag per overlay data patch.
         inits.extend([(0x8000_0000u32 | psxw_abi::phys::MOD_STACK.end) as i32, 0, 0]);
         inits.extend(overlay_patches(&ctx).iter().map(|_| 0));
+    }
+    if spec.slots.is_some() {
+        // How many mods' init and loaded functions are registered.
+        inits.extend([0, 0]);
     }
     for init in inits {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));
@@ -1497,6 +1668,20 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     }
     ex.export(guest::SP, ExportKind::Global, ctx.sp);
     ex.export(guest::GP, ExportKind::Global, ctx.gp);
+    if let Some((ni, nl)) = ctx.moddable {
+        for (name, t) in [
+            (exports::DISPATCH, tables::DISPATCH),
+            (exports::CHAIN, tables::CHAIN),
+            (exports::ENTRIES, tables::ENTRIES),
+            (exports::RAW, tables::RAW),
+            (exports::ON_INIT, tables::ON_INIT),
+            (exports::ON_LOADED, tables::ON_LOADED),
+        ] {
+            ex.export(name, ExportKind::Table, t);
+        }
+        ex.export(exports::N_INIT, ExportKind::Global, ni);
+        ex.export(exports::N_LOADED, ExportKind::Global, nl);
+    }
     module.section(&ex);
     let mut elems = ElementSection::new();
     // Contiguous runs of table slots share a segment.
@@ -1516,6 +1701,12 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         run.push(f);
     }
     flush(&mut elems, run_start, &mut run);
+    if !entries_raw.is_empty() {
+        let entries: Vec<u32> = entries_raw.iter().map(|e| e.0).collect();
+        let raws: Vec<u32> = entries_raw.iter().map(|e| e.1).collect();
+        elems.active(Some(tables::ENTRIES), &ConstExpr::i32_const(0), Elements::Functions(entries.into()));
+        elems.active(Some(tables::RAW), &ConstExpr::i32_const(0), Elements::Functions(raws.into()));
+    }
     module.section(&elems);
     let mut code = CodeSection::new();
     for (_, b) in &bodies {
