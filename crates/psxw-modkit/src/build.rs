@@ -432,6 +432,11 @@ pub struct DeclTarget {
     pub container: String,
     pub address: String,
     pub flavour: String,
+    /// The mod's layer replaces the function outright (a `patch` without
+    /// `original`): the layers below it don't run. The browser loader
+    /// warns about it beside script mods (plans/M12).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaces: bool,
 }
 
 /// Stack each dynamically loaded mod gets.
@@ -490,7 +495,8 @@ pub fn build_modules(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) 
             };
             let (sig, text) = flavour(&t.container, t.addr);
             ensure!(entries.contains_key(&(t.container.clone(), t.addr)), "{}: {} has no slot", m.id(), t.name);
-            decl_targets.push(DeclTarget { name: t.name.clone(), container: t.container.clone(), address: format!("0x{:08X}", t.addr), flavour: text });
+            let replaces = l.patch.as_ref().is_some_and(|p| p.original.is_none());
+            decl_targets.push(DeclTarget { name: t.name.clone(), container: t.container.clone(), address: format!("0x{:08X}", t.addr), flavour: text, replaces });
             targets.push(psxw_link::module::ModTarget { container: t.container.clone(), addr: t.addr, sig, returns: t.returns, layer });
         }
         let mut data = Vec::new();
@@ -527,6 +533,7 @@ pub fn build_modules(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) 
                     container: c.container.clone(),
                     address: format!("0x{:08X}", c.addr),
                     flavour: format!("c {}", lm::sig_text(&c.sig)),
+                    replaces: false,
                 })
                 .collect(),
         };

@@ -1,0 +1,31 @@
+{
+  "replay": {
+    "name": "title-to-gameplay"
+  },
+  "frames": 300,
+  "expect": [
+    {
+      "kind": "no_trap"
+    },
+    {
+      "kind": "symbol",
+      "at": 300,
+      "symbol": "gRandomState",
+      "type": "u32",
+      "op": ">=",
+      "value": 2684354560
+    },
+    {
+      "kind": "symbol",
+      "at": 300,
+      "symbol": "gRandomState",
+      "type": "u32",
+      "op": "<",
+      "value": 2952790016
+    },
+    {
+      "kind": "same_as",
+      "mod": "conflict-a"
+    }
+  ]
+}

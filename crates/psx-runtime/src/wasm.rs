@@ -4,6 +4,7 @@
 
 use crate::boot;
 use crate::driver::{self, Invoke};
+use crate::hold::Hold;
 use psx_bios::{GuestCall, Host, Machine, Regs};
 use psx_devices::mem::Mem;
 use psxw_abi::{BootOptions, WINDOW_BASE, WINDOW_MASK};
@@ -17,6 +18,8 @@ unsafe extern "C" {
     fn host_log(level: u32, ptr: *const u8, len: usize);
     #[link_name = "trap"]
     fn host_trap(code: u32, ptr: *const u8, len: usize);
+    #[link_name = "vblank"]
+    fn host_vblank(frame: u64);
     #[link_name = "wait_vblank"]
     fn host_wait_vblank(frame: u64);
     #[link_name = "disc_info"]
@@ -73,8 +76,11 @@ impl Host for FfiHost {
     fn log(&mut self, level: u32, msg: &str) {
         unsafe { host_log(level, msg.as_ptr(), msg.len()) }
     }
+    fn vblank(&mut self, frame: u64) {
+        unsafe { host_vblank(frame) }
+    }
     fn wait_vblank(&mut self, frame: u64) {
-        unsafe { host_wait_vblank(frame) }
+        HOLD.with(|h| h.wait(frame, |f| unsafe { host_wait_vblank(f) }))
     }
     fn disc_read(&mut self, lba: u32, out: &mut [u8; 2352]) -> bool {
         unsafe { host_disc_read(lba, 1, 0, out.as_mut_ptr()) == 0 }
@@ -238,6 +244,9 @@ struct Rt {
 
 thread_local! {
     static RT: OnceCell<Rt> = const { OnceCell::new() };
+    /// Outside the machine: the waits are made from `psxw_js_leave`, with
+    /// no machine borrow.
+    static HOLD: Hold = const { Hold::new() };
 }
 
 fn with<R>(f: impl FnOnce(&Rt) -> R) -> R {
@@ -347,6 +356,21 @@ pub extern "C" fn psxw_execute(id: u32, addr: u32, a0: u32, a1: u32, a2: u32, a3
         rt.execute.set(Some((id, GuestCall { addr, args: [a0, a1, a2, a3] })));
         0
     })
+}
+
+/// A shim is about to call JS (psxw-abi `JS_ENTER`): hold the host's
+/// vblank waits until it has returned.
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_js_enter() {
+    HOLD.with(Hold::enter);
+}
+
+/// The call into JS has returned or unwound (psxw-abi `JS_LEAVE`); after
+/// the outermost, the held waits are made here, with only wasm frames on
+/// the stack.
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_js_leave() {
+    HOLD.with(|h| h.leave(|f| unsafe { host_wait_vblank(f) }));
 }
 
 /// Let `n` vblanks pass (psxw-abi `RUN_VBLANKS`).
@@ -589,7 +613,7 @@ pub extern "C" fn psxw_report() {
             .map(|(t, a, n, v, w)| format!("\"{t} {} {a:08x}/{n} {v:#x}\"", if *w { "W" } else { "R" }))
             .collect();
         format!(
-            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"cd_loads\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{}}}",
+            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"cd_loads\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{},\"held_waits\":{}}}",
             m.vblanks,
             m.clock.now,
             m.sdk.cd.sectors,
@@ -600,7 +624,8 @@ pub extern "C" fn psxw_report() {
             events.join(","),
             m.crit,
             m.in_irq,
-            m.calls.len()
+            m.calls.len(),
+            HOLD.with(Hold::total)
         )
     });
     report(json);

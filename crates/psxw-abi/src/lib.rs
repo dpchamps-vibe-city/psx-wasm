@@ -40,7 +40,12 @@ pub mod replay;
 /// - 9: the guest's window is where the guest says (`guest.guest_window`):
 ///   [`WINDOW_BASE`], or [`DEBUG_WINDOW_BASE`] in a debug build. The
 ///   runtime and hosts read it; host pointers may lie above 2 GiB.
-pub const ABI_VERSION: u32 = 9;
+/// - 10: the host's vblank in two (D54): `host.vblank`, which never
+///   suspends and carries everything the guest can see, and
+///   `host.wait_vblank`, which only paces; `psxw_js_enter` and
+///   `psxw_js_leave` bracket calls into JS, and the runtime holds
+///   `wait_vblank` calls while JS is on the stack.
+pub const ABI_VERSION: u32 = 10;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -205,7 +210,16 @@ pub mod host {
     pub const LOG: &str = "log";
     /// `(code, ptr, len) -> !`: fatal, with a message.
     pub const TRAP: &str = "trap";
-    /// `(frame: i64) -> ()`: pacing at each vblank; may trap to stop a run.
+    /// `(frame: i64) -> ()`: vblank `frame` happened. Never suspends.
+    /// Everything a host does at a vblank that the guest can see happens
+    /// here (the frame counter replay input is keyed on, mod swaps,
+    /// queued calls); it may trap to stop a run.
+    pub const VBLANK: &str = "vblank";
+    /// `(frame: i64) -> ()`: pacing after vblank `frame`: the host may
+    /// sleep, present and suspend the game (JSPI), but changes nothing the
+    /// guest can see. The runtime holds these calls while JS is on the
+    /// stack ([`super::exports::JS_ENTER`]) and makes them, in order, once
+    /// it has left.
     pub const WAIT_VBLANK: &str = "wait_vblank";
     /// `(out_ptr) -> i32`: writes [`DiscInfo`](super::DiscInfo); 0 = no disc.
     pub const DISC_INFO: &str = "disc_info";
@@ -244,7 +258,7 @@ pub mod exports {
     /// `() -> i32`.
     pub const ABI_VERSION: &str = "psxw_abi_version";
     /// `(options_ptr) -> ()`: boot the disc and run the game until the host
-    /// stops it (a trap from `wait_vblank`). `options_ptr` points at
+    /// stops it (a trap from `vblank`). `options_ptr` points at
     /// [`BootOptions`](super::BootOptions) in memory the host wrote through
     /// `psxw_alloc`.
     pub const BOOT: &str = "psxw_boot";
@@ -260,7 +274,7 @@ pub mod exports {
     /// run the callbacks it left queued; `v0 | v1 << 32`.
     pub const CALL: &str = "psxw_call";
     /// `(id, addr, a0, a1, a2, a3) -> i32`: queue one o32 call, safe while
-    /// the game is suspended in `host.wait_vblank`. The driver executes it
+    /// the game is suspended in `host.wait_vblank` or inside `host.vblank`. The driver executes it
     /// outside a machine borrow, interrupt handler or critical section.
     /// Returns 0 if accepted, -1 before init, -2 if busy, -3 for an invalid
     /// address. Completion: `host.report` JSON `{ "event": "execute",
@@ -269,6 +283,14 @@ pub mod exports {
     /// `(n) -> ()`: let `n` vblanks of virtual time pass, delivering events
     /// and running interrupt handlers and callbacks.
     pub const RUN_VBLANKS: &str = "psxw_run_vblanks";
+    /// `() -> ()`: a call from wasm into JS begins (a script mod's shim).
+    /// While any is open, `host.wait_vblank` calls are held, since JSPI
+    /// can't suspend through a JS frame.
+    pub const JS_ENTER: &str = "psxw_js_enter";
+    /// `() -> ()`: that call has returned (or unwound). When none is open
+    /// any more, the held `host.wait_vblank` calls are made, in order,
+    /// before this returns.
+    pub const JS_LEAVE: &str = "psxw_js_leave";
 }
 
 /// Boot options, as the host writes them (little-endian `u32` fields).

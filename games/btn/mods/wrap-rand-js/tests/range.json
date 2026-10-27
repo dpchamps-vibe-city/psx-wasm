@@ -1,0 +1,19 @@
+{
+  "replay": {
+    "name": "title-to-gameplay"
+  },
+  "frames": 2400,
+  "expect": [
+    {
+      "kind": "no_trap"
+    },
+    {
+      "kind": "log",
+      "contains": "rand: 1000 calls, 1000 results, 0 out of range"
+    },
+    {
+      "kind": "same_as",
+      "mod": "wrap-rand"
+    }
+  ]
+}

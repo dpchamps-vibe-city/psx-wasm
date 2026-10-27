@@ -1,6 +1,9 @@
 //! A mod's tests (plans/M11 task 10): `tests/*.json`, each a replay run for
 //! some vblanks with symbols traced every vblank, expectations, and an
-//! optional check command reading the trace as JSON on stdin.
+//! optional check command reading the trace as JSON on stdin. Commands
+//! can run at vblanks, and a run can be compared with one where another
+//! mod takes the mod's place (`same_as`, plans/M12). A compiled mod's
+//! tests run natively; a script mod's in the browsers.
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -23,6 +26,21 @@ pub struct TestSpec {
     /// in at this vblank (before it, the game runs without them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_at: Option<u64>,
+    /// Commands (a script mod's, or a compiled mod's global functions)
+    /// called at vblanks, inside the game.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<Command>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Command {
+    /// The vblank it's queued at; it runs at the next safe boundary.
+    pub at: u64,
+    pub name: String,
+    /// Up to four arguments (words, for a compiled mod's function).
+    #[serde(default)]
+    pub args: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +91,19 @@ pub struct TraceSym {
     pub symbol: String,
     #[serde(rename = "type")]
     pub ty: ValueType,
+    /// Bytes past the symbol (a field, a word in a work area).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+impl TraceSym {
+    /// The trace's key: the symbol, with its offset if any.
+    pub fn key(&self) -> String {
+        match self.offset {
+            Some(o) if o != 0 => format!("{}+0x{o:X}", self.symbol),
+            _ => self.symbol.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +121,15 @@ pub enum Expect {
         op: String,
         value: i64,
     },
-    /// A line the mods logged (`psxmod_log`) contains this.
+    /// A line the mods logged (`psxmod_log`, a script mod's `log`)
+    /// contains this.
     Log { contains: String },
+    /// The run's RAM, VRAM and audio hashes equal a run with mod `mod` in
+    /// this mod's place, with the same commands at the same vblanks.
+    SameAs {
+        #[serde(rename = "mod")]
+        with: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

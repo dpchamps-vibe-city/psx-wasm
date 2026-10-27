@@ -1,5 +1,10 @@
 // The browser host (M5): runs game.wasm in this Worker and implements its
 // host interface (crates/psxw-abi: `host.*`, plus the M4 render imports):
+// - the vblank (ABI 10, D54): `vblank` does everything the guest can see
+//   (the frame counter replay input is keyed on, mod loads and swaps,
+//   hashes, the frame limit) and never suspends; `wait_vblank` only paces.
+//   The runtime holds `wait_vblank` while a script mod's JS is on the
+//   stack, and makes the held calls once it has returned;
 // - pacing: `wait_vblank` sleeps with Atomics.wait until the frame's
 //   wall-clock deadline (no pacing in verify mode). A run more than
 //   RESYNC_MS behind (a breakpoint, a stall) paces on from now instead of
@@ -35,18 +40,29 @@
 //   before boot (`options.mods`: URLs, or `options.modsFromOpfs`: the
 //   enabled ones in OPFS `mods/`), swap in at given vblanks
 //   (`options.swaps`), or arrive while the game runs through a shared
-//   mailbox (`modBuffer`), applied at the next vblank.
+//   mailbox (`modBuffer`), applied at the next vblank;
+// - script mods (M12, script.js): a `.js` URL among `options.mods` or
+//   `options.swaps` is a script mod; `load` messages import more while the
+//   game runs. They resolve names through the bundle's `snapshot.json`,
+//   and install at the next vblank. In this Worker's console: `psx`,
+//   `game` and `mod`;
+// - tests (M12): `options.watch` reads guest values every vblank,
+//   `options.commands` runs commands at vblanks, `options.logs` keeps the
+//   run's log lines; they come back in the `hashes` message, in the
+//   native host's shapes.
 //
 // Messages in: {type: "start", cue, padBuffer, audioRing, modBuffer, options},
-// {type: "execute", id, address, args} (one call, at a borrow-free boundary).
-// Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"mods"|"scripting-ready"|"execute-result"|"stopped", ...}.
+// {type: "execute", id, address, args} (one call, at a borrow-free boundary),
+// {type: "cmd", id, name, args}, {type: "load", id, url, reload}.
+// Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"mods"|"scripting-ready"|"execute-result"|"cmd-result"|"load-result"|"stopped", ...}.
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, savesDir } from "./cards.js";
 import { ModLoader, takeMod } from "./mods.js";
+import { Calls, ScriptHost, mod } from "./script.js";
 
-const ABI_VERSION = 9;
+const ABI_VERSION = 10;
 const NOTHING_PRESSED = 0xffff;
 // Where the guest's window is, unless the module says (psxw-abi
 // guest::WINDOW; a debug build's is at 2 GiB).
@@ -54,22 +70,39 @@ const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";
 const RESYNC_MS = 250;
 
-let enqueueExecution = null;
+// The running game's queued calls and script mods, for the page's messages.
+let session = null;
+globalThis.mod = mod;
+const answer = (type, id, p) =>
+  p.then(
+    (value) => {
+      try {
+        postMessage({ type, id, value });
+      } catch {
+        postMessage({ type, id, value: String(value) });
+      }
+    },
+    (err) => postMessage({ type, id, error: String((err && err.message) || err) }),
+  );
 onmessage = async (e) => {
-  if (e.data.type === "execute") {
-    try {
-      if (!enqueueExecution) throw new Error("scripting is unavailable (game not running, no JSPI, or dev mode)");
-      enqueueExecution(e.data);
-    } catch (err) {
-      postMessage({ type: "execute-result", id: e.data.id, error: String(err.message || err) });
-    }
+  const m = e.data;
+  if (m.type === "execute" || m.type === "cmd" || m.type === "load") {
+    const unavailable = () => Promise.reject(new Error("scripting is unavailable (game not running, no JSPI, or dev mode)"));
+    if (m.type === "execute") {
+      const p = session?.calls ? session.calls.enqueue(m.address, m.args).then((r) => String(r.value)) : unavailable();
+      answer("execute-result", m.id, p);
+    } else if (!session?.scripts) {
+      answer(`${m.type}-result`, m.id, Promise.reject(new Error("script mods need a moddable bundle (psxw build-web --moddable) and its game running")));
+    } else if (m.type === "cmd") answer("cmd-result", m.id, session.scripts.command(m.name, m.args, true));
+    else answer("load-result", m.id, m.reload ? session.scripts.reload(m.reload, m.url) : session.scripts.load(m.url));
     return;
   }
-  if (e.data.type !== "start") return;
+  if (m.type !== "start") return;
   try {
     await run(e.data);
   } catch (err) {
-    enqueueExecution = null;
+    session?.calls?.fail("game stopped");
+    session = null;
     console.error(err);
     postMessage({ type: "stopped", reason: String((err && err.message) || err) });
   }
@@ -254,32 +287,78 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       turn.port2.postMessage(null);
     });
   let scriptingReady = false;
-  // Mods: the loader exists once the base is instantiated.
+  // Mods: the loader exists once the base is instantiated; script mods'
+  // host once its snapshot is read.
   let loader = null;
+  let scripts = null;
+  let calls = null;
   const swaps = [];
   let mailboxSeq = modBuffer ? Atomics.load(new Int32Array(modBuffer, 0, 1), 0) : 0;
-  const modsChanged = (what) => postMessage({ type: "mods", ids: loader.ids(), functions: loader.functions(), what, frame });
+  // What a test reads back (M12): values every vblank, log lines, events.
+  const watched = [];
+  const logs = options.logs ? [] : null;
+  const events = [];
+  const logLine = (level, line) => {
+    if (logs) logs.push(`${frame}:${level}: ${line}`);
+    postMessage({ type: "log", level, frame, text: line });
+  };
+  const modsChanged = (what) => {
+    const warnings = loader.conflicts();
+    for (const w of warnings) if (!seenWarnings.has(w)) logLine(2, `mods: warning: ${w}`);
+    seenWarnings = new Set(warnings);
+    events.push({ event: "mods", what, frame, ids: loader.ids(), warnings });
+    postMessage({ type: "mods", ids: loader.ids(), functions: loader.functions(), what, warnings, frame });
+  };
+  let seenWarnings = new Set();
+  const swapIn = (w) => {
+    if (w.script) {
+      const i = w.index < loader.mods.length ? w.index : undefined;
+      scripts.queue({ ...w.script, index: i, replaced: i !== undefined, fatal: true }).catch(() => {});
+      return scripts.vblank().join(", ");
+    }
+    return `swapped ${loader.swap(w.index, w.bytes)} in`;
+  };
   const vblank = (f) => {
     frame = Number(f);
-    if (loader) {
-      for (const w of swaps.filter((w) => w.frame === frame)) modsChanged(`swapped ${loader.swap(w.index, w.bytes)} in at vblank ${frame}`);
-      const pushed = modBuffer && takeMod(modBuffer, mailboxSeq);
-      if (pushed) {
-        mailboxSeq = pushed.seq;
-        try {
-          modsChanged(`swapped ${loader.swap(pushed.index, pushed.bytes)} in at vblank ${frame}`);
-        } catch (err) {
-          postMessage({ type: "status", text: `mod swap failed: ${err.message || err}` });
-        }
-      }
-    }
-    const now = performance.now();
-    if (lastVblank) frameTimes.push(now - lastVblank);
     if (frame % 60 === 0 && !lost) shadow = renderer.vram();
     if (hashAt.has(frame)) {
       ramHashes[frame] = (exports.psxw_ram_hash() & 0xffffffffffffffffn).toString(16).padStart(16, "0");
       vramHashes[frame] = renderer.vram_hash();
     }
+    if (options.watch && options.watch.length) {
+      const dv = new DataView(mem());
+      watched.push(options.watch.map(([a, n]) => {
+        let v = 0;
+        for (let i = 0; i < n; i++) v |= dv.getUint8(windowBase + ((a + i) & 0x1fffff)) << (8 * i);
+        return v >>> 0;
+      }));
+    }
+    if (loader) {
+      const host = () => {
+        for (const w of swaps.filter((w) => w.frame === frame)) modsChanged(`${swapIn(w)} at vblank ${frame}`);
+        const pushed = modBuffer && takeMod(modBuffer, mailboxSeq);
+        if (pushed) {
+          mailboxSeq = pushed.seq;
+          try {
+            modsChanged(`swapped ${loader.swap(pushed.index, pushed.bytes)} in at vblank ${frame}`);
+          } catch (err) {
+            postMessage({ type: "status", text: `mod swap failed: ${err.message || err}` });
+          }
+        }
+        const done = scripts ? scripts.vblank() : [];
+        if (done.length) modsChanged(`${done.join(", ")} at vblank ${frame}`);
+        for (const c of (options.commands || []).filter((c) => c.at === frame)) {
+          const p = scripts ? scripts.command(c.name, c.args || [], true) : Promise.reject(new Error("no script host"));
+          p.then(
+            (value) => events.push({ event: "command", name: c.name, at: c.at, value: String(value) }),
+            (err) => events.push({ event: "command", name: c.name, at: c.at, error: String(err.message || err) }),
+          );
+        }
+      };
+      if (scripts) scripts.asHost(host);
+      else host();
+    }
+    calls?.pump();
     if (options.frames && frame >= options.frames) throw new Error(FRAME_LIMIT);
     if (recording) {
       recording.frames = frame;
@@ -290,34 +369,35 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       }
     }
   };
-  const pace = () => {
+  // Vblank `f`'s wait: made at its vblank, or later when held.
+  const pace = (f) => {
+    const n = Number(f);
+    const now = performance.now();
+    if (lastVblank) frameTimes.push(now - lastVblank);
     if (!options.verify) {
-      const wait = origin + frame * period - performance.now();
+      const wait = origin + n * period - now;
       if (wait > 0) Atomics.wait(sleeper, 0, 0, wait);
       else if (wait < -period) lagFrames++;
       if (wait < -RESYNC_MS) origin -= wait;
     }
     lastVblank = performance.now();
-    if (frame % 60 === 0) postMessage({ type: "status", text: `frame ${frame}, ${lagFrames} late` });
+    if (n % 60 === 0) postMessage({ type: "status", text: `frame ${n}, ${lagFrames} late` });
   };
 
   const host = {
+    vblank,
     wait_vblank: suspend
       ? new WebAssembly.Suspending(async (f) => {
-          vblank(f);
           if (!scriptingReady) {
             scriptingReady = true;
             postMessage({ type: "scripting-ready" });
           }
           await nextTask();
-          pace();
+          pace(f);
         })
-      : (f) => {
-          vblank(f);
-          pace();
-        },
+      : pace,
     log(level, p, n) {
-      postMessage({ type: "log", level, frame, text: text(p, n) });
+      logLine(level, text(p, n));
     },
     trap(code, p, n) {
       throw new Error(`runtime trap ${code}: ${text(p, n)}`);
@@ -372,8 +452,9 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       const json = text(p, n);
       const event = JSON.parse(json);
       if (loader && event.event === "boot") loader.booted = true;
-      if (event.event === "execute") postMessage({ type: "execute-result", id: event.id, value: event.value });
+      if (event.event === "execute") calls?.done(event.id, event.value);
       else postMessage({ type: "report", json });
+      if (event.event === "report") events.push(event);
     },
     render_submit(p, len) {
       if (!lost) renderer.submit(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + len)));
@@ -433,30 +514,59 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const abi = exports.psxw_abi_version();
   if (abi !== ABI_VERSION) throw new Error(`game.wasm ABI ${abi}, host ABI ${ABI_VERSION}`);
   if (exports.guest_window) windowBase = exports.guest_window() >>> 0;
-  if (suspend) {
-    enqueueExecution = ({ id, address, args }) => {
-      const a = (i) => args[i] ?? 0;
-      const status = exports.psxw_execute(id, address, a(0), a(1), a(2), a(3));
-      if (status !== 0) throw new Error(`execute rejected: ${status === -2 ? "another call is pending" : status === -3 ? "invalid address" : "runtime not ready"}`);
-    };
-  } else {
-    postMessage({ type: "scripting-ready", error: "scripting needs JSPI and the merged game.wasm (not ?dev)" });
-  }
+  if (!options.dev) calls = new Calls(exports);
+  if (!suspend) postMessage({ type: "scripting-ready", error: "scripting needs JSPI and the merged game.wasm (not ?dev)" });
 
   // Mods, in order, before boot; swaps fetched now, applied at their vblank.
   const fetchBytes = async (u) => new Uint8Array(await (await fetch(new URL(u, location.href))).arrayBuffer());
-  const wanted = [];
-  for (const u of options.mods || []) wanted.push({ name: u, bytes: await fetchBytes(u) });
-  if (options.modsFromOpfs) wanted.push(...(await opfsMods()));
-  for (const w of options.swaps || []) swaps.push({ frame: w.frame, index: w.index, bytes: await fetchBytes(w.url) });
-  if (wanted.length || swaps.length || modBuffer) {
-    loader = baseModule && ModLoader.forBase(baseModule, exports);
-    if (!loader && (wanted.length || swaps.length)) throw new Error("this bundle's game.wasm isn't a moddable base (psxw build-web --moddable)");
-    if (loader) {
-      for (const m of wanted) loader.load(m.bytes);
-      modsChanged(loader.mods.length ? `loaded ${loader.ids().join(", ")}` : "no mods");
+  const isScript = (u) => /\.m?js(\?|$)/.test(u);
+  loader = baseModule && ModLoader.forBase(baseModule, exports);
+  if (loader) {
+    let snapshot = null;
+    try {
+      snapshot = await (await fetch(new URL("./snapshot.json", import.meta.url))).json();
+    } catch {}
+    if (snapshot) {
+      scripts = new ScriptHost({
+        exports,
+        loader,
+        snapshot,
+        windowBase,
+        calls,
+        log: (line) => logLine(1, line),
+        status: (t) => postMessage({ type: "status", text: t }),
+      });
+      globalThis.psx = scripts.console();
+      globalThis.game = scripts.game;
     }
   }
+  const script = async (u) => {
+    if (!scripts) throw new Error(`${u}: script mods need the bundle's snapshot.json (psxw build-web --moddable)`);
+    return scripts.importMod(new URL(u, location.href).href);
+  };
+  const wanted = [];
+  for (const u of options.mods || []) wanted.push(isScript(u) ? { name: u, script: await script(u) } : { name: u, bytes: await fetchBytes(u) });
+  if (options.modsFromOpfs) {
+    // A single-file script mod in OPFS imports from a blob.
+    for (const m of await opfsMods()) {
+      const blob = () => URL.createObjectURL(new Blob([m.bytes], { type: "text/javascript" }));
+      wanted.push(isScript(m.name) ? { name: m.name, script: await script(blob()) } : m);
+    }
+  }
+  for (const w of options.swaps || []) {
+    swaps.push(isScript(w.url) ? { frame: w.frame, index: w.index, script: await script(w.url) } : { frame: w.frame, index: w.index, bytes: await fetchBytes(w.url) });
+  }
+  if (!loader && (wanted.length || swaps.length)) throw new Error("this bundle's game.wasm isn't a moddable base (psxw build-web --moddable)");
+  if (loader) {
+    for (const m of wanted) {
+      if (m.script) {
+        scripts.queue({ ...m.script, fatal: true }).catch(() => {});
+        scripts.vblank();
+      } else loader.load(m.bytes);
+    }
+    modsChanged(loader.mods.length ? `loaded ${loader.ids().join(", ")}` : "no mods");
+  }
+  session = { calls, scripts, loader };
 
   // psxw-abi BootOptions: cd_timing, video, safepoint_budget,
   // safepoint_quantum, debug, trace (u32 each).
@@ -481,7 +591,12 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
     const msg = String((err && err.message) || err);
     reason = msg.includes(FRAME_LIMIT) ? "frame limit" : msg;
   }
-  enqueueExecution = null;
+  calls?.fail(`game stopped: ${reason}`);
+  session = null;
+  // The run's counters (held waits among them), read after the stop.
+  try {
+    exports.psxw_report();
+  } catch {}
   disc.close();
   // A recording outlives its run: hand it over when the run stops.
   if (recording && recording.entries.length) postReplay();
@@ -490,6 +605,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const pct = (p) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] * 100) / 100 : null);
   const frameMs = { p50: pct(50), p95: pct(95), p99: pct(99), max: pct(100) };
   const audio = { frames: audioFrames, hash: audioHash.hex() };
-  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs, audio, yields: suspend });
+  const tests = { watched: options.watch ? watched : undefined, logs: logs || undefined, events };
+  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs, audio, yields: suspend, stop: reason, ...tests });
   postMessage({ type: "stopped", reason, frame });
 }

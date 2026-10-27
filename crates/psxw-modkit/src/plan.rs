@@ -213,6 +213,30 @@ pub fn plan(table: &SymbolTable, mods: &[Mod]) -> Plan {
                 bad(format!("{name} is a runtime adapter: wrap it (before, after, or a patch with original), don't replace it"));
                 continue;
             }
+            let bare = f.point.is_some();
+            let key = (f.container.clone(), f.addr);
+            let scope = from.as_ref().map(|c| (c.container.clone(), c.addr));
+            // A script mod's hooks take the slot's values: no C type.
+            if m.script {
+                p.resolved.insert((mi, hi), (f.clone(), from.clone()));
+                p.targets.entry(key.clone()).or_insert_with(|| TargetPlan {
+                    container: f.container.clone(),
+                    addr: f.addr,
+                    name: name.clone(),
+                    tier: info.tier,
+                    returns: table.decl(info).is_none_or(|d| !d.returns_void()),
+                    default: vec![],
+                    from: BTreeMap::new(),
+                });
+                let layer = layers.entry((key, scope)).or_insert_with(|| LayerPlan { module: mi, befores: vec![], patch: None, afters: vec![] });
+                match h.kind {
+                    Kind::Before => layer.befores.push(HookUse { imp: h.imp.clone(), bare, hook: hi }),
+                    Kind::After => layer.afters.push(HookUse { imp: h.imp.clone(), bare, hook: hi }),
+                    Kind::Patch if layer.patch.is_some() => p.errors.push(format!("{at}: two of {}'s hooks take {name}'s call", m.id())),
+                    Kind::Patch => layer.patch = Some(PatchUse { imp: h.imp.clone(), original: h.original.clone(), hook: hi }),
+                }
+                continue;
+            }
             // The target's C type, for mod.h and the chain.
             let ty = match (&h.signature, table.decl(info)) {
                 // mod.h declares it from the signature; under another name
@@ -238,7 +262,6 @@ pub fn plan(table: &SymbolTable, mods: &[Mod]) -> Plan {
             p.types.insert((mi, hi), ty.clone());
             p.resolved.insert((mi, hi), (f.clone(), from.clone()));
             let returns = ty.returns != "void";
-            let key = (f.container.clone(), f.addr);
             let tp = p.targets.entry(key.clone()).or_insert_with(|| TargetPlan {
                 container: f.container.clone(),
                 addr: f.addr,
@@ -252,9 +275,7 @@ pub fn plan(table: &SymbolTable, mods: &[Mod]) -> Plan {
                 p.errors.push(format!("{at}: {name} is declared returning {}, which disagrees with another hook's declaration", ty.returns));
                 continue;
             }
-            let scope = from.as_ref().map(|c| (c.container.clone(), c.addr));
             let layer = layers.entry((key, scope)).or_insert_with(|| LayerPlan { module: mi, befores: vec![], patch: None, afters: vec![] });
-            let bare = f.point.is_some();
             match h.kind {
                 Kind::Before => layer.befores.push(HookUse { imp: h.imp.clone(), bare, hook: hi }),
                 Kind::After => layer.afters.push(HookUse { imp: h.imp.clone(), bare, hook: hi }),

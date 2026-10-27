@@ -2,59 +2,242 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://psx-wasm.invalid/schema/test.schema.json",
   "title": "psx-wasm mod test (tests/*.json)",
-  "description": "psxw mod test builds the game with the mods and runs each test: a replay for some vblanks, symbols traced every vblank, expectations, and an optional check command.",
+  "description": "psxw mod test runs each test: a replay for some vblanks, symbols traced every vblank, commands at vblanks, expectations, and an optional check command. A compiled mod's tests run natively on the build with the mods linked in; a script mod's in headless Chromium and Firefox, on the moddable base.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["replay", "frames"],
+  "required": [
+    "replay",
+    "frames"
+  ],
   "properties": {
-    "$schema": { "type": "string" },
+    "$schema": {
+      "type": "string"
+    },
     "replay": {
       "oneOf": [
-        { "type": "object", "additionalProperties": false, "required": ["name"], "properties": { "name": { "type": "string", "description": "games/<id>/replays/<name> in psx-wasm." } } },
-        { "type": "object", "additionalProperties": false, "required": ["file"], "properties": { "file": { "type": "string", "description": "Relative to the test." } } }
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "games/<id>/replays/<name> in psx-wasm."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file"
+          ],
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "Relative to the test."
+            }
+          }
+        }
       ]
     },
-    "frames": { "type": "integer", "minimum": 1, "description": "Vblanks to run." },
+    "frames": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Vblanks to run."
+    },
     "trace": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["symbol", "type"],
-        "properties": { "symbol": { "type": "string" }, "type": { "enum": ["u8", "s8", "u16", "s16", "u32", "s32"] } }
+        "required": [
+          "symbol",
+          "type"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "u8",
+              "s8",
+              "u16",
+              "s16",
+              "u32",
+              "s32"
+            ]
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Bytes past the symbol; the trace's key is then SYMBOL+0xOFFSET."
+          }
+        }
       }
     },
     "expect": {
       "type": "array",
       "items": {
         "oneOf": [
-          { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "no_trap" } } },
-          { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "deterministic" } } },
           {
             "type": "object",
             "additionalProperties": false,
-            "required": ["kind", "at", "symbol", "op", "value"],
+            "required": [
+              "kind"
+            ],
             "properties": {
-              "kind": { "const": "symbol" },
-              "at": { "type": "integer", "minimum": 1 },
-              "symbol": { "type": "string" },
-              "type": { "enum": ["u8", "s8", "u16", "s16", "u32", "s32"] },
-              "op": { "enum": ["==", "!=", "<", "<=", ">", ">="] },
-              "value": { "type": "integer" }
+              "kind": {
+                "const": "no_trap"
+              }
             }
           },
-          { "type": "object", "additionalProperties": false, "required": ["kind", "contains"], "properties": { "kind": { "const": "log" }, "contains": { "type": "string" } } }
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "deterministic"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "at",
+              "symbol",
+              "op",
+              "value"
+            ],
+            "properties": {
+              "kind": {
+                "const": "symbol"
+              },
+              "at": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "symbol": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "u8",
+                  "s8",
+                  "u16",
+                  "s16",
+                  "u32",
+                  "s32"
+                ]
+              },
+              "op": {
+                "enum": [
+                  "==",
+                  "!=",
+                  "<",
+                  "<=",
+                  ">",
+                  ">="
+                ]
+              },
+              "value": {
+                "type": "integer"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "contains"
+            ],
+            "properties": {
+              "kind": {
+                "const": "log"
+              },
+              "contains": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "mod"
+            ],
+            "properties": {
+              "kind": {
+                "const": "same_as"
+              },
+              "mod": {
+                "type": "string",
+                "description": "A mod beside this one (the same mods directory): the run's RAM, VRAM and audio hashes equal a run with it in this mod's place."
+              }
+            }
+          }
         ]
       }
     },
-    "load_at": { "type": "integer", "minimum": 1, "description": "Run on the moddable base, the mods loaded at run time at this vblank (none before it)." },
+    "load_at": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Run on the moddable base, the mods loaded at run time at this vblank (none before it)."
+    },
     "check": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command"],
+      "required": [
+        "command"
+      ],
       "properties": {
-        "command": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Run in the test's directory with the trace as JSON on stdin; exit status 0 passes." },
-        "baseline": { "type": "boolean", "description": "Also trace the game without mods over the same replay, as `baseline` in the JSON." }
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Run in the test's directory with the trace as JSON on stdin; exit status 0 passes."
+        },
+        "baseline": {
+          "type": "boolean",
+          "description": "Also trace the game without mods over the same replay, as `baseline` in the JSON."
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "description": "Commands called inside the game, each queued at a vblank: a script mod's commands, or a compiled mod's global functions.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "at",
+          "name"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "name": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "maxItems": 4
+          }
+        }
       }
     }
   }

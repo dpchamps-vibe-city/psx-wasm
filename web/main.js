@@ -12,17 +12,17 @@
 // Mods (M11 phase 2): the panel keeps mod modules in OPFS `mods/` with
 // their order and whether each is enabled (`order.json`); the enabled ones
 // load at Start. "Swap in" sends a module to the running game through a
-// shared mailbox. ?mods=URL,URL loads those instead; ?swap=FRAME:INDEX:URL
-// (repeatable) swaps one in at a vblank; ?watch=URL polls a JSON
-// {seq, index, url} (psxw mod watch) and swaps each new module in.
+// shared mailbox. ?mods=URL,URL loads those instead (a .js URL is a script
+// mod, plans/M12); ?swap=FRAME:INDEX:URL (repeatable) swaps one in at a
+// vblank; ?watch=URL polls a JSON {seq, index, url, kind, id} (psxw mod
+// watch) and swaps each new module in, or reloads a script mod.
 
 import { SaveQueue, cardName, exportCard, importCard } from "./cards.js";
 import { scripting } from "./scripting.js";
 import { MAILBOX_BYTES, postMod } from "./mods.js";
 
-window.wasmPsxScripting = Object.freeze({
-  async execute() { throw new Error("start the game first"); },
-});
+const notStarted = async () => { throw new Error("start the game first"); };
+window.wasmPsxScripting = Object.freeze({ execute: notStarted, cmd: notStarted, load: notStarted, reload: notStarted });
 
 const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
@@ -177,7 +177,7 @@ async function renderMods() {
       await writeOrder(order);
     };
     const name = document.createElement("span");
-    const at = loadedMods.indexOf(m.file.replace(/(\.mod)?\.wasm$/, ""));
+    const at = loadedMods.indexOf(m.file.replace(/(\.mod)?\.(wasm|js)$/, ""));
     name.textContent = m.file + (at >= 0 ? `  (loaded, #${at + 1})` : "");
     const button = (label, fn, disabled) => {
       const b = document.createElement("button");
@@ -203,6 +203,13 @@ async function renderMods() {
         renderMods();
       }, running),
       button("Swap in", async () => {
+        if (m.file.endsWith(".js")) {
+          const url = URL.createObjectURL(new Blob([await modBytes(m.file)], { type: "text/javascript" }));
+          const id = m.file.replace(/\.js$/, "");
+          const done = loadedMods.includes(id) ? window.wasmPsxScripting.reload(id, url) : window.wasmPsxScripting.load(url);
+          say(`${m.file}: ${await done.catch((e) => e.message)} (at the next vblank)`);
+          return;
+        }
         const index = at >= 0 ? at : loadedMods.length;
         postMod(modBuffer, index, await modBytes(m.file));
         say(`${m.file}: swapping in at the next vblank`);
@@ -224,7 +231,11 @@ document.getElementById("mod-file").addEventListener("change", async (e) => {
   e.target.value = "";
   renderMods();
 });
-/** psxw mod watch: each new module it publishes is swapped in. */
+/**
+ * psxw mod watch: each new module it publishes is swapped in; a script
+ * mod (`kind: "script"`, a versioned URL) is re-imported and replaces
+ * the loaded one with its id, at the next vblank.
+ */
 function watchMods(url) {
   let seen = null;
   setInterval(async () => {
@@ -233,10 +244,17 @@ function watchMods(url) {
       if (seen === null) seen = w.seq;
       else if (w.seq !== seen) {
         seen = w.seq;
-        postMod(modBuffer, w.index, new Uint8Array(await (await fetch(w.url, { cache: "no-store" })).arrayBuffer()));
-        say(`watch: swapping in ${w.url} (#${w.seq})`);
+        if (w.kind === "script") {
+          await window.wasmPsxScripting.reload(w.id, w.url);
+          say(`watch: reloaded ${w.id} from ${w.url} (#${w.seq})`);
+        } else {
+          postMod(modBuffer, w.index, new Uint8Array(await (await fetch(w.url, { cache: "no-store" })).arrayBuffer()));
+          say(`watch: swapping in ${w.url} (#${w.seq})`);
+        }
       }
-    } catch {}
+    } catch (e) {
+      if (seen !== null) say(`watch: ${e.message || e}`);
+    }
   }, 500);
 }
 
@@ -268,6 +286,9 @@ async function start(cue, audioRing) {
       return { frame: parseInt(frame, 10), index: parseInt(index, 10), url: url.join(":") };
     }),
   };
+  // ?test=URL (web-test, M12): what a mod test reads back, as JSON
+  // {watch: [[address, size]…], commands: [{at, name, args}…], logs}.
+  if (params.has("test")) Object.assign(options, await (await fetch(params.get("test"))).json());
   if (params.has("watch")) watchMods(params.get("watch"));
   saveReplay.disabled = !options.record;
   worker.onmessage = (e) => {
@@ -289,6 +310,7 @@ async function start(cue, audioRing) {
     else if (m.type === "mods") {
       loadedMods = m.ids.slice();
       say(`mods: ${m.what}`);
+      for (const w of m.warnings || []) console.warn(`mods: ${w}`);
       for (const [name, addrs] of Object.entries(m.functions || {})) {
         console.log(`mod function ${name} at ${addrs.map((a) => "0x" + a.toString(16).toUpperCase().padStart(8, "0")).join(" ")}`);
       }

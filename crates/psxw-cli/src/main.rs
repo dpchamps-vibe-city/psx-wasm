@@ -41,6 +41,7 @@ mod oracle;
 mod wholegame;
 mod record;
 mod mods;
+mod modtest;
 mod passthrough;
 mod writers;
 
@@ -244,7 +245,7 @@ fn run() -> Result<()> {
             if moddable {
                 ensure!(dirs.is_empty(), "a moddable bundle links no mods; load them in the page");
                 let (r, _) = psxw_build::game::build(&ws, &psxw_build::game::Options { moddable: true, ..psxw_build::game::Options::new(game) })?;
-                let dir = psxw_build::web::bundle(&ws, game, &r, ws.out_dir().join("web").join(format!("{game}-moddable")))?;
+                let dir = mods::moddable_bundle(&ws, game, &r, ws.out_dir().join("web").join(format!("{game}-moddable")))?;
                 eprintln!("moddable web bundle: {} (serve it with `psxw serve {}`; add mods in the page)", dir.display(), dir.display());
                 return Ok(());
             }

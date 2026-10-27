@@ -648,6 +648,26 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
             lines += &format!("{c} 0x{a:08X} {flavour}\n");
         }
         wasm_encoder::CustomSection { name: psxw_link::game::exports::SLOTS_SECTION.into(), data: lines.into_bytes().into() }.append_to(&mut bytes);
+        // Script mods (plans/M12) refuse to replace an adapter, and patch
+        // an overlay's data once its first code words are resident.
+        let tiers_text: String = slots
+            .iter()
+            .map(|k| match tiers.get(k) {
+                Some(Tier::C { .. }) => "c\n",
+                Some(Tier::Lift { .. }) => "lift\n",
+                Some(Tier::Adapter(_)) => "adapter\n",
+                None => "?\n",
+            })
+            .collect();
+        wasm_encoder::CustomSection { name: psxw_link::game::exports::TIERS_SECTION.into(), data: tiers_text.into_bytes().into() }.append_to(&mut bytes);
+        let mut resident = String::new();
+        for c in inputs.map.containers.iter().filter(|c| !c.is_main) {
+            if let Some(at) = c.text.first().map(|r| r.start) {
+                let w = |a: u32| inputs.originals.word(&c.id, a).unwrap_or(0);
+                resident += &format!("{} 0x{at:08X} 0x{:08X} 0x{:08X}\n", c.id, w(at), w(at + 4));
+            }
+        }
+        wasm_encoder::CustomSection { name: psxw_link::game::exports::RESIDENT_SECTION.into(), data: resident.into_bytes().into() }.append_to(&mut bytes);
         let identity = identity_json(ws, &inputs)?;
         wasm_encoder::CustomSection { name: psxw_link::mods::GAME_SECTION.into(), data: identity.into_bytes().into() }.append_to(&mut bytes);
         std::fs::write(&game, &bytes)?;

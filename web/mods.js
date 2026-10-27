@@ -6,6 +6,12 @@
 // exported tables, so no JS frame sits between the game and a mod (JSPI
 // can still suspend the game). Loading, swapping or removing a mod
 // rewires every chain from the mods' order.
+//
+// Script mods (plans/M12, script.js) are entries in the same list, of the
+// same shape (slots, originals, a layer instance's `hook.<k>`): their
+// shims chain beside compiled layers, in load order. A layer that
+// replaces a function hides the layers below it; `conflicts()` says so,
+// naming both mods, as `psxw mod check` does for compiled ones.
 
 const AREA_START = 0x80600000;
 const AREA_END = 0x80800000;
@@ -24,15 +30,24 @@ export class ModLoader {
   /** The loader for a base, or null when game.wasm isn't moddable. */
   static forBase(module, exports) {
     const lines = section(module, "psxmod.slots");
-    return lines == null ? null : new ModLoader(lines, section(module, "psxmod.game") || "", exports);
+    if (lines == null) return null;
+    const l = new ModLoader(lines, section(module, "psxmod.game") || "", exports, section(module, "psxmod.tiers") || "");
+    for (const r of (section(module, "psxmod.resident") || "").split("\n").filter(Boolean)) {
+      const [c, at, w0, w1] = r.split(" ");
+      l.resident.set(c, { at: addr(at), words: [addr(w0), addr(w1)] });
+    }
+    return l;
   }
 
-  constructor(lines, identity, exports) {
+  constructor(lines, identity, exports, tiers = "") {
     this.slots = new Map();
+    const tier = tiers.split("\n");
     lines.split("\n").filter(Boolean).forEach((l, i) => {
       const [c, a, ...f] = l.split(" ");
-      this.slots.set(`${c} ${addr(a)}`, { slot: i, flavour: f.join(" ") });
+      this.slots.set(`${c} ${addr(a)}`, { slot: i, flavour: f.join(" "), tier: tier[i] || null });
     });
+    // Each overlay's first code words, which tell it is resident.
+    this.resident = new Map();
     this.identity = identity;
     this.x = exports;
     this.mods = [];
@@ -42,8 +57,21 @@ export class ModLoader {
     this.booted = false;
   }
 
+  /** A function's slot: its address a number, or hex as `psxmod.decl` has it. */
   slot(container, address) {
-    return this.slots.get(`${container} ${addr(address)}`);
+    return this.slots.get(`${container} ${typeof address === "number" ? address >>> 0 : addr(address)}`);
+  }
+
+  tableIndex(a) {
+    return tableIndex(a);
+  }
+
+  /** `n` functions' synthetic addresses: the first. */
+  synthetic(n) {
+    const base = this.codeNext;
+    if (base + 4 * n > SYNTHETIC_END) throw new Error("out of synthetic addresses");
+    this.codeNext += 4 * n;
+    return base >>> 0;
   }
 
   instantiate(bytes, reuse) {
@@ -100,7 +128,8 @@ export class ModLoader {
     calls.forEach((slot, k) => instance.exports.psxmod_calls.set(k, x.psxmod_entries.get(slot)));
     // Function k's o32 entry is at codeBase + 4k (its element segment).
     const functions = Object.entries(decl.function_names || {}).map(([name, k]) => [name, (codeBase + 4 * k) >>> 0]);
-    return { id: decl.id, decl, instance, slots, originals, dataBase, codeBase, area, functions };
+    const targets = decl.targets.map((t, k) => ({ name: t.name, slot: slots[k], replaces: !!t.replaces, kinds: [t.replaces ? "patch" : "layer"] }));
+    return { kind: "wasm", id: decl.id, version: decl.version, decl, instance, slots, originals, dataBase, codeBase, area, functions, targets };
   }
 
   rewire() {
@@ -126,8 +155,7 @@ export class ModLoader {
   /** Load a mod after the others. */
   load(bytes) {
     const m = this.instantiate(bytes, null);
-    this.mods.push(m);
-    this.rewire();
+    this.add(m);
     if (this.booted) m.instance.exports.psxmod_init();
     return m.id;
   }
@@ -136,12 +164,22 @@ export class ModLoader {
   swap(index, bytes) {
     if (index >= this.mods.length) return this.load(bytes);
     const old = this.mods[index];
-    const m = this.instantiate(bytes, old);
-    const same = m.decl.layout_hash === old.decl.layout_hash && m.dataBase === old.dataBase;
-    this.mods[index] = m;
-    this.rewire();
+    const m = this.instantiate(bytes, old.kind === "wasm" ? old : null);
+    const same = old.kind === "wasm" && m.decl.layout_hash === old.decl.layout_hash && m.dataBase === old.dataBase;
+    this.replace(index, m);
     if (this.booted) (same ? m.instance.exports.psxmod_resume : m.instance.exports.psxmod_init)();
     return m.id;
+  }
+
+  /** An instantiated mod of either kind, after the others. */
+  add(m) {
+    this.mods.push(m);
+    this.rewire();
+  }
+
+  replace(index, m) {
+    this.mods[index] = m;
+    this.rewire();
   }
 
   remove(index) {
@@ -151,6 +189,44 @@ export class ModLoader {
 
   ids() {
     return this.mods.map((m) => m.id);
+  }
+
+  /** Each hooked function's layers, innermost (applied first) first. */
+  chains() {
+    const by = new Map();
+    for (const m of this.mods) {
+      for (const t of m.targets || []) {
+        if (!by.has(t.slot)) by.set(t.slot, { name: t.name, layers: [] });
+        by.get(t.slot).layers.push({ id: m.id, kind: m.kind, replaces: t.replaces, kinds: t.kinds });
+      }
+    }
+    return [...by.values()];
+  }
+
+  /** What later mods make unreachable, naming both mods (as `psxw mod check`). */
+  conflicts() {
+    const out = [];
+    for (const { name, layers } of this.chains()) {
+      const top = layers.map((l) => l.replaces).lastIndexOf(true);
+      if (top < 0) continue;
+      const w = layers[top];
+      for (const l of layers.slice(0, top)) {
+        if (l.replaces) out.push(`${l.id} and ${w.id} both replace ${name}; ${w.id}'s runs (applied last), ${l.id}'s never does`);
+        else if (l.id !== w.id) out.push(`${w.id}'s replacement of ${name} hides ${l.id}'s ${l.kinds.join(", ")} on it, applied earlier: they never run`);
+      }
+    }
+    return out;
+  }
+
+  /** The loaded mods, in order, with their layers (`psx.mods()`). */
+  describe() {
+    return this.mods.map((m) => ({
+      id: m.id,
+      kind: m.kind,
+      version: m.version,
+      hooks: (m.targets || []).map((t) => `${t.name}: ${t.kinds.join(", ")}`),
+      commands: m.functions.map(([n, a]) => `${n} 0x${a.toString(16).toUpperCase()}`),
+    }));
   }
 
   /** The loaded mods' global functions: name -> addresses. */

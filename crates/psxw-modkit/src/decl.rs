@@ -234,6 +234,10 @@ pub enum DataValue {
 pub struct Mod {
     pub dir: PathBuf,
     pub decl: ModDecl,
+    /// A script mod's definition, read by running its factory (plans/M12):
+    /// planned with the others, but it needs no C types, and nothing is
+    /// compiled.
+    pub script: bool,
 }
 
 fn ident(s: &str) -> bool {
@@ -247,7 +251,7 @@ impl Mod {
         let path = dir.join(FILE);
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let decl: ModDecl = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
-        let m = Mod { dir: dir.to_path_buf(), decl };
+        let m = Mod { dir: dir.to_path_buf(), decl, script: false };
         m.validate().with_context(|| format!("{}", path.display()))?;
         Ok(m)
     }

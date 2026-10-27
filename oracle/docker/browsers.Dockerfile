@@ -4,6 +4,9 @@
 # the in-container server (browser-serve.py); run-browsers.sh drives each
 # browser and waits for it. No network: everything is served from /www.
 #
+# Node and TypeScript (plans/M12) check script mods: `psxw mod check` runs
+# their factories against a stub API, and `tsc --noEmit` type-checks them.
+#
 # Build context: oracle/. Pins: [oracle] in inputs.lock.
 
 ARG BASE_IMAGE
@@ -12,14 +15,15 @@ SHELL ["/bin/sh", "-eu", "-c"]
 ARG DEBIAN_SNAPSHOT
 COPY docker/apt-snapshot.sh /usr/local/bin/apt-snapshot.sh
 RUN chmod +x /usr/local/bin/apt-snapshot.sh \
- && apt-snapshot.sh "$DEBIAN_SNAPSHOT" chromium firefox-esr python3 \
+ && apt-snapshot.sh "$DEBIAN_SNAPSHOT" chromium firefox-esr python3 nodejs node-typescript \
       libgl1-mesa-dri libegl-mesa0 libegl1 libgl1 libgles2 xvfb xauth
 
 COPY docker/browser-serve.py docker/run-browsers.sh /opt/psxw/
 RUN chmod +x /opt/psxw/run-browsers.sh \
- && printf '{"debian_snapshot": "%s", "chromium": "%s", "firefox_esr": "%s", "mesa": "%s"}\n' \
+ && printf '{"debian_snapshot": "%s", "chromium": "%s", "firefox_esr": "%s", "mesa": "%s", "nodejs": "%s", "typescript": "%s"}\n' \
       "$DEBIAN_SNAPSHOT" "$(dpkg-query -W -f '${Version}' chromium)" \
       "$(dpkg-query -W -f '${Version}' firefox-esr)" "$(dpkg-query -W -f '${Version}' libegl-mesa0)" \
+      "$(dpkg-query -W -f '${Version}' nodejs)" "$(dpkg-query -W -f '${Version}' node-typescript)" \
       > /opt/psxw/sources.json
 
 # Firefox finds no GL in headless mode, so it runs on a virtual X server

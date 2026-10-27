@@ -5,6 +5,7 @@
 //! records the SDK the repo builds against.
 
 use crate::decl::Mod;
+use crate::script::AnyMod;
 use crate::genfiles::{self, Flags};
 use crate::plan::{self, Plan};
 use crate::symbols::SymbolTable;
@@ -144,11 +145,24 @@ impl ModsWorkspace {
         Ok(Some(serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?))
     }
 
+    /// Every mod of either kind (plans/M12: `mod.js` makes a script mod),
+    /// by id.
+    pub fn all_any(&self) -> Result<Vec<AnyMod>> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(self.mods_dir()) else { return Ok(out) };
+        let mut dirs: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| crate::script::is_mod_dir(p)).collect();
+        dirs.sort();
+        for d in dirs {
+            out.push(AnyMod::load(&d)?);
+        }
+        Ok(out)
+    }
+
     /// A mod, a set, or (none given) every mod: a label and the mods in
-    /// the order to apply them.
-    pub fn select(&self, name: Option<&str>) -> Result<(String, Vec<Mod>)> {
-        let all = self.all()?;
-        let pick = |ids: &[String]| -> Result<Vec<Mod>> {
+    /// the order to apply them, of either kind.
+    pub fn select_any(&self, name: Option<&str>) -> Result<(String, Vec<AnyMod>)> {
+        let all = self.all_any()?;
+        let pick = |ids: &[String]| -> Result<Vec<AnyMod>> {
             ids.iter()
                 .map(|id| all.iter().find(|m| m.id() == id).cloned().with_context(|| format!("no mod {id} in {}", self.mods_dir().display())))
                 .collect()
@@ -161,10 +175,16 @@ impl ModsWorkspace {
                 }
                 match self.set(n)? {
                     Some(s) => Ok((format!("set-{n}"), pick(&s.mods)?)),
-                    None => bail!("{n} is neither a mod (mods/{n}/mod.json) nor a set (sets/{n}.json)"),
+                    None => bail!("{n} is neither a mod (mods/{n}/mod.json or mod.js) nor a set (sets/{n}.json)"),
                 }
             }
         }
+    }
+
+    /// The compiled mods of a selection (`select_any`), in order.
+    pub fn select(&self, name: Option<&str>) -> Result<(String, Vec<Mod>)> {
+        let (label, mods) = self.select_any(name)?;
+        Ok((label, crate::script::compiled(&mods)))
     }
 
     pub fn table(&self) -> Result<SymbolTable> {

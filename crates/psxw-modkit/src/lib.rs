@@ -9,6 +9,9 @@
 //!   link into `game.wasm` (`psxw mod build`).
 //! - [`workspace`]: a mods repository (`psxmods.json`) and its SDK.
 //! - [`test`]: a mod's tests (`psxw mod test`).
+//! - [`script`]: script mods (plans/M12): a directory with `mod.js`.
+//! - [`snapshot`]: the game as script mods see it (plans/M12, D55): one
+//!   source's view of the binary, from which `game` and `game.d.ts` come.
 
 pub mod build;
 pub mod compile;
@@ -18,6 +21,8 @@ pub mod headers;
 pub mod plan;
 pub mod resolve;
 pub mod rust;
+pub mod script;
+pub mod snapshot;
 pub mod symbols;
 pub mod test;
 

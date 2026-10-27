@@ -27,3 +27,4 @@ psxw-gpu-oracle = { path = "../psxw-gpu-oracle" }
 psx-devices = { path = "../psx-devices" }
 psxw-link = { path = "../psxw-link" }
 wasmparser = "0.262.0"
+sha2 = "0.11.1"

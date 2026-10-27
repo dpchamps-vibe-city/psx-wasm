@@ -106,6 +106,12 @@ pub mod exports {
     /// The custom section listing the slots, one line each:
     /// `<container> <address> c <params>-><results>` or `... o32`.
     pub const SLOTS_SECTION: &str = "psxmod.slots";
+    /// Each slot's tier, a line each in the slots' order: `c`, `lift` or
+    /// `adapter` (script mods, plans/M12).
+    pub const TIERS_SECTION: &str = "psxmod.tiers";
+    /// How to tell each overlay is resident, a line each:
+    /// `<container> <address> <word> <word>`, its first two code words.
+    pub const RESIDENT_SECTION: &str = "psxmod.resident";
 }
 
 /// The `psx.*` imports, in import order, with their signatures.

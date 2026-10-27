@@ -202,6 +202,67 @@ mod tests {
         m.kernel.int_handlers.entry(prio).or_default().push(at);
     }
 
+    /// The ABI 10 host: `vblank` at every delivered vblank, `wait_vblank`
+    /// through the runtime's hold.
+    struct Paced {
+        seen: std::rc::Rc<RefCell<Vec<String>>>,
+        hold: std::rc::Rc<crate::hold::Hold>,
+    }
+    impl psx_bios::Host for Paced {
+        fn log(&mut self, _: u32, _: &str) {}
+        fn vblank(&mut self, f: u64) {
+            self.seen.borrow_mut().push(format!("vblank {f}"));
+        }
+        fn wait_vblank(&mut self, f: u64) {
+            let seen = self.seen.clone();
+            self.hold.wait(f, move |f| seen.borrow_mut().push(format!("wait {f}")));
+        }
+        fn disc_read(&mut self, _: u32, _: &mut [u8; 2352]) -> bool {
+            false
+        }
+        fn has_disc(&mut self) -> bool {
+            false
+        }
+        fn pad_state(&mut self, _: u32) -> Vec<u8> {
+            vec![]
+        }
+        fn storage_read(&mut self, _: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn storage_write(&mut self, _: &str, _: &[u8]) -> bool {
+            false
+        }
+        fn report(&mut self, _: &str) {}
+    }
+
+    #[test]
+    fn vblank_waits_are_held_while_js_is_on_the_stack() {
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let hold = std::rc::Rc::new(crate::hold::Hold::new());
+        let host = Paced { seen: seen.clone(), hold: hold.clone() };
+        let rt = RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(host), Box::new(Regs), Default::default(), Psyq::default()));
+        let mut g = Guest { rt: &rt, rfe: vec![], seen: vec![] };
+        let vblank = psx_devices::clock::CPU_HZ / 60;
+        let run_vblanks = |g: &mut Guest, n: u64| {
+            let until = rt.borrow().vblanks + n;
+            while rt.borrow().vblanks < until {
+                safepoint(&rt, g, vblank / 8);
+            }
+        };
+        run_vblanks(&mut g, 1);
+        assert_eq!(*seen.borrow(), ["vblank 1", "wait 1"]);
+        // A hook's JS calls back into the game, which reaches two vblanks.
+        hold.enter();
+        run_vblanks(&mut g, 2);
+        assert_eq!(*seen.borrow(), ["vblank 1", "wait 1", "vblank 2", "vblank 3"]);
+        let wait = |f| seen.borrow_mut().push(format!("wait {f}"));
+        hold.leave(wait);
+        assert_eq!(*seen.borrow(), ["vblank 1", "wait 1", "vblank 2", "vblank 3", "wait 2", "wait 3"]);
+        assert_eq!(hold.total(), 2);
+        run_vblanks(&mut g, 1);
+        assert_eq!(seen.borrow().last().map(String::as_str), Some("wait 4"));
+    }
+
     #[test]
     fn host_calls_run_unborrowed_after_callbacks() {
         struct HostCall<'a>(&'a RefCell<Machine<Psyq>>, usize);

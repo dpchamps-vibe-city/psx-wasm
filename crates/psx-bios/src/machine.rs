@@ -18,7 +18,12 @@ use std::collections::{BTreeMap, VecDeque};
 /// What the runtime needs from its host.
 pub trait Host {
     fn log(&mut self, level: u32, msg: &str);
-    /// Pacing at vblank `frame`; a host may stop the run here.
+    /// Vblank `frame` happened: what the host does at a vblank that the
+    /// guest can see (psxw-abi `host::VBLANK`); a host may stop the run
+    /// here.
+    fn vblank(&mut self, _frame: u64) {}
+    /// Pacing after vblank `frame` (psxw-abi `host::WAIT_VBLANK`); nothing
+    /// the guest can see.
     fn wait_vblank(&mut self, frame: u64);
     /// Raw 2352-byte sectors; false when unreadable.
     fn disc_read(&mut self, lba: u32, out: &mut [u8; 2352]) -> bool;
@@ -273,6 +278,7 @@ impl<S: Sdk> Machine<S> {
                 self.gpu_vblank();
                 self.card_vblank();
                 self.audio_vblank();
+                self.host.vblank(self.vblanks);
                 self.host.wait_vblank(self.vblanks);
             }
             Event::Timer(n) => {

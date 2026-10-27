@@ -889,6 +889,7 @@ dependencies = [
  "sdk-psyq",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "wasmparser 0.262.0",
 ]
 

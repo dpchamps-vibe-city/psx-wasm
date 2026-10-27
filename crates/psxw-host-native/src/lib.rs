@@ -1,7 +1,7 @@
 //! The native host (plans/M02): runs `game.wasm` under wasmtime, headless.
 //! It supplies the host interface (psxw-abi): the disc image, pad input
-//! from a replay, storage, logging, and vblank pacing, which is also where
-//! a run stops after its frame budget. Per-frame RAM hashes, dumps and a
+//! from a replay, storage, logging, and the vblank (`host.vblank`), which
+//! is also where a run stops after its frame budget. It doesn't pace. Per-frame RAM hashes, dumps and a
 //! traced word support the determinism and whole-game oracles.
 
 pub mod audio;
@@ -397,7 +397,10 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         let msg = String::from_utf8_lossy(&read_bytes(&mut c, ptr, len)).into_owned();
         Err(wasmtime::Error::msg(format!("runtime trap {code}: {msg}")))
     })?;
-    linker.func_wrap(h, host::WAIT_VBLANK, |mut c: Caller<'_, State>, frame: u64| -> wasmtime::Result<()> {
+    // Everything at a vblank happens in `vblank`: this host runs no JS, so
+    // the runtime never holds its waits, and it doesn't pace.
+    linker.func_wrap(h, host::WAIT_VBLANK, |_: Caller<'_, State>, _frame: u64| {})?;
+    linker.func_wrap(h, host::VBLANK, |mut c: Caller<'_, State>, frame: u64| -> wasmtime::Result<()> {
         c.data_mut().frame = frame;
         let m = mem(&mut c);
         let (want_hash, want_dump, trace) = {

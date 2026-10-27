@@ -18,6 +18,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use psxw_inputs::Workspace;
 use psxw_oracle::images::{docker_output, docker_run, image_id, owner_of};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -33,19 +34,34 @@ struct Record {
     id: String,
     base_image: String,
     debian_snapshot: String,
+    /// sha256 of the Dockerfile and the files it copies: a change rebuilds.
+    #[serde(default)]
+    context: String,
     sources: serde_json::Value,
+}
+
+/// The image's build inputs in `oracle/docker/`, hashed.
+fn context_hash(ws: &Workspace) -> Result<String> {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for f in ["browsers.Dockerfile", "apt-snapshot.sh", "browser-serve.py", "run-browsers.sh"] {
+        h.update(std::fs::read(ws.root.join("oracle/docker").join(f))?);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn record_path(ws: &Workspace) -> PathBuf {
     ws.root.join(".oracle").join("browsers.json")
 }
 
-/// The image, built from the pins on first use (or when it is gone).
-fn image(ws: &Workspace) -> Result<String> {
+/// The image, built from the pins on first use (or when it is gone, or
+/// its Dockerfile changed).
+pub fn image(ws: &Workspace) -> Result<String> {
     let pins = ws.lock.oracle.as_ref().context("inputs.lock has no [oracle] section")?;
+    let context = context_hash(ws)?;
     if let Ok(text) = std::fs::read_to_string(record_path(ws)) {
         let rec: Record = serde_json::from_str(&text)?;
-        if rec.base_image == pins.base_image && rec.debian_snapshot == pins.debian_snapshot && image_id(IMAGE).ok().as_ref() == Some(&rec.id) {
+        if rec.base_image == pins.base_image && rec.debian_snapshot == pins.debian_snapshot && rec.context == context && image_id(IMAGE).ok().as_ref() == Some(&rec.id) {
             return Ok(rec.id);
         }
     }
@@ -78,7 +94,7 @@ fn image(ws: &Workspace) -> Result<String> {
         IMAGE.into(),
         "/opt/psxw/sources.json".into(),
     ])?)?;
-    let rec = Record { id: image_id(IMAGE)?, base_image: pins.base_image.clone(), debian_snapshot: pins.debian_snapshot.clone(), sources };
+    let rec = Record { id: image_id(IMAGE)?, base_image: pins.base_image.clone(), debian_snapshot: pins.debian_snapshot.clone(), context, sources };
     std::fs::create_dir_all(record_path(ws).parent().unwrap())?;
     std::fs::write(record_path(ws), serde_json::to_string_pretty(&rec)?)?;
     Ok(rec.id)
@@ -168,6 +184,9 @@ pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_
         Some(r) => psxw_build::web::bundle(ws, game, r, dir)?,
         None => psxw_build::web::build_into(ws, game, dir)?,
     };
+    if !modules.is_empty() {
+        crate::mods::write_snapshot(ws, game, &bundle)?;
+    }
     // A named replay or file runs its length unless --frames says less.
     let replay = match &replay_path {
         Some(p) => crate::wholegame::replay(ws, game, Some(p))?.0,
@@ -295,6 +314,185 @@ pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_
         }
     }
     Ok(pass)
+}
+
+/// A mod as the page loads it: a module (compiled, M11 phase 2), or a
+/// script mod's directory, with its `mod.js` (plans/M12).
+#[derive(Debug, Clone)]
+pub enum PageMod {
+    Module(PathBuf),
+    Script(PathBuf),
+}
+
+impl PageMod {
+    /// Into the bundle's `mods/`; the URL the page loads it from.
+    pub fn place(&self, bundle: &std::path::Path) -> Result<String> {
+        let mods = bundle.join("mods");
+        std::fs::create_dir_all(&mods)?;
+        match self {
+            PageMod::Module(p) => {
+                let name = p.file_name().context("module name")?.to_string_lossy().into_owned();
+                std::fs::copy(p, mods.join(&name))?;
+                Ok(format!("mods/{name}"))
+            }
+            PageMod::Script(dir) => {
+                let name = dir.file_name().context("script mod directory")?.to_string_lossy().into_owned();
+                copy_js(dir, &mods.join(&name))?;
+                Ok(format!("mods/{name}/mod.js"))
+            }
+        }
+    }
+}
+
+/// A script mod's JavaScript, its tests left out.
+pub fn copy_js(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let p = e?.path();
+        let name = p.file_name().unwrap_or_default();
+        if p.is_dir() && name != "tests" && name != "node_modules" {
+            copy_js(&p, &to.join(name))?;
+        } else if p.extension().is_some_and(|x| x == "js" || x == "mjs" || x == "json") {
+            std::fs::copy(&p, to.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// A page run for a mod test (plans/M12 task 11): the moddable base with
+/// mods loaded at start or swapped in at vblanks, values read every
+/// vblank, commands at vblanks, and the run's log lines.
+#[derive(Debug, Clone, Default)]
+pub struct PageRun {
+    /// Names the bundle and results directories.
+    pub tag: String,
+    pub mods: Vec<PageMod>,
+    /// (vblank, index, mod).
+    pub swaps: Vec<(u64, usize, PageMod)>,
+    pub replay: Vec<u8>,
+    pub frames: u64,
+    pub hash_at: Vec<u64>,
+    /// (address, bytes) read at every vblank.
+    pub watch: Vec<(u32, u32)>,
+    /// (vblank, command, arguments).
+    pub commands: Vec<(u64, String, Vec<serde_json::Value>)>,
+    pub browsers: Vec<String>,
+    pub timeout: u32,
+}
+
+/// One browser's run, in the native host's shapes.
+#[derive(Debug, Clone, Default)]
+pub struct BrowserRun {
+    pub browser: String,
+    /// The page failed before the run's end (no result, a load error).
+    pub error: Option<String>,
+    /// `frame limit`, or why it stopped.
+    pub stop: String,
+    pub frames: u64,
+    pub ram_hashes: BTreeMap<u64, String>,
+    pub vram_hashes: BTreeMap<u64, String>,
+    pub audio_frames: u64,
+    pub audio_hash: String,
+    pub watched: Vec<Vec<u32>>,
+    pub logs: Vec<String>,
+    pub events: Vec<serde_json::Value>,
+    pub seconds: f64,
+}
+
+impl BrowserRun {
+    pub fn reached_limit(&self) -> bool {
+        self.error.is_none() && self.stop == "frame limit"
+    }
+
+    /// RAM, VRAM and audio, for comparing two runs.
+    pub fn hashes(&self) -> String {
+        format!("ram {:?} vram {:?} audio {} {}", self.ram_hashes, self.vram_hashes, self.audio_frames, self.audio_hash)
+    }
+
+    /// The runtime's report (counters, held waits).
+    pub fn report(&self) -> Option<&serde_json::Value> {
+        self.events.iter().rev().find(|e| e["event"] == "report")
+    }
+}
+
+/// Run a moddable `base` with mods in each browser (the `psxw-browsers`
+/// image, D44).
+pub fn page_runs(ws: &Workspace, game: &str, base: &psxw_build::game::Report, run: &PageRun) -> Result<Vec<BrowserRun>> {
+    let disc = ws.disc(game)?;
+    let dir = ws.out_dir().join("web").join(format!("test-{game}-{}", run.tag));
+    let bundle = crate::mods::moddable_bundle(ws, game, base, dir)?;
+    std::fs::write(bundle.join("replay.rpl"), &run.replay)?;
+    std::fs::create_dir_all(bundle.join("disc"))?;
+    let mut urls = Vec::new();
+    for m in &run.mods {
+        urls.push(m.place(&bundle)?);
+    }
+    let mut swaps = Vec::new();
+    for (f, i, m) in &run.swaps {
+        swaps.push(format!("&swap={f}:{i}:{}", m.place(&bundle)?));
+    }
+    let test = serde_json::json!({
+        "watch": run.watch.iter().map(|&(a, n)| serde_json::json!([a, n])).collect::<Vec<_>>(),
+        "commands": run.commands.iter().map(|(at, name, args)| serde_json::json!({ "at": at, "name": name, "args": args })).collect::<Vec<_>>(),
+        "logs": true,
+    });
+    std::fs::write(bundle.join("test.json"), test.to_string())?;
+    let id = image(ws)?;
+    let results = ws.out_dir().join("web").join(format!("test-{game}-{}-results", run.tag));
+    let _ = std::fs::remove_dir_all(&results);
+    std::fs::create_dir_all(&results)?;
+    let cue = disc.file_name().context("disc name")?.to_string_lossy().into_owned();
+    let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let mut page = format!(
+        "index.html?discurl=disc/{cue}&autostart&verify&frames={}&hash={}&replay=replay.rpl&post&test=test.json",
+        run.frames,
+        list(&run.hash_at)
+    );
+    if !urls.is_empty() {
+        page += &format!("&mods={}", urls.join(","));
+    }
+    page += &swaps.concat();
+    let mut args: Vec<String> = vec![page, run.timeout.to_string()];
+    args.extend(run.browsers.iter().cloned());
+    let disc_dir = disc.parent().context("disc directory")?.to_path_buf();
+    let argv = docker_run(
+        &id,
+        &owner_of(&results)?,
+        &[(bundle.clone(), "/www", true), (disc_dir, "/www/disc", true), (results.clone(), "/out", false)],
+        None,
+        &args,
+    );
+    ensure!(Command::new("docker").args(&argv).status()?.success(), "the browser container failed");
+    let mut out = Vec::new();
+    for b in &run.browsers {
+        let mut r = BrowserRun { browser: b.clone(), ..Default::default() };
+        let Ok(text) = std::fs::read_to_string(results.join(format!("result-{b}.json"))) else {
+            r.error = Some(format!("no result within {} s (log: {})", run.timeout, results.join(format!("{b}.log")).display()));
+            out.push(r);
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text)?;
+        if let Some(e) = v["error"].as_str() {
+            r.error = Some(e.to_string());
+            out.push(r);
+            continue;
+        }
+        let map = |o: &serde_json::Value| -> BTreeMap<u64, String> {
+            o.as_object().into_iter().flatten().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_str()?.to_string()))).collect()
+        };
+        r.stop = v["stop"].as_str().unwrap_or("").to_string();
+        r.frames = v["frames"].as_u64().unwrap_or(0);
+        r.ram_hashes = map(&v["ram"]);
+        r.vram_hashes = map(&v["vram"]);
+        r.audio_frames = v["audio"]["frames"].as_u64().unwrap_or(0);
+        r.audio_hash = v["audio"]["hash"].as_str().unwrap_or("").to_string();
+        r.watched = serde_json::from_value(v["watched"].clone()).unwrap_or_default();
+        r.logs = serde_json::from_value(v["logs"].clone()).unwrap_or_default();
+        r.events = serde_json::from_value(v["events"].clone()).unwrap_or_default();
+        r.seconds = v["seconds"].as_f64().unwrap_or(0.0);
+        out.push(r);
+    }
+    Ok(out)
 }
 
 /// `web-test pacing`: M5 exit criterion 3. The game runs idle at real

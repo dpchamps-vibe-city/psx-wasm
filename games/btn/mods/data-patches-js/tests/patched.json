@@ -1,0 +1,27 @@
+{
+  "replay": {
+    "name": "title-to-gameplay"
+  },
+  "frames": 2400,
+  "expect": [
+    {
+      "kind": "no_trap"
+    },
+    {
+      "kind": "log",
+      "contains": "message window opened"
+    },
+    {
+      "kind": "symbol",
+      "at": 1000,
+      "symbol": "gOvl27SpriteFrameIds0",
+      "type": "u16",
+      "op": "==",
+      "value": 64
+    },
+    {
+      "kind": "same_as",
+      "mod": "data-patches"
+    }
+  ]
+}
