@@ -47,6 +47,12 @@ critical sections, and returns its result. Only one call may be pending.
 It requires JSPI and the merged module (not `?dev`); rebuild the bundle for
 ABI 8. Errors before readiness, while busy, or after stop reject the Promise.
 
+A mod loaded into a moddable bundle (`psxw mod watch`, the mod panel) can
+also be called by the name of one of its global functions, such as
+`execute("RotateWorld", 1)`. The console logs each one's synthetic address
+when mods load or swap. `psxw run --execute FRAME:FUNC[:ARG,..]` does the
+same headless.
+
 This is an unsafe developer tool, not a sandbox: choose a valid function,
 the right arguments and a resident overlay. A bad call can trap or hang the
 game or corrupt its state; there is no rollback. It calls code already in

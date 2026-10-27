@@ -106,20 +106,35 @@ impl Clang {
     /// With `physical`, diagnostics locate physical lines of `i_path` (for
     /// fixups), else the source's own.
     pub fn compile_mod(&self, i_path: &Path, obj: &Path, physical: bool) -> Result<(bool, String)> {
-        let mut cmd = self.base();
-        cmd.args(["-c", "-O2", "-fno-builtin", "-fno-caret-diagnostics", "-ferror-limit=0"]);
+        let mut cmd = self.mod_base();
+        cmd.args(["-c", "-O2"]);
         if physical {
             cmd.args(["-Xclang", "-fno-diagnostics-use-presumed-location"]);
         }
-        cmd
+        let out = cmd.arg(i_path).arg("-o").arg(obj).output().context("running clang -c")?;
+        Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+    }
+
+    /// How many errors clang reports for preprocessed text checked as a
+    /// mod's source compiles (the header index prefers declaring headers
+    /// with fewer).
+    pub fn mod_errors(&self, i_path: &Path) -> Result<usize> {
+        let out = self.mod_base().arg("-fsyntax-only").arg(i_path).output().context("running clang -fsyntax-only")?;
+        Ok(String::from_utf8_lossy(&out.stderr).lines().filter(|l| l.contains(" error: ")).count())
+    }
+
+    /// A mod's language: C99 with GNU extensions and the game C's UB
+    /// containment.
+    fn mod_base(&self) -> Command {
+        let mut cmd = self.base();
+        cmd.args(["-fno-builtin", "-fno-caret-diagnostics", "-ferror-limit=0"])
             .args(crate::UB_CONTAINMENT_FLAGS.iter().filter(|f| !f.starts_with("-std=")))
             .arg("-std=gnu99");
         // The game's headers are GCC 2.95-era C.
         for w in DOWNGRADED.iter().filter(|w| **w != "implicit-function-declaration") {
             cmd.arg(format!("-Wno-error={w}"));
         }
-        let out = cmd.arg(i_path).arg("-o").arg(obj).output().context("running clang -c")?;
-        Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+        cmd
     }
 
     /// LLVM IR for a normalized TU, as `compile_i` would lower it.

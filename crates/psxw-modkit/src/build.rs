@@ -414,6 +414,10 @@ pub struct ModuleDecl {
     pub data_size: u32,
     pub stack_size: u32,
     pub functions: u32,
+    /// Its global functions by number: function `k`'s o32 entry is at the
+    /// synthetic address `code_base + 4k` it is given at load.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub function_names: BTreeMap<String, u32>,
     pub layout_hash: String,
     /// `hook.<k>`: each hooked function, by address, and its slot's type
     /// (`c <params>-><results>` or `o32`).
@@ -512,6 +516,7 @@ pub fn build_modules(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) 
             data_size: linked.data_size,
             stack_size: MODULE_STACK,
             functions: linked.functions,
+            function_names: linked.function_names.clone(),
             layout_hash: linked.layout_hash.clone(),
             targets: decl_targets,
             calls: linked

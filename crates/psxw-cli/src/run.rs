@@ -11,7 +11,7 @@
 //! - `--check no-trap`: the run reaches its frame limit (the UBSan gate,
 //!   with `--wasm out/<game>/game-ubsan.wasm`).
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use psxw_host_native::{Options, Overlay, RunReport, Stop};
 use psxw_inputs::Workspace;
 use serde::Serialize;
@@ -50,6 +50,16 @@ pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Ve
                 let (Some(f), Some(i), Some(path)) = (p.next(), p.next(), p.next()) else { bail!("--swap-mod FRAME:INDEX:PATH") };
                 o.swaps.push(psxw_host_native::ModSwap { frame: f.parse()?, index: i.parse()?, path: path.into() });
             }
+            // A call into the game at a vblank: FRAME:FUNC[:ARG,ARG..],
+            // FUNC an 0x address or a loaded mod's global function.
+            "--execute" => {
+                let v = val()?;
+                let mut p = v.splitn(3, ':');
+                let (Some(f), Some(function)) = (p.next(), p.next()) else { bail!("--execute FRAME:FUNC[:ARG,ARG..]") };
+                let args = p.next().map_or(Ok(vec![]), |a| a.split(',').map(|w| psxw_inputs::parse_u32(w).with_context(|| format!("bad argument {w}"))).collect::<Result<Vec<_>>>())?;
+                ensure!(args.len() <= 4, "--execute takes up to four argument words");
+                o.execute.push(psxw_host_native::Execute { frame: f.parse()?, function: function.into(), args });
+            }
             "--check" => checks.push(val()?),
             "--verbose" => o.verbose = true,
             "--render" => {
@@ -84,6 +94,12 @@ pub fn summary(r: &RunReport) -> String {
             rep["cd_sectors"],
             rep["edc_errors"].as_array().map_or(0, Vec::len)
         );
+    }
+    for e in r.events.iter().filter(|e| e["event"] == "mod-function") {
+        s += &format!("mod function {} at {}\n", e["name"].as_str().unwrap_or_default(), e["address"].as_str().unwrap_or_default());
+    }
+    for e in r.events.iter().filter(|e| e["event"] == "execute") {
+        s += &format!("execute #{} returned {}\n", e["id"], e["value"].as_str().unwrap_or_default());
     }
     for l in r.logs.iter().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
         s += &format!("  log {l}\n");

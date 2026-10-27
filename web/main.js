@@ -285,6 +285,9 @@ async function start(cue, audioRing) {
     else if (m.type === "mods") {
       loadedMods = m.ids.slice();
       say(`mods: ${m.what}`);
+      for (const [name, addrs] of Object.entries(m.functions || {})) {
+        console.log(`mod function ${name} at ${addrs.map((a) => "0x" + a.toString(16).toUpperCase().padStart(8, "0")).join(" ")}`);
+      }
       renderMods();
     }
     else if (m.type === "hashes") {

@@ -4,6 +4,8 @@ export function scripting(worker) {
   let unavailable = "game is not ready; wait for its first vblank";
   let pending = null;
   let nextId = 0;
+  // The loaded mods' global functions, by name (from the Worker).
+  let functions = {};
   const fail = (reason) => {
     unavailable = reason;
     if (pending) {
@@ -13,6 +15,7 @@ export function scripting(worker) {
   };
   worker.addEventListener("message", ({ data: m }) => {
     if (m.type === "scripting-ready") unavailable = m.error || null;
+    else if (m.type === "mods") functions = m.functions || {};
     else if (m.type === "execute-result" && pending?.id === m.id) {
       const p = pending;
       pending = null;
@@ -25,6 +28,12 @@ export function scripting(worker) {
 
   return Object.freeze({
     async execute(address, ...args) {
+      if (typeof address === "string") {
+        const found = functions[address];
+        if (!found) throw new Error(`no loaded mod defines a global function ${address}`);
+        if (found.length > 1) throw new Error(`more than one loaded mod defines ${address}`);
+        address = found[0];
+      }
       const word = (v) => Number.isInteger(v) && v >= 0 && v <= 0xffffffff;
       if (!word(address) || !address || address % 4 || (address & 0xffffff) >= 0x400000) {
         throw new Error("address must be an aligned guest function address in RAM or the synthetic code range");

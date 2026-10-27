@@ -35,6 +35,8 @@ struct Decl {
     data_size: u32,
     stack_size: u32,
     functions: u32,
+    #[serde(default)]
+    function_names: BTreeMap<String, u32>,
     layout_hash: String,
     targets: Vec<Target>,
     calls: Vec<Target>,
@@ -297,5 +299,26 @@ impl Loader {
 
     pub fn ids(&self) -> Vec<String> {
         self.mods.iter().map(|m| m.id.clone()).collect()
+    }
+
+    /// Each loaded mod's global functions, by name: their synthetic
+    /// addresses (o32 entries in the dispatch table).
+    pub fn functions(&self) -> BTreeMap<String, Vec<u32>> {
+        let mut out: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for m in &self.mods {
+            for (name, k) in &m.decl.function_names {
+                out.entry(name.clone()).or_default().push(m.code_base + 4 * k);
+            }
+        }
+        out
+    }
+
+    /// The address of the loaded mods' one global function `name`.
+    pub fn function(&self, name: &str) -> Result<u32> {
+        match self.functions().remove(name).as_deref() {
+            Some(&[a]) => Ok(a),
+            Some(_) => bail!("more than one loaded mod defines {name}"),
+            None => bail!("no loaded mod defines a global function {name}"),
+        }
     }
 }

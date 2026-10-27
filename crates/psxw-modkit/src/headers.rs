@@ -15,7 +15,7 @@ use std::path::Path;
 use tree_sitter::Node;
 
 /// Bumped when the index reads headers differently (its cache key).
-pub const INDEX_VERSION: u32 = 2;
+pub const INDEX_VERSION: u32 = 3;
 
 /// A function's declaration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,8 +64,8 @@ pub struct DataDecl {
 pub struct HeaderIndex {
     pub functions: BTreeMap<String, Decl>,
     pub data: BTreeMap<String, DataDecl>,
-    /// Names more than one header declares: the others (the first in
-    /// path order wins).
+    /// Names more than one header declares: the others (the one with the
+    /// fewest errors in its context wins, then the first in path order).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub also: BTreeMap<String, Vec<String>>,
     /// Headers clang couldn't preprocess, with why.
@@ -324,7 +324,8 @@ pub fn index(
     headers.sort();
     let contexts = psxw_census::include_contexts(snap, map);
     std::fs::create_dir_all(work)?;
-    let results: Vec<(String, Result<(Vec<(String, Decl)>, Vec<(String, DataDecl)>)>)> = headers
+    type Read = (Vec<(String, Decl)>, Vec<(String, DataDecl)>, usize);
+    let results: Vec<(String, Result<Read>)> = headers
         .par_iter()
         .map(|(dir, rel)| {
             let context = contexts.get(rel).cloned().unwrap_or_else(|| manifest.probe.prelude.clone());
@@ -337,18 +338,29 @@ pub fn index(
                 head.push_str(&format!("#include \"{rel}\"\n"));
                 std::fs::write(&src, &head)?;
                 let text = clang.preprocess(&src, &["PSXW_CLANG"])?;
-                Ok(read(&text, &format!("{dir}/{rel}"), rel, &context))
+                // A name several headers declare comes from the one that
+                // compiles best (not an m2c catch-all of unknown types).
+                let i = src.with_extension("i");
+                std::fs::write(&i, &text)?;
+                let errors = clang.mod_errors(&i)?;
+                let (funcs, data) = read(&text, &format!("{dir}/{rel}"), rel, &context);
+                Ok((funcs, data, errors))
             })();
             (rel.clone(), r)
         })
         .collect();
     let mut idx = HeaderIndex::default();
+    let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     for (rel, r) in results {
         match r {
-            Ok((funcs, data)) => {
+            Ok((funcs, data, n)) => {
+                errors.insert(rel.clone(), n);
                 for (name, d) in funcs {
                     match idx.functions.get(&name) {
-                        Some(first) if first.header != d.header => idx.also.entry(name).or_default().push(d.header),
+                        Some(first) if first.header != d.header => {
+                            let header = if n < errors[&first.header] { idx.functions.insert(name.clone(), d).map(|o| o.header) } else { Some(d.header) };
+                            idx.also.entry(name).or_default().extend(header);
+                        }
                         Some(_) => {}
                         None => {
                             idx.functions.insert(name, d);
@@ -356,7 +368,15 @@ pub fn index(
                     }
                 }
                 for (name, d) in data {
-                    idx.data.entry(name).or_insert(d);
+                    match idx.data.get(&name) {
+                        Some(first) if n < errors[&first.header] => {
+                            idx.data.insert(name, d);
+                        }
+                        Some(_) => {}
+                        None => {
+                            idx.data.insert(name, d);
+                        }
+                    }
                 }
             }
             Err(e) => {

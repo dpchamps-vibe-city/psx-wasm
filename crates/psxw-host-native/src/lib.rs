@@ -66,6 +66,8 @@ pub struct Options {
     pub mods: Vec<PathBuf>,
     /// Mod modules swapped in at vblanks.
     pub swaps: Vec<ModSwap>,
+    /// Host calls (`psxw_execute`) queued at vblanks.
+    pub execute: Vec<Execute>,
 }
 
 /// At vblank `frame`, the module at `path` replaces loaded mod `index`, or
@@ -75,6 +77,17 @@ pub struct ModSwap {
     pub frame: u64,
     pub index: usize,
     pub path: PathBuf,
+}
+
+/// At vblank `frame`, queue a call of `function` (an address in hex, or a
+/// loaded mod's global function) with up to four o32 argument words. The
+/// runtime runs it once it has released the machine; its result is an
+/// `execute` event.
+#[derive(Debug, Clone)]
+pub struct Execute {
+    pub frame: u64,
+    pub function: String,
+    pub args: Vec<u32>,
 }
 
 /// Which SPU windows a run records: one of `samples` at the first vblank
@@ -277,6 +290,10 @@ pub fn run(opts: Options) -> Result<RunReport> {
         for m in &opts.mods {
             let id = loader.load(&mut store, &std::fs::read(m).with_context(|| format!("reading {}", m.display()))?)?;
             store.data_mut().events.push(serde_json::json!({"event": "mod-load", "id": id, "frame": 0}));
+        }
+        for (name, addrs) in loader.functions() {
+            let addrs: Vec<String> = addrs.iter().map(|a| format!("0x{a:08X}")).collect();
+            store.data_mut().events.push(serde_json::json!({"event": "mod-function", "name": name, "address": addrs.join(" ")}));
         }
         store.data_mut().loader = Some(loader);
     }
@@ -482,6 +499,25 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             c.data_mut().loader = Some(loader);
             let id = r.map_err(|e| wasmtime::Error::msg(format!("swapping in {}: {e:#}", w.path.display())))?;
             c.data_mut().events.push(serde_json::json!({"event": "mod-swap", "id": id, "index": w.index, "frame": frame}));
+        }
+        let calls: Vec<(usize, Execute)> = c.data().opts.execute.iter().cloned().enumerate().filter(|(_, x)| x.frame == frame).collect();
+        for (id, x) in calls {
+            let addr = match x.function.strip_prefix("0x").map(|h| u32::from_str_radix(h, 16)) {
+                Some(a) => a.map_err(|e| wasmtime::Error::msg(format!("--execute {}: {e}", x.function)))?,
+                None => {
+                    let found = c.data().loader.as_ref().map(|l| l.function(&x.function));
+                    found.unwrap_or_else(|| Err(anyhow::anyhow!("no mods are loaded"))).map_err(|e| wasmtime::Error::msg(format!("--execute: {e}")))?
+                }
+            };
+            let a = |i: usize| x.args.get(i).copied().unwrap_or(0);
+            let f = c
+                .get_export(psxw_abi::exports::EXECUTE)
+                .and_then(wasmtime::Extern::into_func)
+                .ok_or_else(|| wasmtime::Error::msg("game.wasm exports no psxw_execute"))?;
+            let status = f.typed::<(u32, u32, u32, u32, u32, u32), i32>(&c)?.call(&mut c, (id as u32, addr, a(0), a(1), a(2), a(3)))?;
+            if status != 0 {
+                return Err(wasmtime::Error::msg(format!("--execute {} at vblank {frame}: rejected ({status})", x.function)));
+            }
         }
         if frame >= c.data().opts.frames {
             return Err(wasmtime::Error::msg(FRAME_LIMIT));

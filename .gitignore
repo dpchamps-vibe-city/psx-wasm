@@ -7,3 +7,4 @@
 *.bin
 *.cue
 *.iso
+.worktrees/

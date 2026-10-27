@@ -109,6 +109,9 @@ pub struct Linked {
     pub data_size: u32,
     /// The mod's functions (synthetic addresses it needs).
     pub functions: u32,
+    /// Its global functions by name, with their numbers: function `k`'s
+    /// entry is at `code_base + 4k` (for calling one from the host).
+    pub function_names: BTreeMap<String, u32>,
     /// Hash of the data image's layout (names, offsets, sizes): a hot swap
     /// keeps the mod's state only when it is unchanged.
     pub layout_hash: String,
@@ -989,10 +992,18 @@ pub fn link(map: &AddressMap, spec: &ModuleSpec, inputs: &[Input]) -> Result<Lin
         m.layout.hash(&mut h);
         format!("{:016x}", h.finish())
     };
+    let mut function_names = BTreeMap::new();
+    for (k, &(i, f)) in m.guest_order.iter().enumerate() {
+        let obj = &inputs[i].obj;
+        if let Some(s) = obj.func_symbol(f + obj.num_imported_funcs()).filter(|s| !s.local) {
+            function_names.insert(s.name.clone(), k as u32);
+        }
+    }
     Ok(Linked {
         wasm: module.finish(),
         data_size: m.image.len() as u32,
         functions: m.guest_order.len() as u32,
+        function_names,
         layout_hash,
         calls: m.calls.clone(),
     })

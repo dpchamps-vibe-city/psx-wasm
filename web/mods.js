@@ -98,7 +98,9 @@ export class ModLoader {
     }
     const instance = new WebAssembly.Instance(module, imports);
     calls.forEach((slot, k) => instance.exports.psxmod_calls.set(k, x.psxmod_entries.get(slot)));
-    return { id: decl.id, decl, instance, slots, originals, dataBase, codeBase, area };
+    // Function k's o32 entry is at codeBase + 4k (its element segment).
+    const functions = Object.entries(decl.function_names || {}).map(([name, k]) => [name, (codeBase + 4 * k) >>> 0]);
+    return { id: decl.id, decl, instance, slots, originals, dataBase, codeBase, area, functions };
   }
 
   rewire() {
@@ -149,6 +151,13 @@ export class ModLoader {
 
   ids() {
     return this.mods.map((m) => m.id);
+  }
+
+  /** The loaded mods' global functions: name -> addresses. */
+  functions() {
+    const out = {};
+    for (const m of this.mods) for (const [name, a] of m.functions) (out[name] ||= []).push(a);
+    return out;
   }
 }
 

@@ -244,7 +244,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   let loader = null;
   const swaps = [];
   let mailboxSeq = modBuffer ? Atomics.load(new Int32Array(modBuffer, 0, 1), 0) : 0;
-  const modsChanged = (what) => postMessage({ type: "mods", ids: loader.ids(), what, frame });
+  const modsChanged = (what) => postMessage({ type: "mods", ids: loader.ids(), functions: loader.functions(), what, frame });
   const vblank = (f) => {
     frame = Number(f);
     if (loader) {
