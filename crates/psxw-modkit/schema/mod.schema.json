@@ -13,7 +13,17 @@
     "game": { "type": "string", "description": "The game's id (games/<id>/game.toml in psx-wasm)." },
     "load_after": { "type": "array", "items": { "type": "string" }, "description": "Mods this one is applied after, when they are applied too." },
     "hooks": { "type": "array", "items": { "$ref": "#/$defs/hook" } },
-    "data": { "type": "array", "items": { "$ref": "#/$defs/data" } }
+    "data": { "type": "array", "items": { "$ref": "#/$defs/data" } },
+    "wasm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "description": "The mod's code as a wasm module another toolchain builds (any language), linked with wasm-ld --emit-relocs --allow-undefined, instead of C under src/.",
+      "properties": {
+        "path": { "type": "string", "description": "The module, relative to the mod's directory." },
+        "build": { "type": "array", "items": { "type": "string" }, "description": "The command that builds it, run in the mod's directory first." }
+      }
+    }
   },
   "$defs": {
     "ident": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },

@@ -16,9 +16,11 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub const USAGE: &str = "mod <command>; in a mods workspace (psxmods.json): \
-    mod sdk [--bump] | mod check [mod|set] | mod build [mod|set] | mod test [mod|set] \
-    | mod play <mod|set> [--port N] [--test] | mod new <id> | mod show <symbol> | mod writers <symbol>; \
-    in psx-wasm: mod check <game> <dir>… | mod build <game> <dir>… | mod test <game> <dir>… \
+    mod sdk [--bump] | mod check [mod|set] | mod build [mod|set] [--modules] | mod test [mod|set] \
+    | mod play <mod|set> [--dynamic] [--port N] [--test] | mod watch <mod|set> [--port N] \
+    | mod new <id> | mod show <symbol> | mod writers <symbol>; \
+    in psx-wasm: mod check <game> <dir>… | mod build <game> <dir>… [--modules] [--out D] | mod test <game> <dir>… \
+    | mod watch <game> <dir>… [--port N] | mod ci <game> \
     | mod new <game> <id> [--dir D] | mod show <game> <symbol> | mod writers <game> <symbol> \
     | mod pass-through <game> --out <dir>";
 
@@ -113,9 +115,33 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
             run_tests(&psx, m.game(), &table, &mods, &built)
         }
         ["play", name, rest @ ..] => {
+            if rest.contains(&"--dynamic") {
+                let psx = m.psx()?;
+                m.check_pins(&psx)?;
+                let (label, mods) = m.select(Some(name))?;
+                let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--dynamic").collect();
+                let modules = modules_ws(m, &psx, &label, &mods)?;
+                let (base, _) = psxw_build::game::build(&psx, &Options { moddable: true, ..Options::new(m.game()) })?;
+                return play(&psx, m.game(), &base, &m.state.join("web").join(format!("{label}-dynamic")), &rest, &modules);
+            }
             let (psx, _, built, label) = build_ws(m, Some(name))?;
             summary(&built);
-            play(&psx, m.game(), &built.report, &m.state.join("web").join(&label), rest)
+            play(&psx, m.game(), &built.report, &m.state.join("web").join(&label), rest, &[])
+        }
+        ["watch", name, rest @ ..] => {
+            let psx = m.psx()?;
+            m.check_pins(&psx)?;
+            let port = match rest {
+                ["--port", p] => p.parse()?,
+                [] => 8081,
+                _ => bail!("usage: psxw mod watch <mod|set> [--port N]"),
+            };
+            let (label, _) = m.select(Some(name))?;
+            let dir = m.state.join("web").join(format!("{label}-watch"));
+            watch(&psx, m.game(), &dir, port, &|| {
+                let (_, mods) = m.select(Some(name))?;
+                Ok((mods.clone(), modules_ws(m, &psx, &label, &mods)?))
+            })
         }
         ["new", id] => {
             let dir = m.mods_dir().join(id);
@@ -126,6 +152,84 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
         ["show", sym] => show(&m.table()?, sym),
         ["writers", sym] => crate::writers::run(&m.psx()?, m.game(), sym),
         _ => bail!("usage: psxw {USAGE}"),
+    }
+}
+
+/// A workspace's mods as modules (phase 2).
+fn modules_ws(m: &ModsWorkspace, psx: &Workspace, label: &str, mods: &[Mod]) -> Result<Vec<PathBuf>> {
+    let inc = m.state.join("mods");
+    let layout = Layout { out: m.build_dir(label).join("modules"), include: Box::new(move |id| inc.join(id).join("include")), flags: Some(m.flags()?) };
+    let built = build::build_modules(psx, m.game(), mods, &layout)?;
+    print_modules(&built);
+    Ok(built.into_iter().map(|b| b.path).collect())
+}
+
+/// `psxw mod watch`: a moddable bundle served with the mods loaded at
+/// start; each time a mod's files change, its module is rebuilt and
+/// published, and the page swaps it in at the next vblank.
+fn watch(ws: &Workspace, game: &str, dir: &Path, port: u16, rebuild: &dyn Fn() -> Result<(Vec<Mod>, Vec<PathBuf>)>) -> Result<bool> {
+    let (mods, modules) = rebuild()?;
+    let (base, _) = psxw_build::game::build(ws, &Options { moddable: true, ..Options::new(game) })?;
+    let dir = psxw_build::web::bundle(ws, game, &base, dir.to_path_buf())?;
+    std::fs::create_dir_all(dir.join("mods"))?;
+    let mut urls = Vec::new();
+    let mut hashes = Vec::new();
+    for p in &modules {
+        let name = p.file_name().context("module")?.to_string_lossy().into_owned();
+        std::fs::copy(p, dir.join("mods").join(&name))?;
+        urls.push(format!("mods/{name}"));
+        hashes.push(std::fs::read(p)?);
+    }
+    let mut seq = 0u64;
+    let publish = |seq: u64, index: usize, url: &str| std::fs::write(dir.join("mods").join("watch.json"), serde_json::json!({ "seq": seq, "index": index, "url": url }).to_string());
+    publish(seq, 0, "")?;
+    let root = dir.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = crate::serve::serve(root, port) {
+            eprintln!("serve: {e:#}");
+        }
+    });
+    eprintln!("watching {}; open http://localhost:{port}/?mods={}&watch=mods/watch.json", mods.iter().map(|m| m.id()).collect::<Vec<_>>().join(", "), urls.join(","));
+    let stamp = |mods: &[Mod]| -> Vec<(PathBuf, std::time::SystemTime, u64)> {
+        let mut v = Vec::new();
+        for m in mods {
+            let mut files = m.sources().unwrap_or_default();
+            files.push(m.dir.join("mod.json"));
+            for f in files {
+                if let Ok(md) = std::fs::metadata(&f) {
+                    v.push((f, md.modified().unwrap_or(std::time::UNIX_EPOCH), md.len()));
+                }
+            }
+        }
+        v
+    };
+    let mut last = stamp(&mods);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let now = stamp(&mods);
+        if now == last {
+            continue;
+        }
+        last = now;
+        match rebuild() {
+            Ok((_, modules)) => {
+                for (i, p) in modules.iter().enumerate() {
+                    let bytes = std::fs::read(p)?;
+                    if hashes.get(i) == Some(&bytes) {
+                        continue;
+                    }
+                    seq += 1;
+                    let name = format!("{}.{seq}.mod.wasm", p.file_name().context("module")?.to_string_lossy().trim_end_matches(".mod.wasm"));
+                    std::fs::write(dir.join("mods").join(&name), &bytes)?;
+                    publish(seq, i, &format!("mods/{name}"))?;
+                    eprintln!("watch: published {name}; the page swaps it in at its next vblank");
+                    if i < hashes.len() {
+                        hashes[i] = bytes;
+                    }
+                }
+            }
+            Err(e) => eprintln!("watch: {e:#}"),
+        }
     }
 }
 
@@ -205,6 +309,24 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
             Ok(true)
         }
         ["show", game, sym] => show(&build::table(ws, game)?.1, sym),
+        ["watch", game, rest @ ..] => {
+            let mut dirs: Vec<&str> = Vec::new();
+            let mut port = 8081u16;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "--port" => port = it.next().context("--port needs a value")?.parse()?,
+                    d => dirs.push(d),
+                }
+            }
+            let dir = ws.out_dir().join("web").join(format!("{game}-watch"));
+            watch(ws, game, &dir, port, &|| {
+                let mods = load(&dirs)?;
+                let built = build_modules_direct(ws, game, &mods, None)?;
+                print_modules(&built);
+                Ok((mods, built.into_iter().map(|b| b.path).collect()))
+            })
+        }
         ["writers", game, sym] => crate::writers::run(ws, game, sym),
         ["ci", game] => {
             let (pass, detail) = ci(ws, game)?;
@@ -301,13 +423,13 @@ fn show(table: &SymbolTable, sym: &str) -> Result<bool> {
 
 /// Serve the bundle with the mods, or (`--test`) run the browser
 /// harness on it (title-to-gameplay unless `--replay` says).
-fn play(ws: &Workspace, game: &str, report: &Report, dir: &Path, rest: &[&str]) -> Result<bool> {
+fn play(ws: &Workspace, game: &str, report: &Report, dir: &Path, rest: &[&str], modules: &[PathBuf]) -> Result<bool> {
     if rest.contains(&"--test") {
         let mut args: Vec<&str> = rest.iter().copied().filter(|a| *a != "--test").collect();
         if !args.contains(&"--replay") {
             args.extend(["--replay", "title-to-gameplay", "--hash", "300,1200,2400,3600,4800,6000", "--timeout", "3600"]);
         }
-        return crate::webtest::game_with(ws, game, &args, Some(report));
+        return crate::webtest::game_with(ws, game, &args, Some(report), modules);
     }
     let mut port = 8081u16;
     let mut it = rest.iter();
@@ -318,7 +440,18 @@ fn play(ws: &Workspace, game: &str, report: &Report, dir: &Path, rest: &[&str]) 
         }
     }
     let dir = psxw_build::web::bundle(ws, game, report, dir.to_path_buf())?;
-    eprintln!("serving {} on http://localhost:{port}/ (record a replay with ?record)", dir.display());
+    let mut query = String::new();
+    if !modules.is_empty() {
+        std::fs::create_dir_all(dir.join("mods"))?;
+        let mut urls = Vec::new();
+        for m in modules {
+            let name = m.file_name().context("module")?.to_string_lossy().into_owned();
+            std::fs::copy(m, dir.join("mods").join(&name))?;
+            urls.push(format!("mods/{name}"));
+        }
+        query = format!("?mods={}", urls.join(","));
+    }
+    eprintln!("serving {} on http://localhost:{port}/{query} (record a replay with the page's checkbox)", dir.display());
     crate::serve::serve(dir, port)?;
     Ok(true)
 }
@@ -338,7 +471,7 @@ pub fn record(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let mods = load(&dirs)?;
     let built = build_direct(ws, game, &mods, None)?;
     let dir = ws.out_dir().join("web").join(format!("{game}-record-{}", label(&mods)));
-    play(ws, game, &built.report, &dir, &rest)
+    play(ws, game, &built.report, &dir, &rest, &[])
 }
 
 #[derive(Serialize)]

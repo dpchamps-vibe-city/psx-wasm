@@ -1,0 +1,10 @@
+{
+  "replay": { "name": "title-to-gameplay" },
+  "frames": 2400,
+  "trace": [{ "symbol": "gRandomState", "type": "u32" }],
+  "expect": [
+    { "kind": "no_trap" },
+    { "kind": "log", "contains": "rust-rand: 600 frames" }
+  ],
+  "check": { "command": ["python3", "../../better-rand-check.py"] }
+}

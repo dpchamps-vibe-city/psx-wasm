@@ -17,6 +17,7 @@ pub mod genfiles;
 pub mod headers;
 pub mod plan;
 pub mod resolve;
+pub mod rust;
 pub mod symbols;
 pub mod test;
 

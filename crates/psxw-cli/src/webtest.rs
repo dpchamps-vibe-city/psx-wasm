@@ -132,12 +132,13 @@ fn encode(vs: &[(String, Vec<u32>, Vec<u8>)]) -> Vec<u8> {
 /// imported into OPFS), and every requested frame's RAM and VRAM hashes
 /// must agree.
 fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
-    game_with(ws, game, args, None)
+    game_with(ws, game, args, None, &[])
 }
 
-/// `web-test game` on a given build (`built`: with mods) instead of the
-/// plain one.
-pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_build::game::Report>) -> Result<bool> {
+/// `web-test game` on a given build (`built`: with mods linked in, or a
+/// moddable base) instead of the plain one, with `modules` loaded into it
+/// at start (natively and in the browsers).
+pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_build::game::Report>, modules: &[PathBuf]) -> Result<bool> {
     let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
     let (mut timeout, mut frames) = (1800u32, None::<u64>);
     let mut replay_path: Option<String> = None;
@@ -168,6 +169,15 @@ pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_
     };
     let frames = frames.unwrap_or_else(|| psxw_abi::replay::Header::parse(&replay).map_or(600, |h| h.frames as u64));
     std::fs::write(bundle.join("replay.rpl"), &replay)?;
+    let mut module_urls = Vec::new();
+    if !modules.is_empty() {
+        std::fs::create_dir_all(bundle.join("mods"))?;
+        for m in modules {
+            let name = m.file_name().context("module name")?.to_string_lossy().into_owned();
+            std::fs::copy(m, bundle.join("mods").join(&name))?;
+            module_urls.push(format!("mods/{name}"));
+        }
+    }
     // The disc's mount point inside the read-only bundle mount.
     std::fs::create_dir_all(bundle.join("disc"))?;
 
@@ -176,6 +186,7 @@ pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_
     if let Some(r) = built {
         o.wasm = r.wasm.clone().into();
     }
+    o.mods = modules.to_vec();
     o.frames = frames;
     o.replay = Some(replay.clone());
     o.hash_at = hash.clone();
@@ -194,6 +205,9 @@ pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_
     let mut page = format!("index.html?discurl=disc/{cue}&autostart&verify&frames={frames}&hash={}&replay=replay.rpl&post", list(&hash));
     if record {
         page += "&record";
+    }
+    if !module_urls.is_empty() {
+        page += &format!("&mods={}", module_urls.join(","));
     }
     let mut args: Vec<String> = vec![page, timeout.to_string()];
     args.extend(browsers.iter().cloned());
@@ -246,6 +260,7 @@ pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_
                     if let Some(r) = built {
                         o.wasm = r.wasm.clone().into();
                     }
+                    o.mods = modules.to_vec();
                     o.frames = frames;
                     o.replay = Some(rec);
                     o.hash_at = hash.clone();

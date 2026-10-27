@@ -1,0 +1,13 @@
+{
+  "id": "plain-clang",
+  "version": "0.1.0",
+  "game": "btn",
+  "wasm": { "path": "build/plain_clang.wasm", "build": ["sh", "build.sh"] },
+  "hooks": [
+    {
+      "kind": "patch",
+      "target": { "symbol": "Rand" },
+      "impl": { "file": "src/random.c", "function": "better_rand" }
+    }
+  ]
+}

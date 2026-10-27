@@ -22,6 +22,24 @@ pub struct ModDecl {
     pub hooks: Vec<Hook>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data: Vec<DataPatch>,
+    /// The mod's code as a wasm module another toolchain builds (any
+    /// language), instead of C under `src/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm: Option<WasmSource>,
+}
+
+/// A mod built by another toolchain: a wasm module linked with
+/// `wasm-ld --emit-relocs --allow-undefined` (so its code still carries
+/// relocations psxw can place it by; game functions and data stay
+/// undefined), which psxw links like an object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmSource {
+    /// The module, relative to the mod's directory.
+    pub path: String,
+    /// The command that builds it, run in the mod's directory first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -286,8 +304,12 @@ impl Mod {
         Ok(())
     }
 
-    /// The mod's C sources: every `.c` under `src/`.
+    /// The mod's C sources: every `.c` under `src/` (none for a mod built
+    /// by another toolchain).
     pub fn sources(&self) -> Result<Vec<PathBuf>> {
+        if self.decl.wasm.is_some() {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         let src = self.dir.join("src");
         if src.is_dir() {

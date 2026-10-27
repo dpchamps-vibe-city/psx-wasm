@@ -1,0 +1,21 @@
+{
+  "id": "rust-rand",
+  "version": "0.1.0",
+  "game": "btn",
+  "wasm": {
+    "path": "target/wasm32-unknown-unknown/release/rust_rand.wasm",
+    "build": ["cargo", "build", "--release", "--quiet"]
+  },
+  "hooks": [
+    {
+      "kind": "patch",
+      "target": { "symbol": "Rand" },
+      "impl": { "file": "src/lib.rs", "function": "better_rand" }
+    },
+    {
+      "kind": "after",
+      "target": { "point": "frame" },
+      "impl": { "file": "src/lib.rs", "function": "on_frame" }
+    }
+  ]
+}

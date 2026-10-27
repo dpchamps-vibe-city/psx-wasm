@@ -230,6 +230,10 @@ pub fn compile_mods(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) -
         write_if_changed(&include.join("mod.h"), &genfiles::mod_h(&plan, mods, mi, &prelude))?;
         write_if_changed(&include.join("psxmod.h"), genfiles::PSXMOD_H)?;
         let (_, obj_dir) = compile::mod_dirs(&layout.out, m.id());
+        if crate::rust::is_rust(m) {
+            compile::flat_header(&flags, m, &include, &obj_dir.join("flat"))?;
+            crate::rust::generate(&flags, &plan, mods, mi, &include)?;
+        }
         let objs = compile::compile(&flags, m, &include, &obj_dir)?;
         objects.insert(mi, objs);
     }
@@ -284,7 +288,13 @@ pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> R
         spec.mods.push(lm::ModInputs { id: m.id().to_string(), inputs: ids });
     }
     let imp = |mi: usize, i: &crate::decl::Impl| -> Result<lm::Impl> {
-        let input = *input_of.get(&(mi, i.file.clone())).with_context(|| format!("{}: no object for {}", mods[mi].id(), i.file))?;
+        // A mod built by another toolchain is one module, whatever source
+        // file declared each implementation.
+        let file = match &mods[mi].decl.wasm {
+            Some(w) => w.path.clone(),
+            None => i.file.clone(),
+        };
+        let input = *input_of.get(&(mi, file)).with_context(|| format!("{}: no object for {}", mods[mi].id(), i.file))?;
         Ok(lm::Impl { input, function: i.function.clone() })
     };
     let layer = |l: &LayerPlan| -> Result<lm::Layer> {
@@ -453,7 +463,11 @@ pub fn build_modules(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) 
         let objs = &objects[&mi];
         let inputs: Vec<Input> = objs.iter().map(|o| mod_input(m, o, &main)).collect();
         let imp = |i: &crate::decl::Impl| -> Result<lm::Impl> {
-            let input = objs.iter().position(|o| o.file == i.file).with_context(|| format!("{}: no object for {}", m.id(), i.file))?;
+            let file = match &m.decl.wasm {
+                Some(w) => w.path.clone(),
+                None => i.file.clone(),
+            };
+            let input = objs.iter().position(|o| o.file == file).with_context(|| format!("{}: no object for {}", m.id(), i.file))?;
             Ok(lm::Impl { input, function: i.function.clone() })
         };
         let mut targets = Vec::new();
