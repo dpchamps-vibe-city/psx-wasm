@@ -9,6 +9,7 @@ use psxw_inputs::boundary::{Boundary, Policy};
 use psxw_inputs::identity::SigDb;
 use psxw_lift::program::Source;
 use psxw_link::game::{GameSpec, Tier};
+use psxw_link::mods::ModSpec;
 use psxw_link::object::{NameClass, SymbolKind, WasmObject, classify_name};
 use psxw_link::{Gcc, Input};
 use rayon::prelude::*;
@@ -35,11 +36,28 @@ pub struct Options {
     /// More functions, by name, whose entries count in the run report
     /// (`probe.<addr>`), besides the manifest's main loop.
     pub probes: Vec<String>,
+    /// Mods to link in (plans/M11), as psxw-modkit planned them.
+    pub mods: Option<ModPlan>,
+}
+
+/// What the modkit links into a build (plans/M11).
+#[derive(Debug, Clone, Default)]
+pub struct ModPlan {
+    /// Where the build's outputs go, instead of `out/<game>/`.
+    pub out: PathBuf,
+    /// Census translation units to recompile with these functions made
+    /// weak and noinline, by (container, object stem): hooked functions and
+    /// `from` callers, so clang neither inlines their calls nor uses their
+    /// bodies to elide them.
+    pub noinline: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Mod objects; `spec` indexes them from 0.
+    pub inputs: Vec<Input>,
+    pub spec: ModSpec,
 }
 
 impl Options {
     pub fn new(game: &str) -> Self {
-        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![], probes: vec![] }
+        Self { game: game.into(), debug_io: false, budget: 1000, ubsan: false, original: vec![], probes: vec![], mods: None }
     }
 
     /// The output name's suffix: `-ubsan`, `-orig-libpad+libetc`.
@@ -93,6 +111,8 @@ pub struct Report {
     pub guest_bytes: usize,
     pub game_bytes: usize,
     pub wasm: String,
+    /// The unmerged guest module (the browser's dev mode).
+    pub guest: String,
 }
 
 /// The `-all` minus features clang and rustc don't emit and hosts may lack.
@@ -127,6 +147,38 @@ pub fn out_dir(ws: &Workspace, game: &str) -> PathBuf {
 }
 
 pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
+    let prep = prepare(ws, opts)?;
+    finish(ws, opts, prep)
+}
+
+/// Everything about a build up to the link: the inputs, each function's
+/// tier, the translations.
+pub struct Prepared {
+    pub inputs: psxw_lift::run::Inputs,
+    pub commit: String,
+    runtime_path: PathBuf,
+    adapters: Vec<String>,
+    pub link_inputs: Vec<Input>,
+    pub tiers: BTreeMap<(String, u32), Tier>,
+    pub translations: Vec<psxw_lift::Translation>,
+    /// Functions the translator expands into their translated callers.
+    pub expanded: BTreeSet<(String, u32)>,
+    /// Each C definition's census object: (container, object stem).
+    pub c_objects: BTreeMap<(String, u32), (String, String)>,
+    /// Adapter names, by adapter id.
+    pub adapter_names: Vec<String>,
+    /// What GCC did that C inputs are linked to reproduce.
+    pub gcc: Gcc,
+    unvalidated: BTreeSet<String>,
+    hardware: Vec<Unbound>,
+    void_used: BTreeSet<(String, u32)>,
+    overlays: BTreeMap<u32, Vec<(String, [u32; 2])>>,
+    spec: GameSpec,
+}
+
+/// A build's inputs and tiers. With mods, the translation units their
+/// plan names are recompiled with functions weak and noinline.
+pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     // Incremental: cheap when the runtime hasn't changed.
     let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;
@@ -154,7 +206,14 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let keys: BTreeMap<&str, &str> =
         identity.identities.iter().filter_map(|i| Some((i.member.as_str(), i.key.as_deref()?))).collect();
     let validated: BTreeSet<(&str, &str)> = sdk_psyq::validated::VALIDATED.iter().copied().collect();
-    let (translations, _, _, _, _) = psxw_lift::run::translate(&mut inputs);
+    let (translations, _, _, _, inline) = psxw_lift::run::translate(&mut inputs);
+    let expanded: BTreeSet<(String, u32)> = inline
+        .keys()
+        .filter_map(|k| {
+            let (c, a) = k.split_once(' ')?;
+            Some((c.to_string(), psxw_inputs::parse_u32(a)?))
+        })
+        .collect();
     let lift_dir = psxw_lift::run::out_dir(ws, &inputs);
 
     // C inputs: every census object with its prototype facts.
@@ -186,9 +245,42 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         ubsan_flags.push(format!("-fsanitize-ignorelist={}", ignorelist.display()));
     }
     let ubsan_flags: Vec<&str> = ubsan_flags.iter().map(String::as_str).collect();
+    let noinline = opts.mods.as_ref().map(|m| &m.noinline);
+    let hook_dir = opts.mods.as_ref().map(|m| m.out.join("noinline"));
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
+            let stem = o.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let i_path = o.with_extension("i");
+            // Hooked functions and `from` callers: weak and noinline.
+            if let (Some(names), Some(dir)) = (noinline.and_then(|n| n.get(&(c.clone(), stem.clone()))), &hook_dir) {
+                ensure!(!opts.ubsan, "a UBSan build can't link mods");
+                let dir = dir.join(c);
+                std::fs::create_dir_all(&dir)?;
+                let text = std::fs::read_to_string(&i_path)?;
+                let variant = psxw_cc::ast::hook_variant(&text, names);
+                let vi = dir.join(format!("{stem}.i"));
+                let vo = dir.join(format!("{stem}.o"));
+                if std::fs::read_to_string(&vi).ok().as_deref() != Some(variant.as_str()) || !vo.is_file() {
+                    std::fs::write(&vi, &variant)?;
+                    clang.compile_variant(&vi, &vo, &[])?;
+                }
+                let protos: BTreeMap<String, Proto> =
+                    psxw_cc::protos::cached(&clang, &vi)?.into_iter().fold(BTreeMap::new(), |mut m, p| {
+                        if p.defined || !m.contains_key(&p.name) {
+                            m.insert(p.name.clone(), p);
+                        }
+                        m
+                    });
+                return Ok(Input {
+                    label: format!("{c}/{stem} (hooked)"),
+                    container: c.clone(),
+                    obj: WasmObject::read(&vo)?,
+                    protos,
+                    generated: false,
+                    gcc: Some(gcc),
+                });
+            }
             let obj_path = if opts.ubsan {
                 let dir = ubsan_dir.join(c);
                 std::fs::create_dir_all(&dir)?;
@@ -226,12 +318,15 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
 
     // C definitions by (container, address).
     let mut c_defs: BTreeMap<(String, u32), (usize, u32)> = BTreeMap::new();
+    let mut c_objects: BTreeMap<(String, u32), (String, String)> = BTreeMap::new();
     for (i, inp) in link_inputs.iter().enumerate() {
         for s in inp.obj.symbols.iter().filter(|s| s.kind == SymbolKind::Function && s.defined) {
             let NameClass::Guest(n) = classify_name(&s.name) else { continue };
             let Some(r) = inputs.map.resolve(&inp.container, n) else { continue };
             let Some(idx) = s.index else { continue };
             c_defs.entry((inp.container.clone(), r.addr)).or_insert((i, idx - inp.obj.num_imported_funcs()));
+            let stem = objs[i].1.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            c_objects.entry((inp.container.clone(), r.addr)).or_insert((inp.container.clone(), stem));
         }
     }
 
@@ -334,6 +429,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             .collect(),
         main: inputs.map.main.clone(),
         min_pages: 1024,
+        mods: None,
         probes: inputs
             .manifest
             .run
@@ -350,6 +446,49 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             })
             .collect(),
     };
+    Ok(Prepared {
+        inputs,
+        commit,
+        runtime_path,
+        adapter_names: adapters.clone(),
+        adapters,
+        gcc,
+        link_inputs,
+        tiers,
+        translations,
+        expanded,
+        c_objects,
+        unvalidated,
+        hardware,
+        void_used,
+        overlays,
+        spec,
+    })
+}
+
+/// The link, the merge with the runtime, and the reports.
+pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report, PathBuf)> {
+    let Prepared {
+        inputs,
+        commit,
+        runtime_path,
+        adapters,
+        mut link_inputs,
+        tiers,
+        translations,
+        unvalidated,
+        hardware,
+        void_used,
+        overlays,
+        mut spec,
+        ..
+    } = prep;
+    // Mods: their objects after the game's.
+    if let Some(plan) = &opts.mods {
+        let base = link_inputs.len();
+        link_inputs.extend(plan.inputs.iter().cloned());
+        spec.mods = Some(plan.spec.clone().offset(base));
+    }
     let rodata = psxw_link::layout::Rodata::new(&inputs.map, &inputs.originals);
     eprintln!("build: linking {} inputs", link_inputs.len());
     let linked = psxw_link::game::link(&inputs.map, Some(&rodata), &spec, &link_inputs)?;
@@ -361,7 +500,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     }
     validate(&linked.wasm).context("guest module fails validation")?;
 
-    let dir = out_dir(ws, &opts.game);
+    let dir = opts.mods.as_ref().map_or_else(|| out_dir(ws, &opts.game), |m| m.out.clone());
     std::fs::create_dir_all(&dir)?;
     let suffix = opts.suffix();
     let guest = dir.join(format!("guest{suffix}.wasm"));
@@ -427,6 +566,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         guest_bytes: linked.wasm.len(),
         game_bytes: bytes.len(),
         wasm: game.display().to_string(),
+        guest: guest.display().to_string(),
     };
     let tier_list: Vec<serde_json::Value> = tiers
         .iter()

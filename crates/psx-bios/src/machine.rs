@@ -170,6 +170,9 @@ pub struct Machine<S> {
     pub sdk: S,
     /// Calls per BIOS function and adapter, for the run report.
     pub counts: BTreeMap<String, u64>,
+    /// Guest ranges (address, length) the disc wrote since the driver last
+    /// looked: mods' overlay data patches apply as their bytes arrive.
+    pub loaded: Vec<(u32, u32)>,
 }
 
 impl<S: Sdk> Machine<S> {
@@ -200,6 +203,7 @@ impl<S: Sdk> Machine<S> {
             in_irq: false,
             sdk,
             counts: BTreeMap::new(),
+            loaded: Vec::new(),
         };
         let first = m.clock.video.vblank_at(1);
         m.clock.schedule(first, Event::Vblank);

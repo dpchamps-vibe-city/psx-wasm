@@ -5,7 +5,10 @@
 //! - anonymous read-only data without relocations (string literals,
 //!   constant tables) is placed on identical bytes in the container's
 //!   original read-only data, so pointers to it equal the original's;
-//! - everything else anonymous goes to the AUX region, 8-byte aligned.
+//! - everything else anonymous goes to the AUX region, 8-byte aligned;
+//! - mods' data (plans/M11) goes to the mod area, below its stack: a mod's
+//!   names never resolve to game addresses, and its references resolve
+//!   inside the mod first.
 
 use crate::object::{RelocKind, SymbolKind, WasmObject};
 use anyhow::{Result, bail};
@@ -15,6 +18,9 @@ use std::collections::{BTreeMap, HashMap};
 /// Start of the AUX region (window offset `phys::AUX_DATA.start`).
 pub const AUX_BASE: u32 = 0x8000_0000 | psxw_abi::phys::AUX_DATA.start;
 pub const AUX_END: u32 = 0x8000_0000 | psxw_abi::phys::AUX_DATA.end;
+/// Static mods' data: from the mod area's start up to its stack.
+pub const MOD_BASE: u32 = 0x8000_0000 | psxw_abi::phys::MOD_DATA.start;
+pub const MOD_END: u32 = 0x8000_0000 | psxw_abi::phys::MOD_STACK.start;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum How {
@@ -24,6 +30,8 @@ pub enum How {
     Matched,
     /// Allocated in the AUX region.
     Aux,
+    /// A mod's, in the mod area.
+    Mod,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -79,9 +87,12 @@ impl Rodata {
 pub struct Layout {
     /// (input, symbol index) → placement, for defined data symbols.
     pub defined: HashMap<(usize, u32), Placed>,
-    /// AUX allocations: (input, symbol index, address).
+    /// AUX and mod-area allocations: (input, symbol index, address).
     pub aux: Vec<(usize, u32, u32)>,
     next: u32,
+    next_mod: u32,
+    /// Per input, the mod it belongs to (`None` for the game's).
+    mod_of: Vec<Option<usize>>,
 }
 
 impl Layout {
@@ -90,13 +101,35 @@ impl Layout {
         map: &AddressMap,
         rodata: Option<&Rodata>,
     ) -> Result<Self> {
-        let mut l = Layout { next: AUX_BASE, ..Default::default() };
+        Self::place_mods(inputs, map, rodata, &[])
+    }
+
+    /// [`Layout::place`], with `mod_of[i]` naming the mod input `i` belongs
+    /// to (missing or `None`: the game's).
+    pub fn place_mods(
+        inputs: &[(&str, &WasmObject)],
+        map: &AddressMap,
+        rodata: Option<&Rodata>,
+        mod_of: &[Option<usize>],
+    ) -> Result<Self> {
+        let mut l = Layout { next: AUX_BASE, next_mod: MOD_BASE, mod_of: mod_of.to_vec(), ..Default::default() };
         for (i, (container, obj)) in inputs.iter().enumerate() {
             for (si, s) in obj.symbols.iter().enumerate() {
                 if s.kind != SymbolKind::Data || !s.defined {
                     continue;
                 }
                 let Some(def) = s.data else { continue };
+                if l.module(i).is_some() {
+                    let align = (1u32 << obj.segment_of(def).align_log2).max(8);
+                    let addr = l.next_mod.div_ceil(align) * align;
+                    l.next_mod = addr + def.size.max(1);
+                    if l.next_mod > MOD_END {
+                        bail!("the mod area is full placing {}", s.name);
+                    }
+                    l.defined.insert((i, si as u32), Placed { addr, how: How::Mod });
+                    l.aux.push((i, si as u32, addr));
+                    continue;
+                }
                 if let Some(r) = map.resolve(container, &s.name) {
                     l.defined.insert((i, si as u32), Placed { addr: r.addr, how: How::Named });
                     continue;
@@ -137,10 +170,22 @@ impl Layout {
         }
         let (container, obj) = inputs[i];
         let s = &obj.symbols[si as usize];
+        // A mod's own globals first, then the game's.
+        if let Some(m) = self.module(i) {
+            for (j, (_, o)) in inputs.iter().enumerate().filter(|(j, _)| self.module(*j) == Some(m)) {
+                for (sj, t) in o.symbols.iter().enumerate() {
+                    if t.kind == SymbolKind::Data && t.defined && !t.local && t.name == s.name {
+                        if let Some(p) = self.defined.get(&(j, sj as u32)) {
+                            return Ok(p.addr);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(r) = map.resolve(container, &s.name) {
             return Ok(r.addr);
         }
-        for (j, (_, o)) in inputs.iter().enumerate() {
+        for (j, (_, o)) in inputs.iter().enumerate().filter(|(j, _)| self.module(*j).is_none()) {
             for (sj, t) in o.symbols.iter().enumerate() {
                 if t.kind == SymbolKind::Data && t.defined && !t.local && t.name == s.name {
                     if let Some(p) = self.defined.get(&(j, sj as u32)) {
@@ -150,6 +195,11 @@ impl Layout {
             }
         }
         bail!("data symbol {} has no address", s.name)
+    }
+
+    /// The mod input `i` belongs to.
+    pub fn module(&self, i: usize) -> Option<usize> {
+        self.mod_of.get(i).copied().flatten()
     }
 
     /// Bytes of a placed symbol with its data relocations applied.

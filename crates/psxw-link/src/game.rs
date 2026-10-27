@@ -15,9 +15,10 @@
 use crate::layout::{Layout, Rodata};
 use crate::link::{Input, Linked};
 use crate::marshal;
-use crate::object::{FuncType, NameClass, WasmObject, classify_name};
+use crate::mods::{Impl, Layer, ModSpec, PatchValue};
+use crate::object::{FuncType, NameClass, SymbolKind, WasmObject, classify_name};
 use crate::rewrite::{self, Lowered, Resolver};
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use psxw_abi::{TABLE_LEN, WINDOW_BASE, WINDOW_MASK, guest, psx, table_index};
 use psxw_inputs::AddressMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -59,6 +60,8 @@ pub struct GameSpec {
     pub min_pages: u64,
     /// Functions whose entry calls `psx.probe(addr)`.
     pub probes: Vec<(String, u32)>,
+    /// Mods (plans/M11): their inputs, hook chains and data patches.
+    pub mods: Option<ModSpec>,
 }
 
 /// The `psx.*` imports, in import order, with their signatures.
@@ -89,6 +92,7 @@ fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         ("adapter", vec![i; 5], vec![V::I64]),
         (psx::PROBE, vec![i], vec![]),
         (psx::RETURN_FROM_EXCEPTION, vec![], vec![]),
+        (psx::MOD_LOG, vec![i, i], vec![]),
     ]
 }
 
@@ -137,6 +141,51 @@ enum Synth {
     SpSet,
     GpGet,
     GpSet,
+    /// o32 wrapper around the C-typed function index `callee` (signature
+    /// `sig`), with the prototype facts of `name` in input `input`.
+    O32WrapOf { callee: u32, sig: FuncType, input: usize, name: String },
+    /// A C-typed hook layer with the hooked function's signature `sig`
+    /// (prototype facts of `name` in `input`): befores, `core` (a patch or
+    /// the next link), afters; each with whether it takes no arguments.
+    CLayer { befores: Vec<(u32, bool)>, core: u32, afters: Vec<(u32, bool)>, sig: FuncType, input: usize, name: String },
+    /// An o32 hook layer; each after takes the result first when `returns`.
+    O32Layer { befores: Vec<u32>, core: u32, afters: Vec<u32>, returns: bool },
+    /// A mod's C function entered from an o32 chain; `hook`: a wrapping
+    /// patch's id.
+    ModWrap { input: usize, func: u32, hook: Option<i32> },
+    /// A mod's `after` entered from an o32 layer.
+    ModAfter { input: usize, func: u32, result: bool },
+    /// A mod's call to the next link of an o32 chain (its `original`).
+    Transparent { input: usize, name: String, sig: FuncType, next: u32, id: i32 },
+    /// `guest.psxmod_init`: data patches to the executable.
+    ModInit,
+    /// `guest.psxmod_loaded(addr, len)`: data patches to overlays.
+    ModLoaded,
+}
+
+/// A hooked function's entries.
+#[derive(Debug, Clone)]
+struct Head {
+    /// The C-typed entry and its signature (a C function's chain).
+    c: Option<(u32, FuncType)>,
+    /// The o32 entry.
+    o32: u32,
+}
+
+/// What a mod's `original` name calls.
+#[derive(Debug, Clone)]
+enum Bound {
+    /// The next link of a C-typed chain.
+    C(u32, FuncType),
+    /// The next link of an o32 chain, inside the wrapping patch `id`.
+    O32 { next: u32, id: i32 },
+}
+
+/// A chain's link while it is built.
+#[derive(Debug, Clone, Copy)]
+enum Link {
+    C(u32),
+    O32(u32),
 }
 
 struct Ctx<'a> {
@@ -163,6 +212,21 @@ struct Ctx<'a> {
     device: HashSet<(usize, u32)>,
     /// C→C calls routed through o32 because clang's C-level kinds differ.
     abi_mismatches: BTreeSet<String>,
+    /// Per input, the mod it belongs to (index into `ModSpec::mods`).
+    mod_of: Vec<Option<usize>>,
+    /// The mod stack pointer and the o32 hook frame (`$sp` at a wrapping
+    /// patch's entry, and its id); globals that exist only with mods.
+    mod_sp: u32,
+    hook_sp: u32,
+    hook_id: u32,
+    /// Synthetic MIPS addresses of mod functions: (input, local function).
+    synthetic: BTreeMap<(usize, u32), u32>,
+    /// Hooked functions' entries: (container, address, from-caller).
+    heads: HashMap<(String, u32, Option<(String, u32)>), Head>,
+    /// Mods' `original` names: (mod, name).
+    bindings: HashMap<(usize, String), Bound>,
+    /// Each game function's (container, address), for `from` scopes.
+    caller_of: HashMap<(usize, u32), (String, u32)>,
 }
 
 impl Ctx<'_> {
@@ -190,17 +254,91 @@ impl Ctx<'_> {
         self.imports[name]
     }
 
-    /// The o32 entry of the function at (container, addr).
+    /// The o32 entry of the function at (container, addr): its hook chain
+    /// when it has one.
     fn entry(&mut self, container: &str, addr: u32) -> Option<u32> {
         if self.spec.overlays.contains_key(&addr) && container != self.spec.main {
             return Some(self.synth(Synth::OverlayStub(addr)));
         }
+        if let Some(h) = self.heads.get(&(container.to_string(), addr, None)) {
+            return Some(h.o32);
+        }
+        self.entry_raw(container, addr)
+    }
+
+    /// The function's own o32 entry, without hooks or overlay dispatch.
+    fn entry_raw(&mut self, container: &str, addr: u32) -> Option<u32> {
         let tier = *self.spec.tiers.get(&(container.to_string(), addr))?;
         Some(match tier {
             Tier::Lift { input, func } => self.guest[&(input, func)],
             Tier::C { input, func } => self.synth(Synth::O32Wrap { input, func }),
             Tier::Adapter(id) => self.synth(Synth::AdapterThunk(id)),
         })
+    }
+
+    /// A hooked function's entries as seen from a caller.
+    fn head(&self, container: &str, addr: u32, caller: Option<&(String, u32)>) -> Option<&Head> {
+        caller
+            .and_then(|k| self.heads.get(&(container.to_string(), addr, Some(k.clone()))))
+            .or_else(|| self.heads.get(&(container.to_string(), addr, None)))
+    }
+
+    /// [`Ctx::entry`] for a call from `caller`, whose `from`-scoped hooks
+    /// apply.
+    fn entry_from(&mut self, container: &str, addr: u32, caller: Option<&(String, u32)>) -> Option<u32> {
+        if self.spec.overlays.contains_key(&addr) && container != self.spec.main {
+            return Some(self.synth(Synth::OverlayStub(addr)));
+        }
+        match self.head(container, addr, caller) {
+            Some(h) => Some(h.o32),
+            None => self.entry_raw(container, addr),
+        }
+    }
+
+    /// A function mod `m` defines that symbol `symbol` of input `input`
+    /// names: the input's own definition, else a global one in another of
+    /// the mod's objects. (input, local function).
+    fn mod_function(&self, m: usize, input: usize, symbol: u32) -> Option<(usize, u32)> {
+        let inp = &self.inputs[input];
+        let s = &inp.obj.symbols[symbol as usize];
+        if s.kind != SymbolKind::Function {
+            return None;
+        }
+        if s.defined {
+            let local = s.index? - inp.obj.num_imported_funcs();
+            return Some((input, local));
+        }
+        let spec = self.spec.mods.as_ref()?;
+        for &j in &spec.mods[m].inputs {
+            let o = &self.inputs[j].obj;
+            if let Some(t) = o.symbols.iter().find(|t| t.kind == SymbolKind::Function && t.defined && !t.local && t.name == s.name) {
+                return Some((j, t.index? - o.num_imported_funcs()));
+            }
+        }
+        None
+    }
+
+    /// The synthetic MIPS address of a mod function a symbol names.
+    fn mod_func_addr(&self, m: usize, input: usize, symbol: u32) -> Option<u32> {
+        let k = self.mod_function(m, input, symbol)?;
+        self.synthetic.get(&k).copied()
+    }
+
+    /// A declaration's mod function: (input, local function).
+    fn impl_func(&self, imp: &Impl) -> Result<(usize, u32)> {
+        let o = &self.inputs[imp.input].obj;
+        let s = o
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Function && s.defined && s.name == imp.function)
+            .with_context(|| format!("{} defines no function {}", self.inputs[imp.input].label, imp.function))?;
+        let index = s.index.context("function symbol without index")?;
+        Ok((imp.input, index - o.num_imported_funcs()))
+    }
+
+    fn func_sig(&self, input: usize, func: u32) -> FuncType {
+        let o = &self.inputs[input].obj;
+        o.types[o.funcs[func as usize].ty as usize].clone()
     }
 
     /// The entry for a call into an overlay slot from outside it.
@@ -271,9 +409,15 @@ impl Resolver for R<'_, '_> {
         if name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
             return Ok(Lowered::Call(self.ctx.synth(Synth::InlineCopy)));
         }
+        if let Some(m) = self.ctx.mod_of[self.input] {
+            if let Some(l) = self.mod_call(m, symbol, sig)? {
+                return Ok(l);
+            }
+        }
+        let caller = self.ctx.caller_of.get(&(self.input, self.func)).cloned();
         if let Some((c, addr)) = parse_generated(&name, &self.ctx.spec.main) {
             let e = match c {
-                Some(c) => self.ctx.entry(&c, addr),
+                Some(c) => self.ctx.entry_from(&c, addr, caller.as_ref()),
                 None => self.ctx.dynamic_entry(addr),
             };
             return e.map(Lowered::Call).with_context(|| format!("{name}: no function at that address"));
@@ -329,6 +473,23 @@ impl Resolver for R<'_, '_> {
                 _ => None,
             }
         };
+        // A hooked function: its chain's C entry when the signatures agree,
+        // else its o32 entry. (An overlay slot's goes through the stub.)
+        if let Some(c) = home.as_ref().filter(|c| !self.ctx.spec.overlays.contains_key(&addr) || **c == self.ctx.spec.main) {
+            if let Some(h) = self.ctx.head(c, addr, caller.as_ref()).cloned() {
+                if let Some((ci, csig)) = &h.c {
+                    match mismatch(self.ctx, c) {
+                        None if csig == sig => return Ok(Lowered::Call(*ci)),
+                        Some(m) => {
+                            self.ctx.abi_mismatches.insert(m);
+                        }
+                        None => {}
+                    }
+                }
+                let target = h.o32;
+                return Ok(Lowered::Call(self.ctx.synth(Synth::ToO32 { input: self.input, name: callee, sig: sig.clone(), target })));
+            }
+        }
         let target = match &home {
             Some(c) => {
                 let differs = mismatch(self.ctx, c);
@@ -355,6 +516,7 @@ impl Resolver for R<'_, '_> {
         let inputs = self.ctx.inputs;
         let s = &inputs[self.input].obj.symbols[symbol as usize];
         match s.name.as_str() {
+            "__stack_pointer" if self.ctx.mod_of[self.input].is_some() => Ok(self.ctx.mod_sp),
             "__stack_pointer" => Ok(self.ctx.sp),
             other => bail!("guest code uses global {other}"),
         }
@@ -366,6 +528,11 @@ impl Resolver for R<'_, '_> {
 
     fn func_addr(&mut self, symbol: u32) -> Result<u32> {
         let inputs = self.ctx.inputs;
+        if let Some(m) = self.ctx.mod_of[self.input] {
+            if let Some(a) = self.ctx.mod_func_addr(m, self.input, symbol) {
+                return Ok(a);
+            }
+        }
         let s = &inputs[self.input].obj.symbols[symbol as usize];
         let name = match classify_name(&s.name) {
             NameClass::Guest(n) | NameClass::SignatureThunk { target: n } => n,
@@ -400,6 +567,9 @@ impl Resolver for R<'_, '_> {
         let inputs = self.ctx.inputs;
         let inp = &inputs[self.input];
         let mut out = Vec::new();
+        if self.ctx.mod_of[self.input].is_some() {
+            return Ok(out);
+        }
         // A watched function: by its guest name (C) or its translation's.
         let addr = func_symbol.and_then(|n| match n.strip_prefix("psxw_t_") {
             Some(rest) => u32::from_str_radix(rest.rsplit('_').next()?, 16).ok(),
@@ -428,6 +598,10 @@ impl Resolver for R<'_, '_> {
     }
 
     fn loop_entry(&mut self) -> Vec<I<'static>> {
+        // A mod's loops don't move the game's virtual time.
+        if self.ctx.mod_of[self.input].is_some() {
+            return Vec::new();
+        }
         let (b, n) = (self.ctx.budget, self.ctx.spec.budget as i32);
         vec![
             I::GlobalGet(b),
@@ -453,12 +627,44 @@ impl Resolver for R<'_, '_> {
     }
 }
 
+impl R<'_, '_> {
+    /// A call from mod code that the mod itself answers: `psxmod_log`, an
+    /// `original` name, or a function the mod defines (in this object, then
+    /// in its others). `None`: a game function, resolved as the game's
+    /// calls are.
+    fn mod_call(&mut self, m: usize, symbol: u32, sig: &FuncType) -> Result<Option<Lowered>> {
+        let inputs = self.ctx.inputs;
+        let inp = &inputs[self.input];
+        let s = &inp.obj.symbols[symbol as usize];
+        let name = s.name.clone();
+        if name == "psxmod_log" && !s.defined {
+            return Ok(Some(Lowered::Call(self.ctx.import(psx::MOD_LOG))));
+        }
+        if let Some(b) = self.ctx.bindings.get(&(m, name.clone())).cloned() {
+            return Ok(Some(match b {
+                Bound::C(f, t) => {
+                    ensure!(t == *sig, "{}: {name} is called as {sig:?}, but the function it wraps is {t:?}", inp.label);
+                    Lowered::Call(f)
+                }
+                Bound::O32 { next, id } => {
+                    Lowered::Call(self.ctx.synth(Synth::Transparent { input: self.input, name, sig: sig.clone(), next, id }))
+                }
+            }));
+        }
+        let Some((j, f)) = self.ctx.mod_function(m, self.input, symbol) else { return Ok(None) };
+        let o = &inputs[j].obj;
+        let t = &o.types[o.funcs[f as usize].ty as usize];
+        ensure!(t == sig, "{}: {name} is called as {sig:?} but defined as {t:?} in {}", inp.label, inputs[j].label);
+        Ok(Some(Lowered::Call(self.ctx.guest[&(j, f)])))
+    }
+}
+
 /// Whether a call through `declared` reaches `defined` differently in wasm
 /// than on the PS1, where both are the same o32 call: a struct passed by
 /// value (or returned through a hidden pointer) on one side only, or
 /// variadic on one side only. Narrow integers pass alike, and an
 /// unprototyped declaration (`f()`) says nothing about the parameters.
-fn abi_differs(declared: &psxw_cc::protos::Proto, defined: &psxw_cc::protos::Proto) -> bool {
+pub fn abi_differs(declared: &psxw_cc::protos::Proto, defined: &psxw_cc::protos::Proto) -> bool {
     use psxw_cc::protos::Kind;
     let unprototyped = declared.params.is_empty() && declared.variadic;
     if unprototyped {
@@ -542,11 +748,9 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let cands = ctx.spec.overlays[&addr].clone();
             let mut entries = Vec::new();
             for (c, words) in &cands {
-                let tier = *ctx.spec.tiers.get(&(c.clone(), addr)).context("overlay candidate without a tier")?;
-                let e = match tier {
-                    Tier::Lift { input, func } => ctx.guest[&(input, func)],
-                    Tier::C { input, func } => ctx.synth(Synth::O32Wrap { input, func }),
-                    Tier::Adapter(id) => ctx.synth(Synth::AdapterThunk(id)),
+                let e = match ctx.heads.get(&(c.clone(), addr, None)) {
+                    Some(h) => h.o32,
+                    None => ctx.entry_raw(c, addr).context("overlay candidate without a tier")?,
                 };
                 entries.push((*words, e));
             }
@@ -606,12 +810,18 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
         Synth::InvokeIrq => {
             // Locals 5 and 6: $sp and $gp at the call, restored when a
             // ReturnFromException unwinds (it returns to the interrupted
-            // context, as the BIOS restores the saved registers).
-            let mut f = Function::new([(2, ValType::I32)]);
+            // context, as the BIOS restores the saved registers). With
+            // mods, 7..9: the mod stack and the hook frame, likewise.
+            let mod_globals = if ctx.spec.mods.is_some() { vec![ctx.mod_sp, ctx.hook_sp, ctx.hook_id] } else { vec![] };
+            let mut f = Function::new([(2 + mod_globals.len() as u32, ValType::I32)]);
             f.instruction(&I::GlobalGet(ctx.sp));
             f.instruction(&I::LocalSet(5));
             f.instruction(&I::GlobalGet(ctx.gp));
             f.instruction(&I::LocalSet(6));
+            for (k, &g) in mod_globals.iter().enumerate() {
+                f.instruction(&I::GlobalGet(g));
+                f.instruction(&I::LocalSet(7 + k as u32));
+            }
             f.instruction(&I::Block(BlockType::Empty));
             f.instruction(&I::TryTable(BlockType::Result(ValType::I64), vec![Catch::One { tag: RFE_TAG, label: 0 }].into()));
             dispatch(&mut f, 0, [1, 2, 3, 4], ctx.import(psx::UNTRANSLATED), ctx.o32_ty);
@@ -622,6 +832,10 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             f.instruction(&I::GlobalSet(ctx.sp));
             f.instruction(&I::LocalGet(6));
             f.instruction(&I::GlobalSet(ctx.gp));
+            for (k, &g) in mod_globals.iter().enumerate() {
+                f.instruction(&I::LocalGet(7 + k as u32));
+                f.instruction(&I::GlobalSet(g));
+            }
             f.instruction(&I::I64Const(0));
             f.instruction(&I::End);
             (FuncType { params: vec![V::I32; 5], results: vec![V::I64] }, f, "invoke_irq".into())
@@ -658,13 +872,406 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             f.instruction(&I::End);
             (FuncType { params: vec![V::I32], results: vec![] }, f, "reg_set".into())
         }
+        Synth::O32WrapOf { callee, sig, input, name } => {
+            let proto = ctx.inputs[input].protos.get(&name);
+            (o32(), marshal::o32_to_c(&sig, proto, callee, sp), format!("o32:hook:{name}"))
+        }
+        Synth::CLayer { befores, core, afters, sig, input, name } => {
+            (sig.clone(), c_layer(ctx, &befores, core, &afters, &sig, input, &name), format!("hook:{name}"))
+        }
+        Synth::O32Layer { befores, core, afters, returns } => {
+            let mut f = Function::new([(1, ValType::I64)]);
+            for b in befores {
+                for l in 0..4 {
+                    f.instruction(&I::LocalGet(l));
+                }
+                f.instruction(&I::Call(b));
+                f.instruction(&I::Drop);
+            }
+            for l in 0..4 {
+                f.instruction(&I::LocalGet(l));
+            }
+            f.instruction(&I::Call(core));
+            f.instruction(&I::LocalSet(4));
+            for a in afters {
+                if returns {
+                    f.instruction(&I::LocalGet(4));
+                }
+                for l in 0..4 {
+                    f.instruction(&I::LocalGet(l));
+                }
+                f.instruction(&I::Call(a));
+            }
+            f.instruction(&I::LocalGet(4));
+            f.instruction(&I::End);
+            (o32(), f, "hook:o32".into())
+        }
+        Synth::ModWrap { input, func, hook } => {
+            let sig = ctx.func_sig(input, func);
+            let name = guest_name(ctx, input, func);
+            let proto = ctx.inputs[input].protos.get(&name);
+            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: hook.map(|id| (ctx.hook_sp, ctx.hook_id, id)) };
+            let callee = ctx.guest[&(input, func)];
+            (o32(), marshal::o32_to_c_with(&sig, proto, callee, marshal::Shape::O32, g), format!("o32:mod:{name}"))
+        }
+        Synth::ModAfter { input, func, result } => {
+            let sig = ctx.func_sig(input, func);
+            let name = guest_name(ctx, input, func);
+            let proto = ctx.inputs[input].protos.get(&name);
+            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: None };
+            let callee = ctx.guest[&(input, func)];
+            let mut params = if result { vec![V::I64] } else { vec![] };
+            params.extend([V::I32; 4]);
+            let f = marshal::o32_to_c_with(&sig, proto, callee, marshal::Shape::After { result }, g);
+            (FuncType { params, results: vec![] }, f, format!("o32:after:{name}"))
+        }
+        Synth::Transparent { input, name, sig, next, id } => {
+            let proto = ctx.inputs[input].protos.get(&name);
+            let (kinds, variadic) = marshal::param_kinds(&sig, proto);
+            let (words, _) = marshal::words(&kinds, variadic);
+            let f = marshal::c_to_o32_transparent(&sig, &words, sp, (ctx.hook_sp, ctx.hook_id, id), next);
+            (sig, f, format!("original:{name}"))
+        }
+        Synth::ModInit => (FuncType { params: vec![], results: vec![] }, mod_init(ctx)?, "psxmod_init".into()),
+        Synth::ModLoaded => (FuncType { params: vec![V::I32; 2], results: vec![] }, mod_loaded(ctx)?, "psxmod_loaded".into()),
     })
+}
+
+/// The guest name of a function (input, local function).
+fn guest_name(ctx: &Ctx, input: usize, func: u32) -> String {
+    let o = &ctx.inputs[input].obj;
+    let name = o.func_symbol(func + o.num_imported_funcs()).map_or_else(String::new, |s| s.name.clone());
+    match classify_name(&name) {
+        NameClass::Guest(n) => n.to_string(),
+        _ => name,
+    }
+}
+
+/// A C-typed hook layer: the befores, then `core` (with copies of structs
+/// passed by value, so the afters see the arguments as passed), then the
+/// afters, each after taking the result first.
+fn c_layer(ctx: &Ctx, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)], sig: &FuncType, input: usize, name: &str) -> Function {
+    let n = sig.params.len() as u32;
+    let proto = ctx.inputs[input].protos.get(name);
+    let (kinds, _) = marshal::param_kinds(sig, proto);
+    let byval: Vec<(u32, u32)> = if afters.iter().all(|(_, bare)| *bare) {
+        Vec::new()
+    } else {
+        kinds.iter().enumerate().filter_map(|(i, k)| match k {
+            psxw_cc::protos::Kind::ByVal { size, .. } => Some((i as u32, *size)),
+            _ => None,
+        }).collect()
+    };
+    // Locals: the result, the saved mod sp, one copy address per struct.
+    let r = n;
+    let save = n + 1;
+    let copy = n + 2;
+    let result = sig.results.first().map(|&t| marshal::val(t));
+    let mut locals = vec![(1, result.unwrap_or(ValType::I32)), (1, ValType::I32)];
+    if !byval.is_empty() {
+        locals.push((byval.len() as u32, ValType::I32));
+    }
+    let mut f = Function::new(locals);
+    for &(b, bare) in befores {
+        if !bare {
+            for l in 0..n {
+                f.instruction(&I::LocalGet(l));
+            }
+        }
+        f.instruction(&I::Call(b));
+    }
+    if !byval.is_empty() {
+        f.instruction(&I::GlobalGet(ctx.mod_sp));
+        f.instruction(&I::LocalSet(save));
+        for (j, &(p, size)) in byval.iter().enumerate() {
+            let at = copy + j as u32;
+            f.instruction(&I::GlobalGet(ctx.mod_sp));
+            f.instruction(&I::I32Const(size.div_ceil(8) as i32 * 8));
+            f.instruction(&I::I32Sub);
+            f.instruction(&I::LocalTee(at));
+            f.instruction(&I::GlobalSet(ctx.mod_sp));
+            for (l, _) in [(at, 0), (p, 0)] {
+                f.instruction(&I::LocalGet(l));
+                f.instruction(&I::I32Const(WINDOW_MASK as i32));
+                f.instruction(&I::I32And);
+                f.instruction(&I::I32Const(WINDOW_BASE as i32));
+                f.instruction(&I::I32Add);
+            }
+            f.instruction(&I::I32Const(size as i32));
+            f.instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        }
+    }
+    for l in 0..n {
+        match byval.iter().position(|&(p, _)| p == l) {
+            Some(j) => f.instruction(&I::LocalGet(copy + j as u32)),
+            None => f.instruction(&I::LocalGet(l)),
+        };
+    }
+    f.instruction(&I::Call(core));
+    if result.is_some() {
+        f.instruction(&I::LocalSet(r));
+    }
+    if !byval.is_empty() {
+        f.instruction(&I::LocalGet(save));
+        f.instruction(&I::GlobalSet(ctx.mod_sp));
+    }
+    for &(a, bare) in afters {
+        if !bare {
+            if result.is_some() {
+                f.instruction(&I::LocalGet(r));
+            }
+            for l in 0..n {
+                f.instruction(&I::LocalGet(l));
+            }
+        }
+        f.instruction(&I::Call(a));
+    }
+    if result.is_some() {
+        f.instruction(&I::LocalGet(r));
+    }
+    f.instruction(&I::End);
+    f
+}
+
+/// The bytes a data patch writes.
+fn patch_bytes(ctx: &Ctx, v: &PatchValue) -> Result<Vec<u8>> {
+    Ok(match v {
+        PatchValue::Bytes(b) => b.clone(),
+        PatchValue::FnPtr(imp) => {
+            let k = ctx.impl_func(imp)?;
+            let a = ctx.synthetic.get(&k).with_context(|| format!("{} has no synthetic address", imp.function))?;
+            a.to_le_bytes().to_vec()
+        }
+    })
+}
+
+fn store_byte(f: &mut Function, addr: u32, b: u8) {
+    f.instruction(&I::I32Const((addr & WINDOW_MASK) as i32));
+    f.instruction(&I::I32Const(b as i32));
+    f.instruction(&I::I32Store8(MemArg { offset: WINDOW_BASE as u64, align: 0, memory_index: 0 }));
+}
+
+/// `psxmod_init`: the executable's data patches, in load order.
+fn mod_init(ctx: &Ctx) -> Result<Function> {
+    let mut f = Function::new([]);
+    for d in ctx.spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_none()) {
+        for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
+            store_byte(&mut f, d.addr + k as u32, b);
+        }
+    }
+    f.instruction(&I::End);
+    Ok(f)
+}
+
+/// `psxmod_loaded(addr, len)`: each overlay's data patches, byte by byte
+/// where the disc's write covered them, when the overlay's first code
+/// words are resident.
+fn mod_loaded(ctx: &Ctx) -> Result<Function> {
+    let mut f = Function::new([(1, ValType::I32)]);
+    let phys = 2;
+    let mut by: BTreeMap<String, Vec<&crate::mods::DataPatch>> = BTreeMap::new();
+    for d in ctx.spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_some()) {
+        by.entry(d.container.clone()).or_default().push(d);
+    }
+    if !by.is_empty() {
+        f.instruction(&I::LocalGet(0));
+        f.instruction(&I::I32Const(0x1F_FFFF));
+        f.instruction(&I::I32And);
+        f.instruction(&I::LocalSet(phys));
+    }
+    let load = |f: &mut Function, a: u32| {
+        f.instruction(&I::I32Const((a & WINDOW_MASK) as i32));
+        f.instruction(&I::I32Load(MemArg { offset: WINDOW_BASE as u64, align: 2, memory_index: 0 }));
+    };
+    for patches in by.values() {
+        let id = patches[0].resident.expect("overlay patch");
+        load(&mut f, id.at);
+        f.instruction(&I::I32Const(id.words[0] as i32));
+        f.instruction(&I::I32Eq);
+        load(&mut f, id.at + 4);
+        f.instruction(&I::I32Const(id.words[1] as i32));
+        f.instruction(&I::I32Eq);
+        f.instruction(&I::I32And);
+        f.instruction(&I::If(BlockType::Empty));
+        for d in patches {
+            for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
+                let a = d.addr + k as u32;
+                f.instruction(&I::I32Const((a & 0x1F_FFFF) as i32));
+                f.instruction(&I::LocalGet(phys));
+                f.instruction(&I::I32Sub);
+                f.instruction(&I::LocalGet(1));
+                f.instruction(&I::I32LtU);
+                f.instruction(&I::If(BlockType::Empty));
+                store_byte(&mut f, a, b);
+                f.instruction(&I::End);
+            }
+        }
+        f.instruction(&I::End);
+    }
+    f.instruction(&I::End);
+    Ok(f)
+}
+
+/// The hook chains (plans/M11): every hooked function's entries, and the
+/// next link each mod's `original` names.
+fn build_chains(ctx: &mut Ctx) -> Result<()> {
+    let Some(spec) = ctx.spec.mods.as_ref() else { return Ok(()) };
+    let mut next_id = 1i32;
+    for ((c, a), chains) in &spec.targets {
+        let tier = *ctx.spec.tiers.get(&(c.clone(), *a)).with_context(|| format!("hooked {c} {a:#010x} is not a function"))?;
+        // A C function's chain is C-typed, anything else's o32.
+        let cfun = match tier {
+            Tier::C { input, func } => Some((ctx.guest[&(input, func)], ctx.func_sig(input, func), input, func)),
+            _ => None,
+        };
+        let bottom = match &cfun {
+            Some((i, ..)) => Link::C(*i),
+            None => Link::O32(ctx.entry_raw(c, *a).context("hooked function without an entry")?),
+        };
+        let what = format!("{c} {a:#010x}");
+        let mut top = bottom;
+        for l in &chains.default {
+            top = realize(ctx, l, top, cfun.as_ref(), chains.returns, &mut next_id, &what)?;
+        }
+        let head = make_head(ctx, top, cfun.as_ref());
+        ctx.heads.insert((c.clone(), *a, None), head);
+        for (caller, layers) in &chains.from {
+            let mut scoped = top;
+            for l in layers {
+                scoped = realize(ctx, l, scoped, cfun.as_ref(), chains.returns, &mut next_id, &what)?;
+            }
+            let head = make_head(ctx, scoped, cfun.as_ref());
+            ctx.heads.insert((c.clone(), *a, Some(caller.clone())), head);
+        }
+    }
+    Ok(())
+}
+
+fn make_head(ctx: &mut Ctx, top: Link, cfun: Option<&(u32, FuncType, usize, u32)>) -> Head {
+    match (top, cfun) {
+        (Link::C(i), Some((own, sig, input, func))) => {
+            let o32 = if i == *own {
+                ctx.synth(Synth::O32Wrap { input: *input, func: *func })
+            } else {
+                let name = guest_name(ctx, *input, *func);
+                ctx.synth(Synth::O32WrapOf { callee: i, sig: sig.clone(), input: *input, name })
+            };
+            Head { c: Some((i, sig.clone())), o32 }
+        }
+        (Link::O32(i), _) | (Link::C(i), None) => Head { c: None, o32: i },
+    }
+}
+
+/// One mod's layer over `next`.
+fn realize(
+    ctx: &mut Ctx,
+    l: &Layer,
+    next: Link,
+    cfun: Option<&(u32, FuncType, usize, u32)>,
+    returns: bool,
+    next_id: &mut i32,
+    what: &str,
+) -> Result<Link> {
+    let id = &ctx.spec.mods.as_ref().expect("mods").mods[l.module].id;
+    let id = id.clone();
+    let bind = |ctx: &mut Ctx, name: &str, b: Bound| -> Result<()> {
+        ensure!(ctx.bindings.insert((l.module, name.to_string()), b).is_none(), "mod {id} names two next links {name}");
+        Ok(())
+    };
+    match (cfun, next) {
+        (Some((_, sig, finput, ffunc)), Link::C(next)) => {
+            let core = match &l.patch {
+                Some(p) => {
+                    let (i, f) = ctx.impl_func(&p.imp)?;
+                    let t = ctx.func_sig(i, f);
+                    ensure!(t == *sig, "{id}: patch {} is {t:?}, but {what} is {sig:?}", p.imp.function);
+                    if let Some(o) = &p.original {
+                        bind(ctx, o, Bound::C(next, sig.clone()))?;
+                    }
+                    ctx.guest[&(i, f)]
+                }
+                None => next,
+            };
+            if l.befores.is_empty() && l.afters.is_empty() {
+                return Ok(Link::C(core));
+            }
+            let unit = FuncType { params: vec![], results: vec![] };
+            let mut befores = Vec::new();
+            for b in &l.befores {
+                let (i, f) = ctx.impl_func(&b.imp)?;
+                let t = ctx.func_sig(i, f);
+                let want = if b.bare { unit.clone() } else { FuncType { params: sig.params.clone(), results: vec![] } };
+                ensure!(t == want, "{id}: before {} is {t:?}, but {what} takes {want:?}", b.imp.function);
+                befores.push((ctx.guest[&(i, f)], b.bare));
+            }
+            let mut afters = Vec::new();
+            for a in &l.afters {
+                let (i, f) = ctx.impl_func(&a.imp)?;
+                let t = ctx.func_sig(i, f);
+                let mut params = sig.results.clone();
+                params.extend(sig.params.iter().copied());
+                let want = if a.bare { unit.clone() } else { FuncType { params, results: vec![] } };
+                ensure!(t == want, "{id}: after {} is {t:?}, but {what} wants {want:?} (the result first)", a.imp.function);
+                afters.push((ctx.guest[&(i, f)], a.bare));
+            }
+            let name = guest_name(ctx, *finput, *ffunc);
+            Ok(Link::C(ctx.synth(Synth::CLayer { befores, core, afters, sig: sig.clone(), input: *finput, name })))
+        }
+        (None, Link::O32(next)) => {
+            let core = match &l.patch {
+                Some(p) => {
+                    let (i, f) = ctx.impl_func(&p.imp)?;
+                    let hook = match &p.original {
+                        Some(o) => {
+                            let hid = *next_id;
+                            *next_id += 1;
+                            bind(ctx, o, Bound::O32 { next, id: hid })?;
+                            Some(hid)
+                        }
+                        None => None,
+                    };
+                    ctx.synth(Synth::ModWrap { input: i, func: f, hook })
+                }
+                None => next,
+            };
+            if l.befores.is_empty() && l.afters.is_empty() {
+                return Ok(Link::O32(core));
+            }
+            let mut befores = Vec::new();
+            for b in &l.befores {
+                let (i, f) = ctx.impl_func(&b.imp)?;
+                befores.push(ctx.synth(Synth::ModWrap { input: i, func: f, hook: None }));
+            }
+            let mut afters = Vec::new();
+            for a in &l.afters {
+                let (i, f) = ctx.impl_func(&a.imp)?;
+                afters.push(ctx.synth(Synth::ModAfter { input: i, func: f, result: returns && !a.bare }));
+            }
+            Ok(Link::O32(ctx.synth(Synth::O32Layer { befores, core, afters, returns })))
+        }
+        _ => bail!("{what}: a chain mixes C and o32 links"),
+    }
 }
 
 /// Link the guest module.
 pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: &[Input]) -> Result<Linked> {
     let view: Vec<(&str, &WasmObject)> = inputs.iter().map(|i| (i.container.as_str(), &i.obj)).collect();
-    let layout = Layout::place(&view, map, rodata)?;
+    // An empty mod set links exactly as no mods.
+    let mods = spec.mods.as_ref().filter(|m| !m.is_empty());
+    let mut mod_of: Vec<Option<usize>> = vec![None; inputs.len()];
+    for (m, mi) in mods.iter().flat_map(|s| s.mods.iter().enumerate()) {
+        for &i in &mi.inputs {
+            *mod_of.get_mut(i).context("mod input out of range")? = Some(m);
+        }
+    }
+    let layout = Layout::place_mods(&view, map, rodata, &mod_of)?;
+    let spec_own;
+    let spec = if spec.mods.is_some() && mods.is_none() {
+        spec_own = GameSpec { mods: None, ..spec.clone() };
+        &spec_own
+    } else {
+        spec
+    };
     let mut ctx = Ctx {
         map,
         inputs,
@@ -684,6 +1291,14 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         budget: 2,
         chain: 3,
         abi_mismatches: BTreeSet::new(),
+        mod_of,
+        mod_sp: 4,
+        hook_sp: 5,
+        hook_id: 6,
+        synthetic: BTreeMap::new(),
+        heads: HashMap::new(),
+        bindings: HashMap::new(),
+        caller_of: HashMap::new(),
         o32_ty: 0,
         device: spec
             .device_funcs
@@ -716,6 +1331,35 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         }
     }
 
+    // Game functions' own addresses (`from` scopes), and mod functions'
+    // synthetic ones, in input order.
+    let has_mods = spec.mods.is_some();
+    if has_mods {
+        let mut next = psxw_abi::SYNTHETIC_CODE.start;
+        for &(i, f) in &ctx.guest_order {
+            let inp = &inputs[i];
+            let index = f + inp.obj.num_imported_funcs();
+            let Some(sym) = inp.obj.func_symbol(index) else { continue };
+            if ctx.mod_of[i].is_some() {
+                ensure!(next < psxw_abi::SYNTHETIC_CODE.end, "mods define more functions than synthetic addresses");
+                ctx.synthetic.insert((i, f), next);
+                next += 4;
+                continue;
+            }
+            let key = match sym.name.strip_prefix("psxw_t_") {
+                Some(rest) => rest.rsplit('_').next().and_then(|h| u32::from_str_radix(h, 16).ok()),
+                None => match classify_name(&sym.name) {
+                    NameClass::Guest(g) if !inp.generated => map.resolve(&inp.container, g).map(|r| r.addr),
+                    _ => None,
+                },
+            };
+            if let Some(a) = key {
+                ctx.caller_of.insert((i, f), (inp.container.clone(), a));
+            }
+        }
+        build_chains(&mut ctx)?;
+    }
+
     let mut bodies = Vec::new();
     let mut names: Vec<(u32, String)> = Vec::new();
     for &(i, f) in &ctx.guest_order.clone() {
@@ -740,6 +1384,13 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         };
         elements.insert(table_index(addr), e);
     }
+    // Mod functions, at their synthetic addresses.
+    for (&(i, f), &addr) in &ctx.synthetic.clone() {
+        let e = ctx.synth(Synth::ModWrap { input: i, func: f, hook: None });
+        elements.insert(table_index(addr), e);
+    }
+    let mod_init = ctx.synth(Synth::ModInit);
+    let mod_loaded = ctx.synth(Synth::ModLoaded);
     let invoke = ctx.synth(Synth::Indirect);
     let invoke_irq = ctx.synth(Synth::InvokeIrq);
     let unit_ty = ctx.intern(&FuncType { params: vec![], results: vec![] });
@@ -792,7 +1443,12 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     tags.tag(TagType { kind: TagKind::Exception, func_type_idx: unit_ty });
     module.section(&tags);
     let mut globals = GlobalSection::new();
-    for init in [0, 0, spec.budget as i32, 0] {
+    let mut inits = vec![0, 0, spec.budget as i32, 0];
+    if has_mods {
+        // The mod stack (a guest address), the hook frame's sp and id.
+        inits.extend([(0x8000_0000u32 | psxw_abi::phys::MOD_STACK.end) as i32, 0, 0]);
+    }
+    for init in inits {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));
     }
     module.section(&globals);
@@ -800,6 +1456,8 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     ex.export(guest::MEMORY, ExportKind::Memory, 0);
     ex.export(guest::INVOKE, ExportKind::Func, invoke);
     ex.export(guest::INVOKE_IRQ, ExportKind::Func, invoke_irq);
+    ex.export(guest::MOD_INIT, ExportKind::Func, mod_init);
+    ex.export(guest::MOD_LOADED, ExportKind::Func, mod_loaded);
     for (n, f) in reg_fns {
         ex.export(n, ExportKind::Func, f);
     }
@@ -834,6 +1492,9 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     let mut aux = Vec::new();
     for &(i, si, addr) in &ctx.layout.aux.clone() {
         let fa = |input: usize, sym: u32| -> Result<u32> {
+            if let Some(a) = ctx.mod_of[input].and_then(|m| ctx.mod_func_addr(m, input, sym)) {
+                return Ok(a);
+            }
             let s = &ctx.inputs[input].obj.symbols[sym as usize];
             let n = match classify_name(&s.name) {
                 NameClass::Guest(n) | NameClass::SignatureThunk { target: n } => n,

@@ -56,6 +56,8 @@ unsafe extern "C" {
     fn guest_sp_set(v: u32);
     fn guest_gp_get() -> u32;
     fn guest_gp_set(v: u32);
+    fn psxmod_init();
+    fn psxmod_loaded(addr: u32, len: u32);
 }
 
 fn fatal(code: u32, msg: &str) -> ! {
@@ -196,6 +198,10 @@ impl Invoke for Guest {
     fn invoke_irq(&mut self, c: GuestCall) -> u64 {
         unsafe { guest_invoke_irq(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) }
     }
+
+    fn loaded(&mut self, addr: u32, len: u32) {
+        unsafe { psxmod_loaded(addr, len) }
+    }
 }
 
 struct Rt {
@@ -269,6 +275,10 @@ pub extern "C" fn psxw_boot(options: u32) {
         "{{\"event\":\"boot\",\"exe\":{:?},\"pc0\":{},\"gp0\":{},\"t_addr\":{},\"t_size\":{},\"b_addr\":{},\"b_size\":{},\"sp\":{},\"text_hash\":\"{:016x}\"}}",
         b.exe, b.pc0, b.gp0, b.t_addr, b.t_size, b.b_addr, b.b_size, b.sp, b.text_hash
     ));
+    // Mods' data patches to the executable, then the boot's own load
+    // isn't news to them.
+    unsafe { psxmod_init() };
+    with(|rt| rt.m.borrow_mut().loaded.clear());
     Guest.invoke(GuestCall { addr: b.pc0, args: [0; 4] });
     with(|rt| rt.m.borrow_mut().log("the entry point returned"));
     report("{\"event\":\"exit\"}".into());
@@ -384,6 +394,22 @@ pub extern "C" fn io_access(off: u32, kind: u32) {
     if let Err(e) = r {
         fatal(9, &e)
     }
+}
+
+/// A mod's `psxmod_log(fmt, ...)`: clang's va-buffer holds the arguments,
+/// a word each.
+#[unsafe(export_name = "mod_log")]
+pub extern "C" fn mod_log(fmt: u32, va: u32) {
+    with(|rt| {
+        let mut m = rt.m.borrow_mut();
+        let mut k = 0;
+        let text = psx_bios::bios::format(&m, fmt, &mut || {
+            let v = m.mem.r32(va.wrapping_add(4 * k));
+            k += 1;
+            v
+        });
+        m.host.log(1, &format!("mod: {text}"));
+    });
 }
 
 /// Entry of a function the build was asked to watch (the boot check's

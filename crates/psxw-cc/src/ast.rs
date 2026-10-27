@@ -27,7 +27,7 @@ pub struct FnDef {
 }
 
 impl Ast {
-    fn text(&self, n: Node) -> &str {
+    pub fn text(&self, n: Node) -> &str {
         n.utf8_text(self.src.as_bytes()).unwrap_or_default()
     }
 
@@ -291,4 +291,76 @@ pub fn harness_variant(text: &str) -> String {
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// The hooked variant of a normalized TU (plans/M11): each function in
+/// `names` it defines becomes `weak` and `noinline`, so clang neither
+/// inlines its calls nor uses its body to fold or delete them, the way
+/// GCC 2.95 at `-O2` left every call to a non-inline function. A `static`
+/// one loses `static` (a weak definition can't be internal) on every
+/// file-scope declaration. `inline` functions are left alone: GCC inlined
+/// them too, so the original program has no such calls.
+pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>) -> String {
+    let ast = parse(text);
+    let mut edits: Vec<crate::edit::Edit> = Vec::new();
+    let words = |s: &str| -> Vec<String> { s.split(|c: char| !c.is_alphanumeric() && c != '_').map(str::to_string).collect() };
+    let mut made_extern: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in ast.functions() {
+        if !names.contains(&f.name) {
+            continue;
+        }
+        let head = &ast.src[f.range.start..f.decl_end];
+        let specifiers = head.split(&f.name).next().unwrap_or("");
+        let w = words(specifiers);
+        if w.iter().any(|w| matches!(w.as_str(), "inline" | "__inline" | "__inline__")) {
+            continue;
+        }
+        const ATTR: &str = "__attribute__((weak, noinline))";
+        let node = ast.top_level_at(f.range.start).filter(|n| n.kind() == "function_definition");
+        let mut c2 = node.map(|n| n.walk());
+        let stat = node.zip(c2.as_mut()).and_then(|(n, c)| {
+            n.named_children(c).find(|s| s.kind() == "storage_class_specifier" && ast.text(*s) == "static")
+        });
+        match stat {
+            Some(st) => {
+                made_extern.insert(f.name.clone());
+                edits.push(crate::edit::Edit::replace(st.byte_range(), ATTR));
+            }
+            None => edits.push(crate::edit::Edit::insert(f.range.start, format!("{ATTR} "))),
+        }
+    }
+    // `static` off every file-scope declaration of those functions.
+    let root = ast.tree.root_node();
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        if node.kind() != "declaration" {
+            continue;
+        }
+        let Some(d) = node.child_by_field_name("declarator") else { continue };
+        let Some(name) = ast.declarator_name(d) else { continue };
+        if !made_extern.contains(&name) {
+            continue;
+        }
+        let mut c2 = node.walk();
+        for spec in node.named_children(&mut c2) {
+            if spec.kind() == "storage_class_specifier" && ast.text(spec) == "static" {
+                edits.push(crate::edit::Edit::replace(spec.byte_range(), ""));
+            }
+        }
+    }
+    crate::edit::apply(text, edits)
+}
+
+#[cfg(test)]
+mod hook_tests {
+    #[test]
+    fn hooked_functions_become_weak() {
+        let src = "static int g(int);\nint f(int a) { return g(a) + 1; }\nstatic int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n";
+        let names = ["f", "g", "h"].iter().map(|s| s.to_string()).collect();
+        let out = super::hook_variant(src, &names);
+        assert_eq!(
+            out,
+            " int g(int);\n__attribute__((weak, noinline)) int f(int a) { return g(a) + 1; }\n__attribute__((weak, noinline)) int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n"
+        );
+    }
 }

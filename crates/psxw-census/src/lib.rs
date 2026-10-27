@@ -5,6 +5,7 @@
 //! compiler. Read-only: nothing is linked or run.
 
 mod checks;
+pub use checks::include_contexts;
 pub mod layout;
 pub mod report;
 

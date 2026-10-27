@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://psx-wasm.invalid/schema/set.schema.json",
+  "title": "psx-wasm mod set (sets/*.json)",
+  "description": "Mods applied together, in this order (load_after constraints first).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["mods"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "mods": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+  }
+}

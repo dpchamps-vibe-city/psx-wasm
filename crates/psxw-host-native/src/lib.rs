@@ -57,6 +57,9 @@ pub struct Options {
     pub record_gpu: Option<GpuRecording>,
     /// Record SPU windows (M6's recording hook).
     pub record_spu: Option<SpuRecording>,
+    /// Guest values to read at every vblank: (address, size in bytes);
+    /// `RunReport::watched` has a row per vblank (a mod test's trace).
+    pub watch: Vec<(u32, u32)>,
 }
 
 /// Which SPU windows a run records: one of `samples` at the first vblank
@@ -136,6 +139,9 @@ pub struct RunReport {
     pub gpu_batches: Vec<GpuBatch>,
     #[serde(skip)]
     pub spu_windows: Vec<SpuWindow>,
+    /// `Options::watch`'s values at each vblank (zero-extended).
+    #[serde(skip)]
+    pub watched: Vec<Vec<u32>>,
 }
 
 /// A RAM dump written during the run.
@@ -175,6 +181,7 @@ struct State {
     spu_windows: Vec<SpuWindow>,
     /// The frame the last SPU window was asked for.
     spu_asked: Option<u64>,
+    watched: Vec<Vec<u32>>,
 }
 
 impl State {
@@ -188,6 +195,7 @@ impl State {
             gpu_batches: vec![],
             spu_windows: vec![],
             spu_asked: None,
+            watched: vec![],
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -305,6 +313,7 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
         audio: s.audio.map(audio::Sink::finish).unwrap_or_default(),
         gpu_batches: s.gpu_batches,
         spu_windows: s.spu_windows,
+        watched: s.watched,
     }
 }
 
@@ -376,6 +385,20 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
                     s.dumps.push(d);
                 }
             }
+        }
+        if !c.data().opts.watch.is_empty() {
+            let ram = guest_ram(m.data(&c));
+            let row: Vec<u32> = c
+                .data()
+                .opts
+                .watch
+                .iter()
+                .map(|&(a, n)| {
+                    let o = (a & 0x1F_FFFF) as usize;
+                    (0..n as usize).fold(0u32, |v, i| v | (ram.get(o + i).copied().unwrap_or(0) as u32) << (8 * i))
+                })
+                .collect();
+            c.data_mut().watched.push(row);
         }
         // Overlay residency: whenever an overlay's first words are in RAM,
         // its whole text must be.

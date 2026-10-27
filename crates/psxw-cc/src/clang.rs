@@ -100,6 +100,28 @@ impl Clang {
         Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
     }
 
+    /// Compile a mod's preprocessed source (plans/M11): C99 with GNU
+    /// extensions, the game C's UB containment, and diagnostics at the
+    /// source's own lines. Returns success and clang's diagnostics.
+    /// With `physical`, diagnostics locate physical lines of `i_path` (for
+    /// fixups), else the source's own.
+    pub fn compile_mod(&self, i_path: &Path, obj: &Path, physical: bool) -> Result<(bool, String)> {
+        let mut cmd = self.base();
+        cmd.args(["-c", "-O2", "-fno-builtin", "-fno-caret-diagnostics", "-ferror-limit=0"]);
+        if physical {
+            cmd.args(["-Xclang", "-fno-diagnostics-use-presumed-location"]);
+        }
+        cmd
+            .args(crate::UB_CONTAINMENT_FLAGS.iter().filter(|f| !f.starts_with("-std=")))
+            .arg("-std=gnu99");
+        // The game's headers are GCC 2.95-era C.
+        for w in DOWNGRADED.iter().filter(|w| **w != "implicit-function-declaration") {
+            cmd.arg(format!("-Wno-error={w}"));
+        }
+        let out = cmd.arg(i_path).arg("-o").arg(obj).output().context("running clang -c")?;
+        Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+    }
+
     /// LLVM IR for a normalized TU, as `compile_i` would lower it.
     pub fn emit_llvm(&self, i_path: &Path) -> Result<String> {
         let mut cmd = self.base();

@@ -132,6 +132,12 @@ fn encode(vs: &[(String, Vec<u32>, Vec<u8>)]) -> Vec<u8> {
 /// imported into OPFS), and every requested frame's RAM and VRAM hashes
 /// must agree.
 fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
+    game_with(ws, game, args, None)
+}
+
+/// `web-test game` on a given build (`built`: with mods) instead of the
+/// plain one.
+pub fn game_with(ws: &Workspace, game: &str, args: &[&str], built: Option<&psxw_build::game::Report>) -> Result<bool> {
     let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
     let (mut timeout, mut frames) = (1800u32, None::<u64>);
     let mut replay_path: Option<String> = None;
@@ -150,7 +156,11 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
         }
     }
     let disc = ws.disc(game)?;
-    let bundle = psxw_build::web::build_into(ws, game, ws.out_dir().join("web").join(format!("test-{game}")))?;
+    let dir = ws.out_dir().join("web").join(format!("test-{game}"));
+    let bundle = match built {
+        Some(r) => psxw_build::web::bundle(ws, game, r, dir)?,
+        None => psxw_build::web::build_into(ws, game, dir)?,
+    };
     // A named replay or file runs its length unless --frames says less.
     let replay = match &replay_path {
         Some(p) => crate::wholegame::replay(ws, game, Some(p))?.0,
@@ -163,6 +173,9 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
 
     // Native.
     let (mut o, _) = crate::run::options(ws, game, &[])?;
+    if let Some(r) = built {
+        o.wasm = r.wasm.clone().into();
+    }
     o.frames = frames;
     o.replay = Some(replay.clone());
     o.hash_at = hash.clone();
@@ -230,6 +243,9 @@ fn game(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
             match std::fs::read(results.join(format!("result-{b}-replay.json"))) {
                 Ok(rec) if psxw_abi::replay::Header::parse(&rec).is_some() => {
                     let (mut o, _) = crate::run::options(ws, game, &[])?;
+                    if let Some(r) = built {
+                        o.wasm = r.wasm.clone().into();
+                    }
                     o.frames = frames;
                     o.replay = Some(rec);
                     o.hash_at = hash.clone();

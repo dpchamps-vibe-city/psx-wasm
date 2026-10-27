@@ -237,7 +237,7 @@ fn expected_bytes(ctx: &Context, obj: &WasmObject, container: &str, def: psxw_li
 /// For each header, as spelled in `#include`, the includes preceding it in
 /// the first translation unit that uses it: the context the decomp itself
 /// compiles it in. Headers like the SDK's depend on include order.
-pub(crate) fn include_contexts(snap: &Path, map: &psxw_inputs::AddressMap) -> std::collections::HashMap<String, Vec<String>> {
+pub fn include_contexts(snap: &Path, map: &psxw_inputs::AddressMap) -> std::collections::HashMap<String, Vec<String>> {
     let mut contexts = std::collections::HashMap::new();
     for tu in map.containers.iter().flat_map(|c| &c.tus) {
         let Ok(text) = std::fs::read_to_string(snap.join(&tu.path)) else { continue };

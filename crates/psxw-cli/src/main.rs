@@ -18,11 +18,16 @@
 //! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose]
 //!                                       M2: run game.wasm headless
 //! psxw identity <game>                 M8: SDK object identity report
-//! psxw build-web <game>; psxw serve [dir] [--port N]   M5: the browser bundle
+//! psxw build-web <game> [--mods D,…]; psxw serve [dir] [--port N]   M5: the browser bundle
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
+//! psxw mod …                            M11: the modkit (mods.rs)
+//! psxw record <game> --mod D…           M11: serve the bundle with mods to record replays
 //! ```
+//!
+//! `run`, `build` and `build-web` take mods too (`--mod <dir>`, repeated;
+//! `--mods a,b`): the game is built with them first.
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use psxw_inputs::{Workspace, snapshot, toolchain};
 
 mod ci;
@@ -34,6 +39,9 @@ mod webtest;
 mod oracle;
 mod wholegame;
 mod record;
+mod mods;
+mod passthrough;
+mod writers;
 
 fn main() {
     if let Err(e) = run() {
@@ -42,8 +50,40 @@ fn main() {
     }
 }
 
+/// Split `--mod <dir>` (repeated) and `--mods a,b` out of `args`.
+fn mod_args(args: &[&str]) -> Result<(Vec<String>, Vec<String>)> {
+    let (mut dirs, mut rest) = (Vec::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--mod" => dirs.push(it.next().context("--mod needs a directory")?.to_string()),
+            "--mods" => dirs.extend(it.next().context("--mods needs a list")?.split(',').map(str::to_string)),
+            other => rest.push(other.to_string()),
+        }
+    }
+    Ok((dirs, rest))
+}
+
+/// The game built with mods `dirs`, when there are any.
+fn with_mods(ws: &Workspace, game: &str, dirs: &[String]) -> Result<Option<psxw_build::game::Report>> {
+    if dirs.is_empty() {
+        return Ok(None);
+    }
+    let d: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    let built = mods::build_direct(ws, game, &mods::load(&d)?, None)?;
+    eprintln!("mods: {}", built.mods_json.display());
+    Ok(Some(built.report))
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "mod") {
+        let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        if !mods::run(&rest)? {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     let ws = Workspace::discover()?;
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["toolchain", "fetch"] => {
@@ -182,9 +222,24 @@ fn run() -> Result<()> {
             }
             eprintln!("wrote {}", out.display());
         }
-        ["build-web", game] => {
-            let dir = psxw_build::web::build(&ws, game)?;
+        ["build-web", game, rest @ ..] => {
+            let (dirs, rest) = mod_args(rest)?;
+            if !rest.is_empty() {
+                bail!("unknown build-web option {}", rest[0]);
+            }
+            let dir = match with_mods(&ws, game, &dirs)? {
+                Some(r) => {
+                    let label: Vec<String> = dirs.iter().map(|d| std::path::Path::new(d).file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+                    psxw_build::web::bundle(&ws, game, &r, ws.out_dir().join("web").join(format!("{game}-{}", label.join("+"))))?
+                }
+                None => psxw_build::web::build(&ws, game)?,
+            };
             eprintln!("web bundle: {} (serve it with `psxw serve {}`)", dir.display(), dir.display());
+        }
+        ["record", game, rest @ ..] => {
+            if !mods::record(&ws, game, rest)? {
+                std::process::exit(2);
+            }
         }
         ["web-test", rest @ ..] => {
             if !webtest::run(&ws, rest)? {
@@ -232,7 +287,12 @@ fn run() -> Result<()> {
             }
         }
         ["run", game, rest @ ..] => {
-            if !run::run(&ws, game, rest)? {
+            let (dirs, mut rest) = mod_args(rest)?;
+            if let Some(r) = with_mods(&ws, game, &dirs)? {
+                rest.extend(["--wasm".to_string(), r.wasm]);
+            }
+            let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+            if !run::run(&ws, game, &rest)? {
                 std::process::exit(2);
             }
         }
@@ -256,6 +316,13 @@ fn run() -> Result<()> {
             eprintln!("runtime: {}", p.display());
         }
         ["build", game, rest @ ..] => {
+            let (dirs, rest) = mod_args(rest)?;
+            if let Some(r) = with_mods(&ws, game, &dirs)? {
+                ensure!(rest.is_empty(), "build options and --mod don't combine yet");
+                eprintln!("game.wasm: {} ({} bytes)", r.wasm, r.game_bytes);
+                return Ok(());
+            }
+            let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
             let mut opts = psxw_build::game::Options::new(game);
             let mut it = rest.iter();
             while let Some(a) = it.next() {

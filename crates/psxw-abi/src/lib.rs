@@ -32,7 +32,10 @@ pub mod replay;
 ///   [`BootOptions::TRACE_RECORD_GPU`] is set, and SPU windows
 ///   (`host.spu_record_begin`, `host.spu_record`, M6) when
 ///   [`BootOptions::TRACE_RECORD_SPU`] is.
-pub const ABI_VERSION: u32 = 6;
+/// - 7: mods (M11): the mod area ([`phys::MOD_DATA`]), the guest's
+///   `guest.psxmod_init` and `guest.psxmod_loaded` (data patches), and
+///   `psx.mod_log`.
+pub const ABI_VERSION: u32 = 7;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -54,7 +57,13 @@ pub mod phys {
     pub const RAM: core::ops::Range<u32> = 0x0000_0000..0x0020_0000;
     /// clang-only data (string literals, constant pools) with no original
     /// address. Occupies the region where hardware mirrors RAM.
-    pub const AUX_DATA: core::ops::Range<u32> = 0x0020_0000..0x0080_0000;
+    pub const AUX_DATA: core::ops::Range<u32> = 0x0020_0000..0x0060_0000;
+    /// Mods' globals, stacks and heaps (M11), above AUX in RAM's mirror;
+    /// never the game's RAM. A static build's mods share it, its stack at
+    /// the top ([`MOD_STACK`]); dynamically loaded mods each get a slice.
+    pub const MOD_DATA: core::ops::Range<u32> = 0x0060_0000..0x0080_0000;
+    /// The stack static mods run on, at the top of [`MOD_DATA`].
+    pub const MOD_STACK: core::ops::Range<u32> = 0x007F_0000..0x0080_0000;
     pub const SCRATCHPAD: core::ops::Range<u32> = 0x0080_0000..0x0080_0400;
     /// Hardware registers. Nothing backs them; debug builds trap here.
     pub const IO: core::ops::Range<u32> = 0x0080_1000..0x0080_3000;
@@ -62,8 +71,8 @@ pub mod phys {
     pub const RUNTIME_PRIVATE: core::ops::Range<u32> = 0x00F0_0000..0x0100_0000;
 }
 
-/// Synthetic MIPS addresses for address-taken functions that have no
-/// original address (compiler-generated helpers).
+/// Synthetic MIPS addresses for functions that have no original address
+/// (mod functions whose address is taken or stored in game data).
 pub const SYNTHETIC_CODE: core::ops::Range<u32> = 0x8020_0000..0x8040_0000;
 
 /// Dispatch table index for a guest function pointer. The table spans
@@ -133,6 +142,9 @@ pub mod psx {
     /// guest to `guest_invoke_irq`; the runtime notes it, or traps outside
     /// an exception handler.
     pub const RETURN_FROM_EXCEPTION: &str = "return_from_exception";
+    /// `(fmt, va) -> ()`: a mod's `psxmod_log(fmt, ...)`: printf-style,
+    /// the arguments in clang's va-buffer at guest address `va`.
+    pub const MOD_LOG: &str = "mod_log";
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
     pub const ADAPTER_PREFIX: &str = "adapter.";
@@ -153,6 +165,15 @@ pub mod guest {
     /// ReturnFromException in the call unwinds to here (wasm `throw`), and
     /// `$sp`/`$gp` are restored to their values at the call.
     pub const INVOKE_IRQ: &str = "guest_invoke_irq";
+    /// `() -> ()`: the mods' data patches to the executable, called once
+    /// the boot has loaded it, before its entry point runs (M11). Empty
+    /// without mods.
+    pub const MOD_INIT: &str = "psxmod_init";
+    /// `(addr, len) -> ()`: the disc just wrote `len` bytes at guest
+    /// address `addr`; the mods' data patches to an overlay whose code is
+    /// now resident and whose patched bytes that range covered are applied
+    /// (M11). Empty without mods.
+    pub const MOD_LOADED: &str = "psxmod_loaded";
 }
 
 /// What `game.wasm` imports from its host: module `host`. All pointers are

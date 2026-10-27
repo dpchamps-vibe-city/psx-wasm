@@ -189,6 +189,7 @@ pub fn on_sector(m: &mut M, generation: u32) {
         if let Some(raw) = raw {
             let data = &raw[r.skip..r.skip + r.size as usize];
             m.mem.write(r.dst, data);
+            m.loaded.push((r.dst, r.size));
         }
         m.drive.head = r.next_lba + 1;
         let left = r.remaining - 1;
@@ -361,6 +362,7 @@ fn cd_get_sector(m: &mut M, a: [u32; 4]) -> Result {
     let skip = if m.drive.mode & mode::SIZE_2340 != 0 { 12 } else { 0x18 };
     let end = (skip + bytes).min(cd::RAW);
     m.mem.write(a[0], &raw[skip..end]);
+    m.loaded.push((a[0], (end - skip) as u32));
     ret(1)
 }
 

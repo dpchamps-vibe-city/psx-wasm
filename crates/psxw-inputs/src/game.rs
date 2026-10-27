@@ -23,6 +23,31 @@ pub struct GameManifest {
     pub conform: ConformSection,
     #[serde(default)]
     pub ubsan: UbsanSection,
+    /// `[mod]`: what mods see of the game (plans/M11).
+    #[serde(default, rename = "mod")]
+    pub mods: ModSection,
+}
+
+/// `[mod]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModSection {
+    /// Named hook points (`[mod.points]`): each a real function boundary
+    /// many mods want, such as once per frame.
+    #[serde(default)]
+    pub points: BTreeMap<String, PointSpec>,
+}
+
+/// A named hook point: before or after one function.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PointSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// What it is, for people writing mods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
 }
 
 /// `[ubsan]`: the UBSan variant's documented reports (M2 task 13).

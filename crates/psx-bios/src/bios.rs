@@ -385,6 +385,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
                 s += 1;
             }
             m.mem.write(a[1], &got);
+            m.loaded.push((a[1], got.len() as u32));
             m.kernel.files.get_mut(&a[0]).unwrap().pos += n;
             r(n)
         }
@@ -512,13 +513,18 @@ impl cd::Disc for HostDisc<'_> {
 /// The BIOS printf: `%d %i %u %x %X %o %c %s %p %%`, with flags, width and
 /// precision. Arguments come from a1..a3, then the guest stack.
 pub fn printf<S: Sdk>(m: &Machine<S>, a: [u32; 4]) -> String {
-    let fmt = m.mem.cstr(a[0], 1024);
     let mut k = 1;
-    let mut next = || {
+    format(m, a[0], &mut || {
         let v = m.arg(&a, k);
         k += 1;
         v
-    };
+    })
+}
+
+/// [`printf`]'s formatting of the string at guest address `fmt`, each
+/// argument word from `next`.
+pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, next: &mut dyn FnMut() -> u32) -> String {
+    let fmt = m.mem.cstr(fmt, 1024);
     let mut out = String::new();
     let mut i = 0;
     while i < fmt.len() {

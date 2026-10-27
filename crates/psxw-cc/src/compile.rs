@@ -273,6 +273,20 @@ fn lift_reason(message: &str) -> String {
     }
 }
 
+/// File-scope fixups for an error clang reports at `offset` of `text`:
+/// the GCC 2.95-isms of headers ([`incomplete_array_fix`]). Mods (M11)
+/// include the decomp's headers and need the same.
+pub fn header_fixups(
+    ast: &Ast,
+    text: &str,
+    message: &str,
+    offset: usize,
+    moved: &mut BTreeSet<usize>,
+    rules: &mut BTreeMap<String, u32>,
+) -> Option<Vec<Edit>> {
+    incomplete_array_fix(ast, text, message, offset, moved, rules)
+}
+
 /// GCC 2.95 accepts `extern struct X a[N];` before `struct X` is complete;
 /// clang never does. Move the declaration after the definition, or drop it
 /// when the TU never completes the type (then nothing can use it).

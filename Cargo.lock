@@ -807,11 +807,14 @@ dependencies = [
  "psxw-host-native",
  "psxw-inputs",
  "psxw-lift",
+ "psxw-link",
+ "psxw-modkit",
  "psxw-oracle",
  "rayon",
  "sdk-psyq",
  "serde",
  "serde_json",
+ "wasmparser 0.262.0",
 ]
 
 [[package]]
@@ -908,6 +911,27 @@ dependencies = [
  "psxw-inputs",
  "serde",
  "wasm-encoder 0.262.0",
+ "wasmparser 0.262.0",
+]
+
+[[package]]
+name = "psxw-modkit"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "psxw-abi",
+ "psxw-build",
+ "psxw-cc",
+ "psxw-census",
+ "psxw-inputs",
+ "psxw-lift",
+ "psxw-link",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tree-sitter",
+ "tree-sitter-c",
  "wasmparser 0.262.0",
 ]
 

@@ -36,7 +36,7 @@ import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, savesDir } from "./cards.js";
 
-const ABI_VERSION = 6;
+const ABI_VERSION = 7;
 const NOTHING_PRESSED = 0xffff;
 const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";

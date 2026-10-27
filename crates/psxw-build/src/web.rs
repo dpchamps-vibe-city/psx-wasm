@@ -22,6 +22,11 @@ pub fn build(ws: &Workspace, game: &str) -> Result<PathBuf> {
 /// own, so a run never rewrites a bundle someone is serving.
 pub fn build_into(ws: &Workspace, game: &str, dir: PathBuf) -> Result<PathBuf> {
     let (report, _) = crate::game::build(ws, &crate::game::Options::new(game))?;
+    bundle(ws, game, &report, dir)
+}
+
+/// The bundle in `dir` around a game already built (with mods, say).
+pub fn bundle(ws: &Workspace, game: &str, report: &crate::game::Report, dir: PathBuf) -> Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     pkg(ws, &dir.join("pkg"))?;
@@ -37,7 +42,7 @@ pub fn build_into(ws: &Workspace, game: &str, dir: PathBuf) -> Result<PathBuf> {
     let clock = crate::game::frame_counter(ws, game, &inputs).ok();
     std::fs::write(dir.join("game.json"), serde_json::to_string(&serde_json::json!({ "id": game, "frame_counter": clock }))?)?;
     // Dev mode (`?dev`): the unmerged modules, wired in the Worker.
-    std::fs::copy(crate::game::out_dir(ws, game).join("guest.wasm"), dir.join("guest.wasm"))?;
+    std::fs::copy(&report.guest, dir.join("guest.wasm"))?;
     std::fs::copy(crate::runtime::path(ws), dir.join("runtime.wasm"))?;
     check_dev(&dir)?;
     Ok(dir)

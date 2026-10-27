@@ -371,6 +371,218 @@ pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u
     f
 }
 
+/// What an o32-to-C wrapper into mod code ([`o32_to_c_with`]) is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// `(a0..a3) -> i64`, the callee's result as `v0 | v1 << 32`.
+    O32,
+    /// An `after` hook: `(r: i64, a0..a3) -> ()` when the callee's first C
+    /// parameter is the hooked function's result `r`, `(a0..a3) -> ()` when
+    /// the hooked function returns nothing. The callee's result is dropped.
+    After { result: bool },
+}
+
+/// Globals an o32-to-C wrapper into mod code uses.
+#[derive(Debug, Clone, Copy)]
+pub struct WrapGlobals {
+    /// The guest `$sp`: words past the fourth are read at entry `$sp + 4k`.
+    pub sp: u32,
+    /// The stack struct copies and va-buffers are rebuilt on (the mod
+    /// stack, so guest RAM is untouched).
+    pub scratch: u32,
+    /// `(hook_sp, hook_id, id)`: around the call, `hook_sp` holds the entry
+    /// `$sp` and `hook_id` this wrapper's id, so the callee's call to the
+    /// next link ([`c_to_o32_transparent`]) reuses the caller's frame.
+    pub hook: Option<(u32, u32, i32)>,
+}
+
+/// Body of an o32-to-C wrapper into a mod's C function `callee` (signature
+/// `sig`, prototype `proto`), shaped as `shape`.
+pub fn o32_to_c_with(sig: &FuncType, proto: Option<&Proto>, callee: u32, shape: Shape, g: WrapGlobals) -> Function {
+    let (kinds, variadic) = param_kinds(sig, proto);
+    let lead = usize::from(shape == Shape::After { result: true });
+    let frame_kinds = kinds.get(lead..).unwrap_or(&[]);
+    let (ws, _) = words(frame_kinds, variadic);
+    // Locals: the parameters, then entry sp, saved scratch sp, scratch
+    // base, saved hook sp and id.
+    let abase = lead as u32;
+    let nparams = abase + 4;
+    let (entry_sp, save, base, save_hsp, save_hid) = (nparams, nparams + 1, nparams + 2, nparams + 3, nparams + 4);
+    let mut f = Function::new([(5, ValType::I32)]);
+    let word = |f: &mut Function, k: usize| {
+        if k < 4 {
+            f.instruction(&I::LocalGet(abase + k as u32));
+        } else {
+            load_word(f, entry_sp, 4 * k as u32);
+        }
+    };
+    let mut mem_params: Vec<(u32, Vec<usize>)> = Vec::new();
+    for (k, w) in ws.iter().enumerate() {
+        if let Word::Mem(n, _) = w {
+            match mem_params.iter_mut().find(|(m, _)| m == n) {
+                Some((_, ks)) => ks.push(k),
+                None => mem_params.push((*n, vec![k])),
+            }
+        }
+    }
+    let bytes: u32 = mem_params.iter().map(|(_, ks)| ks.len() as u32 * 4).sum();
+    let bytes = bytes.div_ceil(8) * 8;
+    f.instruction(&I::GlobalGet(g.sp));
+    f.instruction(&I::LocalSet(entry_sp));
+    f.instruction(&I::GlobalGet(g.scratch));
+    f.instruction(&I::LocalTee(save));
+    f.instruction(&I::I32Const(bytes as i32));
+    f.instruction(&I::I32Sub);
+    f.instruction(&I::LocalTee(base));
+    f.instruction(&I::GlobalSet(g.scratch));
+    let mut offsets: Vec<(u32, u32)> = Vec::new();
+    let mut at = 0u32;
+    for (n, ks) in &mem_params {
+        offsets.push((*n, at));
+        for (j, &k) in ks.iter().enumerate() {
+            f.instruction(&I::LocalGet(base));
+            f.instruction(&I::I32Const((at + 4 * j as u32) as i32));
+            f.instruction(&I::I32Add);
+            mask(&mut f);
+            word(&mut f, k);
+            f.instruction(&I::I32Store(memarg(2)));
+        }
+        at += 4 * ks.len() as u32;
+    }
+    if let Some((hsp, hid, id)) = g.hook {
+        f.instruction(&I::GlobalGet(hsp));
+        f.instruction(&I::LocalSet(save_hsp));
+        f.instruction(&I::GlobalGet(hid));
+        f.instruction(&I::LocalSet(save_hid));
+        f.instruction(&I::LocalGet(entry_sp));
+        f.instruction(&I::GlobalSet(hsp));
+        f.instruction(&I::I32Const(id));
+        f.instruction(&I::GlobalSet(hid));
+    }
+    let pos = |pred: &dyn Fn(&Word) -> bool| ws.iter().position(pred);
+    for (i, t) in sig.params.iter().enumerate() {
+        if i < lead {
+            // The hooked function's result, `v0 | v1 << 32`.
+            f.instruction(&I::LocalGet(0));
+            match t {
+                wasmparser::ValType::I64 => {}
+                wasmparser::ValType::F64 => {
+                    f.instruction(&I::F64ReinterpretI64);
+                }
+                wasmparser::ValType::F32 => {
+                    f.instruction(&I::I32WrapI64);
+                    f.instruction(&I::F32ReinterpretI32);
+                }
+                _ => {
+                    f.instruction(&I::I32WrapI64);
+                }
+            }
+            continue;
+        }
+        let j = (i - lead) as u32;
+        if let Some((_, off)) = offsets.iter().find(|(n, _)| *n == j) {
+            f.instruction(&I::LocalGet(base));
+            f.instruction(&I::I32Const(*off as i32));
+            f.instruction(&I::I32Add);
+            continue;
+        }
+        match t {
+            wasmparser::ValType::I64 | wasmparser::ValType::F64 => {
+                let lo = pos(&|w| *w == Word::Lo(j) || *w == Word::F64Lo(j)).unwrap_or(0);
+                word(&mut f, lo);
+                f.instruction(&I::I64ExtendI32U);
+                word(&mut f, lo + 1);
+                f.instruction(&I::I64ExtendI32U);
+                f.instruction(&I::I64Const(32));
+                f.instruction(&I::I64Shl);
+                f.instruction(&I::I64Or);
+                if *t == wasmparser::ValType::F64 {
+                    f.instruction(&I::F64ReinterpretI64);
+                }
+            }
+            wasmparser::ValType::F32 => {
+                word(&mut f, pos(&|w| *w == Word::F32(j)).unwrap_or(0));
+                f.instruction(&I::F32ReinterpretI32);
+            }
+            _ => word(&mut f, pos(&|w| *w == Word::Param(j)).unwrap_or(0)),
+        }
+    }
+    f.instruction(&I::Call(callee));
+    match shape {
+        Shape::O32 => {
+            if matches!(kinds.first(), Some(Kind::Sret { .. })) {
+                to_o32_result(&mut f, &sig.results);
+                f.instruction(&I::Drop);
+                f.instruction(&I::LocalGet(0));
+                f.instruction(&I::I64ExtendI32U);
+            } else {
+                to_o32_result(&mut f, &sig.results);
+            }
+        }
+        Shape::After { .. } => {
+            for _ in &sig.results {
+                f.instruction(&I::Drop);
+            }
+        }
+    }
+    if let Some((hsp, hid, _)) = g.hook {
+        f.instruction(&I::LocalGet(save_hsp));
+        f.instruction(&I::GlobalSet(hsp));
+        f.instruction(&I::LocalGet(save_hid));
+        f.instruction(&I::GlobalSet(hid));
+    }
+    f.instruction(&I::LocalGet(save));
+    f.instruction(&I::GlobalSet(g.scratch));
+    f.instruction(&I::End);
+    f
+}
+
+/// Body of a mod's call to the next link of an o32 chain, `call`: as
+/// [`c_to_o32`], except that inside the wrapping patch with id `id` it
+/// reuses the patch's caller's frame (`hook_sp`) instead of reserving one,
+/// so the next link sees the `$sp` and stack arguments the hooked
+/// function's caller set up.
+pub fn c_to_o32_transparent(sig: &FuncType, words: &[Word], sp_global: u32, hook: (u32, u32, i32), call: u32) -> Function {
+    let (hsp, hid, id) = hook;
+    let n = sig.params.len() as u32;
+    let old_sp = n;
+    let new_sp = n + 1;
+    let mut f = Function::new([(2, ValType::I32)]);
+    let frame = ((words.len().max(4) as u32) * 4).div_ceil(8) * 8;
+    f.instruction(&I::GlobalGet(sp_global));
+    f.instruction(&I::LocalSet(old_sp));
+    f.instruction(&I::GlobalGet(hid));
+    f.instruction(&I::I32Const(id));
+    f.instruction(&I::I32Eq);
+    f.instruction(&I::If(wasm_encoder::BlockType::Result(ValType::I32)));
+    f.instruction(&I::GlobalGet(hsp));
+    f.instruction(&I::Else);
+    f.instruction(&I::LocalGet(old_sp));
+    f.instruction(&I::I32Const(frame as i32));
+    f.instruction(&I::I32Sub);
+    f.instruction(&I::End);
+    f.instruction(&I::LocalSet(new_sp));
+    for (k, &w) in words.iter().enumerate().skip(4) {
+        f.instruction(&I::LocalGet(new_sp));
+        f.instruction(&I::I32Const(4 * k as i32));
+        f.instruction(&I::I32Add);
+        mask(&mut f);
+        push_word(&mut f, w);
+        f.instruction(&I::I32Store(memarg(2)));
+    }
+    f.instruction(&I::LocalGet(new_sp));
+    f.instruction(&I::GlobalSet(sp_global));
+    for k in 0..4 {
+        push_word(&mut f, words.get(k).copied().unwrap_or(Word::Pad));
+    }
+    f.instruction(&I::Call(call));
+    f.instruction(&I::LocalGet(old_sp));
+    f.instruction(&I::GlobalSet(sp_global));
+    from_o32_result(&mut f, &sig.results);
+    f.instruction(&I::End);
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

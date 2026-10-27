@@ -1,0 +1,240 @@
+//! Compiling a mod's C (plans/M11 task 4): the game's include directories
+//! and defines plus the mod's `mod.h`, through psxw-cc's asm normalization
+//! (the decomp's GTE macros work in mods too), as C99 with GNU extensions.
+//! Then each declaration's implementation must be defined in the file it
+//! names.
+
+use crate::decl::{DataValue, Mod};
+use crate::genfiles::{Flags, linkage_macro};
+use anyhow::{Context as _, Result, bail};
+use psxw_cc::Clang;
+use psxw_cc::protos::Proto;
+use psxw_link::object::{SymbolKind, WasmObject};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+/// One compiled source.
+#[derive(Debug, Clone)]
+pub struct Object {
+    /// Relative to the mod's directory, as declarations name it.
+    pub file: String,
+    pub obj: WasmObject,
+    pub protos: BTreeMap<String, Proto>,
+    /// Defines the source compiles with (its static implementations).
+    pub defines: Vec<String>,
+}
+
+/// The implementations a mod names: functions to look for, by file.
+pub fn impl_names(m: &Mod) -> BTreeMap<String, BTreeSet<String>> {
+    let mut by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for h in &m.decl.hooks {
+        by.entry(h.imp.file.clone()).or_default().insert(h.imp.function.clone());
+    }
+    for d in &m.decl.data {
+        if let Ok(DataValue::FnPtr(imp)) = d.value() {
+            by.entry(imp.file.clone()).or_default().insert(imp.function.clone());
+        }
+    }
+    by
+}
+
+fn rel(m: &Mod, src: &Path) -> String {
+    src.strip_prefix(&m.dir).unwrap_or(src).to_string_lossy().replace('\\', "/")
+}
+
+/// The defines a source compiles with: `PSXW_LINKAGE_<f>` for each
+/// implementation it defines `static`. Found by preprocessing it with
+/// `PSXW_SCAN` (mod.h's prototypes off) and reading its definitions.
+pub fn static_defines(clang: &Clang, m: &Mod, src: &Path) -> Result<Vec<String>> {
+    let names: BTreeSet<String> = impl_names(m).into_values().flatten().collect();
+    let text = clang.preprocess(src, &["PSXW_SCAN"])?;
+    let ast = psxw_cc::ast::parse(&text);
+    let mut out = Vec::new();
+    for f in ast.functions() {
+        if !names.contains(&f.name) {
+            continue;
+        }
+        let head = &ast.src[f.range.start..f.decl_end];
+        let spec = head.split(&f.name).next().unwrap_or("");
+        if spec.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == "static") {
+            out.push(format!("{}=static __attribute__((used))", linkage_macro(&f.name)));
+        }
+    }
+    Ok(out)
+}
+
+/// Compile every source of `m` into `work`.
+pub fn compile(flags: &Flags, m: &Mod, mod_include: &Path, work: &Path) -> Result<Vec<Object>> {
+    std::fs::create_dir_all(work)?;
+    let mut includes = flags.includes.clone();
+    includes.push(mod_include.to_path_buf());
+    let clang = Clang::new(flags.clang.clone(), m.dir.clone(), includes, flags.defines.clone(), work)?;
+    let mut out = Vec::new();
+    let mut failures = Vec::new();
+    for src in m.sources()? {
+        let file = rel(m, &src);
+        // Relative to the mod (clang runs there), so messages name its files.
+        let src = PathBuf::from(&file);
+        let defines = static_defines(&clang, m, &src).with_context(|| format!("{}: {file}", m.id()))?;
+        let d: Vec<&str> = defines.iter().map(String::as_str).collect();
+        let text = clang.preprocess(&src, &d).with_context(|| format!("{}: {file}", m.id()))?;
+        // GTE macros become intrinsics; any other MIPS asm can't run.
+        let sites = psxw_cc::asm::scan(&text);
+        if let Some(s) = sites.iter().find(|s| s.kind == psxw_cc::asm::AsmKind::Real) {
+            let line = psxw_cc::linemap::LineMap::new(&text);
+            let at = line.presumed(line.line_of(s.start)).map(|(f, l)| format!("{f}:{l}")).unwrap_or_default();
+            failures.push(format!("{at}: MIPS asm in a mod can't run: {}", s.template));
+            continue;
+        }
+        let mut text = psxw_cc::edit::apply(&text, psxw_cc::asm::edits(&text, &sites));
+        let stem = file.replace(['/', '.'], "_");
+        let i_path = work.join(format!("{stem}.i"));
+        let obj = work.join(format!("{stem}.o"));
+        // The decomp's headers get the census's file-scope fixups; errors in
+        // the mod's own files are the mod's.
+        let mut moved = BTreeSet::new();
+        let mut rules = BTreeMap::new();
+        let mut ok = false;
+        for _ in 0..8 {
+            std::fs::write(&i_path, &text)?;
+            let (done, diags) = clang.compile_mod(&i_path, &obj, true)?;
+            if done {
+                ok = true;
+                break;
+            }
+            let map = psxw_cc::linemap::LineMap::new(&text);
+            let ast = psxw_cc::ast::parse(&text);
+            let mut edits = Vec::new();
+            let mut fixable = true;
+            for d in psxw_cc::diag::parse_clang(&diags).iter().filter(|d| d.severity == psxw_cc::diag::Severity::Error) {
+                let in_mod = map.presumed(d.line).is_some_and(|(f, _)| !Path::new(f).is_absolute() || Path::new(f).starts_with(&m.dir));
+                if in_mod {
+                    fixable = false;
+                    continue;
+                }
+                match map.offset(d.line).and_then(|o| psxw_cc::compile::header_fixups(&ast, &text, &d.message, o, &mut moved, &mut rules)) {
+                    Some(e) => edits.extend(e),
+                    // Reported again at a declaration already moved.
+                    None if d.message.starts_with("array has incomplete element type") => {}
+                    None => fixable = false,
+                }
+            }
+            if edits.is_empty() || !fixable {
+                break;
+            }
+            text = psxw_cc::edit::apply(&text, edits);
+        }
+        if !ok {
+            let (_, diags) = clang.compile_mod(&i_path, &obj, false)?;
+            failures.push(diags.trim_end().to_string());
+            continue;
+        }
+        let (_, diags) = clang.compile_mod(&i_path, &obj, false)?;
+        if !diags.trim().is_empty() {
+            eprintln!("{}", diags.trim_end());
+        }
+        let protos = psxw_cc::protos::cached(&clang, &i_path)?
+            .into_iter()
+            .fold(BTreeMap::new(), |mut acc: BTreeMap<String, Proto>, p| {
+                if p.defined || !acc.contains_key(&p.name) {
+                    acc.insert(p.name.clone(), p);
+                }
+                acc
+            });
+        out.push(Object { file, obj: WasmObject::read(&obj)?, protos, defines });
+    }
+    if !failures.is_empty() {
+        bail!("{} doesn't compile:\n{}", m.id(), failures.join("\n"));
+    }
+    // Each implementation where its declaration says.
+    let defines = |o: &Object, f: &str| o.obj.symbols.iter().any(|s| s.kind == SymbolKind::Function && s.defined && s.name == f);
+    let mut errors = Vec::new();
+    for (file, names) in impl_names(m) {
+        for f in names {
+            match out.iter().find(|o| o.file == file) {
+                Some(o) if defines(o, &f) => {}
+                _ => match out.iter().find(|o| defines(o, &f)) {
+                    Some(o) => errors.push(format!("{}: {f} is defined in {}, not {file} as declared", m.id(), o.file)),
+                    None => errors.push(format!("{}: {file} defines no function {f}", m.id())),
+                },
+            }
+        }
+    }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("\n"));
+    }
+    Ok(out)
+}
+
+/// What a mod touches of the game, from its objects' relocations.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Surface {
+    /// Game functions it calls.
+    pub calls: BTreeSet<String>,
+    pub reads: BTreeSet<String>,
+    pub writes: BTreeSet<String>,
+    /// Globals whose address it takes (it may read or write through it).
+    pub addresses: BTreeSet<String>,
+}
+
+/// A mod's surface over its objects. Names it defines itself, its
+/// `original`s and the mod library are not the game's.
+pub fn surface(objects: &[Object], own: &BTreeSet<String>) -> Result<Surface> {
+    use wasmparser::{BinaryReader, FunctionBody, Operator as O, RelocationType as R};
+    let mut s = Surface::default();
+    let defined: BTreeSet<&str> = objects
+        .iter()
+        .flat_map(|o| o.obj.symbols.iter().filter(|x| x.defined).map(|x| x.name.as_str()))
+        .collect();
+    let game = |name: &str| !defined.contains(name) && !own.contains(name) && !name.starts_with("psxmod_") && !name.starts_with("psx_gte_") && !name.starts_with("__psxw");
+    for o in objects {
+        let obj = &o.obj;
+        for sym in obj.symbols.iter().filter(|x| x.kind == SymbolKind::Function && !x.defined) {
+            if game(&sym.name) {
+                s.calls.insert(sym.name.clone());
+            }
+        }
+        for f in &obj.funcs {
+            let relocs = obj.relocs_for(&f.body);
+            if relocs.is_empty() {
+                continue;
+            }
+            let body = FunctionBody::new(BinaryReader::new(&obj.bytes[f.body.clone()], f.body.start as u64));
+            let mut ops = body.get_operators_reader()?;
+            let mut list = Vec::new();
+            while !ops.eof() {
+                let (op, at) = ops.read_with_offset()?;
+                let kind = match op {
+                    O::I32Load { .. } | O::I64Load { .. } | O::F32Load { .. } | O::F64Load { .. } | O::I32Load8S { .. } | O::I32Load8U { .. }
+                    | O::I32Load16S { .. } | O::I32Load16U { .. } | O::I64Load8S { .. } | O::I64Load8U { .. } | O::I64Load16S { .. }
+                    | O::I64Load16U { .. } | O::I64Load32S { .. } | O::I64Load32U { .. } => 1,
+                    O::I32Store { .. } | O::I64Store { .. } | O::F32Store { .. } | O::F64Store { .. } | O::I32Store8 { .. } | O::I32Store16 { .. }
+                    | O::I64Store8 { .. } | O::I64Store16 { .. } | O::I64Store32 { .. } => 2,
+                    _ => 0,
+                };
+                list.push((at, kind));
+            }
+            for r in relocs {
+                let Some(sym) = obj.symbols.get(r.symbol as usize) else { continue };
+                if sym.kind != SymbolKind::Data || sym.defined || !game(&sym.name) {
+                    continue;
+                }
+                let at = (obj.code_start + r.offset as usize) as u64;
+                let op = list.iter().rev().find(|(o, _)| *o <= at).map_or(0, |(_, k)| *k);
+                let set = match (r.ty, op) {
+                    (R::MemoryAddrLeb, 1) => &mut s.reads,
+                    (R::MemoryAddrLeb, 2) => &mut s.writes,
+                    _ => &mut s.addresses,
+                };
+                set.insert(sym.name.clone());
+            }
+        }
+    }
+    Ok(s)
+}
+
+/// Where a mod's objects and `mod.h` go under a build directory.
+pub fn mod_dirs(build: &Path, id: &str) -> (PathBuf, PathBuf) {
+    (build.join("mods").join(id).join("include"), build.join("mods").join(id).join("obj"))
+}

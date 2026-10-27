@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://psx-wasm.invalid/schema/psxmods.schema.json",
+  "title": "psx-wasm mods workspace (psxmods.json)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["game", "psx_wasm"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "game": { "type": "string" },
+    "psx_wasm": { "type": "string", "description": "The psx-wasm checkout, relative to the workspace." }
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://psx-wasm.invalid/schema/mod.schema.json",
+  "title": "psx-wasm mod (mod.json)",
+  "description": "A mod's identity, load order and every declaration (plans/M11-modkit.md). Every distinct aspect is its own field.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "version", "game"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "id": { "type": "string", "pattern": "^[a-z0-9-]+$", "description": "Lowercase letters, digits and '-'." },
+    "version": { "type": "string", "minLength": 1 },
+    "game": { "type": "string", "description": "The game's id (games/<id>/game.toml in psx-wasm)." },
+    "load_after": { "type": "array", "items": { "type": "string" }, "description": "Mods this one is applied after, when they are applied too." },
+    "hooks": { "type": "array", "items": { "$ref": "#/$defs/hook" } },
+    "data": { "type": "array", "items": { "$ref": "#/$defs/data" } }
+  },
+  "$defs": {
+    "ident": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "target": {
+      "description": "Exactly one form: {symbol}, {container, symbol}, {container, address}, or {point}.",
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["symbol"], "properties": { "symbol": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["container", "symbol"], "properties": { "container": { "type": "string" }, "symbol": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["container", "address"], "properties": { "container": { "type": "string" }, "address": { "type": "string", "pattern": "^0[xX][0-9A-Fa-f]{1,8}$" } } },
+        { "type": "object", "additionalProperties": false, "required": ["point"], "properties": { "point": { "type": "string" } } }
+      ]
+    },
+    "named_target": {
+      "description": "A named function or data symbol: {symbol}, {container, symbol} or {container, address}.",
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["symbol"], "properties": { "symbol": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["container", "symbol"], "properties": { "container": { "type": "string" }, "symbol": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["container", "address"], "properties": { "container": { "type": "string" }, "address": { "type": "string", "pattern": "^0[xX][0-9A-Fa-f]{1,8}$" } } }
+      ]
+    },
+    "impl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "function"],
+      "properties": {
+        "file": { "type": "string", "description": "Relative to the mod's directory." },
+        "function": { "$ref": "#/$defs/ident" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["returns"],
+      "description": "The target's C type, when no header declares it.",
+      "properties": {
+        "returns": { "type": "string", "description": "One C type." },
+        "params": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type"],
+            "properties": { "name": { "$ref": "#/$defs/ident" }, "type": { "type": "string" } }
+          }
+        },
+        "variadic": { "type": "boolean" }
+      }
+    },
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target", "impl"],
+      "properties": {
+        "kind": { "enum": ["before", "after", "patch"] },
+        "target": { "$ref": "#/$defs/target" },
+        "from": { "$ref": "#/$defs/named_target", "description": "Only calls made inside this caller." },
+        "impl": { "$ref": "#/$defs/impl" },
+        "original": { "$ref": "#/$defs/ident", "description": "patch only: the name the implementation calls the next link by." },
+        "signature": { "$ref": "#/$defs/signature" }
+      },
+      "if": { "properties": { "kind": { "const": "patch" } } },
+      "else": { "not": { "required": ["original"] } }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "type", "value"],
+      "properties": {
+        "target": { "$ref": "#/$defs/named_target" },
+        "offset": { "type": "integer", "minimum": 0 },
+        "type": { "enum": ["u8", "s8", "u16", "s16", "u32", "s32", "fnptr", "bytes"] },
+        "value": true
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "fnptr" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/impl" } } } },
+        { "if": { "properties": { "type": { "const": "bytes" } } }, "then": { "properties": { "value": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0, "maximum": 255 } } } } },
+        { "if": { "properties": { "type": { "enum": ["u8", "s8", "u16", "s16", "u32", "s32"] } } }, "then": { "properties": { "value": { "type": "integer" } } } }
+      ]
+    }
+  }
+}

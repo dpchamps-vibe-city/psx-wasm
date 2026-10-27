@@ -20,6 +20,7 @@ pub mod game;
 pub mod layout;
 pub mod link;
 pub mod marshal;
+pub mod mods;
 pub mod object;
 pub mod rewrite;
 

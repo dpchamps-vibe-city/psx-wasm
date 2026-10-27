@@ -16,11 +16,19 @@ pub trait Invoke {
     fn invoke_irq(&mut self, call: GuestCall) -> u64 {
         self.invoke(call)
     }
+    /// The disc wrote `len` bytes at `addr` (mods' overlay data patches).
+    fn loaded(&mut self, _addr: u32, _len: u32) {}
 }
 
 /// Run queued callbacks, unless one is already running (no nesting:
 /// interrupts are disabled in a handler, as on hardware).
 pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
+    // What the disc wrote first, so no guest code sees an overlay before
+    // its mods' patches (even in a handler).
+    let loaded = std::mem::take(&mut rt.borrow_mut().loaded);
+    for (addr, len) in loaded {
+        inv.loaded(addr, len);
+    }
     loop {
         let (step, exception) = {
             let mut m = rt.borrow_mut();
