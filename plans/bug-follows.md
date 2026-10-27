@@ -77,7 +77,33 @@ btn has one.
 `collision_query_budget.c` keeps them apart on purpose). Either spelling
 matches; calling through an incompatible declaration is undefined in C.
 
-## 3. Smaller findings from the same session
+## 3. Loading and saving hang at "Searching the MEMORY CARD."
+
+**What happens.** CONTINUE on the title screen, then a slot: the game
+shows "Searching the MEMORY CARD." forever (the frame counter stops;
+vblanks go on). Saving hangs the same way. The emulator, on the same
+replay (`games/btn/replays/card-load.toml`), says "No loadable diary in
+MEMORY CARD slot 1." within about 120 frames.
+
+**Cause: a runtime BIOS gap.** libmcrd's `MemCardGetDirentry` clears the
+card events, calls `firstfile`, and when it finds nothing spins in
+`_get_card_event_x` until a low-level card event (F0000011h) says why.
+The PS1 BIOS checks the card before every directory function (open,
+firstfile, erase, rename; OpenBIOS `buDevInit`: a synchronous read of
+frame 0), and the driver delivers that read's event during the call. Our
+`firstfile` answered from the image and delivered nothing, so any search
+that matched no file, such as an empty card or a save that doesn't exist
+yet, waited forever. Saves found by the search returned before the wait,
+which is why the libmcrd conformance scenario never hit it.
+
+**Fix (`psx-bios::card`).** The `bu` functions make the BIOS's check
+and deliver its events: 04h, 100h with no card, and 2000h then 04h for a
+new card, which the check accepts. The event split now follows OpenBIOS
+and what libmcrd waits on. Raw `_card_read`/`_card_write` and every file
+frame deliver only F0000011h; F4000001h comes from `_card_info`,
+`_card_load`, `card_write_test` and the end of asynchronous file I/O.
+
+## 4. Smaller findings from the same session
 
 - **Lifted SDK asm that reads temporaries on entry** (`_spu_pitch2note`
   t1/t2, `func_80037470`/`94` t0–t2, `func_8003A2A4` t3): their callers'

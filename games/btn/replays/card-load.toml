@@ -1,0 +1,6 @@
+# Title screen to the memory card load (bug-follows §3): skip the intro,
+# CONTINUE (the menu's default), slot 1. With the run's card (formatted,
+# no saves) the game answers "No loadable diary in MEMORY CARD slot 1."
+# on both sides. Presses are frame-counter values ([oracle] frame_counter).
+frames = 3000
+press = ["START@400", "START@560", "CROSS@800", "CROSS@950", "CROSS@1100", "CROSS@1250", "CROSS@1400"]
