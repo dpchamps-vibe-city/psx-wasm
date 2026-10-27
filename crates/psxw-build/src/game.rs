@@ -77,6 +77,10 @@ pub struct Report {
     /// Functions whose C is `void` but whose result C callers use: they
     /// run translated (`void_results`).
     pub void_results: Vec<String>,
+    /// C calls whose declaration differs from the callee's definition in
+    /// C-level kinds but not in wasm types (a struct by value against a
+    /// scalar, say): routed through o32, which converts as the PS1 does.
+    pub abi_mismatches: Vec<String>,
     /// Functions per tier.
     pub tiers: BTreeMap<String, usize>,
     /// Per container and tier.
@@ -349,6 +353,12 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let rodata = psxw_link::layout::Rodata::new(&inputs.map, &inputs.originals);
     eprintln!("build: linking {} inputs", link_inputs.len());
     let linked = psxw_link::game::link(&inputs.map, Some(&rodata), &spec, &link_inputs)?;
+    if !linked.abi_mismatches.is_empty() {
+        eprintln!(
+            "build: {} C calls declare their callee differently from its definition; they go through o32 (build.json abi_mismatches)",
+            linked.abi_mismatches.len()
+        );
+    }
     validate(&linked.wasm).context("guest module fails validation")?;
 
     let dir = out_dir(ws, &opts.game);
@@ -406,6 +416,7 @@ pub fn build(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         unvalidated_objects: unvalidated.into_iter().collect(),
         hardware_unbound: hardware.iter().map(|h| h.to_string()).collect(),
         void_results: void_used.iter().map(|(c, a)| format!("{c} {a:#010x}")).collect(),
+        abi_mismatches: linked.abi_mismatches.clone(),
         tiers: counts,
         by_container,
         adapters: bound.into_iter().collect(),

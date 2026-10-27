@@ -126,6 +126,9 @@ pub struct Linked {
     /// Data placed in AUX: (input label, symbol, address).
     pub aux: Vec<(String, String, u32)>,
     pub matched: usize,
+    /// C calls whose declaration and definition differ in C-level kinds
+    /// though not in wasm types, routed through o32 (game link).
+    pub abi_mismatches: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -502,7 +505,7 @@ pub fn link(
 
     let wasm = module.finish();
     let matched = ctx.layout.defined.values().filter(|p| p.how == How::Matched).count();
-    Ok(Linked { wasm, aux, matched })
+    Ok(Linked { wasm, aux, matched, abi_mismatches: Vec::new() })
 }
 
 /// Push a call-out's operands and call it: kind, target, nwords, a0..a3, sp.

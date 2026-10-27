@@ -161,6 +161,8 @@ struct Ctx<'a> {
     o32_ty: u32,
     /// (input, function) of every device-library function.
     device: HashSet<(usize, u32)>,
+    /// C→C calls routed through o32 because clang's C-level kinds differ.
+    abi_mismatches: BTreeSet<String>,
 }
 
 impl Ctx<'_> {
@@ -293,8 +295,31 @@ impl Resolver for R<'_, '_> {
         }
         let addr = resolved.with_context(|| format!("function {callee} has no address"))?.addr;
         let home = self.ctx.home(&container, addr).with_context(|| format!("{callee} at {addr:#x} is not code"))?;
+        // C→C with matching signatures: a plain call. Matching means clang's
+        // C-level kinds as well as the wasm types: a struct by value and a
+        // scalar are both i32 in wasm (a pointer to a copy; the value) but
+        // the same o32 word on the PS1, so a decomp can declare a function
+        // either way and still match. Such a call goes through o32.
+        let mismatch = |ctx: &Ctx, c: &str| -> Option<String> {
+            let Some(Tier::C { input, func }) = ctx.spec.tiers.get(&(c.to_string(), addr)) else { return None };
+            let o = &ctx.inputs[*input].obj;
+            let def = o.func_symbol(func + o.num_imported_funcs())?;
+            let NameClass::Guest(n) = classify_name(&def.name) else { return None };
+            let declared = ctx.inputs[self.input].protos.get(&callee)?;
+            let defined = ctx.inputs[*input].protos.get(n)?;
+            abi_differs(declared, defined).then(|| {
+                format!(
+                    "{} calls {callee} as {:?} -> {:?}; {} defines {:?} -> {:?}",
+                    ctx.inputs[self.input].label,
+                    declared.params,
+                    declared.ret,
+                    ctx.inputs[*input].label,
+                    defined.params,
+                    defined.ret
+                )
+            })
+        };
         let direct = |ctx: &Ctx, c: &str| -> Option<u32> {
-            // C→C with matching signatures: a plain call.
             match ctx.spec.tiers.get(&(c.to_string(), addr))? {
                 Tier::C { input, func } => {
                     let o = &ctx.inputs[*input].obj;
@@ -306,8 +331,13 @@ impl Resolver for R<'_, '_> {
         };
         let target = match &home {
             Some(c) => {
-                if let Some(i) = direct(self.ctx, c) {
-                    return Ok(Lowered::Call(i));
+                let differs = mismatch(self.ctx, c);
+                match (differs, direct(self.ctx, c)) {
+                    (None, Some(i)) => return Ok(Lowered::Call(i)),
+                    (Some(m), Some(_)) => {
+                        self.ctx.abi_mismatches.insert(m);
+                    }
+                    _ => {}
                 }
                 self.ctx.entry(c, addr)
             }
@@ -421,6 +451,26 @@ impl Resolver for R<'_, '_> {
             self.ctx.spec.debug_io.then(|| self.ctx.import(psx::IO_TRAP))
         }
     }
+}
+
+/// Whether a call through `declared` reaches `defined` differently in wasm
+/// than on the PS1, where both are the same o32 call: a struct passed by
+/// value (or returned through a hidden pointer) on one side only, or
+/// variadic on one side only. Narrow integers pass alike, and an
+/// unprototyped declaration (`f()`) says nothing about the parameters.
+fn abi_differs(declared: &psxw_cc::protos::Proto, defined: &psxw_cc::protos::Proto) -> bool {
+    use psxw_cc::protos::Kind;
+    let unprototyped = declared.params.is_empty() && declared.variadic;
+    if unprototyped {
+        return false;
+    }
+    let aggregate = |k: &Kind| matches!(k, Kind::ByVal { .. } | Kind::Sret { .. });
+    let n = declared.params.len().max(defined.params.len());
+    let params = (0..n).any(|i| {
+        let (a, b) = (declared.params.get(i), defined.params.get(i));
+        (a.is_some_and(aggregate) || b.is_some_and(aggregate)) && a != b
+    });
+    params || declared.variadic != defined.variadic
 }
 
 fn o32() -> FuncType {
@@ -633,6 +683,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         gp: 1,
         budget: 2,
         chain: 3,
+        abi_mismatches: BTreeSet::new(),
         o32_ty: 0,
         device: spec
             .device_funcs
@@ -805,5 +856,29 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     module.section(&ns);
     module.section(&CustomSection { name: "psxw.abi".into(), data: psxw_abi::ABI_VERSION.to_le_bytes().to_vec().into() });
     let matched = ctx.layout.defined.values().filter(|p| p.how == crate::layout::How::Matched).count();
-    Ok(Linked { wasm: module.finish(), aux, matched })
+    Ok(Linked { wasm: module.finish(), aux, matched, abi_mismatches: ctx.abi_mismatches.iter().cloned().collect() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abi_differs;
+    use psxw_cc::protos::{Kind, Proto};
+
+    fn proto(params: Vec<Kind>, variadic: bool) -> Proto {
+        Proto { name: "f".into(), defined: false, ret: Kind::I32, params, variadic }
+    }
+
+    #[test]
+    fn abi_differences() {
+        let by_val = Kind::ByVal { size: 4, align: 2 };
+        // A 4-byte struct by value against the word it occupies in o32.
+        assert!(abi_differs(&proto(vec![Kind::Ptr, by_val], false), &proto(vec![Kind::Ptr, Kind::I32], false)));
+        // Narrow integers and pointers pass alike; an unprototyped
+        // declaration says nothing.
+        assert!(!abi_differs(&proto(vec![Kind::I16 { signed: true }], false), &proto(vec![Kind::I32], false)));
+        assert!(!abi_differs(&proto(vec![Kind::I32], false), &proto(vec![Kind::Ptr], false)));
+        assert!(!abi_differs(&proto(vec![], true), &proto(vec![by_val], false)));
+        // Variadic on one side only.
+        assert!(abi_differs(&proto(vec![Kind::Ptr], true), &proto(vec![Kind::Ptr, Kind::I32], false)));
+    }
 }
