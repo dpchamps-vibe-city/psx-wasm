@@ -61,29 +61,33 @@ function pollInput() {
   requestAnimationFrame(pollInput);
 }
 
+/** The .bin files a .cue sheet names. */
+const cueFiles = (text) => [...text.matchAll(/^\s*FILE\s+"?([^"]+?)"?\s+\S+\s*$/gm)].map((m) => m[1]);
+
 async function importDisc(files) {
+  const cueFile = files.find((f) => f.name.toLowerCase().endsWith(".cue"));
+  if (!cueFile) throw new Error("no .cue among the files");
+  const missing = cueFiles(await cueFile.text()).filter((n) => !files.some((f) => f.name === n));
+  if (missing.length) throw new Error(`${cueFile.name} names ${missing.join(", ")}: pick them along with the .cue`);
+  localStorage.removeItem("psxw.cue");
   const root = await navigator.storage.getDirectory();
   await root.removeEntry("disc", { recursive: true }).catch(() => {});
   const dir = await root.getDirectoryHandle("disc", { create: true });
-  let cue = null;
   for (const f of files) {
     say(`copying ${f.name} into OPFS…`);
     const w = await (await dir.getFileHandle(f.name, { create: true })).createWritable();
     await f.stream().pipeTo(w);
-    if (f.name.toLowerCase().endsWith(".cue")) cue = f.name;
   }
-  if (!cue) throw new Error("no .cue among the files");
-  localStorage.setItem("psxw.cue", cue);
-  return cue;
+  localStorage.setItem("psxw.cue", cueFile.name);
+  return cueFile.name;
 }
 
 /** Fetch a .cue and its .bin files over HTTP into OPFS (test hook). */
 async function importDiscUrl(url) {
   const cueText = await (await fetch(url)).text();
   const base = new URL(url, location.href);
-  const names = [...cueText.matchAll(/^\s*FILE\s+"?([^"]+?)"?\s+\S+\s*$/gm)].map((m) => m[1]);
   const files = [new File([cueText], base.pathname.split("/").pop())];
-  for (const n of names) {
+  for (const n of cueFiles(cueText)) {
     say(`fetching ${n}…`);
     files.push(new File([await (await fetch(new URL(n, base))).blob()], n));
   }
@@ -311,9 +315,17 @@ async function start(cue, audioRing) {
 const discInput = document.getElementById("disc");
 const startButton = document.getElementById("start");
 let cue = params.get("cue") || localStorage.getItem("psxw.cue");
-if (cue) {
-  startButton.disabled = false;
-  say(`disc ${cue} is in OPFS; press Start`);
+if (cue && !params.has("discurl")) {
+  // localStorage can outlive OPFS (storage cleared or evicted).
+  navigator.storage.getDirectory()
+    .then((root) => root.getDirectoryHandle("disc"))
+    .then((dir) => dir.getFileHandle(cue))
+    .then(() => {
+      startButton.disabled = false;
+      say(`disc ${cue} is in OPFS; press Start`);
+      if (params.has("autostart")) startButton.click();
+    })
+    .catch(() => say(`disc ${cue} is no longer in this browser's storage: import it again`));
 }
 discInput.addEventListener("change", async () => {
   try {
@@ -370,4 +382,4 @@ if (params.has("discurl")) {
       say(String(e));
       if (params.has("post")) fetch(`/result?browser=${params.get("post") || params.get("browser")}`, { method: "POST", body: JSON.stringify({ error: String(e) }) });
     });
-} else if (params.has("autostart") && cue) startButton.click();
+}

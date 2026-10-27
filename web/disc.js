@@ -19,7 +19,12 @@ export class Disc {
 
   /** Open `cueName` and the .bin files it names from OPFS directory `dir`. */
   static async open(dir, cueName) {
-    const cue = await (await (await dir.getFileHandle(cueName)).getFile()).text();
+    const handle = (name) =>
+      dir.getFileHandle(name).catch((e) => {
+        if (e.name !== "NotFoundError") throw e;
+        throw new Error(`${name} is not in this browser's disc storage: import the .cue and every .bin it names again`);
+      });
+    const cue = await (await (await handle(cueName)).getFile()).text();
     const files = [];
     const tracks = [];
     let cur = null;
@@ -29,11 +34,11 @@ export class Disc {
         const rest = line.slice(5);
         const cut = rest.lastIndexOf(" ");
         const name = (cut > 0 ? rest.slice(0, cut) : rest).replace(/^"|"$/g, "");
-        const handle = await (await dir.getFileHandle(name)).createSyncAccessHandle();
-        const len = handle.getSize();
+        const sync = await (await handle(name)).createSyncAccessHandle();
+        const len = sync.getSize();
         if (len % SECTOR !== 0) throw new Error(`${name} is not raw 2352-byte sectors`);
         const last = files[files.length - 1];
-        files.push({ handle, start: last ? last.start + last.sectors : 0, sectors: len / SECTOR });
+        files.push({ handle: sync, start: last ? last.start + last.sectors : 0, sectors: len / SECTOR });
       } else if (line.startsWith("TRACK ")) {
         const [n, kind] = line.slice(6).trim().split(/\s+/);
         if (!["AUDIO", "MODE2/2352", "MODE1/2352"].includes(kind)) throw new Error(`track ${n}: unsupported type ${kind}`);

@@ -508,6 +508,11 @@ debugger's view true:
   isn't optimized further: clang optimized the C, so stepping follows
   `-O2` code.
 
+The DWARF's source paths are relative (`source/game/…`, `source/lift/…`),
+and the web bundle carries those files. A debugger resolves the paths
+against `game.wasm`'s URL, so DevTools fetches the C from the server,
+whatever machine the browser is on.
+
 ## Pipeline
 
 ```

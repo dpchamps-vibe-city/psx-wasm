@@ -1,7 +1,9 @@
 // The browser host (M5): runs game.wasm in this Worker and implements its
 // host interface (crates/psxw-abi: `host.*`, plus the M4 render imports):
 // - pacing: `wait_vblank` sleeps with Atomics.wait until the frame's
-//   wall-clock deadline (no pacing in verify mode). Where the browser has
+//   wall-clock deadline (no pacing in verify mode). A run more than
+//   RESYNC_MS behind (a breakpoint, a stall) paces on from now instead of
+//   running the frames it missed back to back. Where the browser has
 //   JSPI it first suspends the game and gives this Worker's event loop a
 //   turn: Chromium frees the frames posted to the page only there (without
 //   it, memory grows by a frame a vblank until the GPU process dies), and
@@ -50,6 +52,7 @@ const NOTHING_PRESSED = 0xffff;
 // guest::WINDOW; a debug build's is at 2 GiB).
 const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";
+const RESYNC_MS = 250;
 
 let enqueueExecution = null;
 onmessage = async (e) => {
@@ -67,6 +70,7 @@ onmessage = async (e) => {
     await run(e.data);
   } catch (err) {
     enqueueExecution = null;
+    console.error(err);
     postMessage({ type: "stopped", reason: String((err && err.message) || err) });
   }
 };
@@ -198,7 +202,11 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   postMessage({ type: "status", text: `renderer: ${renderer.info()}` });
 
   const root = await navigator.storage.getDirectory();
-  const disc = await Disc.open(await root.getDirectoryHandle("disc"), cue);
+  const discDir = await root.getDirectoryHandle("disc").catch((e) => {
+    if (e.name !== "NotFoundError") throw e;
+    throw new Error("no disc in this browser's storage for this address: import it");
+  });
+  const disc = await Disc.open(discDir, cue);
   const saves = await loadSaves(await savesDir());
   const replay = options.replay ? new Uint8Array(await (await fetch(options.replay)).arrayBuffer()) : null;
   // [seq, port 1 buttons, port 2 buttons or -1, save-replay requests, frames shown]
@@ -231,6 +239,8 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const text = (p, n) => new TextDecoder().decode(bytes(p, n).slice());
   let frame = 0;
   let t0 = 0;
+  // Frame n's deadline is origin + n * period.
+  let origin = 0;
   const raw = new Uint8Array(SECTOR);
 
   // The game yields once a vblank where JSPI exists. Dev mode can't: its
@@ -282,9 +292,10 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   };
   const pace = () => {
     if (!options.verify) {
-      const wait = t0 + frame * period - performance.now();
+      const wait = origin + frame * period - performance.now();
       if (wait > 0) Atomics.wait(sleeper, 0, 0, wait);
       else if (wait < -period) lagFrames++;
+      if (wait < -RESYNC_MS) origin -= wait;
     }
     lastVblank = performance.now();
     if (frame % 60 === 0) postMessage({ type: "status", text: `frame ${frame}, ${lagFrames} late` });
@@ -462,7 +473,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       ? "the game yields to the Worker's event loop every vblank (JSPI)"
       : "no JSPI here (or dev mode): the Worker never yields, so Chromium's memory grows with every frame shown",
   });
-  t0 = performance.now();
+  t0 = origin = performance.now();
   let reason = "exited";
   try {
     await (suspend ? WebAssembly.promising(exports.psxw_boot) : exports.psxw_boot)(opts);

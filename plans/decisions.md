@@ -579,6 +579,16 @@ and `psxw build-web <game> --debug` gives `out/web/<game>-debug`.
   what `wasm-merge` does with these two modules. It re-encodes the guest's
   code changing only call targets, maps where it moved, and applies that
   map to the DWARF. No `wasm-opt` runs: clang already optimized the C.
+- **The source paths are relative, and the bundle serves the files.**
+  The decomp's C compiles with `-fdebug-compilation-dir=source/game`, and
+  the generated C with `source/lift` and paths relative to the lift
+  directory. The extension resolves relative paths against `game.wasm`'s
+  URL. `build-web --debug` copies every file the line tables name into
+  `source/`, so the C loads from the server on any machine, with no file
+  access. Absolute paths became `file://` URLs, which a browser on
+  another machine couldn't open. The extension also fetches `game.wasm`
+  itself, from its own origin, so `psxw serve` sends CORP `cross-origin`:
+  `same-origin` blocked that fetch, and DevTools listed no C at all.
 - The debug build's guest RAM and audio hashes equal the plain build's
   at frames 60, 300 and 600.
 

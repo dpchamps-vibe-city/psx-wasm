@@ -96,6 +96,60 @@ pub fn sections(wasm: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
+/// The source files a module's line tables name: each unit's
+/// `DW_AT_comp_dir`, the file's directory and its name joined, `.` and
+/// `..` resolved, as a debugger joins them.
+pub fn source_paths(sections: &[(String, Vec<u8>)]) -> Result<std::collections::BTreeSet<String>> {
+    let read = read::Dwarf::load(|id| -> Result<_, gimli::Error> {
+        let data = sections.iter().find(|(n, _)| n == id.name()).map_or(&[][..], |(_, b)| b.as_slice());
+        Ok(EndianSlice::new(data, LittleEndian))
+    })?;
+    let mut out = std::collections::BTreeSet::new();
+    let mut units = read.units();
+    while let Some(header) = units.next()? {
+        let unit = read.unit(header)?;
+        let Some(program) = &unit.line_program else { continue };
+        let header = program.header();
+        let comp = unit.comp_dir.map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        for file in header.file_names() {
+            let mut parts = vec![comp.clone()];
+            // Directory 0 is the compilation directory itself.
+            if file.directory_index() != 0 {
+                if let Some(dir) = file.directory(header) {
+                    parts.push(read.attr_string(&unit, dir)?.to_string_lossy().into_owned());
+                }
+            }
+            parts.push(read.attr_string(&unit, file.path_name())?.to_string_lossy().into_owned());
+            out.insert(join_path(&parts));
+        }
+    }
+    Ok(out)
+}
+
+/// `parts` joined with `/`: an absolute part starts over, `.` and `..`
+/// are resolved as a URL's are.
+fn join_path(parts: &[String]) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    let mut absolute = false;
+    for p in parts {
+        if p.starts_with('/') {
+            segs.clear();
+            absolute = true;
+        }
+        for s in p.split('/') {
+            match s {
+                "" | "." => {}
+                ".." => {
+                    segs.pop();
+                }
+                s => segs.push(s),
+            }
+        }
+    }
+    let joined = segs.join("/");
+    if absolute { format!("/{joined}") } else { joined }
+}
+
 /// Units converted so far, written out by [`Dwarf::finish`].
 pub struct Dwarf {
     out: write::Dwarf,
@@ -324,6 +378,15 @@ fn locations<'a, 'r>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joins_paths_as_urls_resolve() {
+        let j = |p: &[&str]| join_path(&p.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(j(&["source/game", "src/overlays", "a.c"]), "source/game/src/overlays/a.c");
+        assert_eq!(j(&["source/lift", "./psxw_rt.h"]), "source/lift/psxw_rt.h");
+        assert_eq!(j(&["source/game", "src", "../include/b.h"]), "source/game/include/b.h");
+        assert_eq!(j(&["source/game", "/abs/c.h"]), "/abs/c.h");
+    }
 
     #[test]
     fn maps_instruction_starts_and_ends() {

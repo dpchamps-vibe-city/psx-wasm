@@ -1,8 +1,9 @@
 //! `psxw build-web <game>` (M5): the browser bundle in `out/web/<game>/`:
 //! `web/`'s page, Worker and worklet, the game's `game.wasm`, and the
 //! renderer (`psxw-host-web` through the pinned wasm-bindgen CLI) in
-//! `pkg/`, and the unmerged guest.wasm and runtime.wasm for dev mode.
-//! Local only: the wasm modules are game-derived.
+//! `pkg/`, and the unmerged guest.wasm and runtime.wasm for dev mode. A
+//! debug build's bundle also carries the C its DWARF names, in `source/`.
+//! Local only: the wasm modules and the sources are game-derived.
 
 use anyhow::{Context as _, Result, bail};
 use psxw_inputs::Workspace;
@@ -37,6 +38,7 @@ pub fn bundle(ws: &Workspace, game: &str, report: &crate::game::Report, dir: Pat
         }
     }
     std::fs::copy(&report.wasm, dir.join("game.wasm"))?;
+    sources(ws, game, std::path::Path::new(&report.wasm), &dir)?;
     // What the page needs to record replays: the clock they index by.
     let inputs = psxw_lift::run::load(ws, game)?;
     let clock = crate::game::frame_counter(ws, game, &inputs).ok();
@@ -46,6 +48,36 @@ pub fn bundle(ws: &Workspace, game: &str, report: &crate::game::Report, dir: Pat
     std::fs::copy(crate::runtime::path(ws), dir.join("runtime.wasm"))?;
     check_dev(&dir)?;
     Ok(dir)
+}
+
+/// A debug build's C (D53), copied where its DWARF's relative paths put
+/// it beside game.wasm, so DevTools fetches it from the server.
+fn sources(ws: &Workspace, game: &str, wasm: &std::path::Path, dir: &std::path::Path) -> Result<()> {
+    let paths = psxw_link::dwarf::source_paths(&psxw_link::dwarf::sections(&std::fs::read(wasm)?)?)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let roots = crate::game::debug_source_roots(ws, game)?;
+    let (mut copied, mut missing) = (0, Vec::new());
+    for p in &paths {
+        let Some(src) = roots.iter().find_map(|(prefix, root)| Some(root.join(p.strip_prefix(prefix)?.strip_prefix('/')?))) else {
+            missing.push(p.as_str());
+            continue;
+        };
+        if !src.is_file() {
+            missing.push(p.as_str());
+            continue;
+        }
+        let to = dir.join(p);
+        std::fs::create_dir_all(to.parent().context("source directory")?)?;
+        std::fs::copy(&src, &to)?;
+        copied += 1;
+    }
+    eprintln!("build-web: {copied} C sources in source/");
+    if !missing.is_empty() {
+        eprintln!("build-web: {} sources DWARF names aren't there, e.g. {}", missing.len(), missing[..missing.len().min(3)].join(", "));
+    }
+    Ok(())
 }
 
 fn interface(path: &std::path::Path) -> Result<(Vec<(String, String)>, BTreeSet<String>)> {

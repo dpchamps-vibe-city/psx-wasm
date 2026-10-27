@@ -1,6 +1,8 @@
 //! `psxw serve [dir] [--port N]` (M5): a static file server with the
 //! cross-origin isolation headers SharedArrayBuffer and Atomics.wait need
-//! (COOP `same-origin`, COEP `require-corp`). Development only.
+//! (COOP `same-origin`, COEP `require-corp`). Development only; it listens
+//! on every interface. CORP is `cross-origin`: DevTools' DWARF extension
+//! fetches game.wasm and the C from its own origin (D53).
 
 use anyhow::{Context as _, Result};
 use std::io::{BufRead, BufReader, Write};
@@ -41,7 +43,7 @@ fn respond(mut s: TcpStream, root: &Path) -> Result<()> {
     write!(
         s,
         "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nCross-Origin-Opener-Policy: same-origin\r\n\
-         Cross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: same-origin\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+         Cross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: cross-origin\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     s.write_all(&body)?;
@@ -49,8 +51,8 @@ fn respond(mut s: TcpStream, root: &Path) -> Result<()> {
 }
 
 pub fn serve(root: PathBuf, port: u16) -> Result<()> {
-    let l = TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("binding 127.0.0.1:{port}"))?;
-    eprintln!("serving {} at http://127.0.0.1:{port}/ (COOP/COEP set)", root.display());
+    let l = TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("binding 0.0.0.0:{port}"))?;
+    eprintln!("serving {} on 0.0.0.0:{port}, http://127.0.0.1:{port}/ here (COOP/COEP set)", root.display());
     for s in l.incoming() {
         let root = root.clone();
         let s = s?;

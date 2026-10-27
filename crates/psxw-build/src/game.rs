@@ -267,12 +267,21 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         ubsan_flags.push(format!("-fsanitize-ignorelist={}", ignorelist.display()));
     }
     let ubsan_flags: Vec<&str> = ubsan_flags.iter().map(String::as_str).collect();
-    // A debug build's objects carry DWARF; their sources' relative paths
-    // are the decomp's.
+    // A debug build's objects carry DWARF, the decomp's relative paths
+    // under DEBUG_SOURCES' `source/game`. Objects compiled with other
+    // debug flags are rebuilt.
     let debug_dir = out_dir(ws, &opts.game).join("debug");
-    let snap = psxw_inputs::snapshot::ensure(ws, &inputs.manifest.game.input, ws.game_pin(&inputs.manifest)?)?;
-    let debug_flags = ["-g".to_string(), format!("-fdebug-compilation-dir={}", snap.display())];
+    let debug_flags = ["-g".to_string(), format!("-fdebug-compilation-dir={}", DEBUG_SOURCES[0])];
     let debug_flags: Vec<&str> = debug_flags.iter().map(String::as_str).collect();
+    if opts.debug {
+        let stamp = debug_dir.join("flags");
+        let want = format!("{}\n{}\n", debug_flags.join(" "), debug_lift_flags().join(" "));
+        if std::fs::read_to_string(&stamp).ok().as_deref() != Some(want.as_str()) {
+            let _ = std::fs::remove_dir_all(&debug_dir);
+            std::fs::create_dir_all(&debug_dir)?;
+            std::fs::write(&stamp, &want)?;
+        }
+    }
     // GCC 2.95's call structure (D50): every non-inline function weak and
     // noinline, as GCC at -O2 left every call to one. Each call the
     // original makes is then a call here (a mod's hook sees it), and
@@ -492,8 +501,28 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     })
 }
 
+/// Where a debug build's DWARF puts the C (D53): the decomp's sources
+/// under the first, the generated C under the second. The paths are
+/// relative, so a debugger resolves them against game.wasm's URL, and the
+/// web bundle serves the files there ([`debug_source_roots`]).
+pub const DEBUG_SOURCES: [&str; 2] = ["source/game", "source/lift"];
+
+fn debug_lift_flags() -> [String; 2] {
+    ["-g".to_string(), format!("-fdebug-compilation-dir={}", DEBUG_SOURCES[1])]
+}
+
+/// The directories [`DEBUG_SOURCES`] stand for: the decomp's snapshot and
+/// the generated C.
+pub fn debug_source_roots(ws: &Workspace, game: &str) -> Result<[(&'static str, PathBuf); 2]> {
+    let inputs = psxw_lift::run::load(ws, game)?;
+    let snap = psxw_inputs::snapshot::ensure(ws, &inputs.manifest.game.input, ws.game_pin(&inputs.manifest)?)?;
+    Ok([(DEBUG_SOURCES[0], snap), (DEBUG_SOURCES[1], psxw_lift::run::out_dir(ws, &inputs))])
+}
+
 /// The translations again with DWARF, into `dir` (a debug build): each
-/// object is rebuilt when its generated C is newer.
+/// object is rebuilt when its generated C is newer. Clang runs in
+/// `lift_dir` and is given relative paths, which DWARF then has under
+/// `source/lift`.
 fn debug_lift(clang: &psxw_cc::Clang, lift_dir: &Path, dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
     let failed: Vec<String> = lifted
         .par_iter()
@@ -509,7 +538,10 @@ fn debug_lift(clang: &psxw_cc::Clang, lift_dir: &Path, dir: &Path, lifted: &[&ps
                 return Ok(None);
             }
             std::fs::create_dir_all(obj.parent().context("object directory")?)?;
-            let (ok, stderr) = clang.compile_generated(&src, &obj, lift_dir, &["-g"])?;
+            let rel = Path::new(&t.func.container).join(format!("{name}.c"));
+            let flags = debug_lift_flags();
+            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            let (ok, stderr) = clang.compile_generated(&rel, &obj, Path::new("."), &flags)?;
             Ok((!ok).then(|| format!("{}: {}", src.display(), stderr.lines().next().unwrap_or_default())))
         })
         .collect::<Result<Vec<_>>>()?
