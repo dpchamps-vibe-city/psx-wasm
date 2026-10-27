@@ -1,6 +1,6 @@
 # M12 — Script mods
 
-**Status:** not started
+**Status:** in progress (phases 1–3 built; the cost re-measurement and `psxw ci btn` remain)
 **Depends on:** M11 (done). **Unlocks:** —
 **Design refs:** design §7 (one module), §9 (debug builds), "One-shot
 host scripting"; decisions D45 (non-local exits), D49 (hooks on function
@@ -321,7 +321,7 @@ D54 records this design.
 
 ### Tasks
 
-1. [ ] **Runtime and ABI 10:**
+1. [x] **Runtime and ABI 10:**
    - add `host.vblank` and `host.wait_vblank` as above, and
      `psxw_js_enter`/`psxw_js_leave`;
    - both hosts move their guest-visible per-vblank work into
@@ -329,7 +329,7 @@ D54 records this design.
    - a driver test: no held wait is made while the count is nonzero, and
      the held waits are made in order once it returns to zero;
    - the runtime counts held waits and reports them in its run report.
-2. [ ] **Shim generator** (`web/shims.js`). JS writes each shim's wasm
+2. [x] **Shim generator** (`web/shims.js`). JS writes each shim's wasm
    bytes itself, from the slot's flavour (`c <params>-><results>` or
    `o32`, from `psxmod.slots`) and the layer's handler kinds.
    - **Imports:** the base's chain table, `psxw_js_enter`/`leave`, and one
@@ -349,7 +349,7 @@ D54 records this design.
    - **Synthetic addresses:** commands, `psx.run` callbacks and `fnptr`
      values get o32 entries in the dispatch table, at synthetic addresses
      from the mod's range, as compiled mods' functions do (`web/mods.js`).
-3. [ ] **Loader** (`web/mods.js`).
+3. [x] **Loader** (`web/mods.js`).
    - **One list:** a script mod is an entry in `ModLoader.mods`, with the
      same shape as a wasm mod (slots, originals, exports), so `rewire()`
      chains both kinds in load order.
@@ -359,7 +359,7 @@ D54 records this design.
    - **Warnings:** conflicts warn in the `mods` message, naming both mods
      and the winner.
    - **Throwing handlers** behave as described in The API.
-4. [ ] **Names in the bundle.** Every moddable bundle carries a
+4. [x] **Names in the bundle.** Every moddable bundle carries a
    names-only snapshot: the symbol-list frontend's output, in D55's
    format.
    - **Contents:** functions and globals by container and address, with
@@ -371,22 +371,22 @@ D54 records this design.
      their address, as the address map resolves them (`psxw-inputs`
      `auto_name`). So `game.addr.D_8007AFF0` works whether or not a
      symbol file lists the name.
-5. [ ] **Calls from JS into the game.**
+5. [x] **Calls from JS into the game.**
    - `game.F(...)` calls the head of F's chain: `psxmod_entries` for a
      C-typed slot, the dispatch table for an o32 one.
    - Calls work only inside the game, which the shims track with a flag.
      Outside it, a call throws, naming `psx.run`.
-6. [ ] **Commands and `psx.run`.**
+6. [x] **Commands and `psx.run`.**
    - They run through `psxw_execute` (D52), at their synthetic addresses;
      each result resolves the console's Promise.
    - The Worker lists commands together with compiled mods' functions, so
      `execute(name)` finds either kind.
-7. [ ] **Data patches** (`data`), with M11's semantics:
+7. [x] **Data patches** (`data`), with M11's semantics:
    - EXE data is patched after boot;
    - overlay data is patched when the overlay becomes resident
      (`psxmod_loaded`);
    - `fnptr` values are JS functions.
-8. [ ] **Loading and reloading.**
+8. [x] **Loading and reloading.**
    - **Sources:** script mods arrive by URL (`?mods=` takes `.js` too),
      from the mod panel (single-file mods in OPFS), and from
      `psxw mod watch`.
@@ -397,11 +397,11 @@ D54 records this design.
      installed at the next `host.vblank`.
    - **Reload** replaces the mod in place, at its position, and runs its
      factory again.
-9. [ ] **Console:**
+9. [x] **Console:**
    - `psx` in the Worker: `hook`, `cmd`, `run`, `load`, `reload`,
      `unload`, `mods`;
    - `wasmPsxScripting.cmd` and `load` on the page.
-10. [ ] **Workspace commands:**
+10. [x] **Workspace commands:**
     - `psxw mod new <id> --script` writes `mod.js`, `tests/` and
       `jsconfig.json`.
     - `check` reads script mods' definitions by running their factories
@@ -410,7 +410,7 @@ D54 records this design.
     - `build` builds compiled mods and the moddable base.
     - `play` and `watch` serve both kinds.
     - `test` runs script mods' tests in the browsers.
-11. [ ] **Tests in the browser.** `web-test game` gains what
+11. [x] **Tests in the browser.** `web-test game` gains what
     `psxw mod test` needs: per-vblank traces, `load_at`, commands at
     vblanks and mod logs. Results come back in the native JSON shape, so
     `expect` and `check` run unchanged. The test schema gains:
@@ -418,7 +418,7 @@ D54 records this design.
     - an `offset` on trace entries;
     - an `expect` kind `same_as: { "mod" }`: the run's RAM, VRAM and
       audio hashes equal a run with that mod instead.
-12. [ ] **Test mods and the gate:**
+12. [x] **Test mods and the gate:**
     - script twins (`<id>-js`) of the compiled test mods in
       `games/<id>/mods/`;
     - a generated script pass-through: `before`, `after` and an `around`
@@ -432,7 +432,7 @@ D54 records this design.
       on a once-a-frame one.
 
     Record the results in Findings.
-14. [ ] **Docs:**
+14. [x] **Docs:**
     - `web/README.md`: script mods and the console;
     - `docs/design.md`: a "Script mods" section. The scripting section
       stops calling itself "not a script loader";
@@ -463,7 +463,7 @@ D54 records this design.
 
 ### Tasks
 
-1. [ ] **The snapshot format** (D55;
+1. [x] **The snapshot format** (D55;
    `psxw-modkit/schema/snapshot.schema.json`). A snapshot is one source's
    view of one game binary:
    - `game`: the identity hashes, as `identity.json` records them;
@@ -481,9 +481,9 @@ D54 records this design.
 
    Headers and a decomp's conventions appear in a snapshot only as
    provenance.
-2. [ ] **Symbol-list frontend:** names, addresses and sizes from the
+2. [x] **Symbol-list frontend:** names, addresses and sizes from the
    address map (`psxw-inputs`). Every game gets at least this much.
-3. [ ] **C-header frontend:**
+3. [x] **C-header frontend:**
    - **Declarations:** the header index's declarations, parsed into type
      expressions with tree-sitter (`psxw_cc::ast`), each in its declaring
      header's include context. `__asm__` labels name globals.
@@ -498,7 +498,7 @@ D54 records this design.
    - **Declared types stand.** A global declared as an array behind a
      scalar `#define` keeps its declared array type. The census's fixups
      use that pattern (`extern s32 X[3]; #define X (X[0])`).
-4. [ ] **The typed `game`,** built from a snapshot:
+4. [x] **The typed `game`,** built from a snapshot:
    - globals as typed properties and views;
    - records through `game.types`;
    - pointers as numbers, viewed with `game.types.T.at(p)`;
@@ -506,18 +506,18 @@ D54 records this design.
      declared signature. An o32 slot's words and stack follow the o32
      rules that psxw-link's `marshal` applies;
    - `psx.struct`.
-5. [ ] **`game.d.ts` and `psx.d.ts`:**
+5. [x] **`game.d.ts` and `psx.d.ts`:**
    - `game.d.ts` is generated from a snapshot;
    - handlers are typed from their targets;
    - each symbol's doc comment gives its declaration, source, container,
      address and tier.
-6. [ ] **The SDK:**
+6. [x] **The SDK:**
    - `psxw mod sdk` writes the workspace's snapshot (named by its hash)
      and `game.d.ts`;
    - `psxmods.lock.json` records the snapshot's hash;
    - `play` and `watch` bundles carry each served mod's snapshot, and each
      mod's `game` comes from its own.
-7. [ ] **Type checking:** pinned Node and TypeScript in the browsers
+7. [x] **Type checking:** pinned Node and TypeScript in the browsers
    image; `psxw mod check` runs `tsc --noEmit` over script mods.
 8. [ ] **Acceptance** in the mods repo (below).
 
@@ -535,11 +535,11 @@ D54 records this design.
 
 ### Tasks
 
-1. [ ] **Snapshots per iteration:**
+1. [x] **Snapshots per iteration:**
    - cached by source and version, and named by hash;
    - several can be loaded in one session; each mod's `game` comes from
      the snapshot its workspace pinned.
-2. [ ] **`psxw mod sdk --bump`** compares the old and new snapshots by
+2. [x] **`psxw mod sdk --bump`** compares the old and new snapshots by
    address:
    - **renames:** a renamed function or global keeps its old name as an
      alias, in `game` and as `@deprecated` in `game.d.ts`, naming the new
@@ -549,21 +549,21 @@ D54 records this design.
      function's parameter);
    - **removals:** a name whose address no longer holds a function or
      global is an error naming what is there now (M11's rule).
-3. [ ] **DWARF frontend,** from `psxw build --debug` (D53):
+3. [x] **DWARF frontend,** from `psxw build --debug` (D53):
    - types and layouts as compiled, one compilation unit at a time,
      bitfield offsets included;
    - merged with the C frontend: layouts from DWARF, and declarations of
      functions that have no C from the headers.
-4. [ ] **Several sources:**
+4. [x] **Several sources:**
    - `psxmods.json` lists sources in order of precedence;
    - their snapshots merge by address;
    - every source's names become aliases;
    - type disagreements warn, naming both sources and the winner;
    - `game.d.ts` shows each symbol's provenance.
-5. [ ] **Workspace-local declarations:** snapshot fragments in the mods
+5. [x] **Workspace-local declarations:** snapshot fragments in the mods
    repo (`types/*.json`), the most local source, for memory no decomp
    has typed.
-6. [ ] **Packed mods:** `psxw mod pack <id>` writes one file holding the
+6. [x] **Packed mods:** `psxw mod pack <id>` writes one file holding the
    mod and the part of its snapshot it uses; the mod panel accepts packs.
 
 ### Exit criteria (all automated)
@@ -762,5 +762,34 @@ export default mod(({ game, hook }) => {
   binaries, with different addresses.
 
 ## Progress log
+
+- **2026-10-27, phase 1** (`f591318`):
+  - ABI 10: `host.vblank`/`host.wait_vblank`, `psxw_js_enter`/`leave`,
+    the runtime's hold (`psx-runtime` `hold.rs`; a driver test), held
+    waits in the run report. Both hosts moved their vblank work into
+    `host.vblank`.
+  - `web/shims.js` (each mod's layer, `next.<k>`, o32 entries, the host's
+    call helpers), `web/script.js` (definitions, `game`, hooks, commands,
+    data, console), `web/mods.js` (one list for both kinds, conflicts).
+  - The base names each slot's tier (`psxmod.tiers`) and each overlay's
+    resident words (`psxmod.resident`); moddable bundles carry
+    `snapshot.json`.
+  - `psxw mod test` runs a script mod's tests in both browsers (page
+    runs); the test format gained `commands`, trace `offset` and
+    `same_as`. `psxw mod check` runs factories in Node in the browsers
+    image (now with Node 20.19 and TypeScript 4.9.5). `mod new --script`,
+    `play`, `watch` (versioned URLs), `pass-through --script`.
+  - Script twins of btn's five test mods: each passes its tests in
+    Chromium and Firefox and is bit-identical to its compiled mod.
+- **2026-10-27, phases 2 and 3** (`abd1ba6`): the snapshot format and
+  schema, the C-header and DWARF frontends, the typed `game`, `game.d.ts`
+  and `psx.d.ts`, type checking, `--bump` with aliases, sources and
+  workspace fragments, packs, `Options::lift`, and the gate's script part
+  (data-driven: the test format gained `swap`).
+- **2026-10-27, acceptance** (btn-mods `792d8e7`, then the twins): the
+  compiled toys got tests; better-rand-js passes `sequence.json` with
+  `check_sequence.py` unchanged, and its swap test, and is `same_as`
+  better-rand; the three toy twins are each `same_as` their compiled mod
+  with their command at the same vblank; all four type-check.
 
 ## Findings

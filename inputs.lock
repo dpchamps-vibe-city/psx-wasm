@@ -90,7 +90,8 @@ commit = "302b6ae6554c67feeb98620f97664f20461f04b1"
 build = ["npm", "run", "verify"]
 
 [mods.btn]
-# btn's mods repository (plans/M11): the CI gate `mods` checks, builds and
-# tests it against this psx-wasm.
+# btn's mods repository (plans/M11, M12): the CI gate `mods` checks, builds
+# and tests it against this psx-wasm (compiled mods natively, script mods
+# in the browsers).
 repo = "../btn-mods"
-commit = "030a55510e7847f203bf4735faa8df429df77837"
+commit = "3c772427c4308d22512a61894438a351060b95bd"
