@@ -604,6 +604,69 @@ Source maps carry only lines, so they were rejected. Chrome's C/C++
 DevTools Support extension (DWARF) reads pointers as wasm addresses,
 which only this layout makes true.
 
+**D54. Script mods are JavaScript layers on the moddable base** (M12).
+- **A script mod is one ES module.** Its default export, given the mod's
+  `game` and the mod API, returns the mod's definition:
+  - hooks: `before`, `after`, `replace`, and `around`, which calls the
+    next link;
+  - data patches and commands.
+
+  The loader reads the definition before installing anything. A script
+  mod has no `mod.json` and no build step.
+- **Shims make it a layer like any other.** The browser loader writes a
+  small wasm shim for each hooked slot. The shim becomes a layer in the
+  slot's chain, beside compiled mods' layers (D51), with M11's chains,
+  load order and conflict rules (D49). `from` stays static-only (D51).
+- **The runtime holds the host's vblank wait while JS is on the stack**
+  (ABI 10).
+  - `host.vblank(n)` never suspends, and carries everything the guest can
+    see: the replay frame, swaps, queued calls.
+  - `host.wait_vblank(n)` only paces and yields.
+  - Shims bracket each call into JS with `psxw_js_enter`/`psxw_js_leave`.
+    Held waits are made in order once the outermost JS frame returns.
+  - Guest state is unchanged; only the page's pacing slips.
+- **Commands and `psx.run` run inside the game** through D52's queued
+  call, at synthetic addresses.
+- **Browser only.** The native host runs no JS, so script mods' tests run
+  in headless Chromium and Firefox.
+- **Compiled mods stay,** and both kinds load together.
+
+*Why:* the human wants mods without a compile step, editable live from
+the console. A JS hook costs about 16 ns a call on a JSPI stack (measured
+in V8 13.6), so its cost depends only on how often the hooked function is
+called. But JSPI can't suspend through a JS frame (`SuspendError`,
+measured), and a vblank, and with it the host's wait, can be delivered at
+any safepoint in any game code a hook calls. Both hosts keyed replay
+input on that wait, so delaying it whole would have changed the game's
+input.
+
+**D55. Mod types come from snapshots keyed by the game binary** (M12).
+- **A snapshot is neutral JSON.** It records one source's view of one game
+  binary:
+  - the identity hashes;
+  - functions and globals by container and address, with names and
+    types;
+  - record layouts;
+  - type expressions as data.
+- **Frontends produce snapshots.** There are frontends for symbol lists,
+  C headers (the header index with the layout probe) and DWARF, and the
+  mods repo can add its own fragments. Only a frontend knows its source's
+  conventions.
+- **`game` and `game.d.ts` are generated from snapshots,** never from a
+  source directly.
+- **Each mod resolves names through the snapshot its workspace pinned,**
+  down to addresses and offsets. A bundle needs only the same binary, so
+  mods pinned to different snapshots load together.
+- **`--bump` compares snapshots by address.** Renames become deprecated
+  aliases, and layout changes are reported where the mod reaches them.
+- **Several sources merge by address,** in an order the workspace states.
+  Every source's names become aliases, and type disagreements warn.
+
+*Why:* the human wants many iterations of a decomp, and different
+decomps, supported together. Decomps rename symbols, retype data and move
+code from asm to C, but the binary doesn't change, so it is the one
+fixed point to key on.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser

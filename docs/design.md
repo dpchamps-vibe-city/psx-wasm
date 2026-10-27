@@ -840,6 +840,7 @@ Each milestone's exit is gated by an automated oracle.
 | M9 | Second game | The same oracles pass with only a manifest |
 | M10 | Hardware oracle (when a rig exists) | The vector archive replayed on a real console |
 | M11 | Modkit: declared hooks on function boundaries; mods linked in, then loaded and hot-swapped as wasm | Example mods' effects by replay; an empty mod set builds the plain game; static and dynamic backends agree |
+| M12 | Script mods: JavaScript hooks and commands on the moddable base, live in the browser; types from snapshots keyed by the game binary | Script twins equal their compiled mods bit for bit; a script pass-through on every hookable function equals the plain build |
 
 ### M0 result: btn @ 3a15992 (2026-10-25)
 

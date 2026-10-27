@@ -30,6 +30,10 @@ rewrite the `out/web/<game>/` bundle someone is serving.
 
 ## Live scripting: next small steps (D52)
 
+[M12](M12-script-mods.md) (script mods) takes up named references
+(phase 1 names, phase 2 types) and hooks (phase 1); the notes below
+remain its constraints.
+
 The first slice is `window.wasmPsxScripting.execute(address, ...args)`:
 ABI 8 queues one existing guest-function call, with up to four o32 words,
 and returns the raw u64 result. The runtime executes it outside machine
