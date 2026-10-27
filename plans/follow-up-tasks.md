@@ -28,6 +28,42 @@ rewrite the `out/web/<game>/` bundle someone is serving.
   mode always does (its JS trampolines can't be suspended). Chromium and
   Firefox in the test image both have JSPI.
 
+## Live scripting: next small steps (D51)
+
+The first slice is `window.wasmPsxScripting.execute(address, ...args)`:
+ABI 8 queues one existing guest-function call, with up to four o32 words,
+and returns the raw u64 result. The runtime executes it outside machine
+borrows, IRQs and critical sections. It requires JSPI and the merged
+module; there are no persistent hooks or state wrappers. See
+[`web/README.md`](../web/README.md#one-shot-console-scripting).
+The proof called `Rand` and blocking `VSync` in Chromium and Firefox;
+one focused driver test checks the borrow-free execution boundary.
+
+Extend incrementally, only when needed:
+
+- **Named references:** export the existing build symbol map alongside the
+  web bundle (name, container, guest address, build identity; prototype
+  facts where available). Resolve names without guessing overlay residency
+  or accepting ambiguous symbols. Source maps help source-level debugging,
+  not guest-symbol lookup; keep that work separate.
+- **Small memory operations and batches:** bounded scalar reads/writes at
+  the same safe boundary would remove the need to call guest `memset` for
+  a poke. Batch non-blocking writes so fields such as a date cannot be
+  observed half-updated between frames. This is not rollback, and changing
+  fields does not run the game's derived-state updates or simulate days.
+- **Register/unregister hooks later:** reuse M11's manifest-defined
+  function boundaries (`[mod.points]`), rather than inventing a generic
+  game frame. Define ordering, removal and error behaviour first; never
+  re-enter the game directly from a JSPI-suspended borrowed runtime.
+- **Reproducibility and richer calls:** record injected requests at their
+  execution boundary if scripted sessions need replay. Add stack arguments,
+  strings or struct marshalling only for concrete callers. Loading newly
+  compiled wasm belongs to M11 phase 2, not an `eval`-based console bridge.
+
+Keep game-specific helpers and cheat recipes under `games/<id>/` or in
+its mods repo. Don't turn this proof into a general RPC framework or typed
+object model before there is a real use for one.
+
 ## Needs the human
 
 - **M7 task 4, `save-and-reload`:** record two sessions in the page

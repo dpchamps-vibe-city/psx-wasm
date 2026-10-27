@@ -29,23 +29,35 @@
 //   colour-table cache refills on the next table change). Without JSPI
 //   the events never arrive.
 //
-// Messages in: {type: "start", cue, padBuffer, audioRing, options}.
+// Messages in: {type: "start", cue, padBuffer, audioRing, options},
+// {type: "execute", id, address, args} (one call, at a borrow-free boundary).
 // Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"stopped", ...}.
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, savesDir } from "./cards.js";
 
-const ABI_VERSION = 7;
+const ABI_VERSION = 8;
 const NOTHING_PRESSED = 0xffff;
 const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";
 
+let enqueueExecution = null;
 onmessage = async (e) => {
+  if (e.data.type === "execute") {
+    try {
+      if (!enqueueExecution) throw new Error("scripting is unavailable (game not running, no JSPI, or dev mode)");
+      enqueueExecution(e.data);
+    } catch (err) {
+      postMessage({ type: "execute-result", id: e.data.id, error: String(err.message || err) });
+    }
+    return;
+  }
   if (e.data.type !== "start") return;
   try {
     await run(e.data);
   } catch (err) {
+    enqueueExecution = null;
     postMessage({ type: "stopped", reason: String((err && err.message) || err) });
   }
 };
@@ -205,6 +217,7 @@ async function run({ cue, padBuffer, audioRing, options }) {
       turn.port1.onmessage = resolve;
       turn.port2.postMessage(null);
     });
+  let scriptingReady = false;
   const vblank = (f) => {
     frame = Number(f);
     const now = performance.now();
@@ -238,6 +251,10 @@ async function run({ cue, padBuffer, audioRing, options }) {
     wait_vblank: suspend
       ? new WebAssembly.Suspending(async (f) => {
           vblank(f);
+          if (!scriptingReady) {
+            scriptingReady = true;
+            postMessage({ type: "scripting-ready" });
+          }
           await nextTask();
           pace();
         })
@@ -298,7 +315,10 @@ async function run({ cue, padBuffer, audioRing, options }) {
       return 0;
     },
     report(p, n) {
-      postMessage({ type: "report", json: text(p, n) });
+      const json = text(p, n);
+      const event = JSON.parse(json);
+      if (event.event === "execute") postMessage({ type: "execute-result", id: event.id, value: event.value });
+      else postMessage({ type: "report", json });
     },
     render_submit(p, len) {
       if (!lost) renderer.submit(new Uint32Array(mem().slice(p, p + len)));
@@ -351,6 +371,15 @@ async function run({ cue, padBuffer, audioRing, options }) {
   exports = options.dev ? await instantiateDev(host) : (await WebAssembly.instantiateStreaming(fetch(new URL("./game.wasm", import.meta.url)), { host })).instance.exports;
   const abi = exports.psxw_abi_version();
   if (abi !== ABI_VERSION) throw new Error(`game.wasm ABI ${abi}, host ABI ${ABI_VERSION}`);
+  if (suspend) {
+    enqueueExecution = ({ id, address, args }) => {
+      const a = (i) => args[i] ?? 0;
+      const status = exports.psxw_execute(id, address, a(0), a(1), a(2), a(3));
+      if (status !== 0) throw new Error(`execute rejected: ${status === -2 ? "another call is pending" : status === -3 ? "invalid address" : "runtime not ready"}`);
+    };
+  } else {
+    postMessage({ type: "scripting-ready", error: "scripting needs JSPI and the merged game.wasm (not ?dev)" });
+  }
 
   // psxw-abi BootOptions: cd_timing, video, safepoint_budget,
   // safepoint_quantum, debug, trace (u32 each).
@@ -375,6 +404,7 @@ async function run({ cue, padBuffer, audioRing, options }) {
     const msg = String((err && err.message) || err);
     reason = msg.includes(FRAME_LIMIT) ? "frame limit" : msg;
   }
+  enqueueExecution = null;
   disc.close();
   // A recording outlives its run: hand it over when the run stops.
   if (recording && recording.entries.length) postReplay();

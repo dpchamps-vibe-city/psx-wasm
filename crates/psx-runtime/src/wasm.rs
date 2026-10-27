@@ -8,7 +8,7 @@ use psx_bios::{GuestCall, Host, Machine, Regs};
 use psx_devices::mem::Mem;
 use psxw_abi::{BootOptions, WINDOW_BASE, WINDOW_MASK};
 use sdk_psyq::Psyq;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
@@ -202,6 +202,23 @@ impl Invoke for Guest {
     fn loaded(&mut self, addr: u32, len: u32) {
         unsafe { psxmod_loaded(addr, len) }
     }
+
+    fn host_calls(&mut self) {
+        with(|rt| {
+            let Some((id, call)) = rt.execute.take() else { return };
+            // Run on the game's normal wasm stack, not by re-entering a
+            // JSPI-suspended runtime (wait_vblank holds a machine borrow).
+            let sp = unsafe { guest_sp_get() };
+            let gp = unsafe { guest_gp_get() };
+            let value = psxw_call(call.addr, call.args[0], call.args[1], call.args[2], call.args[3]);
+            unsafe {
+                guest_sp_set(sp);
+                guest_gp_set(gp);
+            }
+            rt.executing.set(false);
+            report(format!("{{\"event\":\"execute\",\"id\":{id},\"value\":\"{value}\"}}"));
+        });
+    }
 }
 
 struct Rt {
@@ -209,6 +226,10 @@ struct Rt {
     quantum: u64,
     adapters: Vec<(&'static str, sdk_psyq::Adapter)>,
     cop0: RefCell<[u32; 32]>,
+    /// One pending console call, separate from the borrowed machine.
+    execute: Cell<Option<(u32, GuestCall)>>,
+    /// Remains set while that call runs (it may itself wait for vblank).
+    executing: Cell<bool>,
 }
 
 thread_local! {
@@ -260,6 +281,8 @@ fn init(options: u32) {
         quantum,
         adapters: sdk_psyq::adapters(),
         cop0: RefCell::new([0; 32]),
+        execute: Cell::new(None),
+        executing: Cell::new(false),
     };
     RT.with(|c| {
         let _ = c.set(rt);
@@ -302,6 +325,23 @@ pub extern "C" fn psxw_call(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u6
     let v = Guest.invoke(GuestCall { addr, args: [a0, a1, a2, a3] });
     with(|rt| driver::drain(&rt.m, &mut Guest));
     v
+}
+
+/// Queue one host-requested call. Safe even while wait_vblank has the
+/// machine borrowed; the driver runs it once that borrow is released.
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_execute(id: u32, addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> i32 {
+    if addr == 0 || addr & 3 != 0 || addr & WINDOW_MASK >= 0x0040_0000 {
+        return -3;
+    }
+    RT.with(|c| {
+        let Some(rt) = c.get() else { return -1 };
+        if rt.executing.replace(true) {
+            return -2;
+        }
+        rt.execute.set(Some((id, GuestCall { addr, args: [a0, a1, a2, a3] })));
+        0
+    })
 }
 
 /// Let `n` vblanks pass (psxw-abi `RUN_VBLANKS`).

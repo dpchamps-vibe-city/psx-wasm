@@ -589,6 +589,23 @@ a call into guest code.
   `PadGetState` expect, and 128 KB memory card images.
 - **SDK adapters.** The thin, object-keyed layer from §5.
 
+### One-shot host scripting
+
+`psxw_execute(id, addr, a0..a3)` queues one call into the existing guest
+code (D51). The request slot is separate from the machine: the browser
+can fill it while JSPI has suspended `wait_vblank`, even though that stack
+still holds a mutable machine borrow. Once the driver has released the
+borrow and drained interrupts and callbacks, it executes the request on
+the normal guest stack, preserving `$sp`/`$gp`. Completion is an `execute`
+event through `host.report`, with the request id and the raw o32 result
+as a decimal string. Calls cannot nest; a trapping call stops the run.
+
+The page exposes only `window.wasmPsxScripting.execute(address, ...args)`,
+a Promise-based bridge to that slot. It requires JSPI and the merged
+module. This is a developer tool to call existing code, not a script
+loader, persistent hook system or typed game-state API. The build's symbol
+addresses are the references; source maps are not part of the contract.
+
 ## Browser host
 
 - **Worker.** Runs `game.wasm` and the host interface it imports, and owns

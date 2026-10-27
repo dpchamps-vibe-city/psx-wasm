@@ -10,6 +10,11 @@
 // POSTs the hashes to /result?browser=NAME when the run stops.
 
 import { SaveQueue, cardName, exportCard, importCard } from "./cards.js";
+import { scripting } from "./scripting.js";
+
+window.wasmPsxScripting = Object.freeze({
+  async execute() { throw new Error("start the game first"); },
+});
 
 const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
@@ -134,6 +139,7 @@ async function start(cue, audioRing) {
   const record = document.getElementById("record").checked || params.has("record");
   if (record && game.frame_counter == null) say("this bundle names no frame counter; recording is off");
   const worker = new Worker("worker.js", { type: "module" });
+  window.wasmPsxScripting = scripting(worker);
   const options = {
     instantCd: document.getElementById("instant").checked || params.has("instant"),
     frames: params.has("frames") ? parseInt(params.get("frames"), 10) : 0,

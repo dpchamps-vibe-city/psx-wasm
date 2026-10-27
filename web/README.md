@@ -28,6 +28,32 @@ Put the file at `games/<game>/replays/<name>.rpl`; then `--replay <name>` finds 
 
 Cards persist in this browser's OPFS between runs, so a session that saves can be followed by one that loads; export the card to keep it.
 
+## One-shot console scripting
+
+After Start and the first vblank, the browser console can call an existing
+compiled game function:
+
+```js
+// Set address to the guest address printed by:
+// psxw mod show <game> <symbol>
+const result = await window.wasmPsxScripting.execute(address, 100);
+const v0 = Number(result & 0xffffffffn);
+```
+
+`execute(address, ...args)` accepts up to four unsigned 32-bit o32 argument
+words and returns a Promise of the raw `v0 | (v1 << 32)` BigInt. It queues
+one call, runs it once outside runtime borrows, interrupt handlers and
+critical sections, and returns its result. Only one call may be pending.
+It requires JSPI and the merged module (not `?dev`); rebuild the bundle for
+ABI 8. Errors before readiness, while busy, or after stop reject the Promise.
+
+This is an unsafe developer tool, not a sandbox: choose a valid function,
+the right arguments and a resident overlay. A bad call can trap or hang the
+game or corrupt its state; there is no rollback. It calls code already in
+`game.wasm`, not newly injected JS or wasm. Symbol lookup already exists in
+the build; source maps are for debugging and are not needed for this API.
+There are no persistent hooks or game-state wrappers yet.
+
 ## Dev mode
 
 `?dev` runs the unmerged `guest.wasm` and `runtime.wasm` instead of `game.wasm`. The Worker instantiates the guest first (it defines the memory), with its `psx.*` imports forwarding to the runtime's exports, then the runtime with the guest's exports as `guest.*`. Every guest call into the runtime crosses JS, so it is slower than the merged module.

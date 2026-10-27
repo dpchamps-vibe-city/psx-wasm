@@ -35,7 +35,9 @@ pub mod replay;
 /// - 7: mods (M11): the mod area ([`phys::MOD_DATA`]), the guest's
 ///   `guest.psxmod_init` and `guest.psxmod_loaded` (data patches), and
 ///   `psx.mod_log`.
-pub const ABI_VERSION: u32 = 7;
+/// - 8: one-shot scripting: `psxw_execute` queues a guest call; its result
+///   is an `execute` event through `host.report`.
+pub const ABI_VERSION: u32 = 8;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -238,6 +240,13 @@ pub mod exports {
     /// `(addr, a0, a1, a2, a3) -> i64`: call a guest function (o32), then
     /// run the callbacks it left queued; `v0 | v1 << 32`.
     pub const CALL: &str = "psxw_call";
+    /// `(id, addr, a0, a1, a2, a3) -> i32`: queue one o32 call, safe while
+    /// the game is suspended in `host.wait_vblank`. The driver executes it
+    /// outside a machine borrow, interrupt handler or critical section.
+    /// Returns 0 if accepted, -1 before init, -2 if busy, -3 for an invalid
+    /// address. Completion: `host.report` JSON `{ "event": "execute",
+    /// "id": N, "value": "<decimal u64>" }`. A trapping call stops the game.
+    pub const EXECUTE: &str = "psxw_execute";
     /// `(n) -> ()`: let `n` vblanks of virtual time pass, delivering events
     /// and running interrupt handlers and callbacks.
     pub const RUN_VBLANKS: &str = "psxw_run_vblanks";

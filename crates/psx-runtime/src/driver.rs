@@ -18,10 +18,14 @@ pub trait Invoke {
     }
     /// The disc wrote `len` bytes at `addr` (mods' overlay data patches).
     fn loaded(&mut self, _addr: u32, _len: u32) {}
+    /// Service a host-requested call, with no machine borrow held and
+    /// outside interrupt handlers and critical sections.
+    fn host_calls(&mut self) {}
 }
 
 /// Run queued callbacks, unless one is already running (no nesting:
-/// interrupts are disabled in a handler, as on hardware).
+/// interrupts are disabled in a handler, as on hardware). Then service a
+/// pending host call, with the machine unborrowed.
 pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
     // What the disc wrote first, so no guest code sees an overlay before
     // its mods' patches (even in a handler).
@@ -41,7 +45,7 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
                 Some(s) => (s, true),
                 None => match m.calls.pop_front() {
                     Some(c) => (IrqStep::Chain(c, None), false),
-                    None => return,
+                    None => break,
                 },
             };
             if step.0 == IrqStep::Exit && m.kernel.custom_exit == 0 {
@@ -81,6 +85,7 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
         }
         rt.borrow_mut().in_irq = false;
     }
+    inv.host_calls();
 }
 
 /// Run a flow to completion.
@@ -195,6 +200,39 @@ mod tests {
         m.mem.w32(at + 4, handler);
         m.mem.w32(at + 8, verifier);
         m.kernel.int_handlers.entry(prio).or_default().push(at);
+    }
+
+    #[test]
+    fn host_calls_run_unborrowed_after_callbacks() {
+        struct HostCall<'a>(&'a RefCell<Machine<Psyq>>, usize);
+        impl Invoke for HostCall<'_> {
+            fn invoke(&mut self, _: GuestCall) -> u64 {
+                assert_eq!(self.1, 0);
+                self.0.borrow_mut().count("callback");
+                0
+            }
+            fn host_calls(&mut self) {
+                let mut m = self.0.borrow_mut();
+                assert!(!m.in_irq && !m.crit);
+                assert!(m.calls.is_empty());
+                assert_eq!(m.counts["callback"], 1);
+                self.1 += 1;
+                m.mem.w32(0x8000_1000, 42);
+            }
+        }
+        let rt = machine();
+        rt.borrow_mut().calls.push_back(GuestCall { addr: 0x8001_0000, args: [0; 4] });
+        let mut g = HostCall(&rt, 0);
+        for (crit, in_irq) in [(true, false), (false, true)] {
+            rt.borrow_mut().crit = crit;
+            rt.borrow_mut().in_irq = in_irq;
+            drain(&rt, &mut g);
+            assert_eq!(g.1, 0);
+        }
+        rt.borrow_mut().in_irq = false;
+        drain(&rt, &mut g);
+        assert_eq!(g.1, 1);
+        assert_eq!(rt.borrow().mem.r32(0x8000_1000), 42);
     }
 
     #[test]

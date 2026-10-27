@@ -8,7 +8,7 @@
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 
-const ABI_VERSION = 7;
+const ABI_VERSION = 8;
 const NOTHING_PRESSED = 0xffff;
 const REPLAY_HEADER = 64; // version 2, entries by vblank (clock 0)
 const WINDOW_BASE = 0x01000000;

@@ -518,6 +518,21 @@ bit-identical. Its cost is within run-to-run noise on that replay: 6000
 headless frames took 166 and 169 s with inlining, 174 and 168 s
 without.
 
+**D51. Start live scripting with one queued guest call.** The browser
+exposes `window.wasmPsxScripting.execute(address, ...args)` to call existing
+compiled code, with up to four o32 argument words and the raw u64 result.
+It has no persistent hooks, typed state, code loader or symbol service.
+The runtime owns a single request slot outside its borrowed machine; the
+driver executes it after draining callbacks, outside borrows, IRQs and
+critical sections. Results use `host.report`. `$sp`/`$gp` are preserved.
+The browser requires JSPI and the merged module; invalid guest calls can
+still trap or hang the game. ABI 8 adds the queueing export.
+
+*Why:* the human requested the smallest single-poke proof. Calling
+`psxw_call` directly while JSPI suspends `wait_vblank` would re-enter the
+runtime while its machine is mutably borrowed. Existing symbol addresses
+suffice for references; debugging source maps are a separate concern.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser

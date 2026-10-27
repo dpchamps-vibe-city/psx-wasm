@@ -590,7 +590,7 @@ fn check_abi(wasm: &[u8]) -> Result<()> {
         }
     }
     use psxw_abi::exports as x;
-    for need in [x::MEMORY, x::ABI_VERSION, x::BOOT, x::ALLOC, x::RAM_HASH] {
+    for need in [x::MEMORY, x::ABI_VERSION, x::BOOT, x::ALLOC, x::RAM_HASH, x::EXECUTE] {
         if !exports.contains(need) {
             bail!("game.wasm doesn't export {need}");
         }
