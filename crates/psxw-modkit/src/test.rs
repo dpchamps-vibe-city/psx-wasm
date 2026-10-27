@@ -19,6 +19,10 @@ pub struct TestSpec {
     pub expect: Vec<Expect>,
     #[serde(default)]
     pub check: Option<Check>,
+    /// Run on the moddable base with the mods loaded at run time, swapped
+    /// in at this vblank (before it, the game runs without them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

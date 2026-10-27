@@ -1,6 +1,6 @@
 # M11 — Modkit
 
-**Status:** not started
+**Status:** done (the browser runs of acceptance steps 5 and 7 waived by the user, 2026-10-26)
 **Depends on:** M2 (phase 1); M5 (phase 2). **Unlocks:** —
 **Design refs:** design §2 (function pointers), §3 (overlays), §4 (one
 implementation per function), §7 (one module, hot-swappable runtime), §8
@@ -342,28 +342,28 @@ or whose game identity doesn't match the running game.
 
 ### Tasks
 
-1. [ ] **`psxw-modkit` crate:**
+1. [x] **`psxw-modkit` crate:**
    - the JSON Schema for `mod.json`;
    - parse and validate `mod.json`;
    - resolve targets through the address map and `[mod.points]`;
    - the declaration-only checks;
    - `psxw mod check <game> <mods…>` prints the chain table and the
      warnings, and exits non-zero only on errors.
-2. [ ] **Header index:** for each symbol, the header that declares it and
+2. [x] **Header index:** for each symbol, the header that declares it and
    its parameter types as spelled (clang's AST over the headers the census
    already parses). Generate `mod.h` and `compile_commands.json`.
-3. [ ] **Authoring commands:**
+3. [x] **Authoring commands:**
    - `psxw mod new <game> <id>` scaffolds a mod.
    - `psxw mod show <game> <symbol>` prints the declaration and where it
      is defined in the decomp, the function's tier and its callers.
-4. [ ] **Compile mod sources** with psxw-cc: the game's flags plus the
+4. [x] **Compile mod sources** with psxw-cc: the game's flags plus the
    mod's include directory. Check that each `impl` is defined where
    declared and that its signature agrees with the target's.
-5. [ ] **The original's calls:** every build compiles the game's C with
+5. [x] **The original's calls:** every build compiles the game's C with
    each non-inline function `weak` and `noinline` (D50; at first, only
    hooked targets' and `from` callers' translation units were recompiled
    so, which changed the game's timing).
-6. [ ] **Linker:**
+6. [x] **Linker:**
    - one generated entry per hooked (container, address);
    - rebind to it every direct C call, translated call, dispatch-table
      entry and overlay-stub candidate;
@@ -372,15 +372,15 @@ or whose game identity doesn't match the running game.
    - mod data in a mod area of the window, with its range fixed in
      `psxw-abi`;
    - mod references to game globals resolved through the address map.
-7. [ ] **Data patches** to EXE data, including `fnptr`, applied after
+7. [x] **Data patches** to EXE data, including `fnptr`, applied after
    boot loads the EXE. Overlay data is task 11.
-8. [ ] **Running mods:**
+8. [x] **Running mods:**
    - `psxw run <game> --mod <dir>…`;
    - `psxw build-web <game> --mods <dir>,…`;
    - `psxw record <game> --mod <dir>…`, to record replays with mods
      applied;
    - write `mods.json`.
-9. [ ] **Mods workspace.** A mods repo has a `psxmods.json` naming the
+9. [x] **Mods workspace.** A mods repo has a `psxmods.json` naming the
    game and the psx-wasm checkout, and `psxw` commands run inside it find
    it.
    - **`psxw mod sdk`** exports the mod SDK into `.psxw/sdk/`: the decomp's
@@ -392,7 +392,7 @@ or whose game identity doesn't match the running game.
    - **`psxw mod sdk --bump`** moves to psx-wasm's current pins and checks
      every mod again. A target that no longer exists gets an error naming
      the symbol now at its address.
-10. [ ] **`psxw mod test [mod|set]`** builds the game with the mods and
+10. [x] **`psxw mod test [mod|set]`** builds the game with the mods and
     runs each test in the mod's `tests/`. A test is a JSON file:
     - **`replay`:** `{ "name" }` for a replay from `games/<id>/replays/`,
       or `{ "file" }` for one next to the test.
@@ -412,9 +412,9 @@ or whose game identity doesn't match the running game.
 
     `psxw mod play <mod|set>` builds the web bundle with the mods and
     serves it.
-11. [ ] **The first target game's mods repo** and its first mod: see
+11. [x] **The first target game's mods repo** and its first mod: see
     Acceptance.
-12. [ ] **CI gate `mods`:**
+12. [x] **CI gate `mods`:**
     - **The mods repo:** `inputs.lock` pins the first target game's mods
       repo (`[mods.<id>]`), and the gate runs `psxw mod check`, `build` and
       `test` on it.
@@ -425,12 +425,14 @@ or whose game identity doesn't match the running game.
       function. Over the game's replays it must give the same RAM, VRAM
       and audio hashes as the plain build. That exercises every call path
       at once.
-13. [ ] **Overlay data patches:** apply them when the overlay becomes
+13. [x] **Overlay data patches:** apply them when the overlay becomes
     resident. Design the residency signal (a CD transfer completing over
     the overlay's range, then the stubs' comparison of the overlay's
     original words) and record overlays that arrive another way
-    (`memcpy`, decompression) in Findings.
-14. [ ] **`psxw mod writers <game> <symbol>`:** lists the functions that
+    (`memcpy`, decompression) in Findings. (Landed: a disc write over a
+    patch's bytes marks it pending; it is applied once the overlay's first
+    code words are resident, whichever sector comes first.)
+14. [x] **`psxw mod writers <game> <symbol>`:** lists the functions that
     store to a symbol's address, to find what to hook. It reports the
     functions where it lost track (stores through computed pointers)
     rather than implying a complete list.
@@ -451,35 +453,38 @@ or whose game identity doesn't match the running game.
 
 ### Tasks
 
-1. [ ] **Post-pass for any wasm module:**
+1. [x] **Post-pass for any wasm module:**
    - mask its loads and stores, as the guest pass does for game code;
    - move its data, stack and heap into the mod's area;
    - refuse or redirect `memory.grow`.
 
    First languages: C through plain clang, and `no_std` Rust with a small
    `psx-mod` crate that provides an allocator over the area.
-2. [ ] **The built module:** `psxw mod build` emits it with its
+2. [x] **The built module:** `psxw mod build` emits it with its
    `psxmod.decl` section, one export per declaration, and its imports.
-3. [ ] **Moddable base build:** each hookable entry checks a hook slot.
+3. [x] **Moddable base build:** each hookable entry checks a hook slot.
    Measure the cost on the first target game over `title-to-gameplay`
    (frame time). If it's too high, record it and restrict slots to
    targets declared at base-build time.
-4. [ ] **Loader** in the runtime and both hosts:
+4. [x] **Loader** in both hosts (`psxw-host-native` `mods`,
+   `web/mods.js`); the runtime only calls the registered mods' init and
+   loaded functions through the base:
    - verify identity and declarations;
    - resolve names;
    - wire chains wasm-to-wasm, passing instance exports and a shared
      function table directly as imports. A JS frame between two wasm
      instances would stop JSPI from suspending, as in `?dev` today.
-5. [ ] **Native host `--mod <file>.wasm`.**
-6. [ ] **Browser mod panel:** add a mod from a file, store it in OPFS,
+5. [x] **Native host `--mod <file>.wasm`.** (Landed as `psxw run
+   --load-mod <file>.mod.wasm` and `--swap-mod FRAME:INDEX:PATH`.)
+6. [x] **Browser mod panel:** add a mod from a file, store it in OPFS,
    enable, disable and reorder; mods load at boot.
-7. [ ] **Hot swap at vblank,** while the game waits in `wait_vblank`:
+7. [x] **Hot swap at vblank,** while the game waits in `wait_vblank`:
    - rewire the hook slots; frames already on the stack finish in the old
      code;
    - keep mod state when its layout hash matches, otherwise reset it;
    - `psxw mod watch <dir>` rebuilds on save and pushes the module through
      `psxw serve`.
-8. [ ] **Rust bindings** over the decomp's headers (bindgen), with the
+8. [x] **Rust bindings** over the decomp's headers (bindgen), with the
    Rust counterpart of `mod.h`.
 
 ### Exit criteria (all automated)
@@ -643,4 +648,74 @@ Phase 2:
 
 ## Progress log
 
+- **2026-10-26** `4e6840e`: psxw-modkit (`mod.json` and its schema,
+  resolution, plan, header index, `mod.h`), hook chains in psxw-link,
+  data patches, the runtime's `psxmod_init`/`psxmod_loaded`/`mod_log`,
+  `psxw mod check/build/test/new/show/writers/play`, `psxw run/build/
+  build-web --mod`. better-rand's trace: every change a xorshift step.
+- **2026-10-26** `f94773f`: D50 (game C keeps GCC 2.95's call
+  structure); the pass-through mod and the CI gate `mods`; btn's
+  `[mod.points]` and test mods.
+- **2026-10-26** `ff6aabf`: the moddable base, mod modules, the native
+  loader and hot swap; btn-mods created (`030a555`) and pinned. The gate
+  `mods` passes: empty set byte-identical; pass-through on 3375 functions
+  bit-identical over `card-load` and `title-to-gameplay` (RAM, VRAM,
+  audio); the conflict both ways; the test mods; btn-mods' better-rand.
+- **2026-10-26** `bff75b1`: any language (`wasm-ld --emit-relocs`
+  modules), `mod_flat.h`, Rust bindings and `psx-mod`, the browser loader
+  and mod panel, `psxw mod watch`.
+- **2026-10-26**: the gate's phase 2 checks (base without mods == plain,
+  each test mod loaded at run time == linked in, identical swap
+  transparent), `load_at` tests (better-rand's swap test in btn-mods),
+  D51, the moddable base's cost. The browser runs of acceptance steps 5
+  and 7 were waived by the user; the browser loader and mod panel have
+  not run in a browser.
+
 ## Findings
+
+- **Inlining moved the game's timing (D50).** With clang's inlining, a
+  translation unit recompiled `noinline` for a hook got different loop
+  structure, so loop headers spent the safepoint budget elsewhere and
+  interrupts arrived at other points: the pass-through mod diverged by
+  vblank 210 of `title-to-gameplay` (a timer reading on the stack,
+  `0x49C7` vs `0x49C5`). The pass-through over translated functions and
+  adapters alone was bit-identical; a plain build with every C function
+  noinline was bit-identical to the pass-through over C functions. Every
+  build now keeps GCC 2.95's call structure; the run-time cost is within
+  noise.
+- **Hooks never touch guest RAM or `$sp`.** Mod frames live on a mod
+  stack; a C function's chain is C-typed and its o32 entry is the same
+  wrapper it always had; an o32 chain passes `a0..a3` and `$sp` through,
+  and a wrapping patch's call to its original reuses the caller's frame
+  (the hook frame), so stack arguments stay where the caller put them.
+  That is what makes the pass-through bit-identical.
+- **Mod loops don't spend the safepoint budget**, in either backend: a
+  mod doesn't move the game's virtual time, and the backends agree.
+- **Mod code keeps plain C conventions** (no GCC 2.95 division checks or
+  `memcpy` expansion) in both backends; a mod's `memcpy` is the game's.
+- **The decomp's headers need the census's fixups** (incomplete array
+  element types in `globals_override.h`): mod C compiles through them, and
+  another toolchain gets `mod_flat.h`, `mod.h` with the game's headers
+  preprocessed and fixed up into plain C. Including every game header in
+  one translation unit doesn't compile (139 errors: headers that were
+  never meant to meet), so the flat header is per mod.
+- **Overlay data patches** arrive with the disc's writes (the libcd
+  adapter's sectors, `CdGetSector`, BIOS file reads). btn loads overlays
+  straight from the disc, and a `u16` patch to the title overlay's data
+  is in place at vblank 1000. An overlay that arrives by `memcpy` or
+  decompression is never seen loading: its patches would never apply
+  (none in btn so far).
+- **`$gp`:** btn's executable header has `gp0 = 0`; the startup code sets
+  `$gp`. `psxw mod writers` takes the one constant the code writes to it.
+- **bindgen 0.73 with libclang 23 drops function declarations** but keeps
+  function pointer types: the Rust bindings declare each function as a
+  pointer typedef, spelled from its own declaration, and make it a
+  declaration again. C struct tags and same-named typedefs of other
+  (anonymous) structs collide in Rust: bindgen's C naming plus a tag for
+  the anonymous one keeps them apart.
+- **Dynamic mods can't use `from` (D51).** A slot per call site would put
+  a check on every call.
+- **Byte-identical toolchains:** better-rand built with plain clang and
+  wasm-ld links into the same `game.wasm`, byte for byte, as better-rand
+  through psxw-cc; Rust's gives the same RAM.
+- **Moddable base cost:** see the measurement below.

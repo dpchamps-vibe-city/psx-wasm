@@ -109,10 +109,15 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
         }
         ["test", rest @ ..] => {
             let name = rest.iter().find(|a| !a.starts_with("--")).copied();
-            let (psx, mods, built, _) = build_ws(m, name)?;
+            let (psx, mods, built, label) = build_ws(m, name)?;
             summary(&built);
             let table = m.table()?;
-            run_tests(&psx, m.game(), &table, &mods, &built)
+            let dynamic = || -> Result<(String, Vec<PathBuf>)> {
+                let modules = modules_ws(m, &psx, &label, &mods)?;
+                let (base, _) = psxw_build::game::build(&psx, &Options { moddable: true, ..Options::new(m.game()) })?;
+                Ok((base.wasm, modules))
+            };
+            run_tests(&psx, m.game(), &table, &mods, &built, &dynamic)
         }
         ["play", name, rest @ ..] => {
             if rest.contains(&"--dynamic") {
@@ -262,6 +267,13 @@ fn print_modules(built: &[build::BuiltModule]) {
     }
 }
 
+/// The moddable base and `mods` as modules.
+fn direct_dynamic(ws: &Workspace, game: &str, mods: &[Mod]) -> Result<(String, Vec<PathBuf>)> {
+    let modules = build_modules_direct(ws, game, mods, None)?.into_iter().map(|b| b.path).collect();
+    let (base, _) = psxw_build::game::build(ws, &Options { moddable: true, ..Options::new(game) })?;
+    Ok((base.wasm, modules))
+}
+
 /// Each mod as its own module (phase 2), into `out/<game>/modules/`.
 pub fn build_modules_direct(ws: &Workspace, game: &str, mods: &[Mod], out: Option<PathBuf>) -> Result<Vec<build::BuiltModule>> {
     let out = std::path::absolute(out.unwrap_or_else(|| psxw_build::game::out_dir(ws, game).join("modules")))?;
@@ -295,7 +307,7 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
             let built = build_direct(ws, game, &mods, None)?;
             summary(&built);
             let (_, table) = build::table(ws, game)?;
-            run_tests(ws, game, &table, &mods, &built)
+            run_tests(ws, game, &table, &mods, &built, &|| direct_dynamic(ws, game, &mods))
         }
         ["new", game, id, rest @ ..] => {
             let base = match rest {
@@ -487,17 +499,25 @@ fn fresh(dir: &Path) -> Result<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
-/// Run every test of every mod in `mods` on `built`.
-fn run_tests(ws: &Workspace, game: &str, table: &SymbolTable, mods: &[Mod], built: &Built) -> Result<bool> {
+/// The moddable base and the mods as modules, built when a test asks.
+type Dynamic<'a> = &'a dyn Fn() -> Result<(String, Vec<PathBuf>)>;
+
+/// Run every test of every mod in `mods` on `built` (or, for a test with
+/// `load_at`, on the moddable base with the mods' modules).
+fn run_tests(ws: &Workspace, game: &str, table: &SymbolTable, mods: &[Mod], built: &Built, dynamic: Dynamic) -> Result<bool> {
     let out = PathBuf::from(&built.report.wasm).parent().context("build directory")?.join("tests");
     std::fs::create_dir_all(&out)?;
     let mut all = Vec::new();
     let mut plain: Option<PathBuf> = None;
+    let mut dynamic_built: Option<(String, Vec<PathBuf>)> = None;
     for m in mods {
         for t in psxw_modkit::test::tests(&m.dir)? {
             let name = format!("{}/{}", m.id(), t.name);
             eprintln!("test {name}: {} frames", t.spec.frames);
-            let o = one_test(ws, game, table, &t, built, &out.join(m.id()).join(&t.name), &mut plain)
+            if t.spec.load_at.is_some() && dynamic_built.is_none() {
+                dynamic_built = Some(dynamic()?);
+            }
+            let o = one_test(ws, game, table, &t, built, dynamic_built.as_ref(), &out.join(m.id()).join(&t.name), &mut plain)
                 .with_context(|| format!("test {name}"))?;
             for (what, pass, detail) in &o.0 {
                 println!("{name}: {what:<14} {:<4} {detail}", if *pass { "ok" } else { "FAIL" });
@@ -516,8 +536,16 @@ fn run_tests(ws: &Workspace, game: &str, table: &SymbolTable, mods: &[Mod], buil
 
 type Checks = (Vec<(String, bool, String)>,);
 
-fn one_test(ws: &Workspace, game: &str, table: &SymbolTable, t: &Test, built: &Built, dir: &Path, plain: &mut Option<PathBuf>) -> Result<Checks> {
+fn one_test(ws: &Workspace, game: &str, table: &SymbolTable, t: &Test, built: &Built, dynamic: Option<&(String, Vec<PathBuf>)>, dir: &Path, plain: &mut Option<PathBuf>) -> Result<Checks> {
     let spec = &t.spec;
+    // The build the test runs, and the mods swapped in at `load_at`.
+    let (game_wasm, swaps) = match (spec.load_at, dynamic) {
+        (Some(at), Some((base, modules))) => (
+            base.clone(),
+            modules.iter().enumerate().map(|(i, p)| psxw_host_native::ModSwap { frame: at, index: i, path: p.clone() }).collect::<Vec<_>>(),
+        ),
+        _ => (built.report.wasm.clone(), Vec::new()),
+    };
     let replay = match &spec.replay {
         ReplayRef::Name { name } => crate::wholegame::replay(ws, game, Some(name))?.0,
         ReplayRef::File { file } => {
@@ -559,6 +587,9 @@ fn one_test(ws: &Workspace, game: &str, table: &SymbolTable, t: &Test, built: &B
         o.replay = Some(replay.clone());
         o.storage_dir = Some(storage);
         o.watch = watch.iter().map(|(_, ty, a)| (*a, ty.size())).collect();
+        if wasm == game_wasm {
+            o.swaps = swaps.clone();
+        }
         o.hash_at = hash.clone();
         if deterministic {
             o.render = Some(crate::render::server(ws));
@@ -566,13 +597,13 @@ fn one_test(ws: &Workspace, game: &str, table: &SymbolTable, t: &Test, built: &B
         }
         Ok(o)
     };
-    let first = psxw_host_native::run(options(&built.report.wasm, fresh(&dir.join("storage-1"))?)?)?;
+    let first = psxw_host_native::run(options(&game_wasm, fresh(&dir.join("storage-1"))?)?)?;
     let mut checks = Vec::new();
     for e in &spec.expect {
         match e {
             Expect::NoTrap => checks.push(("no_trap".into(), first.stop == Stop::FrameLimit, format!("{:?} after {} frames", first.stop, first.frames))),
             Expect::Deterministic => {
-                let again = psxw_host_native::run(options(&built.report.wasm, fresh(&dir.join("storage-2"))?)?)?;
+                let again = psxw_host_native::run(options(&game_wasm, fresh(&dir.join("storage-2"))?)?)?;
                 let same = first.ram_hashes == again.ram_hashes
                     && first.vram_hashes == again.vram_hashes
                     && first.audio.hash == again.audio.hash
@@ -616,7 +647,7 @@ fn one_test(ws: &Workspace, game: &str, table: &SymbolTable, t: &Test, built: &B
             }
             serde_json::Value::Object(m)
         };
-        let mut input = serde_json::json!({ "frames": first.frames, "trace": trace_of(&first) });
+        let mut input = serde_json::json!({ "frames": first.frames, "trace": trace_of(&first), "load_at": spec.load_at });
         if check.baseline {
             let wasm = match plain {
                 Some(p) => p.clone(),
@@ -732,7 +763,7 @@ pub fn ci(ws: &Workspace, game: &str) -> Result<(bool, String)> {
             let warned = plan.warnings.iter().any(|w| w.contains(&fi) && w.contains(&li) && w.contains(&format!("{li}'s runs")));
             note(warned, format!("{fi} then {li}: check warns naming both, {li} wins"));
             let built = build_direct(ws, game, &mods, Some(dir.join(format!("{fi}+{li}"))))?;
-            let ok = run_tests(ws, game, &table, &mods[1..], &built)?;
+            let ok = run_tests(ws, game, &table, &mods[1..], &built, &|| direct_dynamic(ws, game, &mods))?;
             note(ok, format!("{fi} then {li}: {li}'s replacement is the one that runs"));
         }
         let mut others: Vec<PathBuf> = std::fs::read_dir(&mods_dir)?
@@ -743,8 +774,56 @@ pub fn ci(ws: &Workspace, game: &str) -> Result<(bool, String)> {
         for m in others {
             let mods = vec![Mod::load(&m)?];
             let built = build_direct(ws, game, &mods, Some(dir.join(mods[0].id())))?;
-            let ok = run_tests(ws, game, &table, &mods, &built)?;
+            let ok = run_tests(ws, game, &table, &mods, &built, &|| direct_dynamic(ws, game, &mods))?;
             note(ok, format!("{}: its tests", mods[0].id()));
+        }
+    }
+
+    // Phase 2: a moddable base without mods runs as the plain build; each
+    // test mod loaded at run time runs as it does linked in; an identical
+    // swap changes nothing. (A mod's own tests check what a swap does:
+    // `load_at`.)
+    if mods_dir.is_dir() {
+        let (base, _) = psxw_build::game::build(ws, &Options { moddable: true, ..Options::new(game) })?;
+        let (bytes, _) = crate::wholegame::replay(ws, game, Some("title-to-gameplay"))?;
+        let at: Vec<u64> = vec![300, 1200, 2400];
+        let run = |wasm: &str, mods: &[PathBuf], swaps: Vec<psxw_host_native::ModSwap>, _trace: Option<u32>, tag: &str| -> Result<psxw_host_native::RunReport> {
+            let (mut o, _) = crate::run::options(ws, game, &[])?;
+            o.wasm = wasm.into();
+            o.frames = 2400;
+            o.replay = Some(bytes.clone());
+            o.storage_dir = Some(fresh(&dir.join(format!("storage-{tag}")))?);
+            o.hash_at = at.clone();
+            o.mods = mods.to_vec();
+            o.swaps = swaps;
+            psxw_host_native::run(o)
+        };
+        let key = |r: &psxw_host_native::RunReport| format!("{:?} {:?} {} {}", r.stop, r.ram_hashes, r.audio.frames, r.audio.hash);
+        let plain_run = run(&plain.wasm, &[], vec![], None, "plain")?;
+        let base_run = run(&base.wasm, &[], vec![], None, "base")?;
+        note(key(&plain_run) == key(&base_run), "moddable base without mods runs as the plain build".into());
+        let mut examples: Vec<PathBuf> = std::fs::read_dir(&mods_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.join("mod.json").is_file() && p != &a && p != &b)
+            .collect();
+        examples.sort();
+        let mut modules = Vec::new();
+        for m in &examples {
+            let mods = vec![Mod::load(m)?];
+            let id = mods[0].id().to_string();
+            let stat = build_direct(ws, game, &mods, Some(dir.join(format!("static-{id}"))))?;
+            let module = build_modules_direct(ws, game, &mods, Some(dir.join("modules")))?.remove(0).path;
+            let s = run(&stat.report.wasm, &[], vec![], None, &format!("static-{id}"))?;
+            let d = run(&base.wasm, &[module.clone()], vec![], None, &format!("dynamic-{id}"))?;
+            let same = key(&s) == key(&d) && s.stop == Stop::FrameLimit;
+            note(same, format!("{id}: loaded at run time, the same RAM and audio as linked in"));
+            modules.push((id, module));
+        }
+        // Swapping a mod for the identical module mid-run changes nothing.
+        if let Some((id, m)) = modules.first() {
+            let once = run(&base.wasm, &[m.clone()], vec![], None, "once")?;
+            let swapped = run(&base.wasm, &[m.clone()], vec![psxw_host_native::ModSwap { frame: 1200, index: 0, path: m.clone() }], None, "same")?;
+            note(key(&once) == key(&swapped), format!("{id}: swapped for the identical module at vblank 1200, the run is bit-identical"));
         }
     }
 
@@ -762,7 +841,12 @@ pub fn ci(ws: &Workspace, game: &str) -> Result<(bool, String)> {
         let inc = m.state.join("mods");
         let layout = Layout { out: m.build_dir(&label), include: Box::new(move |id| inc.join(id).join("include")), flags: Some(m.flags()?) };
         let built = build::build(ws, &Options::new(game), &mods, &layout)?;
-        let ok = run_tests(ws, game, &sdk, &mods, &built)?;
+        let dynamic = || -> Result<(String, Vec<PathBuf>)> {
+            let modules = modules_ws(&m, ws, &label, &mods)?;
+            let (base, _) = psxw_build::game::build(ws, &Options { moddable: true, ..Options::new(game) })?;
+            Ok((base.wasm, modules))
+        };
+        let ok = run_tests(ws, game, &sdk, &mods, &built, &dynamic)?;
         note(ok, format!("{game} mods @ {}: build and tests", pin.short()));
     }
     Ok((pass, detail.join("; ")))

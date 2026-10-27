@@ -47,6 +47,7 @@
         ]
       }
     },
+    "load_at": { "type": "integer", "minimum": 1, "description": "Run on the moddable base, the mods loaded at run time at this vblank (none before it)." },
     "check": {
       "type": "object",
       "additionalProperties": false,
