@@ -136,7 +136,7 @@ fn summary(b: &Built) {
 
 /// Build `mods` in psx-wasm, into `out/<game>/mods/<label>/`.
 pub fn build_direct(ws: &Workspace, game: &str, mods: &[Mod], out: Option<PathBuf>) -> Result<Built> {
-    let out = out.unwrap_or_else(|| psxw_build::game::out_dir(ws, game).join("mods").join(label(mods)));
+    let out = std::path::absolute(out.unwrap_or_else(|| psxw_build::game::out_dir(ws, game).join("mods").join(label(mods))))?;
     let inc = out.join("mods");
     let layout = Layout { out: out.clone(), include: Box::new(move |id| inc.join(id).join("include")), flags: None };
     build::build(ws, &Options::new(game), mods, &layout)
@@ -175,8 +175,13 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
         }
         ["show", game, sym] => show(&build::table(ws, game)?.1, sym),
         ["writers", game, sym] => crate::writers::run(ws, game, sym),
-        ["pass-through", game, "--out", out] => {
-            let n = crate::passthrough::generate(ws, game, Path::new(out))?;
+        ["pass-through", game, "--out", out, rest @ ..] => {
+            let tiers: Option<Vec<&str>> = match rest {
+                ["--tiers", t] => Some(t.split(',').collect()),
+                [] => None,
+                _ => bail!("usage: psxw mod pass-through <game> --out <dir> [--tiers c,lift,adapter]"),
+            };
+            let n = crate::passthrough::generate(ws, game, Path::new(out), tiers.as_deref())?;
             println!("pass-through mod on {n} functions: {out}");
             Ok(true)
         }
@@ -220,7 +225,8 @@ fn show(table: &SymbolTable, sym: &str) -> Result<bool> {
     match table.resolve_func(&t) {
         Ok(f) => {
             let info = table.function(&f.container, f.addr).context("function")?;
-            println!("{}  {} 0x{:08X}  tier {:?}", info.name(), f.container, f.addr, info.tier);
+            let tier = serde_json::to_value(info.tier).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            println!("{}  {} 0x{:08X}  tier {tier}", info.name(), f.container, f.addr);
             if info.names.len() > 1 {
                 println!("  also named {}", info.names[1..].join(", "));
             }
@@ -480,4 +486,115 @@ fn one_test(ws: &Workspace, game: &str, table: &SymbolTable, t: &Test, built: &B
         checks.push((format!("check {}", check.command.join(" ")), out.status.success(), last.join(" | ")));
     }
     Ok((checks,))
+}
+
+/// One replay run for a comparison: RAM, VRAM and audio hashes.
+fn hashes(ws: &Workspace, game: &str, wasm: &str, replay: &[u8], frames: u64, at: &[u64], storage: PathBuf) -> Result<(Stop, String)> {
+    let (mut o, _) = crate::run::options(ws, game, &[])?;
+    o.wasm = wasm.into();
+    o.frames = frames;
+    o.replay = Some(replay.to_vec());
+    o.storage_dir = Some(fresh(&storage)?);
+    o.hash_at = at.to_vec();
+    o.vram_hash_at = at.to_vec();
+    o.render = Some(crate::render::server(ws));
+    let r = psxw_host_native::run(o)?;
+    let text = format!("ram {:?} vram {:?} audio {} {}", r.ram_hashes, r.vram_hashes, r.audio.frames, r.audio.hash);
+    Ok((r.stop, text))
+}
+
+/// The CI gate `mods` (plans/M11 task 12).
+pub fn ci(ws: &Workspace, game: &str) -> Result<(bool, String)> {
+    let mut pass = true;
+    let mut detail = Vec::new();
+    let mut note = |ok: bool, what: String| {
+        pass &= ok;
+        detail.push(format!("{}{what}", if ok { "" } else { "FAIL " }));
+    };
+    let dir = std::path::absolute(ws.out_dir().join("ci").join(game).join("mods"))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    // An empty mod set links exactly the plain build.
+    let (plain, _) = psxw_build::game::build(ws, &Options::new(game))?;
+    let empty = build_direct(ws, game, &[], Some(dir.join("empty")))?;
+    let same = std::fs::read(&plain.wasm)? == std::fs::read(&empty.report.wasm)?;
+    note(same, format!("empty mod set {} the plain game.wasm", if same { "is byte-identical to" } else { "differs from" }));
+
+    // A no-op before, after and wrapping patch on every hookable function:
+    // the game's replays stay bit-identical.
+    let pt_dir = dir.join("pass-through-mod");
+    let n = crate::passthrough::generate(ws, game, &pt_dir, None)?;
+    let pt = build_direct(ws, game, &[Mod::load(&pt_dir)?], Some(dir.join("pass-through")))?;
+    let mut replays: Vec<String> = std::fs::read_dir(ws.root.join("games").join(game).join("replays"))
+        .map(|rd| rd.filter_map(|e| e.ok()?.path().file_stem().map(|s| s.to_string_lossy().into_owned())).collect())
+        .unwrap_or_default();
+    // Committed replays only: specs (.toml) and recordings git tracks.
+    replays.retain(|r| {
+        let base = ws.root.join("games").join(game).join("replays");
+        base.join(format!("{r}.toml")).is_file()
+            || std::process::Command::new("git").arg("-C").arg(&ws.root).args(["ls-files", "--error-unmatch"]).arg(base.join(format!("{r}.rpl"))).output().is_ok_and(|o| o.status.success())
+    });
+    replays.sort();
+    replays.dedup();
+    for r in &replays {
+        let (bytes, _) = crate::wholegame::replay(ws, game, Some(r))?;
+        let frames = psxw_abi::replay::Header::parse(&bytes).map_or(600, |h| h.frames as u64);
+        let at: Vec<u64> = (1..=4).map(|k| frames * k / 4).collect();
+        let (s1, a) = hashes(ws, game, &plain.wasm, &bytes, frames, &at, dir.join("storage-plain"))?;
+        let (s2, b) = hashes(ws, game, &pt.report.wasm, &bytes, frames, &at, dir.join("storage-pt"))?;
+        let ok = a == b && s1 == Stop::FrameLimit && s2 == Stop::FrameLimit;
+        if !ok {
+            std::fs::write(dir.join(format!("pass-through-{r}.txt")), format!("plain {s1:?} {a}\npass-through {s2:?} {b}\n"))?;
+        }
+        note(ok, format!("pass-through on {n} functions: {r} ({frames} frames) {}", if ok { "bit-identical" } else { "differs" }));
+    }
+
+    // The game's own test mods: a conflict (each of two replacements runs
+    // when applied last, and check names both) and the feature mods.
+    let mods_dir = ws.root.join("games").join(game).join("mods");
+    let (a, b) = (mods_dir.join("conflict-a"), mods_dir.join("conflict-b"));
+    if a.is_dir() && b.is_dir() {
+        let (_, table) = build::table(ws, game)?;
+        for (first, last) in [(&a, &b), (&b, &a)] {
+            let mods = vec![Mod::load(first)?, Mod::load(last)?];
+            let plan = psxw_modkit::plan::plan(&table, &mods);
+            let (fi, li) = (mods[0].id().to_string(), mods[1].id().to_string());
+            let warned = plan.warnings.iter().any(|w| w.contains(&fi) && w.contains(&li) && w.contains(&format!("{li}'s runs")));
+            note(warned, format!("{fi} then {li}: check warns naming both, {li} wins"));
+            let built = build_direct(ws, game, &mods, Some(dir.join(format!("{fi}+{li}"))))?;
+            let ok = run_tests(ws, game, &table, &mods[1..], &built)?;
+            note(ok, format!("{fi} then {li}: {li}'s replacement is the one that runs"));
+        }
+        let mut others: Vec<PathBuf> = std::fs::read_dir(&mods_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.join("mod.json").is_file() && p != &a && p != &b)
+            .collect();
+        others.sort();
+        for m in others {
+            let mods = vec![Mod::load(&m)?];
+            let built = build_direct(ws, game, &mods, Some(dir.join(mods[0].id())))?;
+            let ok = run_tests(ws, game, &table, &mods, &built)?;
+            note(ok, format!("{}: its tests", mods[0].id()));
+        }
+    }
+
+    // The pinned mods repository: check, build and test, against this
+    // psx-wasm.
+    if let Some(pin) = ws.lock.mods.get(game) {
+        let snap = psxw_inputs::snapshot::ensure(ws, &format!("{game}-mods"), pin)?;
+        let m = ModsWorkspace::open(&snap, Some(dir.join("workspace")), Some(ws.root.clone()))?;
+        m.check_pins(ws)?;
+        let sdk = psxw_modkit::workspace::sdk_into(&m, ws)?;
+        let (label, mods) = m.select(m.set("all")?.map(|_| "all"))?;
+        let plan = psxw_modkit::plan::plan(&sdk, &mods);
+        let clean = plan.ok() && plan.warnings.is_empty();
+        note(clean, format!("{} @ {}: check {} ({} mods, {} warnings)", game, pin.short(), if plan.ok() { "ok" } else { "errors" }, mods.len(), plan.warnings.len()));
+        let inc = m.state.join("mods");
+        let layout = Layout { out: m.build_dir(&label), include: Box::new(move |id| inc.join(id).join("include")), flags: Some(m.flags()?) };
+        let built = build::build(ws, &Options::new(game), &mods, &layout)?;
+        let ok = run_tests(ws, game, &sdk, &mods, &built)?;
+        note(ok, format!("{game} mods @ {}: build and tests", pin.short()));
+    }
+    Ok((pass, detail.join("; ")))
 }

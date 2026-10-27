@@ -264,17 +264,11 @@ pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> R
             afters: l.afters.iter().map(call).collect::<Result<_>>()?,
         })
     };
-    let mut noinline: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    let mut weak = |c: &str, a: u32| {
-        if let (Some(name), Some(key)) = (c_name(&prep, c, a), prep.c_objects.get(&(c.to_string(), a))) {
-            noinline.entry(key.clone()).or_default().insert(name);
-        }
-    };
+    // Every C function is already weak and noinline in every build (D50),
+    // so hooking one needs no recompile.
     for t in plan.targets.values() {
-        weak(&t.container, t.addr);
         let mut chains = lm::Chains { returns: t.returns, default: t.default.iter().map(&layer).collect::<Result<_>>()?, from: BTreeMap::new() };
         for ((cc, ca), (_, ls)) in &t.from {
-            weak(cc, *ca);
             chains.from.insert((cc.clone(), *ca), ls.iter().map(&layer).collect::<Result<_>>()?);
         }
         spec.targets.insert((t.container.clone(), t.addr), chains);
@@ -296,9 +290,7 @@ pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> R
     }
 
     // The game, linked with the mods.
-    let opts = Options { mods: Some(ModPlan { out: layout.out.clone(), noinline, inputs, spec }), ..base.clone() };
-    drop(prep);
-    let prep = psxw_build::game::prepare(ws, &opts)?;
+    let opts = Options { mods: Some(ModPlan { out: layout.out.clone(), inputs, spec }), ..base.clone() };
     let (report_, _) = psxw_build::game::finish(ws, &opts, prep)?;
 
     let mut mr = report(&table, &plan, mods);

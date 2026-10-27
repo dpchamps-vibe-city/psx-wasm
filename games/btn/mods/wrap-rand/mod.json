@@ -1,0 +1,23 @@
+{
+  "id": "wrap-rand",
+  "version": "0.1.0",
+  "game": "btn",
+  "hooks": [
+    {
+      "kind": "before",
+      "target": { "symbol": "Rand" },
+      "impl": { "file": "src/wrap.c", "function": "count_call" }
+    },
+    {
+      "kind": "patch",
+      "target": { "symbol": "Rand" },
+      "impl": { "file": "src/wrap.c", "function": "checked_rand" },
+      "original": "rand_original"
+    },
+    {
+      "kind": "after",
+      "target": { "symbol": "Rand" },
+      "impl": { "file": "src/wrap.c", "function": "check_result" }
+    }
+  ]
+}

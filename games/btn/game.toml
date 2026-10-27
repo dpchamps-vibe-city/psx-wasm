@@ -88,3 +88,10 @@ BuildSpriteEntryPackets = "clutList[12] has no bound; random frames with more th
 StartSoundArchiveRead = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"
 StepSoundLoad = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"
 BeginSoundBankBodyTransfer = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"
+
+# Named hook points for mods (plans/M11): real function boundaries many
+# mods want. A hook with "target": { "point": "frame" } is an `after` hook
+# on PollPadInputs, which RunSceneUpdateLoop calls once per scene frame.
+[mod.points]
+frame = { after = "PollPadInputs", doc = "once per scene frame, after the pads are read" }
+boot = { before = "main", doc = "once, when the executable starts" }

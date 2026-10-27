@@ -46,6 +46,9 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         for (name, pin) in ws.lock.game.iter().chain(&ws.lock.sdk) {
             snapshot::ensure(ws, name, pin)?;
         }
+        for (game, pin) in &ws.lock.mods {
+            snapshot::ensure(ws, &format!("{game}-mods"), pin)?;
+        }
         Ok((true, "toolchains and snapshots match inputs.lock".into()))
     })());
     gate(&mut gates, "census", "M0", (|| {
@@ -101,6 +104,10 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
             detail.push(format!("{lib} {}", if ok { "pass" } else { "FAIL" }));
         }
         Ok((pass, detail.join(", ")))
+    })());
+    gate(&mut gates, "mods", "M11", (|| {
+        built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;
+        crate::mods::ci(ws, game)
     })());
     gate(&mut gates, "web-gpu", "M5", (|| {
         let ok = crate::webtest::run(ws, &["gpu"])?;

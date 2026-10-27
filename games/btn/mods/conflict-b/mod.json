@@ -1,0 +1,12 @@
+{
+  "id": "conflict-b",
+  "version": "0.1.0",
+  "game": "btn",
+  "hooks": [
+    {
+      "kind": "patch",
+      "target": { "symbol": "Rand" },
+      "impl": { "file": "src/rand.c", "function": "rand_b" }
+    }
+  ]
+}

@@ -10,6 +10,10 @@ pub struct Lockfile {
     pub game: BTreeMap<String, RepoPin>,
     #[serde(default)]
     pub sdk: BTreeMap<String, RepoPin>,
+    /// Each game's mods repository (M11), which the CI gate `mods` checks,
+    /// builds and tests.
+    #[serde(default)]
+    pub mods: BTreeMap<String, RepoPin>,
     /// The device oracle's images and their sources (M3). Optional so a
     /// lockfile without them still parses.
     #[serde(default)]

@@ -216,6 +216,11 @@ How each tier is produced:
     `-msoft-float` (its results come from the game's own soft-float
     routines).
 
+  Every non-inline function compiles `weak` and `noinline` (D50), so each
+  call the original makes stays a call, as GCC 2.95 at `-O2` left it: a
+  mod's hook sees it, and clang's inlining doesn't move where loops spend
+  the safepoint budget.
+
   At link time, C inputs also reproduce what GCC 2.95 did that clang doesn't
   (the `Gcc` conventions): divisions give the R3000's results and the
   original assembler's `break` checks instead of trapping; `memcpy` with a

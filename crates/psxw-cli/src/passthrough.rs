@@ -49,8 +49,9 @@ fn val_type(t: wasmparser::ValType) -> &'static str {
     }
 }
 
-/// Write the mod into `out`; returns how many functions it hooks.
-pub fn generate(ws: &Workspace, game: &str, out: &Path) -> Result<usize> {
+/// Write the mod into `out`; returns how many functions it hooks. `tiers`
+/// limits it to functions of those tiers (`c`, `lift`, `adapter`).
+pub fn generate(ws: &Workspace, game: &str, out: &Path, tiers: Option<&[&str]>) -> Result<usize> {
     let (prep, table) = psxw_modkit::build::table(ws, game)?;
     let mut hooks = Vec::new();
     let mut src = String::new();
@@ -58,6 +59,14 @@ pub fn generate(ws: &Workspace, game: &str, out: &Path) -> Result<usize> {
     let mut n = 0;
     for (k, f) in table.functions.iter().enumerate() {
         if f.expanded {
+            continue;
+        }
+        let tier = match f.tier {
+            psxw_modkit::symbols::TierName::C => "c",
+            psxw_modkit::symbols::TierName::Lift => "lift",
+            psxw_modkit::symbols::TierName::Adapter => "adapter",
+        };
+        if tiers.is_some_and(|t| !t.contains(&tier)) {
             continue;
         }
         // (return type, parameter types, variadic)
@@ -128,7 +137,15 @@ pub fn generate(ws: &Workspace, game: &str, out: &Path) -> Result<usize> {
     }
     let mut bv = String::from("/* Structs passed by value, by size and alignment. */\n#pragma once\n");
     for (size, align) in &structs {
-        let _ = writeln!(bv, "struct psxw_bv_{size}_{align} {{ unsigned char b[{size}]; }} __attribute__((aligned({align})));");
+        // Elements as wide as the alignment, so the struct's natural
+        // alignment is the original's.
+        let el = match align {
+            8 => "unsigned long long",
+            4 => "unsigned int",
+            2 => "unsigned short",
+            _ => "unsigned char",
+        };
+        let _ = writeln!(bv, "struct psxw_bv_{size}_{align} {{ {el} b[{}]; }};", size / (*align).max(1));
     }
     let _ = std::fs::remove_dir_all(out);
     std::fs::create_dir_all(out.join("src"))?;

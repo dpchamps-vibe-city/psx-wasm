@@ -16,11 +16,17 @@ pub fn run(ws: &Workspace, game: &str, sym: &str) -> Result<bool> {
     let (prep, table) = psxw_modkit::build::table(ws, game)?;
     let (c, addr, size, what) = table.resolve_data(&Target { symbol: Some(sym.to_string()), ..Default::default() })?;
     let end = addr + size.unwrap_or(4).max(1);
-    let gp0 = prep.inputs.exe.gp0;
+    // $gp: the one constant the startup code writes to it, else the
+    // executable header's.
+    let written: BTreeSet<u32> = prep.translations.iter().flat_map(|t| t.facts.gp_writes.iter().copied()).collect();
+    let gp0 = match written.len() {
+        1 => *written.first().expect("one"),
+        _ => prep.inputs.exe.gp0,
+    };
     let mut writers: BTreeMap<(String, u32), Vec<u32>> = BTreeMap::new();
     let mut lost: BTreeSet<(String, u32)> = BTreeSet::new();
     for t in &prep.translations {
-        let gp_fixed = t.facts.gp_writes.is_empty();
+        let gp_fixed = t.facts.gp_writes.is_empty() && gp0 != 0;
         for (n, d) in &t.graph.nodes {
             let i = &d.insn;
             if !i.op.is_store() {

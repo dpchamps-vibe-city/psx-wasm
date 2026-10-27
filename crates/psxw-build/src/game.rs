@@ -45,11 +45,6 @@ pub struct Options {
 pub struct ModPlan {
     /// Where the build's outputs go, instead of `out/<game>/`.
     pub out: PathBuf,
-    /// Census translation units to recompile with these functions made
-    /// weak and noinline, by (container, object stem): hooked functions and
-    /// `from` callers, so clang neither inlines their calls nor uses their
-    /// bodies to elide them.
-    pub noinline: BTreeMap<(String, String), BTreeSet<String>>,
     /// Mod objects; `spec` indexes them from 0.
     pub inputs: Vec<Input>,
     pub spec: ModSpec,
@@ -176,8 +171,7 @@ pub struct Prepared {
     spec: GameSpec,
 }
 
-/// A build's inputs and tiers. With mods, the translation units their
-/// plan names are recompiled with functions weak and noinline.
+/// A build's inputs and tiers.
 pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     // Incremental: cheap when the runtime hasn't changed.
     let runtime_path = crate::runtime::build(ws)?;
@@ -245,70 +239,52 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         ubsan_flags.push(format!("-fsanitize-ignorelist={}", ignorelist.display()));
     }
     let ubsan_flags: Vec<&str> = ubsan_flags.iter().map(String::as_str).collect();
-    let noinline = opts.mods.as_ref().map(|m| &m.noinline);
-    let hook_dir = opts.mods.as_ref().map(|m| m.out.join("noinline"));
+    // GCC 2.95's call structure (D50): every non-inline function weak and
+    // noinline, as GCC at -O2 left every call to one. Each call the
+    // original makes is then a call here (a mod's hook sees it), and
+    // clang's inlining doesn't decide where loops spend the safepoint
+    // budget, so hooking a function doesn't change the game's timing.
+    let calls_dir = out_dir(ws, &opts.game).join("calls");
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
             let stem = o.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-            let i_path = o.with_extension("i");
-            // Hooked functions and `from` callers: weak and noinline.
-            if let (Some(names), Some(dir)) = (noinline.and_then(|n| n.get(&(c.clone(), stem.clone()))), &hook_dir) {
-                ensure!(!opts.ubsan, "a UBSan build can't link mods");
-                let dir = dir.join(c);
-                std::fs::create_dir_all(&dir)?;
-                let text = std::fs::read_to_string(&i_path)?;
-                let variant = psxw_cc::ast::hook_variant(&text, names);
-                let vi = dir.join(format!("{stem}.i"));
-                let vo = dir.join(format!("{stem}.o"));
-                if std::fs::read_to_string(&vi).ok().as_deref() != Some(variant.as_str()) || !vo.is_file() {
-                    std::fs::write(&vi, &variant)?;
-                    clang.compile_variant(&vi, &vo, &[])?;
+            let names: BTreeSet<String> = WasmObject::read(o)?
+                .symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Function && s.defined)
+                .map(|s| s.name.clone())
+                .collect();
+            let text = std::fs::read_to_string(o.with_extension("i"))?;
+            let variant = psxw_cc::ast::hook_variant(&text, &names);
+            let (dir, flags): (PathBuf, &[&str]) = if opts.ubsan { (ubsan_dir.join(c), &ubsan_flags) } else { (calls_dir.join(c), &[]) };
+            std::fs::create_dir_all(&dir)?;
+            let vi = dir.join(format!("{stem}.i"));
+            let vo = dir.join(format!("{stem}.o"));
+            let older = |a: &Path, b: &Path| -> bool {
+                match (std::fs::metadata(a).and_then(|m| m.modified()), std::fs::metadata(b).and_then(|m| m.modified())) {
+                    (Ok(x), Ok(y)) => x < y,
+                    _ => true,
                 }
-                let protos: BTreeMap<String, Proto> =
-                    psxw_cc::protos::cached(&clang, &vi)?.into_iter().fold(BTreeMap::new(), |mut m, p| {
-                        if p.defined || !m.contains_key(&p.name) {
-                            m.insert(p.name.clone(), p);
-                        }
-                        m
-                    });
-                return Ok(Input {
-                    label: format!("{c}/{stem} (hooked)"),
-                    container: c.clone(),
-                    obj: WasmObject::read(&vo)?,
-                    protos,
-                    generated: false,
-                    gcc: Some(gcc),
-                });
-            }
-            let obj_path = if opts.ubsan {
-                let dir = ubsan_dir.join(c);
-                std::fs::create_dir_all(&dir)?;
-                let out = dir.join(o.file_name().unwrap_or_default());
-                let i = o.with_extension("i");
-                let fresh = match (std::fs::metadata(&out), std::fs::metadata(&i), std::fs::metadata(&ignorelist)) {
-                    (Ok(a), Ok(b), Ok(l)) => a.modified()? >= b.modified()?.max(l.modified()?),
-                    _ => false,
-                };
-                if !fresh {
-                    clang.compile_variant(&i, &out, &ubsan_flags)?;
-                }
-                out
-            } else {
-                o.clone()
             };
-            let protos: BTreeMap<String, Proto> = psxw_cc::protos::cached(&clang, &o.with_extension("i"))?
-                .into_iter()
-                .fold(BTreeMap::new(), |mut m, p| {
+            let stale = std::fs::read_to_string(&vi).ok().as_deref() != Some(variant.as_str())
+                || !vo.is_file()
+                || (opts.ubsan && older(&vo, &ignorelist));
+            if stale {
+                std::fs::write(&vi, &variant)?;
+                clang.compile_variant(&vi, &vo, flags)?;
+            }
+            let protos: BTreeMap<String, Proto> =
+                psxw_cc::protos::cached(&clang, &vi)?.into_iter().fold(BTreeMap::new(), |mut m, p| {
                     if p.defined || !m.contains_key(&p.name) {
                         m.insert(p.name.clone(), p);
                     }
                     m
                 });
             Ok(Input {
-                label: format!("{c}/{}", o.file_stem().unwrap_or_default().to_string_lossy()),
+                label: format!("{c}/{stem}"),
                 container: c.clone(),
-                obj: WasmObject::read(&obj_path)?,
+                obj: WasmObject::read(&vo)?,
                 protos,
                 generated: false,
                 gcc: Some(gcc),

@@ -1,0 +1,9 @@
+{
+  "replay": { "name": "title-to-gameplay" },
+  "frames": 1200,
+  "expect": [
+    { "kind": "no_trap" },
+    { "kind": "log", "contains": "frames 100" },
+    { "kind": "log", "contains": "frames 200" }
+  ]
+}

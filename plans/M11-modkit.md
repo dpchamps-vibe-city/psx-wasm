@@ -200,14 +200,15 @@ program makes to the target's address:
 A jump into the middle of a function (an interior entry) is not a call
 and fires nothing, as on the hardware.
 
-**Inlining.** psxw-cc compiles at `-O2`, so clang inlines calls between
-functions in one translation unit. GCC 2.95 at `-O2` does not inline
-functions that aren't declared `inline`, so those calls exist in the
-original program. The build therefore recompiles each translation unit
-that defines a hooked target with the target marked `noinline`. For
-`from`, the caller's translation unit is recompiled the same way.
-`wasm-opt` runs after the link, when every call already goes to the
-generated entry, so its inlining keeps the hooks.
+**Inlining.** psxw-cc compiles at `-O2`, and clang would inline calls
+between functions in one translation unit. GCC 2.95 at `-O2` does not
+inline functions that aren't declared `inline`, so those calls exist in
+the original program. Every build therefore compiles each non-inline
+function of the game's C `weak` and `noinline` (D50): every call the
+original makes is a call, hooked or not, so hooking needs no recompile
+and doesn't change where loops spend the safepoint budget. `wasm-opt`
+runs after the link, when every call already goes to the generated
+entry, so its inlining keeps the hooks.
 
 ### What mod code sees
 
@@ -358,9 +359,10 @@ or whose game identity doesn't match the running game.
 4. [ ] **Compile mod sources** with psxw-cc: the game's flags plus the
    mod's include directory. Check that each `impl` is defined where
    declared and that its signature agrees with the target's.
-5. [ ] **`noinline` rebuilds:** recompile each translation unit that
-   defines a hooked target, and each `from` caller's, with the target
-   `noinline`. Cache by the set of `noinline` names.
+5. [ ] **The original's calls:** every build compiles the game's C with
+   each non-inline function `weak` and `noinline` (D50; at first, only
+   hooked targets' and `from` callers' translation units were recompiled
+   so, which changed the game's timing).
 6. [ ] **Linker:**
    - one generated entry per hooked (container, address);
    - rebind to it every direct C call, translated call, dispatch-table
@@ -404,7 +406,9 @@ or whose game identity doesn't match the running game.
       - `symbol`: `{ "at", "symbol", "op", "value" }`;
       - `log`: `{ "contains" }`, a line the mod logged.
     - **`check`:** `{ "command": [...] }`, run with the trace as JSON on
-      stdin; exit status 0 passes.
+      stdin; exit status 0 passes. With `"baseline": true` the JSON also
+      holds the plain game's trace over the same replay (`baseline`), so a
+      check can test itself.
 
     `psxw mod play <mod|set>` builds the web bundle with the mods and
     serves it.
@@ -576,7 +580,7 @@ u32 better_rand(s32 limit) {
     { "kind": "no_trap" },
     { "kind": "deterministic" }
   ],
-  "check": { "command": ["python3", "check_sequence.py"] }
+  "check": { "command": ["python3", "check_sequence.py"], "baseline": true }
 }
 ```
 

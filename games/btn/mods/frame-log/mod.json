@@ -1,0 +1,12 @@
+{
+  "id": "frame-log",
+  "version": "0.1.0",
+  "game": "btn",
+  "hooks": [
+    {
+      "kind": "after",
+      "target": { "point": "frame" },
+      "impl": { "file": "src/frame.c", "function": "on_frame" }
+    }
+  ]
+}

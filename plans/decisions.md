@@ -497,6 +497,27 @@ port. The machinery to force it would cost more than it tells us.
 running anything. Every hook has the semantics the game itself defines,
 and the API is the same in every language.
 
+**D50. Game C keeps GCC 2.95's call structure** (M11). Every non-inline
+function of the game's C compiles `weak` and `noinline`, in every build:
+- clang neither inlines its calls nor uses its body to fold, specialize
+  or delete them, which is what GCC 2.95 at `-O2` did with a function not
+  declared `inline`;
+- `static` functions lose `static` for it (a weak definition can't be
+  internal); the linker resolves by address, not name, so nothing
+  collides;
+- `inline` functions are left alone: GCC inlined them too.
+
+*Why:* a hook must fire on every call the original program makes, and
+hooking must not change the game's timing. Safepoints are spent per wasm
+loop header, so with clang's inlining, recompiling a hooked function's
+translation unit changed where loops spent the budget, hence when
+interrupts arrived: a pass-through hook on every C function diverged from
+the plain build by frame 210 of `title-to-gameplay`. With the call
+structure fixed in every build, the plain build and the pass-through are
+bit-identical. Its cost is within run-to-run noise on that replay: 6000
+headless frames took 166 and 169 s with inlining, 174 and 168 s
+without.
+
 ## Open questions (tracked)
 
 - **Q1.** Webview shell (Tauri) or browser tab only. Decided: browser

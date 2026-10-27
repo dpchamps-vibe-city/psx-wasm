@@ -219,6 +219,8 @@ struct Ctx<'a> {
     mod_sp: u32,
     hook_sp: u32,
     hook_id: u32,
+    /// The first of the overlay data patches' pending flags (globals).
+    pending: u32,
     /// Synthetic MIPS addresses of mod functions: (input, local function).
     synthetic: BTreeMap<(usize, u32), u32>,
     /// Hooked functions' entries: (container, address, from-caller).
@@ -1063,28 +1065,60 @@ fn mod_init(ctx: &Ctx) -> Result<Function> {
     Ok(f)
 }
 
-/// `psxmod_loaded(addr, len)`: each overlay's data patches, byte by byte
-/// where the disc's write covered them, when the overlay's first code
-/// words are resident.
+/// The overlay data patches, in order: each with its pending flag's global.
+fn overlay_patches<'a>(ctx: &Ctx<'a>) -> Vec<(&'a crate::mods::DataPatch, u32)> {
+    ctx.spec
+        .mods
+        .iter()
+        .flat_map(|m| &m.data)
+        .filter(|d| d.resident.is_some())
+        .enumerate()
+        .map(|(k, d)| (d, ctx.pending + k as u32))
+        .collect()
+}
+
+/// `psxmod_loaded(addr, len)`: a disc write over an overlay patch's bytes
+/// marks it pending; a pending patch is applied once its overlay's first
+/// code words are resident (the write that brings them may come before or
+/// after the patch's, in another sector).
 fn mod_loaded(ctx: &Ctx) -> Result<Function> {
-    let mut f = Function::new([(1, ValType::I32)]);
-    let phys = 2;
-    let mut by: BTreeMap<String, Vec<&crate::mods::DataPatch>> = BTreeMap::new();
-    for d in ctx.spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_some()) {
-        by.entry(d.container.clone()).or_default().push(d);
-    }
-    if !by.is_empty() {
+    let mut f = Function::new([(2, ValType::I32)]);
+    let (phys, end) = (2, 3);
+    let patches = overlay_patches(ctx);
+    if !patches.is_empty() {
         f.instruction(&I::LocalGet(0));
         f.instruction(&I::I32Const(0x1F_FFFF));
         f.instruction(&I::I32And);
-        f.instruction(&I::LocalSet(phys));
+        f.instruction(&I::LocalTee(phys));
+        f.instruction(&I::LocalGet(1));
+        f.instruction(&I::I32Add);
+        f.instruction(&I::LocalSet(end));
+    }
+    for &(d, g) in &patches {
+        let a = (d.addr & 0x1F_FFFF) as i32;
+        // a < end && phys < a + len
+        f.instruction(&I::I32Const(a));
+        f.instruction(&I::LocalGet(end));
+        f.instruction(&I::I32LtU);
+        f.instruction(&I::LocalGet(phys));
+        f.instruction(&I::I32Const(a + d.len() as i32));
+        f.instruction(&I::I32LtU);
+        f.instruction(&I::I32And);
+        f.instruction(&I::If(BlockType::Empty));
+        f.instruction(&I::I32Const(1));
+        f.instruction(&I::GlobalSet(g));
+        f.instruction(&I::End);
     }
     let load = |f: &mut Function, a: u32| {
         f.instruction(&I::I32Const((a & WINDOW_MASK) as i32));
         f.instruction(&I::I32Load(MemArg { offset: WINDOW_BASE as u64, align: 2, memory_index: 0 }));
     };
-    for patches in by.values() {
-        let id = patches[0].resident.expect("overlay patch");
+    let mut by: BTreeMap<String, Vec<(&crate::mods::DataPatch, u32)>> = BTreeMap::new();
+    for &(d, g) in &patches {
+        by.entry(d.container.clone()).or_default().push((d, g));
+    }
+    for group in by.values() {
+        let id = group[0].0.resident.expect("overlay patch");
         load(&mut f, id.at);
         f.instruction(&I::I32Const(id.words[0] as i32));
         f.instruction(&I::I32Eq);
@@ -1093,18 +1127,15 @@ fn mod_loaded(ctx: &Ctx) -> Result<Function> {
         f.instruction(&I::I32Eq);
         f.instruction(&I::I32And);
         f.instruction(&I::If(BlockType::Empty));
-        for d in patches {
+        for &(d, g) in group {
+            f.instruction(&I::GlobalGet(g));
+            f.instruction(&I::If(BlockType::Empty));
             for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
-                let a = d.addr + k as u32;
-                f.instruction(&I::I32Const((a & 0x1F_FFFF) as i32));
-                f.instruction(&I::LocalGet(phys));
-                f.instruction(&I::I32Sub);
-                f.instruction(&I::LocalGet(1));
-                f.instruction(&I::I32LtU);
-                f.instruction(&I::If(BlockType::Empty));
-                store_byte(&mut f, a, b);
-                f.instruction(&I::End);
+                store_byte(&mut f, d.addr + k as u32, b);
             }
+            f.instruction(&I::I32Const(0));
+            f.instruction(&I::GlobalSet(g));
+            f.instruction(&I::End);
         }
         f.instruction(&I::End);
     }
@@ -1295,6 +1326,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         mod_sp: 4,
         hook_sp: 5,
         hook_id: 6,
+        pending: 7,
         synthetic: BTreeMap::new(),
         heads: HashMap::new(),
         bindings: HashMap::new(),
@@ -1445,8 +1477,10 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     let mut globals = GlobalSection::new();
     let mut inits = vec![0, 0, spec.budget as i32, 0];
     if has_mods {
-        // The mod stack (a guest address), the hook frame's sp and id.
+        // The mod stack (a guest address), the hook frame's sp and id, then
+        // a pending flag per overlay data patch.
         inits.extend([(0x8000_0000u32 | psxw_abi::phys::MOD_STACK.end) as i32, 0, 0]);
+        inits.extend(overlay_patches(&ctx).iter().map(|_| 0));
     }
     for init in inits {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));

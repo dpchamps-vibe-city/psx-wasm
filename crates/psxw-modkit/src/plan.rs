@@ -45,7 +45,7 @@ impl LayerPlan {
             k.push("before".to_string());
         }
         match &self.patch {
-            Some(p) if p.original.is_some() => k.push("patch, wrapping".into()),
+            Some(p) if p.original.is_some() => k.push("patch with original".into()),
             Some(_) => k.push("patch".into()),
             None => {}
         }

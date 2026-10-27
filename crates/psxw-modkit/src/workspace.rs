@@ -324,41 +324,7 @@ pub fn sdk(ws: &ModsWorkspace, bump: bool) -> Result<SdkOutcome> {
             );
         }
     }
-    let (_, table) = crate::build::table(&psx, &game)?;
-    let sdk = ws.sdk_dir();
-    let _ = std::fs::remove_dir_all(&sdk);
-    std::fs::create_dir_all(&sdk)?;
-    // The decomp's headers at the pin.
-    let manifest = psx.game(&game)?;
-    let snap = crate::build::snapshot(&psx, &game)?;
-    let mut includes = Vec::new();
-    for inc in &manifest.c.include {
-        let rel = Path::new("game").join(inc);
-        let src = snap.join(inc);
-        if src.is_dir() {
-            copy_tree(&src, &sdk.join(&rel), &["h", "inc"])?;
-        }
-        includes.push(rel.to_string_lossy().into_owned());
-    }
-    std::fs::write(sdk.join("psxw_prelude.h"), psxw_cc::PRELUDE)?;
-    std::fs::create_dir_all(sdk.join("include"))?;
-    std::fs::write(sdk.join("include").join("psxmod.h"), genfiles::PSXMOD_H)?;
-    let flags = SdkFlags {
-        clang: psx.clang()?.display().to_string(),
-        std: genfiles::STD.trim_start_matches("-std=").into(),
-        prelude: "psxw_prelude.h".into(),
-        includes,
-        defines: manifest.c.defines.clone(),
-        prelude_headers: manifest.probe.prelude.clone(),
-    };
-    std::fs::write(sdk.join("flags.json"), serde_json::to_string_pretty(&flags)?)?;
-    std::fs::write(sdk.join("symbols.json"), serde_json::to_string(&table)?)?;
-    std::fs::write(sdk.join("identity.json"), serde_json::to_string_pretty(&identity)?)?;
-    let schemas = sdk.join("schema");
-    std::fs::create_dir_all(&schemas)?;
-    for (name, text) in crate::SCHEMAS {
-        std::fs::write(schemas.join(name), text)?;
-    }
+    let table = sdk_into(ws, &psx)?;
 
     // Every mod against it.
     let mods = ws.all()?;
@@ -403,4 +369,50 @@ pub fn sdk(ws: &ModsWorkspace, bump: bool) -> Result<SdkOutcome> {
         ws.generate(&table, &mods, &plan)?;
     }
     Ok(SdkOutcome { plan, mods, moved, lock })
+}
+
+/// Export the mod SDK at psx-wasm's pins into the workspace's state
+/// directory (`.psxw/sdk/`): the decomp's headers, the symbol table with
+/// the header index, the compile flags, the game's identity hashes and the
+/// schemas. No game bytes.
+pub fn sdk_into(ws: &ModsWorkspace, psx: &Workspace) -> Result<SymbolTable> {
+    let game = ws.game().to_string();
+    let (_, identity) = pins(psx, &game)?;
+    let (_, table) = crate::build::table(psx, &game)?;
+    let sdk = ws.sdk_dir();
+    let _ = std::fs::remove_dir_all(&sdk);
+    std::fs::create_dir_all(&sdk)?;
+    // The decomp's headers at the pin.
+    let manifest = psx.game(&game)?;
+    let snap = crate::build::snapshot(psx, &game)?;
+    let mut includes = Vec::new();
+    for inc in &manifest.c.include {
+        let rel = Path::new("game").join(inc);
+        let src = snap.join(inc);
+        if src.is_dir() {
+            copy_tree(&src, &sdk.join(&rel), &["h", "inc"])?;
+        }
+        includes.push(rel.to_string_lossy().into_owned());
+    }
+    std::fs::write(sdk.join("psxw_prelude.h"), psxw_cc::PRELUDE)?;
+    std::fs::create_dir_all(sdk.join("include"))?;
+    std::fs::write(sdk.join("include").join("psxmod.h"), genfiles::PSXMOD_H)?;
+    includes.push("include".into());
+    let flags = SdkFlags {
+        clang: psx.clang()?.display().to_string(),
+        std: genfiles::STD.trim_start_matches("-std=").into(),
+        prelude: "psxw_prelude.h".into(),
+        includes,
+        defines: manifest.c.defines.clone(),
+        prelude_headers: manifest.probe.prelude.clone(),
+    };
+    std::fs::write(sdk.join("flags.json"), serde_json::to_string_pretty(&flags)?)?;
+    std::fs::write(sdk.join("symbols.json"), serde_json::to_string(&table)?)?;
+    std::fs::write(sdk.join("identity.json"), serde_json::to_string_pretty(&identity)?)?;
+    let schemas = sdk.join("schema");
+    std::fs::create_dir_all(&schemas)?;
+    for (name, text) in crate::SCHEMAS {
+        std::fs::write(schemas.join(name), text)?;
+    }
+    Ok(table)
 }
