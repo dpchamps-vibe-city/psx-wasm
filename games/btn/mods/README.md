@@ -11,3 +11,7 @@ separate `btn-mods` repository that `inputs.lock` pins.
   counter in mod data and logging through `psxmod_log`.
 - `wrap-rand`: `before`, `after` and a wrapping `patch` on `Rand`; it
   checks every result against the original's range.
+- `data-patches`: a `fnptr` patch into the executable's message window
+  handler table (the game then calls a mod function through its own
+  table), and a `u16` patch into the title overlay's data, applied as the
+  overlay loads.

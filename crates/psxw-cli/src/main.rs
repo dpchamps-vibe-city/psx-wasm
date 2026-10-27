@@ -96,6 +96,10 @@ fn run() -> Result<()> {
                 let dir = snapshot::ensure(&ws, name, pin)?;
                 eprintln!("{name}: {} → {}", pin.short(), dir.display());
             }
+            for (game, pin) in &ws.lock.mods {
+                let dir = snapshot::ensure(&ws, &format!("{game}-mods"), pin)?;
+                eprintln!("{game} mods: {} → {}", pin.short(), dir.display());
+            }
         }
         ["census", game, rest @ ..] => {
             let mut opts = psxw_census::Options { game: game.to_string(), only: None, probe: true, only_header: None };
@@ -224,8 +228,16 @@ fn run() -> Result<()> {
         }
         ["build-web", game, rest @ ..] => {
             let (dirs, rest) = mod_args(rest)?;
-            if !rest.is_empty() {
-                bail!("unknown build-web option {}", rest[0]);
+            let moddable = rest.iter().any(|a| a == "--moddable");
+            if let Some(o) = rest.iter().find(|a| *a != "--moddable") {
+                bail!("unknown build-web option {o}");
+            }
+            if moddable {
+                ensure!(dirs.is_empty(), "a moddable bundle links no mods; load them in the page");
+                let (r, _) = psxw_build::game::build(&ws, &psxw_build::game::Options { moddable: true, ..psxw_build::game::Options::new(game) })?;
+                let dir = psxw_build::web::bundle(&ws, game, &r, ws.out_dir().join("web").join(format!("{game}-moddable")))?;
+                eprintln!("moddable web bundle: {} (serve it with `psxw serve {}`; add mods in the page)", dir.display(), dir.display());
+                return Ok(());
             }
             let dir = match with_mods(&ws, game, &dirs)? {
                 Some(r) => {
@@ -329,6 +341,7 @@ fn run() -> Result<()> {
                 match *a {
                     "--debug-io" => opts.debug_io = true,
                     "--ubsan" => opts.ubsan = true,
+                    "--moddable" => opts.moddable = true,
                     "--original" => match it.next() {
                         Some(l) => opts.original.extend(l.split(',').map(str::to_string)),
                         None => bail!("--original needs a library list"),

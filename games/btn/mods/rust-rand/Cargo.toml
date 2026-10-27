@@ -1,0 +1,23 @@
+# A mod in Rust (plans/M11): a no_std cdylib for wasm32-unknown-unknown,
+# linked with --emit-relocs and --allow-undefined (.cargo/config.toml) so
+# psxw can place it in the mod area and bind the game's symbols.
+[package]
+name = "rust-rand"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+psx-mod = { path = "../../../../crates/psx-mod" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+
+# Its own workspace, not psx-wasm's.
+[workspace]

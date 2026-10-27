@@ -42,6 +42,14 @@ pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Ve
             "--dump-dir" => o.dump_dir = Some(val()?.into()),
             "--trace-u32" => o.trace_u32 = psxw_inputs::parse_u32(&val()?),
             "--wasm" => o.wasm = val()?.into(),
+            // A moddable base's mods (plans/M11 phase 2).
+            "--load-mod" => o.mods.push(val()?.into()),
+            "--swap-mod" => {
+                let v = val()?;
+                let mut p = v.splitn(3, ':');
+                let (Some(f), Some(i), Some(path)) = (p.next(), p.next(), p.next()) else { bail!("--swap-mod FRAME:INDEX:PATH") };
+                o.swaps.push(psxw_host_native::ModSwap { frame: f.parse()?, index: i.parse()?, path: path.into() });
+            }
             "--check" => checks.push(val()?),
             "--verbose" => o.verbose = true,
             "--render" => {

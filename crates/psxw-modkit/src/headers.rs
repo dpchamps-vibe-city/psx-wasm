@@ -14,6 +14,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::Node;
 
+/// Bumped when the index reads headers differently (its cache key).
+pub const INDEX_VERSION: u32 = 2;
+
 /// A function's declaration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Decl {
@@ -125,7 +128,9 @@ const STORAGE: &[&str] = &["extern", "static", "inline", "__inline", "__inline__
 fn decl_of(ast: &Ast, node: Node, header: &str, context: &[String]) -> Option<(String, Decl)> {
     let d = node.child_by_field_name("declarator")?;
     let f = innermost_function(d)?;
-    let name_n = name_node(f.child_by_field_name("declarator")?)?;
+    // A function's declarator holds its name directly; `(*table[4])(int)`
+    // is data (an array of pointers to functions).
+    let name_n = f.child_by_field_name("declarator").filter(|n| n.kind() == "identifier")?;
     let name = ast.text(name_n).to_string();
     let params_n = f.child_by_field_name("parameters")?;
     let mut params = Vec::new();
@@ -186,12 +191,75 @@ fn decl_of(ast: &Ast, node: Node, header: &str, context: &[String]) -> Option<(S
     Some((name, Decl { header: header.to_string(), context: context.to_vec(), text, returns, params, variadic, prototyped }))
 }
 
+/// The functions a preprocessed text declares (with prototypes, at file
+/// scope), in order.
+pub fn function_names(text: &str) -> Vec<String> {
+    let tree = ast::parse(text);
+    let root = tree.tree.root_node();
+    let mut c = root.walk();
+    let mut out = Vec::new();
+    for node in root.named_children(&mut c) {
+        if !matches!(node.kind(), "declaration" | "function_definition") {
+            continue;
+        }
+        let mut c2 = node.walk();
+        if node.named_children(&mut c2).any(|n| n.kind() == "storage_class_specifier" && matches!(tree.text(n), "typedef" | "static")) {
+            continue;
+        }
+        if let Some((name, d)) = decl_of(&tree, node, "", &[]) {
+            if d.prototyped && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Each function a preprocessed text declares, as a typedef of a pointer
+/// to its type, spelled from its own declaration (the name becomes
+/// `(*<prefix><name>)`): (name, typedef).
+pub fn function_typedefs(text: &str, prefix: &str) -> Vec<(String, String)> {
+    let tree = ast::parse(text);
+    let root = tree.tree.root_node();
+    let mut c = root.walk();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for node in root.named_children(&mut c) {
+        if node.kind() != "declaration" {
+            continue;
+        }
+        let mut c2 = node.walk();
+        if node.named_children(&mut c2).any(|n| n.kind() == "storage_class_specifier" && matches!(tree.text(n), "typedef" | "static")) {
+            continue;
+        }
+        let Some(d) = node.child_by_field_name("declarator") else { continue };
+        let Some(f) = innermost_function(d) else { continue };
+        let Some(id) = f.child_by_field_name("declarator").filter(|n| n.kind() == "identifier") else { continue };
+        let name = tree.text(id).to_string();
+        if out.iter().any(|(n, _)| *n == name) || f.child_by_field_name("parameters").is_none_or(|p| tree.text(p) == "()") {
+            continue;
+        }
+        let start = node.start_byte();
+        let full = tree.text(node);
+        let (a, b) = (id.start_byte() - start, id.end_byte() - start);
+        let spelled = format!("{}(*{prefix}{name}){}", &full[..a], &full[b..]);
+        let words: Vec<&str> = spelled.split_whitespace().collect();
+        let kept: Vec<&str> = words.into_iter().filter(|w| !STORAGE.contains(w)).collect();
+        out.push((name, format!("typedef {}", kept.join(" "))));
+    }
+    out
+}
+
+fn ast_has_function_declarator(node: Node) -> bool {
+    node.child_by_field_name("declarator").is_some_and(|d| innermost_function(d).is_some())
+}
+
 /// Read one preprocessed header: (functions, globals).
 fn read(text: &str, header_path: &str, rel: &str, context: &[String]) -> (Vec<(String, Decl)>, Vec<(String, DataDecl)>) {
     let map = LineMap::new(text);
     let tree = ast::parse(text);
     let in_header = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| f == header_path);
     let mut funcs = Vec::new();
+    let mut fptrs = Vec::new();
     let root = tree.tree.root_node();
     let mut c = root.walk();
     for node in root.named_children(&mut c) {
@@ -202,11 +270,18 @@ fn read(text: &str, header_path: &str, rel: &str, context: &[String]) -> (Vec<(S
         if node.named_children(&mut c2).any(|n| n.kind() == "storage_class_specifier" && tree.text(n) == "typedef") {
             continue;
         }
-        if let Some(d) = decl_of(&tree, node, rel, context) {
-            funcs.push(d);
+        match decl_of(&tree, node, rel, context) {
+            Some(d) => funcs.push(d),
+            // Pointers to functions, and tables of them, are data.
+            None if node.kind() == "declaration" && ast_has_function_declarator(node) => {
+                if let Some(name) = node.child_by_field_name("declarator").and_then(|d| tree.declarator_name(d)) {
+                    fptrs.push((name, DataDecl { header: rel.to_string(), context: context.to_vec(), text: collapse(tree.text(node)) }));
+                }
+            }
+            None => {}
         }
     }
-    let data = tree
+    let mut data: Vec<(String, DataDecl)> = tree
         .objects()
         .into_iter()
         .filter(|o| in_header(o.start))
@@ -215,6 +290,7 @@ fn read(text: &str, header_path: &str, rel: &str, context: &[String]) -> (Vec<(S
             (o.name, DataDecl { header: rel.to_string(), context: context.to_vec(), text })
         })
         .collect();
+    data.extend(fptrs);
     (funcs, data)
 }
 
@@ -302,7 +378,7 @@ mod tests {
 
     #[test]
     fn spelled_types() {
-        let d = decls("extern u32 Rand(s32 limit);\nu8 *GetPtr(void);\nvoid (*GetCb(int a))(int);\nint printf(const char *fmt, ...);\nvoid Old();\nvoid Cb(void (*fn)(int), int arr[4]);\n");
+        let d = decls("extern u32 Rand(s32 limit);\nextern int (*gTable[4])(int);\nu8 *GetPtr(void);\nvoid (*GetCb(int a))(int);\nint printf(const char *fmt, ...);\nvoid Old();\nvoid Cb(void (*fn)(int), int arr[4]);\n");
         let by: BTreeMap<_, _> = d.into_iter().collect();
         let r = &by["Rand"];
         assert_eq!((r.returns.as_str(), r.params[0].ty.as_str(), r.params[0].name.as_deref()), ("u32", "s32", Some("limit")));
@@ -313,5 +389,24 @@ mod tests {
         assert!(!by["Old"].prototyped);
         assert_eq!(by["Cb"].params[0].ty, "void (*)(int)");
         assert_eq!(by["Cb"].params[1].ty, "int [4]");
+        assert!(!by.contains_key("gTable"));
+    }
+
+    #[test]
+    fn function_typedefs() {
+        let t = super::function_typedefs("extern u32 Rand(s32 limit);\nvoid (*GetCb(int a))(int);\nvoid Old();\nint printf(const char *f, ...);\n", "P_");
+        let by: BTreeMap<_, _> = t.into_iter().collect();
+        assert_eq!(by["Rand"], "typedef u32 (*P_Rand)(s32 limit);");
+        assert_eq!(by["GetCb"], "typedef void (*(*P_GetCb)(int a))(int);");
+        assert_eq!(by["printf"], "typedef int (*P_printf)(const char *f, ...);");
+        assert!(!by.contains_key("Old"));
+    }
+
+    #[test]
+    fn function_pointer_tables_are_data() {
+        let (f, d) = read("# 1 \"inc/h.h\"\nextern int (*gTable[21])(short *);\nextern void (*gHook)(void);\n", "inc/h.h", "h.h", &[]);
+        assert!(f.is_empty());
+        let names: Vec<&str> = d.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["gTable", "gHook"]);
     }
 }

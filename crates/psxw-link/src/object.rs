@@ -324,7 +324,10 @@ pub fn classify_name(name: &str) -> NameClass<'_> {
 fn symbol(info: SymbolInfo<'_>, func_imports: &[FuncImport], global_imports: &[String]) -> Symbol {
     let (kind, flags, name, index, data) = match info {
         SymbolInfo::Func { flags, index, name } => {
+            // A final module (wasm-ld --emit-relocs) names imports by the
+            // import, with an empty symbol name.
             let name = name
+                .filter(|n| !n.is_empty())
                 .map(str::to_string)
                 .or_else(|| func_imports.get(index as usize).map(|i| i.name.clone()))
                 .unwrap_or_default();

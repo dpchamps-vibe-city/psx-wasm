@@ -8,7 +8,7 @@ use crate::genfiles::{self, Flags};
 use crate::headers::{self, HeaderIndex};
 use crate::plan::{self, LayerPlan, Plan};
 use crate::symbols::{SymbolTable, TierName};
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use psxw_build::game::{ModPlan, Options, Prepared, Report};
 use psxw_inputs::Workspace;
 use psxw_link::Input;
@@ -49,7 +49,7 @@ pub fn flags(ws: &Workspace, game: &str, work: &Path) -> Result<Flags> {
 pub fn header_index(ws: &Workspace, prep: &Prepared) -> Result<HeaderIndex> {
     let game = &prep.inputs.manifest.game.id;
     let dir = ws.out_dir().join("modkit").join(game);
-    let path = dir.join(format!("headers-{}.json", &prep.commit[..7]));
+    let path = dir.join(format!("headers-v{}-{}.json", headers::INDEX_VERSION, &prep.commit[..7]));
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(idx) = serde_json::from_str(&text) {
             return Ok(idx);
@@ -195,10 +195,18 @@ fn c_name(prep: &Prepared, c: &str, a: u32) -> Option<String> {
     }
 }
 
-/// Plan, compile and link `mods` (in the order the user gave) into
-/// `game.wasm`. `base` carries the build's other options.
-pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> Result<Built> {
-    let game = base.game.clone();
+/// Mods planned and compiled: the build's facts, the symbol table, the
+/// plan, and each mod's objects (by its index in the mods given).
+pub struct Compiled {
+    pub prep: Prepared,
+    pub table: SymbolTable,
+    pub plan: Plan,
+    pub objects: BTreeMap<usize, Vec<Object>>,
+}
+
+/// Plan `mods` (in the order the user gave) and compile them.
+pub fn compile_mods(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) -> Result<Compiled> {
+    let game = game.to_string();
     let (prep, table) = table(ws, &game)?;
     let plan = plan::plan(&table, mods);
     for w in &plan.warnings {
@@ -222,10 +230,45 @@ pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> R
         write_if_changed(&include.join("mod.h"), &genfiles::mod_h(&plan, mods, mi, &prelude))?;
         write_if_changed(&include.join("psxmod.h"), genfiles::PSXMOD_H)?;
         let (_, obj_dir) = compile::mod_dirs(&layout.out, m.id());
+        if crate::rust::is_rust(m) {
+            compile::flat_header(&flags, m, &include, &obj_dir.join("flat"))?;
+            crate::rust::generate(&flags, &plan, mods, mi, &include)?;
+        }
         let objs = compile::compile(&flags, m, &include, &obj_dir)?;
         objects.insert(mi, objs);
     }
     check_c_kinds(&prep, &plan, mods, &objects)?;
+    Ok(Compiled { prep, table, plan, objects })
+}
+
+fn mod_input(m: &Mod, o: &Object, main: &str) -> Input {
+    Input {
+        label: format!("mod {}/{}", m.id(), o.file),
+        container: main.to_string(),
+        obj: o.obj.clone(),
+        protos: o.protos.clone(),
+        generated: false,
+        // Mods are ordinary C, in both backends: no GCC 2.95 conventions.
+        gcc: None,
+    }
+}
+
+/// The resident check of an overlay data patch: the overlay's first code
+/// words.
+fn resident(prep: &Prepared, container: &str) -> Result<Option<lm::Resident>> {
+    if container == prep.inputs.map.main {
+        return Ok(None);
+    }
+    let c = prep.inputs.map.container(container).context("container")?;
+    let at = c.text.first().map(|r| r.start).with_context(|| format!("{container} has no code to recognize it by"))?;
+    let w = |a: u32| prep.inputs.originals.word(container, a).unwrap_or(0);
+    Ok(Some(lm::Resident { at, words: [w(at), w(at + 4)] }))
+}
+
+/// Plan, compile and link `mods` (in the order the user gave) into
+/// `game.wasm`. `base` carries the build's other options.
+pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> Result<Built> {
+    let Compiled { prep, table, plan, objects } = compile_mods(ws, &base.game, mods, layout)?;
 
     // The link's view: inputs, chains, data patches.
     let main = prep.inputs.map.main.clone();
@@ -239,20 +282,19 @@ pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> R
         for o in &objects[&mi] {
             input_of.insert((mi, o.file.clone()), inputs.len());
             ids.push(inputs.len());
-            inputs.push(Input {
-                label: format!("mod {}/{}", m.id(), o.file),
-                container: main.clone(),
-                obj: o.obj.clone(),
-                protos: o.protos.clone(),
-                generated: false,
-                gcc: Some(prep.gcc),
-            });
+            inputs.push(mod_input(m, o, &main));
         }
         position.insert(mi, spec.mods.len());
         spec.mods.push(lm::ModInputs { id: m.id().to_string(), inputs: ids });
     }
     let imp = |mi: usize, i: &crate::decl::Impl| -> Result<lm::Impl> {
-        let input = *input_of.get(&(mi, i.file.clone())).with_context(|| format!("{}: no object for {}", mods[mi].id(), i.file))?;
+        // A mod built by another toolchain is one module, whatever source
+        // file declared each implementation.
+        let file = match &mods[mi].decl.wasm {
+            Some(w) => w.path.clone(),
+            None => i.file.clone(),
+        };
+        let input = *input_of.get(&(mi, file)).with_context(|| format!("{}: no object for {}", mods[mi].id(), i.file))?;
         Ok(lm::Impl { input, function: i.function.clone() })
     };
     let layer = |l: &LayerPlan| -> Result<lm::Layer> {
@@ -278,14 +320,7 @@ pub fn build(ws: &Workspace, base: &Options, mods: &[Mod], layout: &Layout) -> R
             DataValue::Bytes(b) => lm::PatchValue::Bytes(b.clone()),
             DataValue::FnPtr(i) => lm::PatchValue::FnPtr(imp(d.module, i)?),
         };
-        let resident = if d.container == main {
-            None
-        } else {
-            let c = prep.inputs.map.container(&d.container).context("container")?;
-            let at = c.text.first().map(|r| r.start).with_context(|| format!("{} has no code to recognize it by", d.container))?;
-            let w = |a: u32| prep.inputs.originals.word(&d.container, a).unwrap_or(0);
-            Some(lm::Resident { at, words: [w(at), w(at + 4)] })
-        };
+        let resident = resident(&prep, &d.container)?;
         spec.data.push(lm::DataPatch { container: d.container.clone(), addr: d.addr, value, resident });
     }
 
@@ -357,4 +392,148 @@ pub fn write_if_changed(path: &Path, text: &str) -> Result<()> {
         std::fs::write(path, text)?;
     }
     Ok(())
+}
+
+/// One built mod module.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuiltModule {
+    pub id: String,
+    pub path: PathBuf,
+    pub bytes: usize,
+    pub targets: usize,
+}
+
+/// `psxmod.decl`: what the loader needs of a mod module.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ModuleDecl {
+    pub schema_version: u32,
+    pub id: String,
+    pub version: String,
+    /// sha256 of the module without this section.
+    pub hash: String,
+    pub data_size: u32,
+    pub stack_size: u32,
+    pub functions: u32,
+    pub layout_hash: String,
+    /// `hook.<k>`: each hooked function, by address, and its slot's type
+    /// (`c <params>-><results>` or `o32`).
+    pub targets: Vec<DeclTarget>,
+    /// `psxmod_calls[k]`: each game function it calls through its entry.
+    pub calls: Vec<DeclTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DeclTarget {
+    pub name: String,
+    pub container: String,
+    pub address: String,
+    pub flavour: String,
+}
+
+/// Stack each dynamically loaded mod gets.
+pub const MODULE_STACK: u32 = 0x8000;
+
+/// Plan and compile `mods`, then link each into its own module (phase 2):
+/// `<out>/<id>.mod.wasm`.
+pub fn build_modules(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) -> Result<Vec<BuiltModule>> {
+    let Compiled { prep, table, plan, objects } = compile_mods(ws, game, mods, layout)?;
+    let main = prep.inputs.map.main.clone();
+    let identity = psxw_build::game::identity_json(ws, &prep.inputs)?;
+    let flavour = |c: &str, a: u32| -> (Option<psxw_link::object::FuncType>, String) {
+        match prep.tiers.get(&(c.to_string(), a)) {
+            Some(Tier::C { input, func }) => {
+                let o = &prep.link_inputs[*input].obj;
+                let t = o.types[o.funcs[*func as usize].ty as usize].clone();
+                let text = format!("c {}", lm::sig_text(&t));
+                (Some(t), text)
+            }
+            _ => (None, "o32".into()),
+        }
+    };
+    let entries: BTreeMap<(String, u32), Option<psxw_link::object::FuncType>> = prep
+        .tiers
+        .keys()
+        .filter(|k| !prep.expanded.contains(*k))
+        .map(|(c, a)| ((c.clone(), *a), flavour(c, *a).0))
+        .collect();
+    std::fs::create_dir_all(&layout.out)?;
+    let mut out = Vec::new();
+    for &mi in &plan.order {
+        let m = &mods[mi];
+        let objs = &objects[&mi];
+        let inputs: Vec<Input> = objs.iter().map(|o| mod_input(m, o, &main)).collect();
+        let imp = |i: &crate::decl::Impl| -> Result<lm::Impl> {
+            let file = match &m.decl.wasm {
+                Some(w) => w.path.clone(),
+                None => i.file.clone(),
+            };
+            let input = objs.iter().position(|o| o.file == file).with_context(|| format!("{}: no object for {}", m.id(), i.file))?;
+            Ok(lm::Impl { input, function: i.function.clone() })
+        };
+        let mut targets = Vec::new();
+        let mut decl_targets = Vec::new();
+        for t in plan.targets.values() {
+            if t.from.values().any(|(_, ls)| ls.iter().any(|l| l.module == mi)) {
+                bail!("{}: a from-scoped hook on {} needs the static backend; a module can't tell callers apart", m.id(), t.name);
+            }
+            let Some(l) = t.default.iter().find(|l| l.module == mi) else { continue };
+            let call = |h: &crate::plan::HookUse| -> Result<lm::Call> { Ok(lm::Call { imp: imp(&h.imp)?, bare: h.bare }) };
+            let layer = lm::Layer {
+                module: 0,
+                befores: l.befores.iter().map(call).collect::<Result<_>>()?,
+                patch: l.patch.as_ref().map(|p| -> Result<lm::Patch> { Ok(lm::Patch { imp: imp(&p.imp)?, original: p.original.clone() }) }).transpose()?,
+                afters: l.afters.iter().map(call).collect::<Result<_>>()?,
+            };
+            let (sig, text) = flavour(&t.container, t.addr);
+            ensure!(entries.contains_key(&(t.container.clone(), t.addr)), "{}: {} has no slot", m.id(), t.name);
+            decl_targets.push(DeclTarget { name: t.name.clone(), container: t.container.clone(), address: format!("0x{:08X}", t.addr), flavour: text });
+            targets.push(psxw_link::module::ModTarget { container: t.container.clone(), addr: t.addr, sig, returns: t.returns, layer });
+        }
+        let mut data = Vec::new();
+        for d in plan.data.iter().filter(|d| d.module == mi) {
+            let value = match &d.value {
+                DataValue::Bytes(b) => lm::PatchValue::Bytes(b.clone()),
+                DataValue::FnPtr(i) => lm::PatchValue::FnPtr(imp(i)?),
+            };
+            data.push(lm::DataPatch { container: d.container.clone(), addr: d.addr, value, resident: resident(&prep, &d.container)? });
+        }
+        let spec = psxw_link::module::ModuleSpec { id: m.id().to_string(), targets, data, entries: entries.clone(), stack_size: MODULE_STACK };
+        let linked = psxw_link::module::link(&prep.inputs.map, &spec, &inputs).with_context(|| format!("linking {}", m.id()))?;
+        psxw_build::game::validate(&linked.wasm).with_context(|| format!("{}'s module fails validation", m.id()))?;
+        let hash = {
+            use sha2::Digest;
+            sha2::Sha256::digest(&linked.wasm).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let decl = ModuleDecl {
+            schema_version: 1,
+            id: m.id().to_string(),
+            version: m.decl.version.clone(),
+            hash,
+            data_size: linked.data_size,
+            stack_size: MODULE_STACK,
+            functions: linked.functions,
+            layout_hash: linked.layout_hash.clone(),
+            targets: decl_targets,
+            calls: linked
+                .calls
+                .iter()
+                .map(|c| DeclTarget {
+                    name: table.display(&c.container, c.addr),
+                    container: c.container.clone(),
+                    address: format!("0x{:08X}", c.addr),
+                    flavour: format!("c {}", lm::sig_text(&c.sig)),
+                })
+                .collect(),
+        };
+        let mut bytes = linked.wasm;
+        {
+            use wasm_encoder::Section;
+            wasm_encoder::CustomSection { name: psxw_link::module::names::DECL_SECTION.into(), data: serde_json::to_vec(&decl)?.into() }.append_to(&mut bytes);
+            wasm_encoder::CustomSection { name: lm::GAME_SECTION.into(), data: identity.clone().into_bytes().into() }.append_to(&mut bytes);
+        }
+        let path = layout.out.join(format!("{}.mod.wasm", m.id()));
+        std::fs::write(&path, &bytes)?;
+        out.push(BuiltModule { id: m.id().to_string(), path, bytes: bytes.len(), targets: decl.targets.len() });
+    }
+    Ok(out)
 }

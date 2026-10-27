@@ -592,7 +592,7 @@ a call into guest code.
 ### One-shot host scripting
 
 `psxw_execute(id, addr, a0..a3)` queues one call into the existing guest
-code (D51). The request slot is separate from the machine: the browser
+code (D52). The request slot is separate from the machine: the browser
 can fill it while JSPI has suspended `wait_vblank`, even though that stack
 still holds a mutable machine borrow. Once the driver has released the
 borrow and drained interrupts and callbacks, it executes the request on

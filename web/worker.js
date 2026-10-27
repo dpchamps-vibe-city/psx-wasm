@@ -29,13 +29,20 @@
 //   colour-table cache refills on the next table change). Without JSPI
 //   the events never arrive.
 //
-// Messages in: {type: "start", cue, padBuffer, audioRing, options},
+// - mods (M11 phase 2, mods.js): with a moddable base, mod modules load
+//   before boot (`options.mods`: URLs, or `options.modsFromOpfs`: the
+//   enabled ones in OPFS `mods/`), swap in at given vblanks
+//   (`options.swaps`), or arrive while the game runs through a shared
+//   mailbox (`modBuffer`), applied at the next vblank.
+//
+// Messages in: {type: "start", cue, padBuffer, audioRing, modBuffer, options},
 // {type: "execute", id, address, args} (one call, at a borrow-free boundary).
-// Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"stopped", ...}.
+// Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"mods"|"scripting-ready"|"execute-result"|"stopped", ...}.
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, savesDir } from "./cards.js";
+import { ModLoader, takeMod } from "./mods.js";
 
 const ABI_VERSION = 8;
 const NOTHING_PRESSED = 0xffff;
@@ -154,7 +161,22 @@ class Fnv64 {
   }
 }
 
-async function run({ cue, padBuffer, audioRing, options }) {
+/** The enabled mods in OPFS `mods/`, in their order (main.js keeps them). */
+async function opfsMods() {
+  const root = await navigator.storage.getDirectory();
+  const dir = await root.getDirectoryHandle("mods", { create: true });
+  let order = [];
+  try {
+    order = JSON.parse(await (await (await dir.getFileHandle("order.json")).getFile()).text());
+  } catch {}
+  const out = [];
+  for (const m of order.filter((m) => m.enabled)) {
+    out.push({ name: m.file, bytes: new Uint8Array(await (await (await dir.getFileHandle(m.file)).getFile()).arrayBuffer()) });
+  }
+  return out;
+}
+
+async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const canvas = new OffscreenCanvas(options.width || 640, options.height || 480);
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
@@ -218,8 +240,25 @@ async function run({ cue, padBuffer, audioRing, options }) {
       turn.port2.postMessage(null);
     });
   let scriptingReady = false;
+  // Mods: the loader exists once the base is instantiated.
+  let loader = null;
+  const swaps = [];
+  let mailboxSeq = modBuffer ? Atomics.load(new Int32Array(modBuffer, 0, 1), 0) : 0;
+  const modsChanged = (what) => postMessage({ type: "mods", ids: loader.ids(), what, frame });
   const vblank = (f) => {
     frame = Number(f);
+    if (loader) {
+      for (const w of swaps.filter((w) => w.frame === frame)) modsChanged(`swapped ${loader.swap(w.index, w.bytes)} in at vblank ${frame}`);
+      const pushed = modBuffer && takeMod(modBuffer, mailboxSeq);
+      if (pushed) {
+        mailboxSeq = pushed.seq;
+        try {
+          modsChanged(`swapped ${loader.swap(pushed.index, pushed.bytes)} in at vblank ${frame}`);
+        } catch (err) {
+          postMessage({ type: "status", text: `mod swap failed: ${err.message || err}` });
+        }
+      }
+    }
     const now = performance.now();
     if (lastVblank) frameTimes.push(now - lastVblank);
     if (frame % 60 === 0 && !lost) shadow = renderer.vram();
@@ -317,6 +356,7 @@ async function run({ cue, padBuffer, audioRing, options }) {
     report(p, n) {
       const json = text(p, n);
       const event = JSON.parse(json);
+      if (loader && event.event === "boot") loader.booted = true;
       if (event.event === "execute") postMessage({ type: "execute-result", id: event.id, value: event.value });
       else postMessage({ type: "report", json });
     },
@@ -368,7 +408,13 @@ async function run({ cue, padBuffer, audioRing, options }) {
     },
   };
 
-  exports = options.dev ? await instantiateDev(host) : (await WebAssembly.instantiateStreaming(fetch(new URL("./game.wasm", import.meta.url)), { host })).instance.exports;
+  let baseModule = null;
+  if (options.dev) exports = await instantiateDev(host);
+  else {
+    const r = await WebAssembly.instantiateStreaming(fetch(new URL("./game.wasm", import.meta.url)), { host });
+    baseModule = r.module;
+    exports = r.instance.exports;
+  }
   const abi = exports.psxw_abi_version();
   if (abi !== ABI_VERSION) throw new Error(`game.wasm ABI ${abi}, host ABI ${ABI_VERSION}`);
   if (suspend) {
@@ -379,6 +425,21 @@ async function run({ cue, padBuffer, audioRing, options }) {
     };
   } else {
     postMessage({ type: "scripting-ready", error: "scripting needs JSPI and the merged game.wasm (not ?dev)" });
+  }
+
+  // Mods, in order, before boot; swaps fetched now, applied at their vblank.
+  const fetchBytes = async (u) => new Uint8Array(await (await fetch(new URL(u, location.href))).arrayBuffer());
+  const wanted = [];
+  for (const u of options.mods || []) wanted.push({ name: u, bytes: await fetchBytes(u) });
+  if (options.modsFromOpfs) wanted.push(...(await opfsMods()));
+  for (const w of options.swaps || []) swaps.push({ frame: w.frame, index: w.index, bytes: await fetchBytes(w.url) });
+  if (wanted.length || swaps.length || modBuffer) {
+    loader = baseModule && ModLoader.forBase(baseModule, exports);
+    if (!loader && (wanted.length || swaps.length)) throw new Error("this bundle's game.wasm isn't a moddable base (psxw build-web --moddable)");
+    if (loader) {
+      for (const m of wanted) loader.load(m.bytes);
+      modsChanged(loader.mods.length ? `loaded ${loader.ids().join(", ")}` : "no mods");
+    }
   }
 
   // psxw-abi BootOptions: cd_timing, video, safepoint_budget,

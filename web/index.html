@@ -12,6 +12,10 @@
     canvas { width: 100%; aspect-ratio: 4 / 3; background: #000; image-rendering: pixelated; border-radius: 6px; }
     section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
     #status { color: var(--muted); font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; }
+    #mod-list { margin: 0; padding-left: 20px; width: 100%; }
+    #mod-list li { display: flex; gap: 8px; align-items: center; padding: 2px 0; }
+    #mod-list li span { flex: 1; font-family: ui-monospace, monospace; font-size: 13px; overflow-wrap: anywhere; }
+    #mods-note { color: var(--muted); font-size: 13px; }
     button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
   </style>
 </head>
@@ -30,6 +34,11 @@
       <button id="export0">Export card 1</button>
       <label>Card 2 (.mcr) <input id="card1" type="file" accept=".mcr,.mcd"></label>
       <button id="export1">Export card 2</button>
+    </section>
+    <section id="mods-panel">
+      <label>Mods (.mod.wasm) <input id="mod-file" type="file" multiple accept=".wasm"></label>
+      <ol id="mod-list"></ol>
+      <span id="mods-note">Mods load at Start, in this order, into a moddable build (psxw build-web --moddable). While the game runs, “Swap in” replaces a loaded mod (or loads one) at the next vblank.</span>
     </section>
     <div id="status">Import a disc. It is copied into this browser's private storage (OPFS) and never leaves it.</div>
   </main>

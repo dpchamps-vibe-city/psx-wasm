@@ -8,9 +8,17 @@
 // &replay=URL&hash=F,F,...&autostart; ?discurl=URL imports the .cue at URL
 // (and the .bin files it names, beside it) into OPFS first; ?post=NAME
 // POSTs the hashes to /result?browser=NAME when the run stops.
+//
+// Mods (M11 phase 2): the panel keeps mod modules in OPFS `mods/` with
+// their order and whether each is enabled (`order.json`); the enabled ones
+// load at Start. "Swap in" sends a module to the running game through a
+// shared mailbox. ?mods=URL,URL loads those instead; ?swap=FRAME:INDEX:URL
+// (repeatable) swaps one in at a vblank; ?watch=URL polls a JSON
+// {seq, index, url} (psxw mod watch) and swaps each new module in.
 
 import { SaveQueue, cardName, exportCard, importCard } from "./cards.js";
 import { scripting } from "./scripting.js";
+import { MAILBOX_BYTES, postMod } from "./mods.js";
 
 window.wasmPsxScripting = Object.freeze({
   async execute() { throw new Error("start the game first"); },
@@ -131,6 +139,103 @@ function show(bitmap) {
   Atomics.add(pad, 4, 1);
 }
 
+// Mods in OPFS `mods/`, and the mailbox to the running game.
+const modBuffer = new SharedArrayBuffer(MAILBOX_BYTES);
+let loadedMods = [];
+const modsDir = async () => (await navigator.storage.getDirectory()).getDirectoryHandle("mods", { create: true });
+async function readOrder() {
+  try {
+    return JSON.parse(await (await (await (await modsDir()).getFileHandle("order.json")).getFile()).text());
+  } catch {
+    return [];
+  }
+}
+async function writeOrder(order) {
+  const w = await (await (await modsDir()).getFileHandle("order.json", { create: true })).createWritable();
+  await w.write(JSON.stringify(order));
+  await w.close();
+}
+async function modBytes(file) {
+  return new Uint8Array(await (await (await (await modsDir()).getFileHandle(file)).getFile()).arrayBuffer());
+}
+async function renderMods() {
+  const order = await readOrder();
+  const list = document.getElementById("mod-list");
+  list.replaceChildren();
+  order.forEach((m, i) => {
+    const li = document.createElement("li");
+    const on = document.createElement("input");
+    on.type = "checkbox";
+    on.checked = m.enabled;
+    on.disabled = running;
+    on.onchange = async () => {
+      order[i].enabled = on.checked;
+      await writeOrder(order);
+    };
+    const name = document.createElement("span");
+    const at = loadedMods.indexOf(m.file.replace(/(\.mod)?\.wasm$/, ""));
+    name.textContent = m.file + (at >= 0 ? `  (loaded, #${at + 1})` : "");
+    const button = (label, fn, disabled) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.disabled = disabled;
+      b.onclick = fn;
+      return b;
+    };
+    const move = (d) => async () => {
+      [order[i], order[i + d]] = [order[i + d], order[i]];
+      await writeOrder(order);
+      renderMods();
+    };
+    li.append(
+      on,
+      name,
+      button("↑", move(-1), running || i === 0),
+      button("↓", move(1), running || i === order.length - 1),
+      button("Remove", async () => {
+        order.splice(i, 1);
+        await writeOrder(order);
+        await (await modsDir()).removeEntry(m.file).catch(() => {});
+        renderMods();
+      }, running),
+      button("Swap in", async () => {
+        const index = at >= 0 ? at : loadedMods.length;
+        postMod(modBuffer, index, await modBytes(m.file));
+        say(`${m.file}: swapping in at the next vblank`);
+      }, !running),
+    );
+    list.append(li);
+  });
+}
+document.getElementById("mod-file").addEventListener("change", async (e) => {
+  const order = await readOrder();
+  const dir = await modsDir();
+  for (const f of e.target.files) {
+    const w = await (await dir.getFileHandle(f.name, { create: true })).createWritable();
+    await w.write(await f.arrayBuffer());
+    await w.close();
+    if (!order.some((m) => m.file === f.name)) order.push({ file: f.name, enabled: true });
+  }
+  await writeOrder(order);
+  e.target.value = "";
+  renderMods();
+});
+/** psxw mod watch: each new module it publishes is swapped in. */
+function watchMods(url) {
+  let seen = null;
+  setInterval(async () => {
+    try {
+      const w = await (await fetch(url, { cache: "no-store" })).json();
+      if (seen === null) seen = w.seq;
+      else if (w.seq !== seen) {
+        seen = w.seq;
+        postMod(modBuffer, w.index, new Uint8Array(await (await fetch(w.url, { cache: "no-store" })).arrayBuffer()));
+        say(`watch: swapping in ${w.url} (#${w.seq})`);
+      }
+    } catch {}
+  }, 500);
+}
+
 // The cards the game saves, written into OPFS here (cards.js).
 const saves = new SaveQueue((name, e) => say(`saving ${name}: ${e}`));
 
@@ -152,7 +257,14 @@ async function start(cue, audioRing) {
     record: record && game.frame_counter != null,
     clock: game.frame_counter,
     gameId: game.id || "",
+    mods: params.has("mods") ? params.get("mods").split(",").filter(Boolean) : [],
+    modsFromOpfs: !params.has("mods") && (await readOrder()).some((m) => m.enabled),
+    swaps: params.getAll("swap").map((s) => {
+      const [frame, index, ...url] = s.split(":");
+      return { frame: parseInt(frame, 10), index: parseInt(index, 10), url: url.join(":") };
+    }),
   };
+  if (params.has("watch")) watchMods(params.get("watch"));
   saveReplay.disabled = !options.record;
   worker.onmessage = (e) => {
     const m = e.data;
@@ -170,6 +282,11 @@ async function start(cue, audioRing) {
       say(`replay saved: ${m.frames} frames`);
     }
     else if (m.type === "log") console.log(`[${m.frame}] ${m.text}`);
+    else if (m.type === "mods") {
+      loadedMods = m.ids.slice();
+      say(`mods: ${m.what}`);
+      renderMods();
+    }
     else if (m.type === "hashes") {
       m.display = display;
       window.psxwHashes = m;
@@ -185,7 +302,7 @@ async function start(cue, audioRing) {
       }
     }
   };
-  worker.postMessage({ type: "start", cue, padBuffer, audioRing, options });
+  worker.postMessage({ type: "start", cue, padBuffer, audioRing, modBuffer, options });
 }
 
 const discInput = document.getElementById("disc");
@@ -230,9 +347,11 @@ for (const slot of [0, 1]) {
   });
 }
 
+renderMods();
 startButton.addEventListener("click", async () => {
   startButton.disabled = true;
   running = true;
+  renderMods();
   const ring = await startAudio();
   requestAnimationFrame(pollInput);
   await start(cue, ring);

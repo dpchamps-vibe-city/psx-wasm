@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod disc;
+pub mod mods;
 pub mod render;
 
 use anyhow::{Context as _, Result, bail};
@@ -60,6 +61,20 @@ pub struct Options {
     /// Guest values to read at every vblank: (address, size in bytes);
     /// `RunReport::watched` has a row per vblank (a mod test's trace).
     pub watch: Vec<(u32, u32)>,
+    /// Mod modules to load into a moddable base before it boots, in
+    /// order (plans/M11 phase 2).
+    pub mods: Vec<PathBuf>,
+    /// Mod modules swapped in at vblanks.
+    pub swaps: Vec<ModSwap>,
+}
+
+/// At vblank `frame`, the module at `path` replaces loaded mod `index`, or
+/// loads after the others when there is no such mod.
+#[derive(Debug, Clone)]
+pub struct ModSwap {
+    pub frame: u64,
+    pub index: usize,
+    pub path: PathBuf,
 }
 
 /// Which SPU windows a run records: one of `samples` at the first vblank
@@ -182,6 +197,8 @@ struct State {
     /// The frame the last SPU window was asked for.
     spu_asked: Option<u64>,
     watched: Vec<Vec<u32>>,
+    /// Mods loaded at run time.
+    loader: Option<mods::Loader>,
 }
 
 impl State {
@@ -196,6 +213,7 @@ impl State {
             spu_windows: vec![],
             spu_asked: None,
             watched: vec![],
+            loader: None,
             disc,
             opts: opts.clone(),
             frame: 0,
@@ -252,6 +270,16 @@ fn disc_exe_text(disc: &mut Disc, exe: &str) -> Option<Vec<u8>> {
 pub fn run(opts: Options) -> Result<RunReport> {
     let disc = Disc::open(&opts.disc)?;
     let (mut store, instance) = instantiate(&opts, Some(disc))?;
+    if !opts.mods.is_empty() || !opts.swaps.is_empty() {
+        let base = std::fs::read(&opts.wasm)?;
+        let mut loader = mods::Loader::new(&mut store, &instance, &base)?
+            .with_context(|| format!("{} is not a moddable base (psxw build --moddable)", opts.wasm.display()))?;
+        for m in &opts.mods {
+            let id = loader.load(&mut store, &std::fs::read(m).with_context(|| format!("reading {}", m.display()))?)?;
+            store.data_mut().events.push(serde_json::json!({"event": "mod-load", "id": id, "frame": 0}));
+        }
+        store.data_mut().loader = Some(loader);
+    }
     let ptr = boot_options(&mut store, &instance, &opts)?;
     let boot = instance.get_typed_func::<u32, ()>(&mut store, psxw_abi::exports::BOOT)?;
     let stop = match boot.call(&mut store, ptr) {
@@ -445,6 +473,16 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             }
         }
         c.data_mut().events.extend(events);
+        // Mods swapped in at this vblank, while the game waits here.
+        let swaps: Vec<ModSwap> = c.data().opts.swaps.iter().filter(|w| w.frame == frame).cloned().collect();
+        for w in swaps {
+            let Some(mut loader) = c.data_mut().loader.take() else { break };
+            let bytes = std::fs::read(&w.path).map_err(|e| wasmtime::Error::msg(format!("reading {}: {e}", w.path.display())))?;
+            let r = if w.index < loader.ids().len() { loader.swap(&mut c, w.index, &bytes) } else { loader.load(&mut c, &bytes) };
+            c.data_mut().loader = Some(loader);
+            let id = r.map_err(|e| wasmtime::Error::msg(format!("swapping in {}: {e:#}", w.path.display())))?;
+            c.data_mut().events.push(serde_json::json!({"event": "mod-swap", "id": id, "index": w.index, "frame": frame}));
+        }
         if frame >= c.data().opts.frames {
             return Err(wasmtime::Error::msg(FRAME_LIMIT));
         }
@@ -636,6 +674,9 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             return;
         };
         if v["event"] == "boot" {
+            if let Some(l) = c.data_mut().loader.as_mut() {
+                l.booted = true;
+            }
             // RAM over [t_addr, t_addr + t_size) must equal the disc's EXE.
             let exe = v["exe"].as_str().unwrap_or_default().to_string();
             let (t_addr, t_size) = (v["t_addr"].as_u64().unwrap_or(0) as u32, v["t_size"].as_u64().unwrap_or(0) as usize);

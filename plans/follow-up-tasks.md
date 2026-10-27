@@ -28,7 +28,7 @@ rewrite the `out/web/<game>/` bundle someone is serving.
   mode always does (its JS trampolines can't be suspended). Chromium and
   Firefox in the test image both have JSPI.
 
-## Live scripting: next small steps (D51)
+## Live scripting: next small steps (D52)
 
 The first slice is `window.wasmPsxScripting.execute(address, ...args)`:
 ABI 8 queues one existing guest-function call, with up to four o32 words,

@@ -518,7 +518,26 @@ bit-identical. Its cost is within run-to-run noise on that replay: 6000
 headless frames took 166 and 169 s with inlining, 174 and 168 s
 without.
 
-**D51. Start live scripting with one queued guest call.** The browser
+**D51. Mods loaded at run time go through hook slots in a moddable base**
+(M11 phase 2).
+- `psxw build --moddable` gives every hookable function an entry that
+  checks its slot in an exported table; without mods it runs as the plain
+  build.
+- A mod module is linked by psxw from the same objects (or from any
+  toolchain's `wasm-ld --emit-relocs` module), with the same hook layers.
+  Its data is addressed relative to the area the loader gives it, and its
+  functions' addresses relative to a synthetic range.
+- The host wires chains wasm-to-wasm through the base's tables. A layer's
+  next link is a slot of the same table, so a swap only rewires.
+- **`from` hooks are static only.** The loader refuses a module with
+  them: telling callers apart at run time would need a slot per call
+  site in the base, a check on every call for a rarely used modifier.
+  `psxw mod build --modules` says so and names the hook.
+
+*Why:* the static and dynamic backends must agree bit for bit, and JSPI
+can't suspend through a JS frame between two wasm instances.
+
+**D52. Start live scripting with one queued guest call.** The browser
 exposes `window.wasmPsxScripting.execute(address, ...args)` to call existing
 compiled code, with up to four o32 argument words and the raw u64 result.
 It has no persistent hooks, typed state, code loader or symbol service.
