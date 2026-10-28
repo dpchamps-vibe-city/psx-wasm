@@ -628,7 +628,7 @@ the normal guest stack, preserving `$sp`/`$gp`. Completion is an `execute`
 event through `host.report`, with the request id and the raw o32 result as
 a decimal string. Calls cannot nest; a trapping call stops the run.
 
-The page's `window.wasmPsxScripting.execute(address, ...args)` is a
+The page's `psx.execute(address, ...args)` is a
 Promise-based bridge to that slot; `cmd(name, ...args)` and `load(url)`
 reach script mods. Commands and `psx.run` callbacks of script mods run
 through the same slot, at synthetic addresses. The build's symbol

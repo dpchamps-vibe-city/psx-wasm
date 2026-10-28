@@ -31,13 +31,21 @@ Cards persist in this browser's OPFS between runs, so a session that saves can b
 
 ## Console scripting
 
-After Start and the first vblank, the browser console can call an existing
-compiled game function:
+The console API is `psx`, in both of DevTools' console contexts:
+
+- **The game Worker** (`worker.js`): all of it. `psx.hook`, `psx.run`,
+  `psx.mods`, `psx.mem`, `psx.cmd`, `psx.load`, `psx.reload`, and `game`
+  beside it. Hooks and `run` take functions, which only run here.
+- **The page** (top): the part that crosses to the Worker as messages:
+  `psx.cmd`, `psx.execute`, `psx.load`, `psx.reload`.
+
+After Start and the first vblank, `execute` calls an existing compiled game
+function by address:
 
 ```js
 // Set address to the guest address printed by:
 // psxw mod show <game> <symbol>
-const result = await window.wasmPsxScripting.execute(address, 100);
+const result = await psx.execute(address, 100);
 const v0 = Number(result & 0xffffffffn);
 ```
 
@@ -91,7 +99,7 @@ export default mod(({ game, mem, hook, log }) => {
 - **Loading.** A moddable bundle (`psxw build-web <game> --moddable`, `psxw mod
   play`, `psxw mod watch`) carries the game's names (`snapshot.json`).
   `?mods=` takes `.js` URLs beside `.mod.wasm` ones, in load order; the mod
-  panel takes single-file `.js` mods; `wasmPsxScripting.load(url)` loads one
+  panel takes single-file `.js` mods; `psx.load(url)` loads one
   while the game runs. A mod is installed at the next vblank. `psxw mod
   watch` publishes each saved script mod at a new URL
   (`mods/<id>@<seq>/mod.js`), and the page reloads it in place.

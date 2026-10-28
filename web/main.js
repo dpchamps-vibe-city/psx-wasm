@@ -22,7 +22,7 @@ import { scripting } from "./scripting.js";
 import { MAILBOX_BYTES, postMod } from "./mods.js";
 
 const notStarted = async () => { throw new Error("start the game first"); };
-window.wasmPsxScripting = Object.freeze({ execute: notStarted, cmd: notStarted, load: notStarted, reload: notStarted });
+window.psx = Object.freeze({ execute: notStarted, cmd: notStarted, load: notStarted, reload: notStarted });
 
 const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
@@ -205,7 +205,7 @@ async function renderMods() {
       button("Swap in", async () => {
         if (m.file.endsWith(".psxpack.json")) {
           const pack = JSON.parse(new TextDecoder().decode(await modBytes(m.file)));
-          say(`${m.file}: ${await window.wasmPsxScripting.load(pack).catch((e) => e.message)} (at the next vblank)`);
+          say(`${m.file}: ${await window.psx.load(pack).catch((e) => e.message)} (at the next vblank)`);
           return;
         }
         if (m.file.endsWith(".js")) {
@@ -213,7 +213,7 @@ async function renderMods() {
           // breakpoints hold across reloads.
           const url = URL.createObjectURL(new Blob([await modBytes(m.file), `\n//# sourceURL=psxw-mods/${m.file}\n`], { type: "text/javascript" }));
           const id = m.file.replace(/\.js$/, "");
-          const done = loadedMods.includes(id) ? window.wasmPsxScripting.reload(id, url) : window.wasmPsxScripting.load(url);
+          const done = loadedMods.includes(id) ? window.psx.reload(id, url) : window.psx.load(url);
           say(`${m.file}: ${await done.catch((e) => e.message)} (at the next vblank)`);
           return;
         }
@@ -272,7 +272,7 @@ function watchMods(url) {
       else if (w.seq !== seen) {
         seen = w.seq;
         if (w.kind === "script") {
-          await window.wasmPsxScripting.reload(w.id, w.url);
+          await window.psx.reload(w.id, w.url);
           say(`watch: reloaded ${w.id} from ${w.url} (#${w.seq})`);
         } else {
           postMod(modBuffer, w.index, new Uint8Array(await (await fetch(w.url, { cache: "no-store" })).arrayBuffer()));
@@ -293,7 +293,7 @@ async function start(cue, audioRing) {
   const record = document.getElementById("record").checked || params.has("record");
   if (record && game.frame_counter == null) say("this bundle names no frame counter; recording is off");
   const worker = new Worker("worker.js", { type: "module" });
-  window.wasmPsxScripting = scripting(worker);
+  window.psx = scripting(worker);
   const options = {
     instantCd: document.getElementById("instant").checked || params.has("instant"),
     frames: params.has("frames") ? parseInt(params.get("frames"), 10) : 0,

@@ -94,4 +94,4 @@ build = ["npm", "run", "verify"]
 # and tests it against this psx-wasm (compiled mods natively, script mods
 # in the browsers).
 repo = "../btn-mods"
-commit = "e4128cd8abda5b9f36a103a67e1e952af68c5f4a"
+commit = "94dfedf01b9bfc0a31110fa53171bfb797070623"

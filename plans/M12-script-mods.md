@@ -208,7 +208,7 @@ to several targets.
   D52's queued call, so they can call game functions.
 - **What the console gets:** a Promise of the command's result.
 - **One namespace:** compiled mods' global functions and script mods'
-  commands share it, so `wasmPsxScripting.execute("GoldRush", 1)` works
+  commands share it, so `psx.execute("GoldRush", 1)` works
   for either kind.
 
 ### What a mod sees
@@ -287,7 +287,8 @@ game.gGold                                  // memory reads work any time
 await psx.run(() => game.AddGold(100, 0))   // game calls run in the game
 ```
 
-For use from the page's own context, `wasmPsxScripting` gains
+For use from the page's own context, the page's `psx` (once
+`wasmPsxScripting`) gains
 `cmd(name, ...args)` and `load(url)`.
 
 ## The runtime: holding the host's vblank wait
@@ -402,7 +403,7 @@ D54 records this design.
 9. [x] **Console:**
    - `psx` in the Worker: `hook`, `cmd`, `run`, `load`, `reload`,
      `unload`, `mods`;
-   - `wasmPsxScripting.cmd` and `load` on the page.
+   - `psx.cmd` and `load` on the page (once `wasmPsxScripting`).
 10. [x] **Workspace commands:**
     - `psxw mod new <id> --script` writes `mod.js`, `tests/` and
       `jsconfig.json`.
@@ -891,10 +892,13 @@ export default mod(({ game, hook }) => {
     same one, re-imported) in the tested mod's place at a vblank, and a
     `same_as` run has no swaps: the reload tests are data, like the rest;
   - `game.at(container, name)` besides `game.at(container, address)`;
-  - `psx.hook` returns `{ id, ready, remove }`; `wasmPsxScripting` also
+  - `psx.hook` returns `{ id, ready, remove }`; the page's API also
     has `reload`;
   - without a declaration, an o32 target's `after` and `original` give
-    `v0`.
+    `v0`;
+  - the page's API is `psx` too (D52's `wasmPsxScripting`, renamed at the
+    human's word): `cmd`, `execute`, `load`, `reload`, the part that
+    crosses to the Worker as messages.
 - **Traces read any RAM.** A work area past the executable's bss (btn's
   `D_8007AFF0`) is in no container, so trace entries fall back to the
   address an auto-name spells.
