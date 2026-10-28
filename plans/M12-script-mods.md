@@ -154,8 +154,10 @@ export default mod(({ game, mem, hook, log }) => {
 **Fields:**
 - `id`, `version` and `load_after`, as in `mod.json` (M11);
 - `hooks`, `data` and `commands`;
-- `init()`, optional: it runs at load and again after boot, like
-  compiled mods' `psxmod_init`.
+- `init()`, optional: it runs once the mod is installed and the game has
+  booted, like compiled mods' `psxmod_init`: at boot for a mod loaded
+  before it, at load (through the queued call, so inside the game)
+  otherwise.
 
 ### Hooks
 
@@ -859,6 +861,18 @@ export default mod(({ game, hook }) => {
   nothing, and the clock doesn't run on the opening day, so noclip's and
   freeze-time's effects aren't visible; their twins are held to their
   compiled mods by `same_as` (the flag writes around each call included).
+- **What the build added to the plan's API:**
+  - a `psxmod.json` beside a mod's `mod.js` names the snapshot its `game`
+    comes from; that is how a bundle serves each mod its own (phase 2
+    task 6, phase 3 task 1);
+  - the test format's `swap: [{ "at", "mod" }]` puts another mod (or the
+    same one, re-imported) in the tested mod's place at a vblank, and a
+    `same_as` run has no swaps: the reload tests are data, like the rest;
+  - `game.at(container, name)` besides `game.at(container, address)`;
+  - `psx.hook` returns `{ id, ready, remove }`; `wasmPsxScripting` also
+    has `reload`;
+  - without a declaration, an o32 target's `after` and `original` give
+    `v0`.
 - **Traces read any RAM.** A work area past the executable's bss (btn's
   `D_8007AFF0`) is in no container, so trace entries fall back to the
   address an auto-name spells.
