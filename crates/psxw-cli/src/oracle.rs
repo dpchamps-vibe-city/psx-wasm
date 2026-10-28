@@ -26,10 +26,7 @@ use psxw_oracle::report::Report;
 use psxw_oracle::{Kind, images};
 use std::path::Path;
 
-pub const USAGE: &str = "oracle gen-header | images build [--no-cache] | images verify | selftest [--seed N] [--count N] \
-                         | capture [--kind K] [--missing] | check <game> --device D | ci \
-                         | play <game> … | ramdiff <game> … | record <game> … \
-                         | export --out DIR [--set S].. [--kind K] [--missing-hw] | import DIR | disagree";
+const USAGE: &str = "oracle <command> [arguments] [options]\n\nRun `psxw oracle --help` for commands and options.";
 
 /// psx-wasm's device implementations the oracle can check. They start
 /// lazily: only the checked device runs.

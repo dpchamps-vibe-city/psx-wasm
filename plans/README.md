@@ -88,7 +88,7 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M8](M08-sdk-generality.md) | SDK generality | **in progress** (identity, boundary, layouts, conformance; the .LIB converter and psyq-decomp C remain) | M2 (*parallel* with M4–M7) | Per-object adapter conformance; psyq-decomp C == translated |
 | [M9](M09-second-game.md) | Second game | not started | M7, M8 | All gates with only a manifest |
 | [M10](M10-hardware-oracle.md) | Hardware oracle | **in progress** (batch export/import, disagreement report; capture waits for a rig) | M3; a rig | Vector archive replayed on hardware |
-| [M11](M11-modkit.md) | Modkit | **done** (browser runs of acceptance 5 and 7 waived) | M2 (phase 1), M5 (phase 2) | Example mods' effects by replay; empty mod set == plain build; static and dynamic backends agree |
+| [M11](M11-modkit.md) | Modkit | **done** (browser runs of acceptance 5 and 7 waived); compiled mods deprecated for M12's script mods (D56) | M2 (phase 1), M5 (phase 2) | Example mods' effects by replay; empty mod set == plain build; static and dynamic backends agree |
 | [M12](M12-script-mods.md) | Script mods | **done** | M11 | Script twins == compiled mods bit for bit in both browsers; a script pass-through on every hookable function == plain build |
 
 ```

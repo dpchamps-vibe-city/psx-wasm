@@ -788,6 +788,11 @@ export default mod(({ game, hook }) => {
   and `psx.d.ts`, type checking, `--bump` with aliases, sources and
   workspace fragments, packs, `Options::lift`, and the gate's script part
   (data-driven: the test format gained `swap`).
+- **2026-10-27, after:** compiled mods deprecated (D56). A debug
+  build can be a moddable base (`build-web --moddable --debug`, `mod
+  play`/`watch`/`test --debug`) that loads script mods; the loader
+  refuses compiled modules there. `mod new` makes a script mod
+  (`--compiled` for M11's kind).
 - **2026-10-27, done:** `psxw ci btn` passes every gate (41 min),
   including `mods` with its script part, and `web-game`.
 - **2026-10-27, acceptance** (btn-mods `792d8e7`, then the twins): the

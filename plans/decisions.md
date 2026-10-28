@@ -629,7 +629,8 @@ which only this layout makes true.
   call, at synthetic addresses.
 - **Browser only.** The native host runs no JS, so script mods' tests run
   in headless Chromium and Firefox.
-- **Compiled mods stay,** and both kinds load together.
+- **Compiled mods stay,** and both kinds load together (deprecated since,
+  D56).
 
 *Why:* the human wants mods without a compile step, editable live from
 the console. A JS hook costs about 16 ns a call on a JSPI stack (measured
@@ -666,6 +667,21 @@ input.
 decomps, supported together. Decomps rename symbols, retype data and move
 code from asm to C, but the binary doesn't change, so it is the one
 fixed point to key on.
+
+**D56. Compiled mods are deprecated; script mods are the modkit** (M12).
+- **New mods are script mods.** `psxw mod new` makes one (`--compiled`
+  for M11's kind); docs lead with them.
+- **Compiled mods keep working** where they work now: linked in, loaded
+  into the moddable base, their tests natively, the `mods` gate's M11
+  checks, and as the oracle script twins are held to (`same_as`).
+- **New capabilities are script-only.** A debug build's moddable base
+  (D53) loads script mods; the loader refuses compiled modules there,
+  since their code has the default window's address built in.
+
+*Why:* the human: once script mods worked, the compile-and-reload flow is
+the old one. Script mods cover what compiled ones do with no build step,
+bit for bit (M12's twins), and a script hook's cost (about 100 ns a call)
+matters only for the hottest functions.
 
 ## Open questions (tracked)
 

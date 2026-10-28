@@ -13,6 +13,7 @@
 // replaces a function hides the layers below it; `conflicts()` says so,
 // naming both mods, as `psxw mod check` does for compiled ones.
 
+const DEFAULT_WINDOW = 0x01000000;
 const AREA_START = 0x80600000;
 const AREA_END = 0x80800000;
 const SYNTHETIC_START = 0x80200000;
@@ -32,6 +33,8 @@ export class ModLoader {
     const lines = section(module, "psxmod.slots");
     if (lines == null) return null;
     const l = new ModLoader(lines, section(module, "psxmod.game") || "", exports, section(module, "psxmod.tiers") || "");
+    // A debug build's window (D53); compiled modules assume the default.
+    l.window = exports.guest_window ? exports.guest_window() >>> 0 : DEFAULT_WINDOW;
     for (const r of (section(module, "psxmod.resident") || "").split("\n").filter(Boolean)) {
       const [c, at, w0, w1] = r.split(" ");
       l.resident.set(c, { at: addr(at), words: [addr(w0), addr(w1)] });
@@ -48,6 +51,7 @@ export class ModLoader {
     });
     // Each overlay's first code words, which tell it is resident.
     this.resident = new Map();
+    this.window = DEFAULT_WINDOW;
     this.identity = identity;
     this.x = exports;
     this.mods = [];
@@ -79,6 +83,9 @@ export class ModLoader {
     const declText = section(module, "psxmod.decl");
     if (declText == null) throw new Error("not a mod module (no psxmod.decl)");
     const decl = JSON.parse(declText);
+    if (this.window !== DEFAULT_WINDOW) {
+      throw new Error(`${decl.id}: compiled mods are deprecated (D56) and don't load into a debug build (they have the default window's address built in); use a script mod`);
+    }
     if (section(module, "psxmod.game") !== this.identity) throw new Error(`${decl.id}: built for another game build than this one`);
     const slots = decl.targets.map((t) => {
       const s = this.slot(t.container, t.address);

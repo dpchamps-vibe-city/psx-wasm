@@ -22,11 +22,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-pub const USAGE: &str = "web-test gpu [--browsers chromium,firefox] [--timeout SECONDS] \
-                         | web-test storage [--browsers ..] [--timeout S] \
-                         | web-test conform <game> [--browsers ..] [--timeout S] \
-                         | web-test game <game> [--replay R] [--frames N] [--hash F,..] [--record] [--debug] [--browsers ..] [--timeout S] \
-                         | web-test pacing <game> [--seconds N | --replay R] [--moddable] [--mod DIR].. [--tag T] [--browsers ..]";
+const USAGE: &str = "web-test <command> [arguments] [options]\n\nRun `psxw web-test --help` for commands and options.";
 const IMAGE: &str = "psxw-browsers:local";
 
 #[derive(Serialize, Deserialize)]

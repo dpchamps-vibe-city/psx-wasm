@@ -15,14 +15,7 @@ use psxw_modkit::script::AnyMod;
 use psxw_modkit::workspace::ModsWorkspace;
 use std::path::{Path, PathBuf};
 
-pub const USAGE: &str = "mod <command>; in a mods workspace (psxmods.json): \
-    mod sdk [--bump] | mod check [mod|set] | mod build [mod|set] [--modules] | mod test [mod|set] \
-    | mod play <mod|set> [--dynamic] [--port N] [--test] | mod watch <mod|set> [--port N] \
-    | mod new <id> [--script] | mod pack <id> | mod show <symbol> | mod writers <symbol>; \
-    in psx-wasm: mod check <game> <dir>… | mod build <game> <dir>… [--modules] [--out D] | mod test <game> <dir>… \
-    | mod watch <game> <dir>… [--port N] | mod ci <game> \
-    | mod new <game> <id> [--dir D] [--script] | mod show <game> <symbol> | mod writers <game> <symbol> \
-    | mod pass-through <game> --out <dir> [--script] | mod pack <game> <dir> [--out F] | mod snapshot <game> [--source symbols|c|dwarf] [--at COMMIT] [--out F] [--verify] [--agree]";
+const USAGE: &str = "mod <command> [arguments] [options]\n\nRun `psxw mod --help` for commands and options.";
 
 pub fn run(args: &[&str]) -> Result<bool> {
     match ModsWorkspace::discover()? {
@@ -155,20 +148,23 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
             m.check_pins(&psx)?;
             let (label, mods) = m.select_any(name)?;
             let table = m.table()?;
-            let cache = Cache::default();
+            let cache = test_cache(&psx, m.game(), &mods, rest.contains(&"--debug"))?;
             let b = InWorkspace { m, psx: &psx, cache: &cache };
             crate::modtest::run_tests(&b, &cache, &table, &mods, None, &m.build_dir(&label).join("tests"))
         }
         ["play", name, rest @ ..] => {
             let (label, any) = m.select_any(Some(name))?;
+            let debug = rest.contains(&"--debug");
             // Script mods load at run time, so their set does too.
-            if rest.contains(&"--dynamic") || any.iter().any(AnyMod::is_script) {
+            if rest.contains(&"--dynamic") || debug || any.iter().any(AnyMod::is_script) {
                 let psx = m.psx()?;
                 m.check_pins(&psx)?;
-                let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--dynamic").collect();
+                no_compiled_in_debug(&any, debug)?;
+                let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--dynamic" && *a != "--debug").collect();
                 let modules = modules_ws(m, &psx, &label, &psxw_modkit::script::compiled(&any))?;
-                let (base, _) = psxw_build::game::build(&psx, &Options { moddable: true, ..Options::new(m.game()) })?;
-                return play(&psx, m.game(), &base, &m.state.join("web").join(format!("{label}-dynamic")), &rest, &page_mods(&any, &modules, Some(&m.snapshot_path()?)));
+                let (base, _) = psxw_build::game::build(&psx, &base_options(m.game(), debug))?;
+                let dir = m.state.join("web").join(format!("{label}-dynamic{}", if debug { "-debug" } else { "" }));
+                return play(&psx, m.game(), &base, &dir, &rest, &page_mods(&any, &modules, Some(&m.snapshot_path()?)));
             }
             let (psx, _, built, label) = build_ws(m, Some(name))?;
             summary(&built);
@@ -177,27 +173,24 @@ fn in_workspace(m: &ModsWorkspace, args: &[&str]) -> Result<bool> {
         ["watch", name, rest @ ..] => {
             let psx = m.psx()?;
             m.check_pins(&psx)?;
-            let port = match rest {
-                ["--port", p] => p.parse()?,
-                [] => 8081,
-                _ => bail!("usage: psxw mod watch <mod|set> [--port N]"),
-            };
+            let (port, debug) = watch_args(rest)?;
             let (label, _) = m.select_any(Some(name))?;
-            let dir = m.state.join("web").join(format!("{label}-watch"));
+            let dir = m.state.join("web").join(format!("{label}-watch{}", if debug { "-debug" } else { "" }));
             let snapshot = m.snapshot_path().ok();
-            watch(&psx, m.game(), &dir, port, snapshot.as_deref(), &|| {
+            watch(&psx, m.game(), &dir, port, debug, snapshot.as_deref(), &|| {
                 let (_, any) = m.select_any(Some(name))?;
                 let modules = modules_ws(m, &psx, &label, &psxw_modkit::script::compiled(&any))?;
                 Ok((any, modules))
             })
         }
-        ["new", id] => {
+        ["new", id, "--compiled"] => {
             let dir = m.mods_dir().join(id);
             new_mod(&dir, id, m.game(), Some("../../.psxw/sdk/schema/mod.schema.json"), false)?;
             println!("created {}; declare hooks in its mod.json, then psxw mod check {id}", dir.display());
+            println!("note: compiled mods are deprecated (D56); `psxw mod new {id}` makes a script mod");
             Ok(true)
         }
-        ["new", id, "--script"] => {
+        ["new", id] | ["new", id, "--script"] => {
             let dir = m.mods_dir().join(id);
             new_mod(&dir, id, m.game(), None, true)?;
             let jsconfig = m.root.join("jsconfig.json");
@@ -452,9 +445,10 @@ fn modules_ws(m: &ModsWorkspace, psx: &Workspace, label: &str, mods: &[Mod]) -> 
 /// script mod's do, it is published at a new versioned URL
 /// (`mods/<id>@<seq>/mod.js`, so its relative imports reload with it), and
 /// the page reloads it in place (plans/M12).
-fn watch(ws: &Workspace, game: &str, dir: &Path, port: u16, snapshot: Option<&Path>, rebuild: &dyn Fn() -> Result<(Vec<AnyMod>, Vec<PathBuf>)>) -> Result<bool> {
+fn watch(ws: &Workspace, game: &str, dir: &Path, port: u16, debug: bool, snapshot: Option<&Path>, rebuild: &dyn Fn() -> Result<(Vec<AnyMod>, Vec<PathBuf>)>) -> Result<bool> {
     let (mods, modules) = rebuild()?;
-    let (base, _) = psxw_build::game::build(ws, &Options { moddable: true, ..Options::new(game) })?;
+    no_compiled_in_debug(&mods, debug)?;
+    let (base, _) = psxw_build::game::build(ws, &base_options(game, debug))?;
     let dir = moddable_bundle(ws, game, &base, dir.to_path_buf())?;
     std::fs::create_dir_all(dir.join("mods"))?;
     let script_url = |id: &str, seq: u64| -> Result<String> {
@@ -569,6 +563,47 @@ fn js_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The moddable base, or (`debug`) its debug build (D53): the C's DWARF
+/// in DevTools, script mods loaded at run time.
+pub fn base_options(game: &str, debug: bool) -> Options {
+    Options { moddable: true, debug, ..Options::new(game) }
+}
+
+/// Compiled mods (deprecated, D56) don't load into a debug build: their
+/// code has the default window's address built in.
+fn no_compiled_in_debug(mods: &[AnyMod], debug: bool) -> Result<()> {
+    if let Some(c) = mods.iter().find(|m| !m.is_script()).filter(|_| debug) {
+        bail!("{} is a compiled mod: compiled mods are deprecated (D56) and don't load into a debug build; leave out --debug, or use a script mod", c.id());
+    }
+    Ok(())
+}
+
+/// `watch`'s options: `--port N`, `--debug`.
+fn watch_args(rest: &[&str]) -> Result<(u16, bool)> {
+    let mut port = 8081;
+    let mut debug = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--port" => port = it.next().context("--port needs a value")?.parse()?,
+            "--debug" => debug = true,
+            other => bail!("usage: psxw mod watch <mod|set> [--port N] [--debug] (not {other})"),
+        }
+    }
+    Ok((port, debug))
+}
+
+/// Tests' cache: with `--debug`, the debug moddable base, and no `same_as`
+/// (the mods it would compare with are compiled, and don't load there).
+fn test_cache(ws: &Workspace, game: &str, mods: &[AnyMod], debug: bool) -> Result<Cache> {
+    if !debug {
+        return Ok(Cache::default());
+    }
+    no_compiled_in_debug(mods, debug)?;
+    let (base, _) = psxw_build::game::build(ws, &base_options(game, true))?;
+    Ok(Cache::with_base(base, true))
+}
+
 /// The page's mods: compiled ones as their modules (`modules`, in order),
 /// script ones with `snapshot`.
 fn page_mods(any: &[AnyMod], modules: &[PathBuf], snapshot: Option<&Path>) -> Vec<crate::webtest::PageMod> {
@@ -652,20 +687,22 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
             Ok(true)
         }
         ["test", game, dirs @ ..] => {
-            let mods = load_any(dirs)?;
+            let debug = dirs.contains(&"--debug");
+            let dirs: Vec<&str> = dirs.iter().copied().filter(|d| *d != "--debug").collect();
+            let mods = load_any(&dirs)?;
             let (_, table) = build::table(ws, game)?;
-            let cache = Cache::default();
+            let cache = test_cache(ws, game, &mods, debug)?;
             let b = Direct { ws, game, out_root: None, cache: &cache, snapshot: None };
             let out = psxw_build::game::out_dir(ws, game).join("mods").join(label_any(&mods)).join("tests");
             crate::modtest::run_tests(&b, &cache, &table, &mods, None, &std::path::absolute(out)?)
         }
         ["new", game, id, rest @ ..] => {
-            let script = rest.contains(&"--script");
-            let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--script").collect();
+            let script = !rest.contains(&"--compiled");
+            let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--script" && *a != "--compiled").collect();
             let base = match rest.as_slice() {
                 ["--dir", d] => PathBuf::from(d),
                 [] => PathBuf::from("."),
-                _ => bail!("usage: psxw mod new <game> <id> [--dir D] [--script]"),
+                _ => bail!("usage: psxw mod new <game> <id> [--dir D] [--compiled]"),
             };
             let dir = base.join(id);
             new_mod(&dir, id, game, None, script)?;
@@ -676,15 +713,17 @@ fn in_psx(ws: &Workspace, args: &[&str]) -> Result<bool> {
         ["watch", game, rest @ ..] => {
             let mut dirs: Vec<&str> = Vec::new();
             let mut port = 8081u16;
+            let mut debug = false;
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match *a {
                     "--port" => port = it.next().context("--port needs a value")?.parse()?,
+                    "--debug" => debug = true,
                     d => dirs.push(d),
                 }
             }
-            let dir = ws.out_dir().join("web").join(format!("{game}-watch"));
-            watch(ws, game, &dir, port, None, &|| {
+            let dir = ws.out_dir().join("web").join(format!("{game}-watch{}", if debug { "-debug" } else { "" }));
+            watch(ws, game, &dir, port, debug, None, &|| {
                 let any = load_any(&dirs)?;
                 let built = build_modules_direct(ws, game, &psxw_modkit::script::compiled(&any), None)?;
                 print_modules(&built);

@@ -205,10 +205,9 @@ pub struct Prepared {
 
 /// A build's inputs and tiers.
 pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
-    ensure!(
-        !opts.debug || (!opts.ubsan && !opts.moddable && opts.mods.is_none()),
-        "a debug build doesn't combine with --ubsan, --moddable or mods yet"
-    );
+    // A debug build can be a moddable base (script mods, D56); mods linked
+    // in would need building for its window.
+    ensure!(!opts.debug || (!opts.ubsan && opts.mods.is_none()), "a debug build doesn't combine with --ubsan or linked-in mods yet");
     // Incremental: cheap when the runtime hasn't changed.
     let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;

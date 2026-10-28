@@ -637,7 +637,8 @@ not part of the contract.
 
 ### Script mods (D54, D55)
 
-A script mod is one ES module whose default export, `mod(factory)`, given
+Script mods are the modkit; compiled mods (M11) are deprecated but keep
+working (D56). A script mod is one ES module whose default export, `mod(factory)`, given
 the mod's `game` and the mod API, returns its hooks (`before`, `after`,
 `replace`, `around`), data patches and commands. It loads into a moddable
 base (D51) beside compiled mods, with no build step (`web/script.js`).
@@ -672,6 +673,9 @@ base (D51) beside compiled mods, with no build step (`web/script.js`).
 - **Tests run in the browsers.** The native host runs no JS; a script
   mod's tests run in headless Chromium and Firefox and report in the
   native host's shapes, so M11's expectations read them alike.
+- **Debug builds load them.** A debug build's moddable base (D53's
+  window at 2 GiB) loads script mods, which read the window from the
+  module: the game's C in DevTools with mods applied.
 
 ## Browser host
 

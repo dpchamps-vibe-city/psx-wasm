@@ -1,6 +1,8 @@
 # M11 — Modkit
 
-**Status:** done (the browser runs of acceptance steps 5 and 7 waived by the user, 2026-10-26)
+**Status:** done (the browser runs of acceptance steps 5 and 7 waived by the user, 2026-10-26).
+Compiled mods are deprecated in favour of M12's script mods (D56,
+2026-10-27); they keep working, and they are what script twins are held to.
 **Depends on:** M2 (phase 1); M5 (phase 2). **Unlocks:** —
 **Design refs:** design §2 (function pointers), §3 (overlays), §4 (one
 implementation per function), §7 (one module, hot-swappable runtime), §8

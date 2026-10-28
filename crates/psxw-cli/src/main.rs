@@ -32,6 +32,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use psxw_inputs::{Workspace, snapshot, toolchain};
 
 mod ci;
+mod help;
 mod run;
 mod conform;
 mod render;
@@ -79,6 +80,9 @@ fn with_mods(ws: &Workspace, game: &str, dirs: &[String]) -> Result<Option<psxw_
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if help::show(&args)? {
+        return Ok(());
+    }
     if args.first().is_some_and(|a| a == "mod") {
         let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
         if !mods::run(&rest)? {
@@ -235,8 +239,15 @@ fn run() -> Result<()> {
             if let Some(o) = rest.iter().find(|a| *a != "--moddable" && *a != "--debug") {
                 bail!("unknown build-web option {o}");
             }
+            if debug && moddable {
+                ensure!(dirs.is_empty(), "a moddable bundle links no mods; load script mods in the page");
+                let (r, _) = psxw_build::game::build(&ws, &mods::base_options(game, true))?;
+                let dir = mods::moddable_bundle(&ws, game, &r, ws.out_dir().join("web").join(format!("{game}-moddable-debug")))?;
+                eprintln!("debug moddable web bundle: {} (serve it with `psxw serve {}`; script mods load in the page, the C is in DevTools' Sources)", dir.display(), dir.display());
+                return Ok(());
+            }
             if debug {
-                ensure!(dirs.is_empty() && !moddable, "a debug bundle links no mods yet");
+                ensure!(dirs.is_empty(), "a debug bundle links no mods: build it with --moddable and load script mods in the page");
                 let (r, _) = psxw_build::game::build(&ws, &psxw_build::game::Options { debug: true, ..psxw_build::game::Options::new(game) })?;
                 let dir = psxw_build::web::bundle(&ws, game, &r, ws.out_dir().join("web").join(format!("{game}-debug")))?;
                 eprintln!("debug web bundle: {} (serve it with `psxw serve {}`; the C is in DevTools' Sources)", dir.display(), dir.display());
@@ -384,13 +395,7 @@ fn run() -> Result<()> {
                 std::process::exit(2);
             }
         }
-        _ => bail!(
-            "usage: psxw toolchain fetch | inputs sync | census <game> [--only S] [--only-header S] [--no-probe] \
-             | lift <game> [--function F | --container C | --all] | difftest <game> [--only S] [--seeds N] \
-             | link-test <game> --function F | ci <game> | {} | {}",
-            conform::USAGE,
-            oracle::USAGE
-        ),
+        _ => bail!("unknown or incomplete command; run `psxw --help` for commands and options"),
     }
     Ok(())
 }

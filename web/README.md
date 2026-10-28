@@ -61,7 +61,15 @@ game or corrupt its state; there is no rollback.
 
 ## Script mods
 
-A script mod (plans/M12) is one ES module, with no build step:
+A script mod (plans/M12) is one ES module, with no build step. Script mods
+are the modkit; compiled mods (`.mod.wasm`, M11) still load but are
+deprecated (D56), and don't load into a debug build.
+
+```
+psxw build-web <game> --moddable --debug   # script mods, and the C in DevTools
+psxw mod watch <mod|set> --debug           # the same from a mods workspace
+```
+
 
 ```js
 // mods/gold-rush/mod.js

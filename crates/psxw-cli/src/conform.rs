@@ -15,8 +15,6 @@ use psxw_host_native::{Conform, Options};
 use psxw_inputs::Workspace;
 use serde::Serialize;
 
-pub const USAGE: &str = "conform <game> --lib libpad|libgpu|libmcrd|libetc|libsnd|libspu [--frames N] [--render server] [--dump-frames DIR]";
-
 /// Libraries with a scenario (the `psxw ci` gate runs each).
 pub const LIBRARIES: &[&str] = &["libpad", "libgpu", "libmcrd", "libetc", "libsnd", "libspu"];
 
