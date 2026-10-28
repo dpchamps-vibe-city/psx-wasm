@@ -12,8 +12,8 @@
 // Mods (M11 phase 2): the panel keeps mod modules in OPFS `mods/` with
 // their order and whether each is enabled (`order.json`); the enabled ones
 // load at Start. "Swap in" sends a module to the running game through a
-// shared mailbox. ?mods=URL,URL loads those instead (a .js URL is a script
-// mod, plans/M12); ?swap=FRAME:INDEX:URL (repeatable) swaps one in at a
+// shared mailbox. ?mods=URL,URL loads those first (a .js URL is a script
+// mod, plans/M12), then the panel's enabled ones; ?swap=FRAME:INDEX:URL (repeatable) swaps one in at a
 // vblank; ?watch=URL polls a JSON {seq, index, url, kind, id} (psxw mod
 // watch) and swaps each new module in, or reloads a script mod.
 
@@ -223,14 +223,34 @@ async function renderMods() {
     list.append(li);
   });
 }
+/**
+ * The name a mod file is kept under in OPFS: a script mod's by its id
+ * (every script mod's file is `mod.js`), a pack's by its id, a module's by
+ * its file name.
+ */
+async function storedName(f) {
+  if (f.name.endsWith(".psxpack.json")) {
+    try {
+      const id = JSON.parse(await f.text()).id;
+      if (/^[a-z0-9-]+$/.test(id)) return `${id}.psxpack.json`;
+    } catch {}
+    return f.name;
+  }
+  if (f.name.endsWith(".js")) {
+    const id = /\bid\s*:\s*["']([a-z0-9-]+)["']/.exec(await f.text())?.[1];
+    if (id) return `${id}.js`;
+  }
+  return f.name;
+}
 document.getElementById("mod-file").addEventListener("change", async (e) => {
   const order = await readOrder();
   const dir = await modsDir();
   for (const f of e.target.files) {
-    const w = await (await dir.getFileHandle(f.name, { create: true })).createWritable();
+    const name = await storedName(f);
+    const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
     await w.write(await f.arrayBuffer());
     await w.close();
-    if (!order.some((m) => m.file === f.name)) order.push({ file: f.name, enabled: true });
+    if (!order.some((m) => m.file === name)) order.push({ file: name, enabled: true });
   }
   await writeOrder(order);
   e.target.value = "";
@@ -285,7 +305,9 @@ async function start(cue, audioRing) {
     clock: game.frame_counter,
     gameId: game.id || "",
     mods: params.has("mods") ? params.get("mods").split(",").filter(Boolean) : [],
-    modsFromOpfs: !params.has("mods") && (await readOrder()).some((m) => m.enabled),
+    // The panel's enabled mods load after the URL's (one with the same id
+    // replaces the URL's).
+    modsFromOpfs: (await readOrder()).some((m) => m.enabled),
     swaps: params.getAll("swap").map((s) => {
       const [frame, index, ...url] = s.split(":");
       return { frame: parseInt(frame, 10), index: parseInt(index, 10), url: url.join(":") };

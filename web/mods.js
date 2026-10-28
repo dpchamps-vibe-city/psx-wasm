@@ -159,10 +159,12 @@ export class ModLoader {
     x.psxmod_n_loaded.value = this.mods.length;
   }
 
-  /** Load a mod after the others. */
+  /** Load a mod after the others, or in place of a loaded one with its id. */
   load(bytes) {
     const m = this.instantiate(bytes, null);
-    this.add(m);
+    const at = this.mods.findIndex((x) => x.id === m.id);
+    if (at >= 0) this.replace(at, m);
+    else this.add(m);
     if (this.booted) m.instance.exports.psxmod_init();
     return m.id;
   }

@@ -37,8 +37,9 @@
 //   the events never arrive.
 //
 // - mods (M11 phase 2, mods.js): with a moddable base, mod modules load
-//   before boot (`options.mods`: URLs, or `options.modsFromOpfs`: the
-//   enabled ones in OPFS `mods/`), swap in at given vblanks
+//   before boot (`options.mods`: URLs, then with `options.modsFromOpfs`
+//   the enabled ones in OPFS `mods/`; one with a loaded mod's id replaces
+//   it), swap in at given vblanks
 //   (`options.swaps`), or arrive while the game runs through a shared
 //   mailbox (`modBuffer`), applied at the next vblank;
 // - script mods (M12, script.js): a `.js` URL among `options.mods` or
@@ -551,10 +552,15 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   if (options.modsFromOpfs) {
     // A single-file script mod in OPFS imports from a blob; a pack brings
     // its snapshot.
+    // Each is optional: one that fails is reported, and the game runs on.
     for (const m of await opfsMods()) {
       const blob = () => URL.createObjectURL(new Blob([m.bytes], { type: "text/javascript" }));
-      if (isPack(m.name)) wanted.push({ name: m.name, script: await scripts.importPack(JSON.parse(new TextDecoder().decode(m.bytes))) });
-      else wanted.push(isScript(m.name) ? { name: m.name, script: await script(blob()) } : m);
+      try {
+        if (isPack(m.name)) wanted.push({ name: m.name, optional: true, script: await scripts.importPack(JSON.parse(new TextDecoder().decode(m.bytes))) });
+        else wanted.push(isScript(m.name) ? { name: m.name, optional: true, script: await script(blob()) } : { ...m, optional: true });
+      } catch (err) {
+        postMessage({ type: "status", text: `mod ${m.name}: ${err.message || err}` });
+      }
     }
   }
   for (const w of options.swaps || []) {
@@ -563,10 +569,15 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   if (!loader && (wanted.length || swaps.length)) throw new Error("this bundle's game.wasm isn't a moddable base (psxw build-web --moddable)");
   if (loader) {
     for (const m of wanted) {
-      if (m.script) {
-        scripts.queue({ ...m.script, fatal: true }).catch(() => {});
-        scripts.vblank();
-      } else loader.load(m.bytes);
+      try {
+        if (m.script) {
+          scripts.queue({ ...m.script, fatal: true }).catch(() => {});
+          scripts.vblank();
+        } else loader.load(m.bytes);
+      } catch (err) {
+        if (!m.optional) throw err;
+        postMessage({ type: "status", text: `mod ${m.name}: ${err.message || err}` });
+      }
     }
     modsChanged(loader.mods.length ? `loaded ${loader.ids().join(", ")}` : "no mods");
   }
