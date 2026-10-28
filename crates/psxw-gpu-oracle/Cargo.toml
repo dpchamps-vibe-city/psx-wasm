@@ -3,6 +3,7 @@ name = "psxw-gpu-oracle"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "psx-wasm's GPU (front end + GL backend in the pinned Mesa image) as an oracle device under test"
 
 [dependencies]

@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.0.0"
 edition = "2024"
 publish = false
+license = "MIT"
 
 # Intended external crates (not yet added):
 #   object                 – read matching ELFs and relocatable MIPS objects

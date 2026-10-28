@@ -3,6 +3,7 @@ name = "psxw-lift"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"

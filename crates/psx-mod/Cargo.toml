@@ -3,6 +3,7 @@ name = "psx-mod"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "The mod library for mods written in Rust (plans/M11): logging, an allocator over the mod's own area, a panic handler."
 
 [features]

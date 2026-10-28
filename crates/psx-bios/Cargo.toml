@@ -3,6 +3,7 @@ name = "psx-bios"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 psx-spu = { path = "../psx-spu" }

@@ -3,6 +3,7 @@ name = "psx-runtime"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # `psxw runtime build` builds this as a cdylib for wasm32 (runtime.wasm);
 # natively it's a library for tests.

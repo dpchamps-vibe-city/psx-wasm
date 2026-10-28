@@ -3,6 +3,7 @@ name = "psx-render-gl"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "The GPU backend: renderer commands to VRAM over glow (WebGL2 / GLES 3.0), byte-exact at 1x"
 
 [features]
