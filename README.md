@@ -15,6 +15,7 @@ is in [docs/design.md](docs/design.md); decisions in
 
 ```sh
 cargo build --release -p psxw-cli
+./target/release/psxw --help               # commands; use <command> --help for options
 ./target/release/psxw toolchain fetch      # pinned clang, binaryen, wasm-bindgen, signatures
 ./target/release/psxw inputs sync          # snapshot pinned repos into .inputs/
 ./target/release/psxw ci btn               # every gate of every milestone so far
