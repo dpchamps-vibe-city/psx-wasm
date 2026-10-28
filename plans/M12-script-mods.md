@@ -1,6 +1,6 @@
 # M12 — Script mods
 
-**Status:** in progress (phases 1–3 built; the cost re-measurement and `psxw ci btn` remain)
+**Status:** done
 **Depends on:** M11 (done). **Unlocks:** —
 **Design refs:** design §7 (one module), §9 (debug builds), "One-shot
 host scripting"; decisions D45 (non-local exits), D49 (hooks on function
@@ -521,7 +521,7 @@ D54 records this design.
      mod's `game` comes from its own.
 7. [x] **Type checking:** pinned Node and TypeScript in the browsers
    image; `psxw mod check` runs `tsc --noEmit` over script mods.
-8. [ ] **Acceptance** in the mods repo (below).
+8. [x] **Acceptance** in the mods repo (below).
 
 ### Exit criteria (all automated)
 
@@ -788,6 +788,8 @@ export default mod(({ game, hook }) => {
   and `psx.d.ts`, type checking, `--bump` with aliases, sources and
   workspace fragments, packs, `Options::lift`, and the gate's script part
   (data-driven: the test format gained `swap`).
+- **2026-10-27, done:** `psxw ci btn` passes every gate (41 min),
+  including `mods` with its script part, and `web-game`.
 - **2026-10-27, acceptance** (btn-mods `792d8e7`, then the twins): the
   compiled toys got tests; better-rand-js passes `sequence.json` with
   `check_sequence.py` unchanged, and its swap test, and is `same_as`
@@ -818,12 +820,27 @@ export default mod(({ game, hook }) => {
     every variant, the plain bundle included: its pacing, not M12's.
   - A first set of runs overlapped a compile; its outliers (a 1 s
     Firefox frame, 300 frames of Chromium drift) are discarded.
+- **The hold, in practice.** The script pass-through (before, after and
+  an `around` calling `original`, on all 3,375 hookable functions) leaves
+  `title-to-gameplay` bit-identical to the plain build in both browsers,
+  unpaced in 72 s (Chromium) and 70 s (Firefox) for 6000 vblanks. With
+  `around` on the main loop's functions JS is on the stack at almost every
+  vblank: 5,999 of the 6,000 waits were held and made on the way out.
+- **The `mods` gate's first full run passed** (2026-10-27): M11's checks,
+  and M12's: the C snapshot against the census and the address map, the
+  types (twins clean, the fixture's three errors), the twins by names
+  alone (symbol-list snapshot), the pass-through, reload, conflicts warned
+  by both `check` and the loader, `--bump` from `3a15992` (587 renames, 44
+  layout changes at their anchors), mods pinned to the two snapshots
+  together, DWARF agreeing, slot flavours (`Rand` translated: its slot
+  o32, conflict-a-js's tests pass on both bases), and btn-mods `3c77242`
+  (every mod's tests, the twins in both browsers).
 - **ABI 10 changes nothing without JS.** Natively, `title-to-gameplay`,
   `card-load`, `frozen-cutscene` and `start-no-cutscene-interaction` (6000
   vblanks each) give the same RAM and VRAM hashes at 1500/3000/4500/6000
   and the same audio under ABI 9 (`ed0e85a`, built in a worktree) and
-  ABI 10; the browsers equal the native host over `title-to-gameplay`
-  (`web-game`).
+  ABI 10; in Chromium and Firefox all four equal the native host under
+  ABI 10 (`web-test game --replay`, RAM and VRAM at three frames, audio).
 - **Exactness needs two rules for `around`.** Calling `original` with the
   arguments it was given passes the original words on (an o32 call's pad
   words, a value typed narrower than its register), and returning
