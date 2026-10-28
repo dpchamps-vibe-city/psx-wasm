@@ -543,7 +543,7 @@ export class ScriptHost {
     if (JSON.stringify(pack.snapshot.game) !== JSON.stringify(this.names.snapshot.game)) {
       throw new Error(`${pack.id}: packed for another game binary than this bundle's`);
     }
-    const url = URL.createObjectURL(new Blob([pack.mod], { type: "text/javascript" }));
+    const url = URL.createObjectURL(new Blob([pack.mod, `\n//# sourceURL=psxw-mods/${pack.id}.js\n`], { type: "text/javascript" }));
     const module = await import(url);
     const d = module.default;
     if (!d || !d[MOD]) throw new Error(`${pack.id}: its default export isn't mod(factory)`);

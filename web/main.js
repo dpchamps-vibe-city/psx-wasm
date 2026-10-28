@@ -209,7 +209,9 @@ async function renderMods() {
           return;
         }
         if (m.file.endsWith(".js")) {
-          const url = URL.createObjectURL(new Blob([await modBytes(m.file)], { type: "text/javascript" }));
+          // Named for DevTools (Sources: the game Worker's psxw-mods/), so
+          // breakpoints hold across reloads.
+          const url = URL.createObjectURL(new Blob([await modBytes(m.file), `\n//# sourceURL=psxw-mods/${m.file}\n`], { type: "text/javascript" }));
           const id = m.file.replace(/\.js$/, "");
           const done = loadedMods.includes(id) ? window.wasmPsxScripting.reload(id, url) : window.wasmPsxScripting.load(url);
           say(`${m.file}: ${await done.catch((e) => e.message)} (at the next vblank)`);

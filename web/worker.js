@@ -554,7 +554,8 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
     // its snapshot.
     // Each is optional: one that fails is reported, and the game runs on.
     for (const m of await opfsMods()) {
-      const blob = () => URL.createObjectURL(new Blob([m.bytes], { type: "text/javascript" }));
+      // Named for DevTools (psxw-mods/), so breakpoints hold across reloads.
+      const blob = () => URL.createObjectURL(new Blob([m.bytes, `\n//# sourceURL=psxw-mods/${m.name}\n`], { type: "text/javascript" }));
       try {
         if (isPack(m.name)) wanted.push({ name: m.name, optional: true, script: await scripts.importPack(JSON.parse(new TextDecoder().decode(m.bytes))) });
         else wanted.push(isScript(m.name) ? { name: m.name, optional: true, script: await script(blob()) } : { ...m, optional: true });
