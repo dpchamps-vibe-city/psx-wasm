@@ -34,8 +34,11 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x2C) => "memmove",
         (0xA0, 0x2D) => "memcmp",
         (0xA0, 0x2E) => "memchr",
+        (0xA0, 0x2F) => "rand",
+        (0xA0, 0x30) => "srand",
         (0xA0, 0x39) => "InitHeap",
         (0xA0, 0x3F) => "printf",
+        (0xA0, 0x43) => "Exec",
         (0xA0, 0x44) => "FlushCache",
         (0xA0, 0x49) => "GPU_cw",
         (0xA0, 0x55) | (0xA0, 0x70) => "_bu_init",
@@ -53,6 +56,9 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x0B) => "TestEvent",
         (0xB0, 0x0C) => "EnableEvent",
         (0xB0, 0x0D) => "DisableEvent",
+        (0xB0, 0x0E) => "OpenThread",
+        (0xB0, 0x0F) => "CloseThread",
+        (0xB0, 0x10) => "ChangeThread",
         (0xB0, 0x12) => "InitPAD",
         (0xB0, 0x13) => "StartPAD",
         (0xB0, 0x14) => "StopPAD",
@@ -217,6 +223,16 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             let hit = (0..n).find(|&i| mem.r8(a[0] + i) == a[1] as u8);
             r(hit.map_or(0, |i| a[0] + i))
         }
+        (0xA0, 0x2F) => {
+            // The kernel's LCG: x = x * 41C64E6Dh + 3039h, 15 bits of it.
+            m.kernel.rand = m.kernel.rand.wrapping_mul(0x41C6_4E6D).wrapping_add(0x3039);
+            r((m.kernel.rand >> 16) & 0x7FFF)
+        }
+        (0xA0, 0x30) => {
+            m.kernel.rand = a[0];
+            r(0)
+        }
+        (0xA0, 0x43) => Err(format!("{label}: loading and running another executable is not supported")),
         (0xA0, 0x39) => {
             m.kernel.heap = (a[0], a[1]);
             r(0)
@@ -298,6 +314,9 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             }
             r(1)
         }
+        (0xB0, 0x0E) => r(m.open_thread(a[0], a[1], a[2])),
+        (0xB0, 0x0F) => r(m.close_thread(a[0])),
+        (0xB0, 0x10) => m.change_thread(a[0]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xB0, 0x12) => {
             m.kernel.pad_bufs = Some([(a[0], a[1]), (a[2], a[3])]);
             r(1)

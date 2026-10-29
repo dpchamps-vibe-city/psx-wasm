@@ -45,7 +45,11 @@ pub mod replay;
 ///   `host.wait_vblank`, which only paces; `psxw_js_enter` and
 ///   `psxw_js_leave` bracket calls into JS, and the runtime holds
 ///   `wait_vblank` calls while JS is on the stack.
-pub const ABI_VERSION: u32 = 10;
+/// - 11: guest threads (D57): the guest exports binaryen Asyncify's
+///   control functions ([`guest::ASYNCIFY_START_UNWIND`] and the rest),
+///   instrumented when the game switches threads and stubs otherwise; the
+///   BIOS keeps the kernel's thread tables in guest RAM ([`kernel`]).
+pub const ABI_VERSION: u32 = 11;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -73,6 +77,42 @@ pub const WINDOW_MASK: u32 = 0x00FF_FFFF;
 /// lives above the default guest window (below a debug build's, its heap
 /// above it).
 pub const RUNTIME_BASE: u32 = 0x0200_0000;
+
+/// The kernel's tables in guest RAM (D57, M13): what the BIOS lays out
+/// for games to read and edit directly (psx-spx "BIOS Memory Map"). The
+/// rest of the kernel's state stays in the runtime. Addresses are
+/// physical; the BIOS points at them through KSEG1, as the console's does.
+pub mod kernel {
+    use core::ops::Range;
+    /// The table of tables: a (pointer, size) pair per table from 0x100.
+    /// These two entries are filled: the process control block, and the
+    /// thread control blocks.
+    pub const PCB_ENTRY: u32 = 0x108;
+    pub const TCB_ENTRY: u32 = 0x110;
+    /// The PCB: one word, the current thread's TCB.
+    pub const PCB: u32 = 0xE000;
+    /// The TCBs (SYSTEM.CNF `TCB=`, at most [`MAX_TCBS`]); TCB 0 is the
+    /// main thread.
+    pub const TCBS: u32 = 0xE010;
+    pub const TCB_SIZE: u32 = 0xC0;
+    pub const MAX_TCBS: u32 = 32;
+    /// TCB fields: status, then r0..r31 from `REGS`, then cop0 epc, hi,
+    /// lo, sr, cause.
+    pub const TCB_STATUS: u32 = 0x00;
+    pub const TCB_REGS: u32 = 0x08;
+    pub const TCB_EPC: u32 = 0x88;
+    pub const TCB_SR: u32 = 0x94;
+    pub const TCB_FREE: u32 = 0x1000;
+    pub const TCB_USED: u32 = 0x4000;
+    /// Kernel RAM a game may read and write at constant addresses: the
+    /// lift's kernel rule accepts these and still fails on the rest.
+    pub const RAM_BACKED: [Range<u32>; 2] = [PCB_ENTRY..TCB_ENTRY + 8, PCB..TCBS + MAX_TCBS * TCB_SIZE];
+
+    /// Whether physical address `addr` lies in [`RAM_BACKED`].
+    pub fn ram_backed(addr: u32) -> bool {
+        RAM_BACKED.iter().any(|r| r.contains(&(addr & 0x1FFF_FFFF)))
+    }
+}
 
 /// Guest physical layout inside the window.
 pub mod phys {
@@ -200,6 +240,16 @@ pub mod guest {
     /// [`super::DEBUG_WINDOW_BASE`]). Hosts read it from the module's
     /// exports; a module without it has the default.
     pub const WINDOW: &str = "guest_window";
+    /// binaryen Asyncify's control functions (D57): `(data_ptr) -> ()`
+    /// start an unwind or a rewind over the data structure at `data_ptr`
+    /// (current position, end, then the saved frames); `() -> ()` stop
+    /// them; `() -> i32` is the state (0 normal, 1 unwinding, 2
+    /// rewinding). A guest that never switches threads exports stubs.
+    pub const ASYNCIFY_START_UNWIND: &str = "asyncify_start_unwind";
+    pub const ASYNCIFY_STOP_UNWIND: &str = "asyncify_stop_unwind";
+    pub const ASYNCIFY_START_REWIND: &str = "asyncify_start_rewind";
+    pub const ASYNCIFY_STOP_REWIND: &str = "asyncify_stop_rewind";
+    pub const ASYNCIFY_GET_STATE: &str = "asyncify_get_state";
 }
 
 /// What `game.wasm` imports from its host: module `host`. All pointers are
@@ -305,7 +355,9 @@ pub struct BootOptions {
     pub safepoint_budget: u32,
     /// CPU cycles of virtual time per safepoint.
     pub safepoint_quantum: u32,
-    /// Bit 0: trap on I/O-window accesses; bit 1: verify resident overlays.
+    /// Bit 0: trap on I/O-window accesses; bit 1: verify resident overlays;
+    /// bit 2: report I/O-window bytes no device access wrote (`shadow-io`
+    /// events, at each vblank).
     pub debug: u32,
     /// Bit 0: report every BIOS and adapter call; bit 1: offer GPU draw
     /// batches for recording; bit 2: offer SPU windows for recording.
@@ -315,6 +367,7 @@ pub struct BootOptions {
 impl BootOptions {
     pub const DEBUG_IO: u32 = 1;
     pub const DEBUG_OVERLAYS: u32 = 2;
+    pub const DEBUG_SHADOW_IO: u32 = 4;
     pub const TRACE_CALLS: u32 = 1;
     pub const TRACE_RECORD_GPU: u32 = 2;
     pub const TRACE_RECORD_SPU: u32 = 4;

@@ -11,6 +11,7 @@ pub mod card;
 pub mod io;
 pub mod kernel;
 pub mod machine;
+pub mod threads;
 
 pub use machine::{Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, Wait};
 

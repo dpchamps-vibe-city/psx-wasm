@@ -28,6 +28,11 @@ pub trait Host {
     /// Raw 2352-byte sectors; false when unreadable.
     fn disc_read(&mut self, lba: u32, out: &mut [u8; 2352]) -> bool;
     fn has_disc(&mut self) -> bool;
+    /// The disc's tracks (psxw-abi `host::DISC_INFO`), if the host knows
+    /// them.
+    fn disc_info(&mut self) -> Option<psxw_abi::DiscInfo> {
+        None
+    }
     /// The pad state for `port` (0 or 1): bytes as the controller sends
     /// them after its ID (e.g. `[0xFF, 0xFF]` for a digital pad, nothing
     /// pressed). Empty when nothing is connected.
@@ -100,6 +105,8 @@ pub enum Event {
     Timer(u8),
     /// A device event the SDK adapters own: (kind, data).
     Sdk(u32, u32),
+    /// The register-level CD controller has work due (D58).
+    Cdc,
 }
 
 /// What a BIOS call or adapter does next.
@@ -294,6 +301,7 @@ impl<S: Sdk> Machine<S> {
                 self.raise_irq(psx_devices::irq::TIMER0 + n as u32);
             }
             Event::Sdk(kind, data) => S::on_event(self, kind, data),
+            Event::Cdc => self.cdc_sync(),
         }
     }
 

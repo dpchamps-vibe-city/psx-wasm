@@ -9,7 +9,11 @@
 //!   RAM hashes at frames 60, 300 and 600, and identical audio (frames and
 //!   hash);
 //! - `--check no-trap`: the run reaches its frame limit (the UBSan gate,
-//!   with `--wasm out/<game>/game-ubsan.wasm`).
+//!   with `--wasm out/<game>/game-ubsan.wasm`);
+//! - `--check no-shadow-io` (M13): after every frame, the I/O window's
+//!   bytes in guest memory are as device accesses left them: no store
+//!   through a pointer reached a register silently. A failure names the
+//!   first frame and address; a `--debug-io` build traps at the store.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_host_native::{Options, Overlay, RunReport, Stop};
@@ -211,6 +215,9 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
             }
         }
     }
+    if checks.iter().any(|c| c == "no-shadow-io") {
+        o.boot.debug |= psxw_abi::BootOptions::DEBUG_SHADOW_IO;
+    }
     let r = psxw_host_native::run(o.clone())?;
     let dir = ws.out_dir().join("run").join(game);
     std::fs::create_dir_all(&dir)?;
@@ -240,9 +247,23 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
     if checks.iter().any(|c| c == "card") {
         results.extend(card_checks(&o)?);
     }
+    if checks.iter().any(|c| c == "no-shadow-io") {
+        let hits: Vec<&serde_json::Value> = r.events.iter().filter(|e| e["event"] == "shadow-io").collect();
+        let detail = match hits.first() {
+            None => format!("{} frames", r.frames),
+            Some(e) => format!(
+                "frame {}: {} bytes, first {} = {:#x}; rebuild with `psxw build {game} --debug-io` to trap at the store",
+                e["frame"],
+                hits.len(),
+                e["addr"].as_str().unwrap_or_default(),
+                e["value"].as_u64().unwrap_or(0)
+            ),
+        };
+        results.push(Check { name: "no-shadow-io", pass: hits.is_empty(), detail });
+    }
     for c in &checks {
-        if !["boot", "determinism", "no-trap", "card"].contains(&c.as_str()) {
-            bail!("unknown check {c} (boot, determinism, no-trap, card)");
+        if !["boot", "determinism", "no-trap", "card", "no-shadow-io"].contains(&c.as_str()) {
+            bail!("unknown check {c} (boot, determinism, no-trap, card, no-shadow-io)");
         }
     }
     if !results.is_empty() {

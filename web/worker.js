@@ -63,7 +63,7 @@ import { loadSaves, savesDir } from "./cards.js";
 import { ModLoader, takeMod } from "./mods.js";
 import { Calls, ScriptHost, mod } from "./script.js";
 
-const ABI_VERSION = 10;
+const ABI_VERSION = 11;
 const NOTHING_PRESSED = 0xffff;
 // Where the guest's window is, unless the module says (psxw-abi
 // guest::WINDOW; a debug build's is at 2 GiB).

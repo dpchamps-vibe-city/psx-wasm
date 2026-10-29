@@ -50,6 +50,10 @@ pub struct Kernel {
     pub int_handlers: BTreeMap<u32, Vec<u32>>,
     /// Memory cards and their files.
     pub cards: crate::card::Cards,
+    /// Threads; their TCBs are in guest RAM.
+    pub threads: crate::threads::Threads,
+    /// The C library's random generator (A0h:2Fh/30h).
+    pub rand: u32,
 }
 
 impl Kernel {

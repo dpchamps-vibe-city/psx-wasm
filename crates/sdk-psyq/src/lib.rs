@@ -41,7 +41,12 @@ pub type Adapter = fn(&mut M, [u32; 4]) -> Result;
 /// - libspu and libsnd (D47): the SPU is register-level (`psx-spu`, exact
 ///   against the oracle), so libspu's own code programs it, and libsnd's
 ///   few direct register writes reach it too.
-pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd"];
+/// - libcd and libds (D58): the CD controller (`psx_devices::cdc`) takes
+///   their commands and delivers sectors and XA audio. libcd's adapters
+///   stay for the objects they are validated against (`adapter-or-device`).
+/// - libpress: the MDEC (`psx_devices::mdec`) decodes what its own code
+///   feeds it by DMA0, and DMA1 takes the pixels.
+pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress"];
 
 /// Event kinds the adapters schedule.
 pub mod ev {

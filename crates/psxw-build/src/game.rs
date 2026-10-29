@@ -201,6 +201,8 @@ pub struct Prepared {
     void_used: BTreeSet<(String, u32)>,
     overlays: BTreeMap<u32, Vec<(String, [u32; 2])>>,
     spec: GameSpec,
+    /// Functions that switch threads (wasm names), seeding Asyncify.
+    switches: BTreeSet<String>,
 }
 
 /// A build's inputs and tiers.
@@ -235,8 +237,10 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         );
     }
     let runtime_devices = crate::runtime::devices(&runtime)?;
+    let placed: BTreeSet<&str> =
+        inputs.map.containers.iter().flat_map(|c| &c.sdk).filter_map(|p| p.member.split('/').next()).collect();
     let mut device_libs = boundary.device_libraries();
-    if let Some(l) = device_libs.iter().find(|l| !runtime_devices.contains(l)) {
+    if let Some(l) = device_libs.iter().find(|l| placed.contains(l.as_str()) && !runtime_devices.contains(l)) {
         bail!("the boundary runs {l} over devices, but the runtime has no device support for it");
     }
     let db = SigDb::pinned(ws)?;
@@ -245,33 +249,19 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         identity.identities.iter().filter_map(|i| Some((i.member.as_str(), i.key.as_deref()?))).collect();
     let validated: BTreeSet<(&str, &str)> = sdk_psyq::validated::VALIDATED.iter().copied().collect();
     let (translations, _, _, _, inline) = psxw_lift::run::translate(&mut inputs);
-    // `adapter-or-device` libraries (D58), decided for the whole library:
-    // its adapters if every placed object defining one of their functions
-    // is validated, otherwise its original code over the devices.
+    // `adapter-or-device` libraries (D58), decided for the whole library.
     let adapter_names: BTreeSet<&str> = adapters.iter().map(String::as_str).collect();
     let mut resolved: BTreeMap<String, Policy> = BTreeMap::new();
     for lib in boundary.adapter_or_device_libraries() {
-        let unvalidated: BTreeSet<&str> = translations
-            .iter()
-            .filter(|t| adapter_names.contains(t.func.name.as_str()))
-            .filter_map(|t| inputs.map.sdk_at(&t.func.container, t.func.addr))
-            .map(|p| p.member.as_str())
-            .filter(|m| m.split('/').next() == Some(lib.as_str()))
-            .filter(|m| !keys.get(m).is_some_and(|k| validated.contains(&(*m, *k))))
-            .collect();
-        if unvalidated.is_empty() {
+        let why = adapter_or_device(&inputs.map, &translations, &lib, &|m: &str, name: &str| {
+            adapter_names.contains(name) && keys.get(m).is_some_and(|k| validated.contains(&(m, *k)))
+        }, &adapter_names);
+        let Some(why) = why else {
             resolved.insert(lib, Policy::Adapter);
             continue;
-        }
-        ensure!(
-            runtime_devices.contains(&lib),
-            "{lib} (adapter-or-device) has objects with unvalidated adapters ({}), and the runtime has no device support for it",
-            unvalidated.into_iter().collect::<Vec<_>>().join(", ")
-        );
-        eprintln!(
-            "build: {lib} runs as original code over the devices: unvalidated objects with adapters: {}",
-            unvalidated.into_iter().collect::<Vec<_>>().join(", ")
-        );
+        };
+        ensure!(runtime_devices.contains(&lib), "{lib} (adapter-or-device) needs its original code ({why}), and the runtime has no device support for it");
+        eprintln!("build: {lib} runs as original code over the devices: {why}");
         resolved.insert(lib.clone(), Policy::Device);
         device_libs.push(lib);
     }
@@ -461,6 +451,14 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         );
     }
     bios_calls(&out_dir(ws, &opts.game), &lifted)?;
+    // Thread switches (ChangeThread, B0h:10h) seed the Asyncify scope (D57),
+    // by their wasm names.
+    let switches: BTreeSet<String> = lifted
+        .iter()
+        .filter(|t| psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10)))
+        .map(|t| format!("{}:{}", t.func.container, t.cname))
+        .collect();
+    ensure!(!(opts.debug && !switches.is_empty()), "debug builds of games that switch threads aren't supported (D57): Asyncify drops the DWARF");
     let failures = psxw_lift::run::write_and_compile(ws, &lift_dir, &lifted)?;
     if !failures.is_empty() {
         bail!("{} translations don't compile; run `psxw lift {}`", failures.len(), opts.game);
@@ -527,6 +525,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         // Every function a mod can hook, by (container, address): not the
         // ones the translator expands into its callers.
         slots: opts.moddable.then(|| tiers.keys().filter(|k| !expanded.contains(*k)).cloned().collect()),
+        threads: !switches.is_empty(),
         probes: inputs
             .manifest
             .run
@@ -560,6 +559,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         void_used,
         overlays,
         spec,
+        switches,
     })
 }
 
@@ -629,6 +629,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         void_used,
         overlays,
         mut spec,
+        switches,
         ..
     } = prep;
     // Mods: their objects after the game's.
@@ -654,7 +655,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
     let guest = dir.join(format!("guest{suffix}.wasm"));
     // The adapter table the guest's ids index, so a runtime swapped in
     // unmerged (the browser's dev mode) can be checked against it.
-    let mut guest_bytes = linked.wasm.clone();
+    let mut guest_bytes = if spec.threads { asyncify(ws, &dir, &linked.wasm, &switches)? } else { linked.wasm.clone() };
     {
         use wasm_encoder::Section;
         let data = adapters.join("\n").into_bytes();
@@ -942,6 +943,48 @@ fn void_results(
     out
 }
 
+/// Why `adapter-or-device` library `lib` must run as original code (D58),
+/// or `None` when its adapters can bind. They can when every placed object
+/// defining one of their functions is validated (`bound`), and the code
+/// outside the library (the game and other libraries, through direct calls,
+/// stopping at those adapters) reaches its other objects only at helpers
+/// that call nothing. Anything else drives the library's own internals,
+/// which the adapters' state can't stand in for.
+fn adapter_or_device(
+    map: &psxw_inputs::AddressMap,
+    translations: &[psxw_lift::Translation],
+    lib: &str,
+    bound: &dyn Fn(&str, &str) -> bool,
+    adapter_names: &BTreeSet<&str>,
+) -> Option<String> {
+    let member = |t: &psxw_lift::Translation| map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
+    let in_lib = |m: Option<&str>| m.is_some_and(|m| m.split('/').next() == Some(lib));
+    let unvalidated: BTreeSet<&str> = translations
+        .iter()
+        .filter(|t| adapter_names.contains(t.func.name.as_str()) && in_lib(member(t)))
+        .filter_map(|t| member(t).filter(|m| !bound(m, &t.func.name)))
+        .collect();
+    if !unvalidated.is_empty() {
+        return Some(format!("unvalidated objects with adapters: {}", unvalidated.into_iter().collect::<Vec<_>>().join(", ")));
+    }
+    let by_key: BTreeMap<(&str, u32), &psxw_lift::Translation> =
+        translations.iter().map(|t| ((t.func.container.as_str(), t.func.addr), t)).collect();
+    let mut drives: BTreeSet<String> = BTreeSet::new();
+    for t in translations.iter().filter(|t| !in_lib(member(t))) {
+        for &(_, target, _) in &t.facts.call_sites {
+            let Some(c) = [t.func.container.as_str(), map.main.as_str()].into_iter().find_map(|c| by_key.get(&(c, target))) else { continue };
+            let m = member(c);
+            if !in_lib(m) || m.is_some_and(|m| bound(m, &c.func.name)) {
+                continue;
+            }
+            if !c.facts.call_sites.is_empty() {
+                drives.insert(format!("{} ({})", c.func.name, m.unwrap_or_default()));
+            }
+        }
+    }
+    (!drives.is_empty()).then(|| format!("reached past its adapters at {}", drives.into_iter().collect::<Vec<_>>().join(", ")))
+}
+
 fn hardware_unbound(
     map: &psxw_inputs::AddressMap,
     policy_of: &dyn Fn(&str) -> Policy,
@@ -1024,6 +1067,49 @@ fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
     ensure!(missing.is_empty(), "translated code makes BIOS calls the runtime doesn't implement:\n  {}", missing.join("\n  "));
     eprintln!("build: {} BIOS calls, all implemented", calls.len());
     Ok(())
+}
+
+/// Instrument the guest with Asyncify over the functions that can be on
+/// the stack at a thread switch (D57; `psxw_link::asyncify`). Only
+/// `psx.bios` unwinds. Prints the scope's size.
+fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>) -> Result<Vec<u8>> {
+    let scope = psxw_link::asyncify::scope(wasm, switches)?;
+    let linked = dir.join("guest-linked.wasm");
+    std::fs::write(&linked, wasm)?;
+    // Binaryen's own function names (it renames duplicates), by index.
+    let map = Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg(&linked).arg("--print-function-map").output()?;
+    ensure!(map.status.success(), "wasm-opt --print-function-map failed: {}", String::from_utf8_lossy(&map.stderr));
+    let names: BTreeMap<u32, String> = String::from_utf8_lossy(&map.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (i, n) = l.split_once(':')?;
+            Some((i.parse().ok()?, n.to_string()))
+        })
+        .collect();
+    let list: Vec<&str> = scope
+        .instrument
+        .iter()
+        .map(|i| names.get(i).map(String::as_str).with_context(|| format!("wasm-opt names no function {i}")))
+        .collect::<Result<_>>()?;
+    let list_path = dir.join("asyncify-only.txt");
+    std::fs::write(&list_path, list.join("\n") + "\n")?;
+    eprintln!(
+        "build: Asyncify instruments {} of {} functions for thread switches ({} exception handlers left out)",
+        list.len(),
+        scope.defined,
+        scope.excluded.len()
+    );
+    let out = dir.join("guest-asyncify.wasm");
+    run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?)
+        .args(FEATURES)
+        .arg(&linked)
+        .arg("--asyncify")
+        .arg(format!("--pass-arg=asyncify-imports@{}.{}", psxw_abi::psx::MODULE, psxw_abi::psx::BIOS))
+        .arg(format!("--pass-arg=asyncify-onlylist@@{}", list_path.display()))
+        .arg("-g")
+        .arg("-o")
+        .arg(&out))?;
+    Ok(std::fs::read(&out)?)
 }
 
 pub fn game_path(ws: &Workspace, game: &str) -> PathBuf {

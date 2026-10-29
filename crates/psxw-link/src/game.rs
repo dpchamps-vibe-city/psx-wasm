@@ -73,6 +73,10 @@ pub struct GameSpec {
     /// entries checks its hook slot (its index here), which mods loaded at
     /// run time fill.
     pub slots: Option<Vec<(String, u32)>>,
+    /// The game switches threads (D57): the build instruments the module
+    /// with Asyncify, which exports the control functions; otherwise the
+    /// link exports stubs.
+    pub threads: bool,
 }
 
 /// A moddable base's tables, by index.
@@ -193,6 +197,9 @@ enum Synth {
     GpSet,
     /// `guest.guest_window`: the window's wasm address.
     Window,
+    /// Asyncify's control function `name` for a guest that never switches
+    /// threads (D57): the state is always normal, and the rest trap.
+    AsyncifyStub(&'static str),
     /// o32 wrapper around the C-typed function index `callee` (signature
     /// `sig`), with the prototype facts of `name` in input `input`.
     O32WrapOf { callee: u32, sig: FuncType, input: usize, name: String },
@@ -269,6 +276,8 @@ struct Ctx<'a> {
     device: HashSet<(usize, u32)>,
     /// C→C calls routed through o32 because clang's C-level kinds differ.
     abi_mismatches: BTreeSet<String>,
+    /// Generated calls to addresses no container defines (reported together).
+    unresolved: BTreeSet<String>,
     /// Per input, the mod it belongs to (index into `ModSpec::mods`).
     mod_of: Vec<Option<usize>>,
     /// The mod stack pointer and the o32 hook frame (`$sp` at a wrapping
@@ -481,7 +490,14 @@ impl Resolver for R<'_, '_> {
                 Some(c) => self.ctx.entry_from(&c, addr, caller.as_ref()),
                 None => self.ctx.dynamic_entry(addr),
             };
-            return e.map(Lowered::Call).with_context(|| format!("{name}: no function at that address"));
+            return match e {
+                Some(f) => Ok(Lowered::Call(f)),
+                None => {
+                    // Listed after the link with every other such call.
+                    self.ctx.unresolved.insert(format!("{}: {name}", inp.label));
+                    Ok(Lowered::Call(self.ctx.synth(Synth::Indirect)))
+                }
+            };
         }
         // Helpers defined in the same object with no guest address.
         let callee = match classify_name(&name) {
@@ -928,6 +944,20 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             f.instruction(&I::I32Const(window as i32));
             f.instruction(&I::End);
             (FuncType { params: vec![], results: vec![V::I32] }, f, "guest_window".into())
+        }
+        Synth::AsyncifyStub(name) => {
+            let mut f = Function::new([]);
+            let name: &'static str = name;
+            let ty = if name == guest::ASYNCIFY_GET_STATE {
+                f.instruction(&I::I32Const(0));
+                FuncType { params: vec![], results: vec![V::I32] }
+            } else {
+                f.instruction(&I::Unreachable);
+                let starts = [guest::ASYNCIFY_START_UNWIND, guest::ASYNCIFY_START_REWIND];
+                FuncType { params: if starts.contains(&name) { vec![V::I32] } else { vec![] }, results: vec![] }
+            };
+            f.instruction(&I::End);
+            (ty, f, name.to_string())
         }
         Synth::SpGet | Synth::GpGet => {
             let g = if *s == Synth::SpGet { ctx.sp } else { ctx.gp };
@@ -1479,6 +1509,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         budget: 2,
         chain: 3,
         abi_mismatches: BTreeSet::new(),
+        unresolved: BTreeSet::new(),
         mod_of,
         mod_sp: 4,
         hook_sp: 5,
@@ -1629,6 +1660,22 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         ("guest_gp_set", ctx.synth(Synth::GpSet)),
         (guest::WINDOW, ctx.synth(Synth::Window)),
     ];
+    // Asyncify adds the real ones after the link when the game switches
+    // threads (D57).
+    let asyncify_stubs: Vec<(&str, u32)> = if spec.threads {
+        Vec::new()
+    } else {
+        [
+            guest::ASYNCIFY_START_UNWIND,
+            guest::ASYNCIFY_STOP_UNWIND,
+            guest::ASYNCIFY_START_REWIND,
+            guest::ASYNCIFY_STOP_REWIND,
+            guest::ASYNCIFY_GET_STATE,
+        ]
+        .into_iter()
+        .map(|n| (n, ctx.synth(Synth::AsyncifyStub(n))))
+        .collect()
+    };
 
     let mut si = 0;
     while si < ctx.synth.len() {
@@ -1699,7 +1746,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     ex.export(guest::INVOKE_IRQ, ExportKind::Func, invoke_irq);
     ex.export(guest::MOD_INIT, ExportKind::Func, mod_init);
     ex.export(guest::MOD_LOADED, ExportKind::Func, mod_loaded);
-    for (n, f) in reg_fns {
+    for (n, f) in reg_fns.into_iter().chain(asyncify_stubs) {
         ex.export(n, ExportKind::Func, f);
     }
     ex.export(guest::SP, ExportKind::Global, ctx.sp);
@@ -1782,6 +1829,12 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     if spec.debug_info {
         debug_info(&ctx, &moved, &mut wasm)?;
     }
+    ensure!(
+        ctx.unresolved.is_empty(),
+        "{} generated calls go to addresses where no container defines a function:\n  {}",
+        ctx.unresolved.len(),
+        ctx.unresolved.iter().cloned().collect::<Vec<_>>().join("\n  ")
+    );
     Ok(Linked { wasm, aux, matched, abi_mismatches: ctx.abi_mismatches.iter().cloned().collect() })
 }
 

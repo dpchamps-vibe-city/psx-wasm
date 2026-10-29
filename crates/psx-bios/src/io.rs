@@ -1,7 +1,7 @@
-//! Register-level I/O for device libraries (D40, D42, D45, D47) and
+//! Register-level I/O for device libraries (D40, D42, D45, D47, D58) and
 //! conformance runs: guest accesses to the I/O window reach the interrupt
-//! controller, SIO0, the root counters, the DMA controller, the GPU and the
-//! SPU here, and interrupts run the kernel's `SysEnqIntRP` chains as the
+//! controller, SIO0, the root counters, the DMA controller, the GPU, the
+//! SPU, the CD controller and the MDEC here, and interrupts run the kernel's `SysEnqIntRP` chains as the
 //! BIOS exception handler does. Without a bus, an I/O access is a runtime
 //! trap: the function needs an adapter.
 //!
@@ -21,9 +21,11 @@
 //! with that value in `a0`.
 
 use crate::machine::{GuestCall, IrqStep, Machine, Sdk};
+use psx_devices::cdc::Cdc;
 use psx_devices::dma::{self, Dma};
 use psx_devices::gpu::Gpu;
 use psx_devices::irq::{self, Irq};
+use psx_devices::mdec::Mdec;
 use psx_devices::sio::Sio0;
 use std::collections::BTreeMap;
 
@@ -31,6 +33,13 @@ const TIMERS: std::ops::Range<u32> = 0x1F80_1100..0x1F80_1130;
 const SPU: std::ops::Range<u32> = 0x1F80_1C00..0x1F80_2000;
 /// DMA channel 4: SPU RAM transfers.
 const DMA_SPU: usize = 4;
+/// DMA channel 3: the CD controller's data FIFO.
+const DMA_CD: usize = 3;
+/// DMA channels 0 and 1: the MDEC's input and output.
+const DMA_MDEC_IN: usize = 0;
+const DMA_MDEC_OUT: usize = 1;
+/// Decoded CD audio kept for the SPU's CD input: a second.
+const CD_AUDIO_MAX: usize = 44_100;
 const GP0: u32 = 0x1F80_1810;
 const GP1: u32 = 0x1F80_1814;
 /// Linked-list nodes one GPU DMA may walk before it is called a loop.
@@ -101,6 +110,12 @@ pub struct Io {
     pub dma: Dma,
     pub gpu: Gpu,
     pub spu: SpuBus,
+    /// The CD controller (D58), for SDK code that drives the drive itself.
+    pub cdc: Cdc,
+    /// Its interrupt line at the last look (for the rising edge).
+    pub cdc_line: bool,
+    /// The MDEC, for libpress (FMV).
+    pub mdec: Mdec,
     /// GPU words received (GP0 port and DMA), for the run report.
     pub gp0_words: u64,
     /// Memory-control words written, by address.
@@ -139,6 +154,9 @@ impl<S: Sdk> Machine<S> {
             }
         } else if Irq::handles(addr) {
             io.irq.read(addr)
+        } else if Cdc::handles(addr) {
+            // Wider reads (the data FIFO's halfwords) take bytes in turn.
+            (0..size.min(4)).fold(0, |v, i| v | (io.cdc.read(addr) as u32) << (8 * i))
         } else if Sio0::handles(addr) {
             io.sio0.read(addr, now, &mut io.irq)
         } else if TIMERS.contains(&addr) {
@@ -155,6 +173,10 @@ impl<S: Sdk> Machine<S> {
             io.memctrl.get(&(addr & !3)).copied().unwrap_or(0) >> (8 * (addr & 3))
         } else if Dma::handles(addr) {
             io.dma.read(addr)
+        } else if addr & !3 == psx_devices::mdec::DATA {
+            io.mdec.read()
+        } else if addr & !3 == psx_devices::mdec::STATUS {
+            io.mdec.status() >> (8 * (addr & 3))
         } else if addr & !3 == GP0 {
             io.gpu.read() >> (8 * (addr & 3))
         } else if addr & !3 == GP1 {
@@ -165,6 +187,9 @@ impl<S: Sdk> Machine<S> {
         let v = v & mask(size);
         if let Some(io) = self.io.as_mut() {
             io.note(now, addr, size, v, false);
+        }
+        if Cdc::handles(addr) {
+            self.cdc_sync();
         }
         Ok(v)
     }
@@ -208,6 +233,9 @@ impl<S: Sdk> Machine<S> {
             self.spu_irq();
         } else if Irq::handles(addr) {
             io.irq.write(addr, size, v);
+        } else if Cdc::handles(addr) {
+            io.cdc.write(addr, v as u8, now);
+            self.cdc_sync();
         } else if Sio0::handles(addr) {
             io.sio0.write(addr, size, v, now, &mut io.irq);
         } else if TIMERS.contains(&addr) {
@@ -225,6 +253,14 @@ impl<S: Sdk> Machine<S> {
             if io.dma.write(addr, size, v).is_some() {
                 self.run_dma()?;
             }
+        } else if Mdec::handles(addr) {
+            if addr & !3 == psx_devices::mdec::DATA {
+                io.mdec.write(v);
+            } else {
+                io.mdec.control(v);
+            }
+            // Output a waiting DMA1 can take now.
+            self.run_dma()?;
         } else if addr & !3 == GP0 {
             self.gp0(v);
         } else if addr & !3 == GP1 {
@@ -253,9 +289,12 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
-    /// Run every DMA channel that is ready.
+    /// Run every DMA channel that is ready, and whose device can serve it:
+    /// MDEC output waits (as its request line does) while a decode is
+    /// still taking input and hasn't produced the words asked for.
     fn run_dma(&mut self) -> Result<(), String> {
-        while let Some(ch) = self.io.as_ref().and_then(|io| (0..7).find(|&c| io.dma.ready(c))) {
+        let waits = |io: &Io, ch: usize| ch == DMA_MDEC_OUT && io.mdec.busy() && io.mdec.available() < io.dma.words(ch) as usize;
+        while let Some(ch) = self.io.as_ref().and_then(|io| (0..7).find(|&c| io.dma.ready(c) && !waits(io, c))) {
             self.dma_transfer(ch)?;
             let raise = self.io.as_mut().is_some_and(|io| io.dma.complete(ch));
             S::on_dma(self, ch);
@@ -326,6 +365,29 @@ impl<S: Sdk> Machine<S> {
                     let w = self.io.as_mut().map_or(0, |io| io.gpu.read());
                     self.mem.w32(addr, w);
                     addr = addr.wrapping_add(step) & 0x1F_FFFC;
+                }
+            }
+            (DMA_MDEC_IN, 0 | 1, true) => {
+                for _ in 0..d.words(ch) {
+                    let w = self.mem.r32(addr);
+                    if let Some(io) = self.io.as_mut() {
+                        io.mdec.write(w);
+                    }
+                    addr = addr.wrapping_add(step) & 0x1F_FFFC;
+                }
+            }
+            (DMA_MDEC_OUT, 0 | 1, false) => {
+                for _ in 0..d.words(ch) {
+                    let w = self.io.as_mut().map_or(0, |io| io.mdec.read());
+                    self.mem.w32(addr, w);
+                    addr = addr.wrapping_add(step) & 0x1F_FFFC;
+                }
+            }
+            (DMA_CD, 0 | 1, false) => {
+                for _ in 0..d.words(ch) {
+                    let w = self.io.as_mut().map_or(0, |io| io.cdc.fifo_word());
+                    self.mem.w32(addr, w);
+                    addr = addr.wrapping_add(4) & 0x1F_FFFC;
                 }
             }
             (DMA_SPU, 0 | 1, true) => {
@@ -410,6 +472,56 @@ impl<S: Sdk> Machine<S> {
         if samples > 0 {
             let ram = io.spu.spu.ram().iter().flat_map(|h| h.to_le_bytes()).collect();
             io.spu.window = Some(SpuWindow { start: io.spu.at, samples, regs: spu_state_regs(&io.spu.spu), writes: Vec::new(), ram });
+        }
+    }
+
+    /// Bring the CD controller up to now: its due work (reading sectors
+    /// through the host), its decoded audio to the SPU's CD input, its next
+    /// wakeup on the clock, and IRQ2 when its line rises.
+    pub fn cdc_sync(&mut self) {
+        let now = self.clock.now;
+        let timing = self.drive.timing;
+        let Machine { io, host, cd_audio, clock, .. } = self;
+        let Some(io) = io.as_mut() else { return };
+        io.cdc.drive.timing = timing;
+        io.cdc.run(now, &mut crate::bios::HostDisc(&mut **host));
+        cd_audio.extend(io.cdc.audio.drain(..));
+        let over = cd_audio.len().saturating_sub(CD_AUDIO_MAX);
+        cd_audio.drain(..over);
+        clock.cancel(|e| *e == crate::machine::Event::Cdc);
+        if let Some(t) = io.cdc.next_due() {
+            clock.schedule(t.max(now), crate::machine::Event::Cdc);
+        }
+        let line = io.cdc.line();
+        let rising = line && !io.cdc_line;
+        io.cdc_line = line;
+        if rising {
+            self.raise_irq(irq::CDROM);
+        }
+    }
+
+    /// Tell the CD controller about the disc: its tracks, and the region
+    /// its license sector names (GetID).
+    pub fn cdc_insert(&mut self) {
+        let info = self.host.disc_info();
+        let mut lic = [0u8; psx_devices::cd::RAW];
+        let region = if self.host.disc_read(4, &mut lic) {
+            let text = String::from_utf8_lossy(psx_devices::cd::user_data(&lic)).to_ascii_lowercase();
+            if text.contains("amer") {
+                *b"SCEA"
+            } else if text.contains("euro") {
+                *b"SCEE"
+            } else {
+                *b"SCEI"
+            }
+        } else {
+            *b"SCEI"
+        };
+        let Some(io) = self.io.as_mut() else { return };
+        io.cdc.region = region;
+        if let Some(i) = info.filter(|i| i.tracks > 0) {
+            io.cdc.tracks = i.track_lba[..i.tracks.min(99) as usize].to_vec();
+            io.cdc.end = i.sectors;
         }
     }
 
@@ -503,11 +615,11 @@ mod tests {
         assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Exit));
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
-        // The SPU: main volume left reads back; the CD controller isn't on
-        // the bus (libcd has adapters).
+        // The SPU: main volume left reads back; the CD controller's status
+        // (index 0, parameter FIFO empty and not full).
         m.io_write(0x1F80_1D80, 2, 0x3FFF).unwrap();
         assert_eq!(m.io_read(0x1F80_1D80, 2).unwrap(), 0x3FFF);
-        assert!(m.io_read(0x1F80_1800, 1).is_err(), "the CD controller is not on the bus");
+        assert_eq!(m.io_read(0x1F80_1800, 1).unwrap(), 0x18);
         // GP1(08h) display mode, read back in GPUSTAT bits 17-22.
         m.io_write(0x1F80_1814, 4, 0x0800_0001).unwrap();
         assert_eq!((m.io_read(0x1F80_1814, 4).unwrap() >> 17) & 3, 1);

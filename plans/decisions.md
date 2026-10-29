@@ -32,6 +32,10 @@ target, not the design centre. Game facts live only in
 
 Open: register-level SPU as a fallback for unknown libspu versions (M8).
 
+Later decisions made the pad (D40), GPU (D42), SPU (D41, D47), CD
+controller and MDEC (D58) register-level devices, for SDK code that
+drives them itself. There is still no CPU emulation.
+
 ## Memory and calls
 
 **D5. Keep the PSX address space.** Every symbol sits at its original
@@ -682,6 +686,79 @@ fixed point to key on.
 the old one. Script mods cover what compiled ones do with no build step,
 bit for bit (M12's twins), and a script hook's cost (about 100 ns a call)
 matters only for the hottest functions.
+
+**D57. Guest threads switch stacks with Asyncify, scoped by the call
+graph** (M13). ChangeThread (B0h:10h) must suspend one guest call stack
+and resume another, and a translated function's MIPS registers are wasm
+locals, so the wasm stack itself switches.
+- **What a game does with threads** (bof4, measured): a round-robin
+  scheduler on the main thread opens up to four worker threads
+  (OpenThread with the entry, a 200h-byte stack and gp from a table) and
+  ChangeThreads to each in turn; a worker yields with
+  `ChangeThread(0xFF000000)` from any depth, or closes itself. The game
+  also edits the TCBs directly (each thread's saved SR, enabling COP2), so
+  the kernel's tables live in guest RAM (psxw-abi `kernel`: the table of
+  tables' PCB and TCB entries, the PCB and the TCBs at E000h, sized by
+  SYSTEM.CNF `TCB=`). Events stay in the runtime.
+- **How:** binaryen Asyncify (pinned, version 133) instruments the guest
+  after the link, only the functions that can be on the stack at a
+  switch: the reverse closure of the functions making B0h:10h calls,
+  through direct calls, plus every function making an indirect call (an
+  indirect call can reach any function in the dispatch table). For bof4
+  that's about 13% of functions. `psx.bios` is the one import that
+  unwinds. Functions with exception handlers (`guest_invoke_irq`) can't be
+  instrumented and are left out; a switch from a callback or interrupt
+  handler traps.
+- **The runtime's side:** ChangeThread saves the running thread's sp and
+  gp in its TCB and records the target; `bios` then unwinds the thread
+  into its buffer, back to the thread's root call in `run_threads`, which
+  starts the target afresh at its TCB's start address (and sp, gp, which
+  the game may have edited) or rewinds the target's own stack to the
+  ChangeThread it called, which returns 1 there.
+- **A game that never switches** gets stubs for Asyncify's exports, so
+  its module is unchanged otherwise (ABI 11).
+- **Not taken:** wasm stack switching (host support is uneven, and it
+  would split the browser host); one instance per thread over shared
+  memory (a shared-memory build, and per-instance globals synced on every
+  switch).
+
+*Why:* the plan's recommendation, taken without the human's input as
+instructed (the human may reopen it). It works the same under wasmtime and
+in browsers, is deterministic, and costs only in the functions that can
+be suspended.
+
+**D58. A register-level CD controller for libds and libcd's internals;
+`adapter-or-device` decides per library** (M13). bof4 links libds (no
+adapters exist) and a libcd whose drive layer (`CD_init`, `CD_cw`, the
+`St*` streaming ring) its game code and libds call directly.
+- **The device:** `psx_devices::cdc`, at 1F801800h-1F801803h with IRQ2
+  and DMA3. Commands get INT3 after the drive model's latency and INT2
+  when the drive has done the work; one interrupt is presented at a time;
+  reads deliver a sector per period on the virtual timeline (realistic or
+  instant timing, as `cd_timing` says), into the buffer the data FIFO or
+  DMA3 reads; XA-ADPCM sectors go to the existing decoder and into the
+  SPU's CD input. Sectors are checked by EDC. No CD-DA (bof4's second
+  track is data).
+- **The policy** `adapter-or-device` (libcd): decided per game for the
+  whole library, never per object, because the adapters keep the drive's
+  state in the runtime, where the library's own code can't see it (a
+  `CdDataCallback` adapter, say, doesn't register libetc's DMA3 callback
+  that libcd's original code relies on). Adapters bind when every placed
+  object defining an adapter's function is validated and the code outside
+  the library (the game and other libraries, through direct calls,
+  stopping at those adapters) reaches its other objects only at helpers
+  that call nothing (`CdIntToPos`). Otherwise the whole library runs as
+  original code over the controller. btn keeps its adapters; bof4's libcd
+  is reached past them at `CD_cw`, `CD_init`, `StSetRing` and others.
+- **libds** is `device`; **libpress** is `device` over the MDEC
+  (`psx_devices::mdec`, DMA0 in, DMA1 out, decoding instantly in virtual
+  time).
+
+*Why:* the plan's recommendation (b), taken without the human's input as
+instructed. It follows D40, D42, D45 and D47: the original library decides
+everything observable. The per-library rule is this milestone's
+refinement of the recommended per-object one, which would have mixed
+adapter state with original code in bof4.
 
 ## Open questions (tracked)
 

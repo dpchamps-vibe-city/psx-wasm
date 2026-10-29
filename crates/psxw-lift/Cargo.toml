@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+psxw-abi = { path = "../psxw-abi" }
 psxw-cc = { path = "../psxw-cc" }
 psxw-inputs = { path = "../psxw-inputs" }
 psxw-link = { path = "../psxw-link" }

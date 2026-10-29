@@ -970,6 +970,7 @@ name = "psxw-lift"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "psxw-abi",
  "psxw-cc",
  "psxw-inputs",
  "psxw-link",

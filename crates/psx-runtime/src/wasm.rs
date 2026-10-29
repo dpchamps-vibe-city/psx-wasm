@@ -63,6 +63,11 @@ unsafe extern "C" {
     fn psxmod_init();
     fn psxmod_loaded(addr: u32, len: u32);
     fn guest_window() -> u32;
+    fn asyncify_start_unwind(data: u32);
+    fn asyncify_stop_unwind();
+    fn asyncify_start_rewind(data: u32);
+    fn asyncify_stop_rewind();
+    fn asyncify_get_state() -> i32;
 }
 
 fn fatal(code: u32, msg: &str) -> ! {
@@ -77,6 +82,7 @@ impl Host for FfiHost {
         unsafe { host_log(level, msg.as_ptr(), msg.len()) }
     }
     fn vblank(&mut self, frame: u64) {
+        shadow_check(frame);
         unsafe { host_vblank(frame) }
     }
     fn wait_vblank(&mut self, frame: u64) {
@@ -88,6 +94,10 @@ impl Host for FfiHost {
     fn has_disc(&mut self) -> bool {
         let mut info = psxw_abi::DiscInfo::default();
         unsafe { host_disc_info((&mut info as *mut psxw_abi::DiscInfo).cast()) != 0 }
+    }
+    fn disc_info(&mut self) -> Option<psxw_abi::DiscInfo> {
+        let mut info = psxw_abi::DiscInfo::default();
+        (unsafe { host_disc_info((&mut info as *mut psxw_abi::DiscInfo).cast()) } != 0).then_some(info)
     }
     fn pad_state(&mut self, port: u32) -> Vec<u8> {
         let mut buf = [0u8; 32];
@@ -200,13 +210,22 @@ impl Mem for Window {
 
 struct Guest;
 
+/// Guest calls in progress: 1 inside a thread's root call, more in a
+/// callback the runtime made from it.
+fn nested<R>(f: impl FnOnce() -> R) -> R {
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let r = f();
+    DEPTH.with(|d| d.set(d.get() - 1));
+    r
+}
+
 impl Invoke for Guest {
     fn invoke(&mut self, c: GuestCall) -> u64 {
-        unsafe { guest_invoke(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) }
+        nested(|| unsafe { guest_invoke(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) })
     }
 
     fn invoke_irq(&mut self, c: GuestCall) -> u64 {
-        unsafe { guest_invoke_irq(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) }
+        nested(|| unsafe { guest_invoke_irq(c.addr, c.args[0], c.args[1], c.args[2], c.args[3]) })
     }
 
     fn loaded(&mut self, addr: u32, len: u32) {
@@ -244,6 +263,11 @@ struct Rt {
 
 thread_local! {
     static RT: OnceCell<Rt> = const { OnceCell::new() };
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// With `DEBUG_SHADOW_IO`: the I/O window's bytes as device accesses
+    /// last left them.
+    static SHADOW: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static THREADS: RefCell<Option<Stacks>> = const { RefCell::new(None) };
     /// Outside the machine: the waits are made from `psxw_js_leave`, with
     /// no machine borrow.
     static HOLD: Hold = const { Hold::new() };
@@ -290,6 +314,11 @@ fn init(options: u32) {
     let mut m = Machine::new(Box::new(Window), Box::new(FfiHost), Box::new(FfiRegs), opts, Psyq::default());
     // Device libraries (D40) reach these registers.
     m.io = Some(Default::default());
+    if opts.debug & BootOptions::DEBUG_SHADOW_IO != 0 {
+        let mut io = vec![0u8; SHADOW_LEN];
+        Window.read(SHADOW_BASE, &mut io);
+        SHADOW.with(|s| *s.borrow_mut() = Some(io));
+    }
     let rt = Rt {
         m: RefCell::new(m),
         quantum,
@@ -316,7 +345,7 @@ pub extern "C" fn psxw_boot(options: u32) {
     // isn't news to them.
     unsafe { psxmod_init() };
     with(|rt| rt.m.borrow_mut().loaded.clear());
-    Guest.invoke(GuestCall { addr: b.pc0, args: [0; 4] });
+    run_threads(GuestCall { addr: b.pc0, args: [0; 4] });
     with(|rt| rt.m.borrow_mut().log("the entry point returned"));
     report("{\"event\":\"exit\"}".into());
 }
@@ -397,13 +426,109 @@ pub extern "C" fn untranslated(addr: u32) -> u64 {
 
 #[unsafe(export_name = "bios")]
 pub extern "C" fn bios(table: u32, func: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
-    with(|rt| {
+    // A resumed thread's stack has been rewound to its ChangeThread, which
+    // returns 1 there.
+    if THREADS.with(|t| t.borrow_mut().as_mut().is_some_and(|s| std::mem::take(&mut s.rewinding))) {
+        unsafe { asyncify_stop_rewind() };
+        return 1;
+    }
+    let v = with(|rt| {
         let flow = psx_bios::bios::call(&mut rt.m.borrow_mut(), table, func, [a0, a1, a2, a3]);
         match flow {
             Ok(f) => driver::run(&rt.m, &mut Guest, f),
             Err(e) => fatal(5, &e),
         }
-    })
+    });
+    if with(|rt| rt.m.borrow().kernel.threads.switch_to.is_some()) {
+        suspend();
+    }
+    v
+}
+
+// --- Guest threads (D57) --------------------------------------------------
+//
+// ChangeThread suspends the running thread by unwinding its wasm stack
+// into a buffer (binaryen Asyncify, which the build applies to every
+// function that can be on the stack here), back to its root call in
+// `run_threads`. That then starts the target thread afresh at its TCB's
+// start address, or rewinds the target's own stack back to the
+// ChangeThread it called. The thread's MIPS registers are wasm locals, so
+// they come back with its frames; sp and gp come from its TCB.
+
+/// Bytes of saved frames per thread.
+const STACK_BYTES: usize = 1 << 20;
+const UNWINDING: i32 = 1;
+
+/// Each thread's Asyncify buffer (by TCB), and whether a rewind is under
+/// way.
+struct Stacks {
+    bufs: std::collections::BTreeMap<u32, Box<[u32]>>,
+    rewinding: bool,
+}
+
+impl Stacks {
+    /// Thread `i`'s buffer: (current, end) and then the frames.
+    fn data(&mut self, i: u32) -> u32 {
+        let b = self.bufs.entry(i).or_insert_with(|| vec![0u32; STACK_BYTES / 4].into_boxed_slice());
+        b.as_ptr() as u32
+    }
+}
+
+/// Run the main thread from `main`, and every thread it switches to, until
+/// the main thread's function returns.
+fn run_threads(main: GuestCall) {
+    THREADS.with(|t| *t.borrow_mut() = Some(Stacks { bufs: Default::default(), rewinding: false }));
+    let mut roots = std::collections::BTreeMap::from([(0u32, main)]);
+    let mut cur = 0;
+    let mut resume = false;
+    loop {
+        if resume {
+            let data = THREADS.with(|t| {
+                let mut t = t.borrow_mut();
+                let s = t.as_mut().unwrap_or_else(|| fatal(12, "thread stacks missing"));
+                s.rewinding = true;
+                s.data(cur)
+            });
+            unsafe { asyncify_start_rewind(data) };
+        }
+        let root = roots[&cur];
+        Guest.invoke(root);
+        if unsafe { asyncify_get_state() } != UNWINDING {
+            if cur == 0 {
+                return;
+            }
+            fatal(12, &format!("thread {cur}'s function {:#010x} returned", root.addr));
+        }
+        unsafe { asyncify_stop_unwind() };
+        let (next, start) = with(|rt| {
+            let mut m = rt.m.borrow_mut();
+            let next = m.kernel.threads.switch_to.take().unwrap_or_else(|| fatal(12, "unwound with no thread to switch to"));
+            (next, m.enter_thread(next))
+        });
+        resume = start.is_none();
+        if let Some(pc) = start {
+            roots.insert(next, GuestCall { addr: pc, args: [0; 4] });
+        }
+        cur = next;
+    }
+}
+
+/// Unwind the running thread to its root (ChangeThread recorded a switch).
+fn suspend() {
+    let depth = DEPTH.with(Cell::get);
+    let cur = with(|rt| rt.m.borrow().kernel.threads.current);
+    let data = THREADS.with(|t| t.borrow_mut().as_mut().map(|s| s.data(cur)));
+    let Some(data) = data else { fatal(12, "ChangeThread outside a booted game's threads") };
+    if depth != 1 {
+        fatal(12, "ChangeThread from a callback or an interrupt handler is not supported");
+    }
+    // SAFETY: `data` is this thread's buffer, alive for the run.
+    unsafe {
+        let hdr = (data as usize) as *mut u32;
+        *hdr = data + 8;
+        *hdr.add(1) = data + STACK_BYTES as u32;
+        asyncify_start_unwind(data);
+    }
 }
 
 #[unsafe(export_name = "syscall")]
@@ -445,6 +570,42 @@ pub extern "C" fn io_trap(off: u32, _kind: u32) {
     fatal(9, &format!("guest access to I/O register {:#010x}; this function needs an adapter", 0x1F00_0000 | (off & 0xFF_FFFF)))
 }
 
+/// The I/O window's shadow in guest memory: what an access to a register
+/// through a pointer writes when it reaches no device.
+const SHADOW_BASE: u32 = 0x1F80_1000;
+const SHADOW_LEN: usize = 0x2000;
+
+/// At a vblank, with `DEBUG_SHADOW_IO`: report every byte of the I/O
+/// window that changed since a device access left it (M13 task 9). Only
+/// stores from code with no device routing do that.
+fn shadow_check(frame: u64) {
+    SHADOW.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(seen) = s.as_mut() else { return };
+        let mut now = vec![0u8; SHADOW_LEN];
+        Window.read(SHADOW_BASE, &mut now);
+        for (i, (a, b)) in now.iter().zip(seen.iter()).enumerate().filter(|(_, (a, b))| a != b).take(16) {
+            report(format!(
+                "{{\"event\":\"shadow-io\",\"frame\":{frame},\"addr\":\"{:#010x}\",\"was\":{b},\"value\":{a}}}",
+                SHADOW_BASE + i as u32
+            ));
+        }
+        *seen = now;
+    });
+}
+
+/// A device access left `size` bytes at `addr` in the window.
+fn shadow_note(addr: u32, size: u32) {
+    SHADOW.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(seen) = s.as_mut() else { return };
+        let off = addr.wrapping_sub(SHADOW_BASE) as usize;
+        if off + size as usize <= SHADOW_LEN {
+            Window.read(addr, &mut seen[off..off + size as usize]);
+        }
+    });
+}
+
 #[unsafe(export_name = "io_access")]
 pub extern "C" fn io_access(off: u32, kind: u32) {
     let addr = 0x1F00_0000 | (off & 0xFF_FFFF);
@@ -463,6 +624,7 @@ pub extern "C" fn io_access(off: u32, kind: u32) {
     if let Err(e) = r {
         fatal(9, &e)
     }
+    shadow_note(addr, size);
 }
 
 /// A mod's `psxmod_log(fmt, ...)`: clang's va-buffer holds the arguments,
@@ -578,7 +740,10 @@ pub extern "C" fn psxw_report() {
         // frame holding a borrow will execute again.
         let m = unsafe { &*rt.m.as_ptr() };
         let counts: Vec<String> = m.counts.iter().map(|(k, v)| format!("{k:?}:{v}")).collect();
-        let errors: Vec<String> = m.sdk.cd.edc_errors.iter().map(|e| format!("{e:?}")).collect();
+        let cdc = m.io.as_ref().map(|io| &io.cdc);
+        let errors: Vec<String> =
+            m.sdk.cd.edc_errors.iter().chain(cdc.iter().flat_map(|c| &c.edc_errors)).map(|e| format!("{e:?}")).collect();
+        let cd_sectors = m.sdk.cd.sectors + cdc.map_or(0, |c| c.sectors);
         let events: Vec<String> = m
             .kernel
             .events
@@ -616,7 +781,7 @@ pub extern "C" fn psxw_report() {
             "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"cd_loads\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{},\"held_waits\":{}}}",
             m.vblanks,
             m.clock.now,
-            m.sdk.cd.sectors,
+            cd_sectors,
             cd_loads,
             errors.join(","),
             counts.join(","),

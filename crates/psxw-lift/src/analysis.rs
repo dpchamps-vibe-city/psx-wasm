@@ -130,10 +130,12 @@ fn is_io(addr: u32) -> bool {
     (0x1F80_1000..0x1F80_3000).contains(&(addr & 0x1FFF_FFFF))
 }
 
-/// The BIOS kernel's RAM. Address 0 is excluded: a load through a constant
-/// null is a game bug, not kernel access.
+/// The BIOS kernel's RAM, but for the tables the runtime's BIOS keeps in
+/// guest RAM (psxw-abi `kernel::RAM_BACKED`), which games read and write
+/// directly. Address 0 is excluded: a load through a constant null is a
+/// game bug, not kernel access.
 fn is_kernel(addr: u32) -> bool {
-    (1..0x1_0000).contains(&(addr & 0x1FFF_FFFF))
+    (1..0x1_0000).contains(&(addr & 0x1FFF_FFFF)) && !psxw_abi::kernel::ram_backed(addr)
 }
 
 /// Constant effect of one instruction.
@@ -368,4 +370,18 @@ pub fn reg_list(bits: u64) -> String {
         names.push("lo");
     }
     names.join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn kernel_tables_in_ram_are_not_kernel_access() {
+        // The TCB array pointer and the TCBs themselves (D57).
+        assert!(!super::is_kernel(0x0000_0110));
+        assert!(!super::is_kernel(0xA000_E010 + 0xC0 + 0x94));
+        // Tables the BIOS doesn't lay out, and its patch area, are.
+        assert!(super::is_kernel(0x0000_0150));
+        assert!(super::is_kernel(0xA000_DF80));
+        assert!(!super::is_kernel(0));
+    }
 }

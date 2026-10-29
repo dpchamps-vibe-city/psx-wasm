@@ -1,5 +1,6 @@
 //! Boot (plans/M02 "Boot sequence"): read `SYSTEM.CNF` from the disc, load
-//! the PS-X EXE it names into the window, zero BSS, set `sp` and `gp`. The
+//! the PS-X EXE it names into the window, zero BSS, set `sp` and `gp`, lay
+//! out the kernel's thread tables (`TCB=`). The
 //! caller then calls the entry point through the dispatch table.
 
 use psx_bios::bios::HostDisc;
@@ -49,6 +50,9 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
     let exe = cnf(&text, "BOOT").unwrap_or_else(|| "cdrom:\\PSX.EXE;1".into());
     let stack = cnf(&text, "STACK").and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
     let events = cnf(&text, "EVENT").and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(16);
+    let tcbs = cnf(&text, "TCB")
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(psx_bios::threads::DEFAULT_TCBS);
     let entry = cd::find(&mut disc, &exe).ok_or_else(|| format!("{exe} not found"))?;
     let file = cd::read_file(&mut disc, &entry).ok_or_else(|| format!("{exe} unreadable"))?;
     if file.len() < 0x800 || &file[..8] != b"PS-X EXE" {
@@ -65,5 +69,9 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
     m.regs.set_sp(sp);
     m.regs.set_gp(gp0);
     m.kernel.events = vec![Default::default(); events.clamp(1, 64) as usize];
+    // The kernel's thread tables live in guest RAM (D57).
+    m.lay_out_threads(tcbs);
+    // The CD controller, for SDK code that drives the drive (D58).
+    m.cdc_insert();
     Ok(Boot { exe, pc0, gp0, t_addr, t_size, b_addr, b_size, sp, events, text_hash: fnv(body) })
 }
