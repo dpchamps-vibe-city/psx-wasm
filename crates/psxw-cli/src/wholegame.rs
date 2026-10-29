@@ -90,13 +90,13 @@ fn frames_of(replay: &[u8]) -> u64 {
 }
 
 /// The guest address of `[oracle] frame_counter`.
-fn counter_addr(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs) -> Result<u32> {
+pub fn counter_addr(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs) -> Result<u32> {
     psxw_build::game::frame_counter(ws, game, inputs)
 }
 
 /// Symbols of every container, residency probes for overlays, and the
 /// excluded ranges: kernel RAM, the stack below `sp`, manifest exclusions.
-fn layout(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs, sp: u32) -> Result<Layout> {
+pub fn layout(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs, sp: u32) -> Result<Layout> {
     let manifest = ws.game(game)?;
     let entries = |id: &str| -> Vec<(String, u32, Option<u32>)> {
         inputs.map.symbols(id).iter().map(|s| (s.name.clone(), s.addr, s.size)).collect()

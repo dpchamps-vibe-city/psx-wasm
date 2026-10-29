@@ -47,6 +47,7 @@ mod modtest;
 mod passthrough;
 mod writers;
 mod sdk;
+mod modes;
 
 fn main() {
     if let Err(e) = run() {

@@ -125,6 +125,13 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
             pass &= ok;
             detail.push(format!("{lib} {}", if ok { "pass" } else { "FAIL" }));
         }
+        // Every native chip's adapter cases (D59; levels 1-3).
+        let native: Vec<String> = built.as_ref().map(|(r, _)| r.chips.iter().filter(|(_, m)| m.native).map(|(c, _)| c.clone()).collect()).unwrap_or_default();
+        for chip in native {
+            let ok = crate::conform::run_chip(ws, game, &chip, 4)?;
+            pass &= ok;
+            detail.push(format!("chip {chip} {}", if ok { "pass" } else { "FAIL" }));
+        }
         Ok((pass, detail.join(", ")))
     })());
     gate!("mods", "M11", (|| {

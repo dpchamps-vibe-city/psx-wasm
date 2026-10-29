@@ -389,7 +389,15 @@ fn finish(mut store: Store<State>, instance: &wasmtime::Instance, stop: Stop) ->
     }
 }
 
-fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasmtime::Instance)> {
+/// The engine and compiled module for a wasm file, compiled once per
+/// process (conformance instantiates the same build many times).
+fn compiled(opts: &Options) -> Result<(Engine, Module)> {
+    type Key = (std::path::PathBuf, bool, Option<std::time::SystemTime>);
+    static CACHE: std::sync::Mutex<BTreeMap<Key, (Engine, Module)>> = std::sync::Mutex::new(BTreeMap::new());
+    let key: Key = (opts.wasm.clone(), opts.deadline_secs > 0, std::fs::metadata(&opts.wasm).and_then(|m| m.modified()).ok());
+    if let Some(hit) = CACHE.lock().map_err(|_| anyhow::anyhow!("module cache poisoned"))?.get(&key) {
+        return Ok(hit.clone());
+    }
     let mut config = Config::new();
     config.epoch_interruption(opts.deadline_secs > 0);
     // ReturnFromException unwinds guest frames with a wasm exception
@@ -397,6 +405,12 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
     config.wasm_exceptions(true);
     let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, &opts.wasm).map_err(|e| anyhow::anyhow!("loading {}: {e}", opts.wasm.display()))?;
+    CACHE.lock().map_err(|_| anyhow::anyhow!("module cache poisoned"))?.insert(key, (engine.clone(), module.clone()));
+    Ok((engine, module))
+}
+
+fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasmtime::Instance)> {
+    let (engine, module) = compiled(opts)?;
     let mut linker: Linker<State> = Linker::new(&engine);
     let h = host::MODULE;
 
@@ -648,6 +662,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         let s = c.data_mut();
         s.render.submits += 1;
         s.render.words += words.len() as u64;
+        s.render.hash = words.iter().fold(if s.render.hash == 0 { 0xcbf2_9ce4_8422_2325 } else { s.render.hash }, |h, w| (h ^ *w as u64).wrapping_mul(0x100_0000_01b3));
         let r = s.renderer.clone();
         let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
         r.submit(&words).map_err(|e| wasmtime::Error::msg(format!("render_submit: {e:#}")))
@@ -912,6 +927,11 @@ impl Conform {
         f.call(&mut self.store, ())?;
         let report = self.store.data_mut().events.pop().filter(|e| e["event"] == "report").context("no report")?;
         Ok(report["counts"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect()).unwrap_or_default())
+    }
+
+    /// The renderer commands so far, hashed (see `RenderStats::hash`).
+    pub fn render_hash(&self) -> u64 {
+        self.store.data().render.hash
     }
 
     /// Vblanks so far.

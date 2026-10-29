@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4 done)
+**Status:** in progress (tasks 1–4 done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -199,3 +199,9 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 - **BIOS tables.** libapi's and libcard's patches find kernel RAM through
   GetB0Table/GetC0Table (B0h:56h, 57h) and jump into patched kernel code
   (`jr 0xA000DFAC`). The scan follows both.
+- **btn with its CD on the device stalls** (found by level 4, 2026-10-29).
+  `psxw build btn --device cd`, then 1,500 frames: libgpu logs `GPU
+  timeout: que=0, stat=d6800000, chcr=01000401` at frame 99 (a linked-list
+  GPU DMA that never runs), and the frame counter never leaves 0 under
+  `--device all`. btn's libcd has never run original before. Chip d owns
+  it: exit criterion 4 needs it.

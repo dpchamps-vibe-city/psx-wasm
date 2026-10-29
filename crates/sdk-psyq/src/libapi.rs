@@ -10,6 +10,9 @@
 
 use crate::{Adapter, M, Result, ret};
 
+/// The root-counter adapters (`counter.o`): chip irq (D59).
+pub const COUNTERS: &[&str] = &["SetRCnt", "GetRCnt", "StartRCnt", "StopRCnt", "ResetRCnt"];
+
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("SetRCnt", set_rcnt),
     ("GetRCnt", get_rcnt),

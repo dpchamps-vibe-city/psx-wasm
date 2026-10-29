@@ -51,6 +51,9 @@ pub struct RenderStats {
     pub presents: u64,
     /// The last display the game presented.
     pub last_present: Option<[u32; 5]>,
+    /// FNV-1a over every renderer command word submitted, in order: the
+    /// GPU's output however it was batched (conformance compares it).
+    pub hash: u64,
 }
 
 pub type SharedRender = std::sync::Arc<std::sync::Mutex<Box<dyn Render>>>;

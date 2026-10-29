@@ -13,6 +13,7 @@
 //! Some libraries need no adapters: they run as the game's own code over
 //! register-level devices ([`DEVICE_LIBRARIES`], decision D40).
 
+pub mod cases;
 pub mod libapi;
 pub mod libcd;
 pub mod libmc;
@@ -99,6 +100,15 @@ pub(crate) fn ret(v: u32) -> Result {
 
 pub(crate) fn block(until: psx_bios::Wait, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Result {
     Ok(Flow::Block { until, then: Box::new(then) })
+}
+
+/// The hardware adapters (D59), by name, with their chip. The rest are
+/// BIOS-internals adapters, which have no device to fall back to.
+pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
+    let mut v: Vec<(&'static str, &'static str)> = Vec::new();
+    v.extend(libapi::COUNTERS.iter().map(|n| (*n, "irq")));
+    v.extend(libcd::ADAPTERS.iter().map(|(n, _)| (*n, "cd")));
+    v
 }
 
 /// Every adapter, by SDK function name.

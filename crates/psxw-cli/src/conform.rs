@@ -8,6 +8,8 @@
 //!
 //! ```text
 //! psxw conform <game> --lib libpad [--frames N]
+//! psxw conform <game> --chip gpu [--seeds N]   (D59: the chip's adapter cases, native vs device)
+//! psxw conform <game> --modes [--replay R]     (D59 level 4: the replay native and all-device)
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -504,9 +506,17 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let mut frames = 120u32;
     let mut server = false;
     let mut dump: Option<std::path::PathBuf> = None;
+    let mut chip: Option<String> = None;
+    let mut seeds = 4u64;
+    let mut modes = false;
+    let mut replay_name: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {
+            "--chip" => chip = it.next().map(|s| s.to_string()),
+            "--seeds" => seeds = it.next().context("--seeds needs a value")?.parse()?,
+            "--modes" => modes = true,
+            "--replay" => replay_name = it.next().map(|s| s.to_string()),
             "--lib" => lib = it.next().map(|s| s.to_string()),
             "--frames" => frames = it.next().context("--frames needs a value")?.parse()?,
             "--render" => server = it.next().is_some_and(|r| *r == "server"),
@@ -514,7 +524,13 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
             other => bail!("unknown conform option {other}"),
         }
     }
-    let lib = lib.context("--lib is required")?;
+    if modes {
+        return crate::modes::run(ws, game, replay_name.as_deref());
+    }
+    if let Some(chip) = chip {
+        return run_chip(ws, game, &chip, seeds);
+    }
+    let lib = lib.context("--lib or --chip is required")?;
     let scenario = scenario_for(&lib)?;
 
     let inputs = psxw_lift::run::load(ws, game)?;
@@ -603,5 +619,136 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let json = dir.join(format!("{lib}.json"));
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
     println!("conform {game} {lib}: {} ({} steps; {})", if pass { "PASS" } else { "FAIL" }, report.steps, json.display());
+    Ok(pass)
+}
+
+/// One side of a chip's cases (D59): one instance of one build, with SDK
+/// functions found by name in the game's map.
+struct ChipSide<'a> {
+    c: Conform,
+    ctx: &'a Ctx<'a>,
+    log: Vec<Observation>,
+    callback: Option<(u32, u32)>,
+}
+
+impl sdk_psyq::cases::Harness for ChipSide<'_> {
+    fn linked(&self, name: &str) -> bool {
+        self.ctx.addr(name).is_ok()
+    }
+
+    fn call(&mut self, name: &str, args: &[u32]) -> Result<u32, String> {
+        let a = self.ctx.addr(name).map_err(|e| format!("{e:#}"))?;
+        self.c.call_args(a, args).map(|v| v as u32).map_err(|e| format!("{e:#}"))
+    }
+
+    fn read(&mut self, addr: u32, len: usize) -> Vec<u8> {
+        self.c.read(addr, len)
+    }
+
+    fn write(&mut self, addr: u32, bytes: &[u8]) {
+        self.c.write(addr, bytes)
+    }
+
+    fn vblanks(&mut self, n: u32) -> Result<(), String> {
+        self.c.run_vblanks(n).map_err(|e| format!("{e:#}"))
+    }
+
+    fn observe(&mut self, what: &str, value: String) {
+        self.log.push(Observation { step: what.into(), values: vec![value] });
+    }
+
+    fn device(&mut self) -> String {
+        format!("render {:016x}", self.c.render_hash())
+    }
+
+    fn callback(&self) -> Option<(u32, u32)> {
+        self.callback
+    }
+}
+
+/// One case's outcome in one game.
+#[derive(Serialize)]
+struct CaseResult {
+    case: String,
+    level: u8,
+    /// `pass`, `FAIL`, or `skipped: …`.
+    verdict: String,
+    first_difference: Option<(Observation, Observation)>,
+    native_log: Vec<Observation>,
+    device_log: Vec<Observation>,
+}
+
+#[derive(Serialize)]
+struct ChipReport {
+    schema_version: u32,
+    game: String,
+    chip: String,
+    /// The chip's mode in the game's build: the adapter side is the device
+    /// itself unless it is native.
+    native: bool,
+    why: String,
+    pass: bool,
+    cases: Vec<CaseResult>,
+}
+
+/// `psxw conform <game> --chip C [--seeds N]`: every case of chip C, on the
+/// game's build and on its build with C on the device; level-1 cases once
+/// per seed. A case runs only where the game links every function it
+/// names (level 3: the same cases in every game).
+pub fn run_chip(ws: &Workspace, game: &str, chip: &str, seeds: u64) -> Result<bool> {
+    let inputs = psxw_lift::run::load(ws, game)?;
+    let (ram, sp, gp) = start(&inputs)?;
+    let (native, _) = psxw_build::game::build(ws, &psxw_build::game::Options::new(game))?;
+    let mode = native.chips.get(chip).cloned().with_context(|| format!("{game} places no member of chip {chip}"))?;
+    if !mode.native {
+        eprintln!("conform: {chip} is emulated in {game} ({}): both sides run the device", mode.why);
+    }
+    let device = psxw_build::game::build(ws, &psxw_build::game::Options { device: vec![chip.into()], ..psxw_build::game::Options::new(game) })?.0;
+    let ctx = Ctx { inputs: &inputs };
+    let callback = ctx.callback().ok();
+    let side = |wasm: &str| -> Result<ChipSide<'_>> {
+        let o = Options { wasm: wasm.into(), replay: Some(replay(600)), deadline_secs: 20, ..Default::default() };
+        Ok(ChipSide { c: Conform::new(&o, &ram, sp, gp)?, ctx: &ctx, log: vec![], callback })
+    };
+    let mut results = Vec::new();
+    for case in sdk_psyq::cases::all().into_iter().filter(|c| c.chip == chip) {
+        let missing: Vec<&str> = case.needs.iter().copied().filter(|n| ctx.addr(n).is_err()).collect();
+        if !missing.is_empty() {
+            let verdict = format!("skipped: {game} doesn't link {}", missing.join(", "));
+            println!("conform {game} {chip} {}: {verdict}", case.name);
+            results.push(CaseResult { case: case.name.into(), level: case.level, verdict, first_difference: None, native_log: vec![], device_log: vec![] });
+            continue;
+        }
+        for seed in 0..if case.level == 1 { seeds } else { 1 } {
+            let mut logs = Vec::new();
+            for wasm in [&native.wasm, &device.wasm] {
+                let mut s = side(wasm)?;
+                let r = (case.run)(&mut s, &mut sdk_psyq::cases::Rng::new(seed));
+                if let Err(e) = r {
+                    s.log.push(Observation { step: "error".into(), values: vec![e] });
+                }
+                let d = sdk_psyq::cases::Harness::device(&mut s);
+                s.log.push(Observation { step: "device".into(), values: vec![d] });
+                logs.push(s.log);
+            }
+            let (d, n) = (logs.pop().unwrap_or_default(), logs.pop().unwrap_or_default());
+            let first = n.iter().zip(&d).find(|(x, y)| x != y).map(|(x, y)| (x.clone(), y.clone()));
+            let errored = n.iter().chain(&d).any(|o| o.step == "error");
+            let ok = first.is_none() && n.len() == d.len() && !errored;
+            let name = if case.level == 1 { format!("{} seed {seed}", case.name) } else { case.name.to_string() };
+            println!("conform {game} {chip} {name}: {}", if ok { "pass" } else { "FAIL" });
+            if let Some((x, y)) = &first {
+                println!("  differs at {}:\n    native {:?}\n    device {:?}", x.step, x.values, y.values);
+            }
+            results.push(CaseResult { case: name, level: case.level, verdict: if ok { "pass" } else { "FAIL" }.into(), first_difference: first, native_log: n, device_log: d });
+        }
+    }
+    let pass = results.iter().all(|r| r.verdict != "FAIL");
+    let report = ChipReport { schema_version: 1, game: game.into(), chip: chip.into(), native: mode.native, why: mode.why, pass, cases: results };
+    let dir = ws.out_dir().join("conform").join(game);
+    std::fs::create_dir_all(&dir)?;
+    let json = dir.join(format!("chip-{chip}.json"));
+    std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
+    println!("conform {game} chip {chip}: {} ({} case runs; {})", if pass { "PASS" } else { "FAIL" }, report.cases.len(), json.display());
     Ok(pass)
 }

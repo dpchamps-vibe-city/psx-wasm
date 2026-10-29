@@ -291,6 +291,12 @@ fn boot_checks(ws: &Workspace, game: &str, o: &Options, r: &RunReport) -> Result
 /// Runs the game with `args` and evaluates the requested checks; writes
 /// `out/run/<game>/run.json` (and `checks.json` when there are checks).
 pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport, Vec<Check>)> {
+    evaluate_with(ws, game, args, |_| {})
+}
+
+/// [`evaluate`], with the run's options adjusted first (level 4 dumps RAM
+/// in the same run).
+pub fn evaluate_with(ws: &Workspace, game: &str, args: &[&str], tweak: impl FnOnce(&mut Options)) -> Result<(RunReport, Vec<Check>)> {
     let (mut o, checks, expects) = options_with_expects(ws, game, args)?;
     let watch_base = o.watch.len() - expects.len();
     if checks.iter().any(|c| c == "boot") {
@@ -308,6 +314,7 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
     if checks.iter().any(|c| c == "no-shadow-io") {
         o.boot.debug |= psxw_abi::BootOptions::DEBUG_SHADOW_IO;
     }
+    tweak(&mut o);
     let r = psxw_host_native::run(o.clone())?;
     let dir = ws.out_dir().join("run").join(game);
     std::fs::create_dir_all(&dir)?;
