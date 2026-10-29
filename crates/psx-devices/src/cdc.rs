@@ -421,7 +421,10 @@ impl Cdc {
             }
             0x19 => {
                 res = match arg(0) {
-                    0x20 => vec![0x94, 0x09, 0x19, 0xC0],
+                    // The drive controller's date and version: a PU-18
+                    // (10 Jan 1997, vC2), as the device oracle answers;
+                    // it differs between console models.
+                    0x20 => vec![0x97, 0x01, 0x10, 0xC2],
                     _ => vec![stat],
                 };
             }

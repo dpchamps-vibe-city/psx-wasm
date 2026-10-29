@@ -26,7 +26,8 @@ const ZIGZAG: [usize; 64] = [
 
 /// Where the `k`th coefficient in scan order goes: psx-spx's `zagzig`
 /// (the zigzag table inverted), transposed for the IDCT's orientation
-/// (oracle: its table starts 0, 8, 1, 2, 9, 16).
+/// (oracle: its table starts 0, 8, 1, 2, 9, 16). The IDCT transposes its
+/// result back ([`Mdec::idct`]).
 fn scan() -> [usize; 64] {
     let mut out = [0; 64];
     for (raster, &k) in ZIGZAG.iter().enumerate() {
@@ -96,7 +97,7 @@ fn signed10(v: u16) -> i32 {
 
 /// oracle: a 9-bit wraparound, then a clamp to a signed byte.
 fn clamp_s8(v: i32) -> i32 {
-    (((v << 23) >> 23).clamp(-128, 127)) as i32
+    ((v << 23) >> 23).clamp(-128, 127)
 }
 
 impl Mdec {
@@ -277,7 +278,11 @@ impl Mdec {
     }
 
     /// oracle: two passes of an 8-point product with the scale table, each
-    /// rounding at bit 15.
+    /// rounding at bit 15, over the transposed coefficients; the result is
+    /// transposed back, so scan index 1 is the first horizontal frequency
+    /// (Beetle's goldens: a lone coefficient at index 1 varies along each
+    /// row, and the rounding falls as after these passes, not as after
+    /// passes over untransposed coefficients).
     fn idct(&self, coef: &[i32; 64]) -> [i16; 64] {
         let pass = |src: &[i32; 64]| -> [i32; 64] {
             let mut dst = [0i32; 64];
@@ -291,7 +296,8 @@ impl Mdec {
         };
         let mid = pass(coef);
         let mid = mid.map(|v| v.clamp(-0x8000, 0x7FFF));
-        pass(&mid).map(|v| v as i16)
+        let out = pass(&mid);
+        std::array::from_fn(|i| out[(i % 8) * 8 + i / 8] as i16)
     }
 
     /// One macroblock's pixels into the output.
@@ -300,11 +306,15 @@ impl Mdec {
         match depth {
             0 | 1 => {
                 // Monochrome: one 8×8 block of luma.
-                let y: Vec<u8> = blocks[0].iter().map(|&v| (clamp_s8(v as i32) ^ flip) as u8).collect();
+                let y: Vec<i32> = blocks[0].iter().map(|&v| clamp_s8(v as i32)).collect();
                 if depth == 1 {
-                    self.push_bytes(&y);
+                    let bytes: Vec<u8> = y.iter().map(|&v| (v ^ flip) as u8).collect();
+                    self.push_bytes(&bytes);
                 } else {
-                    let nib: Vec<u8> = y.chunks(2).map(|p| (p[0] >> 4) | (p[1] & 0xF0)).collect();
+                    // oracle: rounded to 4 bits (+8, saturating), not
+                    // truncated.
+                    let nibble = |v: i32| ((v + 8).min(127) ^ flip) as u8 >> 4;
+                    let nib: Vec<u8> = y.chunks(2).map(|p| nibble(p[0]) | nibble(p[1]) << 4).collect();
                     self.push_bytes(&nib);
                 }
             }
@@ -323,18 +333,20 @@ impl Mdec {
                             let r = clamp_s8(l + ((359 * cr + 0x80) >> 8));
                             let g = clamp_s8(l + ((((-88 * cb) & !0x1F) + ((-183 * cr) & !0x07) + 0x80) >> 8));
                             let b = clamp_s8(l + ((454 * cb + 0x80) >> 8));
-                            px[px_y * 16 + px_x] = [r ^ flip, g ^ flip, b ^ flip];
+                            px[px_y * 16 + px_x] = [r, g, b];
                         }
                     }
                 }
                 if depth == 2 {
-                    let bytes: Vec<u8> = px.iter().flat_map(|p| p.map(|c| c as u8)).collect();
+                    let bytes: Vec<u8> = px.iter().flat_map(|p| p.map(|c| (c ^ flip) as u8)).collect();
                     self.push_bytes(&bytes);
                 } else {
+                    // oracle: each component rounded to 5 bits (+4,
+                    // saturating), not truncated.
                     let halves: Vec<u8> = px
                         .iter()
                         .flat_map(|p| {
-                            let [r, g, b] = p.map(|c| (c as u8 as u16) >> 3);
+                            let [r, g, b] = p.map(|c| (((c + 4).min(127) ^ flip) as u8 >> 3) as u16);
                             (r | g << 5 | b << 10 | (bit15 as u16) << 15).to_le_bytes()
                         })
                         .collect();

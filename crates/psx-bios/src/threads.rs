@@ -16,6 +16,9 @@ use psxw_abi::kernel as k;
 pub const HANDLE: u32 = 0xFF00_0000;
 /// SYSTEM.CNF's default `TCB=`.
 pub const DEFAULT_TCBS: u32 = 4;
+/// The TCB word after the status, which OpenThread sets to 1000h (the
+/// device oracle's BIOS does; M13 task 13).
+pub const TCB_FLAGS2: u32 = 0x04;
 
 #[derive(Debug, Clone, Default)]
 pub struct Threads {
@@ -77,14 +80,16 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// OpenThread(pc, sp, gp): a free TCB gets the thread's start address,
-    /// its stack (as sp and fp) and gp. Nothing else in it changes. The
-    /// handle, or -1 when none is free.
+    /// its stack (as sp and fp) and gp, and 1000h in the word after its
+    /// status. Nothing else in it changes (its saved SR stays what the game
+    /// left there). The handle, or -1 when none is free.
     pub fn open_thread(&mut self, pc: u32, sp: u32, gp: u32) -> u32 {
         self.threads_ready();
         let n = self.kernel.threads.count;
         let Some(i) = (1..n).find(|&i| self.mem.r32(tcb(i) + k::TCB_STATUS) != k::TCB_USED) else { return u32::MAX };
         let mem = &mut *self.mem;
         mem.w32(tcb(i) + k::TCB_STATUS, k::TCB_USED);
+        mem.w32(tcb(i) + TCB_FLAGS2, 0x1000);
         mem.w32(tcb(i) + k::TCB_EPC, pc);
         mem.w32(reg(i, 28), gp);
         mem.w32(reg(i, 29), sp);
@@ -155,6 +160,7 @@ mod tests {
         let h = m.open_thread(0x8001_0000, 0x801F_F600, 0x8017_C524);
         assert_eq!(h, 0xFF00_0001);
         assert_eq!(m.mem.r32(tcb(1) + k::TCB_SR), 0x4000_0404);
+        assert_eq!(m.mem.r32(tcb(1) + TCB_FLAGS2), 0x1000);
         assert_eq!(m.mem.r32(reg(1, 29)), 0x801F_F600);
         assert_eq!(m.change_thread(h), Ok(1));
         assert_eq!(m.kernel.threads.switch_to.take(), Some(1));
