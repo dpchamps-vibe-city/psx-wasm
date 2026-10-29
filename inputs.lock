@@ -104,7 +104,7 @@ sha1 = "27162ae90fd4111885b6cdeaca4b25c4978eec23"
 [sdk.psyq-470]
 repo = "../psyq-decomp"
 remote = "git@github.com:software-factory-vibe-city/psyq-decompilation.git"
-commit = "302b6ae6554c67feeb98620f97664f20461f04b1"
+commit = "654b23603a3825467209d7ea826505ed021a9d99"
 build = ["npm", "run", "verify"]
 
 [mods.btn]
