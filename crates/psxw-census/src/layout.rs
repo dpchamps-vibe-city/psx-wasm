@@ -4,10 +4,10 @@
 //! census does). Only values both compilers agree on are kept; a struct
 //! whose layout differs, or that no header defines, is an error.
 
-use crate::checks::include_contexts;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use psxw_cc::Clang;
 use psxw_cc::probe::{Outcome, Reference, probe_header};
+use psxw_inputs::headers::Headers;
 use psxw_inputs::{AddressMap, Workspace, snapshot};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -22,8 +22,8 @@ pub struct StructLayout {
     pub fields: Vec<(String, u32)>,
 }
 
-/// Layouts of `structs`, looked up in `headers` (paths under the game's
-/// probe include dirs, e.g. `psyq/libgpu.h`).
+/// Layouts of `structs`, looked up in `headers` (as an `#include` from
+/// the game's `[c] include` dirs names them, e.g. `psyq/libgpu.h`).
 pub fn sdk_layout(ws: &Workspace, game: &str, headers: &[String], structs: &[String]) -> Result<Vec<StructLayout>> {
     let manifest = ws.game(game)?;
     let pin = ws.game_pin(&manifest)?;
@@ -39,13 +39,14 @@ pub fn sdk_layout(ws: &Workspace, game: &str, headers: &[String], structs: &[Str
     };
     let out = ws.out_dir().join("layout").join(game);
     let clang = Clang::new(ws.clang()?, snap.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &out)?;
-    let contexts = include_contexts(&snap, &map);
-    let dir = manifest.probe.include_dirs.first().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|| "include".into());
+    let all = Headers::new(&snap, &manifest.c.include)?;
+    let contexts = all.contexts(&map);
 
     let mut found: BTreeMap<String, StructLayout> = BTreeMap::new();
     for h in headers {
-        let prelude = contexts.get(h).unwrap_or(&manifest.probe.prelude);
-        let entries = match probe_header(&clang, &reference, prelude, &dir, h, &out.join("probe"))? {
+        let header = all.named(h).with_context(|| format!("{h}: no [c] include dir has it"))?;
+        let prelude = contexts.get(&header.path).unwrap_or(&manifest.probe.prelude);
+        let entries = match probe_header(&clang, &reference, &all, prelude, &header, &out.join("probe"))? {
             Outcome::Probed { entries, .. } => entries,
             Outcome::Skipped(why) | Outcome::ClangFailed(why) => bail!("{h}: {why}"),
         };

@@ -12,6 +12,7 @@ use crate::clang::Clang;
 use crate::diag::{self, Severity};
 use crate::linemap::LineMap;
 use anyhow::{Context, Result};
+use psxw_inputs::headers::{Header, Headers};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -57,24 +58,20 @@ pub enum Outcome {
     ClangFailed(String),
 }
 
-/// Probe one header. `rel` is its path under the include dir `dir`
-/// (e.g. `include` + `psyq/libgpu.h`).
+/// Probe one header of `headers`, included after `prelude` (spellings,
+/// as [`Headers::contexts`] gives them).
 pub fn probe_header(
     clang: &Clang,
     reference: &Reference,
+    headers: &Headers,
     prelude: &[String],
-    dir: &str,
-    rel: &str,
+    header: &Header,
     work: &Path,
 ) -> Result<Outcome> {
     std::fs::create_dir_all(work)?;
-    let stem = format!("probe_{}", rel.replace(['/', '.'], "_"));
+    let stem = format!("probe_{}", header.spelling.replace(['/', '.'], "_"));
     let src = work.join(format!("{stem}.c"));
-    let mut head = String::new();
-    for p in prelude {
-        head.push_str(&format!("#include \"{p}\"\n"));
-    }
-    head.push_str(&format!("#include \"{rel}\"\n"));
+    let head = headers.head(prelude, &header.spelling);
 
     // Enumerate what the header defines, from clang's view of it.
     std::fs::write(&src, &head)?;
@@ -84,8 +81,7 @@ pub fn probe_header(
     };
     let map = LineMap::new(&text);
     let tree = ast::parse(&text);
-    let header_path = format!("{dir}/{rel}");
-    let in_header = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| f == header_path);
+    let in_header = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| headers.marks(f, header));
     let mut entries: Vec<Entry> = Vec::new();
     let mut seen = BTreeSet::new();
     let mut bitfields = 0;
@@ -370,7 +366,8 @@ mod tests {
             cc1: cc1.into(),
             cc1flags: vec!["-O2".into(), "-mips1".into(), "-msoft-float".into(), "-quiet".into()],
         };
-        let out = probe_header(&clang, &reference, &[], "include", "t.h", &root.join("work")).unwrap();
+        let headers = Headers::new(&root, &["include".into()]).unwrap();
+        let out = probe_header(&clang, &reference, &headers, &[], &headers.named("t.h").unwrap(), &root.join("work")).unwrap();
         let Outcome::Probed { entries, .. } = out else { panic!("not probed: {out:?}") };
         let get = |expr: &str| entries.iter().find(|e| e.entry.expr == expr).unwrap();
         assert_eq!((get("sizeof(Same)").reference, get("sizeof(Same)").clang), (Some(12), Some(12)));

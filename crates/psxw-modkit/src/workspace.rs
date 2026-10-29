@@ -12,7 +12,7 @@ use crate::symbols::SymbolTable;
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_inputs::Workspace;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub const FILE: &str = "psxmods.json";
@@ -335,6 +335,18 @@ fn psx_commit(psx: &Workspace) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// The files directly in `from` with an extension in `ext`.
+fn copy_dir(from: &Path, to: &Path, ext: &[&str]) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let p = e?.path();
+        if p.is_file() && p.extension().is_some_and(|x| ext.iter().any(|e| x == *e)) {
+            std::fs::copy(&p, to.join(p.file_name().unwrap_or_default()))?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_tree(from: &Path, to: &Path, ext: &[&str]) -> Result<usize> {
     let mut n = 0;
     std::fs::create_dir_all(to)?;
@@ -504,7 +516,7 @@ pub fn write_types(dir: &Path, snap: &crate::snapshot::Snapshot, table: &SymbolT
 pub fn sdk_into(ws: &ModsWorkspace, psx: &Workspace) -> Result<SymbolTable> {
     let game = ws.game().to_string();
     let (_, identity) = pins(psx, &game)?;
-    let (_, table) = crate::build::table(psx, &game)?;
+    let (prep, table) = crate::build::table(psx, &game)?;
     let sdk = ws.sdk_dir();
     let _ = std::fs::remove_dir_all(&sdk);
     std::fs::create_dir_all(&sdk)?;
@@ -519,6 +531,17 @@ pub fn sdk_into(ws: &ModsWorkspace, psx: &Workspace) -> Result<SymbolTable> {
             copy_tree(&src, &sdk.join(&rel), &["h", "inc"])?;
         }
         includes.push(rel.to_string_lossy().into_owned());
+    }
+    // Headers no include dir has (beside their C, say) are named by their
+    // path in the decomp: the SDK has their directories, and the decomp's
+    // root last among its include dirs.
+    let headers = psxw_inputs::headers::Headers::load(&snap, &manifest)?;
+    let rooted = headers.rooted_in(&headers.contexts(&prep.inputs.map));
+    for dir in rooted.iter().filter_map(|s| Path::new(s).parent()).collect::<BTreeSet<_>>() {
+        copy_dir(&snap.join(dir), &sdk.join("game").join(dir), &["h", "inc"])?;
+    }
+    if !rooted.is_empty() {
+        includes.push("game".into());
     }
     std::fs::write(sdk.join("psxw_prelude.h"), psxw_cc::PRELUDE)?;
     std::fs::create_dir_all(sdk.join("include"))?;

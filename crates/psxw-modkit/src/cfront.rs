@@ -22,6 +22,7 @@ use anyhow::Result;
 use psxw_cc::ast::{self, Ast};
 use psxw_cc::linemap::LineMap;
 use psxw_cc::probe::{self, Outcome, Reference};
+use psxw_inputs::headers::{Header, Headers};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -446,20 +447,16 @@ struct HeaderResult {
 }
 
 /// Read and probe one header.
-fn header(clang: &psxw_cc::Clang, reference: Option<&Reference>, context: &[String], dir: &str, rel: &str, work: &Path) -> Result<Option<HeaderResult>> {
+fn header(clang: &psxw_cc::Clang, reference: Option<&Reference>, headers: &Headers, context: &[String], h: &Header, work: &Path) -> Result<Option<HeaderResult>> {
+    let rel = h.spelling.as_str();
     let stem = format!("cfront_{}", rel.replace(['/', '.'], "_"));
     let src = work.join(format!("{stem}.c"));
-    let mut head = String::new();
-    for p in context {
-        head.push_str(&format!("#include \"{p}\"\n"));
-    }
-    head.push_str(&format!("#include \"{rel}\"\n"));
+    let head = headers.head(context, rel);
     std::fs::write(&src, &head)?;
     let Ok(text) = clang.preprocess(&src, &["PSXW_CLANG"]) else { return Ok(None) };
     let map = LineMap::new(&text);
     let tree = ast::parse(&text);
-    let path = format!("{dir}/{rel}");
-    let mine = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| f == path);
+    let mine = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| headers.marks(f, h));
     let mut r = Reader { ast: &tree, tu: Tu::default() };
     r.read();
     let tu = r.tu;
@@ -513,7 +510,7 @@ fn header(clang: &psxw_cc::Clang, reference: Option<&Reference>, context: &[Stri
             if opaque.contains(&name) {
                 break;
             }
-            let include = format!("#include \"{rel}\"\n");
+            let include = headers.include_line(rel);
             head = head.replace(&include, &format!("typedef struct psxw_opaque_{name} {name};\n{include}"));
             opaque.push(name);
         }
@@ -638,14 +635,15 @@ pub fn snapshot(
     map: &psxw_inputs::AddressMap,
     work: &Path,
 ) -> Result<Snapshot> {
-    let headers = crate::headers::list(snap, manifest)?;
-    let contexts = psxw_census::include_contexts(snap, map);
+    let headers = Headers::load(snap, manifest)?;
+    let contexts = headers.contexts(map);
     std::fs::create_dir_all(work)?;
     let results: Vec<Result<Option<HeaderResult>>> = headers
+        .list
         .par_iter()
-        .map(|(dir, rel)| {
-            let context = contexts.get(rel).cloned().unwrap_or_else(|| manifest.probe.prelude.clone());
-            header(clang, reference, &context, dir, rel, work)
+        .map(|h| {
+            let context = contexts.get(&h.path).cloned().unwrap_or_else(|| manifest.probe.prelude.clone());
+            header(clang, reference, &headers, &context, h, work)
         })
         .collect();
     let mut s = base;
@@ -827,13 +825,14 @@ pub fn verify(
     map: &psxw_inputs::AddressMap,
     work: &Path,
 ) -> Result<Agreement> {
-    let headers = crate::headers::list(snap, manifest)?;
-    let contexts = psxw_census::include_contexts(snap, map);
+    let headers = Headers::load(snap, manifest)?;
+    let contexts = headers.contexts(map);
     let outcomes: Vec<Result<Outcome>> = headers
+        .list
         .par_iter()
-        .map(|(dir, rel)| {
-            let prelude = contexts.get(rel).cloned().unwrap_or_else(|| manifest.probe.prelude.clone());
-            probe::probe_header(clang, reference, &prelude, dir, rel, work)
+        .map(|h| {
+            let prelude = contexts.get(&h.path).cloned().unwrap_or_else(|| manifest.probe.prelude.clone());
+            probe::probe_header(clang, reference, &headers, &prelude, h, work)
         })
         .collect();
     let mut a = Agreement::default();

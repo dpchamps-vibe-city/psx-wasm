@@ -6,6 +6,7 @@
 
 pub mod boundary;
 pub mod game;
+pub mod headers;
 pub mod identity;
 pub mod local;
 pub mod lock;

@@ -234,31 +234,6 @@ fn expected_bytes(ctx: &Context, obj: &WasmObject, container: &str, def: psxw_li
     (bytes, mask, unchecked)
 }
 
-/// For each header, as spelled in `#include`, the includes preceding it in
-/// the first translation unit that uses it: the context the decomp itself
-/// compiles it in. Headers like the SDK's depend on include order.
-pub fn include_contexts(snap: &Path, map: &psxw_inputs::AddressMap) -> std::collections::HashMap<String, Vec<String>> {
-    let mut contexts = std::collections::HashMap::new();
-    for tu in map.containers.iter().flat_map(|c| &c.tus) {
-        let Ok(text) = std::fs::read_to_string(snap.join(&tu.path)) else { continue };
-        let mut before: Vec<String> = Vec::new();
-        for line in text.lines() {
-            let Some(rest) = line.trim_start().strip_prefix("#include") else { continue };
-            let rest = rest.trim_start();
-            let close = match rest.chars().next() {
-                Some('"') => '"',
-                Some('<') => '>',
-                _ => continue,
-            };
-            let Some(end) = rest[1..].find(close) else { continue };
-            let inc = rest[1..1 + end].to_string();
-            contexts.entry(inc.clone()).or_insert_with(|| before.clone());
-            before.push(inc);
-        }
-    }
-    contexts
-}
-
 pub(crate) fn layout(
     clang: &psxw_cc::Clang,
     snap: &Path,
@@ -283,44 +258,26 @@ pub(crate) fn layout(
         ..Default::default()
     };
 
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for dir in &manifest.probe.include_dirs {
-        let root = snap.join(dir);
-        let mut stack = vec![root.clone()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d)? {
-                let p = e?.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "h") {
-                    let rel = p.strip_prefix(&root)?.to_string_lossy().into_owned();
-                    let name = p.file_name().unwrap_or_default().to_string_lossy();
-                    let excluded = manifest.probe.exclude.iter().any(|x| *x == rel || *x == name);
-                    if !excluded && only.is_none_or(|s| rel.contains(s)) {
-                        headers.push((dir.to_string_lossy().into_owned(), rel));
-                    }
-                }
-            }
-        }
-    }
-    headers.sort();
+    let all = psxw_inputs::headers::Headers::load(snap, manifest)?;
+    let headers: Vec<_> = all.list.iter().filter(|h| only.is_none_or(|s| h.spelling.contains(s))).collect();
     eprintln!("census: probing {} headers", headers.len());
 
-    let contexts = include_contexts(snap, map);
+    let contexts = all.contexts(map);
     let work = out.join("probe");
     let outcomes: Vec<_> = headers
         .par_iter()
-        .map(|(dir, rel)| {
-            let prelude = contexts.get(rel).unwrap_or(&manifest.probe.prelude);
-            probe_header(clang, &reference, prelude, dir, rel, &work).map(|o| (rel.clone(), o))
+        .map(|h| {
+            let prelude = contexts.get(&h.path).unwrap_or(&manifest.probe.prelude);
+            probe_header(clang, &reference, &all, prelude, h, &work).map(|o| (*h, o))
         })
         .collect::<anyhow::Result<_>>()?;
 
-    for (header, outcome) in outcomes {
+    for (h, outcome) in outcomes {
         r.headers += 1;
+        let header = h.spelling.clone();
         match outcome {
             Outcome::Skipped(why) => {
-                let unused = if contexts.contains_key(&header) { "" } else { "not included by any TU; " };
+                let unused = if contexts.contains_key(&h.path) { "" } else { "not included by any TU; " };
                 r.headers_skipped.push(named("probe", &header, None, format!("{unused}{why}")))
             }
             Outcome::ClangFailed(why) => r.headers_clang_failed.push(named("probe", &header, None, why)),

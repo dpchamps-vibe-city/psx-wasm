@@ -8,6 +8,7 @@
 use anyhow::Result;
 use psxw_cc::ast::{self, Ast};
 use psxw_cc::linemap::LineMap;
+use psxw_inputs::headers::Headers;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,7 +21,8 @@ pub const INDEX_VERSION: u32 = 3;
 /// A function's declaration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Decl {
-    /// As `#include "…"` names it, relative to an include directory.
+    /// As `#include "…"` names it: relative to an include directory, or
+    /// the header's path in the decomp when none has it.
     pub header: String,
     /// The headers the decomp includes before it (its context).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -254,10 +256,11 @@ fn ast_has_function_declarator(node: Node) -> bool {
 }
 
 /// Read one preprocessed header: (functions, globals).
-fn read(text: &str, header_path: &str, rel: &str, context: &[String]) -> (Vec<(String, Decl)>, Vec<(String, DataDecl)>) {
+/// The declarations in `text` whose line markers `mine` accepts.
+fn read(text: &str, mine: impl Fn(&str) -> bool, rel: &str, context: &[String]) -> (Vec<(String, Decl)>, Vec<(String, DataDecl)>) {
     let map = LineMap::new(text);
     let tree = ast::parse(text);
-    let in_header = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| f == header_path);
+    let in_header = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| mine(f));
     let mut funcs = Vec::new();
     let mut fptrs = Vec::new();
     let root = tree.tree.root_node();
@@ -294,31 +297,6 @@ fn read(text: &str, header_path: &str, rel: &str, context: &[String]) -> (Vec<(S
     (funcs, data)
 }
 
-/// The headers the census probes: (include dir, path under it), sorted.
-pub fn list(snap: &Path, manifest: &psxw_inputs::GameManifest) -> Result<Vec<(String, String)>> {
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for dir in &manifest.probe.include_dirs {
-        let root = snap.join(dir);
-        let mut stack = vec![root.clone()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d)? {
-                let p = e?.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "h") {
-                    let rel = p.strip_prefix(&root)?.to_string_lossy().into_owned();
-                    let name = p.file_name().unwrap_or_default().to_string_lossy();
-                    if !manifest.probe.exclude.iter().any(|x| *x == rel || *x == name) {
-                        headers.push((dir.to_string_lossy().into_owned(), rel));
-                    }
-                }
-            }
-        }
-    }
-    headers.sort();
-    Ok(headers)
-}
-
 /// Build the index over a game's headers in snapshot `snap`.
 pub fn index(
     clang: &psxw_cc::Clang,
@@ -327,29 +305,26 @@ pub fn index(
     map: &psxw_inputs::AddressMap,
     work: &Path,
 ) -> Result<HeaderIndex> {
-    let headers = list(snap, manifest)?;
-    let contexts = psxw_census::include_contexts(snap, map);
+    let headers = Headers::load(snap, manifest)?;
+    let contexts = headers.contexts(map);
     std::fs::create_dir_all(work)?;
     type Read = (Vec<(String, Decl)>, Vec<(String, DataDecl)>, usize);
     let results: Vec<(String, Result<Read>)> = headers
+        .list
         .par_iter()
-        .map(|(dir, rel)| {
-            let context = contexts.get(rel).cloned().unwrap_or_else(|| manifest.probe.prelude.clone());
+        .map(|h| {
+            let rel = &h.spelling;
+            let context = contexts.get(&h.path).cloned().unwrap_or_else(|| manifest.probe.prelude.clone());
             let r = (|| {
                 let src = work.join(format!("index_{}.c", rel.replace(['/', '.'], "_")));
-                let mut head = String::new();
-                for p in &context {
-                    head.push_str(&format!("#include \"{p}\"\n"));
-                }
-                head.push_str(&format!("#include \"{rel}\"\n"));
-                std::fs::write(&src, &head)?;
+                std::fs::write(&src, headers.head(&context, rel))?;
                 let text = clang.preprocess(&src, &["PSXW_CLANG"])?;
                 // A name several headers declare comes from the one that
                 // compiles best (not an m2c catch-all of unknown types).
                 let i = src.with_extension("i");
                 std::fs::write(&i, &text)?;
                 let errors = clang.mod_errors(&i)?;
-                let (funcs, data) = read(&text, &format!("{dir}/{rel}"), rel, &context);
+                let (funcs, data) = read(&text, |f| headers.marks(f, h), rel, &context);
                 Ok((funcs, data, errors))
             })();
             (rel.clone(), r)
@@ -399,7 +374,7 @@ mod tests {
     use super::*;
 
     fn decls(src: &str) -> Vec<(String, Decl)> {
-        read(&format!("# 1 \"inc/h.h\"\n{src}"), "inc/h.h", "h.h", &[]).0
+        read(&format!("# 1 \"inc/h.h\"\n{src}"), |f| f == "inc/h.h", "h.h", &[]).0
     }
 
     #[test]
@@ -430,7 +405,7 @@ mod tests {
 
     #[test]
     fn function_pointer_tables_are_data() {
-        let (f, d) = read("# 1 \"inc/h.h\"\nextern int (*gTable[21])(short *);\nextern void (*gHook)(void);\n", "inc/h.h", "h.h", &[]);
+        let (f, d) = read("# 1 \"inc/h.h\"\nextern int (*gTable[21])(short *);\nextern void (*gHook)(void);\n", |f| f == "inc/h.h", "h.h", &[]);
         assert!(f.is_empty());
         let names: Vec<&str> = d.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["gTable", "gHook"]);

@@ -29,7 +29,7 @@ pub fn snapshot(ws: &Workspace, game: &str) -> Result<PathBuf> {
 }
 
 /// How the game's C compiles, for mod sources.
-pub fn flags(ws: &Workspace, game: &str, work: &Path) -> Result<Flags> {
+pub fn flags(ws: &Workspace, game: &str, map: &psxw_inputs::AddressMap, work: &Path) -> Result<Flags> {
     let manifest = ws.game(game)?;
     let snap = snapshot(ws, game)?;
     std::fs::create_dir_all(work)?;
@@ -37,12 +37,13 @@ pub fn flags(ws: &Workspace, game: &str, work: &Path) -> Result<Flags> {
     if std::fs::read_to_string(&prelude).ok().as_deref() != Some(psxw_cc::PRELUDE) {
         std::fs::write(&prelude, psxw_cc::PRELUDE)?;
     }
-    Ok(Flags {
-        clang: ws.clang()?,
-        prelude,
-        includes: manifest.c.include.iter().map(|i| snap.join(i)).collect(),
-        defines: manifest.c.defines.clone(),
-    })
+    let mut includes: Vec<PathBuf> = manifest.c.include.iter().map(|i| snap.join(i)).collect();
+    // A header no include dir has is named from the snapshot root.
+    let headers = psxw_inputs::headers::Headers::load(&snap, &manifest)?;
+    if !headers.rooted_in(&headers.contexts(map)).is_empty() {
+        includes.push(snap.clone());
+    }
+    Ok(Flags { clang: ws.clang()?, prelude, includes, defines: manifest.c.defines.clone() })
 }
 
 /// The header index at the pinned commit, cached under `out/modkit/`.
@@ -275,7 +276,7 @@ pub fn compile_mods(ws: &Workspace, game: &str, mods: &[Mod], layout: &Layout) -
     }
     let flags = match &layout.flags {
         Some(f) => f.clone(),
-        None => flags(ws, &game, &layout.out)?,
+        None => flags(ws, &game, &prep.inputs.map, &layout.out)?,
     };
     let prelude = prep.inputs.manifest.probe.prelude.clone();
 

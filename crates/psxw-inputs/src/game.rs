@@ -154,9 +154,14 @@ pub struct CSection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProbeSection {
+    /// Where the census finds headers: every `.h` under them. Not
+    /// necessarily include dirs; headers beside their C are named by their
+    /// path (`psxw_inputs::headers`).
     pub include_dirs: Vec<PathBuf>,
     #[serde(default)]
     pub prelude: Vec<String>,
+    /// Headers left out, by file name, path under an `include_dirs` entry,
+    /// or path in the snapshot.
     #[serde(default)]
     pub exclude: Vec<String>,
 }
