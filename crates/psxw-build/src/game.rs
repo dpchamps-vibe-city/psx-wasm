@@ -223,19 +223,68 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         Some(p) => Boundary::load(&ws.root.join(p))?,
         None => Boundary::default(),
     };
+    // Every library the game places needs a policy (M13): an unknown one
+    // must not silently default to adapters.
+    let unknown = boundary.unknown(inputs.map.containers.iter().flat_map(|c| &c.sdk).filter(|p| p.is_text()).map(|p| p.member.as_str()));
+    if !unknown.is_empty() {
+        let list: Vec<String> = unknown.iter().map(|(l, n)| format!("{l} ({n} objects)")).collect();
+        bail!(
+            "SDK libraries placed in the game have no policy in {}:\n  {}\n(add a [library.<name>] entry)",
+            inputs.manifest.game.boundary.as_deref().map_or("the boundary".into(), |p| p.display().to_string()),
+            list.join("\n  ")
+        );
+    }
     let runtime_devices = crate::runtime::devices(&runtime)?;
     let mut device_libs = boundary.device_libraries();
     if let Some(l) = device_libs.iter().find(|l| !runtime_devices.contains(l)) {
         bail!("the boundary runs {l} over devices, but the runtime has no device support for it");
     }
-    // Libraries built from their original code on request.
-    device_libs.extend(opts.original.iter().cloned());
     let db = SigDb::pinned(ws)?;
     let identity = psxw_inputs::identity::identify(&opts.game, &inputs.map, &inputs.originals, &db);
     let keys: BTreeMap<&str, &str> =
         identity.identities.iter().filter_map(|i| Some((i.member.as_str(), i.key.as_deref()?))).collect();
     let validated: BTreeSet<(&str, &str)> = sdk_psyq::validated::VALIDATED.iter().copied().collect();
     let (translations, _, _, _, inline) = psxw_lift::run::translate(&mut inputs);
+    // `adapter-or-device` libraries (D58), decided for the whole library:
+    // its adapters if every placed object defining one of their functions
+    // is validated, otherwise its original code over the devices.
+    let adapter_names: BTreeSet<&str> = adapters.iter().map(String::as_str).collect();
+    let mut resolved: BTreeMap<String, Policy> = BTreeMap::new();
+    for lib in boundary.adapter_or_device_libraries() {
+        let unvalidated: BTreeSet<&str> = translations
+            .iter()
+            .filter(|t| adapter_names.contains(t.func.name.as_str()))
+            .filter_map(|t| inputs.map.sdk_at(&t.func.container, t.func.addr))
+            .map(|p| p.member.as_str())
+            .filter(|m| m.split('/').next() == Some(lib.as_str()))
+            .filter(|m| !keys.get(m).is_some_and(|k| validated.contains(&(*m, *k))))
+            .collect();
+        if unvalidated.is_empty() {
+            resolved.insert(lib, Policy::Adapter);
+            continue;
+        }
+        ensure!(
+            runtime_devices.contains(&lib),
+            "{lib} (adapter-or-device) has objects with unvalidated adapters ({}), and the runtime has no device support for it",
+            unvalidated.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        eprintln!(
+            "build: {lib} runs as original code over the devices: unvalidated objects with adapters: {}",
+            unvalidated.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        resolved.insert(lib.clone(), Policy::Device);
+        device_libs.push(lib);
+    }
+    // Libraries built from their original code on request.
+    device_libs.extend(opts.original.iter().cloned());
+    let policy_of = |member: &str| -> Policy {
+        match boundary.policy(member) {
+            Some(Policy::AdapterOrDevice) => {
+                resolved.get(member.split('/').next().unwrap_or(member)).copied().unwrap_or(Policy::Device)
+            }
+            p => p.unwrap_or(Policy::Adapter),
+        }
+    };
     let expanded: BTreeSet<(String, u32)> = inline
         .keys()
         .filter_map(|k| {
@@ -384,7 +433,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         let key = (t.func.container.clone(), t.func.addr);
         let member = inputs.map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
         let original = member.is_some_and(|m| device_libs.iter().any(|l| m.split('/').next() == Some(l.as_str())));
-        let policy = member.map(|m| boundary.policy(m).unwrap_or(Policy::Adapter));
+        let policy = member.map(policy_of);
         let adapter = adapter_id.get(t.func.name.as_str()).filter(|_| policy == Some(Policy::Adapter) && !original);
         let object_ok = member.is_some_and(|m| keys.get(m).is_some_and(|k| validated.contains(&(m, *k))));
         if let (Some(_), Some(m), false) = (adapter, member, object_ok) {
@@ -403,7 +452,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         };
         tiers.insert(key, tier);
     }
-    let hardware = hardware_unbound(&inputs.map, &boundary, &translations, &tiers);
+    let hardware = hardware_unbound(&inputs.map, &policy_of, &translations, &tiers);
     if let Some(bad) = Some(hardware.iter().filter(|h| h.reachable).map(|h| h.to_string()).collect::<Vec<_>>()).filter(|v| !v.is_empty()) {
         bail!(
             "functions that touch hardware themselves are reachable from guest code with no validated adapter \
@@ -895,7 +944,7 @@ fn void_results(
 
 fn hardware_unbound(
     map: &psxw_inputs::AddressMap,
-    boundary: &Boundary,
+    policy_of: &dyn Fn(&str) -> Policy,
     translations: &[psxw_lift::Translation],
     tiers: &BTreeMap<(String, u32), Tier>,
 ) -> Vec<Unbound> {
@@ -926,7 +975,7 @@ fn hardware_unbound(
     let mut out = Vec::new();
     for t in translations {
         let Some(p) = map.sdk_at(&t.func.container, t.func.addr) else { continue };
-        if boundary.policy(&p.member).unwrap_or(Policy::Adapter) != Policy::Adapter || is_adapter(&t.func.container, t.func.addr) {
+        if policy_of(&p.member) != Policy::Adapter || is_adapter(&t.func.container, t.func.addr) {
             continue;
         }
         let what = match (!t.facts.io.is_empty(), !t.facts.kernel.is_empty()) {

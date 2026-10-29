@@ -11,6 +11,15 @@
 #                     register-level devices (D40); no adapters.
 # policy = "guest"    guest code only (decompiled C or translated);
 #                     adapters must not claim these.
+# policy = "adapter-or-device"
+#                     decided per game for the whole library (D58): its
+#                     adapters when every placed object defining one of
+#                     their functions is validated, otherwise its original
+#                     code over the devices. Never a mix: the adapters keep
+#                     state in the runtime that the original can't see.
+#
+# Every library a game places must have an entry here; an unknown one
+# fails the build (M13).
 #
 # [object."<library>/<member>"] overrides a library's policy for one
 # member.
@@ -24,8 +33,15 @@ policy = "device"  # entered through the BIOS's custom exception exit
 [library.libgpu]   # D42: original over the GPU front end and DMA
 policy = "device"
 
-[library.libcd]    # the drive (CdInit, CdControl*, CdRead*, CdSearchFile, …)
-policy = "adapter"
+[library.libcd]    # D58: adapters at the drive (CdInit, CdControl*, CdRead*,
+policy = "adapter-or-device" # CdSearchFile, …) for validated objects, else the
+                    # original over the register-level CD controller
+
+[library.libds]    # D58: the original over the register-level CD controller
+policy = "device"  # (no adapters exist)
+
+[library.libpress] # the original over the MDEC (DMA0 in, DMA1 out)
+policy = "device"
 
 [library.libspu]   # D47: original over the register-level SPU and DMA4
 policy = "device"
@@ -58,6 +74,12 @@ policy = "guest"
 policy = "guest"
 
 [library.libmath]
+policy = "guest"
+
+[library.libsn]    # SN Systems' C++ runtime (op_vnew, op_vdel): plain code
+policy = "guest"
+
+[library.2mbyte]   # SN's startup: assembly by design, touches no hardware
 policy = "guest"
 
 # The structs adapters read and write, generated into Rust constants by

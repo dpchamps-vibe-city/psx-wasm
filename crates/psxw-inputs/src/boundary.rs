@@ -15,6 +15,13 @@ pub enum Policy {
     Device,
     /// Guest code only.
     Guest,
+    /// Decided per game for the whole library (D58): adapters when every
+    /// placed object that defines an adapter's function is validated,
+    /// otherwise the library's original code over the devices. Never a mix:
+    /// a library's adapters keep their state in the runtime, which the
+    /// library's original code can't see.
+    #[serde(rename = "adapter-or-device")]
+    AdapterOrDevice,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +68,24 @@ impl Boundary {
     pub fn device_libraries(&self) -> Vec<String> {
         self.library.iter().filter(|(_, e)| e.policy == Policy::Device).map(|(l, _)| l.clone()).collect()
     }
+
+    /// Libraries with policy `adapter-or-device`.
+    pub fn adapter_or_device_libraries(&self) -> Vec<String> {
+        self.library.iter().filter(|(_, e)| e.policy == Policy::AdapterOrDevice).map(|(l, _)| l.clone()).collect()
+    }
+
+    /// The libraries of `members` (`<library>/<member>`) with no policy,
+    /// each with how many of its members are placed (M13): a library the
+    /// boundary doesn't know must not silently default to adapters.
+    pub fn unknown<'a>(&self, members: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, usize> {
+        let mut out = BTreeMap::new();
+        for m in members {
+            if self.policy(m).is_none() {
+                *out.entry(m.split('/').next().unwrap_or(m).to_string()).or_default() += 1;
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -84,5 +109,22 @@ mod tests {
         assert_eq!(b.policy("libgpu/font"), Some(Policy::Guest));
         assert_eq!(b.policy("libsnd/play"), None);
         assert_eq!(b.device_libraries(), ["libpad"]);
+    }
+
+    #[test]
+    fn unknown_libraries_and_adapter_or_device() {
+        let b: Boundary = toml::from_str(
+            r#"
+            [library.libcd]
+            policy = "adapter-or-device"
+            [object."libds/dsread"]
+            policy = "device"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(b.policy("libcd/bios_1"), Some(Policy::AdapterOrDevice));
+        assert_eq!(b.adapter_or_device_libraries(), ["libcd"]);
+        let unknown = b.unknown(["libcd/sys", "libds/dsread", "libds/dssys_1", "libds/dsfile", "libsn/op_vnew"]);
+        assert_eq!(unknown.into_iter().collect::<Vec<_>>(), [("libds".to_string(), 2), ("libsn".to_string(), 1)]);
     }
 }
