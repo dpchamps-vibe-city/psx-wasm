@@ -110,12 +110,16 @@ fn parse_options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, 
         o.boot.cd_timing = 1;
     }
     let mut checks = Vec::new();
+    let mut frames_given = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!("{a} needs a value"));
         match *a {
             "--headless" => {}
-            "--frames" => o.frames = val()?.parse()?,
+            "--frames" => {
+                o.frames = val()?.parse()?;
+                frames_given = true;
+            }
             "--replay" => o.replay = Some(crate::wholegame::replay(ws, game, Some(&val()?))?.0),
             "--cd" => o.boot.cd_timing = if val()? == "instant" { 1 } else { 0 },
             "--hash-at" => o.hash_at = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
@@ -162,6 +166,10 @@ fn parse_options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, 
             }
             other => bail!("unknown run option {other}"),
         }
+    }
+    // A replay runs its own length unless told otherwise.
+    if let (false, Some(h)) = (frames_given, o.replay.as_deref().and_then(psxw_abi::replay::Header::parse)) {
+        o.frames = h.frames as u64;
     }
     Ok((o, checks))
 }
