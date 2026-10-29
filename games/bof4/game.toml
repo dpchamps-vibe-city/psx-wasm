@@ -48,3 +48,22 @@ cd_timing = "realistic"
 # (0x801397C4), so it counts game frames: fewer than vblanks while a scene
 # runs at half rate or loads. Found by diffing RAM across frames.
 frame_counter = "D_80116B20"
+
+[ci]
+# The layout probe compares game struct layouts under the matching
+# compiler and clang. bof4-decomp's headers declare no game types yet, and
+# its matching cc1 is provisioned by the harness at build time, not kept in
+# the checkout.
+census_no_probe = true
+# Title to the first field scene (M13), with its reached-state checks.
+replay = "title-to-field"
+
+[ci.skip]
+difftest = "M13: no decompiled C yet, so nothing to compare against its translation"
+conform = "M13: no object is newly validated for this game (build.json unvalidated_objects is empty); the scenarios are written against btn's links"
+mods = "M9: no mods for this game yet"
+web-gpu = "M9: the browser host for this game is out of M13's scope"
+web-conform = "M9: the browser host for this game is out of M13's scope"
+web-storage = "M9: the browser host for this game is out of M13's scope"
+web-game = "M9: the browser host for this game is out of M13's scope"
+web-pacing = "M9: the browser host for this game is out of M13's scope"

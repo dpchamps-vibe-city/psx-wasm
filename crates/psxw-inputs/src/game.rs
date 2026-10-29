@@ -26,6 +26,23 @@ pub struct GameManifest {
     /// `[mod]`: what mods see of the game (plans/M11).
     #[serde(default, rename = "mod")]
     pub mods: ModSection,
+    #[serde(default)]
+    pub ci: CiSection,
+}
+
+/// `[ci]`: how `psxw ci` treats this game (M13).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CiSection {
+    /// Gates this game doesn't run yet, each with the recorded reason. They
+    /// are reported as skipped, never as passes.
+    #[serde(default)]
+    pub skip: BTreeMap<String, String>,
+    /// A replay (`replays/<name>.toml`) gated natively: its `expect` lines,
+    /// determinism, no trap, no shadow I/O.
+    pub replay: Option<String>,
+    /// Run the census without the layout probe (no game types to probe yet).
+    #[serde(default)]
+    pub census_no_probe: bool,
 }
 
 /// `[mod]`.

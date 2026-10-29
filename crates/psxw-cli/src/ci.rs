@@ -12,6 +12,9 @@ struct Gate {
     milestone: &'static str,
     pass: bool,
     detail: String,
+    /// Not run: the manifest's `[ci] skip` reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -25,7 +28,7 @@ struct Report {
 fn gate(gates: &mut Vec<Gate>, name: &'static str, milestone: &'static str, r: Result<(bool, String)>) {
     let (pass, detail) = r.unwrap_or_else(|e| (false, format!("error: {e:#}")));
     eprintln!("ci: {name:<12} {:<4} {detail}", if pass { "ok" } else { "FAIL" });
-    gates.push(Gate { name, milestone, pass, detail });
+    gates.push(Gate { name, milestone, pass, detail, skipped: None });
 }
 
 fn checks_detail(checks: &[crate::run::Check]) -> (bool, String) {
@@ -38,8 +41,23 @@ fn checks_detail(checks: &[crate::run::Check]) -> (bool, String) {
 }
 
 pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
+    let ci = ws.game(game)?.ci;
     let mut gates = Vec::new();
-    gate(&mut gates, "inputs", "M0", (|| {
+    // A gate the manifest skips, with its reason, instead of running it.
+    let skip = |gates: &mut Vec<Gate>, name: &'static str, milestone: &'static str| -> bool {
+        let Some(why) = ci.skip.get(name) else { return false };
+        eprintln!("ci: {name:<12} skip {why}");
+        gates.push(Gate { name, milestone, pass: true, detail: String::new(), skipped: Some(why.clone()) });
+        true
+    };
+    macro_rules! gate {
+        ($name:literal, $m:literal, $body:expr) => {
+            if !skip(&mut gates, $name, $m) {
+                gate(&mut gates, $name, $m, $body);
+            }
+        };
+    }
+    gate!("inputs", "M0", (|| {
         for name in ws.lock.toolchain.keys() {
             toolchain::fetch(ws, name)?;
         }
@@ -51,24 +69,24 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         }
         Ok((true, "toolchains and snapshots match inputs.lock".into()))
     })());
-    gate(&mut gates, "census", "M0", (|| {
-        let opts = psxw_census::Options { game: game.into(), only: None, probe: true, only_header: None };
+    gate!("census", "M0", (|| {
+        let opts = psxw_census::Options { game: game.into(), only: None, probe: !ci.census_no_probe, only_header: None };
         let (r, json) = psxw_census::run(ws, &opts)?;
         Ok((r.verdict.pass, json.display().to_string()))
     })());
-    gate(&mut gates, "lift", "M1", (|| {
+    gate!("lift", "M1", (|| {
         let opts = psxw_lift::run::Options { game: game.into(), function: None, container: None };
         let (r, json) = psxw_lift::run::run(ws, &opts)?;
         let n: usize = r.containers.values().map(|c| c.translated).sum();
         Ok((r.verdict.pass, format!("{n} functions translated; {}", json.display())))
     })());
-    gate(&mut gates, "difftest", "M1", (|| {
+    gate!("difftest", "M1", (|| {
         let opts = psxw_difftest::Options { game: game.into(), only: None, seeds: 64, keep: false, verbose: false };
         let (r, json) = psxw_difftest::run(ws, &opts)?;
         let counts: Vec<String> = r.counts.iter().map(|(k, n)| format!("{k} {n}")).collect();
         Ok((r.pass(), format!("{}; {}", counts.join(", "), json.display())))
     })());
-    gate(&mut gates, "unit-tests", "M1", (|| {
+    gate!("unit-tests", "M1", (|| {
         let out = std::process::Command::new("cargo")
             .current_dir(&ws.root)
             .args(["test", "--workspace", "--release", "-q"])
@@ -83,19 +101,23 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
     })());
     let built = psxw_build::game::build(ws, &psxw_build::game::Options::new(game));
     gate(&mut gates, "build", "M2", built.as_ref().map(|(r, _)| (true, r.wasm.clone())).map_err(|e| anyhow::anyhow!("{e:#}")));
-    gate(&mut gates, "boot", "M2", (|| {
+    gate!("boot", "M2", (|| {
         built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;
-        let (_, checks) = crate::run::evaluate(ws, game, &["--frames", "1200", "--check", "boot", "--check", "determinism"])?;
+        let (_, checks) = crate::run::evaluate(
+            ws,
+            game,
+            &["--frames", "1200", "--check", "boot", "--check", "determinism", "--check", "no-trap", "--check", "no-shadow-io"],
+        )?;
         Ok(checks_detail(&checks))
     })());
-    gate(&mut gates, "ubsan", "M2", (|| {
+    gate!("ubsan", "M2", (|| {
         let opts = psxw_build::game::Options { ubsan: true, ..psxw_build::game::Options::new(game) };
         let (report, _) = psxw_build::game::build(ws, &opts)?;
         let wasm = report.wasm;
         let (_, checks) = crate::run::evaluate(ws, game, &["--frames", "1200", "--wasm", &wasm, "--check", "no-trap"])?;
         Ok(checks_detail(&checks))
     })());
-    gate(&mut gates, "conform", "M4", (|| {
+    gate!("conform", "M4", (|| {
         let mut detail = Vec::new();
         let mut pass = true;
         for lib in crate::conform::LIBRARIES {
@@ -105,23 +127,23 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         }
         Ok((pass, detail.join(", ")))
     })());
-    gate(&mut gates, "mods", "M11", (|| {
+    gate!("mods", "M11", (|| {
         built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;
         crate::mods::ci(ws, game)
     })());
-    gate(&mut gates, "web-gpu", "M5", (|| {
+    gate!("web-gpu", "M5", (|| {
         let ok = crate::webtest::run(ws, &["gpu"])?;
         Ok((ok, "every GPU vector through the browser renderer in Chromium and Firefox".into()))
     })());
-    gate(&mut gates, "web-conform", "M5", (|| {
+    gate!("web-conform", "M5", (|| {
         let ok = crate::webtest::run(ws, &["conform", game])?;
         Ok((ok, "every conformance scenario replayed on game.wasm in Chromium and Firefox, native results".into()))
     })());
-    gate(&mut gates, "web-storage", "M7", (|| {
+    gate!("web-storage", "M7", (|| {
         let ok = crate::webtest::run(ws, &["storage"])?;
         Ok((ok, "memory cards through OPFS in Chromium and Firefox".into()))
     })());
-    gate(&mut gates, "web-game", "M5", (|| {
+    gate!("web-game", "M5", (|| {
         // The milestones' title-to-gameplay replay when the game has one
         // (recorded on the way, checking the recorder too); else idle.
         let named = ["toml", "rpl"].iter().any(|x| ws.root.join("games").join(game).join("replays").join(format!("title-to-gameplay.{x}")).is_file());
@@ -134,16 +156,28 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         let what = if named { "title-to-gameplay" } else { "600 idle frames" };
         Ok((ok, format!("{what}: RAM, VRAM and audio, native vs browsers")))
     })());
-    gate(&mut gates, "web-pacing", "M5", (|| {
+    gate!("web-pacing", "M5", (|| {
         let ok = crate::webtest::run(ws, &["pacing", game])?;
         Ok((ok, "60 s idle at real time; gates once psxw.local.toml states the machine".into()))
     })());
-    gate(&mut gates, "oracle", "M3", (|| {
+    gate!("oracle", "M3", (|| {
         let reports = psxw_oracle::commands::ci(ws, &mut crate::oracle::devices(ws))?;
         let pass = reports.iter().all(|(r, _)| r.pass);
         let detail: Vec<String> = reports.iter().map(|(r, _)| format!("{}: {}", r.command, if r.pass { "pass" } else { "FAIL" })).collect();
         Ok((pass, detail.join(", ")))
     })());
+
+    if let Some(name) = &ci.replay {
+        gate!("replay", "M13", (|| {
+            built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;
+            let (_, checks) = crate::run::evaluate(
+                ws,
+                game,
+                &["--replay", name, "--check", "determinism", "--check", "no-trap", "--check", "no-shadow-io"],
+            )?;
+            Ok(checks_detail(&checks))
+        })());
+    }
 
     let pass = gates.iter().all(|g| g.pass);
     let report = Report { schema_version: 1, game: game.into(), pass, gates };
