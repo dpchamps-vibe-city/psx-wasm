@@ -8,10 +8,12 @@
 //! function of virtual time.
 
 pub mod cd;
+pub mod cdc;
 pub mod clock;
 pub mod dma;
 pub mod gpu;
 pub mod irq;
+pub mod mdec;
 pub mod mem;
 pub mod memcard;
 pub mod sio;
