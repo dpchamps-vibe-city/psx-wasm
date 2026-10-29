@@ -410,9 +410,12 @@ census and lift)
     - The run fails when one doesn't hold.
     - Frame dumps at the same points are for a human to look at, never
       committed.
-21. [ ] **The Beetle diagnostic.** Run `psxw oracle play bof4 --replay
+21. [x] **The Beetle diagnostic.** Run `psxw oracle play bof4 --replay
     title-to-field` with VRAM and frames compared at counter checkpoints.
-    D48 applies, so differences are reported, not gated.
+    D48 applies, so differences are reported, not gated. (`76f3bb8`:
+    `psxw oracle ramdiff <game> --replay R --at V,.. --compare-frames`;
+    Beetle's VRAM comes from its savestate's `GPURAM` entry, unpatched.
+    Results in Findings.)
 22. [ ] **`psxw ci bof4`**, with these gates:
     - census, lift and build;
     - boot, determinism, no-trap and no-shadow-io;
@@ -525,6 +528,37 @@ census and lift)
     own command passes since.
 
 ## Findings
+
+- **The Beetle diagnostic on `title-to-field`** (task 21; 29,000 frames,
+  so Beetle reaches every checkpoint):
+
+  | counter | frames (ours/Beetle) | pixels differ | VRAM words differ | what differs |
+  |---|---|---|---|---|
+  | 900 | 1919 / 3454 | 0.7% | 0.5% | title: only the PRESS START fade |
+  | 2000 | 3988 / 5605 | 2.0% | 0.6% | intro text: we've typed more lines |
+  | 6000 | 11988 / 13605 | 64.8% | 23.6% | same scene; dialog box only ours |
+  | 9000 | 17988 / 19605 | 17.0% | 5.5% | same scene; dialog box only ours |
+  | 12300 | 24588 / 26205 | 17.4% | 5.9% | we're in the field; Beetle letterboxed |
+  | 12590 | 25168 / 26785 | 59.8% | 26.6% | both walking; positions differ |
+
+  Scenery and sprites match; the differences are progress and timing
+  (D48). Open, and looking like real differences in the FMV path, not
+  timing (not gated, not yet investigated):
+  - **Magenta frames** during the intro FMV (counters 771–772, 789–792,
+    824–825, 850–852): the display is in 24-bit mode over VRAM that still
+    holds 15-bit white. Beetle never shows them.
+  - **The FMV runs at half pace:** our counter advances once per 8 vblanks
+    during it, Beetle's once per 4. Our white screen before it also runs
+    longer (the FMV starts at counter 763 vs 476).
+  - **A seam at x=303/304:** the rightmost macroblock column of our FMV
+    pictures comes from another picture.
+- **Also open:** bof4 with a second pad (follow-up tasks); older tests
+  that embed btn facts (follow-up tasks).
+- **The native-port claim** (discussed 2026-10-29,
+  `docs/status-btn-vs-bof4.md`): the CPU isn't emulated, but D40–D58
+  moved the hardware boundary below the SDK, so both games run on
+  register-level device models. Where the shipped boundary should be is
+  the human's open decision.
 
 - **Generality review (exit criterion 7).** An independent review of
   psx-wasm (`0ebd944`..) and the harness branch (`86749e4..m13-bof4`)
