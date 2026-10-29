@@ -157,7 +157,7 @@ mod tests {
         // COP2 in the thread); OpenThread keeps it.
         let tcbs = m.mem.r32(k::TCB_ENTRY);
         m.mem.w32(tcbs + 0xC0 + k::TCB_SR, 0x4000_0404);
-        let h = m.open_thread(0x8001_0000, 0x801F_F600, 0x8017_C524);
+        let h = m.open_thread(0x8001_0000, 0x801F_F600, 0x8002_4000);
         assert_eq!(h, 0xFF00_0001);
         assert_eq!(m.mem.r32(tcb(1) + k::TCB_SR), 0x4000_0404);
         assert_eq!(m.mem.r32(tcb(1) + TCB_FLAGS2), 0x1000);

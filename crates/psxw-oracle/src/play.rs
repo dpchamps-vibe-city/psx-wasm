@@ -176,13 +176,13 @@ mod tests {
 
     #[test]
     fn presses() {
-        let r = replay_from_presses("btn", 10, &["START@2:2".into(), "2:cross+up@9".into()], 0, 2).unwrap();
+        let r = replay_from_presses("game", 10, &["START@2:2".into(), "2:cross+up@9".into()], 0, 2).unwrap();
         assert_eq!(replay::Header::parse(&r).unwrap().frames, 10);
         assert_eq!(replay::frame(&r, 1), [replay::NOTHING_PRESSED; 2]);
         assert_eq!(replay::frame(&r, 2), [!(1 << 3), replay::NOTHING_PRESSED]);
         assert_eq!(replay::frame(&r, 3), [!(1 << 3), replay::NOTHING_PRESSED]);
         assert_eq!(replay::frame(&r, 4), [replay::NOTHING_PRESSED; 2]);
         assert_eq!(replay::frame(&r, 9), [replay::NOTHING_PRESSED, !(1 << 14 | 1 << 4)]);
-        assert!(replay_from_presses("btn", 10, &["JUMP@1".into()], 0, 2).is_err());
+        assert!(replay_from_presses("game", 10, &["JUMP@1".into()], 0, 2).is_err());
     }
 }

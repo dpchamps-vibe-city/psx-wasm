@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let h = Header { version: VERSION, pad_type: 0x41, frames: 2, game_id: *b"btn\0\0\0\0\0\0\0\0\0\0\0\0\0", disc_sha1: [7; 20], clock: 0x8006_C840, unplugged: UNPLUGGED_PORT2 };
+        let h = Header { version: VERSION, pad_type: 0x41, frames: 2, game_id: *b"game\0\0\0\0\0\0\0\0\0\0\0\0", disc_sha1: [7; 20], clock: 0x8001_0040, unplugged: UNPLUGGED_PORT2 };
         let mut buf = [0u8; HEADER_LEN + 2 * FRAME_LEN];
         let mut head = [0u8; HEADER_LEN];
         h.encode(&mut head);
