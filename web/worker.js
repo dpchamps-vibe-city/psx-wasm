@@ -125,6 +125,12 @@ function replayButtons(replay, frame, port, readU32) {
   return dv.getUint16(data + 4 * at + 2 * port, true);
 }
 
+/** Whether a replay has a pad on `port` (0 or 1): version 2's unplugged-ports word. */
+function replayPlugged(replay, port) {
+  const dv = new DataView(replay.buffer, replay.byteOffset, replay.byteLength);
+  return dv.getUint32(8, true) === 1 || (dv.getUint32(60, true) & (1 << port)) === 0;
+}
+
 /**
  * A recorded session as a version 2 replay (psxw-abi replay): entry `c`
  * holds the pads the game saw at the last vblank its frame counter (the
@@ -419,6 +425,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
     },
     pad_state(port, out) {
       let buttons;
+      if (replay && !replayPlugged(replay, port & 1)) return 0;
       if (replay) buttons = replayButtons(replay, frame, port & 1, (a) => new DataView(mem()).getUint32(windowBase + (a & 0x1ffffc), true));
       else buttons = Atomics.load(pad, 1 + (port & 1));
       if (recording) {

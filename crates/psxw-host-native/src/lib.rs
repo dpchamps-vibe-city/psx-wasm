@@ -573,6 +573,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         let header = c.data().opts.replay.as_deref().map(replay::Header::parse);
         let buttons = match header {
             Some(None) => return 0,
+            Some(Some(h)) if !h.plugged(port) => return 0,
             Some(Some(h)) => {
                 let frame = c.data().frame;
                 let m = mem(&mut c);

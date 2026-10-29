@@ -49,7 +49,7 @@ fn play_traces_and_dumps_deterministically() {
     use psxw_oracle::wire;
     let Some((ws, _)) = target() else { return };
     let im = images::load(&ws).unwrap();
-    let replay = play::replay_from_presses("runner", 600, &["START@100".into()], 0).unwrap();
+    let replay = play::replay_from_presses("runner", 600, &["START@100".into()], 0, 2).unwrap();
     let base = ws.out_dir().join("oracle").join(format!("test-play-{}", std::process::id()));
     let run = |n: u32| {
         let o = PlayOptions {

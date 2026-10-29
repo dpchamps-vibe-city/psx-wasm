@@ -454,6 +454,8 @@ static size_t replay_len;
 static uint32_t replay_frames;
 static size_t replay_data;
 static uint32_t replay_clock;
+/* Version 2: bit n set means port n+1 has no pad (psxw-abi replay). */
+static uint32_t replay_unplugged;
 
 #define REPLAY_HEADER_LEN_V1 56
 #define REPLAY_HEADER_LEN 64
@@ -921,6 +923,7 @@ static int mode_play(const struct play_args *a) {
         if (replay_len < REPLAY_HEADER_LEN) die(EXIT_USAGE, "%s: truncated", a->replay);
         replay_data = REPLAY_HEADER_LEN;
         replay_clock = le32(r + 56);
+        replay_unplugged = le32(r + 60);
         break;
     default: die(EXIT_USAGE, "%s: replay version %u", a->replay, le32(r + 8));
     }
@@ -933,8 +936,8 @@ static int mode_play(const struct play_args *a) {
 
     struct retro_game_info game = {.path = a->disc, .data = NULL, .size = 0, .meta = NULL};
     if (!core.load_game(&game)) die(EXIT_USAGE, "the core refused %s", a->disc);
-    core.set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
-    core.set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
+    core.set_controller_port_device(0, (replay_unplugged & 1) ? RETRO_DEVICE_NONE : RETRO_DEVICE_JOYPAD);
+    core.set_controller_port_device(1, (replay_unplugged & 2) ? RETRO_DEVICE_NONE : RETRO_DEVICE_JOYPAD);
     ram = core.get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
     ram_size = core.get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
     if (!ram || ram_size != 0x200000) die(EXIT_PROTOCOL, "core exposes %zu bytes of system RAM", ram_size);

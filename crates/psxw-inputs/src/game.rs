@@ -122,6 +122,13 @@ pub struct ReplaySpec {
     /// or halfword) equals VALUE once the frame counter reaches COUNTER.
     #[serde(default)]
     pub expect: Vec<String>,
+    /// Pads connected: 2 (the default) or 1, port 2 left empty.
+    #[serde(default = "two")]
+    pub pads: u32,
+}
+
+fn two() -> u32 {
+    2
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

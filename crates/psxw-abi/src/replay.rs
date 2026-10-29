@@ -9,7 +9,7 @@
 //! 16  entries (u32)
 //! 20  game id (16 bytes, NUL padded)
 //! 36  disc sha1 (20 bytes; zero when unknown)
-//! 56  version 2: clock (u32), reserved (u32)
+//! 56  version 2: clock (u32), unplugged ports (u32)
 //! 56 or 64: entry 0: port 1 buttons (u16), port 2 buttons (u16)
 //! ...
 //! ```
@@ -23,6 +23,10 @@
 //!
 //! Buttons are the pad's 16-bit word as libpad reports it, active low
 //! (`0xFFFF` = nothing pressed).
+//!
+//! **Unplugged ports** (version 2): bit `n` set means port `n + 1` has no
+//! pad. 0, as every file written before the field existed has, means both
+//! have one. Games can behave differently with a second pad connected.
 
 pub const MAGIC: &[u8; 8] = b"PSXWRPL\0";
 /// The version written.
@@ -42,7 +46,12 @@ pub struct Header {
     pub disc_sha1: [u8; 20],
     /// 0: entries by vblank; else the guest address of a u32 frame counter.
     pub clock: u32,
+    /// Bit `n`: port `n + 1` has no pad.
+    pub unplugged: u32,
 }
+
+/// [`Header::unplugged`]: port 2 has no pad.
+pub const UNPLUGGED_PORT2: u32 = 2;
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -58,12 +67,12 @@ impl Header {
         let mut disc_sha1 = [0; 20];
         disc_sha1.copy_from_slice(&bytes[36..56]);
         let version = u32_at(bytes, 8);
-        let clock = match version {
-            1 => 0,
-            2 if bytes.len() >= HEADER_LEN => u32_at(bytes, 56),
+        let (clock, unplugged) = match version {
+            1 => (0, 0),
+            2 if bytes.len() >= HEADER_LEN => (u32_at(bytes, 56), u32_at(bytes, 60)),
             _ => return None,
         };
-        let h = Header { version, pad_type: u32_at(bytes, 12), frames: u32_at(bytes, 16), game_id, disc_sha1, clock };
+        let h = Header { version, pad_type: u32_at(bytes, 12), frames: u32_at(bytes, 16), game_id, disc_sha1, clock, unplugged };
         if bytes.len() < h.data_offset() + h.frames as usize * FRAME_LEN {
             return None;
         }
@@ -77,6 +86,11 @@ impl Header {
 
     /// The entry for a vblank: the vblank number, or the clock's value
     /// (read with `read_u32`, a guest address in, the word out).
+    /// Whether port `port` (0 or 1) has a pad.
+    pub fn plugged(&self, port: u32) -> bool {
+        self.unplugged & (1 << (port & 1)) == 0
+    }
+
     pub fn entry(&self, vblank: u64, read_u32: impl FnOnce(u32) -> u32) -> u32 {
         if self.clock == 0 { vblank.min(u32::MAX as u64) as u32 } else { read_u32(self.clock) }
     }
@@ -89,7 +103,7 @@ impl Header {
         out[20..36].copy_from_slice(&self.game_id);
         out[36..56].copy_from_slice(&self.disc_sha1);
         out[56..60].copy_from_slice(&self.clock.to_le_bytes());
-        out[60..64].fill(0);
+        out[60..64].copy_from_slice(&self.unplugged.to_le_bytes());
     }
 }
 
@@ -116,7 +130,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let h = Header { version: VERSION, pad_type: 0x41, frames: 2, game_id: *b"btn\0\0\0\0\0\0\0\0\0\0\0\0\0", disc_sha1: [7; 20], clock: 0x8006_C840 };
+        let h = Header { version: VERSION, pad_type: 0x41, frames: 2, game_id: *b"btn\0\0\0\0\0\0\0\0\0\0\0\0\0", disc_sha1: [7; 20], clock: 0x8006_C840, unplugged: UNPLUGGED_PORT2 };
         let mut buf = [0u8; HEADER_LEN + 2 * FRAME_LEN];
         let mut head = [0u8; HEADER_LEN];
         h.encode(&mut head);
@@ -126,6 +140,7 @@ mod tests {
         assert_eq!(frame(&buf, 0), [0xFFEF, 0]);
         assert_eq!(frame(&buf, 5), [NOTHING_PRESSED; 2]);
         assert_eq!(h.entry(9, |a| a & 0xFF), 0x40, "counter-indexed");
+        assert!(h.plugged(0) && !h.plugged(1));
         // Version 1: no clock field, entries from byte 56.
         let mut v1 = [0u8; 56 + 4];
         v1[..56].copy_from_slice(&head[..56]);
@@ -134,6 +149,7 @@ mod tests {
         v1[56..58].copy_from_slice(&0xFFFEu16.to_le_bytes());
         let p = Header::parse(&v1).unwrap();
         assert_eq!((p.clock, p.data_offset()), (0, 56));
+        assert!(p.plugged(1), "version 1: both ports have pads");
         assert_eq!(frame(&v1, 0), [0xFFFE, 0]);
         assert_eq!(p.entry(7, |_| unreachable!()), 7);
     }

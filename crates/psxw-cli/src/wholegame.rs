@@ -66,7 +66,7 @@ pub fn replay(ws: &Workspace, game: &str, arg: Option<&str>) -> Result<(Vec<u8>,
     let inputs = psxw_lift::run::load(ws, game)?;
     let clock = counter_addr(ws, game, &inputs)?;
     let what = if name.is_empty() { "[oracle.replay]".to_string() } else { format!("replays/{name}.toml") };
-    let bytes = play::replay_from_presses(game, spec.frames, &spec.press, clock).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+    let bytes = play::replay_from_presses(game, spec.frames, &spec.press, clock, spec.pads).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     let file = if name.is_empty() { format!("{game}.rpl") } else { format!("{game}-{name}.rpl") };
     let path = ws.out_dir().join("oracle").join("replays").join(file);
     std::fs::create_dir_all(path.parent().unwrap())?;
