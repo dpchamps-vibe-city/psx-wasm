@@ -35,8 +35,19 @@ pub struct Boundary {
     library: BTreeMap<String, Entry>,
     #[serde(default)]
     object: BTreeMap<String, Entry>,
+    /// Chip groups (D59): the libraries and objects that drive each chip.
+    #[serde(default)]
+    chip: BTreeMap<String, Chip>,
     /// The structs adapters touch, for `psxw layout`.
     pub layout: Option<LayoutSection>,
+}
+
+/// A chip group (D59): its `adapter-or-device` members are decided
+/// together, native or on the chip's device.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Chip {
+    /// `<library>` or `<library>/<member>`.
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -67,6 +78,23 @@ impl Boundary {
     /// Libraries with policy `device`.
     pub fn device_libraries(&self) -> Vec<String> {
         self.library.iter().filter(|(_, e)| e.policy == Policy::Device).map(|(l, _)| l.clone()).collect()
+    }
+
+    /// Libraries with policy `adapter`.
+    pub fn adapter_libraries(&self) -> Vec<String> {
+        self.library.iter().filter(|(_, e)| e.policy == Policy::Adapter).map(|(l, _)| l.clone()).collect()
+    }
+
+    pub fn chips(&self) -> &BTreeMap<String, Chip> {
+        &self.chip
+    }
+
+    /// The chip group of `<library>/<member>`: one naming the object, else
+    /// one naming its library.
+    pub fn chip_of(&self, member: &str) -> Option<&str> {
+        let lib = member.split('/').next()?;
+        let named = |want: &str| self.chip.iter().find(|(_, c)| c.members.iter().any(|m| m == want)).map(|(n, _)| n.as_str());
+        named(member).or_else(|| named(lib))
     }
 
     /// Libraries with policy `adapter-or-device`.
@@ -126,5 +154,22 @@ mod tests {
         assert_eq!(b.adapter_or_device_libraries(), ["libcd"]);
         let unknown = b.unknown(["libcd/sys", "libds/dsread", "libds/dssys_1", "libds/dsfile", "libsn/op_vnew"]);
         assert_eq!(unknown.into_iter().collect::<Vec<_>>(), [("libds".to_string(), 2), ("libsn".to_string(), 1)]);
+    }
+
+    #[test]
+    fn chip_groups() {
+        let b: Boundary = toml::from_str(
+            r#"
+            [chip.irq]
+            members = ["libetc", "libapi/counter"]
+            [chip.cd]
+            members = ["libcd", "libds"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(b.chip_of("libapi/counter"), Some("irq"));
+        assert_eq!(b.chip_of("libapi/pad"), None);
+        assert_eq!(b.chip_of("libds/dsread"), Some("cd"));
+        assert_eq!(b.chips().len(), 2);
     }
 }

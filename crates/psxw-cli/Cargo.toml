@@ -25,6 +25,7 @@ serde_json = "1.0.154"
 psxw-oracle = { path = "../psxw-oracle" }
 sdk-psyq = { path = "../sdk-psyq" }
 psxw-gpu-oracle = { path = "../psxw-gpu-oracle" }
+psxw-sdk = { path = "../psxw-sdk" }
 psx-devices = { path = "../psx-devices" }
 psxw-link = { path = "../psxw-link" }
 wasmparser = "0.262.0"

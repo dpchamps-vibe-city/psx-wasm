@@ -885,6 +885,7 @@ dependencies = [
  "psxw-link",
  "psxw-modkit",
  "psxw-oracle",
+ "psxw-sdk",
  "rayon",
  "sdk-psyq",
  "serde",
@@ -1032,6 +1033,17 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.11.1",
+]
+
+[[package]]
+name = "psxw-sdk"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "psxw-inputs",
+ "psxw-lift",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

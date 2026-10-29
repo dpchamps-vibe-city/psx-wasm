@@ -18,6 +18,7 @@
 //! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose] [--debug]
 //!                                       M2: run game.wasm headless
 //! psxw identity <game>                 M8: SDK object identity report
+//! psxw sdk scan [--game G]…             D59: SDK functions that reach hardware; adapters per game
 //! psxw build-web <game> [--mods D,…] [--moddable] [--debug]; psxw serve [dir] [--port N]
 //!                                       M5: the browser bundle (--debug: C source in DevTools)
 //! psxw oracle …                         M3: device oracle harness (oracle.rs)
@@ -45,6 +46,7 @@ mod mods;
 mod modtest;
 mod passthrough;
 mod writers;
+mod sdk;
 
 fn main() {
     if let Err(e) = run() {
@@ -326,6 +328,12 @@ fn run() -> Result<()> {
             }
             let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
             if !run::run(&ws, game, &rest)? {
+                std::process::exit(2);
+            }
+        }
+        ["sdk", "disasm", rest @ ..] => sdk::disasm(&ws, rest)?,
+        ["sdk", "scan", rest @ ..] => {
+            if !sdk::run(&ws, rest)? {
                 std::process::exit(2);
             }
         }

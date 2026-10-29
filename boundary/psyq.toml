@@ -82,6 +82,30 @@ policy = "guest"
 [library.2mbyte]   # SN's startup: assembly by design, touches no hardware
 policy = "guest"
 
+# Chip groups (D59): the libraries and objects that drive each chip. A
+# chip runs native (its members' adapters) or emulated (their original
+# code over its device), never a mix: see `psxw build`'s per-chip report.
+# Libraries here that touch no register themselves (libds) run as guest
+# code over the chip's adapters, or over the original.
+
+[chip.irq]         # the interrupt controller, root counters, vblank
+members = ["libetc", "libapi/counter"]
+
+[chip.gpu]
+members = ["libgpu"]
+
+[chip.sio0]        # pads
+members = ["libpad"]
+
+[chip.cd]          # libds and streaming ride on libcd's drive layer
+members = ["libcd", "libds"]
+
+[chip.mdec]
+members = ["libpress"]
+
+[chip.spu]
+members = ["libspu", "libsnd"]
+
 # The structs adapters read and write, generated into Rust constants by
 # `psxw layout <game>` from the game's SDK headers (offsets checked equal
 # under the matching compiler and clang). Adapters use these, never

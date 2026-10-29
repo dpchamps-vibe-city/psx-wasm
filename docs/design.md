@@ -1963,3 +1963,39 @@ instructed. It follows D40, D42, D45 and D47: the original library decides
 everything observable. The per-library rule is this milestone's
 refinement of the recommended per-object one, which would have mixed
 adapter state with original code in bof4.
+
+**D59. Adapters first, the device as the fallback, decided per chip**
+(unified adapter layer, phase 1). Each chip runs native through SDK
+adapters wherever a validated adapter set covers everything a game uses
+on it. Otherwise the whole chip falls back to its register-level device
+model.
+- **Chip groups:** the boundary file names each chip's libraries (CD:
+  libcd, libds; SPU: libspu, libsnd; GPU: libgpu; SIO0: libpad; IRQ and
+  timers: libetc, libapi's counters; MDEC: libpress). The build decides
+  each chip, not each library: a chip can't have two drivers.
+- **Native** when every placed object in the group that defines an
+  adapter's function is validated, and nothing the game runs reaches the
+  chip outside the adapter set: no function reached from outside the
+  group (through direct calls, stopping at adapters) touches the chip's
+  registers, or drives an adapted library's internals.
+- **One adapter per SDK function,** the same code in every game: no
+  per-game variants, tables or modes. If an adapter works in one game
+  and not another, its seam or its shared state is widened.
+- **Two kinds of adapter.** Hardware adapters fall back to the device.
+  BIOS-internals adapters (libcard's `_patch_card`, libapi's pad flags)
+  are mandatory: there is no Sony BIOS to emulate.
+- **Reporting:** `build.json` says, per chip, native or emulated and
+  why; `game.toml` lists the chips a game expects native, and a build
+  that falls back on one fails. `--device <chip,…|all>` forces chips onto
+  their devices, for conformance (level 4) and as the escape hatch.
+- **Conformance:** an adapter is done when it matches the original
+  library over the device models on every observation code staying
+  original can make: per call, per chip sequence, in every game that
+  links it, and whole-game replays in both modes.
+
+*Why:* the human's decision ("graceful degradation to emulated
+hardware"). It reverses the device default of D40, D42, D45 and D47,
+which made the layer beneath the SDK an emulator, and generalizes D41
+and D58 (libspu's and libcd's adapter-or-device policies) from one
+library to every chip. The device models stay, as the fallback and as
+the oracle. (plans/unified-adaptor-layer)

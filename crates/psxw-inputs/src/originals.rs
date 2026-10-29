@@ -58,6 +58,11 @@ impl Originals {
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    /// A container's segments: (file range, guest address).
+    pub fn segments(&self, container: &str) -> &[(std::ops::Range<u32>, u32)] {
+        self.images.get(container).map_or(&[], |img| img.segments.as_slice())
+    }
+
     /// Original bytes at a guest address in a container.
     pub fn read(&self, container: &str, addr: u32, len: usize) -> Option<&[u8]> {
         let img = self.images.get(container)?;

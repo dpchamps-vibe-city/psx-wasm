@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** not started
+**Status:** in progress (tasks 1–2 done)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -14,63 +14,66 @@ GTE. The device models stay, as the fallback and as the oracle.
 
 ## Inventory
 
-From the prototype analysis (PsyQ 4.7; btn `b37ae28`, bof4 `1560817`).
-Task 1 regenerates these numbers with the Rust analysis.
+From `psxw sdk scan` (task 2) over PsyQ 4.7's objects, joined with btn
+`b37ae28` and bof4 `57f7da1`. `out/sdk/psyq-470/<game>.json` has the
+per-function detail. The scan reproduces every constant-address access
+the translator sees in either game's SDK code.
 
-**121 adapters** across both games: btn needs 95, bof4 76, and 50 are
-shared. 22 exist. About 45 of the 121 are state accessors, a rule that
-over-counts (task 1 refines it). The mandatory BIOS-internals adapters
-(libcard; libapi's pad and counter functions) aren't counted; they exist.
+**141 adapters** across both games: btn needs 109, bof4 90. 78 reach a
+chip or BIOS internals; 63 are state accessors. 23 exist.
 
-| Library | Need | btn | bof4 | Have | Decompiled (psyq-decomp HEAD / our pin) |
-|---|---|---|---|---|---|
-| libspu | 26 | 23 | 23 | 0 | 3 / 3 |
-| libgpu | 27 | 24 | 15 | 0 | 24 / 24 |
-| libcd | 24 | 11 | 13 | 11 | 18 / 18 |
-| libmcx | 19 | 19 | 0 | 4 | 12 / 0 |
-| libetc | 8 | 6 | 8 | 0 | 7 / 7 |
-| libapi | 7 | 5 | 7 | 7 | 5 / 5 |
-| libpad | 6 | 6 | 6 | 0 | 6 / 0 |
-| libpress | 3 | 0 | 3 | 0 | 3 / 0 |
-| libsnd | 1 | 1 | 1 | 0 | 0 / 0 |
-| **Total** | **121** | **95** | **76** | **22** | **78 / 57** |
+| Library | Reach hardware | State accessors | Have |
+|---|---|---|---|
+| libapi | 3 | 2 | 5 |
+| libcard | 2 (BIOS internals) | 0 | 2 |
+| libcd | 20 | 5 | 12 |
+| libetc | 8 | 0 | 0 |
+| libgpu | 17 | 12 | 0 |
+| libmcx | 1 | 18 | 4 |
+| libpad | 5 | 1 | 0 |
+| libpress | 3 | 0 | 0 |
+| libsnd | 1 | 19 | 0 |
+| libspu | 18 | 6 | 0 |
 
-psyq-decomp HEAD is `935cc39`; our pin `302b6ae` is 832 commits behind it.
+**State accessors need no adapter when the adapters keep the library's
+state where the original keeps it,** in guest RAM. libsnd shows why: only
+`_SsInit` touches the SPU (16 volume registers), and the 19 libsnd
+accessors share `_snd_openflag` and friends with it. An `_SsInit` adapter
+that writes those globals and calls the original `_SsVmInit` leaves all of
+libsnd original. The scan lists accessors so each chip's adapters can
+choose: state in guest RAM (accessors stay original), or state in the
+runtime (accessors get adapters, as libcd's do today).
+
+**Hardware-reaching functions, by game** (the seam each chip must cover):
+
+| Library | btn | bof4 |
+|---|---|---|
+| libapi | ResetRCnt SetRCnt firstfile | same |
+| libcard | InitCARD StopCARD | same |
+| libcd | CdControl CdControlB CdControlF CdFlush CdInit CdRead CdReadBreak CdReadSync CdSearchFile CdSync | CD_cw CD_flush CD_init CD_initvol CD_ready CD_sync CdGetSector CdMix StCdInterrupt StUnSetRing |
+| libetc | DMACallback InterruptCallback ResetCallback VSync VSyncCallback VSyncCallbacks | the same, plus SetIntrMask StopCallback |
+| libgpu | ClearImage ClearOTagR DrawOTag DrawSync FntFlush FntLoad KanjiFntFlush KanjiFntOpen LoadImage MoveImage MoveImage2 PutDispEnv PutDrawEnv ResetGraph SetDispMask StoreImage | ClearImage ClearOTagR DrawOTag DrawOTagEnv DrawSync LoadImage PutDispEnv PutDrawEnv ResetGraph SetDispMask StoreImage |
+| libmcx | McxStartCom | — |
+| libpad | PadGetState PadInfoMode PadSetAct PadSetActAlign PadStartCom | same |
+| libpress | — | DecDCTReset DecDCTin DecDCTout |
+| libsnd | SsInit | SsInit |
+| libspu | SpuGetAllKeysStatus SpuGetKeyStatus SpuGetNoiseVoice SpuGetReverbVoice SpuGetVoiceEnvelope SpuSetCommonAttr SpuSetKey SpuSetNoiseVoice SpuSetReverb SpuSetReverbDepth SpuSetReverbModeParam SpuSetReverbVoice SpuSetTransferStartAddr SpuSetVoiceAttr SpuWritePartly | SpuClearReverbWorkArea SpuGetNoiseVoice SpuGetReverbVoice SpuGetVoiceEnvelope SpuGetVoiceVolume SpuSetCommonAttr SpuSetKey SpuSetNoiseVoice SpuSetReverb SpuSetReverbDepth SpuSetReverbModeParam SpuSetReverbVoice SpuSetTransferStartAddr SpuSetVoiceAttr SpuSetVoiceVolume SpuWritePartly |
 
 **libcd is the unification problem in one table.** btn calls the public
-layer (`CdControl`, `CdRead`, `CdSync`, …). bof4 calls the low layer
-(`CD_cw`, `CD_sync`, …) through libds, plus streaming (`St*`). The two
-games share no libcd adapter today.
+layer; bof4 calls the low layer (`CD_cw`, `CD_sync`, …) through libds,
+plus streaming (`St*`). The two games share no libcd adapter today.
 
-### The functions
-
-| Library | Reach hardware | State accessors |
-|---|---|---|
-| libspu | SpuClearReverbWorkArea, SpuGetAllKeysStatus, SpuGetKeyStatus, SpuGetNoiseVoice, SpuGetReverbVoice, SpuGetVoiceEnvelope, SpuGetVoiceVolume, SpuSetCommonAttr, SpuSetKey, SpuSetNoiseClock, SpuSetNoiseVoice, SpuSetReverb, SpuSetReverbDepth, SpuSetReverbModeParam, SpuSetReverbVoice, SpuSetTransferStartAddr, SpuSetVoiceAttr, SpuSetVoiceVolume, SpuWritePartly | SpuFree, SpuInitMalloc, SpuIsTransferCompleted, SpuMalloc, SpuSetTransferMode, `_spu_getInTransfer`, `_spu_setInTransfer` |
-| libgpu | ClearImage, ClearOTagR, DrawOTag, DrawOTagEnv, DrawSync, FntFlush, FntLoad, KanjiFntFlush, KanjiFntOpen, LoadImage, MoveImage, MoveImage2, PutDispEnv, PutDrawEnv, ResetGraph, SetDispMask, StoreImage | ClearOTag, DrawSyncCallback, FntOpen, FntPrint, KanjiFntClose, KanjiFntPrint, SetDumpFnt, SetGraphDebug, two statics in `4-sys.o` |
-| libcd | CD_cw, CD_flush, CD_init, CD_initvol, CD_sync, CdControl, CdControlB, CdControlF, CdFlush, CdGetSector, CdInit, CdMix, CdRead, CdReadBreak, CdReadSync, CdSearchFile, CdSync, StCdInterrupt, StUnSetRing | CdLastCom, StFreeRing, StGetNext, StSetRing, StSetStream |
-| libmcx | McxStartCom | McxAllInfo, McxCurrCtrl, McxExecApl, McxExecFlag, McxFlashAcs, McxGetApl, McxGetMcxInfo, McxGetMem, McxGetSerial, McxGetTime, McxHideTrans, McxReadDev, McxSetLED, McxSetMem, McxShowTrans, McxSync, McxWriteDev, `_mcxStopFastDsr` |
-| libetc | DMACallback, InterruptCallback, ResetCallback, SetIntrMask, StopCallback, VSync, VSyncCallback, VSyncCallbacks | — |
-| libapi | ResetRCnt, SetRCnt, firstfile | DisablePAD, EnablePAD, ReadInitPadFlag, SetInitPadFlag |
-| libpad | PadGetState, PadInfoMode, PadSetAct, PadSetActAlign, PadStartCom | PadInitDirect |
-| libpress | DecDCTReset, DecDCTin, DecDCTout | — |
-| libsnd | SsInit | — |
-
-Not decompiled at psyq-decomp HEAD, and no adapter yet (37):
-- **libspu (23):** all of its column except SpuGetNoiseVoice,
-  SpuGetReverbVoice and `_spu_getInTransfer`.
-- **libmcx (6):** McxGetMcxInfo, McxGetMem, McxGetTime, McxReadDev,
-  McxWriteDev, `_mcxStopFastDsr`.
-- **libgpu (3):** PutDispEnv and the two statics.
-- **libcd (3):** CD_cw, CD_sync, CdGetSector.
-- **libetc (1):** SetIntrMask.
-- **libsnd (1):** SsInit.
+**The adapters btn binds today, classed by the scan:** 21 are in the set;
+16 are internal (only adapted functions call them: `CdGetSector`,
+`CdStatus`, …); 4 are BIOS-call trampolines (`InitCARD2`, `_bu_init`, …);
+6 are riders that reach nothing themselves (`CdDataCallback` calls
+libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 
 ## Tasks
 
-1. [ ] **Record D59** in [docs/design.md](../../docs/design.md)'s
+1. [x] **Record D59** in [docs/design.md](../../docs/design.md)'s
    decision log (README, "Decisions this plan needs"), and update §5.
-2. [ ] **`psxw sdk scan`: the hardware-reach analysis, in Rust.**
+2. [x] **`psxw sdk scan`: the hardware-reach analysis, in Rust.**
    - **Input:** an SDK version's relocatable library objects.
    - **Output:** for every function: the chips it reaches directly and
      through its own library, its calls (direct and through
@@ -166,3 +169,20 @@ Not decompiled at psyq-decomp HEAD, and no adapter yet (37):
 ## Progress log
 
 ## Findings
+
+- **2026-10-29, tasks 1–2.** D59 recorded. `psxw sdk scan` (crate
+  `psxw-sdk`) reads PsyQ 4.7's 2,163 objects in 7 s: 3,140 functions, 389
+  reach hardware or BIOS internals. Its check: every constant-address
+  access the translator's facts see in either game's SDK code is in the
+  scan's reach (0 misses). `psxw sdk disasm <fn>` prints a function with
+  its relocations, for writing adapters from the objects.
+
+- **The state-accessor rule, refined.** An accessor is a function that
+  reaches no hardware and reads mutable library data that a
+  hardware-reaching function accesses, or writes data one reads. Data
+  nothing writes at run time (register-pointer tables) no longer couples.
+  Accessors only need adapters when the adapters keep the state in the
+  runtime; see the inventory.
+- **BIOS tables.** libapi's and libcard's patches find kernel RAM through
+  GetB0Table/GetC0Table (B0h:56h, 57h) and jump into patched kernel code
+  (`jr 0xA000DFAC`). The scan follows both.
