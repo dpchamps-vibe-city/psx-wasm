@@ -17,7 +17,7 @@
  *                                PS-X EXE loader hooks a Sony-BIOS address.
  *   play --disc GAME.cue --replay R --frames N --out DIR
  *        [--trace-u32 ADDR] [--dump-at F,..] [--dump-counter V,..]
- *        [--frames-every N]
+ *        [--frames-every N] [--dump-frames] [--dump-vram]
  *                                run a game from a psx-wasm replay file
  *                                (crates/psxw-abi/src/replay.rs): the pad
  *                                state of frame k is what the core reads
@@ -31,6 +31,14 @@
  *                                and button words match psxw-host-native.
  *                                With --frames-every N, every Nth presented
  *                                frame goes to DIR/frames/frame_NNNNNN.ppm.
+ *                                With --dump-frames, each RAM dump also
+ *                                writes the picture the core presented in
+ *                                that frame beside it (ram_X.bin ->
+ *                                frame_X.ppm); with --dump-vram, VRAM
+ *                                (vram_X.bin: 1024x512 16-bit words, LE),
+ *                                read from the core's savestate
+ *                                (retro_serialize), the only libretro call
+ *                                that exposes it.
  */
 
 #define _GNU_SOURCE
@@ -402,10 +410,13 @@ static uint64_t frames_run;
 static uint64_t frames_every;
 static const char *frames_dir;
 
-/* One presented frame as a binary PPM, from the core's pixel format. */
-static void write_ppm(const void *data, unsigned width, unsigned height, size_t pitch) {
-    char path[4096];
-    snprintf(path, sizeof path, "%s/frame_%06llu.ppm", frames_dir, (unsigned long long)frames_run);
+static size_t bytes_per_pixel(enum retro_pixel_format f) {
+    return f == RETRO_PIXEL_FORMAT_XRGB8888 ? 4 : 2;
+}
+
+/* A picture in the core's pixel format as a binary PPM. */
+static void write_ppm_file(const char *path, const void *data, unsigned width, unsigned height, size_t pitch,
+                           enum retro_pixel_format fmt) {
     FILE *f = fopen(path, "wb");
     if (!f) die(EXIT_USAGE, "create %s: %s", path, strerror(errno));
     fprintf(f, "P6\n%u %u\n255\n", width, height);
@@ -413,12 +424,12 @@ static void write_ppm(const void *data, unsigned width, unsigned height, size_t 
         const uint8_t *row = (const uint8_t *)data + y * pitch;
         for (unsigned x = 0; x < width; x++) {
             uint8_t rgb[3];
-            if (pixel_format == RETRO_PIXEL_FORMAT_XRGB8888) {
+            if (fmt == RETRO_PIXEL_FORMAT_XRGB8888) {
                 uint32_t p = ((const uint32_t *)row)[x];
                 rgb[0] = p >> 16, rgb[1] = p >> 8, rgb[2] = p;
             } else {
                 uint16_t p = ((const uint16_t *)row)[x];
-                if (pixel_format == RETRO_PIXEL_FORMAT_RGB565)
+                if (fmt == RETRO_PIXEL_FORMAT_RGB565)
                     rgb[0] = (p >> 11) << 3, rgb[1] = ((p >> 5) & 63) << 2, rgb[2] = (p & 31) << 3;
                 else
                     rgb[0] = ((p >> 10) & 31) << 3, rgb[1] = ((p >> 5) & 31) << 3, rgb[2] = (p & 31) << 3;
@@ -429,9 +440,38 @@ static void write_ppm(const void *data, unsigned width, unsigned height, size_t 
     if (fclose(f) != 0) die(EXIT_USAGE, "write %s", path);
 }
 
+/* One presented frame as DIR/frames/frame_NNNNNN.ppm. */
+static void write_ppm(const void *data, unsigned width, unsigned height, size_t pitch) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s/frame_%06llu.ppm", frames_dir, (unsigned long long)frames_run);
+    write_ppm_file(path, data, width, height, pitch, pixel_format);
+}
+
+/* play --dump-frames: a copy of the last picture the core presented (a
+ * duped frame, data NULL, shows the previous one), so a dump decided after
+ * retro_run returns can write it. */
+static bool keep_frames;
+static uint8_t *kept;
+static size_t kept_cap;
+static unsigned kept_w, kept_h;
+static enum retro_pixel_format kept_fmt;
+
+static void keep_frame(const void *data, unsigned width, unsigned height, size_t pitch) {
+    size_t row = width * bytes_per_pixel(pixel_format);
+    if (row * height > kept_cap) {
+        free(kept);
+        kept_cap = row * height;
+        kept = malloc(kept_cap);
+        if (!kept) die(EXIT_USAGE, "out of memory keeping a frame");
+    }
+    for (unsigned y = 0; y < height; y++) memcpy(kept + y * row, (const uint8_t *)data + y * pitch, row);
+    kept_w = width, kept_h = height, kept_fmt = pixel_format;
+}
+
 static void video_refresh(const void *data, unsigned width, unsigned height, size_t pitch) {
     frames_presented++;
     if (frames_every && data && frames_run % frames_every == 0) write_ppm(data, width, height, pitch);
+    if (keep_frames && data) keep_frame(data, width, height, pitch);
 }
 
 static void audio_sample(int16_t left, int16_t right) {
@@ -519,6 +559,8 @@ static struct {
     void (*unload_game)(void);
     void *(*get_memory_data)(unsigned);
     size_t (*get_memory_size)(unsigned);
+    size_t (*serialize_size)(void);
+    bool (*serialize)(void *, size_t);
 } core;
 
 static void *sym(const char *name) {
@@ -547,6 +589,8 @@ static void core_open(void) {
     *(void **)&core.unload_game = sym("retro_unload_game");
     *(void **)&core.get_memory_data = sym("retro_get_memory_data");
     *(void **)&core.get_memory_size = sym("retro_get_memory_size");
+    *(void **)&core.serialize_size = sym("retro_serialize_size");
+    *(void **)&core.serialize = sym("retro_serialize");
     if (core.api_version() != RETRO_API_VERSION)
         die(EXIT_USAGE, "core API version %u, host built for %u", core.api_version(), RETRO_API_VERSION);
     core.set_environment(environment);
@@ -848,6 +892,7 @@ struct play_args {
     uint32_t dump_counter[MAX_DUMPS];
     int ndump_counter;
     uint64_t frames_every;
+    bool dump_frames, dump_vram;
 };
 
 struct dump_rec {
@@ -856,6 +901,9 @@ struct dump_rec {
     uint32_t counter;
     bool by_counter;
     char sha1[41];
+    /* --dump-frames, --dump-vram: the files beside it ("" for none). */
+    char picture[64];
+    char vram[64];
 };
 static struct dump_rec dumps[2 * MAX_DUMPS];
 static int ndumps;
@@ -890,6 +938,82 @@ static void write_dump(const char *dir, const char *name, uint64_t frame, uint32
     if (fwrite(ram, 1, ram_size, f) != ram_size || fclose(f) != 0) die(EXIT_USAGE, "write %s", path);
 }
 
+/*
+ * VRAM from the core's savestate: Mednafen's format is a 32-byte header
+ * ("MDFNSVST", the total size at offset 20), then sections (a 32-byte
+ * name, a u32 LE size) of entries (a u8 name length, the name, a u32 LE
+ * size, the bytes). Beetle's "GPU" section keeps VRAM as "&GPURAM[0][0]",
+ * 1024x512 16-bit words. NULL, with the reason in vram_unavailable, when
+ * the state has no such entry.
+ */
+#define VRAM_SECTION "GPU"
+#define VRAM_ENTRY "&GPURAM[0][0]"
+#define VRAM_BYTES (1024 * 512 * 2)
+static const char *vram_unavailable;
+static uint8_t *state_buf;
+static size_t state_cap;
+
+static const uint8_t *state_vram(void) {
+    size_t n = core.serialize_size();
+    if (n < 32) {
+        vram_unavailable = "retro_serialize_size gave no room for a state";
+        return NULL;
+    }
+    if (n > state_cap) {
+        free(state_buf);
+        state_buf = malloc(n);
+        if (!state_buf) die(EXIT_USAGE, "out of memory for a %zu-byte state", n);
+        state_cap = n;
+    }
+    if (!core.serialize(state_buf, n)) {
+        vram_unavailable = "retro_serialize failed";
+        return NULL;
+    }
+    if (memcmp(state_buf, "MDFNSVST", 8) != 0) {
+        vram_unavailable = "the core's savestate is not in Mednafen's format";
+        return NULL;
+    }
+    size_t total = le32(state_buf + 20);
+    if (total > n) total = n;
+    for (size_t pos = 32; pos + 36 <= total;) {
+        size_t start = pos + 36, end = start + le32(state_buf + pos + 32);
+        if (end > total) break;
+        if (!strncmp((const char *)state_buf + pos, VRAM_SECTION, 32)) {
+            for (size_t p = start; p + 1 <= end;) {
+                size_t nl = state_buf[p];
+                if (p + 1 + nl + 4 > end) break;
+                size_t data = p + 1 + nl + 4, size = le32(state_buf + p + 1 + nl);
+                if (data + size > end) break;
+                if (nl == strlen(VRAM_ENTRY) && !memcmp(state_buf + p + 1, VRAM_ENTRY, nl) && size == VRAM_BYTES)
+                    return state_buf + data;
+                p = data + size;
+            }
+        }
+        pos = end;
+    }
+    vram_unavailable = "the core's savestate has no " VRAM_SECTION " section entry " VRAM_ENTRY " of 1 MiB";
+    return NULL;
+}
+
+/* --dump-frames and --dump-vram beside the RAM dump just written. */
+static void write_dump_extras(const struct play_args *a, const char *dir, const char *suffix) {
+    struct dump_rec *d = &dumps[ndumps - 1];
+    char path[4096];
+    if (a->dump_frames && kept) {
+        snprintf(d->picture, sizeof d->picture, "frame_%s.ppm", suffix);
+        snprintf(path, sizeof path, "%s/%s", dir, d->picture);
+        write_ppm_file(path, kept, kept_w, kept_h, kept_w * bytes_per_pixel(kept_fmt), kept_fmt);
+    }
+    const uint8_t *vram = a->dump_vram ? state_vram() : NULL;
+    if (vram) {
+        snprintf(d->vram, sizeof d->vram, "vram_%s.bin", suffix);
+        snprintf(path, sizeof path, "%s/%s", dir, d->vram);
+        FILE *f = fopen(path, "wb");
+        if (!f) die(EXIT_USAGE, "create %s: %s", path, strerror(errno));
+        if (fwrite(vram, 1, VRAM_BYTES, f) != VRAM_BYTES || fclose(f) != 0) die(EXIT_USAGE, "write %s", path);
+    }
+}
+
 static void write_play_stats(FILE *f) {
     fprintf(f, ",\n  \"run\": {\"mode\": \"play\", \"replay_sha1\": \"%s\", \"pad_type\": %u, \"replay_frames\": %u, ",
             replay_sha1, play_pad_type, replay_frames);
@@ -899,9 +1023,16 @@ static void write_play_stats(FILE *f) {
         fprintf(f, "%s\n    {\"file\": \"%s\", \"frame\": %llu, ", i ? "," : "", dumps[i].file,
                 (unsigned long long)dumps[i].frame);
         if (dumps[i].by_counter) fprintf(f, "\"counter\": %u, ", dumps[i].counter);
+        if (dumps[i].picture[0]) fprintf(f, "\"picture\": \"%s\", ", dumps[i].picture);
+        if (dumps[i].vram[0]) fprintf(f, "\"vram\": \"%s\", ", dumps[i].vram);
         fprintf(f, "\"sha1\": \"%s\"}", dumps[i].sha1);
     }
-    fprintf(f, "%s]}", ndumps ? "\n  " : "");
+    fprintf(f, "%s]", ndumps ? "\n  " : "");
+    if (vram_unavailable) {
+        fprintf(f, ", \"vram_unavailable\": ");
+        json_str(f, vram_unavailable);
+    }
+    fprintf(f, "}");
 }
 
 static int mode_play(const struct play_args *a) {
@@ -915,6 +1046,7 @@ static int mode_play(const struct play_args *a) {
         frames_dir = frames_path;
         frames_every = a->frames_every;
     }
+    keep_frames = a->dump_frames;
     uint8_t *r = read_file(a->replay, &replay_len);
     if (replay_len < REPLAY_HEADER_LEN_V1 || memcmp(r, "PSXWRPL", 8) != 0) die(EXIT_USAGE, "%s: not a replay", a->replay);
     switch (le32(r + 8)) {
@@ -955,16 +1087,20 @@ static int mode_play(const struct play_args *a) {
         if (trace) put32(trace, word);
         for (int i = 0; i < a->ndump_at; i++) {
             if (a->dump_at[i] != frames_run) continue;
-            char name[64];
-            snprintf(name, sizeof name, "ram_%06llu.bin", (unsigned long long)frames_run);
+            char suffix[32], name[64];
+            snprintf(suffix, sizeof suffix, "%06llu", (unsigned long long)frames_run);
+            snprintf(name, sizeof name, "ram_%s.bin", suffix);
             write_dump(a->out_dir, name, frames_run, word, false);
+            write_dump_extras(a, a->out_dir, suffix);
         }
         for (int i = 0; i < a->ndump_counter; i++) {
             if (counter_done[i] || a->dump_counter[i] != word) continue;
             counter_done[i] = true;
-            char name[64];
-            snprintf(name, sizeof name, "ram_c%010u.bin", word);
+            char suffix[32], name[64];
+            snprintf(suffix, sizeof suffix, "c%010u", word);
+            snprintf(name, sizeof name, "ram_%s.bin", suffix);
             write_dump(a->out_dir, name, frames_run, word, true);
+            write_dump_extras(a, a->out_dir, suffix);
         }
     }
     if (trace && fclose(trace) != 0) die(EXIT_USAGE, "write %s", path);
@@ -994,7 +1130,8 @@ static void usage(void) {
             "       psxw-emu-host exe (--disc R.cue | --exe R.exe) --vectors IN --out OUT [--provenance P.json]\n"
             "                     [--mailbox ADDR] [--boot-frames N] [--timeout-frames N] [--dump-ram F] [common]\n"
             "       psxw-emu-host play --disc GAME.cue --replay R --frames N --out DIR [--trace-u32 ADDR]\n"
-            "                     [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--provenance P.json] [common]\n"
+            "                     [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--dump-frames]\n"
+            "                     [--dump-vram] [--provenance P.json] [common]\n"
             "common: --core LIB --system DIR --work DIR --log FILE --option KEY=VALUE --verbose\n");
     exit(EXIT_USAGE);
 }
@@ -1073,6 +1210,10 @@ int main(int argc, char **argv) {
         } else if (!strcmp(k, "--frames-every")) {
             TAKE();
             pa.frames_every = parse_num(v);
+        } else if (!strcmp(k, "--dump-frames")) {
+            pa.dump_frames = true;
+        } else if (!strcmp(k, "--dump-vram")) {
+            pa.dump_vram = true;
         } else if (!strcmp(k, "--vectors")) {
             TAKE();
             ea.vectors = v;

@@ -359,6 +359,7 @@ fn oracle() -> String {
             ("--every <N>", "ramdiff: comparison interval; record: capture interval."),
             ("--at <value,...>", "ramdiff: compare at game-counter values."),
             ("--require-equal", "ramdiff: fail if compared RAM differs."),
+            ("--compare-frames", "ramdiff: also frames and VRAM; play: dump them."),
             ("--device <gpu|spu>", "record: select a device [default: both]."),
             ("--budget <N>", "record: maximum number of vectors."),
             ("--samples <N>", "record: SPU sample window [default: 8820]."),

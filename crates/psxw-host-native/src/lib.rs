@@ -52,8 +52,15 @@ pub struct Options {
     /// (needs a renderer that draws).
     pub dump_frames: Option<(PathBuf, u64)>,
     /// With `dump_frames`: also write all of VRAM (1024×512, 15-bit colour
-    /// as RGB) as `vram_NNNNNN.png` beside each frame.
+    /// as RGB) as `vram_NNNNNN.png` beside each frame. With
+    /// `dump_with_frame`: also write it beside each RAM dump.
     pub dump_vram: bool,
+    /// Each RAM dump (`dump_at`, `dump_counter`) also writes the frame
+    /// presented at that vblank beside it (`ram_X.bin` → `frame_X.png`;
+    /// needs a renderer that draws) and, with `dump_vram`, VRAM as it is
+    /// then (`vram_X.bin`: 1024×512 16-bit words, little-endian), as the
+    /// oracle's emulator host does.
+    pub dump_with_frame: bool,
     /// Write the audio output here as a WAV file.
     pub audio_wav: Option<PathBuf>,
     /// Record GPU linked-list batches (M4's recording hook; needs a
@@ -182,6 +189,11 @@ pub struct Dump {
     pub frame: u64,
     /// The traced word's value, for dumps taken by counter.
     pub counter: Option<u32>,
+    /// With `dump_with_frame`: the presented frame and VRAM beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vram: Option<String>,
 }
 
 struct State {
@@ -421,13 +433,13 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             });
             let mut files = Vec::new();
             if want_dump {
-                files.push(Dump { file: format!("ram_{frame:06}.bin"), frame, counter: None });
+                files.push(Dump { file: format!("ram_{frame:06}.bin"), frame, counter: None, picture: None, vram: None });
             }
             if let Some(w) = word {
                 let s = c.data();
                 for (i, v) in s.opts.dump_counter.iter().enumerate() {
                     if *v == w && !s.counter_done[i] {
-                        files.push(Dump { file: format!("ram_c{w:010}.bin"), frame, counter: Some(w) });
+                        files.push(Dump { file: format!("ram_c{w:010}.bin"), frame, counter: Some(w), picture: None, vram: None });
                     }
                 }
             }
@@ -444,8 +456,30 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             }
             if let Some(dir) = s.opts.dump_dir.clone() {
                 std::fs::create_dir_all(&dir).ok();
-                for d in files {
+                // The frame presented at this vblank (the runtime presents
+                // just before it), and VRAM.
+                let (picture, vram) = if s.opts.dump_with_frame && !files.is_empty() {
+                    let r = s.renderer.clone();
+                    let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
+                    let picture = r.frame().map_err(|e| wasmtime::Error::msg(format!("frame: {e:#}")))?;
+                    let vram = if s.opts.dump_vram { r.vram().map_err(|e| wasmtime::Error::msg(format!("vram: {e:#}")))? } else { None };
+                    (picture.map(|(w, h, rgba)| render::png(w, h, &rgba)), vram.map(|v| v.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>()))
+                } else {
+                    (None, None)
+                };
+                for mut d in files {
                     std::fs::write(dir.join(&d.file), &ram).ok();
+                    let suffix = d.file.trim_start_matches("ram_").trim_end_matches(".bin").to_string();
+                    if let Some(png) = &picture {
+                        let name = format!("frame_{suffix}.png");
+                        std::fs::write(dir.join(&name), png).ok();
+                        d.picture = Some(name);
+                    }
+                    if let Some(v) = &vram {
+                        let name = format!("vram_{suffix}.bin");
+                        std::fs::write(dir.join(&name), v).ok();
+                        d.vram = Some(name);
+                    }
                     s.dumps.push(d);
                 }
             }

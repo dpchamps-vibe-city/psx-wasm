@@ -61,6 +61,7 @@ fn play_traces_and_dumps_deterministically() {
             dump_counter: vec![wire::MBX_MAGIC],
             frames_every: None,
             out_dir: base.join(format!("run-{n}")),
+            ..Default::default()
         };
         play::play(&ws, &o).unwrap()
     };

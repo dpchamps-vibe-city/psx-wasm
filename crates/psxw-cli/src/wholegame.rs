@@ -2,8 +2,8 @@
 //! (plans/completed/M03-oracle-harness.md, tasks 8 and 9).
 //!
 //! ```text
-//! psxw oracle play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--check determinism]
-//! psxw oracle ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--require-equal]
+//! psxw oracle play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--compare-frames] [--check determinism]
+//! psxw oracle ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--compare-frames] [--require-equal]
 //! ```
 //!
 //! `--replay R` takes a replay file or a named replay: a press list,
@@ -13,16 +13,27 @@
 //! trace the manifest's `[oracle] frame_counter` every frame; `ramdiff`
 //! dumps RAM on both at the same counter values (by default the counter at
 //! every 600th psx-wasm frame) and compares them by symbol.
+//!
+//! With `--compare-frames` (M13 task 21), psx-wasm runs with the render
+//! server, and both sides also write the frame presented at each of those
+//! points and VRAM (the emulator's from its savestate); the report adds,
+//! per point, the share of pixels that differ, the mean absolute error,
+//! VRAM's differing words and pages, and the paths of both pictures. Like
+//! the RAM comparison this is a diagnostic (D48): frames never fail the
+//! command. `play --compare-frames` only writes the pictures and VRAM
+//! beside its RAM dumps.
 
 use anyhow::{Context, Result, bail, ensure};
 use psxw_inputs::Workspace;
-use psxw_oracle::play::{self, PlayOptions, Played};
+use psxw_host_native::render::png;
+use psxw_oracle::framediff::{self, Class, Image, ImageDiff, VramDiff};
+use psxw_oracle::play::{self, PlayDump, PlayOptions, Played};
 use psxw_oracle::ramdiff::{self, KERNEL, Layout, OverlayLayout, PointDiff};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub const USAGE: &str = "play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--check determinism] \
-                         | ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--require-equal]";
+pub const USAGE: &str = "play <game> [--replay R] [--frames N] [--dump-at F,..] [--dump-counter V,..] [--frames-every N] [--compare-frames] [--check determinism] \
+                         | ramdiff <game> [--replay R] [--frames N] [--every F] [--at V,..] [--compare-frames] [--require-equal]";
 
 const DEFAULT_STACK: u32 = 0x1_0000;
 
@@ -131,6 +142,7 @@ struct PlayArgs {
     at: Vec<u32>,
     determinism: bool,
     require_equal: bool,
+    compare_frames: bool,
 }
 
 fn parse(args: &[&str]) -> Result<PlayArgs> {
@@ -144,6 +156,7 @@ fn parse(args: &[&str]) -> Result<PlayArgs> {
         at: vec![],
         determinism: false,
         require_equal: false,
+        compare_frames: false,
     };
     let mut it = args.iter();
     while let Some(k) = it.next() {
@@ -160,6 +173,7 @@ fn parse(args: &[&str]) -> Result<PlayArgs> {
                 other => bail!("unknown check {other:?} (determinism)"),
             },
             "--require-equal" => a.require_equal = true,
+            "--compare-frames" => a.compare_frames = true,
             other => bail!("unknown option {other}"),
         }
     }
@@ -175,6 +189,8 @@ fn emu_play(ws: &Workspace, game: &str, replay: &[u8], frames: u64, trace: u32, 
         dump_at: a.dump_at.clone(),
         dump_counter: a.dump_counter.clone(),
         frames_every: a.frames_every,
+        dump_frames: a.compare_frames,
+        dump_vram: a.compare_frames,
         out_dir: dir,
     };
     let t = std::time::Instant::now();
@@ -193,16 +209,8 @@ pub fn ppm_to_png(dir: &std::path::Path) -> Result<()> {
         if p.extension().is_none_or(|x| x != "ppm") {
             continue;
         }
-        let b = std::fs::read(&p)?;
-        let mut fields = b.splitn(4, |c| c.is_ascii_whitespace());
-        let (Some(b"P6"), Some(w), Some(h), Some(rest)) = (fields.next(), fields.next(), fields.next(), fields.next()) else {
-            bail!("{}: not a binary PPM", p.display());
-        };
-        let (w, h): (u32, u32) = (std::str::from_utf8(w)?.parse()?, std::str::from_utf8(h)?.parse()?);
-        let rgb = &rest[rest.iter().position(|c| c.is_ascii_whitespace()).context("PPM header")? + 1..];
-        ensure!(rgb.len() == (w * h * 3) as usize, "{}: {} pixel bytes for {w}x{h}", p.display(), rgb.len());
-        let rgba: Vec<u8> = rgb.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect();
-        std::fs::write(p.with_extension("png"), psxw_host_native::render::png(w, h, &rgba))?;
+        let i = Image::from_ppm(&std::fs::read(&p)?).with_context(|| p.display().to_string())?;
+        std::fs::write(p.with_extension("png"), png(i.width, i.height, &i.rgba()))?;
         std::fs::remove_file(&p)?;
     }
     Ok(())
@@ -218,14 +226,20 @@ pub fn play_cmd(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let root = ws.out_dir().join("oracle").join("play").join(game);
     eprintln!("play: {game}, replay {label}, {frames} frames, counter at {trace:#010x}");
     let one = emu_play(ws, game, &replay, frames, trace, &a, root.join("run-1"))?;
+    // The pictures beside the RAM dumps as PNGs too.
+    ppm_to_png(&one.out_dir)?;
     for d in &one.run.dumps {
         println!("dump {:<22} frame {:>6} counter {:>8} sha1 {}", d.file, d.frame, d.counter.map_or("-".into(), |c| c.to_string()), d.sha1);
+    }
+    if let Some(why) = &one.run.vram_unavailable {
+        println!("VRAM unavailable from the emulator: {why}");
     }
     println!("counter at the last frame: {:?}", one.trace.last());
     if !a.determinism {
         return Ok(true);
     }
     let two = emu_play(ws, game, &replay, frames, trace, &a, root.join("run-2"))?;
+    ppm_to_png(&two.out_dir)?;
     let same = one.run.dumps == two.run.dumps && one.trace == two.trace;
     println!(
         "check determinism {} ({} dumps, {} trace words)",
@@ -244,19 +258,184 @@ struct RamdiffReport {
     frames: u64,
     frame_counter: String,
     excluded: Vec<String>,
+    /// With `--compare-frames`: how frames and VRAM were taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_frames: Option<FramesInfo>,
     points: Vec<Point>,
+    /// RAM only: frames and VRAM never gate (D48).
     equal: bool,
+}
+
+#[derive(Serialize)]
+struct FramesInfo {
+    /// psx-wasm's renderer in the dumping run (its RAM is that run's too).
+    renderer_wasm: &'static str,
+    vram_emu: String,
+    /// A channel differs when |a - b| exceeds this.
+    tolerance: u8,
+    gate: &'static str,
 }
 
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Point {
-    Compared(PointDiff),
+    Compared {
+        #[serde(flatten)]
+        ram: PointDiff,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frame: Option<FramePoint>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vram: Option<VramPoint>,
+    },
     Missing { counter: u32, frame_wasm: Option<u64>, frame_emu: Option<u64> },
 }
 
+/// The frame each side presented at one point.
+#[derive(Serialize, Default)]
+struct FramePoint {
+    class: Option<Class>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// The pictures (PNG), for a human to look at.
+    wasm: Option<String>,
+    emu: Option<String>,
+    size_wasm: Option<[u32; 2]>,
+    size_emu: Option<[u32; 2]>,
+    /// The most common colour and its share of the picture.
+    dominant_wasm: Option<String>,
+    dominant_emu: Option<String>,
+    #[serde(flatten)]
+    diff: Option<ImageDiff>,
+}
+
+/// VRAM on each side at one point.
+#[derive(Serialize, Default)]
+struct VramPoint {
+    class: Option<Class>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// VRAM as pictures (PNG, 15-bit colour), for a human to look at.
+    wasm: Option<String>,
+    emu: Option<String>,
+    #[serde(flatten)]
+    diff: Option<VramDiff>,
+}
+
+fn unresolved<T: Default>(reason: String, set: impl FnOnce(&mut T, Class, String)) -> T {
+    let mut t = T::default();
+    set(&mut t, Class::Unresolved, reason);
+    t
+}
+
+fn path_str(p: &Path) -> String {
+    p.display().to_string()
+}
+
+/// Compares the pictures beside one point's RAM dumps; the emulator's PPM
+/// is turned into a PNG afterwards ([`ppm_to_png`]).
+fn frame_point(wasm_dir: &Path, dw: &psxw_host_native::Dump, emu_dir: &Path, de: &PlayDump) -> Result<FramePoint> {
+    let set = |f: &mut FramePoint, c, r| (f.class, f.reason) = (Some(c), Some(r));
+    let (pw, pe) = match (&dw.picture, &de.picture) {
+        (Some(a), Some(b)) => (wasm_dir.join(a), emu_dir.join(b)),
+        (None, _) => return Ok(unresolved("psx-wasm presented no frame (a renderer that draws is needed)".into(), set)),
+        (_, None) => return Ok(unresolved("the emulator presented no frame yet".into(), set)),
+    };
+    let a = Image::from_png(&std::fs::read(&pw)?).with_context(|| path_str(&pw))?;
+    let b = Image::from_ppm(&std::fs::read(&pe)?).with_context(|| path_str(&pe))?;
+    let d = framediff::compare(&a, &b);
+    let dominant = |i: &Image| {
+        let (c, share) = i.dominant();
+        format!("{c} {:.1}%", 100.0 * share)
+    };
+    Ok(FramePoint {
+        class: Some(if d.differing_pixels == 0 { Class::Equal } else { Class::Differs }),
+        reason: None,
+        wasm: Some(path_str(&pw)),
+        emu: Some(path_str(&pe.with_extension("png"))),
+        size_wasm: Some([a.width, a.height]),
+        size_emu: Some([b.width, b.height]),
+        dominant_wasm: Some(dominant(&a)),
+        dominant_emu: Some(dominant(&b)),
+        diff: Some(d),
+    })
+}
+
+/// Compares VRAM beside one point's RAM dumps, and writes both as PNGs.
+fn vram_point(wasm_dir: &Path, dw: &psxw_host_native::Dump, emu_dir: &Path, de: &PlayDump, emu_why: Option<&str>) -> Result<VramPoint> {
+    let set = |v: &mut VramPoint, c, r| (v.class, v.reason) = (Some(c), Some(r));
+    let (vw, ve) = match (&dw.vram, &de.vram) {
+        (Some(a), Some(b)) => (wasm_dir.join(a), emu_dir.join(b)),
+        (None, _) => return Ok(unresolved("psx-wasm's renderer has no VRAM".into(), set)),
+        (_, None) => {
+            let why = emu_why.unwrap_or("the emulator host wrote none");
+            return Ok(unresolved(format!("VRAM is unavailable from the oracle: {why}"), set));
+        }
+    };
+    let a = framediff::vram(&std::fs::read(&vw)?).with_context(|| path_str(&vw))?;
+    let b = framediff::vram(&std::fs::read(&ve)?).with_context(|| path_str(&ve))?;
+    for (p, v) in [(&vw, &a), (&ve, &b)] {
+        std::fs::write(p.with_extension("png"), png(1024, 512, &framediff::vram_rgba(v)))?;
+    }
+    let d = framediff::compare_vram(&a, &b);
+    Ok(VramPoint {
+        class: Some(if d.differing_words == 0 { Class::Equal } else { Class::Differs }),
+        reason: None,
+        wasm: Some(path_str(&vw.with_extension("png"))),
+        emu: Some(path_str(&ve.with_extension("png"))),
+        diff: Some(d),
+    })
+}
+
+fn class_name(c: Option<Class>) -> &'static str {
+    match c {
+        Some(Class::Equal) => "equal",
+        Some(Class::Differs) => "differs",
+        Some(Class::Unresolved) | None => "unresolved",
+    }
+}
+
+fn print_frame(f: &FramePoint) {
+    match &f.diff {
+        Some(d) => {
+            println!(
+                "    frame  {}: {:.1}% of {}x{} pixels differ by more than {}, MAE {:.2}; dominant psx-wasm {}, emulator {}",
+                class_name(f.class),
+                100.0 * d.differing_fraction,
+                d.compared[0],
+                d.compared[1],
+                framediff::TOLERANCE,
+                d.mae,
+                f.dominant_wasm.as_deref().unwrap_or("-"),
+                f.dominant_emu.as_deref().unwrap_or("-"),
+            );
+            if let Some(n) = &d.note {
+                println!("           {n}");
+            }
+            println!("           psx-wasm {}", f.wasm.as_deref().unwrap_or("-"));
+            println!("           emulator {}", f.emu.as_deref().unwrap_or("-"));
+        }
+        None => println!("    frame  unresolved: {}", f.reason.as_deref().unwrap_or("-")),
+    }
+}
+
+fn print_vram(v: &VramPoint) {
+    match &v.diff {
+        Some(d) => {
+            let bbox = d.bbox.map_or(String::new(), |[x0, y0, x1, y1]| format!(", within ({x0},{y0})-({x1},{y1})"));
+            println!(
+                "    vram   {}: {:.1}% of words differ, in {} of 32 pages{bbox}",
+                class_name(v.class),
+                100.0 * d.differing_fraction,
+                d.pages.len()
+            );
+        }
+        None => println!("    vram   unresolved: {}", v.reason.as_deref().unwrap_or("-")),
+    }
+}
+
 /// `psxw oracle ramdiff`: exit criterion 5 (equality from M4 on, with
-/// `--require-equal`).
+/// `--require-equal`). With `--compare-frames`, also the displayed frame
+/// and VRAM at each point (reported, never gated: D48).
 pub fn ramdiff_cmd(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let a = parse(args)?;
     let (replay, label) = replay(ws, game, a.replay.as_deref())?;
@@ -267,23 +446,35 @@ pub fn ramdiff_cmd(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root)?;
 
-    // psx-wasm: a traced run picks the points, a second one dumps there.
+    // psx-wasm: without --at, a traced run picks the points; a second one
+    // dumps there.
     let (mut o, _) = crate::run::options(ws, game, &[])?;
     o.frames = frames;
     o.replay = Some(replay.clone());
     o.trace_u32 = Some(trace);
-    let first = psxw_host_native::run(o.clone())?;
-    ensure!(
-        matches!(first.stop, psxw_host_native::Stop::FrameLimit),
-        "psx-wasm stopped early: {:?} (frame {})",
-        first.stop,
-        first.frames
-    );
-    let values = if a.at.is_empty() { ramdiff::points(&first.trace, a.every) } else { a.at.clone() };
+    let full = |r: &psxw_host_native::RunReport| {
+        ensure!(matches!(r.stop, psxw_host_native::Stop::FrameLimit), "psx-wasm stopped early: {:?} (frame {})", r.stop, r.frames);
+        Ok(())
+    };
+    let values = if a.at.is_empty() {
+        let first = psxw_host_native::run(o.clone())?;
+        full(&first)?;
+        ramdiff::points(&first.trace, a.every)
+    } else {
+        a.at.clone()
+    };
     ensure!(!values.is_empty(), "the frame counter never left zero in {frames} frames; nothing to align on");
     o.dump_counter = values.clone();
     o.dump_dir = Some(root.join("wasm"));
+    if a.compare_frames {
+        // The presented frame and VRAM at each point need a renderer.
+        o.render = Some(crate::render::server(ws));
+        o.dump_with_frame = true;
+        o.dump_vram = true;
+    }
     let wasm = psxw_host_native::run(o)?;
+    full(&wasm)?;
+    std::fs::create_dir_all(root.join("wasm"))?;
     // Same layout as the emulator's trace.bin: one u32 LE per frame.
     std::fs::write(root.join("wasm").join("trace.bin"), wasm.trace.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>())?;
     let sp = wasm.boot.as_ref().and_then(|b| b["sp"].as_u64()).context("the run reported no boot sp")? as u32;
@@ -295,6 +486,7 @@ pub fn ramdiff_cmd(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     let layout = layout(ws, game, &inputs, sp)?;
     let mut points = Vec::new();
     let mut equal = true;
+    let mut tally = std::collections::BTreeMap::<(&str, &str), usize>::new();
     for (v, fw, fe) in ramdiff::align(&wasm.trace, &emu.trace, &values) {
         let dw = wasm.dumps.iter().find(|d| d.counter == Some(v));
         let de = emu.run.dumps.iter().find(|d| d.counter == Some(v));
@@ -311,7 +503,18 @@ pub fn ramdiff_cmd(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
                     println!("    {:<10} {:<40} {} +{:<6} {:>6} bytes, first at {}", s.container, s.name, s.addr, s.size, s.bytes, s.first);
                 }
                 equal &= p.differing_bytes == 0;
-                points.push(Point::Compared(p));
+                let (frame, vram) = if a.compare_frames {
+                    let f = frame_point(&root.join("wasm"), dw, &emu.out_dir, de)?;
+                    let vr = vram_point(&root.join("wasm"), dw, &emu.out_dir, de, emu.run.vram_unavailable.as_deref())?;
+                    print_frame(&f);
+                    print_vram(&vr);
+                    *tally.entry(("frames", class_name(f.class))).or_default() += 1;
+                    *tally.entry(("VRAM", class_name(vr.class))).or_default() += 1;
+                    (Some(f), Some(vr))
+                } else {
+                    (None, None)
+                };
+                points.push(Point::Compared { ram: p, frame, vram });
             }
             _ => {
                 println!("counter {v:>8}: not reached (psx-wasm frame {fw:?}, emulator frame {fe:?})");
@@ -320,18 +523,40 @@ pub fn ramdiff_cmd(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
             }
         }
     }
+    let compare_frames = a.compare_frames.then(|| {
+        // The emulator's pictures as PNGs, like its --frames-every ones.
+        FramesInfo {
+            renderer_wasm: "the render server (psx-render-gl in its pinned image)",
+            vram_emu: match &emu.run.vram_unavailable {
+                Some(why) => format!("unavailable: {why}"),
+                None => "the core's savestate (retro_serialize): the GPU section's &GPURAM[0][0]".into(),
+            },
+            tolerance: framediff::TOLERANCE,
+            gate: "none: differences are reported, never gated (D48)",
+        }
+    });
+    if a.compare_frames {
+        ppm_to_png(&emu.out_dir)?;
+    }
     let report = RamdiffReport {
-        schema_version: 1,
+        schema_version: 2,
         game: game.into(),
         replay: label,
         frames,
         frame_counter: format!("{trace:#010x}"),
         excluded: layout.excluded.iter().map(|(r, why)| format!("{:#x}..{:#x}: {why}", r.start, r.end)).collect(),
+        compare_frames,
         points,
         equal,
     };
     let json = root.join("report.json");
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
+    for what in ["frames", "VRAM"] {
+        let counts: Vec<String> = tally.iter().filter(|((w, _), _)| *w == what).map(|((_, c), n)| format!("{n} {c}")).collect();
+        if !counts.is_empty() {
+            eprintln!("ramdiff: {what}: {} (reported, never gated: D48)", counts.join(", "));
+        }
+    }
     eprintln!("ramdiff: {} ({})", if equal { "RAM equal at every point" } else { "differences" }, json.display());
     Ok(equal || !a.require_equal)
 }

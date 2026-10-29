@@ -67,6 +67,12 @@ pub struct PlayOptions {
     pub dump_counter: Vec<u32>,
     /// Every Nth presented frame as `frames/frame_NNNNNN.ppm`.
     pub frames_every: Option<u64>,
+    /// Each RAM dump also writes the picture presented in that frame
+    /// beside it (`ram_X.bin` → `frame_X.ppm`).
+    pub dump_frames: bool,
+    /// Each RAM dump also writes VRAM beside it (`vram_X.bin`, 1024×512
+    /// 16-bit words), from the core's savestate.
+    pub dump_vram: bool,
     /// Receives `trace.bin`, `ram_*.bin`, `play.json` and `host.log`.
     pub out_dir: PathBuf,
 }
@@ -77,6 +83,11 @@ pub struct PlayDump {
     pub frame: u64,
     #[serde(default)]
     pub counter: Option<u32>,
+    /// With `dump_frames` and `dump_vram`: the files beside the dump.
+    #[serde(default)]
+    pub picture: Option<String>,
+    #[serde(default)]
+    pub vram: Option<String>,
     pub sha1: String,
 }
 
@@ -86,6 +97,9 @@ pub struct PlayRun {
     pub frames: u64,
     pub frames_presented: u64,
     pub dumps: Vec<PlayDump>,
+    /// Why the host wrote no VRAM, when `dump_vram` asked for it.
+    #[serde(default)]
+    pub vram_unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +149,12 @@ pub fn play(ws: &Workspace, o: &PlayOptions) -> Result<Played> {
     }
     if let Some(n) = o.frames_every {
         args.extend(["--frames-every".into(), n.to_string()]);
+    }
+    if o.dump_frames {
+        args.push("--dump-frames".into());
+    }
+    if o.dump_vram {
+        args.push("--dump-vram".into());
     }
     let argv = images::docker_run(
         &imgs.emu.id,

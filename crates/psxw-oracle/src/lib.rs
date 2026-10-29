@@ -12,6 +12,7 @@ pub mod batch;
 pub mod cdc;
 pub mod commands;
 pub mod exact;
+pub mod framediff;
 pub mod golden;
 pub mod gpu_synth;
 pub mod gte;
