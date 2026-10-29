@@ -183,7 +183,7 @@ impl<'a> Emitter<'a> {
             self.line(&format!("{tmp} = {read};"));
             ov_next = Some((r, tmp));
         }
-        let s = stmt(&insn, pc, &ov);
+        let s = stmt(&insn, pc, &ov, self.facts.dead_loads.contains(&n));
         self.line(&format!("{s} /* {pc:08X}: {} */", disasm(&insn, pc)));
         match self.g.nodes[&n].transfer.clone() {
             Transfer::Seq(next) => {
@@ -235,7 +235,7 @@ impl<'a> Emitter<'a> {
             Op::Jalr if head.rd != 0 => self.line(&format!("r{} = 0x{:08X}u;", head.rd, b + 8)),
             _ => {}
         }
-        let s = stmt(&slot.insn, b + 4, &None);
+        let s = stmt(&slot.insn, b + 4, &None, self.facts.dead_loads.contains(&Node::Slot(b)));
         self.line(&format!("{s} /* {:08X}: {} (delay slot) */", b + 4, disasm(&slot.insn, b + 4)));
         let c = c_expr.unwrap_or_default();
         match slot.transfer {
@@ -356,8 +356,9 @@ fn write(r: u8, expr: String, pure: bool) -> String {
     }
 }
 
-/// The C statement for a non-control instruction.
-pub fn stmt(i: &Insn, pc: u32, ov: &Ov) -> String {
+/// The C statement for a non-control instruction. `keep`: a load whose
+/// result is dead, emitted as a volatile read so it still happens.
+pub fn stmt(i: &Insn, pc: u32, ov: &Ov, keep: bool) -> String {
     let s = reg(i.rs, ov);
     let t = reg(i.rt, ov);
     let imm = format!("0x{:X}u", i.simm as u32);
@@ -406,6 +407,14 @@ pub fn stmt(i: &Insn, pc: u32, ov: &Ov) -> String {
         Op::Mtc2 => format!("psx_gte_mtc2({}, {t});", i.rd),
         Op::Ctc2 => format!("psx_gte_ctc2({}, {t});", i.rd),
         Op::Cop2 => format!("psx_gte_exec(0x{:07X}u);", i.word & 0x01FF_FFFF),
+        Op::Lb | Op::Lbu | Op::Lh | Op::Lhu | Op::Lw if keep => {
+            let size = match i.op {
+                Op::Lb | Op::Lbu => "B",
+                Op::Lh | Op::Lhu => "H",
+                _ => "W",
+            };
+            write(i.rt, format!("(uint32_t)PSXW_L{size}V({addr})"), false)
+        }
         Op::Lb => w(i.rt, format!("(uint32_t)(int32_t)(int8_t)PSXW_LB({addr})")),
         Op::Lbu => w(i.rt, format!("(uint32_t)PSXW_LB({addr})")),
         Op::Lh => w(i.rt, format!("(uint32_t)(int32_t)(int16_t)PSXW_LH({addr})")),

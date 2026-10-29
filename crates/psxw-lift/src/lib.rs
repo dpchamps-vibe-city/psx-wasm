@@ -630,4 +630,38 @@ mod tests {
             assert_eq!(t.facts.returns_callee_v0, expect, "after the call: {after:08X}");
         }
     }
+
+    /// Reads whose result nothing uses still happen: a driver drains an I/O
+    /// FIFO with them. A load into zero and a loop of discarded loads are
+    /// volatile reads; a used load stays an ordinary one.
+    #[test]
+    fn discarded_loads_are_kept() {
+        const BASE: u32 = 0x8001_0000;
+        let words: [u32; 9] = [
+            0x9080_0000, // lbu zero, 0(a0)
+            0x2405_0008, // addiu a1, zero, 8
+            0x9082_0000, // 1: lbu v0, 0(a0) (discarded)
+            0x24A5_FFFF, // addiu a1, a1, -1
+            0x14A0_FFFD, // bnez a1, 1b
+            0,           // nop
+            0x9083_0000, // lbu v1, 0(a0)
+            0x03E0_0008, // jr ra
+            0x0060_1021, // addu v0, v1, zero
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let start = Start { name: None, size: Some(code.len() as u32), sources: [Source::Symbol].into(), boundary: true };
+        let mut program = Program {
+            main: "test".into(),
+            containers: [(
+                "test".to_string(),
+                Code { id: "test".into(), text: vec![BASE..BASE + code.len() as u32], data: vec![], starts: [(BASE, start)].into() },
+            )]
+            .into(),
+        };
+        let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
+        let out = translate_all(&mut program, &originals, &["test".into()]);
+        let c = &out.ok.iter().find(|t| t.func.addr == BASE).expect("translated").c;
+        assert_eq!(c.matches("PSXW_LBV(").count(), 2, "{c}");
+        assert!(c.contains("r3 = (uint32_t)PSXW_LB("), "{c}");
+    }
 }

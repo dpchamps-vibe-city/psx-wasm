@@ -51,6 +51,10 @@ pub struct Facts {
     /// Direct calls and fall-throughs to code addresses: (pc, target,
     /// registers written in the straight-line block leading to it).
     pub call_sites: Vec<(u32, u32, u64)>,
+    /// Loads whose result nothing reads (or that load into `zero`). They
+    /// still happen on hardware, and from an I/O register a read pops a
+    /// FIFO, so they are emitted as volatile reads clang keeps.
+    pub dead_loads: BTreeSet<Node>,
 }
 
 pub fn analyze(g: &Graph, in_code: &dyn Fn(u32) -> bool) -> Facts {
@@ -324,6 +328,15 @@ fn liveness(g: &Graph, f: &mut Facts) {
     // After a call, only reads by instructions count: argument setup for a
     // later call doesn't depend on what the callee left behind.
     let live_in = live_in(g, &nodes, &succs, false);
+    for &n in &nodes {
+        let i = &g.nodes[&n].insn;
+        if matches!(i.op, Op::Lb | Op::Lbu | Op::Lh | Op::Lhu | Op::Lw) {
+            let out = succs[&n].iter().fold(0, |acc, s| acc | live_in[s]);
+            if i.rt == 0 || out & (1 << i.rt) == 0 {
+                f.dead_loads.insert(n);
+            }
+        }
+    }
     for &n in &nodes {
         if let Transfer::Call { callee, .. } | Transfer::CondCall { callee, .. } = &g.nodes[&n].transfer {
             let after = succs[&n].iter().fold(0, |acc, s| acc | live_in[s]);

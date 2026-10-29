@@ -23,6 +23,11 @@ typedef struct { uint32_t v; } __attribute__((packed, aligned(1))) psxw_u32;
 #define PSXW_LB(a) (((psxw_u8 *)(uint32_t)(a))->v)
 #define PSXW_LH(a) (((psxw_u16 *)(uint32_t)(a))->v)
 #define PSXW_LW(a) (((psxw_u32 *)(uint32_t)(a))->v)
+/* A load whose result nothing reads still happens (from an I/O register
+ * it pops a FIFO), so clang must keep it. */
+#define PSXW_LBV(a) (((volatile psxw_u8 *)(uint32_t)(a))->v)
+#define PSXW_LHV(a) (((volatile psxw_u16 *)(uint32_t)(a))->v)
+#define PSXW_LWV(a) (((volatile psxw_u32 *)(uint32_t)(a))->v)
 #define PSXW_SB(a, x) (((psxw_u8 *)(uint32_t)(a))->v = (uint8_t)(x))
 #define PSXW_SH(a, x) (((psxw_u16 *)(uint32_t)(a))->v = (uint16_t)(x))
 #define PSXW_SW(a, x) (((psxw_u32 *)(uint32_t)(a))->v = (uint32_t)(x))
