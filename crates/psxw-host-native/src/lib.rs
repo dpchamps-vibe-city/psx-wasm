@@ -51,6 +51,9 @@ pub struct Options {
     /// Write every `.1`th presented frame to `.0` as `frame_NNNNNN.png`
     /// (needs a renderer that draws).
     pub dump_frames: Option<(PathBuf, u64)>,
+    /// With `dump_frames`: also write all of VRAM (1024×512, 15-bit colour
+    /// as RGB) as `vram_NNNNNN.png` beside each frame.
+    pub dump_vram: bool,
     /// Write the audio output here as a WAV file.
     pub audio_wav: Option<PathBuf>,
     /// Record GPU linked-list batches (M4's recording hook; needs a
@@ -670,6 +673,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         let frame = s.frame + 1;
         let want_vram = s.opts.vram_hash_at.contains(&frame);
         let dump = s.opts.dump_frames.clone().filter(|(_, every)| frame % (*every).max(1) == 0);
+        let c_dump_vram = s.opts.dump_vram;
         let r = s.renderer.clone();
         let mut r = r.lock().map_err(|_| wasmtime::Error::msg("renderer poisoned"))?;
         r.present(&desc).map_err(|e| wasmtime::Error::msg(format!("present: {e:#}")))?;
@@ -677,6 +681,18 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             if let Some((w, h, rgba)) = r.frame().map_err(|e| wasmtime::Error::msg(format!("frame: {e:#}")))? {
                 std::fs::create_dir_all(&dir).ok();
                 std::fs::write(dir.join(format!("frame_{frame:06}.png")), render::png(w, h, &rgba)).ok();
+            }
+            if c_dump_vram {
+                if let Some(v) = r.vram().map_err(|e| wasmtime::Error::msg(format!("vram: {e:#}")))? {
+                    let rgba: Vec<u8> = v
+                        .iter()
+                        .flat_map(|&p| {
+                            let c = |s: u16| (((p >> s) & 31) << 3) as u8;
+                            [c(0), c(5), c(10), 255]
+                        })
+                        .collect();
+                    std::fs::write(dir.join(format!("vram_{frame:06}.png")), render::png(1024, 512, &rgba)).ok();
+                }
             }
         }
         if want_vram {

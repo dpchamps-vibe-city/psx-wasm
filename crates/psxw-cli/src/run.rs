@@ -152,6 +152,7 @@ fn parse_options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, 
             }
             "--vram-hash-at" => o.vram_hash_at = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             "--dump-frames" => o.dump_frames = Some((val()?.into(), 1)),
+            "--dump-vram" => o.dump_vram = true,
             "--audio-wav" => o.audio_wav = Some(val()?.into()),
             "--dump-every" => {
                 let n: u64 = val()?.parse()?;
