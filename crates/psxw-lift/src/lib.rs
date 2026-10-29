@@ -645,7 +645,8 @@ mod tests {
     #[test]
     fn discarded_loads_are_kept() {
         const BASE: u32 = 0x8001_0000;
-        let words: [u32; 9] = [
+        let words: [u32; 10] = [
+            0x8486_0000, // lh a2, 0(a0) (only a result: sign-extended still)
             0x9080_0000, // lbu zero, 0(a0)
             0x2405_0008, // addiu a1, zero, 8
             0x9082_0000, // 1: lbu v0, 0(a0) (discarded)
@@ -670,6 +671,7 @@ mod tests {
         let out = translate_all(&mut program, &originals, &["test".into()]);
         let c = &out.ok.iter().find(|t| t.func.addr == BASE).expect("translated").c;
         assert_eq!(c.matches("PSXW_LBV(").count(), 2, "{c}");
+        assert!(c.contains("(uint32_t)(int32_t)(int16_t)PSXW_LHV("), "{c}");
         assert!(c.contains("r3 = (uint32_t)PSXW_LB("), "{c}");
     }
 

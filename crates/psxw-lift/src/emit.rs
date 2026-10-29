@@ -414,12 +414,14 @@ pub fn stmt(i: &Insn, pc: u32, ov: &Ov, keep: bool) -> String {
         Op::Ctc2 => format!("psx_gte_ctc2({}, {t});", i.rd),
         Op::Cop2 => format!("psx_gte_exec(0x{:07X}u);", i.word & 0x01FF_FFFF),
         Op::Lb | Op::Lbu | Op::Lh | Op::Lhu | Op::Lw if keep => {
-            let size = match i.op {
-                Op::Lb | Op::Lbu => "B",
-                Op::Lh | Op::Lhu => "H",
-                _ => "W",
+            let v = match i.op {
+                Op::Lb => format!("(uint32_t)(int32_t)(int8_t)PSXW_LBV({addr})"),
+                Op::Lbu => format!("(uint32_t)PSXW_LBV({addr})"),
+                Op::Lh => format!("(uint32_t)(int32_t)(int16_t)PSXW_LHV({addr})"),
+                Op::Lhu => format!("(uint32_t)PSXW_LHV({addr})"),
+                _ => format!("(uint32_t)PSXW_LWV({addr})"),
             };
-            write(i.rt, format!("(uint32_t)PSXW_L{size}V({addr})"), false)
+            write(i.rt, v, false)
         }
         Op::Lb => w(i.rt, format!("(uint32_t)(int32_t)(int8_t)PSXW_LB({addr})")),
         Op::Lbu => w(i.rt, format!("(uint32_t)PSXW_LB({addr})")),
