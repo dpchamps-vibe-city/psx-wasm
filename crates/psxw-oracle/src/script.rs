@@ -200,6 +200,40 @@ pub fn compile(v: &Vector, store: &Store) -> Result<Vec<Op>> {
             ensure!(v.result_len() <= MAX_OP_RESULT, "SPU run captures {} bytes, more than one exchange", v.result_len());
             ops.push(Op::keeping(wire::OP_SPU_RUN, p, v.result_len()));
         }
+        Vector::MdecRun(m) => {
+            let mut p = Vec::new();
+            le(&mut p, m.cmds.len() as u32);
+            for c in &m.cmds {
+                le(&mut p, c.words.len() as u32);
+                c.words.iter().for_each(|w| le(&mut p, *w));
+                le(&mut p, c.out);
+            }
+            ensure!(p.len() <= MAX_OP_PAYLOAD, "MDEC run payload too large");
+            ensure!(v.result_len() <= MAX_OP_RESULT, "MDEC run decodes {} bytes, more than one exchange", v.result_len());
+            ops.push(Op::keeping(wire::OP_MDEC_RUN, p, v.result_len()));
+        }
+        Vector::CdCmds(c) => {
+            let mut p = Vec::new();
+            le(&mut p, c.cmds.len() as u32);
+            for k in &c.cmds {
+                for v in [k.cmd, k.params.len() as u32, k.ints, k.data] {
+                    le(&mut p, v);
+                }
+                p.extend_from_slice(&k.params);
+                pad(&mut p);
+            }
+            ensure!(p.len() <= MAX_OP_PAYLOAD, "CD command payload too large");
+            ensure!(v.result_len() <= MAX_OP_RESULT, "CD commands record {} bytes, more than one exchange", v.result_len());
+            ops.push(Op::keeping(wire::OP_CD_CMDS, p, v.result_len()));
+        }
+        Vector::BiosThreads(t) => {
+            let mut p = Vec::new();
+            le(&mut p, t.pc);
+            t.steps.iter().flatten().for_each(|w| le(&mut p, *w));
+            ensure!(p.len() <= MAX_OP_PAYLOAD, "thread steps payload too large");
+            ensure!(v.result_len() <= MAX_OP_RESULT, "thread steps record too much");
+            ops.push(Op::keeping(wire::OP_BIOS_THREADS, p, v.result_len()));
+        }
         Vector::BiosCall(b) => {
             let mut p = Vec::new();
             le(&mut p, b.table);
@@ -235,9 +269,15 @@ pub struct Plan {
     pub slots: Vec<Vec<(usize, usize)>>,
 }
 
-/// Pack ops into batches in order, as many per exchange as fit. An
-/// OP_CD_XA plays up to a second or so of audio, so a batch holds at most
-/// one, to keep each exchange well inside the host's time limit.
+/// Ops that can take a second or so (OP_CD_XA plays audio; OP_CD_CMDS
+/// seeks and reads): a batch holds at most one, to keep each exchange well
+/// inside the host's time limit.
+fn is_long(code: u32) -> bool {
+    code == wire::OP_CD_XA || code == wire::OP_CD_CMDS
+}
+
+/// Pack ops into batches in order, as many per exchange as fit, with at
+/// most one long op ([`is_long`]) per batch.
 pub fn pack(ops: &[Vec<Op>]) -> Plan {
     let cap = wire::MBX_CAPACITY as usize;
     let mut plan = Plan::default();
@@ -261,7 +301,7 @@ pub fn pack(ops: &[Vec<Op>]) -> Plan {
     };
     let mut xa_in_batch = false;
     for (v, vops) in ops.iter().enumerate() {
-        let is_xa = vops.iter().any(|op| op.code == wire::OP_CD_XA);
+        let is_xa = vops.iter().any(|op| is_long(op.code));
         if is_xa && xa_in_batch {
             flush(&mut plan, &mut cur);
             in_len = 4;

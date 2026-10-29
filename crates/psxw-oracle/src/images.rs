@@ -265,6 +265,7 @@ pub fn build(ws: &Workspace, no_cache: bool) -> Result<Images> {
     let gen_dir = oracle_dir(ws).join("work").join("gen");
     std::fs::create_dir_all(&gen_dir)?;
     std::fs::write(gen_dir.join("xatest.xa"), crate::xa_disc::file())?;
+    std::fs::write(gen_dir.join("cdtest.bin"), crate::cdc::file())?;
     eprintln!("images: building the runner");
     let out = docker_output(&docker_run(
         SDK_IMAGE,

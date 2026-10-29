@@ -34,10 +34,24 @@ pub enum Kind {
     SpuRun,
     BiosCall,
     CdXa,
+    MdecRun,
+    CdCmds,
+    BiosThreads,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 7] = [Kind::Echo, Kind::GpuDraw, Kind::GpuTransfer, Kind::GteOp, Kind::SpuRun, Kind::BiosCall, Kind::CdXa];
+    pub const ALL: [Kind; 10] = [
+        Kind::Echo,
+        Kind::GpuDraw,
+        Kind::GpuTransfer,
+        Kind::GteOp,
+        Kind::SpuRun,
+        Kind::BiosCall,
+        Kind::CdXa,
+        Kind::MdecRun,
+        Kind::CdCmds,
+        Kind::BiosThreads,
+    ];
 
     pub fn tag(self) -> u32 {
         match self {
@@ -48,6 +62,9 @@ impl Kind {
             Kind::SpuRun => wire::VK_SPU_RUN,
             Kind::BiosCall => wire::VK_BIOS_CALL,
             Kind::CdXa => wire::VK_CD_XA,
+            Kind::MdecRun => wire::VK_MDEC_RUN,
+            Kind::CdCmds => wire::VK_CD_CMDS,
+            Kind::BiosThreads => wire::VK_BIOS_THREADS,
         }
     }
 
@@ -65,6 +82,9 @@ impl Kind {
             Kind::SpuRun => "spu_run",
             Kind::BiosCall => "bios_call",
             Kind::CdXa => "cd_xa",
+            Kind::MdecRun => "mdec_run",
+            Kind::CdCmds => "cd_cmds",
+            Kind::BiosThreads => "bios_threads",
         }
     }
 
@@ -84,6 +104,9 @@ impl Kind {
             Kind::SpuRun => "spu",
             Kind::BiosCall => "bios",
             Kind::CdXa => "xa",
+            Kind::MdecRun => "mdec",
+            Kind::CdCmds => "cdc",
+            Kind::BiosThreads => "threads",
         }
     }
 }
@@ -266,6 +289,57 @@ pub struct CdXa {
     pub captures: Vec<(u32, u32)>,
 }
 
+/// One MDEC command: its words (the command word, then its parameters)
+/// and how many decoded words DMA1 reads after it (a multiple of
+/// `MDEC_OUT_BLOCK`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MdecCmd {
+    pub words: Vec<u32>,
+    pub out: u32,
+}
+
+/// MDEC commands from a reset: tables and decodes. Result: each command's
+/// decoded words, u32 LE. See OP_MDEC_RUN.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MdecRun {
+    pub cmds: Vec<MdecCmd>,
+}
+
+/// One CD controller command: the command byte, its parameters, how many
+/// interrupts to collect, and the bytes to read from the data FIFO at each
+/// INT1 (0, 800h or 924h).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CdCmd {
+    pub cmd: u32,
+    pub params: Vec<u8>,
+    pub ints: u32,
+    pub data: u32,
+}
+
+/// CD controller commands on the runner disc (`crate::cdc`). `disc` holds
+/// the raw 2352-byte sectors from `first_lba`, as the disc image has them
+/// (the sectors a model of the disc reads); `end_lba` is the disc's size
+/// in sectors and `region` GetID's region letters. Result: see
+/// OP_CD_CMDS.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CdCmds {
+    pub disc: BlobRef,
+    pub first_lba: u32,
+    pub end_lba: u32,
+    pub region: [u8; 4],
+    pub cmds: Vec<CdCmd>,
+}
+
+/// BIOS threads (`crate::threads`): the thread entry's address, the TCB
+/// count SYSTEM.CNF gives the runner disc, and the steps (u32 op, a, b,
+/// c). Result: see OP_BIOS_THREADS.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BiosThreads {
+    pub pc: u32,
+    pub tcbs: u32,
+    pub steps: Vec<[u32; 4]>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Vector {
     Echo(Vec<u8>),
@@ -275,6 +349,21 @@ pub enum Vector {
     SpuRun(SpuRun),
     BiosCall(BiosCall),
     CdXa(CdXa),
+    MdecRun(MdecRun),
+    CdCmds(CdCmds),
+    BiosThreads(BiosThreads),
+}
+
+/// Result words of a BIOS_THREADS step (`None` for an unknown op).
+pub fn thread_step_words(op: u32) -> Option<u32> {
+    Some(match op {
+        wire::TS_TABLES => wire::TS_TABLES_WORDS,
+        wire::TS_FILL => wire::TS_FILL_WORDS,
+        wire::TS_OPEN => wire::TS_OPEN_WORDS,
+        wire::TS_CHANGE => wire::TS_CHANGE_WORDS,
+        wire::TS_CLOSE => wire::TS_CLOSE_WORDS,
+        _ => return None,
+    })
 }
 
 /// SPU RAM the runner reserves (its silent loop block).
@@ -290,6 +379,9 @@ impl Vector {
             Vector::SpuRun(_) => Kind::SpuRun,
             Vector::BiosCall(_) => Kind::BiosCall,
             Vector::CdXa(_) => Kind::CdXa,
+            Vector::MdecRun(_) => Kind::MdecRun,
+            Vector::CdCmds(_) => Kind::CdCmds,
+            Vector::BiosThreads(_) => Kind::BiosThreads,
         }
     }
 
@@ -312,6 +404,7 @@ impl Vector {
                 .collect(),
             Vector::SpuRun(s) => s.ram.iter().map(|r| r.bytes).collect(),
             Vector::CdXa(x) => vec![x.xa],
+            Vector::CdCmds(c) => vec![c.disc],
             _ => Vec::new(),
         }
     }
@@ -336,6 +429,9 @@ impl Vector {
             Vector::SpuRun(s) => wire::SPU_SNAPSHOT_SIZE as usize + s.captures.iter().map(|c| c.1 as usize).sum::<usize>(),
             Vector::BiosCall(b) => 4 + b.captures.iter().map(|c| c.1 as usize).sum::<usize>(),
             Vector::CdXa(x) => x.captures.iter().map(|c| c.1 as usize).sum(),
+            Vector::MdecRun(m) => m.cmds.iter().map(|c| 4 * c.out as usize).sum(),
+            Vector::CdCmds(c) => 8 + c.cmds.iter().map(|c| (c.ints * (wire::CD_RECORD_SIZE + c.data + 4)) as usize).sum::<usize>(),
+            Vector::BiosThreads(t) => t.steps.iter().map(|s| 4 * thread_step_words(s[0]).unwrap_or(0) as usize).sum(),
         }
     }
 
@@ -396,6 +492,35 @@ impl Vector {
                 ensure!(x.mode <= 0xFF && x.file <= 0xFF && x.channel <= 0xFF, "XA mode or filter out of range");
                 for &(addr, len) in &x.captures {
                     check_spu_range(addr, len)?;
+                }
+            }
+            Vector::MdecRun(m) => {
+                ensure!(!m.cmds.is_empty(), "MDEC run with no commands");
+                for c in &m.cmds {
+                    ensure!(!c.words.is_empty() && c.words.len() <= 0x4000, "MDEC command of {} words", c.words.len());
+                    ensure!(c.out % wire::MDEC_OUT_BLOCK == 0, "MDEC output of {} words is not a multiple of {}", c.out, wire::MDEC_OUT_BLOCK);
+                }
+            }
+            Vector::CdCmds(c) => {
+                ensure!(c.end_lba >= c.first_lba, "disc ends before its sectors");
+                for k in &c.cmds {
+                    ensure!(k.cmd <= 0xFF && k.params.len() <= 16, "CD command {:#x} with {} parameters", k.cmd, k.params.len());
+                    ensure!((1..=64).contains(&k.ints), "CD command {:#x} collects {} interrupts", k.cmd, k.ints);
+                    ensure!(k.data <= wire::CD_DATA_MAX && k.data % 4 == 0, "CD data read of {} bytes", k.data);
+                }
+            }
+            Vector::BiosThreads(t) => {
+                let end = wire::SCRATCH_BASE + wire::SCRATCH_SIZE;
+                ensure!(
+                    t.pc % 4 == 0 && t.pc >= wire::SCRATCH_BASE && t.pc + 4 * wire::THREAD_STUB_WORDS <= end,
+                    "thread entry {:#x} outside the scratch region",
+                    t.pc
+                );
+                ensure!((1..=32).contains(&t.tcbs), "{} TCBs", t.tcbs);
+                for s in &t.steps {
+                    ensure!(thread_step_words(s[0]).is_some(), "thread step {}", s[0]);
+                    let limit = if s[0] == wire::TS_FILL { 32 } else { wire::THREAD_SLOTS };
+                    ensure!(s[1] < limit, "thread step {} operand {}", s[0], s[1]);
                 }
             }
             Vector::BiosCall(b) => {
@@ -495,6 +620,36 @@ impl Vector {
                 }
                 e.pairs(&x.captures);
             }
+            Vector::MdecRun(m) => {
+                e.u32(m.cmds.len() as u32);
+                for c in &m.cmds {
+                    e.words(&c.words);
+                    e.u32(c.out);
+                }
+            }
+            Vector::CdCmds(c) => {
+                e.hash(&c.disc.0);
+                e.u32(c.first_lba);
+                e.u32(c.end_lba);
+                e.u32(u32::from_le_bytes(c.region));
+                e.u32(c.cmds.len() as u32);
+                for k in &c.cmds {
+                    e.u32(k.cmd);
+                    e.bytes(&k.params);
+                    e.u32(k.ints);
+                    e.u32(k.data);
+                }
+            }
+            Vector::BiosThreads(t) => {
+                e.u32(t.pc);
+                e.u32(t.tcbs);
+                e.u32(t.steps.len() as u32);
+                for s in &t.steps {
+                    for v in s {
+                        e.u32(*v);
+                    }
+                }
+            }
         }
         e.0
     }
@@ -582,6 +737,33 @@ impl Vector {
                 let (file_lba, start, mode, file, channel, samples) = (d.u32()?, d.u32()?, d.u32()?, d.u32()?, d.u32()?, d.u32()?);
                 let captures = d.pairs()?;
                 Vector::CdXa(CdXa { xa, file_lba, start, mode, file, channel, samples, captures })
+            }
+            Kind::MdecRun => {
+                let n = d.count()?;
+                let mut cmds = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cmds.push(MdecCmd { words: d.words()?, out: d.u32()? });
+                }
+                Vector::MdecRun(MdecRun { cmds })
+            }
+            Kind::CdCmds => {
+                let disc = BlobRef(d.hash()?);
+                let (first_lba, end_lba, region) = (d.u32()?, d.u32()?, d.u32()?.to_le_bytes());
+                let n = d.count()?;
+                let mut cmds = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cmds.push(CdCmd { cmd: d.u32()?, params: d.bytes()?, ints: d.u32()?, data: d.u32()? });
+                }
+                Vector::CdCmds(CdCmds { disc, first_lba, end_lba, region, cmds })
+            }
+            Kind::BiosThreads => {
+                let (pc, tcbs) = (d.u32()?, d.u32()?);
+                let n = d.count()?;
+                let mut steps = Vec::with_capacity(n);
+                for _ in 0..n {
+                    steps.push([d.u32()?, d.u32()?, d.u32()?, d.u32()?]);
+                }
+                Vector::BiosThreads(BiosThreads { pc, tcbs, steps })
             }
         };
         ensure!(d.pos == bytes.len(), "{} trailing bytes after the vector", bytes.len() - d.pos);
@@ -766,6 +948,17 @@ mod tests {
                 setup: vec![(0x8010_0000, b"abc\0".to_vec())],
                 captures: vec![(0x8010_0000, 4)],
             }),
+            Vector::MdecRun(MdecRun {
+                cmds: vec![MdecCmd { words: vec![0x6000_0000, 1, 2], out: 0 }, MdecCmd { words: vec![0x3800_0001, 0xFE00_0400], out: 128 }],
+            }),
+            Vector::CdCmds(CdCmds {
+                disc: blob,
+                first_lba: 40,
+                end_lba: 1200,
+                region: *b"SCEA",
+                cmds: vec![CdCmd { cmd: 0x02, params: vec![0, 2, 0x40], ints: 1, data: 0 }, CdCmd { cmd: 0x06, params: vec![], ints: 3, data: 0x800 }],
+            }),
+            Vector::BiosThreads(BiosThreads { pc: 0x8010_0000, tcbs: 4, steps: vec![[0, 0, 0, 0], [2, 0, 0x8010_8000, 0], [3, 0, 0, 0]] }),
         ]
     }
 
@@ -792,6 +985,9 @@ mod tests {
         assert_eq!(v[3].result_len(), 256);
         assert_eq!(v[4].result_len(), 0x260 + 0x1000);
         assert_eq!(v[5].result_len(), 8);
+        assert_eq!(v[6].result_len(), 512);
+        assert_eq!(v[7].result_len(), 8 + 24 + 3 * (24 + 0x800));
+        assert_eq!(v[8].result_len(), 4 * (11 + 49 + 13));
     }
 
     #[test]

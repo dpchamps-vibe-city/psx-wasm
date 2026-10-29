@@ -150,6 +150,16 @@
 /* the status register, and the interrupt flags << 8). */
 #define PSXW_DIAG_CD 0x00000006u
 
+/* Diagnostic: waiting for the MDEC to finish a command (value: its */
+/* status register). */
+#define PSXW_DIAG_MDEC 0x00000007u
+
+/* Diagnostic: waiting for DMA channel 0, MDEC in (value: its CHCR). */
+#define PSXW_DIAG_DMA0 0x00000008u
+
+/* Diagnostic: waiting for DMA channel 1, MDEC out (value: its CHCR). */
+#define PSXW_DIAG_DMA1 0x00000009u
+
 /* ---- Runner operations ---- */
 
 /* Payload: any bytes. Result: the same bytes. */
@@ -203,6 +213,22 @@
 /* Addresses lie in the scratch region. */
 #define PSXW_OP_BIOS_CALL 0x00000040u
 
+/* Payload: u32 pc, then `THREAD_STEP_SIZE`-byte steps (u32 op, a, b, */
+/* c) to the end. Result: each step's `TS_*_WORDS` words. Threads */
+/* (B0h:0Eh-10h) on the target's own BIOS, seen through the table of */
+/* tables (PCB at 108h, TCBs at 110h, sizes at 10Ch and 114h). The op */
+/* writes the `THREAD_STUB_WORDS`-word thread entry at `pc` (in the */
+/* scratch region; it passes sp and gp to the runner's thread body, */
+/* which counts a round, notes the PCB's current TCB and */
+/* ChangeThreads back to the thread that switched to it). Steps: */
+/* `TS_TABLES`; `TS_FILL` (TCB a: every word after the status = b | k */
+/* << 8 for word k, then the SR word at `TCB_SR` = c); `TS_OPEN` */
+/* (OpenThread(pc, b, c), handle into slot a; then the TCB the handle */
+/* names); `TS_CHANGE` (ChangeThread to slot a and back); `TS_CLOSE` */
+/* (CloseThread(slot a), then that TCB's status). See */
+/* `oracle/runner/threads.c` for each result's words. */
+#define PSXW_OP_BIOS_THREADS 0x00000041u
+
 /* Payload: u32 lba, u32 mode, u32 file, u32 channel, u32 samples, u32 */
 /* n_captures, n_captures × (u32 addr, u32 len). Result: each capture */
 /* (SPU RAM). XA-ADPCM streaming, after SPU_RESET: SPUCNT C001h (CD */
@@ -213,6 +239,33 @@
 /* the SPU keeps running; then Pause. CD interrupts are acknowledged */
 /* as they come. */
 #define PSXW_OP_CD_XA 0x00000050u
+
+/* Payload: u32 n_cmds, then per command u32 cmd, u32 n_params, u32 */
+/* n_ints, u32 data_len, n_params parameter bytes (padded to 4). */
+/* Result: u32 the interrupt enable register as found (1F801803h, */
+/* index 0), u32 n_records (the n_ints of every command together); */
+/* then per command n_ints records of `CD_RECORD_SIZE` + data_len */
+/* bytes: u32 type | n_response << 8, 16 response bytes (zero past */
+/* n_response), then for INT1 the data_len bytes of the sector read */
+/* through the data FIFO (requested before the interrupt is */
+/* acknowledged); then n_records u32 times, in timer ticks */
+/* (`CD_TICK_CYCLES` CPU cycles each) from the command write to the */
+/* interrupt. A command collects interrupts until it has n_ints or one */
+/* is INT5; records not collected stay zero, and type */
+/* `CD_TYPE_TIMEOUT` marks a wait that gave up. Interrupts off; every */
+/* flag acknowledged before each command. */
+#define PSXW_OP_CD_CMDS 0x00000051u
+
+/* Payload: u32 n_cmds, then per command u32 n_words, n_words words */
+/* (the command, then its parameters), u32 n_out. Result: each */
+/* command's n_out decoded words. The MDEC is reset (1F801824h */
+/* 80000000h) and its DMA requests enabled (60000000h) first; for */
+/* each command, once the MDEC is idle: DMA1 is started for n_out */
+/* words (blocks of `MDEC_OUT_BLOCK`), the command word is written to */
+/* 1F801820h, the parameters go by DMA0 (blocks of 32, 16 or 1 */
+/* words, the largest that divides them), and the op waits for both */
+/* channels and the MDEC. */
+#define PSXW_OP_MDEC_RUN 0x00000060u
 
 /* ---- Payload layouts and limits ---- */
 
@@ -282,6 +335,67 @@
 /* capacity, scratch base, scratch size, image end, COP0 SR. */
 #define PSXW_INFO_RESULT_SIZE 0x00000020u
 
+/* BIOS_THREADS step size: u32 op, a, b, c. */
+#define PSXW_THREAD_STEP_SIZE 0x00000010u
+
+/* Words of the thread entry BIOS_THREADS writes at its pc. */
+#define PSXW_THREAD_STUB_WORDS 0x00000006u
+
+/* TCB statuses a `TS_TABLES` result holds (zero past the count). */
+#define PSXW_THREAD_MAX_TCBS 0x00000008u
+
+/* Handle slots for `TS_OPEN`, `TS_CHANGE` and `TS_CLOSE`. */
+#define PSXW_THREAD_SLOTS 0x00000008u
+
+/* Step: the tables. Result: PCB size, TCB area size, the current */
+/* TCB's index (FFFFFFFFh if the PCB names none), then */
+/* `THREAD_MAX_TCBS` status words. */
+#define PSXW_TS_TABLES 0x00000000u
+
+/* Step: fill free TCB a (no result). */
+#define PSXW_TS_FILL 0x00000001u
+
+/* Step: OpenThread. Result: the handle, then the 30h words of the TCB */
+/* it names (zero if it names none). */
+#define PSXW_TS_OPEN 0x00000002u
+
+/* Step: ChangeThread to the thread and back. Result: see threads.c. */
+#define PSXW_TS_CHANGE 0x00000003u
+
+/* Step: CloseThread. Result: its return, then the TCB's status. */
+#define PSXW_TS_CLOSE 0x00000004u
+
+/* Result words of `TS_TABLES`. */
+#define PSXW_TS_TABLES_WORDS 0x0000000Bu
+
+/* Result words of `TS_FILL`. */
+#define PSXW_TS_FILL_WORDS 0x00000000u
+
+/* Result words of `TS_OPEN`. */
+#define PSXW_TS_OPEN_WORDS 0x00000031u
+
+/* Result words of `TS_CHANGE`. */
+#define PSXW_TS_CHANGE_WORDS 0x0000000Du
+
+/* Result words of `TS_CLOSE`. */
+#define PSXW_TS_CLOSE_WORDS 0x00000002u
+
+/* CD_CMDS interrupt record header: the type word, 16 response bytes. */
+#define PSXW_CD_RECORD_SIZE 0x00000014u
+
+/* Largest CD_CMDS data read per sector (2340 bytes: everything after */
+/* the sync). */
+#define PSXW_CD_DATA_MAX 0x00000924u
+
+/* CD_CMDS record type of a wait that gave up. */
+#define PSXW_CD_TYPE_TIMEOUT 0x00000080u
+
+/* CPU cycles per CD_CMDS timer tick (root counter 2 at sysclock/8). */
+#define PSXW_CD_TICK_CYCLES 0x00000008u
+
+/* MDEC_RUN's DMA1 block size; n_out is a multiple of it. */
+#define PSXW_MDEC_OUT_BLOCK 0x00000020u
+
 /* ---- Vector kinds (the type tag in a vector's canonical encoding) ---- */
 
 /* Bytes echoed through the runner (harness self-check). */
@@ -305,6 +419,17 @@
 /* XA-ADPCM from the runner disc's test file, captured from the SPU's */
 /* CD input buffers. */
 #define PSXW_VK_CD_XA 0x00000006u
+
+/* MDEC commands (tables, decodes) and the decoded words. */
+#define PSXW_VK_MDEC_RUN 0x00000007u
+
+/* CD controller commands on the runner disc: interrupts, responses, */
+/* sector data. */
+#define PSXW_VK_CD_CMDS 0x00000008u
+
+/* BIOS threads: OpenThread, ChangeThread, CloseThread and the */
+/* kernel's tables. */
+#define PSXW_VK_BIOS_THREADS 0x00000009u
 
 /* ---- Exchange files (driver ↔ psxw-emu-host) ---- */
 

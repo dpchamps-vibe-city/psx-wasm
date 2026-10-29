@@ -9,6 +9,7 @@
 //! (gitignored); reports go under `out/oracle/`.
 
 pub mod batch;
+pub mod cdc;
 pub mod commands;
 pub mod exact;
 pub mod golden;
@@ -17,6 +18,7 @@ pub mod gte;
 pub mod handwritten;
 pub mod hash;
 pub mod images;
+pub mod mdec;
 pub mod play;
 pub mod ramdiff;
 pub mod record;
@@ -25,6 +27,7 @@ pub mod script;
 pub mod spu;
 pub mod store;
 pub mod target;
+pub mod threads;
 pub mod vector;
 pub mod verdict;
 pub mod wire;

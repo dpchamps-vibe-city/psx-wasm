@@ -296,9 +296,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(&dir);
         let all = all(&store).unwrap();
-        // XA vectors name sectors on the runner disc, so xa_disc makes them
-        // against the built disc instead.
-        for k in Kind::ALL.into_iter().filter(|k| *k != Kind::CdXa) {
+        // XA and CD vectors name sectors on the runner disc, so xa_disc
+        // and cdc make them against the built disc instead; mdec and
+        // threads generate their own.
+        let elsewhere = [Kind::CdXa, Kind::CdCmds, Kind::MdecRun, Kind::BiosThreads];
+        for k in Kind::ALL.into_iter().filter(|k| !elsewhere.contains(k)) {
             assert!(all.iter().any(|h| h.vector.kind() == k), "no handwritten {k}");
         }
         for h in &all {

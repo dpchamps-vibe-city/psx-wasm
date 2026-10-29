@@ -32,8 +32,9 @@ pub const SELFTEST_SET: &str = "selftest";
 pub const SYNTHETIC_PREFIX: &str = "synthetic-";
 /// Devices whose milestone gate also fails on unresolved vectors (no
 /// golden): M4 exit criterion 1 wants every GTE vector matched, M6 exit
-/// criterion 1 every SPU vector.
-pub const UNRESOLVED_FAILS: [&str; 2] = ["gte", "spu"];
+/// criterion 1 every SPU vector, M13 task 14 every MDEC and CD controller
+/// vector.
+pub const UNRESOLVED_FAILS: [&str; 4] = ["gte", "spu", "mdec", "cdc"];
 
 /// Store the synthetic GTE vectors (default seed); the note for reports.
 fn install_gte(store: &Store) -> Result<String> {
@@ -49,6 +50,24 @@ fn install_xa(ws: &Workspace, store: &Store) -> Result<String> {
     Ok(match images::load(ws)?.runner.xa_lba {
         Some(lba) => format!("XA vectors: {} (test file at LBA {lba})", crate::xa_disc::install(store, lba)?.len()),
         None => "XA vectors: none (the runner disc has no XA test file; run `psxw oracle images build`)".into(),
+    })
+}
+
+/// Store the MDEC and thread vectors; the note for reports.
+fn install_mdec_threads(store: &Store) -> Result<String> {
+    let mdec = crate::mdec::install(store)?.len();
+    let threads = crate::threads::install(store)?.len();
+    Ok(format!("MDEC vectors: {mdec}; BIOS thread vectors: {threads}"))
+}
+
+/// Store the CD controller vectors for the runner disc's test file; the
+/// note for reports.
+fn install_cdc(ws: &Workspace, store: &Store) -> Result<String> {
+    let im = images::load(ws)?;
+    let bin = ws.root.join(&im.runner.dir).join("psxw-runner.bin");
+    Ok(match crate::cdc::install(store, &bin)? {
+        Some((lba, ids)) => format!("CD controller vectors: {} (test file at LBA {lba})", ids.len()),
+        None => format!("CD controller vectors: none ({} is not on the runner disc; run `psxw oracle images build`)", crate::cdc::NAME),
     })
 }
 
@@ -162,6 +181,8 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     handwritten::install(&store)?;
     let gte_note = install_gte(&store)?;
     let xa_note = install_xa(ws, &store)?;
+    let cdc_note = install_cdc(ws, &store)?;
+    let mdec_note = install_mdec_threads(&store)?;
     let spu_note = if kind.is_none_or(|k| k == Kind::SpuRun) { Some(install_spu(&store)?) } else { None };
     let synthetic = gpu_synth::install(&store)?;
     let mut target = DockerTarget::open(ws)?;
@@ -184,6 +205,8 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
     report.seed = Some(format!("{:#018x}", gte::DEFAULT_SEED));
     report.notes.push(gte_note);
     report.notes.push(xa_note);
+    report.notes.push(cdc_note);
+    report.notes.push(mdec_note);
     report.notes.extend(spu_note);
     let (mut new, mut same, mut changed, mut moved) = (0usize, 0usize, 0usize, 0usize);
     for ((id, v), res) in vectors.iter().zip(results) {
@@ -214,7 +237,11 @@ pub fn capture(ws: &Workspace, kind: Option<Kind>, missing: bool) -> Result<(Rep
             _ => String::new(),
         };
         match store.golden(&tid, id)? {
-            Some((old, _)) if old != got && crate::verdict::timing_variable(v.kind()) => {
+            Some((old, _))
+                if old != got
+                    && crate::verdict::timing_variable(v.kind())
+                    && crate::verdict::same_but_timing(v, &old, &got) != Some(false) =>
+            {
                 moved += 1;
                 detail = "captured at another moment (timing-variable; its check compares values)".into();
             }
@@ -269,7 +296,7 @@ pub trait DeviceUnderTest {
     }
 }
 
-pub const DEVICES: [&str; 5] = ["gpu", "gte", "spu", "bios", "xa"];
+pub const DEVICES: [&str; 8] = ["gpu", "gte", "spu", "bios", "xa", "mdec", "cdc", "threads"];
 
 /// The result of `check`.
 pub struct Checked {
@@ -299,6 +326,12 @@ pub fn check(ws: &Workspace, game: &str, device: &str, impls: &mut [Box<dyn Devi
     }
     if device == "spu" {
         notes.push(install_spu(&store)?);
+    }
+    if device == "cdc" {
+        notes.push(install_cdc(ws, &store)?);
+    }
+    if device == "mdec" || device == "threads" {
+        notes.push(install_mdec_threads(&store)?);
     }
     let synthetic: Vec<String> = store.set_names()?.into_iter().filter(|n| n.starts_with(SYNTHETIC_PREFIX)).collect();
     let mut ids = std::collections::BTreeSet::new();

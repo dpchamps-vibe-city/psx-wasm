@@ -36,6 +36,9 @@ pub(crate) fn devices(ws: &Workspace) -> Vec<Box<dyn DeviceUnderTest>> {
         Box::new(psxw_gpu_oracle::GpuDevice::new(ws)),
         Box::new(psxw_oracle::spu::Device::default()),
         Box::new(psxw_oracle::xa_disc::Device),
+        Box::new(psxw_oracle::mdec::Device),
+        Box::new(psxw_oracle::cdc::Device),
+        Box::new(psxw_oracle::threads::Device),
     ]
 }
 

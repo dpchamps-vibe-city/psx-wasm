@@ -109,6 +109,9 @@ op_fn op_gte_exec;
 op_fn op_spu_reset, op_spu_ram_write, op_spu_run;
 op_fn op_cd_xa;
 op_fn op_bios_call;
+op_fn op_cd_cmds;
+op_fn op_mdec_run;
+op_fn op_bios_threads;
 
 /* A0/B0/C0 call: jumps to `table` with t1 = func. */
 uint32_t psxw_bios_call(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t table, uint32_t func);

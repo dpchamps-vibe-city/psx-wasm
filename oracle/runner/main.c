@@ -73,6 +73,9 @@ static op_fn *lookup(uint32_t op) {
     case PSXW_OP_SPU_RUN: return op_spu_run;
     case PSXW_OP_CD_XA: return op_cd_xa;
     case PSXW_OP_BIOS_CALL: return op_bios_call;
+    case PSXW_OP_CD_CMDS: return op_cd_cmds;
+    case PSXW_OP_MDEC_RUN: return op_mdec_run;
+    case PSXW_OP_BIOS_THREADS: return op_bios_threads;
     default: return 0;
     }
 }

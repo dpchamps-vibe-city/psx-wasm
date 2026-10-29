@@ -132,6 +132,13 @@ wire_consts!(ERRORS, "Error codes (mailbox error field and op status) and diagno
     /// Diagnostic: waiting for a CD controller interrupt or idle (value:
     /// the status register, and the interrupt flags << 8).
     DIAG_CD = 6;
+    /// Diagnostic: waiting for the MDEC to finish a command (value: its
+    /// status register).
+    DIAG_MDEC = 7;
+    /// Diagnostic: waiting for DMA channel 0, MDEC in (value: its CHCR).
+    DIAG_DMA0 = 8;
+    /// Diagnostic: waiting for DMA channel 1, MDEC out (value: its CHCR).
+    DIAG_DMA1 = 9;
 });
 
 wire_consts!(OPS, "Runner operations", {
@@ -175,6 +182,21 @@ wire_consts!(OPS, "Runner operations", {
     /// n_captures × (u32 addr, u32 len). Result: u32 v0, then each capture.
     /// Addresses lie in the scratch region.
     OP_BIOS_CALL = 0x40;
+    /// Payload: u32 pc, then `THREAD_STEP_SIZE`-byte steps (u32 op, a, b,
+    /// c) to the end. Result: each step's `TS_*_WORDS` words. Threads
+    /// (B0h:0Eh-10h) on the target's own BIOS, seen through the table of
+    /// tables (PCB at 108h, TCBs at 110h, sizes at 10Ch and 114h). The op
+    /// writes the `THREAD_STUB_WORDS`-word thread entry at `pc` (in the
+    /// scratch region; it passes sp and gp to the runner's thread body,
+    /// which counts a round, notes the PCB's current TCB and
+    /// ChangeThreads back to the thread that switched to it). Steps:
+    /// `TS_TABLES`; `TS_FILL` (TCB a: every word after the status = b | k
+    /// << 8 for word k, then the SR word at `TCB_SR` = c); `TS_OPEN`
+    /// (OpenThread(pc, b, c), handle into slot a; then the TCB the handle
+    /// names); `TS_CHANGE` (ChangeThread to slot a and back); `TS_CLOSE`
+    /// (CloseThread(slot a), then that TCB's status). See
+    /// `oracle/runner/threads.c` for each result's words.
+    OP_BIOS_THREADS = 0x41;
     /// Payload: u32 lba, u32 mode, u32 file, u32 channel, u32 samples, u32
     /// n_captures, n_captures × (u32 addr, u32 len). Result: each capture
     /// (SPU RAM). XA-ADPCM streaming, after SPU_RESET: SPUCNT C001h (CD
@@ -185,6 +207,31 @@ wire_consts!(OPS, "Runner operations", {
     /// the SPU keeps running; then Pause. CD interrupts are acknowledged
     /// as they come.
     OP_CD_XA = 0x50;
+    /// Payload: u32 n_cmds, then per command u32 cmd, u32 n_params, u32
+    /// n_ints, u32 data_len, n_params parameter bytes (padded to 4).
+    /// Result: u32 the interrupt enable register as found (1F801803h,
+    /// index 0), u32 n_records (the n_ints of every command together);
+    /// then per command n_ints records of `CD_RECORD_SIZE` + data_len
+    /// bytes: u32 type | n_response << 8, 16 response bytes (zero past
+    /// n_response), then for INT1 the data_len bytes of the sector read
+    /// through the data FIFO (requested before the interrupt is
+    /// acknowledged); then n_records u32 times, in timer ticks
+    /// (`CD_TICK_CYCLES` CPU cycles each) from the command write to the
+    /// interrupt. A command collects interrupts until it has n_ints or one
+    /// is INT5; records not collected stay zero, and type
+    /// `CD_TYPE_TIMEOUT` marks a wait that gave up. Interrupts off; every
+    /// flag acknowledged before each command.
+    OP_CD_CMDS = 0x51;
+    /// Payload: u32 n_cmds, then per command u32 n_words, n_words words
+    /// (the command, then its parameters), u32 n_out. Result: each
+    /// command's n_out decoded words. The MDEC is reset (1F801824h
+    /// 80000000h) and its DMA requests enabled (60000000h) first; for
+    /// each command, once the MDEC is idle: DMA1 is started for n_out
+    /// words (blocks of `MDEC_OUT_BLOCK`), the command word is written to
+    /// 1F801820h, the parameters go by DMA0 (blocks of 32, 16 or 1
+    /// words, the largest that divides them), and the op waits for both
+    /// channels and the MDEC.
+    OP_MDEC_RUN = 0x60;
 });
 
 wire_consts!(LAYOUT, "Payload layouts and limits", {
@@ -234,6 +281,48 @@ wire_consts!(LAYOUT, "Payload layouts and limits", {
     /// INFO result size: u32 runner_version, wire_version, mailbox address,
     /// capacity, scratch base, scratch size, image end, COP0 SR.
     INFO_RESULT_SIZE = 32;
+    /// BIOS_THREADS step size: u32 op, a, b, c.
+    THREAD_STEP_SIZE = 16;
+    /// Words of the thread entry BIOS_THREADS writes at its pc.
+    THREAD_STUB_WORDS = 6;
+    /// TCB statuses a `TS_TABLES` result holds (zero past the count).
+    THREAD_MAX_TCBS = 8;
+    /// Handle slots for `TS_OPEN`, `TS_CHANGE` and `TS_CLOSE`.
+    THREAD_SLOTS = 8;
+    /// Step: the tables. Result: PCB size, TCB area size, the current
+    /// TCB's index (FFFFFFFFh if the PCB names none), then
+    /// `THREAD_MAX_TCBS` status words.
+    TS_TABLES = 0;
+    /// Step: fill free TCB a (no result).
+    TS_FILL = 1;
+    /// Step: OpenThread. Result: the handle, then the 30h words of the TCB
+    /// it names (zero if it names none).
+    TS_OPEN = 2;
+    /// Step: ChangeThread to the thread and back. Result: see threads.c.
+    TS_CHANGE = 3;
+    /// Step: CloseThread. Result: its return, then the TCB's status.
+    TS_CLOSE = 4;
+    /// Result words of `TS_TABLES`.
+    TS_TABLES_WORDS = 11;
+    /// Result words of `TS_FILL`.
+    TS_FILL_WORDS = 0;
+    /// Result words of `TS_OPEN`.
+    TS_OPEN_WORDS = 49;
+    /// Result words of `TS_CHANGE`.
+    TS_CHANGE_WORDS = 13;
+    /// Result words of `TS_CLOSE`.
+    TS_CLOSE_WORDS = 2;
+    /// CD_CMDS interrupt record header: the type word, 16 response bytes.
+    CD_RECORD_SIZE = 20;
+    /// Largest CD_CMDS data read per sector (2340 bytes: everything after
+    /// the sync).
+    CD_DATA_MAX = 0x924;
+    /// CD_CMDS record type of a wait that gave up.
+    CD_TYPE_TIMEOUT = 0x80;
+    /// CPU cycles per CD_CMDS timer tick (root counter 2 at sysclock/8).
+    CD_TICK_CYCLES = 8;
+    /// MDEC_RUN's DMA1 block size; n_out is a multiple of it.
+    MDEC_OUT_BLOCK = 32;
 });
 
 wire_consts!(VECTOR_KINDS, "Vector kinds (the type tag in a vector's canonical encoding)", {
@@ -252,6 +341,14 @@ wire_consts!(VECTOR_KINDS, "Vector kinds (the type tag in a vector's canonical e
     /// XA-ADPCM from the runner disc's test file, captured from the SPU's
     /// CD input buffers.
     VK_CD_XA = 6;
+    /// MDEC commands (tables, decodes) and the decoded words.
+    VK_MDEC_RUN = 7;
+    /// CD controller commands on the runner disc: interrupts, responses,
+    /// sector data.
+    VK_CD_CMDS = 8;
+    /// BIOS threads: OpenThread, ChangeThread, CloseThread and the
+    /// kernel's tables.
+    VK_BIOS_THREADS = 9;
 });
 
 wire_consts!(EXCHANGE, "Exchange files (driver ↔ psxw-emu-host)", {

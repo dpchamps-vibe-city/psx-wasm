@@ -41,7 +41,11 @@ pub enum Reference {
 /// status per device"). None of the v1 kinds; CD timing joins in M6.
 pub fn emulator_weak(kind: Kind) -> bool {
     match kind {
-        Kind::Echo | Kind::GpuDraw | Kind::GpuTransfer | Kind::GteOp | Kind::SpuRun | Kind::BiosCall => false,
+        Kind::Echo | Kind::GpuDraw | Kind::GpuTransfer | Kind::GteOp | Kind::SpuRun | Kind::BiosCall | Kind::MdecRun | Kind::BiosThreads => false,
+        // The interrupts, responses and sector data are evidence; the
+        // times recorded with them are not (D48), and the check leaves
+        // them out.
+        Kind::CdCmds => false,
         // The check ignores when the captures were read; their values are
         // evidence.
         Kind::CdXa => false,
@@ -54,7 +58,18 @@ pub fn emulator_weak(kind: Kind) -> bool {
 /// can't reproduce them byte for byte; their checks compare values, not
 /// bytes (`DeviceUnderTest::consistent`).
 pub fn timing_variable(kind: Kind) -> bool {
-    kind == Kind::CdXa
+    matches!(kind, Kind::CdXa | Kind::CdCmds)
+}
+
+/// For a timing-variable vector whose result separates values from
+/// timing: whether two results agree on everything timing doesn't decide.
+/// `None` when the kind's values can't be told apart from its timing (an
+/// XA capture).
+pub fn same_but_timing(v: &crate::vector::Vector, a: &[u8], b: &[u8]) -> Option<bool> {
+    match v {
+        crate::vector::Vector::CdCmds(c) => Some(a.len() == b.len() && crate::cdc::values(c, a) == crate::cdc::values(c, b)),
+        _ => None,
+    }
 }
 
 /// The verdict for `result`, given the references available. The
