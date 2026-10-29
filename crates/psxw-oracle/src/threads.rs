@@ -67,7 +67,7 @@ const TABLES: [u32; 4] = [TS_TABLES, 0, 0, 0];
 /// The step lists. Fill patterns keep the low byte zero and bits 16 and 22
 /// clear, so a pattern word taken for a status register is harmless; the
 /// SR word itself is set apart (40000000h: COP2 on, interrupts off; and
-/// 40000404h, which bof4 writes so its threads run with interrupts on).
+/// 40000404h, which a game may write so its threads run with interrupts on).
 pub fn scripts() -> Vec<(&'static str, Vec<[u32; 4]>)> {
     let mut out = Vec::new();
 
