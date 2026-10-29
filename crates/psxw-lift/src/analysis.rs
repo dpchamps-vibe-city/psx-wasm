@@ -236,7 +236,7 @@ fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, f: &mut Facts) {
             let mut after = *st;
             step(i, n.pc(), &mut after);
             if let Some(v) = after[i.rt as usize] {
-                if v & 3 == 0 && in_code(v) {
+                if v & 3 == 0 && in_code(v) && !g.embedded_tables.contains_key(&v) {
                     f.code_consts.insert(v);
                 }
             }

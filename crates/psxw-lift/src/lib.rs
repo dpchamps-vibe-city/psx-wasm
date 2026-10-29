@@ -262,6 +262,14 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
             let interior = enclosing.is_some_and(|f| reach.get(&(c.clone(), f.addr)).is_some_and(|r| r.contains(&a)));
             added |= program.add(&c, a, None, source, !interior);
         }
+        // A block only a code pointer reaches that reads registers the ABI
+        // doesn't pass is entered by a computed jump, part way.
+        for t in results.iter().flatten() {
+            let pointer_only = t.func.sources.iter().all(|&s| matches!(s, Source::CodePointer | Source::ComputedEntry));
+            if pointer_only && t.facts.entry_reads != 0 {
+                added |= program.add_source(&t.func.container, t.func.addr, Source::ComputedEntry);
+            }
+        }
         if !added {
             let ends: BTreeMap<(String, u32), (u32, bool)> = funcs
                 .iter()
@@ -663,5 +671,47 @@ mod tests {
         let c = &out.ok.iter().find(|t| t.func.addr == BASE).expect("translated").c;
         assert_eq!(c.matches("PSXW_LBV(").count(), 2, "{c}");
         assert!(c.contains("r3 = (uint32_t)PSXW_LB("), "{c}");
+    }
+
+    /// Hand-written code that jumps through a table of addresses inside its
+    /// own text, indexed by a byte offset it loads: the entries are local
+    /// labels, and the table's address is no function.
+    #[test]
+    fn embedded_jump_table() {
+        const BASE: u32 = 0x8001_0000;
+        let table = BASE + 0x18;
+        let (t0, t1) = (BASE + 0x20, BASE + 0x28);
+        let words: [u32; 12] = [
+            0x8C8C_0000,                      // lw t4, 0(a0) (a byte offset)
+            0x3C0D_0000 | (table >> 16),      // lui t5, %hi(table)
+            0x35AD_0000 | (table & 0xFFFF),   // ori t5, t5, %lo(table)
+            0x018D_6821,                      // addu t5, t4, t5
+            0x8DAC_0000,                      // lw t4, 0(t5)
+            0x0180_0008,                      // jr t4
+            t0,                               // table: t0
+            t1,                               //        t1
+            0x03E0_0008,                      // t0: jr ra
+            0x2402_0001,                      //     addiu v0, zero, 1
+            0x03E0_0008,                      // t1: jr ra
+            0x2402_0002,                      //     addiu v0, zero, 2
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let start = Start { name: None, size: Some(code.len() as u32), sources: [Source::Symbol].into(), boundary: true };
+        let mut program = Program {
+            main: "test".into(),
+            containers: [(
+                "test".to_string(),
+                Code { id: "test".into(), text: vec![BASE..BASE + code.len() as u32], data: vec![], starts: [(BASE, start)].into() },
+            )]
+            .into(),
+        };
+        let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
+        let out = translate_all(&mut program, &originals, &["test".into()]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert_eq!(out.ok.len(), 1, "the table's address became a function");
+        let c = &out.ok[0].c;
+        assert!(c.contains(&format!("case 0x{t0:08X}u: goto L_{t0:08X};")), "{c}");
+        assert!(c.contains(&format!("case 0x{t1:08X}u: goto L_{t1:08X};")), "{c}");
+        assert!(!c.contains("psxw_call_indirect"), "{c}");
     }
 }

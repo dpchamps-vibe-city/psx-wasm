@@ -83,6 +83,9 @@ pub struct Graph {
     pub regions: Vec<(u32, u32, String)>,
     /// Return addresses of inlined calls.
     pub inline_returns: BTreeSet<u32>,
+    /// Jump tables inside the function's own text: base → entries. Data,
+    /// not code: their base is no function pointer.
+    pub embedded_tables: BTreeMap<u32, u32>,
 }
 
 impl Graph {
@@ -158,8 +161,41 @@ impl Explorer<'_> {
         }
     }
 
+    /// Inside this function's extent, past its entry: where hand-written
+    /// code keeps a jump table among its instructions.
+    fn in_own_text(&self, a: u32) -> bool {
+        a > self.func.addr && a < self.func.end
+    }
+
     fn in_extent(&self, g: &Graph, a: u32) -> bool {
         g.regions.iter().any(|(s, e, _)| a >= *s && a < *e)
+    }
+
+    /// Targets of a computed jump: every instruction of the branch-free
+    /// head of each [`Source::ComputedEntry`] block in this container, with
+    /// the block's extent brought into this translation.
+    fn computed_targets(&self, g: &mut Graph) -> Vec<u32> {
+        let c = &self.func.container;
+        let Some(code) = self.program.code(c) else { return Vec::new() };
+        let mut targets = Vec::new();
+        for f in self.program.functions(c) {
+            if f.addr == self.func.addr || !code.starts.get(&f.addr).is_some_and(|s| s.sources.contains(&Source::ComputedEntry)) {
+                continue;
+            }
+            if !self.in_extent(g, f.addr) {
+                g.regions.push((f.addr, f.end, c.clone()));
+            }
+            let mut a = f.addr;
+            while a < f.end {
+                let Some(w) = self.originals.word(c, a) else { break };
+                targets.push(a);
+                if decode(w).op.has_delay_slot() {
+                    break;
+                }
+                a += 4;
+            }
+        }
+        targets
     }
 
     /// Bring an inline function's extent into this translation.
@@ -339,6 +375,35 @@ impl Explorer<'_> {
                 Window::Unbounded(base) => {
                     return err(pc, format!("jump table at 0x{base:08X} has no recognizable bound"));
                 }
+                // Hand-written code's table inside the function's own text:
+                // its entries are the words that point into the function.
+                Window::Embedded(base) => {
+                    let mut targets = Vec::new();
+                    while targets.len() < 256 {
+                        let at = base + 4 * targets.len() as u32;
+                        match self.originals.word(&self.func.container, at) {
+                            Some(t) if self.in_extent(g, t) && t & 3 == 0 && !(base..at + 4).contains(&t) => targets.push(t),
+                            _ => break,
+                        }
+                    }
+                    if targets.is_empty() {
+                        Transfer::Jump(Dest::Tail(Callee::Indirect { reg: insn.rs }))
+                    } else {
+                        g.embedded_tables.insert(base, targets.len() as u32);
+                        Transfer::Table { reg: insn.rs, base, targets }
+                    }
+                }
+                // Base plus a scaled index, the base not constant: a jump
+                // into a block entered at computed offsets. Each such block's
+                // branch-free head is expanded here, every instruction of it
+                // a target, so the registers the jump carries stay shared.
+                Window::Computed => {
+                    let targets = self.computed_targets(g);
+                    match targets.first() {
+                        Some(&base) => Transfer::Table { reg: insn.rs, base, targets },
+                        None => Transfer::Jump(Dest::Tail(Callee::Indirect { reg: insn.rs })),
+                    }
+                }
                 Window::Unknown | Window::Const(_) => Transfer::Jump(Dest::Tail(Callee::Indirect { reg: insn.rs })),
             },
             Op::Jalr => {
@@ -378,13 +443,16 @@ impl Explorer<'_> {
         }
         match sym.regs[reg as usize].clone() {
             Sym::Const(c) => Window::Const(c),
+            Sym::Sum(terms, _) if terms.iter().any(|t| matches!(t, Sym::Shl(..))) => Window::Computed,
             Sym::Load(addr) => {
                 let (terms, base) = addr.flatten();
                 match terms.as_slice() {
                     [Sym::Shl(idx, 2)] => match sym.bound_for(idx) {
                         Some(len) => Window::Table { base, len },
+                        None if self.in_own_text(base) => Window::Embedded(base),
                         None => Window::Unbounded(base),
                     },
+                    [_] if self.in_own_text(base) => Window::Embedded(base),
                     _ => Window::Unknown,
                 }
             }
@@ -397,6 +465,10 @@ enum Window {
     Const(u32),
     Table { base: u32, len: u32 },
     Unbounded(u32),
+    /// A table of code addresses in the function's own text.
+    Embedded(u32),
+    /// A base plus a scaled index, the base not constant.
+    Computed,
     Unknown,
 }
 

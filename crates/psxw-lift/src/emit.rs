@@ -317,6 +317,12 @@ impl<'a> Emitter<'a> {
     fn dest(&mut self, d: &Dest) -> String {
         match d {
             Dest::Local(a) => format!("goto L_{a:08X};"),
+            // r31 starts at 0, standing for the caller's return address, so
+            // a jump to 0 through another register (hand-written code that
+            // kept `ra` elsewhere) returns.
+            Dest::Tail(c @ Callee::Indirect { .. }) => {
+                format!("if (t_ == 0u) return ((uint64_t)r3 << 32) | r2; return {};", self.call(c))
+            }
             Dest::Tail(c) => format!("return {};", self.call(c)),
         }
     }

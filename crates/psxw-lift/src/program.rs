@@ -36,6 +36,11 @@ pub enum Source {
     /// The return address of a `setjmp` call (BIOS A0h:13h): where a
     /// longjmp to its buffer resumes, with the registers the buffer holds.
     Continuation,
+    /// Code only a code pointer reaches that reads registers on entry the
+    /// o32 ABI doesn't pass: a block hand-written code jumps into at a
+    /// computed offset (an unrolled loop entered part way), sharing the
+    /// jumper's registers. A computed jump expands it in place.
+    ComputedEntry,
 }
 
 #[derive(Debug, Clone, Default)]
