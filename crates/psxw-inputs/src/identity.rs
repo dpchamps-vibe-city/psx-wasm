@@ -177,7 +177,7 @@ pub struct IdentityReport {
 pub fn identify(game: &str, map: &AddressMap, originals: &Originals, db: &SigDb) -> IdentityReport {
     let mut ids = Vec::new();
     for c in &map.containers {
-        let texts: Vec<&SdkPlacement> = c.sdk.iter().filter(|p| p.section.is_none()).collect();
+        let texts: Vec<&SdkPlacement> = c.sdk.iter().filter(|p| p.is_text()).collect();
         for p in texts {
             let len = (p.vram.end - p.vram.start) as usize;
             let bytes = originals.read(&c.id, p.vram.start, len).unwrap_or(&[]);

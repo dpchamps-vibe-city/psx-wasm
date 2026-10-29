@@ -50,6 +50,14 @@ pub struct SdkPlacement {
     pub vram: Range<u32>,
 }
 
+impl SdkPlacement {
+    /// The member's code: `[…, o, lib/x/y]` and `[…, o, lib/x/y, .text]`
+    /// both place `.text`.
+    pub fn is_text(&self) -> bool {
+        is_text_section(self.section.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Via {
     /// Named in the container's own symbol file.
@@ -295,9 +303,15 @@ fn is_rodata(sub: &splat::Subsegment) -> bool {
 fn is_text(sub: &splat::Subsegment) -> bool {
     match sub.kind.as_str() {
         "c" | "asm" | "hasm" => true,
-        "o" => sub.args.first().is_none_or(|s| s == ".text"),
+        "o" => is_text_section(sub.args.first().map(String::as_str)),
         _ => false,
     }
+}
+
+/// An `o` subsegment's section argument names its `.text` when absent or
+/// spelled out.
+fn is_text_section(section: Option<&str>) -> bool {
+    section.is_none_or(|s| s == ".text")
 }
 
 /// splat names unnamed symbols `<prefix>_<8 hex digits>`.
@@ -331,5 +345,18 @@ mod tests {
         assert_eq!(auto_name("D_8005E274").map(|r| r.addr), Some(0x8005_E274));
         assert!(auto_name(".Lswitch.table.ovl_11_func_800F1BD0").is_none());
         assert!(auto_name("func_90012345").is_none());
+    }
+
+    #[test]
+    fn object_text_with_or_without_section() {
+        let at = |section: Option<&str>| SdkPlacement {
+            member: "libapi/first".into(),
+            section: section.map(str::to_string),
+            vram: 0x8001_0000..0x8001_0100,
+        };
+        assert!(at(None).is_text());
+        assert!(at(Some(".text")).is_text());
+        assert!(!at(Some(".rodata")).is_text());
+        assert!(!at(Some(".data")).is_text());
     }
 }
