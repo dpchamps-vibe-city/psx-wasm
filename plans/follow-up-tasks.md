@@ -71,9 +71,10 @@ its mods repo.
 - **M9:** a second game, its decomp and disc.
 - **M10:** a capture rig.
 - **M13, the harness push:** the human said not to push
-  psx-decompilation-harness. Its M13 work is on branch `m13-bof4`;
-  bof4-decomp names that branch and has it checked out locally, but a
-  fresh clone can't install it until it's pushed (M13 exit criteria 1–2).
+  psx-decompilation-harness. Its M13 work is merged into local `main`
+  (`00c41b7`); bof4-decomp names `main` and has that checked out
+  locally, but a fresh clone can't install it until it's pushed (M13
+  exit criteria 1–2).
 
 ## Blocked on CD timing (D48)
 

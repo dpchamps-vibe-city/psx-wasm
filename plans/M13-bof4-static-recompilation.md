@@ -245,6 +245,9 @@ run alongside. Task 15 onward needs phase 2's commit.
    from GitHub until the branch is pushed, which the human withheld).
    `npm run check-all` there passes: 641 containers byte-identical,
    placement coverage (313 placed, 78 deferred), configs current.
+   Later the branch merged with harness main and went back into it
+   (`00c41b7`, local only). bof4-decomp `57f7da1` names `main` again, and
+   check-all passes there with no regenerated changes.
    - Set `.pi/settings.json` to `…/psx-decompilation-harness@<task 5
      commit>` and reinstall.
    - Regenerate the configs with that harness. `ovl_4414` gains libpress's
@@ -526,6 +529,11 @@ census and lift)
   - `psxw ci bof4`: every gate passes but the replay gate, which ran 600
     frames before `psxw run` defaulted to the replay's length; the gate's
     own command passes since.
+  - Harness `m13-bof4` merged with main (`bc411b9`, no conflicts;
+    `tools/lib` and `tools/build` tests pass) and fast-forwarded into
+    main (`00c41b7`), not pushed. bof4-decomp `57f7da1` names `main`;
+    check-all passes. psx-wasm repinned to `57f7da1`; `psxw ci` was not
+    rerun at this pin.
 
 ## Findings
 

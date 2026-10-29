@@ -85,7 +85,7 @@ sha1 = "cb26381fa1336bdd15f07469e59f1143ccf37b03"
 
 [game.bof4]
 repo = "../bof4-decomp"
-commit = "156081718e93e867303bf15df63f832901a033ad"
+commit = "57f7da1aaa5b27ddc239b3bca4ba1178c1098ec3"
 build = ["npm", "run", "check-all"]
 
 [game.bof4.disc]
