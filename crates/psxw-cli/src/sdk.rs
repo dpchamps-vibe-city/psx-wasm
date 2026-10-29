@@ -65,6 +65,24 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
     let out = ws.out_dir().join("sdk").join(&sdk);
     std::fs::create_dir_all(&out)?;
     std::fs::write(out.join("scan.json"), serde_json::to_string_pretty(&scan)?)?;
+    // The table builds decide chips with (D59), kept in the repo: what
+    // each function touches itself, and, when it calls through pointers
+    // the scan can't resolve, what its library's code reaches.
+    let mut reach_table = psxw_inputs::boundary::Reach { sdk: sdk.clone(), members: BTreeMap::new() };
+    for (k, f) in &scan.functions {
+        let r: BTreeSet<String> = if f.indirect { reach[k.as_str()].clone() } else { f.direct.keys().cloned().collect() };
+        let text = members.iter().find(|m| m.lib == f.lib && m.name == f.member).is_some_and(|m| m.obj.sections[f.section].name == ".text");
+        if !r.is_empty() && text {
+            reach_table.members.entry(format!("{}/{}", f.lib, f.member)).or_default().insert(f.off, r.into_iter().collect());
+        }
+    }
+    let path = psxw_inputs::boundary::Reach::path(&ws.root, &sdk);
+    let text = serde_json::to_string_pretty(&reach_table)? + "\n";
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+        std::fs::create_dir_all(path.parent().context("reach table directory")?)?;
+        std::fs::write(&path, &text)?;
+        eprintln!("sdk scan: wrote {} (changed)", path.display());
+    }
 
     let have: Vec<&str> = sdk_psyq::adapters().iter().map(|(n, _)| *n).collect();
     let have: BTreeSet<&str> = have.into_iter().collect();

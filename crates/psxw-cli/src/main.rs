@@ -12,7 +12,7 @@
 //! psxw link-test <game> --function F    M1: link one pair, validate, run once
 //! psxw ci <game>                        every gate of every milestone in place
 //! psxw runtime build                    runtime.wasm (game-agnostic)
-//! psxw build <game> [--debug-io] [--ubsan] [--original libpad,…] [--debug]
+//! psxw build <game> [--debug-io] [--ubsan] [--original libpad,…] [--device gpu,…|all] [--debug]
 //!                                       M2: out/<game>/game.wasm (--debug: game-debug.wasm, DWARF)
 //! psxw report tiers <game>              each function's tier, by library
 //! psxw run <game> [--frames N] [--replay R] [--check boot] [--cd instant] [--verbose] [--debug]
@@ -376,11 +376,16 @@ fn run() -> Result<()> {
                         Some(l) => opts.original.extend(l.split(',').map(str::to_string)),
                         None => bail!("--original needs a library list"),
                     },
+                    "--device" => match it.next() {
+                        Some(c) => opts.device.extend(c.split(',').map(str::to_string)),
+                        None => bail!("--device needs a chip list (or all)"),
+                    },
                     other => bail!("unknown build option {other}"),
                 }
             }
             let (report, json) = psxw_build::game::build(&ws, &opts)?;
             println!("{}", serde_json::to_string_pretty(&report.tiers)?);
+            eprintln!("{}", report.emulated);
             eprintln!("game.wasm: {} ({} bytes); report {}", report.wasm, report.game_bytes, json.display());
         }
         ["ci", game] => {

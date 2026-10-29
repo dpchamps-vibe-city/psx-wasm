@@ -59,6 +59,36 @@ pub struct LayoutSection {
     pub output: String,
 }
 
+/// What an SDK's functions touch (D59), from `psxw sdk scan` over its
+/// library objects: `boundary/reach/<sdk>.json`, member (`libcd/bios_1`) →
+/// offset in its text → chips (`CD`, `DMA`, `kernel`, …): what its own
+/// instructions touch, and what its library reaches when it calls through
+/// pointers the scan can't resolve. Only functions that touch something
+/// are listed. It covers register pointers kept in data, which the
+/// translator's constant-address facts don't see.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct Reach {
+    pub sdk: String,
+    pub members: BTreeMap<String, BTreeMap<u32, Vec<String>>>,
+}
+
+impl Reach {
+    pub fn path(root: &Path, sdk: &str) -> std::path::PathBuf {
+        root.join("boundary").join("reach").join(format!("{sdk}.json"))
+    }
+
+    pub fn load(root: &Path, sdk: &str) -> Result<Self> {
+        let path = Self::path(root, sdk);
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {} (`psxw sdk scan --sdk {sdk}` writes it)", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// What the function at `off` in `member`'s text reaches.
+    pub fn at(&self, member: &str, off: u32) -> &[String] {
+        self.members.get(member).and_then(|m| m.get(&off)).map_or(&[], Vec::as_slice)
+    }
+}
+
 impl Boundary {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;

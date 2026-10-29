@@ -777,12 +777,14 @@ pub extern "C" fn psxw_report() {
             .flat_map(|io| io.recent.iter())
             .map(|(t, a, n, v, w)| format!("\"{t} {} {a:08x}/{n} {v:#x}\"", if *w { "W" } else { "R" }))
             .collect();
+        let accesses: Vec<String> = m.io.iter().flat_map(|io| io.accesses.iter()).map(|(c, n)| format!("\"{c}\":{n}")).collect();
         format!(
-            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"cd_loads\":{},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{},\"held_waits\":{}}}",
+            "{{\"event\":\"report\",\"vblanks\":{},\"cycles\":{},\"cd_sectors\":{},\"cd_loads\":{},\"io_accesses\":{{{}}},\"edc_errors\":[{}],\"counts\":{{{}}},\"io_recent\":[{}],\"bios_events\":[{}],\"crit\":{},\"in_irq\":{},\"queued_calls\":{},\"held_waits\":{}}}",
             m.vblanks,
             m.clock.now,
             cd_sectors,
             cd_loads,
+            accesses.join(","),
             errors.join(","),
             counts.join(","),
             io.join(","),

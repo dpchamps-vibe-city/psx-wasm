@@ -46,6 +46,10 @@ pub struct Options {
     /// at psxw-abi `DEBUG_WINDOW_BASE` so a debugger's addresses are the
     /// game's, merged without binaryen.
     pub debug: bool,
+    /// Chips forced onto their register-level devices (D59; `all` for
+    /// every chip): the fallback, and level 4 of conformance
+    /// (`game-device-<chips>.wasm`).
+    pub device: Vec<String>,
     /// More functions, by name, built at their translated tier besides the
     /// manifest's `[tier]` pins (`game-lift-<names>.wasm`): a moddable base
     /// whose slot for one is o32 instead of C-typed (plans/M12).
@@ -75,6 +79,7 @@ impl Options {
             moddable: false,
             debug: false,
             lift: vec![],
+            device: vec![],
         }
     }
 
@@ -83,6 +88,9 @@ impl Options {
         let mut s = String::new();
         if !self.original.is_empty() {
             s += &format!("-orig-{}", self.original.join("+"));
+        }
+        if !self.device.is_empty() {
+            s += &format!("-device-{}", self.device.join("+"));
         }
         if self.ubsan {
             s += "-ubsan";
@@ -126,6 +134,11 @@ pub struct Report {
     /// C-level kinds but not in wasm types (a struct by value against a
     /// scalar, say): routed through o32, which converts as the PS1 does.
     pub abi_mismatches: Vec<String>,
+    /// Each chip the game drives (D59): native through its adapters, or
+    /// emulated on its device, and why.
+    pub chips: BTreeMap<String, ChipMode>,
+    /// One line: the emulated chips (`emulated: cd, mdec; 2 of 6 chips`).
+    pub emulated: String,
     /// Functions per tier.
     pub tiers: BTreeMap<String, usize>,
     /// Per container and tier.
@@ -140,6 +153,27 @@ pub struct Report {
     pub wasm: String,
     /// The unmerged guest module (the browser's dev mode).
     pub guest: String,
+}
+
+/// How a chip runs in a build (D59).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChipMode {
+    pub native: bool,
+    /// Why it is emulated; empty when native.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
+impl ChipMode {
+    /// The one-line summary of a build's chips.
+    pub fn summary(chips: &BTreeMap<String, ChipMode>) -> String {
+        let emulated: Vec<&str> = chips.iter().filter(|(_, m)| !m.native).map(|(c, _)| c.as_str()).collect();
+        if emulated.is_empty() {
+            format!("emulated: none; 0 of {} chips", chips.len())
+        } else {
+            format!("emulated: {}; {} of {} chips", emulated.join(", "), emulated.len(), chips.len())
+        }
+    }
 }
 
 /// The `-all` minus features clang and rustc don't emit and hosts may lack.
@@ -196,6 +230,7 @@ pub struct Prepared {
     pub adapter_names: Vec<String>,
     /// What GCC did that C inputs are linked to reproduce.
     pub gcc: Gcc,
+    chips: BTreeMap<String, ChipMode>,
     unvalidated: BTreeSet<String>,
     hardware: Vec<Unbound>,
     void_used: BTreeSet<(String, u32)>,
@@ -237,44 +272,81 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         );
     }
     let runtime_devices = crate::runtime::devices(&runtime)?;
-    let placed: BTreeSet<&str> =
-        inputs.map.containers.iter().flat_map(|c| &c.sdk).filter_map(|p| p.member.split('/').next()).collect();
-    let mut device_libs = boundary.device_libraries();
-    if let Some(l) = device_libs.iter().find(|l| placed.contains(l.as_str()) && !runtime_devices.contains(l)) {
-        bail!("the boundary runs {l} over devices, but the runtime has no device support for it");
-    }
     let db = SigDb::pinned(ws)?;
     let identity = psxw_inputs::identity::identify(&opts.game, &inputs.map, &inputs.originals, &db);
     let keys: BTreeMap<&str, &str> =
         identity.identities.iter().filter_map(|i| Some((i.member.as_str(), i.key.as_deref()?))).collect();
     let validated: BTreeSet<(&str, &str)> = sdk_psyq::validated::VALIDATED.iter().copied().collect();
     let (translations, _, _, _, inline) = psxw_lift::run::translate(&mut inputs);
-    // `adapter-or-device` libraries (D58), decided for the whole library.
+    // Chips (D59): each runs native through its members' adapters, or
+    // emulated on its device, decided for the whole chip.
     let adapter_names: BTreeSet<&str> = adapters.iter().map(String::as_str).collect();
-    let mut resolved: BTreeMap<String, Policy> = BTreeMap::new();
-    for lib in boundary.adapter_or_device_libraries() {
-        let why = adapter_or_device(&inputs.map, &translations, &lib, &|m: &str, name: &str| {
-            adapter_names.contains(name) && keys.get(m).is_some_and(|k| validated.contains(&(m, *k)))
-        }, &adapter_names);
-        let Some(why) = why else {
-            resolved.insert(lib, Policy::Adapter);
-            continue;
-        };
-        ensure!(runtime_devices.contains(&lib), "{lib} (adapter-or-device) needs its original code ({why}), and the runtime has no device support for it");
-        eprintln!("build: {lib} runs as original code over the devices: {why}");
-        resolved.insert(lib.clone(), Policy::Device);
-        device_libs.push(lib);
+    let bound = |m: &str, name: &str| adapter_names.contains(name) && keys.get(m).is_some_and(|k| validated.contains(&(m, *k)));
+    let forced = |c: &str| opts.device.iter().any(|d| d == c || d == "all");
+    if let Some(d) = opts.device.iter().find(|d| *d != "all" && !boundary.chips().contains_key(d.as_str())) {
+        bail!("--device {d}: the boundary has no chip of that name ({})", boundary.chips().keys().cloned().collect::<Vec<_>>().join(", "));
     }
+    // What SDK functions touch, including through register pointers in
+    // data (`psxw sdk scan`), besides the translator's own facts.
+    let reach = match &inputs.manifest.game.sdk {
+        Some(s) => psxw_inputs::boundary::Reach::load(&ws.root, s)?,
+        None => Default::default(),
+    };
+    let touches = |t: &psxw_lift::Translation| {
+        !t.facts.io.is_empty()
+            || !t.facts.kernel.is_empty()
+            || inputs.map.sdk_at(&t.func.container, t.func.addr).is_some_and(|p| !reach.at(&p.member, t.func.addr - p.vram.start).is_empty())
+    };
+    let mut chips: BTreeMap<String, ChipMode> = BTreeMap::new();
+    for chip in boundary.chips().keys() {
+        let in_chip = |m: &str| boundary.chip_of(m) == Some(chip.as_str()) && boundary.policy(m) == Some(Policy::AdapterOrDevice);
+        if !translations.iter().any(|t| inputs.map.sdk_at(&t.func.container, t.func.addr).is_some_and(|p| in_chip(&p.member))) {
+            continue;
+        }
+        let why = if forced(chip) {
+            Some("forced by --device".to_string())
+        } else {
+            chip_decision(&inputs.map, &translations, &in_chip, &bound, &adapter_names, &touches)
+        };
+        if let Some(w) = &why {
+            eprintln!("build: {chip} is emulated: {w}");
+        }
+        chips.insert(chip.clone(), ChipMode { native: why.is_none(), why: why.unwrap_or_default() });
+    }
+    eprintln!("build: {}", ChipMode::summary(&chips));
+    let fell_back: Vec<String> = inputs
+        .manifest
+        .chips
+        .native
+        .iter()
+        .filter(|c| !forced(c))
+        .filter_map(|c| match chips.get(c) {
+            Some(m) if !m.native => Some(format!("{c}: {}", m.why)),
+            Some(_) => None,
+            None => Some(format!("{c}: the game places none of its members")),
+        })
+        .collect();
+    ensure!(fell_back.is_empty(), "chips game.toml [chips] expects native are emulated:\n  {}", fell_back.join("\n  "));
     // Libraries built from their original code on request.
-    device_libs.extend(opts.original.iter().cloned());
+    let original_libs: BTreeSet<&str> = opts.original.iter().map(String::as_str).collect();
+    let lib_of = |m: &str| m.split('/').next().unwrap_or(m).to_string();
+    let native_chips: BTreeSet<String> = chips.iter().filter(|(_, m)| m.native).map(|(c, _)| c.clone()).collect();
     let policy_of = |member: &str| -> Policy {
         match boundary.policy(member) {
             Some(Policy::AdapterOrDevice) => {
-                resolved.get(member.split('/').next().unwrap_or(member)).copied().unwrap_or(Policy::Device)
+                let native = boundary.chip_of(member).is_some_and(|c| native_chips.contains(c));
+                if native && !original_libs.contains(lib_of(member).as_str()) { Policy::Adapter } else { Policy::Device }
             }
             p => p.unwrap_or(Policy::Adapter),
         }
     };
+    // Members whose original code runs over the devices.
+    let is_device = |member: &str| policy_of(member) == Policy::Device || original_libs.contains(lib_of(member).as_str());
+    let device_libs: BTreeSet<String> =
+        inputs.map.containers.iter().flat_map(|c| &c.sdk).filter(|p| p.is_text() && is_device(&p.member)).map(|p| lib_of(&p.member)).collect();
+    if let Some(l) = device_libs.iter().find(|l| !runtime_devices.contains(*l)) {
+        bail!("{l} runs as original code over the devices here, but the runtime has no device support for it");
+    }
     let expanded: BTreeSet<(String, u32)> = inline
         .keys()
         .filter_map(|k| {
@@ -422,7 +494,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     for t in &translations {
         let key = (t.func.container.clone(), t.func.addr);
         let member = inputs.map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
-        let original = member.is_some_and(|m| device_libs.iter().any(|l| m.split('/').next() == Some(l.as_str())));
+        let original = member.is_some_and(is_device);
         let policy = member.map(policy_of);
         let adapter = adapter_id.get(t.func.name.as_str()).filter(|_| policy == Some(Policy::Adapter) && !original);
         let object_ok = member.is_some_and(|m| keys.get(m).is_some_and(|k| validated.contains(&(m, *k))));
@@ -513,7 +585,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         device_funcs: tiers
             .keys()
             .filter(|(c, a)| {
-                inputs.map.sdk_at(c, *a).is_some_and(|p| device_libs.iter().any(|l| p.member.split('/').next() == Some(l.as_str())))
+                inputs.map.sdk_at(c, *a).is_some_and(|p| is_device(&p.member))
             })
             .cloned()
             .collect(),
@@ -554,6 +626,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         translations,
         expanded,
         c_objects,
+        chips,
         unvalidated,
         hardware,
         void_used,
@@ -624,6 +697,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         mut link_inputs,
         tiers,
         translations,
+        chips,
         unvalidated,
         hardware,
         void_used,
@@ -758,6 +832,8 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         game: opts.game.clone(),
         commit,
         unvalidated_objects: unvalidated.into_iter().collect(),
+        emulated: ChipMode::summary(&chips),
+        chips,
         hardware_unbound: hardware.iter().map(|h| h.to_string()).collect(),
         void_results: void_used.iter().map(|(c, a)| format!("{c} {a:#010x}")).collect(),
         abi_mismatches: linked.abi_mismatches.clone(),
@@ -943,44 +1019,62 @@ fn void_results(
     out
 }
 
-/// Why `adapter-or-device` library `lib` must run as original code (D58),
-/// or `None` when its adapters can bind. They can when every placed object
-/// defining one of their functions is validated (`bound`), and the code
-/// outside the library (the game and other libraries, through direct calls,
-/// stopping at those adapters) reaches its other objects only at helpers
-/// that call nothing. Anything else drives the library's own internals,
-/// which the adapters' state can't stand in for.
-fn adapter_or_device(
+/// Why a chip must be emulated (D59), or `None` when it runs native. It
+/// runs native when every placed object of its group (`in_chip`) that
+/// defines an adapter's function is validated (`bound`), it has adapters
+/// here, and the code outside the group, through direct calls that stop
+/// at those adapters, reaches nothing in the group that touches hardware
+/// or kernel RAM itself. Group code it reaches that doesn't (libds over
+/// libcd, a packet helper) runs as guest code over the adapters.
+fn chip_decision(
     map: &psxw_inputs::AddressMap,
     translations: &[psxw_lift::Translation],
-    lib: &str,
+    in_chip: &dyn Fn(&str) -> bool,
     bound: &dyn Fn(&str, &str) -> bool,
     adapter_names: &BTreeSet<&str>,
+    touches: &dyn Fn(&psxw_lift::Translation) -> bool,
 ) -> Option<String> {
     let member = |t: &psxw_lift::Translation| map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
-    let in_lib = |m: Option<&str>| m.is_some_and(|m| m.split('/').next() == Some(lib));
+    let inside = |t: &psxw_lift::Translation| member(t).is_some_and(in_chip);
     let unvalidated: BTreeSet<&str> = translations
         .iter()
-        .filter(|t| adapter_names.contains(t.func.name.as_str()) && in_lib(member(t)))
+        .filter(|t| adapter_names.contains(t.func.name.as_str()) && inside(t))
         .filter_map(|t| member(t).filter(|m| !bound(m, &t.func.name)))
         .collect();
     if !unvalidated.is_empty() {
         return Some(format!("unvalidated objects with adapters: {}", unvalidated.into_iter().collect::<Vec<_>>().join(", ")));
     }
+    let adapted = |t: &psxw_lift::Translation| inside(t) && member(t).is_some_and(|m| bound(m, &t.func.name));
+    if !translations.iter().any(adapted) {
+        return Some("no adapters for it".into());
+    }
     let by_key: BTreeMap<(&str, u32), &psxw_lift::Translation> =
         translations.iter().map(|t| ((t.func.container.as_str(), t.func.addr), t)).collect();
+    let callees = |t: &'_ psxw_lift::Translation| -> Vec<(String, u32)> {
+        t.facts
+            .call_sites
+            .iter()
+            .filter_map(|&(_, target, _)| {
+                [t.func.container.as_str(), map.main.as_str()].into_iter().find(|c| by_key.contains_key(&(*c, target))).map(|c| (c.to_string(), target))
+            })
+            .collect()
+    };
+    let mut work: Vec<(String, u32)> = translations.iter().filter(|t| !inside(t)).flat_map(callees).collect();
+    let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
     let mut drives: BTreeSet<String> = BTreeSet::new();
-    for t in translations.iter().filter(|t| !in_lib(member(t))) {
-        for &(_, target, _) in &t.facts.call_sites {
-            let Some(c) = [t.func.container.as_str(), map.main.as_str()].into_iter().find_map(|c| by_key.get(&(c, target))) else { continue };
-            let m = member(c);
-            if !in_lib(m) || m.is_some_and(|m| bound(m, &c.func.name)) {
-                continue;
-            }
-            if !c.facts.call_sites.is_empty() {
-                drives.insert(format!("{} ({})", c.func.name, m.unwrap_or_default()));
-            }
+    while let Some(k) = work.pop() {
+        if !seen.insert(k.clone()) {
+            continue;
         }
+        let Some(t) = by_key.get(&(k.0.as_str(), k.1)) else { continue };
+        if !inside(t) || adapted(t) {
+            continue;
+        }
+        if touches(t) {
+            drives.insert(format!("{} ({})", t.func.name, member(t).unwrap_or_default()));
+            continue;
+        }
+        work.extend(callees(t));
     }
     (!drives.is_empty()).then(|| format!("reached past its adapters at {}", drives.into_iter().collect::<Vec<_>>().join(", ")))
 }

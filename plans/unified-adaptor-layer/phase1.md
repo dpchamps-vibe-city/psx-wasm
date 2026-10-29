@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–2 done)
+**Status:** in progress (tasks 1–4 done)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -88,14 +88,14 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    - **Refine the state-accessor rule:** count data that code staying
      original reads, not all shared data.
    - Regenerate this plan's inventory from it.
-3. [ ] **Chip groups and the per-chip decision.**
+3. [x] **Chip groups and the per-chip decision.**
    - `boundary/psyq.toml` names each chip's libraries.
    - `psxw-build` generalizes `adapter_or_device()` from one library to a
      chip group: a chip is native only if every placed object in its group
      that defines an adapter function is validated, and nothing outside the
      adapter set reaches the chip.
    - Expected chips go in `game.toml`.
-4. [ ] **Reporting.** Per chip, native or emulated and why, in
+4. [x] **Reporting.** Per chip, native or emulated and why, in
    `build.json` and in a summary line. Register accesses per chip in the
    run report. `--check no-io`.
 5. [ ] **Conformance harness**, levels 1–3 (README, "Conformance"):
@@ -174,6 +174,19 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   access the translator's facts see in either game's SDK code is in the
   scan's reach (0 misses). `psxw sdk disasm <fn>` prints a function with
   its relocations, for writing adapters from the objects.
+- **2026-10-29, tasks 3–4.** The boundary names six chip groups (irq, gpu,
+  sio0, cd, mdec, spu); every chip library is `adapter-or-device`, decided
+  per chip. What touches hardware comes from the translator's facts plus
+  the scan's reach table, committed as `boundary/reach/psyq-470.json`:
+  libetc and libcd reach their registers through pointers in data, which
+  the facts alone miss. Today: btn runs cd native, bof4 nothing (its cd
+  is reached past the adapters at `CD_cw`, `CD_init`, … `StUnSetRing`).
+  Because a chip never mixes, libapi's counter functions now run
+  original over the timers in both games while irq is emulated; both
+  still boot clean (1,200 frames, no trap, no shadow I/O). `build.json`
+  has `chips` and `emulated`; `--device <chips|all>`; `[chips] native` in
+  `game.toml` (btn: cd); `io_accesses` in the run report; `--check
+  no-io`.
 
 ## Findings
 

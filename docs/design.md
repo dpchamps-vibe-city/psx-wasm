@@ -362,23 +362,44 @@ a library with no entry fails the build (M13). A per-object entry
 |---|---|
 | `adapter` | A function with a runtime adapter, in an object the adapter is validated against, runs the adapter. The rest are guest code. |
 | `device` | Guest code. Its I/O-window accesses reach the runtime's register-level devices (D40). No adapters. |
-| `adapter-or-device` | Decided per game for the whole library, never per object (D58): `adapter` when every placed object defining an adapter's function is validated and code outside the library reaches its other objects only at helpers that call nothing; otherwise `device`. The adapters keep their state in the runtime (libcd's: the drive's), where the library's own code can't see it, so the two never mix. Only libcd has it. |
+| `adapter-or-device` | Decided per game for the member's whole chip group (D59), never per library or object: `adapter` when the chip runs native, otherwise `device`. Every chip library has it. |
 | `guest` | Guest code only; no adapter may claim its functions. |
 
 Guest code is decompiled C or translated, exactly like game code (§4).
 
-**Where the boundary sits today.** Most libraries that touch hardware
-are `device` libraries: the original code runs over register-level
-models of the interrupt controller, the root counters, DMA, the GPU, the
-SPU, SIO0, the CD controller and the MDEC. Adapters remain for libapi's
-timer, pad and card members, libcard, libmcx, and libcd where it
-validates (btn). Each move below the API (D40, D42, D45, D47, D58) bought
-exactness by construction and independence from the SDK version, because
-the original library decides every value a game can observe. Together
-they made the layer beneath the SDK an emulated device layer
-([`emulation-layers.md`](emulation-layers.md)). The unified adapter layer
-plan, being written in `plans/unified-adaptor-layer/`, proposes native
-adapters per chip, with the device models as the fallback.
+**Chips (D59).** The boundary file groups the chip libraries: irq
+(libetc, libapi's `counter.o`), gpu (libgpu), sio0 (libpad), cd (libcd,
+libds), mdec (libpress), spu (libspu, libsnd). `psxw build` decides each
+chip as a whole:
+- **native** when every placed object of the group that defines an
+  adapter's function is validated, the game binds adapters there, and the
+  code outside the group, through direct calls that stop at those
+  adapters, reaches nothing in the group that touches hardware or kernel
+  RAM itself. Group code it reaches that doesn't (libds over libcd, a
+  packet helper) runs as guest code over the adapters.
+- **emulated** otherwise: every member's original code over the chip's
+  register-level device.
+
+What touches hardware comes from the translator's constant-address facts
+and from the SDK's reach table, `boundary/reach/<sdk>.json`. `psxw sdk
+scan` writes the table from the SDK's library objects; it sees register
+pointers kept in data, which most PsyQ libraries use. `build.json` gives
+each chip's mode and the reason, and a summary line ("emulated: gpu,
+spu; 2 of 5 chips"). `game.toml` `[chips] native` lists the chips a game
+expects native, and the build fails if one falls back. `--device
+<chip,…|all>` forces chips onto their devices. A run reports register
+accesses per chip, and `psxw run --check no-io` requires none.
+
+**Where the boundary sits today.** The device models carry most chips:
+the original code runs over register-level models of the interrupt
+controller, the root counters, DMA, the GPU, the SPU, SIO0, the CD
+controller and the MDEC. Each move below the API (D40, D42, D45, D47,
+D58) bought exactness by construction and independence from the SDK
+version, because the original library decides every value a game can
+observe. Together they made the layer beneath the SDK an emulated device
+layer ([`emulation-layers.md`](emulation-layers.md)). D59 makes the
+adapters first again, chip by chip, with the device models as the
+fallback (`plans/unified-adaptor-layer/`).
 
 **The runtime splits into three layers**, so that SDK versions stay cheap:
 
@@ -440,15 +461,15 @@ The PsyQ policy (`boundary/psyq.toml`):
 
 | Library | Policy |
 |---|---|
-| libapi | `adapter`. Translated; BIOS calls go to the Rust BIOS (D13). Adapters for `counter.o` (`SetRCnt`… program the timers), `pad.o` and `patch.o` (BIOS pad buffers and patches) and `first.o` (`firstfile`, the memory card directory). `chclrpad.o` and `padstop.o` touch no hardware and run as guest code. |
-| libetc | `device`: original code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
-| libgpu | `device`: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
-| libcd | `adapter-or-device` (D58). The adapters sit at the drive (`CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`). btn binds them; bof4's game code and libds reach libcd's drive layer past them (`CD_cw`, `CD_init`, `StSetRing`), so its libcd runs as original code over the CD controller. |
-| libds | `device`: original code over the CD controller (D58). No adapters exist. |
-| libpress | `device`: original code over the MDEC, DMA0 in and DMA1 out (D58). |
-| libspu | `device`: original code over the register-level SPU and DMA4 (D41, D47). |
-| libsnd | `device`: original code (D14). The sequencer *is* the game's music, and its direct SPU register writes reach the SPU (D47). |
-| libpad | `device`: original code over SIO0 (D40). Its state machine is the behaviour games observe, and the device is a port of the oracle's. |
+| libapi | `adapter`. Translated; BIOS calls go to the Rust BIOS (D13). Adapters for `pad.o` and `patch.o` (BIOS pad buffers and patches) and `first.o` (`firstfile`, the memory card directory). `counter.o` (`SetRCnt`… program the timers) is `adapter-or-device`, in chip irq. `chclrpad.o` and `padstop.o` touch no hardware and run as guest code. |
+| libetc | `adapter-or-device`, chip irq. On the device: original code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
+| libgpu | `adapter-or-device`, chip gpu. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
+| libcd | `adapter-or-device`, chip cd (D58). The adapters sit at the drive (`CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`). btn binds them; bof4's game code and libds reach libcd's drive layer past them (`CD_cw`, `CD_init`, `StUnSetRing`), so its CD is emulated: libcd runs as original code over the CD controller. |
+| libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's adapters, or over the original (D58). |
+| libpress | `adapter-or-device`, chip mdec. On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
+| libspu | `adapter-or-device`, chip spu. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
+| libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 volume registers); on the device those writes reach the SPU (D47). |
+| libpad | `adapter-or-device`, chip sio0. On the device: original code over SIO0 (D40). Its state machine is the behaviour games observe, and the device is a port of the oracle's. |
 | libmcrd | `guest`, over the HLE BIOS card functions (D43). |
 | libcard | `adapter`. Its `_patch_card` patches Sony BIOS code in kernel RAM (D43). |
 | libmcx | `adapter`. |

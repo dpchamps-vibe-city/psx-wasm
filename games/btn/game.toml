@@ -100,3 +100,8 @@ previous_decomp = "3a159925fe0994ae43f11fd990eb6f5339f5833f"
 [mod.points]
 frame = { after = "PollPadInputs", doc = "once per scene frame, after the pads are read" }
 boot = { before = "main", doc = "once, when the executable starts" }
+
+[chips]
+# The chips this game runs native through their adapters (D59); a build
+# that falls back to one's device fails. The rest are emulated.
+native = ["cd"]

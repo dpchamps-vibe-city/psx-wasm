@@ -15,6 +15,9 @@
 //!   through a pointer reached a register silently. A failure names the
 //!   first frame and address; a `--debug-io` build traps at the store.
 //!
+//! - `--check no-io` (D59): the run made no register access: every chip
+//!   ran native. The run report counts accesses per chip (`io_accesses`).
+//!
 //! A replay's `expect` lines (M13) are checked whenever it runs:
 //! `SYMBOL==VALUE@COUNTER` holds once the frame counter reaches COUNTER.
 
@@ -348,6 +351,12 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
         };
         results.push(Check { name: "no-shadow-io", pass: hits.is_empty(), detail });
     }
+    if checks.iter().any(|c| c == "no-io") {
+        // Every chip native (D59): no register access at all.
+        let accesses = r.events.iter().rev().find(|e| e["event"] == "report").map(|e| e["io_accesses"].clone()).unwrap_or_default();
+        let hits: Vec<String> = accesses.as_object().into_iter().flatten().filter(|(_, n)| n.as_u64() != Some(0)).map(|(c, n)| format!("{c} {n}")).collect();
+        results.push(Check { name: "no-io", pass: hits.is_empty(), detail: if hits.is_empty() { "no register accesses".into() } else { hits.join(", ") } });
+    }
     // The replay's reached-state checks: each value when the counter first
     // reaches its mark.
     for (k, e) in expects.iter().enumerate() {
@@ -362,8 +371,8 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
         results.push(Check { name: "expect", pass, detail });
     }
     for c in &checks {
-        if !["boot", "determinism", "no-trap", "card", "no-shadow-io"].contains(&c.as_str()) {
-            bail!("unknown check {c} (boot, determinism, no-trap, card, no-shadow-io)");
+        if !["boot", "determinism", "no-trap", "card", "no-shadow-io", "no-io"].contains(&c.as_str()) {
+            bail!("unknown check {c} (boot, determinism, no-trap, card, no-shadow-io, no-io)");
         }
     }
     if !results.is_empty() {

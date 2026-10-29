@@ -46,7 +46,7 @@ pub type Adapter = fn(&mut M, [u32; 4]) -> Result;
 ///   stay for the objects they are validated against (`adapter-or-device`).
 /// - libpress: the MDEC (`psx_devices::mdec`) decodes what its own code
 ///   feeds it by DMA0, and DMA1 takes the pixels.
-pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress"];
+pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress", "libapi"];
 
 /// Event kinds the adapters schedule.
 pub mod ev {

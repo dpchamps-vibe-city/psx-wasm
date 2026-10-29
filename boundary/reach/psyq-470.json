@@ -1,0 +1,1402 @@
+{
+  "sdk": "psyq-470",
+  "members": {
+    "libapi/chclrpad": {
+      "0": [
+        "kernel"
+      ]
+    },
+    "libapi/counter": {
+      "0": [
+        "timers"
+      ],
+      "156": [
+        "timers"
+      ],
+      "212": [
+        "IRQ"
+      ],
+      "260": [
+        "IRQ"
+      ],
+      "312": [
+        "timers"
+      ]
+    },
+    "libapi/first": {
+      "0": [
+        "kernel"
+      ],
+      "412": [
+        "IRQ",
+        "SIO0",
+        "kernel"
+      ]
+    },
+    "libapi/pad": {
+      "484": [
+        "SIO0"
+      ],
+      "588": [
+        "IRQ"
+      ]
+    },
+    "libapi/patch": {
+      "40": [
+        "kernel"
+      ]
+    },
+    "libapi/sc2b": {
+      "764": [
+        "kernel"
+      ]
+    },
+    "libcard/end": {
+      "0": [
+        "kernel"
+      ]
+    },
+    "libcard/patch": {
+      "0": [
+        "kernel"
+      ],
+      "180": [
+        "kernel"
+      ],
+      "200": [
+        "kernel"
+      ],
+      "220": [
+        "kernel"
+      ],
+      "368": [
+        "kernel"
+      ]
+    },
+    "libcd/bios_1": {
+      "0": [
+        "CD"
+      ],
+      "1380": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ],
+      "2020": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ],
+      "2732": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ],
+      "3768": [
+        "CD"
+      ],
+      "3904": [
+        "CD",
+        "memctrl"
+      ],
+      "4116": [
+        "CD",
+        "SPU"
+      ],
+      "4432": [
+        "CD",
+        "memctrl"
+      ],
+      "4912": [
+        "DMA"
+      ],
+      "5284": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ]
+    },
+    "libcd/bios_2": {
+      "0": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ]
+    },
+    "libcd/bios_3": {
+      "0": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ]
+    },
+    "libcd/c_003": {
+      "0": [
+        "CD"
+      ]
+    },
+    "libcd/c_004": {
+      "0": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ]
+    },
+    "libcd/c_011": {
+      "0": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ],
+      "2376": [
+        "CD",
+        "DMA"
+      ]
+    },
+    "libcd/cdr_1": {
+      "52": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ],
+      "680": [
+        "CD",
+        "DMA",
+        "memctrl"
+      ]
+    },
+    "libcomb/comb": {
+      "68": [
+        "SIO1"
+      ],
+      "156": [
+        "IRQ",
+        "SIO1"
+      ],
+      "752": [
+        "SIO1"
+      ],
+      "840": [
+        "IRQ",
+        "SIO1"
+      ],
+      "1444": [
+        "SIO1"
+      ],
+      "2680": [
+        "IRQ",
+        "SIO1"
+      ],
+      "2804": [
+        "IRQ",
+        "SIO1"
+      ],
+      "3664": [
+        "IRQ",
+        "SIO1"
+      ],
+      "3924": [
+        "IRQ",
+        "SIO1"
+      ]
+    },
+    "libetc/hwconfig": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "kernel",
+        "rom",
+        "timers"
+      ]
+    },
+    "libetc/intr": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "48": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "96": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "144": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "196": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "244": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "292": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "356": [
+        "IRQ"
+      ],
+      "380": [
+        "IRQ"
+      ],
+      "404": [
+        "DMA",
+        "IRQ"
+      ],
+      "620": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "1084": [
+        "IRQ"
+      ],
+      "1412": [
+        "DMA",
+        "IRQ"
+      ],
+      "1572": [
+        "DMA",
+        "IRQ"
+      ]
+    },
+    "libetc/intr_dma": {
+      "0": [
+        "DMA"
+      ],
+      "76": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ],
+      "460": [
+        "DMA"
+      ]
+    },
+    "libetc/intr_vb": {
+      "0": [
+        "timers"
+      ],
+      "88": [
+        "DMA",
+        "IRQ",
+        "timers"
+      ]
+    },
+    "libetc/vsync": {
+      "0": [
+        "GPU",
+        "timers"
+      ]
+    },
+    "libgpu/break": {
+      "0": [
+        "DMA"
+      ],
+      "148": [
+        "GPU"
+      ],
+      "244": [
+        "DMA",
+        "GPU"
+      ]
+    },
+    "libgpu/param": {
+      "0": [
+        "GPU"
+      ],
+      "188": [
+        "GPU"
+      ],
+      "456": [
+        "GPU"
+      ]
+    },
+    "libgpu/sys": {
+      "0": [
+        "DMA",
+        "GPU"
+      ],
+      "464": [
+        "DMA",
+        "GPU"
+      ],
+      "740": [
+        "DMA",
+        "GPU"
+      ],
+      "892": [
+        "DMA",
+        "GPU"
+      ],
+      "1280": [
+        "DMA",
+        "GPU"
+      ],
+      "1424": [
+        "DMA",
+        "GPU"
+      ],
+      "1576": [
+        "DMA",
+        "GPU"
+      ],
+      "1672": [
+        "DMA",
+        "GPU"
+      ],
+      "1768": [
+        "DMA",
+        "GPU"
+      ],
+      "2152": [
+        "DMA",
+        "GPU"
+      ],
+      "2324": [
+        "DMA",
+        "GPU"
+      ],
+      "2416": [
+        "DMA",
+        "GPU"
+      ],
+      "2528": [
+        "DMA",
+        "GPU"
+      ],
+      "2720": [
+        "DMA",
+        "GPU"
+      ],
+      "2988": [
+        "DMA",
+        "GPU"
+      ],
+      "4312": [
+        "DMA",
+        "GPU"
+      ],
+      "6172": [
+        "GPU"
+      ],
+      "6196": [
+        "DMA"
+      ],
+      "6420": [
+        "GPU"
+      ],
+      "6980": [
+        "DMA",
+        "GPU"
+      ],
+      "7552": [
+        "DMA",
+        "GPU"
+      ],
+      "8192": [
+        "GPU"
+      ],
+      "8220": [
+        "GPU"
+      ],
+      "8284": [
+        "DMA",
+        "GPU"
+      ],
+      "8356": [
+        "GPU"
+      ],
+      "8440": [
+        "DMA",
+        "GPU"
+      ],
+      "9128": [
+        "DMA",
+        "GPU"
+      ],
+      "9736": [
+        "DMA",
+        "GPU"
+      ],
+      "10052": [
+        "DMA",
+        "GPU"
+      ],
+      "10420": [
+        "DMA",
+        "GPU"
+      ],
+      "10744": [
+        "GPU"
+      ],
+      "10904": [
+        "DMA",
+        "GPU"
+      ],
+      "11140": [
+        "DMA",
+        "GPU"
+      ],
+      "11376": [
+        "DMA",
+        "GPU"
+      ],
+      "11700": [
+        "DMA",
+        "GPU"
+      ]
+    },
+    "libgte/patchgte": {
+      "0": [
+        "kernel"
+      ]
+    },
+    "libgun/gun": {
+      "24": [
+        "SIO0"
+      ],
+      "200": [
+        "IRQ",
+        "SIO0"
+      ],
+      "1432": [
+        "IRQ",
+        "timers"
+      ],
+      "1708": [
+        "IRQ",
+        "SIO0"
+      ],
+      "1860": [
+        "IRQ"
+      ],
+      "1956": [
+        "IRQ",
+        "timers"
+      ],
+      "2384": [
+        "IRQ",
+        "exp2"
+      ],
+      "2760": [
+        "IRQ"
+      ],
+      "3036": [
+        "rom"
+      ]
+    },
+    "libgun/newgun": {
+      "308": [
+        "DMA",
+        "IRQ",
+        "exp2",
+        "timers"
+      ],
+      "660": [
+        "timers"
+      ]
+    },
+    "libmcx/mcxcmd10": {
+      "216": [
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "kernel",
+        "timers"
+      ]
+    },
+    "libmcx/mcxcmd12": {
+      "260": [
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "kernel",
+        "timers"
+      ]
+    },
+    "libmcx/mcxcmd15": {
+      "532": [
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "kernel",
+        "timers"
+      ]
+    },
+    "libmcx/mcxdsr": {
+      "0": [
+        "kernel"
+      ],
+      "448": [
+        "IRQ",
+        "SIO0"
+      ]
+    },
+    "libmcx/mcxinit": {
+      "0": [
+        "IRQ"
+      ]
+    },
+    "libmcx/mcxmain": {
+      "0": [
+        "IRQ",
+        "SIO0"
+      ],
+      "324": [
+        "IRQ",
+        "SIO0"
+      ],
+      "536": [
+        "timers"
+      ],
+      "588": [
+        "timers"
+      ],
+      "796": [
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libmcx/mcxresi": {
+      "0": [
+        "IRQ"
+      ],
+      "64": [
+        "IRQ"
+      ],
+      "128": [
+        "IRQ",
+        "SIO0"
+      ],
+      "632": [
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "kernel",
+        "timers"
+      ]
+    },
+    "libpad/pdcmd1": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdcmd2": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdcmd3": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "244": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pddirres": {
+      "344": [
+        "SIO0"
+      ],
+      "1460": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "1732": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "2352": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdent2": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdent3": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdent4": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdent5": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdgn1ini": {
+      "0": [
+        "IRQ",
+        "timers"
+      ],
+      "328": [
+        "rom"
+      ]
+    },
+    "libpad/pdgun": {
+      "0": [
+        "IRQ"
+      ]
+    },
+    "libpad/pdgunres": {
+      "0": [
+        "exp2"
+      ],
+      "60": [
+        "IRQ",
+        "timers"
+      ]
+    },
+    "libpad/pdhokres": {
+      "0": [
+        "kernel"
+      ],
+      "116": [
+        "kernel"
+      ],
+      "288": [
+        "DMA",
+        "IRQ",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdmaiini": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdmain1": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdresres": {
+      "0": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "104": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "504": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "1324": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "1564": [
+        "IRQ",
+        "SIO0",
+        "timers"
+      ],
+      "2112": [
+        "IRQ",
+        "SIO0",
+        "timers"
+      ],
+      "2748": [
+        "IRQ",
+        "SIO0"
+      ],
+      "2892": [
+        "SIO0"
+      ],
+      "3080": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "3760": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "5324": [
+        "timers"
+      ],
+      "5356": [
+        "timers"
+      ],
+      "5516": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "5588": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "5804": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "5976": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "6260": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpad/pdtapres": {
+      "396": [
+        "SIO0"
+      ],
+      "1764": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "2388": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ],
+      "3388": [
+        "DMA",
+        "IRQ",
+        "SIO0",
+        "exp2",
+        "timers"
+      ]
+    },
+    "libpress/libpress": {
+      "560": [
+        "DMA"
+      ],
+      "704": [
+        "DMA",
+        "MDEC"
+      ],
+      "944": [
+        "DMA",
+        "MDEC"
+      ],
+      "1088": [
+        "DMA"
+      ],
+      "1228": [
+        "MDEC"
+      ],
+      "1376": [
+        "DMA"
+      ],
+      "1524": [
+        "MDEC"
+      ],
+      "1548": [
+        "DMA",
+        "MDEC"
+      ]
+    },
+    "libsio/sio": {
+      "0": [
+        "SIO1"
+      ]
+    },
+    "libsio/siohandl": {
+      "0": [
+        "SIO1"
+      ],
+      "384": [
+        "SIO1"
+      ],
+      "1108": [
+        "SIO1"
+      ],
+      "1316": [
+        "SIO1"
+      ],
+      "1464": [
+        "SIO1"
+      ],
+      "1744": [
+        "SIO1"
+      ],
+      "1920": [
+        "SIO1"
+      ]
+    },
+    "libsnd/ssinit": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_f": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gav": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gca": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gccm": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gccr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gccv": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gcmv": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gcmva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gcmvx": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gi": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gks": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gm": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gnc": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvad": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvada": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvar": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvara": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvdr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvea": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvex": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvlsa": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvn": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvp": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvrr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvrra": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvsa": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvsl": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvsr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvsra": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvv": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_gvvx": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_rdd": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sav": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sca": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sccm": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sccr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sccv": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_scmv": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_scmva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sesa": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_si": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sk": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sm": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_snc": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sra": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_srd": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_srmd": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_srmp": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_srmt": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_sva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svad": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svada": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svar": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svara": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svdr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svn": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svp": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svrr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svrra": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svsl": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svsr": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svsra": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svv": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/s_svva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/sl_sva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/sn_gva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/sn_sva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/spu": {
+      "0": [
+        "DMA",
+        "SPU"
+      ],
+      "640": [
+        "SPU"
+      ],
+      "1088": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ],
+      "1276": [
+        "DMA",
+        "SPU"
+      ],
+      "1444": [
+        "DMA",
+        "SPU"
+      ],
+      "2316": [
+        "SPU"
+      ],
+      "2384": [
+        "SPU"
+      ],
+      "2548": [
+        "SPU"
+      ],
+      "2608": [
+        "DMA"
+      ],
+      "2696": [
+        "memctrl"
+      ],
+      "2736": [
+        "memctrl"
+      ]
+    },
+    "libspu/sr_gaks": {
+      "0": [
+        "SPU"
+      ],
+      "212": [
+        "SPU"
+      ]
+    },
+    "libspu/sr_sva": {
+      "0": [
+        "SPU"
+      ]
+    },
+    "libspu/st": {
+      "0": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ],
+      "1328": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ],
+      "2452": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ],
+      "4468": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ]
+    },
+    "libspu/t_c": {
+      "404": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ],
+      "488": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ],
+      "572": [
+        "DMA",
+        "SPU",
+        "memctrl"
+      ]
+    },
+    "libtap/tap": {
+      "24": [
+        "SIO0"
+      ],
+      "200": [
+        "IRQ",
+        "SIO0"
+      ],
+      "3884": [
+        "IRQ",
+        "SIO0"
+      ],
+      "4028": [
+        "IRQ"
+      ],
+      "4352": [
+        "IRQ"
+      ]
+    }
+  }
+}

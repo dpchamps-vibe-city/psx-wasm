@@ -12,11 +12,10 @@
 # policy = "guest"    guest code only (decompiled C or translated);
 #                     adapters must not claim these.
 # policy = "adapter-or-device"
-#                     decided per game for the whole library (D58): its
-#                     adapters when every placed object defining one of
-#                     their functions is validated, otherwise its original
-#                     code over the devices. Never a mix: the adapters keep
-#                     state in the runtime that the original can't see.
+#                     decided per game for the whole chip group the member
+#                     is in (D59; [chip.*] below): its adapters when the
+#                     chip runs native, otherwise its original code over
+#                     the chip's device. A chip never mixes the two.
 #
 # Every library a game places must have an entry here; an unknown one
 # fails the build (M13).
@@ -24,30 +23,32 @@
 # [object."<library>/<member>"] overrides a library's policy for one
 # member.
 
-[library.libapi]   # BIOS trampolines go to the Rust BIOS; counter.o, pad.o,
-policy = "adapter" # patch.o, first.o patch BIOS internals or program timers
+[library.libapi]   # BIOS trampolines go to the Rust BIOS; pad.o, patch.o,
+policy = "adapter" # first.o patch BIOS internals (mandatory adapters)
 
-[library.libetc]   # D45: original over the IRQ controller, DMA and timers,
-policy = "device"  # entered through the BIOS's custom exception exit
+[object."libapi/counter"] # chip irq: the root counters
+policy = "adapter-or-device"
 
-[library.libgpu]   # D42: original over the GPU front end and DMA
-policy = "device"
+[library.libetc]   # chip irq; on its device (D45), the BIOS enters libetc's
+policy = "adapter-or-device" # dispatcher through its custom exception exit
 
-[library.libcd]    # D58: adapters at the drive (CdInit, CdControl*, CdRead*,
-policy = "adapter-or-device" # CdSearchFile, …) for validated objects, else the
-                    # original over the register-level CD controller
+[library.libgpu]   # chip gpu; on its device (D42), the GPU front end and DMA
+policy = "adapter-or-device"
 
-[library.libds]    # D58: the original over the register-level CD controller
-policy = "device"  # (no adapters exist)
+[library.libcd]    # chip cd; on its device (D58), the CD controller
+policy = "adapter-or-device"
 
-[library.libpress] # the original over the MDEC (DMA0 in, DMA1 out)
-policy = "device"
+[library.libds]    # chip cd: guest code over libcd's adapters, or over the
+policy = "adapter-or-device" # original and the CD controller (D58)
 
-[library.libspu]   # D47: original over the register-level SPU and DMA4
-policy = "device"
+[library.libpress] # chip mdec; on its device, the MDEC (DMA0 in, DMA1 out)
+policy = "adapter-or-device"
 
-[library.libpad]   # D40: original over SIO0
-policy = "device"
+[library.libspu]   # chip spu; on its device (D47), the SPU and DMA4
+policy = "adapter-or-device"
+
+[library.libpad]   # chip sio0; on its device (D40), SIO0
+policy = "adapter-or-device"
 
 [library.libmcrd]  # guest code over the BIOS card functions
 policy = "guest"
@@ -58,8 +59,8 @@ policy = "adapter"
 [library.libcard]
 policy = "adapter"
 
-[library.libsnd]   # D47: the sequencer is the game's music: original code,
-policy = "device"  # its direct SPU register writes routed to the SPU
+[library.libsnd]   # chip spu: the sequencer is the game's music, original
+policy = "adapter-or-device" # code; its few SPU accesses are adapted or on the device
 
 [library.libgs]    # packet building into RAM
 policy = "guest"

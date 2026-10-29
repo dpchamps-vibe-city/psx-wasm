@@ -28,6 +28,16 @@ pub struct GameManifest {
     pub mods: ModSection,
     #[serde(default)]
     pub ci: CiSection,
+    #[serde(default)]
+    pub chips: ChipsSection,
+}
+
+/// `[chips]` (D59): the chips the game is expected to run native. A build
+/// where one falls back to its device fails, unless `--device` forced it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChipsSection {
+    #[serde(default)]
+    pub native: Vec<String>,
 }
 
 /// `[ci]`: how `psxw ci` treats this game (M13).

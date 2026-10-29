@@ -122,12 +122,15 @@ pub struct Io {
     pub memctrl: BTreeMap<u32, u32>,
     /// The last [`RECENT`] accesses: (cycle, address, size, value, write).
     pub recent: std::collections::VecDeque<(u64, u32, u32, u32, bool)>,
+    /// Register accesses so far, per chip (D59: what a run emulated).
+    pub accesses: BTreeMap<&'static str, u64>,
 }
 
 pub const RECENT: usize = 256;
 
 impl Io {
     fn note(&mut self, now: u64, addr: u32, size: u32, v: u32, write: bool) {
+        *self.accesses.entry(chip(addr)).or_default() += 1;
         if self.recent.len() == RECENT {
             self.recent.pop_front();
         }
@@ -583,6 +586,22 @@ impl<S: Sdk> Machine<S> {
             }
         }
         self.irq_calls.push_back(IrqStep::Exit);
+    }
+}
+
+/// The chip a register belongs to, for the run report.
+pub fn chip(addr: u32) -> &'static str {
+    match addr {
+        0x1F80_1040..0x1F80_1050 => "SIO0",
+        0x1F80_1050..0x1F80_1060 => "SIO1",
+        0x1F80_1070..0x1F80_1078 => "IRQ",
+        0x1F80_1080..0x1F80_1100 => "DMA",
+        0x1F80_1100..0x1F80_1130 => "timers",
+        0x1F80_1800..0x1F80_1804 => "CD",
+        0x1F80_1810..0x1F80_1818 => "GPU",
+        0x1F80_1820..0x1F80_1828 => "MDEC",
+        0x1F80_1C00..0x1F80_2000 => "SPU",
+        _ => "other",
     }
 }
 
