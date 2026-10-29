@@ -286,6 +286,20 @@ How each tier is produced:
   straight-line window must be confirmed by dataflow. Calls name their
   target by address (`psxw_f_<ADDR>`, or `psxw_d_<ADDR>` for a call into an
   overlay slot), and the linker binds each one to a tier.
+
+  Hand-written code adds three idioms (M13):
+  - a table of code addresses inside the function's own text, indexed
+    without a bounds check: its entries are the words that point into the
+    function, and it becomes a local switch;
+  - a jump to a computed offset in a block only a code pointer reaches,
+    which reads registers the ABI doesn't pass (an unrolled loop entered
+    part way): the block is expanded into the jumping function, every
+    instruction of its branch-free head a target;
+  - a jump through a register holding the entry `ra`: `r31` starts at 0,
+    standing for the caller's return address, so a jump to 0 returns.
+
+  A load whose result nothing reads is kept, as a volatile read: from an
+  I/O register it pops a FIFO.
 - **A translated SDK is reusable.** Games link SDK members byte for byte, so
   the translated C is cached per SDK release, keyed by member hash, and
   reused by every game linking that member. It is derived from Sony's
