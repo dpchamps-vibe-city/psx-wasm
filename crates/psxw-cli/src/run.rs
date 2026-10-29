@@ -14,13 +14,90 @@
 //!   bytes in guest memory are as device accesses left them: no store
 //!   through a pointer reached a register silently. A failure names the
 //!   first frame and address; a `--debug-io` build traps at the store.
+//!
+//! A replay's `expect` lines (M13) are checked whenever it runs:
+//! `SYMBOL==VALUE@COUNTER` holds once the frame counter reaches COUNTER.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_host_native::{Options, Overlay, RunReport, Stop};
 use psxw_inputs::Workspace;
 use serde::Serialize;
 
+/// A replay's reached-state check (M13): the `size`-byte value at `addr`
+/// once the frame counter reaches `counter`.
+#[derive(Debug, Clone)]
+pub struct Expect {
+    pub text: String,
+    pub addr: u32,
+    pub size: u32,
+    pub value: u32,
+    pub counter: u32,
+}
+
+/// Parse a replay's `expect` lines against the game's address map.
+pub fn expects(ws: &Workspace, game: &str, lines: &[String]) -> Result<Vec<Expect>> {
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inputs = psxw_lift::run::load(ws, game)?;
+    lines
+        .iter()
+        .map(|l| {
+            let (sym, size, value, counter) = parse_expect(l)?;
+            let addr = inputs.map.resolve(&inputs.map.main, &sym).with_context(|| format!("expect {l:?}: {sym} does not resolve"))?.addr;
+            Ok(Expect { text: l.clone(), addr, size, value, counter })
+        })
+        .collect()
+}
+
+/// `SYMBOL[:SIZE]==VALUE@COUNTER`: (symbol, size, value, counter).
+fn parse_expect(l: &str) -> Result<(String, u32, u32, u32)> {
+    let bad = || anyhow::anyhow!("expect {l:?}: want SYMBOL[:SIZE]==VALUE@COUNTER");
+    let (lhs, rest) = l.split_once("==").ok_or_else(bad)?;
+    let (value, counter) = rest.split_once('@').ok_or_else(bad)?;
+    let (sym, size) = match lhs.trim().rsplit_once(':') {
+        Some((s, n)) if ["1", "2", "4"].contains(&n) => (s, n.parse()?),
+        _ => (lhs.trim(), 4),
+    };
+    let num = |t: &str| psxw_inputs::parse_u32(t.trim()).or_else(|| t.trim().parse::<i64>().ok().map(|v| v as u32)).ok_or_else(bad);
+    Ok((sym.to_string(), size, num(value)?, num(counter)?))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn expect_lines() {
+        assert_eq!(super::parse_expect("D_80012345+0x8==3@1200").unwrap(), ("D_80012345+0x8".into(), 4, 3, 1200));
+        assert_eq!(super::parse_expect("gMode:1 == 0x2 @ 400").unwrap(), ("gMode".into(), 1, 2, 400));
+        assert!(super::parse_expect("gMode=2@400").is_err());
+    }
+}
+
 pub fn options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Vec<String>)> {
+    let (o, checks, _) = options_with_expects(ws, game, args)?;
+    Ok((o, checks))
+}
+
+/// [`options`], and the replay's reached-state checks: the run traces the
+/// frame counter and watches each checked address.
+pub fn options_with_expects(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Vec<String>, Vec<Expect>)> {
+    let mut expect_lines = Vec::new();
+    if let Some(i) = args.iter().position(|a| *a == "--replay") {
+        if let Some(spec) = args.get(i + 1).map(|n| ws.replay_spec(game, n)).transpose()?.flatten() {
+            expect_lines = spec.expect;
+        }
+    }
+    let (mut o, checks) = parse_options(ws, game, args)?;
+    let ex = expects(ws, game, &expect_lines)?;
+    if !ex.is_empty() {
+        let inputs = psxw_lift::run::load(ws, game)?;
+        o.trace_u32 = Some(psxw_build::game::frame_counter(ws, game, &inputs)?);
+        o.watch.extend(ex.iter().map(|e| (e.addr, e.size)));
+    }
+    Ok((o, checks, ex))
+}
+
+fn parse_options(ws: &Workspace, game: &str, args: &[&str]) -> Result<(Options, Vec<String>)> {
     let manifest = ws.game(game)?;
     let mut o = Options {
         wasm: psxw_build::game::game_path(ws, game),
@@ -202,7 +279,8 @@ fn boot_checks(ws: &Workspace, game: &str, o: &Options, r: &RunReport) -> Result
 /// Runs the game with `args` and evaluates the requested checks; writes
 /// `out/run/<game>/run.json` (and `checks.json` when there are checks).
 pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport, Vec<Check>)> {
-    let (mut o, checks) = options(ws, game, args)?;
+    let (mut o, checks, expects) = options_with_expects(ws, game, args)?;
+    let watch_base = o.watch.len() - expects.len();
     if checks.iter().any(|c| c == "boot") {
         o.overlays = overlays(ws, game)?;
         o.frames = o.frames.max(1200);
@@ -260,6 +338,19 @@ pub fn evaluate(ws: &Workspace, game: &str, args: &[&str]) -> Result<(RunReport,
             ),
         };
         results.push(Check { name: "no-shadow-io", pass: hits.is_empty(), detail });
+    }
+    // The replay's reached-state checks: each value when the counter first
+    // reaches its mark.
+    for (k, e) in expects.iter().enumerate() {
+        let at = r.trace.iter().position(|&c| c >= e.counter);
+        let (pass, detail) = match at {
+            None => (false, format!("{}: the counter never reached {} (last {:?})", e.text, e.counter, r.trace.last())),
+            Some(i) => {
+                let got = r.watched.get(i).and_then(|row| row.get(watch_base + k)).copied().unwrap_or(0);
+                (got == e.value, format!("{}: {got:#x} at frame {} (counter {})", e.text, i + 1, r.trace[i]))
+            }
+        };
+        results.push(Check { name: "expect", pass, detail });
     }
     for c in &checks {
         if !["boot", "determinism", "no-trap", "card", "no-shadow-io"].contains(&c.as_str()) {

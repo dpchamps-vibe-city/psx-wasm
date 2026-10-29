@@ -100,6 +100,11 @@ pub struct ReplaySpec {
     pub frames: u32,
     #[serde(default)]
     pub press: Vec<String>,
+    /// Reached-state checks (M13): `SYMBOL==VALUE@COUNTER`, the guest word
+    /// at SYMBOL (an address-map expression; `SYMBOL:1` or `:2` for a byte
+    /// or halfword) equals VALUE once the frame counter reaches COUNTER.
+    #[serde(default)]
+    pub expect: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
