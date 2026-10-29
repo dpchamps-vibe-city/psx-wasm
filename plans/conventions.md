@@ -108,7 +108,7 @@ components.
 ## Documentation
 
 - `docs/design.md` changes whenever an architectural decision changes.
-  Record the change in `decisions.md` too.
+  Record the change in `docs/design.md` (its decision log) too.
 - Each milestone file keeps its Status, ticked Tasks, Progress log and
   Findings current. Findings that affect later milestones are also copied
   into those milestones' Context sections.

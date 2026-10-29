@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://psx-wasm.invalid/schema/mod.schema.json",
   "title": "psx-wasm mod (mod.json)",
-  "description": "A mod's identity, load order and every declaration (plans/M11-modkit.md). Every distinct aspect is its own field.",
+  "description": "A mod's identity, load order and every declaration (plans/completed/M11-modkit.md). Every distinct aspect is its own field.",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "version", "game"],

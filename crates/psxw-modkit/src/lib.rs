@@ -1,4 +1,4 @@
-//! The modkit (plans/M11-modkit.md): mods change and extend a game built by
+//! The modkit (plans/completed/M11-modkit.md): mods change and extend a game built by
 //! psx-wasm with their own code. Each mod states every hook, its target
 //! and its type in `mod.json` ([`decl`]); mod code is ordinary C.
 //!

@@ -11,7 +11,7 @@ boots from the user's disc (`psxw.local.toml`) into its main loop,
 deterministically, natively and in the browser.
 Milestones and their state: [plans/README.md](plans/README.md). The design
 is in [docs/design.md](docs/design.md); decisions in
-[plans/decisions.md](plans/decisions.md).
+[docs/design.md, "Decision log"](docs/design.md#decision-log).
 
 ```sh
 cargo build --release -p psxw-cli

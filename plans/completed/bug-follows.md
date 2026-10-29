@@ -1,8 +1,8 @@
 # Bug follow-ups
 
 Bugs found playing btn in the browser (2026-10-26), what each one is, and
-the fix we want. Open toolchain tasks that aren't bugs stay in
-[`follow-up-tasks.md`](follow-up-tasks.md).
+the fix we want. §2 and §3 are fixed and kept as history. §1 and §4 are
+open, tracked in [`open-items.md`](../open-items.md).
 
 ## 1. `void` functions that return a value
 
@@ -28,27 +28,11 @@ answers v0 = 0.
   returns `ovl_11_func_800E5704`'s "arrived" result. It never read 1.
   Still `void` at b37ae28.
 
-**Current state: a stopgap to remove.** `36764d8` routes these functions
-to the translated tier (`build.json` `void_results`: 62 in btn at
-3a15992, 54 at b37ae28). It works,
-but it hides a decomp defect by swapping code. Replace it with:
-
-1. **A normalizer rule in psxw-cc** (like the existing GCC-idiom rules).
-   For a C-defined `void` function whose original leaves its last
-   callee's v0 at every exit (lifter fact `returns_callee_v0`) and whose
-   result something reads (a C caller declares a result, translated code
-   reads v0 after the call, or its address is taken), rewrite the
-   definition before clang sees it: the return type becomes the callee's,
-   and each exit's trailing call becomes `return <call>;`. The census
-   counts it like any rule. If a flagged function can't be rewritten
-   (exits that don't end in the call), the build fails with the function,
-   the conflicting declarations and the evidence. No silent fallback to
-   the translated tier. Then drop the tiering half of `36764d8`, keeping
-   the detection.
-2. **Fix btn-decompilation.** Change each flagged definition to return its
-   callee's value, and make the conflicting prototypes agree (the code
-   still matches byte for byte). Bump the pin. After that the rule applies
-   nowhere in btn and stays for other decomps.
+**Current state: open.** `36764d8` routes these functions to the
+translated tier (`build.json` `void_results`: 62 in btn at 3a15992, 54 at
+b37ae28). It works, but it hides a decomp defect by swapping code. The
+replacement (a psxw-cc normalizer rule, then btn-decompilation fixes) is
+in [`open-items.md`](../open-items.md), Bugs.
 
 ## 2. Entities don't collide or respond
 
@@ -69,7 +53,7 @@ tag (`query.object = &arg1; ... query.object->field_2`), matched no entry
 in the 0xC5-entry item pool (weeds, stones, sticks) and no actor, while
 the map probe, which ignores the tag, kept working.
 
-**Fix (linker).** "C calls C directly when the signatures agree" now
+**Fix (linker, `e3f65f1`).** "C calls C directly when the signatures agree" now
 also compares clang's C-level kinds: a struct by value (or hidden
 struct return) on one side only, or variadic on one side only, sends the
 call through the o32 boundary, which converts exactly as the PS1 does.
@@ -101,7 +85,7 @@ that matched no file, such as an empty card or a save that doesn't exist
 yet, waited forever. Saves found by the search returned before the wait,
 which is why the libmcrd conformance scenario never hit it.
 
-**Fix (`psx-bios::card`).** The `bu` functions make the BIOS's check
+**Fix (`psx-bios::card`, `ad39b70`).** The `bu` functions make the BIOS's check
 and deliver its events: 04h, 100h with no card, and 2000h then 04h for a
 new card, which the check accepts. The event split now follows OpenBIOS
 and what libmcrd waits on. Raw `_card_read`/`_card_write` and every file
@@ -110,11 +94,6 @@ frame deliver only F0000011h; F4000001h comes from `_card_info`,
 
 ## 4. Smaller findings from the same session
 
-- **Lifted SDK asm that reads temporaries on entry** (`_spu_pitch2note`
-  t1/t2, `func_80037470`/`94` t0–t2, `func_8003A2A4` t3): their callers'
-  values don't reach them. Audit each.
-- **Emulator title-menu timing:** the menu appears about 10 counter steps
-  later on the emulator than natively, so a press recorded right after it
-  appears natively is lost there; loads also tick the counter differently
-  (D48). Replays recorded in the page don't steer the emulator through the
-  title menu.
+Both open, in [`open-items.md`](../open-items.md):
+- **Lifted SDK asm that reads temporaries on entry** (Bugs);
+- **Emulator title-menu timing** (Blocked on CD timing).

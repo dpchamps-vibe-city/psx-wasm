@@ -1,4 +1,4 @@
-//! The mod library for Rust mods (plans/M11-modkit.md, phase 2): what
+//! The mod library for Rust mods (plans/completed/M11-modkit.md, phase 2): what
 //! `psxmod.h` is to C. A mod is a `no_std` `cdylib` for
 //! `wasm32-unknown-unknown`, linked with `--emit-relocs` and
 //! `--allow-undefined`; psxw places it in the mod area, so its statics,

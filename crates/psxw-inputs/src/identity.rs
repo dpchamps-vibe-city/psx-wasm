@@ -1,4 +1,4 @@
-//! SDK object identity (plans/M08-sdk-generality.md, task 1): which PsyQ
+//! SDK object identity (plans/completed/M08-sdk-generality.md, task 1): which PsyQ
 //! object, of which SDK version, each linked SDK member in a game image
 //! is.
 //!

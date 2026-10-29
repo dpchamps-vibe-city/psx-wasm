@@ -1,6 +1,7 @@
 # M7 — Saves and a full play session
 
-**Status:** in progress (tasks 1–3 and 7 done; 4–5 wait for the human's recordings, 6 is blocked on CD timing, D48)
+**Status:** closed (tasks 1–3 and 7 done). Its open items are in
+[`open-items.md`](../open-items.md).
 **Depends on:** M4, M6 (and M5 for browser storage). **Unlocks:** M9.
 **Design refs:** design: Runtime (sio), Oracles (whole-game); decisions
 D21–D23.

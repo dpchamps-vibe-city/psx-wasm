@@ -1,4 +1,4 @@
-//! What the modkit adds to a game link (plans/M11-modkit.md): mod code as
+//! What the modkit adds to a game link (plans/completed/M11-modkit.md): mod code as
 //! more inputs, hook chains on game functions, and data patches.
 //!
 //! - **Mod inputs** are C objects. Their names resolve first inside the mod

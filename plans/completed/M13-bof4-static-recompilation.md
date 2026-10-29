@@ -1,8 +1,7 @@
 # M13 — Breath of Fire IV: a game with no decompiled C
 
-**Status:** in progress (the headless replay reaches the first field
-scene and walks in four directions, with every check passing; the
-harness push and so a GitHub-installable pin wait on the human)
+**Status:** closed (tasks 1–4 and 6–21 done). Its open items are in
+[`open-items.md`](../open-items.md).
 **Depends on:** M2, M8. Parallel with M7. **Unlocks:** M9's generality
 claim, on a game whose code is entirely translated.
 **Design refs:** design §3 (overlays), §4 (one implementation per
@@ -292,7 +291,7 @@ run alongside. Task 15 onward needs phase 2's commit.
     - Event control blocks can stay in Rust unless a game reads them.
     - `func_8013A308` then passes the lift.
 
-**Decisions (the human's; record in `decisions.md` and `docs/design.md`)**
+**Decisions (the human's; record in `docs/design.md` and its decision log)**
 
 11. [x] **D57: how guest threads run.** Recorded: (a), as recommended.
     - ChangeThread has to suspend one guest call stack and resume another.
@@ -427,7 +426,7 @@ census and lift)
     - conformance for every newly validated object.
 
     Update `docs/design.md` (threads, the CD, MDEC, kernel tables in RAM),
-    `decisions.md` and the README index.
+    the design's decision log and the README index.
 
 ## Exit criteria (all automated)
 
@@ -465,8 +464,8 @@ census and lift)
   16.
 - **Hardware access hidden behind pointers** in Capcom's own code shows up
   only at run time. Task 9's check exists for that.
-- **Lifted functions that read temporaries on entry** (follow-up-tasks
-  "Gaps") will recur at this scale.
+- **Lifted functions that read temporaries on entry**
+  ([`open-items.md`](../open-items.md), Bugs) will recur at this scale.
 - **FMV and XA streaming** depend on CD timing. D48's caveats apply to any
   comparison with Beetle.
 - **Track 2.** If it's CD audio, the CD needs a Play path and SPU CD
@@ -560,8 +559,8 @@ census and lift)
     longer (the FMV starts at counter 763 vs 476).
   - **A seam at x=303/304:** the rightmost macroblock column of our FMV
     pictures comes from another picture.
-- **Also open:** bof4 with a second pad (follow-up tasks); older tests
-  that embed btn facts (follow-up tasks).
+- **Also open:** bof4 with a second pad; older tests that embed btn facts
+  (both in [`open-items.md`](../open-items.md)).
 - **The native-port claim** (discussed 2026-10-29,
   `docs/status-btn-vs-bof4.md`): the CPU isn't emulated, but D40–D58
   moved the hardware boundary below the SDK, so both games run on
@@ -573,7 +572,8 @@ census and lift)
   found no code keyed to bof4. It flagged bof4's gp in a psx-bios test
   and borrowed fixture values in two harness tests; both were replaced
   with made-up values (psx-wasm `b7d0ae2`, harness
-  `dd8c4a6`). Older tests still embed btn facts (follow-up tasks).
+  `dd8c4a6`). Older tests still embed btn facts
+  ([`open-items.md`](../open-items.md)).
 
 - **A second pad changes bof4's path.** With a pad in port 2 (as every
   replay had) the game draws nothing and its loop runs at a fixed rate;

@@ -1,5 +1,5 @@
 //! `mod.json`: a mod's identity, load order and every declaration
-//! (plans/M11-modkit.md "Declarations"). Every distinct aspect is its own
+//! (plans/completed/M11-modkit.md "Declarations"). Every distinct aspect is its own
 //! field; `schema/mod.schema.json` describes the same file for editors.
 
 use anyhow::{Context as _, Result, bail, ensure};

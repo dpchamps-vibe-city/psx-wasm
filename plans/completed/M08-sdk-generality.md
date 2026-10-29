@@ -1,7 +1,7 @@
 # M8 — SDK generality
 
-**Status:** in progress (tasks 1–4 and 7 done, Q2 decided; 5 waits for the
-PsyQ `.LIB` files, 6 is parked)
+**Status:** closed (tasks 1–4 and 7 done, Q2 decided). Its open items
+are in [`open-items.md`](../open-items.md).
 **Depends on:** M2. Parallel with M4–M7. **Unlocks:** M9.
 **Design refs:** design §4 (the translated SDK cache), §5 (devices, BIOS,
 adapters keyed by object identity; layout generation); decisions D12–D15,
@@ -81,7 +81,7 @@ PsyQ 4.7 set:
   parameterized by object hash, run for every adapter and every object it
   claims.
 - **Q2:** decide whether to add a register-level SPU fallback for unknown
-  libspu versions. Record the decision in `decisions.md`.
+  libspu versions. Record the decision in the design's decision log.
 
 **Out:** writing adapters for SDK versions no target game uses. That
 belongs to whichever milestone first needs them (M9).

@@ -1,5 +1,5 @@
 //! The displayed frame and VRAM at the whole-game oracle's aligned points
-//! (plans/M13-bof4-static-recompilation.md task 21). Both sides write the
+//! (plans/completed/M13-bof4-static-recompilation.md task 21). Both sides write the
 //! picture presented at each counter checkpoint beside its RAM dump:
 //! psx-wasm as a PNG (`render::png`, stored deflate blocks), the emulator
 //! host as a binary PPM. VRAM is 1024×512 16-bit words, little-endian.

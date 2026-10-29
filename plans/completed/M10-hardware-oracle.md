@@ -1,7 +1,7 @@
 # M10 — Hardware oracle
 
-**Status:** in progress: the parts that need no rig (tasks 5 and 6) are
-done. The rest waits on a rig (human-needed).
+**Status:** closed (tasks 5 and 6 done). Its open items are in
+[`open-items.md`](../open-items.md).
 **Depends on:** M3, and a rig. Can run any time after M3.
 **Design refs:** design: Oracles (the upgrade path); decisions D22–D24.
 
@@ -110,7 +110,7 @@ real one.
 ## Findings
 
 - **GTE questions only hardware can settle (from M4).** See
-  `completed/M04-pixels.md`, Findings.
+  [`M04-pixels.md`](M04-pixels.md), Findings.
   - The set `disputed-gte`: GPL's MAC overflow flag at exactly 2^43−1.
     The emulator flags it; psx-spx and psx-gte don't.
   - The N/A opcodes 00h and 1Ah, which the emulator runs as RTPS and DCPL.

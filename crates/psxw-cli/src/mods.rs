@@ -1,4 +1,4 @@
-//! `psxw mod …` (plans/M11-modkit.md): checking, building, testing and
+//! `psxw mod …` (plans/completed/M11-modkit.md): checking, building, testing and
 //! playing mods, inside a mods workspace (`psxmods.json` above the current
 //! directory) or inside psx-wasm with the game and mod directories named.
 
