@@ -1,8 +1,9 @@
 # M13 — Breath of Fire IV: a game with no decompiled C
 
-**Status:** in progress (psx-wasm pins bof4-decomp @ `48159a8`; census
-passes; lift has 1 problem left; the build fails; harness work is
-uncommitted)
+**Status:** in progress (harness bootstrap committed locally, not yet
+pushed; lift passes; the build links only past 3 split defects, and that
+build boots to the Capcom logo with every boot, determinism and no-trap
+check passing)
 **Depends on:** M2, M8. Parallel with M7. **Unlocks:** M9's generality
 claim, on a game whose code is entirely translated.
 **Design refs:** design §3 (overlays), §4 (one implementation per
@@ -196,7 +197,8 @@ run alongside. Task 15 onward needs phase 2's commit.
 
 ### Phase 1 — psx-decompilation-harness (`../psx-decompilation-harness`)
 
-1. [ ] **Reconcile and commit the bootstrap work.**
+1. [x] **Reconcile and commit the bootstrap work.** (`48fdd95`..`77cdcc2`;
+   the push waits for the human)
    - Bring the old-gcc pin move from bof4's `.pi/git/…` copy into the
      canonical checkout, then diff the two trees again. Only the canonical
      copy's additions (its tests) may remain.
@@ -247,14 +249,14 @@ run alongside. Task 15 onward needs phase 2's commit.
 
 **Make the build's verdict trustworthy (generic)**
 
-7. [ ] **Identity reads `.text`-labelled placements.**
+7. [x] **Identity reads `.text`-labelled placements.** (`5035cb3`)
    - `identity.rs:180` filters on `section.is_none()`. Share `map.rs`'s
      `is_text` instead, so `[…, o, lib/x/y, .text]` and `[…, o, lib/x/y]`
      both count.
    - Add a unit test with the explicit spelling.
    - Rerun `psxw identity bof4`. Expect about 300 members, all PsyQ 4.7.
    - Rerun `psxw build bof4` and record its real verdict.
-8. [ ] **Every linked library needs a boundary entry.**
+8. [x] **Every linked library needs a boundary entry.** (`1b4a623`)
    - A library placed in the game but missing from `boundary/psyq.toml`
      fails the build and is listed, instead of silently defaulting to
      `adapter`.
@@ -262,13 +264,13 @@ run alongside. Task 15 onward needs phase 2's commit.
      - `2mbyte` and `libsn`: `guest`;
      - `libds`: per D58;
      - `libpress`: `device`, with task 14.
-9. [ ] **Catch I/O through pointers.**
+9. [x] **Catch I/O through pointers.** (`5c70bdd`)
    - Add a `--check no-shadow-io` run check: after every frame, the
      window's I/O shadow (the masked addresses of `0x1F801000`–`0x1F803000`)
      must be untouched.
    - On failure, report the first frame and the writing function: a
      debug-build store hook or a bisect by frame.
-10. [ ] **Kernel tables in guest RAM.**
+10. [x] **Kernel tables in guest RAM.** (`5c70bdd`)
     - psx-bios lays out the kernel's system table at `0x100` in guest RAM,
       sized from SYSTEM.CNF (`TCB=`, `EVENT=`), with at least the TCB
       header and TCB array pointers (`0x108`, `0x110`) and the TCBs
@@ -281,7 +283,7 @@ run alongside. Task 15 onward needs phase 2's commit.
 
 **Decisions (the human's; record in `decisions.md` and `docs/design.md`)**
 
-11. [ ] **D57: how guest threads run.**
+11. [x] **D57: how guest threads run.** Recorded: (a), as recommended.
     - ChangeThread has to suspend one guest call stack and resume another.
       A translated function's MIPS registers live in wasm locals, so the
       wasm stack itself must be switched.
@@ -301,7 +303,8 @@ run alongside. Task 15 onward needs phase 2's commit.
         globals on every switch; it's the heaviest.
     - **Recommendation:** (a), scoped by the call graph, after the
       characterization.
-12. [ ] **D58: the CD for libds and unvalidated libcd.**
+12. [x] **D58: the CD for libds and unvalidated libcd.** Recorded: (b),
+    with `adapter-or-device` decided per library (see D58).
     - **(a) Ds adapters** over the existing drive model, plus conformance
       for each of bof4's 16 unvalidated libcd placements.
     - **(b) A register-level CD controller** (`0x1F801800`–`3`, IRQ2,
@@ -357,7 +360,7 @@ census and lift)
       EXE rodata.
 
     Record `game.wasm`'s size and the link time.
-17. [ ] **Manifest facts** in `games/bof4/game.toml`, found here:
+17. [x] **Manifest facts** in `games/bof4/game.toml`, found here (`f92561d`):
     - `[run] main_loop_symbol`: the function entered once per frame after
       boot. Trace it from `main` in the lifted call graph.
     - `[oracle] frame_counter`: a RAM word the game increments once per
@@ -383,7 +386,7 @@ census and lift)
        directions.
 
     Presses are frame-counter values.
-20. [ ] **Reached-state checks** (a generic `psxw run` feature).
+20. [x] **Reached-state checks** (a generic `psxw run` feature). (`dde6766`)
     - A replay can declare `expect = ["SYMBOL==VALUE@COUNTER", …]`: RAM
       predicates by symbol at frame-counter values.
     - The run fails when one doesn't hold.
@@ -462,8 +465,53 @@ census and lift)
     7's identity bug.
 - **2026-10-29:** plan widened to three repos (harness, bof4-decomp,
   psx-wasm).
+- **2026-10-29 (execution):**
+  - Harness: the two copies reconciled (only the canonical copy's tests
+    and an npm-install lockfile drift differed, plus the old-gcc pin);
+    `npm test` 1637 pass, 0 fail; five commits `48fdd95`..`77cdcc2`.
+  - Task 7: identity finds 311 members (310 by signature, all PsyQ 4.7;
+    `libgte/smp_00_1` by subsegment). The build's real verdict was then
+    five unimplemented BIOS calls (rand, Exec, the three thread calls).
+  - Tasks 8, 10, 13, 14 (code): boundary completeness, `adapter-or-device`,
+    kernel tables in RAM, BIOS threads over Asyncify, the CD controller,
+    the MDEC (`1b4a623`, `f476bd1`, `5c70bdd`). `psxw lift bof4`: PASS, no
+    problems. btn builds unchanged (adapter 47, c 2523, lift 817; libcd
+    keeps its adapters).
+  - The build stops at 19 generated calls to 3 addresses no container
+    defines (split defects, below). Linked past them as an uncommitted
+    experiment: `game.wasm` 9.2 MB, link + Asyncify + merge + optimize in
+    17 s, Asyncify over 3,697 of 17,796 functions. It boots to the Capcom
+    logo; `--check boot --check determinism --check no-trap` all pass over
+    1200 frames (EXE byte-exact, 1058 sectors EDC-clean, the main loop
+    entered 763 times, 1527 thread switches by frame 1800, RAM and audio
+    identical across runs); `no-shadow-io` fails only on the unplaced
+    libpress (task 6).
 
 ## Findings
+
+- **The split misses leaf functions at the start of overlays.** Calls
+  from other containers land where the configs have rodata: `ovl_4319`'s
+  code starts at `0x801E6808` (a `lui`/`lhu` pair scheduled before the
+  `addiu sp` the splitter keys on), `ovl_5659` has a frameless setter at
+  `0x800F886C` (`lui v0; jr ra; sw a0`) and `ovl_7271` a getter at
+  `0x800F88E4`, all inside the leading region split as rodata. 19 call
+  sites in 17 overlays reach them. That's a harness fix (cross-container
+  call targets as code evidence) plus a regeneration, not a hand edit.
+- **`adapter-or-device` can't be per object.** bof4's libcd has one
+  validated adapter function (`CdDataCallback`), but its game code and
+  libds call libcd's drive layer directly (`CD_cw`, `CD_init`, `St*`). A
+  bound `CdDataCallback` adapter would keep the callback in the runtime,
+  where libcd's original interrupt code never looks. The policy is
+  decided for the whole library by what outside code reaches past the
+  adapters (D58).
+- **The BIOS leaves the CD controller's interrupts enabled.** libcd's
+  `CD_init` writes the enable register only when flags are pending, so a
+  controller that resets it to 0 never raises IRQ2.
+- **Threads in practice.** bof4 runs a round-robin scheduler on the main
+  thread over up to four worker threads, each yielding with
+  `ChangeThread(0xFF000000)` from arbitrary depth. Asyncify over the
+  reverse call graph plus every indirect caller covers 21% of functions
+  and costs little: 600 frames run in 1.7 s headless.
 
 - **The lift is a free split validator.** The lift's FAIL on 12 overlay
   functions was the split's fault (pointer tables split as code), not the

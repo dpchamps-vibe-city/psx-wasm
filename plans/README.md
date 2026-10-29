@@ -90,7 +90,7 @@ with PsyQ 4.7. Nothing in code may be specific to it.
 | [M10](M10-hardware-oracle.md) | Hardware oracle | **in progress** (batch export/import, disagreement report; capture waits for a rig) | M3; a rig | Vector archive replayed on hardware |
 | [M11](M11-modkit.md) | Modkit | **done** (browser runs of acceptance 5 and 7 waived); compiled mods deprecated for M12's script mods (D56) | M2 (phase 1), M5 (phase 2) | Example mods' effects by replay; empty mod set == plain build; static and dynamic backends agree |
 | [M12](M12-script-mods.md) | Script mods | **done** | M11 | Script twins == compiled mods bit for bit in both browsers; a script pass-through on every hookable function == plain build |
-| [M13](M13-bof4-static-recompilation.md) | Breath of Fire IV: a game with no decompiled C (spans the harness, bof4-decomp and psx-wasm) | **in progress** (census passes; lift has 1 problem; build fails; harness work uncommitted) | M2, M8 (*parallel* with M7) | A headless replay to the first field scene: determinism, no traps, reached-state checks; `psxw ci btn` unchanged |
+| [M13](M13-bof4-static-recompilation.md) | Breath of Fire IV: a game with no decompiled C (spans the harness, bof4-decomp and psx-wasm) | **in progress** (lift passes; boots to the Capcom logo past 3 split defects; harness committed, not pushed) | M2, M8 (*parallel* with M7) | A headless replay to the first field scene: determinism, no traps, reached-state checks; `psxw ci btn` unchanged |
 
 ```
 M0 ─► M1 ─► M2 ─┬─► M4 ─► M5
