@@ -526,6 +526,13 @@ census and lift)
 
 ## Findings
 
+- **Generality review (exit criterion 7).** An independent review of
+  psx-wasm (`0ebd944`..) and the harness branch (`86749e4..m13-bof4`)
+  found no code keyed to bof4. It flagged bof4's gp in a psx-bios test
+  and borrowed fixture values in two harness tests; both were replaced
+  with made-up values (psx-wasm `b7d0ae2`, harness
+  `dd8c4a6`). Older tests still embed btn facts (follow-up tasks).
+
 - **A second pad changes bof4's path.** With a pad in port 2 (as every
   replay had) the game draws nothing and its loop runs at a fixed rate;
   with port 2 empty it plays normally. Whether hardware does the same is

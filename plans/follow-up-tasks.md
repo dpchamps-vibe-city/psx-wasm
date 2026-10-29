@@ -70,6 +70,10 @@ its mods repo.
   the member layout they carry.
 - **M9:** a second game, its decomp and disc.
 - **M10:** a capture rig.
+- **M13, the harness push:** the human said not to push
+  psx-decompilation-harness. Its M13 work is on branch `m13-bof4`;
+  bof4-decomp names that branch and has it checked out locally, but a
+  fresh clone can't install it until it's pushed (M13 exit criteria 1–2).
 
 ## Blocked on CD timing (D48)
 
@@ -145,3 +149,10 @@ differences.
 - **M5 task 7, the Tauri shell:** declined for now (D46).
 - **Housekeeping:** `.claude/worktrees/` (untracked) is left over from
   agent runs and can be deleted.
+- **Tests that embed btn's facts** (pre-existing, found by M13's
+  generality review): btn's serial in card test file names
+  (`psx-devices::memcard`, `psx-bios::card`), btn symbols and addresses in
+  `psxw-cc::asm`, `psxw-inputs::map` and `psxw-modkit::decl` tests, and
+  `psxw build btn` in the help examples. Replace them with made-up values.
+- **bof4 with a second pad** draws nothing; check against the emulator
+  with both ports plugged (the replays now record the pads, M13).
