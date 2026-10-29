@@ -495,7 +495,7 @@ impl Resolver for R<'_, '_> {
                 None => {
                     // Listed after the link with every other such call.
                     self.ctx.unresolved.insert(format!("{}: {name}", inp.label));
-                    Ok(Lowered::Call(self.ctx.synth(Synth::Indirect)))
+                    Ok(Lowered::Call(self.ctx.synth(Synth::OverlayStub(addr))))
                 }
             };
         }
@@ -827,7 +827,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             (o32(), f, format!("adapter#{id}"))
         }
         Synth::OverlayStub(addr) => {
-            let cands = ctx.spec.overlays[&addr].clone();
+            let cands = ctx.spec.overlays.get(&addr).cloned().unwrap_or_default();
             let mut entries = Vec::new();
             for (c, words) in &cands {
                 let e = match ctx.heads.get(&(c.clone(), addr, None)) {
