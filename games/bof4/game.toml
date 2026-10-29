@@ -37,4 +37,14 @@ cc1 = "dependencies/compiler/gcc-2.95.2-psx/cc1"
 cc1flags = ["-O2", "-G8", "-mips1", "-mcpu=r3000", "-funsigned-char", "-fpeephole", "-ffunction-cse", "-fpcc-struct-return", "-fcommon", "-msoft-float", "-mgas", "-fgnu-linker", "-quiet"]
 
 [run]
+# main's loop (0x8013965C) calls this once a pass, after VSync: the thread
+# scheduler, which opens the game's worker threads and ChangeThreads to
+# each in turn (D57).
+main_loop_symbol = "func_8013A37C"
 cd_timing = "realistic"
+
+[oracle]
+# main adds one to this word at the end of every pass of its loop
+# (0x801397C4), so it counts game frames: fewer than vblanks while a scene
+# runs at half rate or loads. Found by diffing RAM across frames.
+frame_counter = "D_80116B20"

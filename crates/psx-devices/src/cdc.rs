@@ -111,7 +111,9 @@ impl Default for Cdc {
             cmd_params: Vec::new(),
             response: VecDeque::new(),
             int: 0,
-            int_enable: 0,
+            // As the BIOS leaves it after reading the boot disc: libcd's
+            // CD_init only rewrites it when flags are pending.
+            int_enable: 0x1F,
             queue: VecDeque::new(),
             jobs: Vec::new(),
             busy: false,
