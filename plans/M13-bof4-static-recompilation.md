@@ -1,9 +1,8 @@
 # M13 — Breath of Fire IV: a game with no decompiled C
 
-**Status:** in progress (harness bootstrap committed locally, not yet
-pushed; lift passes; the build links only past 3 split defects, and that
-build boots to the Capcom logo with every boot, determinism and no-trap
-check passing)
+**Status:** in progress (the headless replay reaches the first field
+scene and walks in four directions, with every check passing; the
+harness push and so a GitHub-installable pin wait on the human)
 **Depends on:** M2, M8. Parallel with M7. **Unlocks:** M9's generality
 claim, on a game whose code is entirely translated.
 **Design refs:** design §3 (overlays), §4 (one implementation per
@@ -239,7 +238,13 @@ run alongside. Task 15 onward needs phase 2's commit.
 
 ### Phase 2 — bof4-decomp (`../bof4-decomp`)
 
-6. [ ] **Pin and regenerate.**
+6. [x] **Pin and regenerate.** bof4-decomp `1560817` (`f8df46d` regenerates,
+   `1560817` pins). The human asked for M13's harness work to live on a
+   branch: harness branch `m13-bof4` (`79849a7`), which `.pi/settings.json`
+   names and the installed copy is checked out at (it can't be reinstalled
+   from GitHub until the branch is pushed, which the human withheld).
+   `npm run check-all` there passes: 641 containers byte-identical,
+   placement coverage (313 placed, 78 deferred), configs current.
    - Set `.pi/settings.json` to `…/psx-decompilation-harness@<task 5
      commit>` and reinstall.
    - Regenerate the configs with that harness. `ovl_4414` gains libpress's
@@ -320,7 +325,7 @@ run alongside. Task 15 onward needs phase 2's commit.
 
 **Runtime**
 
-13. [ ] **BIOS threads per D57.**
+13. [x] **BIOS threads per D57.** (`5c70bdd`; oracle `bios_threads`)
     - OpenThread allocates a TCB in the RAM array from task 10.
     - ChangeThread saves the current thread and starts or resumes the
       target. A new thread starts from its TCB's saved epc, sp and gp,
@@ -330,7 +335,8 @@ run alongside. Task 15 onward needs phase 2's commit.
       (A0h:43h), or trap with a named message if it's ever reached.
     - Tests: a PSn00bSDK runner program using threads, checked against the
       Beetle oracle (M3).
-14. [ ] **The CD per D58, and the MDEC.**
+14. [x] **The CD per D58, and the MDEC.** (`f476bd1`, `5c70bdd`, `0c3dd0d`,
+    `9a8a9d2`; oracle `cd_cmds`, `mdec_run`)
     - **The CD**, if D58 picks (b):
       - the controller's command and response state machine;
       - sector delivery on the virtual timeline, keeping `cd_timing`;
@@ -344,7 +350,14 @@ run alongside. Task 15 onward needs phase 2's commit.
       - CD command/response and MDEC decode vectors against Beetle goldens
         (provisional).
     - Keep `psxw ci btn` green.
-15. [ ] **Validate or route the remaining adapter-policy objects.**
+15. [x] **Validate or route the remaining adapter-policy objects.** Shown
+    by the build: `unvalidated_objects` is empty (no adapter function sits
+    in an unvalidated object), and the only functions in those libraries
+    that touch hardware (`libcard/patch`'s `_patch_card` and helpers,
+    `libapi/first`'s helper) are unreachable, cut off by the validated
+    `InitCARD` and `firstfile` adapters. libcard `card`, `end`, `format`
+    and libapi `chclrpad`, `padstop` run as guest code and touch no
+    hardware (no I/O or kernel facts; `no-shadow-io` passes).
     - Add a libcard conformance scenario (as libmcrd has) for `card`,
       `end`, `format` and `patch`, and extend `validated.rs` with what
       passes.
@@ -356,7 +369,8 @@ run alongside. Task 15 onward needs phase 2's commit.
 **Boot** (after task 6: repin `[game.bof4]` to its commit, then rerun
 census and lift)
 
-16. [ ] **`psxw build bof4` passes:**
+16. [x] **`psxw build bof4` passes:** (`be50fe7`; 9,744,843 bytes, link
+    about 17 s warm and 83 s cold)
     - no unbound hardware;
     - no unknown libraries;
     - residency keys unambiguous in every slot, including the slot over
@@ -370,7 +384,8 @@ census and lift)
       game frame. Find it by diffing RAM across frames in a headless run.
 
     Auto-names (`func_…`, `D_…`) are fine.
-18. [ ] **Boot:**
+18. [x] **Boot:** (traps fixed generically: `fae6e99` kept loads,
+    `17195e5` hand-written dispatch idioms)
     `psxw run bof4 --frames 1200 --check boot --check determinism --check no-trap --check no-shadow-io`.
     - Fix each trap generically: an untranslated dispatch target, a
       missing BIOS function, or I/O reaching no device.
@@ -380,7 +395,7 @@ census and lift)
 
 **Play, headless**
 
-19. [ ] **Replay `games/bof4/replays/title-to-field.toml`**, authored from
+19. [x] **Replay `games/bof4/replays/title-to-field.toml`**, authored from
     headless frame dumps as btn's `title-to-gameplay` was. The route:
     1. boot, the Capcom logo, and the intro FMV (DEMO.EMI, MDEC);
     2. the title screen, then NEW GAME;
@@ -490,7 +505,43 @@ census and lift)
     identical across runs); `no-shadow-io` fails only on the unplaced
     libpress (task 6).
 
+- **2026-10-29 (later):**
+  - Harness tasks 2–4 (`d5140a5`, `09b9e02`, `5588a9a`, `16d3e9b`) and
+    the split fix (`8901f3d`, `79849a7`: calls from other containers are
+    overlay code evidence) moved to branch `m13-bof4` at the human's
+    request; not pushed (the human said not to).
+  - bof4-decomp regenerated and pinned (`1560817`); psx-wasm repinned
+    (`be50fe7`): lift and build pass with no problems.
+  - Run fixes, each generic: unused loads kept as volatile reads
+    (`fae6e99`); in-text jump tables, computed entries and returns
+    through a copied `ra` (`17195e5`); replays say which ports have a pad
+    (`ec773f4`); a replay runs its own length (`psxw run`).
+  - `title-to-field` (`d1d9346`): Capcom logo, intro FMV (skipped),
+    title, NEW GAME, the opening, the first field scene, four walks.
+    `psxw run bof4 --replay title-to-field --check determinism --check
+    no-trap --check no-shadow-io` passes with all five expectations.
+  - `psxw ci bof4`: every gate passes but the replay gate, which ran 600
+    frames before `psxw run` defaulted to the replay's length; the gate's
+    own command passes since.
+
 ## Findings
+
+- **A second pad changes bof4's path.** With a pad in port 2 (as every
+  replay had) the game draws nothing and its loop runs at a fixed rate;
+  with port 2 empty it plays normally. Whether hardware does the same is
+  open; the replay format now records the pads plugged in, so a one-pad
+  session is what's replayed, natively, in the browser and under Beetle.
+- **Dead loads matter.** libcd's streaming interrupt drains 8 bytes of a
+  sector header with loads whose results nothing reads; clang deleted
+  them, so the FIFO fell behind and every movie sector was dropped.
+- **Hand-written decompressors** use three idioms the GCC-shaped lift
+  didn't handle (an in-text jump table, Duff's device into an unrolled
+  copy reached by a stored code pointer, and returns through `ra` kept in
+  another register); each is now handled generically (design §4).
+- **The first field scene** is at counter about 12,300 (frame 24,600),
+  after about 280 dialogue advances. Its controllable state shows in
+  Nina's facing halfword (`D_80117334`), whose high byte is twice the
+  direction plus one.
 
 - **Device oracles (tasks 13–14), `0c3dd0d` and `9a8a9d2`.** Captured on
   Beetle + OpenBIOS and checked by `psxw oracle check <game> --device
