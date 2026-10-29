@@ -352,7 +352,8 @@ The PsyQ policy, measured on the 361 SDK members btn links:
 | libapi | Translated. BIOS calls go to the Rust BIOS. Adapters for `counter.o` (`SetRCnt`… program the timers directly) and for `pad.o`, `patch.o` and `chclrpad.o` (they patch Sony BIOS internals in RAM). |
 | libetc | Guest code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
 | libgpu | Guest code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
-| libcd | Adapters at the device edge: `CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`. Helpers such as `CdIntToPos` stay guest code. |
+| libcd | `adapter-or-device` (D58): adapters at the device edge (`CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`) when the game reaches libcd only through validated adapters and helpers such as `CdIntToPos`; otherwise the whole library runs as original code over the register-level CD controller. |
+| libds, libpress | Guest code over the CD controller and the MDEC (D58). |
 | libspu | Adapters (register programming). Open question: register-level SPU emulation as the fallback for unknown versions. |
 | libpad | Guest code over the SIO0 device (D40). Its state machine is the behaviour games observe, and the device is a port of the oracle's. |
 | libmcrd | Guest code over the HLE BIOS card functions (D43). |
@@ -365,9 +366,15 @@ The PsyQ policy, measured on the 361 SDK members btn links:
 **Device libraries (D40).** A library can run as guest code over
 register-level devices instead of getting adapters. Only its functions'
 I/O-window accesses reach the runtime's bus (`psx-bios::io`: interrupt
-controller, root counters, SIO0), and interrupts run the kernel's
-`SysEnqIntRP` chains. That pays off where the hardware traffic is tiny and
-the library's own logic is what games observe.
+controller, root counters, DMA, SIO0, the GPU, the SPU, the CD controller
+and the MDEC), and interrupts run the kernel's `SysEnqIntRP` chains. That
+pays off where the hardware traffic is tiny and the library's own logic is
+what games observe.
+
+Every library a game places needs a policy in the boundary file; an
+unknown one fails the build. Code outside device libraries that reaches
+a register through a pointer writes only the window's I/O shadow; `psxw
+run --check no-shadow-io` catches that at the frame it happens.
 
 **Conformance.** `psxw conform <game> --lib L` checks the result of the
 adapter rule. One scenario of SDK calls and vblanks runs on the build with
@@ -558,6 +565,16 @@ a call into guest code.
 - **Boot.** Does the BIOS's startup job: reads `SYSTEM.CNF` from the disc,
   loads the PS-X EXE into RAM, zeroes BSS, sets `__guest_sp`, and calls
   `guest_main`.
+- **Threads (D57).** The BIOS keeps the kernel's thread tables in guest
+  RAM (the table of tables' PCB and TCB entries, the PCB, and the TCBs
+  from E000h, sized by SYSTEM.CNF `TCB=`), because games read and edit
+  them. ChangeThread switches wasm stacks with binaryen Asyncify: the
+  build instruments only the functions that can be on the stack at a
+  switch (the call graph's reverse closure from ChangeThread calls, plus
+  every indirect caller), the running thread unwinds into its buffer back
+  to its root call in the runtime, and the target starts afresh at its
+  TCB's start address or rewinds to its own ChangeThread. A game that
+  never switches gets stubs and no instrumentation.
 - **BIOS.** The A0/B0/C0 call tables and `syscall`: events (`OpenEvent`,
   `EnableEvent`, `TestEvent`, `WaitEvent`, `DeliverEvent`), the callback
   registry, critical sections, the heap, the file API on top of the CD,
@@ -613,6 +630,13 @@ a call into guest code.
 - **cd.** Disc images (`.bin`/`.cue`, `.iso`), the ISO9660 lookup that
   `CdSearchFile` needs, sector reads scheduled on the clock (with the
   timing toggle from §6), and XA-ADPCM streaming into the SPU's CD input.
+  For SDK code that drives the drive itself (D58), a register-level CD
+  controller (1F801800h-3h, IRQ2, DMA3) answers commands with INT3/INT2
+  after the same timing model's latencies and delivers sectors through
+  its data FIFO, XA through the same decoder.
+- **mdec.** The motion decoder (1F801820h/24h, DMA0 in, DMA1 out) for
+  libpress's FMV: run-length decode, IDCT and colour conversion, instant
+  in virtual time (D58).
 - **sio.** The digital pad and DualShock buffers that `PadInitDirect` and
   `PadGetState` expect, and 128 KB memory card images.
 - **SDK adapters.** The thin, object-keyed layer from §5.
