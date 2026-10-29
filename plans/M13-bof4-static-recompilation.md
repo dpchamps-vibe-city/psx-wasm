@@ -213,26 +213,29 @@ run alongside. Task 15 onward needs phase 2's commit.
    - No Claude attribution lines (conventions: Commits).
    - Push once the human approves.
    - From here on, nobody edits a project's `.pi/git/…` copy.
-2. [ ] **Scan every container for SDK code.**
+2. [x] **Scan every container for SDK code.** (`d5140a5`)
    - `detectLibFunctions.ts` and `patchSplatForLibs.ts` run over every
      container in the project: the EXE and each overlay config, each with
      its own text range and vram.
    - Overlay configs get `o` subsegments and their symbol files get the
      SDK names, in the same form as the EXE.
    - A test with an overlay fixture that contains a library object.
-3. [ ] **Check placement coverage in `check-all`.**
+3. [x] **Check placement coverage in `check-all`.** (`09b9e02`)
    - In every container, each signature match is either placed as an `o`
      subsegment or listed in the project's deferred-objects file with a
      reason (e.g. `2mbyte`, libsn: SN-built).
    - Anything else fails, naming the container, address and object.
    - This would have caught the 21 EXE objects and libpress.
-4. [ ] **Check that generated configs are current in `check-all`.**
+4. [x] **Check that generated configs are current in `check-all`.**
+   (`5588a9a`, `16d3e9b`)
    - Regenerate overlay discovery and the splat configs from the installed
      harness into a scratch directory, then diff them against the
      committed configs.
    - A difference fails and names the files.
    - This would have caught the stale `overlays.json`.
 5. [ ] **Commit and push**, with tests for 2–4. Record the commit here.
+   Committed locally; the human has said not to push the harness
+   (2026-10-29), so this stays open.
 
 ### Phase 2 — bof4-decomp (`../bof4-decomp`)
 
@@ -488,6 +491,35 @@ census and lift)
     libpress (task 6).
 
 ## Findings
+
+- **Device oracles (tasks 13–14), `0c3dd0d` and `9a8a9d2`.** Captured on
+  Beetle + OpenBIOS and checked by `psxw oracle check <game> --device
+  mdec|cdc|threads` (all provisional, none failed or unresolved):
+  - `mdec_run`, 49 vectors (libpress's tables, every output depth, edge
+    cases, isolating cases). The golden showed the IDCT's output
+    transposed against the first implementation, and that 15-bit and
+    4-bit output round (add half a step, saturate) instead of truncating.
+  - `cd_cmds`, 14 vectors on a generated runner-disc file: status
+    commands, seeks, ReadN/ReadS at both sizes and speeds. Interrupt
+    types, response bytes and sector data compare exactly (2340-byte
+    sectors by EDC too); times and the head position while not reading
+    are recorded, not compared (D48). Test 20h answers `97 01 10 C2`, as
+    the oracle's drive does. The interrupt enable reads 1Fh after boot, as
+    the runtime now starts it.
+  - `bios_threads`, 4 vectors: handles, TCB statuses and fields, what
+    ChangeThread returns, a full table. OpenThread also writes 1000h into
+    the TCB word after the status, as OpenBIOS does. OpenBIOS saves every
+    register into a thread's TCB when it switches away; psx-bios saves only
+    sp and gp, because the rest are wasm locals (D57), so a reused TCB is
+    refilled by the vector before it is compared.
+- **Harness tasks 2–4 on bof4** (before regeneration): placement coverage
+  first flagged 105 matches; two rules made detection sound (an
+  overlay's imports must agree with the EXE's verified SDK addresses, and
+  an object made only of empty functions isn't a match: libsnd `vm_vib`
+  in 21 overlays). What remained was libpress in ovl_4414 (now placed)
+  and libsn `op_vnew` (deferred with `2mbyte` in
+  `configs/deferred-sdk-objects.json`). Configs-current found
+  `configs/overlays.json` stale for five members.
 
 - **The split misses leaf functions at the start of overlays.** Calls
   from other containers land where the configs have rodata: `ovl_4319`'s
