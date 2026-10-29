@@ -168,14 +168,14 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 
 ## Progress log
 
-## Findings
-
 - **2026-10-29, tasks 1–2.** D59 recorded. `psxw sdk scan` (crate
   `psxw-sdk`) reads PsyQ 4.7's 2,163 objects in 7 s: 3,140 functions, 389
   reach hardware or BIOS internals. Its check: every constant-address
   access the translator's facts see in either game's SDK code is in the
   scan's reach (0 misses). `psxw sdk disasm <fn>` prints a function with
   its relocations, for writing adapters from the objects.
+
+## Findings
 
 - **The state-accessor rule, refined.** An accessor is a function that
   reaches no hardware and reads mutable library data that a
