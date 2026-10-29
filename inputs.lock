@@ -83,6 +83,24 @@ exe_sha256 = "34e3b35dcd3fb1cd9a7d4813b8a9ef987915826e3d436f1908ecbe2d4fdf1444"
 name = "hmb2n.bin"
 sha1 = "cb26381fa1336bdd15f07469e59f1143ccf37b03"
 
+[game.bof4]
+repo = "../bof4-decomp"
+commit = "48159a8c6c55dfe4298a015883794850f059115d"
+build = ["npm", "run", "check-all"]
+
+[game.bof4.disc]
+# User-supplied; verified, never stored.
+exe = "SLUS_013.24"
+exe_sha256 = "0f85a9fc4796279024b508f6a37bc5b8ed24a90bcdaa2e2e2fdcbaa0e8b93c95"
+
+[[game.bof4.disc.files]]
+name = "Breath of Fire IV (Track 1).bin"
+sha1 = "24b49e9063e015dd54cd34c74bcb2c2cdc47ebd3"
+
+[[game.bof4.disc.files]]
+name = "Breath of Fire IV (Track 2).bin"
+sha1 = "27162ae90fd4111885b6cdeaca4b25c4978eec23"
+
 [sdk.psyq-470]
 repo = "../psyq-decomp"
 remote = "git@github.com:software-factory-vibe-city/psyq-decompilation.git"
