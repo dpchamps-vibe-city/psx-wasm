@@ -82,9 +82,24 @@ pub struct Renderer {
     skip: i32,
     readbacks: Vec<u16>,
     scratch: Vec<u32>,
+    staged: Staged,
     last_present: Option<PresentDesc>,
     /// GL work since [`Renderer::take_stats`].
     stats: Stats,
+}
+
+/// Uploads waiting to draw as one batch: their pixels where they sit in the
+/// staging texture (rows of 1024), the next free spot on the current shelf
+/// of rows and its height, the width used, and their records.
+#[derive(Default)]
+struct Staged {
+    px: Vec<u16>,
+    x: u32,
+    y: u32,
+    row_h: u32,
+    w: u32,
+    recs: Vec<u32>,
+    n: usize,
 }
 
 /// What the backend did, for hosts that report where a frame's time went:
@@ -231,6 +246,7 @@ impl Renderer {
                 skip: -1,
                 readbacks: Vec::new(),
                 scratch: Vec::new(),
+                staged: Staged::default(),
                 last_present: None,
                 stats: Stats::default(),
             };
@@ -272,6 +288,10 @@ impl Renderer {
     pub fn execute(&mut self, words: &[u32]) -> Result<()> {
         for cmd in render::commands(words) {
             let cmd = cmd.map_err(|e| anyhow::anyhow!("bad command stream: {e:?}"))?;
+            // Uploads in a row draw as one batch.
+            if !matches!(cmd, Command::Upload { .. }) {
+                self.draw_staged();
+            }
             match cmd {
                 Command::SetState { clip, flags } => {
                     self.clip = Clip { x0: clip[0] as i32, y0: clip[1] as i32, x1: clip[2] as i32, y1: clip[3] as i32 };
@@ -302,28 +322,7 @@ impl Renderer {
                 }
                 Command::Upload { rect, mask, pixels } => {
                     self.stats.uploads += 1;
-                    let mut bytes = Vec::with_capacity(rect.pixels() * 2);
-                    for i in 0..rect.pixels() {
-                        let p = (pixels[i / 2] >> (16 * (i % 2))) as u16;
-                        bytes.extend_from_slice(&p.to_le_bytes());
-                    }
-                    unsafe {
-                        self.gl.bind_texture(glow::TEXTURE_2D, Some(self.stage));
-                        self.gl.tex_sub_image_2d(
-                            glow::TEXTURE_2D,
-                            0,
-                            0,
-                            0,
-                            rect.w as i32,
-                            rect.h as i32,
-                            glow::RED_INTEGER,
-                            glow::UNSIGNED_SHORT,
-                            glow::PixelUnpackData::Slice(Some(&bytes)),
-                        );
-                    }
-                    let mut rec = vec![0u32; WORDS];
-                    setup::upload(rect.x, rect.y, rect.w, rect.h, 0, 0, mask, &mut rec);
-                    self.draw_records(&mut rec, 1);
+                    self.stage(rect, mask, pixels);
                 }
                 Command::Copy { src_x, src_y, dst_x, dst_y, w, h, mask } => {
                     let mut rec = vec![0u32; WORDS];
@@ -372,6 +371,7 @@ impl Renderer {
                 },
             }
         }
+        self.draw_staged();
         let err = unsafe { self.gl.get_error() };
         ensure!(err == glow::NO_ERROR, "GL error {err:#x}");
         Ok(())
@@ -380,6 +380,64 @@ impl Renderer {
     /// The pixels READBACK commands produced, in order.
     pub fn take_readbacks(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.readbacks)
+    }
+
+    /// Pack an upload's pixels into the staging texture's next free space,
+    /// in shelves of rows, drawing what is staged first when it doesn't fit.
+    fn stage(&mut self, rect: render::Rect, mask: u32, pixels: &[u32]) {
+        let s = &mut self.staged;
+        if s.x + rect.w > 1024 {
+            (s.x, s.y, s.row_h) = (0, s.y + s.row_h, 0);
+        }
+        if s.y + rect.h > 512 {
+            self.draw_staged();
+        }
+        let s = &mut self.staged;
+        s.px.resize(1024 * 512, 0);
+        let (sx, sy) = (s.x, s.y);
+        for j in 0..rect.h {
+            let row = ((sy + j) * 1024 + sx) as usize;
+            for i in 0..rect.w as usize {
+                let k = (j * rect.w) as usize + i;
+                s.px[row + i] = (pixels[k / 2] >> (16 * (k % 2))) as u16;
+            }
+        }
+        s.x += rect.w;
+        s.row_h = s.row_h.max(rect.h);
+        s.w = s.w.max(s.x);
+        let at = s.recs.len();
+        s.recs.resize(at + WORDS, 0);
+        setup::upload(rect.x, rect.y, rect.w, rect.h, sx, sy, mask, &mut s.recs[at..]);
+        s.n += 1;
+    }
+
+    /// Draw the staged uploads: one texture upload, one batch.
+    fn draw_staged(&mut self) {
+        if self.staged.n == 0 {
+            return;
+        }
+        let mut s = std::mem::take(&mut self.staged);
+        let rows = s.y + s.row_h;
+        unsafe {
+            let bytes = std::slice::from_raw_parts(s.px.as_ptr() as *const u8, rows as usize * 1024 * 2);
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(self.stage));
+            self.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 1024);
+            self.gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                s.w as i32,
+                rows as i32,
+                glow::RED_INTEGER,
+                glow::UNSIGNED_SHORT,
+                glow::PixelUnpackData::Slice(Some(bytes)),
+            );
+            self.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+        }
+        self.draw_records(&mut s.recs, s.n);
+        s.recs.clear();
+        self.staged = Staged { px: s.px, recs: s.recs, ..Staged::default() };
     }
 
     /// Set up and draw primitive records as one batch.
