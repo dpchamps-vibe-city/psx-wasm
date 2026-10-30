@@ -99,7 +99,8 @@ async function startAudio() {
   try {
     const ctx = new AudioContext({ sampleRate: 44100 });
     await ctx.audioWorklet.addModule("audio.js");
-    const ring = new SharedArrayBuffer(4 * 4096 + 8);
+    // 186 ms: audio.js's start cushion and a catch-up burst after a stall.
+    const ring = new SharedArrayBuffer(4 * 8192 + 8);
     new AudioWorkletNode(ctx, "psxw-audio", { processorOptions: { ring }, outputChannelCount: [2] }).connect(ctx.destination);
     return ring;
   } catch (e) {
