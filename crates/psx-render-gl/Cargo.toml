@@ -21,3 +21,6 @@ khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
 name = "psxw-render-server"
 path = "src/bin/psxw-render-server.rs"
 required-features = ["headless"]
+
+[dev-dependencies]
+psx-devices = { path = "../psx-devices" }

@@ -16,6 +16,7 @@ pub mod irq;
 pub mod mdec;
 pub mod mem;
 pub mod memcard;
+pub mod raster;
 pub mod sio;
 pub mod timers;
 pub mod xa;

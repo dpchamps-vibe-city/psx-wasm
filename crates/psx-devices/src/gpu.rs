@@ -29,7 +29,11 @@
 //! VRAM, so the front end tracks the regions written since the last
 //! [`render::op::SYNC`] (at bounding-box granularity) and, before
 //! anything that reads one of them, ends the batch and syncs. Within a
-//! batch every read therefore sees VRAM as it was before the batch.
+//! batch every read therefore sees VRAM as it was before the batch. A
+//! primitive that reads its own destination (semi-transparency, the mask
+//! check) is held to the pixels written since the sync, polygons as the
+//! GPU's edge walkers plot them ([`crate::raster`]): a translucent mesh's
+//! neighbouring triangles share a batch, only overlapping ones sync.
 //!
 //! # VRAM→CPU transfers
 //!
@@ -38,6 +42,7 @@
 //! reads the rectangle (the `render_readback` host import), and hands the
 //! pixels to [`Gpu::finish_readback`], which serves them through GPUREAD.
 
+use crate::raster::Triangle;
 use psxw_abi::render::{self, CLUT_SLOTS, PRIM_WORDS, PresentDesc, header, op, pack_xy, prim};
 
 /// Regions tracked individually before they are merged into one box.
@@ -125,6 +130,61 @@ impl Areas {
         } else if let Some(last) = self.a[3].as_mut() {
             *last = last.union(&a);
         }
+    }
+
+    /// Their pixels, row by row.
+    fn spans(&self) -> Vec<Span> {
+        self.iter().flat_map(|a| (a.y0..a.y1).map(move |y| (y as u32, a.x0 as u32, a.x1 as u32))).collect()
+    }
+}
+
+/// Pixels of a VRAM row: (row, first column, end column).
+type Span = (u32, u32, u32);
+
+/// The pixels written since the last SYNC, as primitives plot them. A
+/// primitive that reads its own destination (semi-transparency, the mask
+/// check) needs a sync only where it plots over one of them; bounding
+/// boxes can't tell that for neighbouring triangles of a mesh, which
+/// would sync between every two.
+#[derive(Clone, Default)]
+struct Written {
+    /// Per VRAM pixel, the generation that last wrote it.
+    stamp: Vec<u16>,
+    now: u16,
+}
+
+impl std::fmt::Debug for Written {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Written({})", self.now)
+    }
+}
+
+impl Written {
+    fn clear(&mut self) {
+        self.now = self.now.wrapping_add(1);
+        if self.now == 0 {
+            self.stamp.fill(0);
+            self.now = 1;
+        }
+    }
+
+    fn mark(&mut self, spans: &[Span]) {
+        if self.stamp.is_empty() {
+            self.stamp = vec![0; 1024 * 512];
+            self.now = self.now.max(1);
+        }
+        for &(row, x0, x1) in spans {
+            let o = row as usize * 1024;
+            self.stamp[o + x0 as usize..o + x1 as usize].fill(self.now);
+        }
+    }
+
+    fn hits(&self, spans: &[Span]) -> bool {
+        !self.stamp.is_empty()
+            && spans.iter().any(|&(row, x0, x1)| {
+                let o = row as usize * 1024;
+                self.stamp[o + x0 as usize..o + x1 as usize].contains(&self.now)
+            })
     }
 }
 
@@ -261,6 +321,7 @@ pub struct Gpu {
     batch_len: u32,
     emitted_state: Option<[u32; 3]>,
     dirty: Vec<Area>,
+    written: Written,
 }
 
 impl Default for Gpu {
@@ -318,6 +379,7 @@ impl Gpu {
             batch_len: 0,
             emitted_state: None,
             dirty: Vec::new(),
+            written: Written::default(),
         };
         g.soft_reset();
         g
@@ -744,16 +806,26 @@ impl Gpu {
     /// close the batch and sync everything written.
     fn before_reads(&mut self, reads: &Areas) {
         if reads.iter().any(|r| self.dirty.iter().any(|d| d.overlaps(&r))) {
-            self.flush();
-            self.out.push(header(op::SYNC, 1 + 2 * self.dirty.len() as u32));
-            self.out.push(self.dirty.len() as u32);
-            for d in self.dirty.drain(..) {
-                self.out.extend_from_slice(&d.rect().words());
-            }
+            self.sync();
         }
     }
 
+    fn sync(&mut self) {
+        self.flush();
+        self.out.push(header(op::SYNC, 1 + 2 * self.dirty.len() as u32));
+        self.out.push(self.dirty.len() as u32);
+        for d in self.dirty.drain(..) {
+            self.out.extend_from_slice(&d.rect().words());
+        }
+        self.written.clear();
+    }
+
     fn wrote(&mut self, writes: &Areas) {
+        self.written.mark(&writes.spans());
+        self.add_dirty(writes);
+    }
+
+    fn add_dirty(&mut self, writes: &Areas) {
         for w in writes.iter() {
             if self.dirty.iter().any(|d| d.contains(&w)) {
                 continue;
@@ -767,12 +839,33 @@ impl Gpu {
         }
     }
 
-    fn add_prim(&mut self, rec: [u32; PRIM_WORDS], reads: Areas, writes: Areas) {
+    /// A primitive that reads `reads` (its texels) and plots `cover`
+    /// within `writes`; with semi-transparency or the mask check it reads
+    /// what it plots over too.
+    fn add_prim(&mut self, rec: [u32; PRIM_WORDS], reads: Areas, writes: Areas, cover: &[Span]) {
         self.ensure_state();
         self.before_reads(&reads);
+        if rec[0] & (prim::SEMI | prim::MASK_CHECK) != 0 && self.written.hits(cover) {
+            self.sync();
+        }
         self.batch.extend_from_slice(&rec);
         self.batch_len += 1;
-        self.wrote(&writes);
+        self.written.mark(cover);
+        self.add_dirty(&writes);
+    }
+
+    /// The pixels a polygon plots, as the GPU's edge walkers decide.
+    fn polygon_cover(&self, rec: &[u32; PRIM_WORDS], quad: bool) -> Vec<Span> {
+        let xy = |n: usize| render::unpack_xy(rec[3 + 3 * n]);
+        let tris: &[[usize; 3]] = if quad { &[[0, 1, 2], [1, 2, 3]] } else { &[[0, 1, 2]] };
+        let clip = self.clip.map(|c| c as i32);
+        let mut out = Vec::new();
+        for t in tris {
+            if let Some(t) = Triangle::new(t.map(xy)) {
+                t.spans(clip, |row, x0, x1| out.push((row, x0, x1)));
+            }
+        }
+        out
     }
 
     /// The colour-table cache: load the table if its address or depth
@@ -840,14 +933,8 @@ impl Gpu {
         f
     }
 
-    fn reads_for(&self, flags: u32, texels: &Areas, writes: &Areas) -> Areas {
-        let mut reads = if flags & prim::TEXTURED != 0 { *texels } else { Areas::none() };
-        if flags & (prim::SEMI | prim::MASK_CHECK) != 0 {
-            for w in writes.iter() {
-                reads.push(w);
-            }
-        }
-        reads
+    fn reads_for(flags: u32, texels: &Areas) -> Areas {
+        if flags & prim::TEXTURED != 0 { *texels } else { Areas::none() }
     }
 
     // ---------------------------------------------------------------
@@ -935,7 +1022,7 @@ impl Gpu {
         self.add_polygon(rec, &all, true);
     }
 
-    fn add_polygon(&mut self, mut rec: [u32; PRIM_WORDS], v: &[Vertex], _quad: bool) {
+    fn add_polygon(&mut self, mut rec: [u32; PRIM_WORDS], v: &[Vertex], quad: bool) {
         let xs = v.iter().map(|p| p.x);
         let ys = v.iter().map(|p| p.y);
         let (x0, x1) = (xs.clone().min().unwrap_or(0), xs.max().unwrap_or(0));
@@ -956,8 +1043,9 @@ impl Gpu {
         let vv = (vs.clone().min().unwrap_or(0) - 1, vs.max().unwrap_or(0) + 1);
         let texels = Self::texture_reads(&page, rec[2], u, vv);
         rec[0] |= Self::serial(rec[0], &texels, &writes);
-        let reads = self.reads_for(rec[0], &texels, &writes);
-        self.add_prim(rec, reads, writes);
+        let reads = Self::reads_for(rec[0], &texels);
+        let cover = self.polygon_cover(&rec, quad);
+        self.add_prim(rec, reads, writes, &cover);
     }
 
     /// [`prim::SERIAL`] when a textured primitive can sample where it
@@ -1007,8 +1095,7 @@ impl Gpu {
         let exact = [p0, p1].iter().all(|p| (0..1024).contains(&p.x) && (0..1024).contains(&p.y));
         let writes =
             self.plot_areas(p0.x.min(p1.x), p0.x.max(p1.x), p0.y.min(p1.y), p0.y.max(p1.y), exact);
-        let reads = self.reads_for(flags, &Areas::none(), &writes);
-        self.add_prim(rec, reads, writes);
+        self.add_prim(rec, Areas::none(), writes, &writes.spans());
     }
 
     // ---------------------------------------------------------------
@@ -1068,8 +1155,8 @@ impl Gpu {
         let v = if flags & prim::FLIP_Y != 0 { (v0 - (h as i32 - 1), v0) } else { (v0, v0 + h as i32 - 1) };
         let texels = Self::texture_reads(&page, self.window, u, v);
         rec[0] |= Self::serial(flags, &texels, &writes);
-        let reads = self.reads_for(flags, &texels, &writes);
-        self.add_prim(rec, reads, writes);
+        let reads = Self::reads_for(flags, &texels);
+        self.add_prim(rec, reads, writes, &writes.spans());
     }
 
     // ---------------------------------------------------------------
@@ -1639,6 +1726,29 @@ mod tests {
         g.gp0_words(&[0x6500_0000, pack_xy(300, 0), 0, 4 << 16 | 4]);
         let cs = decode(&cmds(&mut g));
         assert!(matches!(cs[0], C::Sync(_)), "{cs:?}");
+    }
+
+    /// Semi-transparent polygons sync where they plot over each other,
+    /// not where their bounding boxes meet: the two halves of a quad
+    /// share a batch, a third triangle over them doesn't.
+    #[test]
+    fn semi_transparent_mesh_syncs_by_pixels() {
+        let mut g = gpu();
+        let quad = [pack_xy(10, 10), pack_xy(60, 14), pack_xy(8, 50), pack_xy(57, 61)];
+        g.gp0_words(&[0x2200_00FF, quad[0], quad[1], quad[2]]);
+        g.gp0_words(&[0x2200_00FF, quad[1], quad[2], quad[3]]);
+        g.gp0_words(&[0x2200_00FF, pack_xy(20, 20), pack_xy(40, 20), pack_xy(30, 40)]);
+        let cs = decode(&cmds(&mut g));
+        let kinds: Vec<_> = cs
+            .iter()
+            .map(|c| match c {
+                C::State(..) => "state",
+                C::Draw(r) => if r.len() == 2 { "draw2" } else { "draw" },
+                C::Sync(_) => "sync",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["state", "draw2", "sync", "draw"]);
     }
 
     #[test]

@@ -498,4 +498,36 @@ mod tests {
         assert_eq!((w[0], w[1], w[2], w[3]), (0, 5, 10, 1), "swapped so x increases; x-major");
         assert_eq!(((w[8] as u64) << 32 | w[9] as u64), 1u64 << 32);
     }
+
+    /// The GPU front end's coverage (`psx_devices::raster`, its hazard
+    /// tracking) walks the same edges this setup gives the shader.
+    #[test]
+    fn edges_are_the_front_ends() {
+        let mut seed = 0x2545_F491u32;
+        let mut next = |m: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % (2 * m as u32 + 1)) as i32 - m
+        };
+        for i in 0..20_000 {
+            // Small ones too, where equal coordinates are common.
+            let m = if i % 2 == 0 { 600 } else { 6 };
+            let xy = [(next(m), next(m)), (next(m), next(m)), (next(m), next(m))];
+            let w = triangle(xy.map(|(x, y)| V { x, y, u: 0, v: 0, r: 0, g: 0, b: 0 }));
+            let t = psx_devices::raster::Triangle::new(xy);
+            assert_eq!(w.is_some(), t.is_some(), "{xy:?}");
+            let (Some(w), Some(t)) = (w, t) else { continue };
+            assert_eq!(w[1..4], t.y.map(|y| y as u32), "{xy:?}");
+            for (k, p) in t.parts.iter().enumerate() {
+                let o = 4 + 12 * k;
+                let mut want = vec![p.yref as u32, p.dec as u32];
+                for e in [p.left, p.right] {
+                    want.extend(split(e.coord));
+                    want.extend(split(e.step));
+                }
+                assert_eq!([&w[o..o + 2], &w[o + 4..o + 12]].concat(), want, "{xy:?} part {k}");
+            }
+        }
+    }
 }
