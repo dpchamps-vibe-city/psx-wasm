@@ -34,7 +34,8 @@ manifest, without changes to the toolchain's code.
 | GTE | **Modelled.** A fixed-point library (`psx-gte`) holding the GTE's register file, which COP2 instructions and the `gte_*` macros drive. |
 | GPU | **Native, per chip** (D59, D61). libgpu's `sys.o` adapters (btn, bof4) give the GPU front end (`psx-devices::gpu`) its GP0/GP1 words and run its transfers on the DMA controller the other chips share; libgpu's state stays in guest RAM, where the library's code that stays original reads it. As the fallback, libgpu is original code over the front end, which answers GPUSTAT/GPUREAD, fed by the DMA controller (D42). The front end decodes packets into renderer commands; the host's WebGL2 backend draws them into a VRAM model. |
 | SPU | **Register level.** libspu and libsnd are original code over `psx-spu`: 24 ADPCM voices with reverb, on their own 44.1 kHz clock (D47). |
-| CD-ROM | **Native, per chip** (D59, D62). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). libpress is original code over the MDEC (`psx-devices::mdec`). |
+| CD-ROM | **Native, per chip** (D59, D62). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). |
+| MDEC | **Native, per chip** (D59, D64). libpress's adapters (bof4, the game that links it) give the MDEC's decode core (`psx-devices::mdec`) the run-length codes `DecDCTin` names and put its pixels into `DecDCTout`'s buffer, without its register protocol. DMA0 and DMA1 complete on the shared DMA controller, so their callbacks come through libetc's DMA handler, at the guest's next safepoint as on the device. As the fallback, libpress is original code over the MDEC's registers, DMA0 in and DMA1 out (D58). |
 | Pad | **Native** (D59, D60). libpad's adapters run its direct-connection engine (btn and bof4): at each vblank interrupt, one exchange per port with a digital-pad model fed by the host's buttons, the detection steps and the buffers as libpad's own state machine makes them, and the time its busy-waits take. As the fallback, libpad is original code over SIO0 (`psx-devices::sio`, D40). |
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
 | BIOS/kernel | A Rust implementation of the A0/B0/C0 services the SDK calls, including threads (D57) and the memory card functions (D43). |
@@ -52,7 +53,8 @@ D59 moves each chip back to native adapters, degrading to its device
 model where the adapters don't cover a game
 ([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):
 so far the CD (chip cd), the interrupt layer (chip irq), the GPU (chip
-gpu) and the pads (chip sio0) in both games.
+gpu) and the pads (chip sio0) in both games, and the MDEC (chip mdec) in
+bof4, the game that links libpress.
 
 ## What the inputs look like (measured)
 
@@ -397,11 +399,11 @@ expects native, and the build fails if one falls back. `--device
 accesses per chip, and `psxw run --check no-io` requires none.
 
 **Where the boundary sits today.** The device models carry most chips:
-the original code runs over register-level models of the SPU and the
-MDEC, and of the DMA controller they use. Adapters drive the interrupt
-controller and the root counters (chip irq), the GPU (chip gpu), the pads
-(chip sio0) and the CD (chip cd: libcd's drive layer over the CD
-controller's core) in both games. Each move below the API (D40, D42, D45, D47,
+the original code runs over register-level models of the SPU and of the
+DMA controller it uses. Adapters drive the interrupt controller and the
+root counters (chip irq), the GPU (chip gpu), the pads (chip sio0) and the
+CD (chip cd: libcd's drive layer over the CD controller's core) in both
+games, and the MDEC (chip mdec: libpress over its decode core) in bof4. Each move below the API (D40, D42, D45, D47,
 D58) bought exactness by construction and independence from the SDK
 version, because the original library decides every value a game can
 observe. Together they made the layer beneath the SDK an emulated device
@@ -474,7 +476,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libgpu | `adapter-or-device`, chip gpu. Native (btn, bof4): adapters for `sys.o`'s functions that reach the GPU (`ResetGraph`, `DrawSync`, `DrawOTag`, `PutDrawEnv`, `PutDispEnv`, the image transfers …), over the front end and DMA2/DMA6, with libgpu's state (`GEnv`, its command queue, its packets) where libgpu keeps it, found through the object's relocated code (D61). The rest of libgpu (the font and kanji functions, `DrawSyncCallback`, `ClearOTag`, `SetDrawEnv`, the primitive helpers) and libgs stay guest code over them. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
 | libcd | `adapter-or-device`, chip cd (D58, D62). Native (btn, bof4): adapters for the drive layer (`bios_1`'s `CD_init`, `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_flush`, `CD_vol`, `CD_initvol`, `CD_datasync`; `CD_getsector`, `CD_getsector2`) and the streaming ring's `StCdInterrupt` and `StUnSetRing`, over the CD controller's core and DMA3, their state in the library's own globals; the public layer (`CdInit`, `CdControl*`, `CdRead*`, `CdSearchFile`, the callbacks and accessors) and the rest of streaming run as original code over them. On the device: original code over the CD controller's registers (D58). |
 | libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's drive layer, adapted or original (D58, D62). |
-| libpress | `adapter-or-device`, chip mdec. On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
+| libpress | `adapter-or-device`, chip mdec. Native (bof4; D64): adapters for every `libpress.o` function that reaches the MDEC or its DMA (`DecDCTReset`, `DecDCTPutEnv`, `DecDCTin`, `DecDCTout`, `DecDCTinSync`, `DecDCToutSync`) over the MDEC's decode function, completing DMA0 and DMA1 on the shared controller. libpress's tables stay in its `.data` (D61), so `DecDCTGetEnv` and the callback setters stay guest code, as do the run-length coders (`DecDCTvlc*`). On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
 | libspu | `adapter-or-device`, chip spu. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
 | libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 volume registers); on the device those writes reach the SPU (D47). |
 | libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), their state in the runtime, the games' buffers in guest RAM; `PadStartCom` installs a `SysEnqIntRP` element the kernel runs as an adapter step. On the device: original code over SIO0 (D40), a port of the oracle's. |
@@ -536,7 +538,10 @@ Game-visible time is **virtual and deterministic**:
   ticks and vblank are all scheduled on the virtual timeline. They are
   delivered in a fixed order at safepoints, meaning runtime calls and loop
   back-edges. A device register access doesn't deliver them: an interrupt
-  it raises waits for the next safepoint.
+  it raises waits for the next safepoint. An adapter that ends a transfer
+  the original ended with a register write holds the interrupt the same
+  way (`Machine::hold_irq`): it is queued as the adapter returns, for the
+  guest's next safepoint, not taken at the adapter's own return (D64).
 - **Wall-clock time only paces presentation.** The same disc, build and
   input log always produce the same frames. That gives replays, golden-frame
   tests in CI, and bisection for free.
@@ -804,7 +809,9 @@ a call into guest code.
   controller without the register protocol.
 - **mdec.** The motion decoder (1F801820h/24h, DMA0 in, DMA1 out) for
   libpress's FMV: run-length decode, IDCT and colour conversion, instant
-  in virtual time (D58).
+  in virtual time (D58). Its decode function (`Mdec::input`, `output`)
+  is what DMA0 and DMA1 call, and what libpress's adapters call without
+  the register protocol (D64).
 - **sio.** SIO0 at register level (1F801040h-1F80104Eh, IRQ7), a
   bit-level port of the oracle's FrontIO and digital pad, so libpad's own
   state machine sees the timing it sees on the oracle (D40): chip sio0's
@@ -2197,3 +2204,46 @@ makes commands, interrupts and sectors arrive at the same cycle in both
 modes, so conformance compares only the library logic. Decided without
 the human's input, as the task said (plans/unified-adaptor-layer, phase 1
 findings).
+
+**D64. libpress's adapters drive the MDEC's decode function, and hold
+the interrupts its register writes raised** (unified adapter layer, phase
+1 task 9e). bof4 links libpress, in an overlay, and its movie player
+calls `DecDCTReset`, `DecDCTin` and `DecDCTout` (with `DecDCToutCallback`
+loading each slice).
+- **The seam** is every function of `libpress/libpress` that reaches the
+  MDEC or DMA0/DMA1: those three, `DecDCTPutEnv`, `DecDCTinSync`,
+  `DecDCToutSync`, so no function of the object reads the I/O shadow when
+  the chip is native. libpress's tables stay in its `.data`, found as
+  D61 finds libgpu's, so `DecDCTGetEnv` stays original; the callback
+  setters call libetc's `DMACallback`, and the run-length coders
+  (`DecDCTvlc*`) touch no hardware.
+- **The core** is `psx_devices::mdec`'s decode function, `Mdec::input`
+  (command and parameter words, decoded at once) and `Mdec::output`
+  (decoded words, zeros past them), which the device's DMA0 and DMA1 now
+  call too. `DecDCTin`'s words go in as libpress's DMA0 would deliver
+  them (blocks of 32, at least one); DMA1 waits, as on the device, while
+  a decode is still taking input and hasn't produced the words asked
+  for, and `DecDCTin`, a reset or a timeout lets it go.
+- **Completions are the shared DMA controller's** (DICR's flags, IRQ3),
+  so the callbacks run through libetc's DMA handler, its adapters' or its
+  own. CHCR0/1 stay untouched: DMA1's busy bit is the adapters' state,
+  which only libpress reads.
+- **The interrupt is held** (`Machine::hold_irq`, `dma_done_held`): the
+  original's IRQ3, raised by a register write inside guest code, waits for
+  the guest's next safepoint, while what an adapter raises would run at its
+  own return. The runtime's adapter export queues held interrupts as the
+  adapter returns (`release_irq`), and a wait releases them before its
+  quantum.
+- **Waits spin like libpress's loops** (a quantum per thousand
+  iterations), to its timeout after 0x100001, which prints through the
+  game's `printf` and resets the MDEC and both channels.
+
+*Why:* bof4's player goes on decoding the next frame's run-length codes
+after `DecDCTout`, and the slice callbacks come when that work reaches a
+safepoint. Taken at the adapter's return, a word the player updates every
+frame (`0x80116BB8`) read 10 less than on the device from the first
+decoded frame. Held, `title-to-field`'s RAM matches the device at every
+checkpoint except dead stack, and the renderer's command stream is the
+same, the movie's slices included. The same rule as D59's and D60's: the
+device decides when a callback runs. Decided without the human's input,
+as the task said (plans/unified-adaptor-layer, phase 1 findings).

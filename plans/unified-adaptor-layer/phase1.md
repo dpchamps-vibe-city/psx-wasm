@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c and 9d done; 5–6 harness in place)
+**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c, 9d and 9e done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -20,9 +20,10 @@ per-function detail. The scan reproduces every constant-address access
 the translator sees in either game's SDK code.
 
 **141 adapters** across both games: btn needs 109, bof4 90. 78 reach a
-chip or BIOS internals; 63 are state accessors. 46 of them exist (23
+chip or BIOS internals; 63 are state accessors. 49 of them exist (23
 before chip irq, task 9a; 31 before chip sio0, task 9c; chip cd, 9d,
-traded libcd's 12 public-layer adapters for 8 of its drive layer here).
+traded libcd's 12 public-layer adapters for 8 of its drive layer here;
+chip mdec, 9e, added libpress's 3).
 
 | Library | Reach hardware | State accessors | Have |
 |---|---|---|---|
@@ -33,7 +34,7 @@ traded libcd's 12 public-layer adapters for 8 of its drive layer here).
 | libgpu | 17 | 12 | 13 (the rest stay original over them, 9b) |
 | libmcx | 1 | 18 | 4 |
 | libpad | 5 | 1 | 6 |
-| libpress | 3 | 0 | 0 |
+| libpress | 3 | 0 | 3 (and the 3 internal ones, 9e) |
 | libsnd | 1 | 19 | 0 |
 | libspu | 18 | 6 | 0 |
 
@@ -114,7 +115,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    `psxw oracle ramdiff --compare-frames`).
 7. [ ] **Cores without the protocol** (README, "Native backends"):
    - a mixer API over `psx-spu`'s voice DSP;
-   - an MDEC decode function;
+   - an MDEC decode function (done, 9e: `Mdec::input`, `Mdec::output`);
    - an XA route from the drive to the mixer;
    - the GPU decoder and the drive, shared between adapters and devices.
 8. [ ] **Bump the psyq-decomp pin.** libpad, libpress and libmcx were
@@ -129,7 +130,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    | b ✓ | GPU | libgpu | 15: 13 of the 17 that reach it, `GetODE`, `_GPU_ResetCallback` | Done 2026-10-29 (progress log). The font and kanji functions and the 12 accessors stay original over libgpu's state in guest RAM (D61). libgs rides on it. Old set (24) in `02180f4^`. |
    | c ✓ | SIO0 | libpad | 6 (+ PadStopCom) | Done 2026-10-29 (progress log). Old set (7) in `609a64a^`. Reproduces libpad's observable state machine (D40's reason for removing it) and its interrupt's time (D60). |
    | d ✓ | CD | libcd (libds and streaming ride on it) | 13: `bios_1`'s 9, `CD_getsector`, `CD_getsector2`, `StCdInterrupt`, `StUnSetRing` | Done 2026-10-29 (progress log). The seam is libcd's drive layer under both games (D62); the public layer, libds and the rest of the ring stay original over it, its state in libcd's own globals. btn's 22 public-layer adapters are gone. |
-   | e | MDEC | libpress | 3 | Needs the decode function (task 7). |
+   | e ✓ | MDEC | libpress | 6: the 3 bof4 calls and the 3 internal ones | Done 2026-10-29 (progress log). bof4 only (btn links no libpress). Over the MDEC's decode function (task 7), DMA0/DMA1 completed on the shared controller, IRQ3 held to the guest's next safepoint (D64). |
    | f | SPU | libspu, libsnd | 26 + 1 | Needs the mixer API (task 7). The largest set. |
    | g | Memory card (PocketStation) | libmcx | 19 (4 exist) | btn only. |
 
@@ -442,6 +443,78 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     for a call. Other jobs had the machine at load average 12. The rerun
     passed, 29 s for the whole chip. The deadline is wall-clock, so a
     loaded machine can fail that case.
+- **2026-10-29, task 9e: chip mdec native in bof4.** 6 libpress adapters
+  (`sdk-psyq/src/libpress.rs`): `DecDCTReset`, `DecDCTPutEnv`,
+  `DecDCTin`, `DecDCTout`, `DecDCTinSync`, `DecDCToutSync`, every
+  function of `libpress/libpress` that reaches the MDEC or DMA0/DMA1,
+  written from the 4.7 object (`psxw sdk disasm`; psyq-decomp's C, for a
+  libpress with the same logic at other offsets). bof4 calls the first,
+  third and fourth (the scan's set); the other three are its `internal`
+  ones, adapted so no function of the object reads the I/O shadow
+  natively.
+  `libpress/libpress` (key `c750d3ed…`, in bof4's overlay `ovl_4414`) is
+  validated; bof4 reports mdec native and `game.toml` expects it (cd,
+  gpu, irq, mdec, sio0). btn links no libpress. Inventory: 49 of the 141
+  exist.
+  - **How (D64).** libpress's tables stay in its `.data`, found from
+    `Psyq::at` through the object's code with its `.rdata`, `printf` and
+    `ResetCallback` (D61), so `DecDCTGetEnv` stays original, and so do
+    `DecDCTinCallback`/`DecDCToutCallback` (libetc's `DMACallback`) and
+    the run-length coders. The MDEC is the bus's core, driven through
+    its new decode function (`Mdec::input`: commands and parameters,
+    decoded at once; `Mdec::output`: decoded words, zeros past them),
+    which the device's DMA0 and DMA1 now call too (phase 1 task 7's
+    "MDEC decode function"). `DecDCTin`'s words go in as its DMA0 would
+    deliver them (blocks of 32, at least one); DMA1 waits while a decode
+    is still taking input and short of the words asked for, as on the
+    device, and `DecDCTin`, a reset or a timeout lets it go. DMA0 and
+    DMA1 end on the shared DMA controller (`Machine::dma_done_held`:
+    DICR's flags, IRQ3), with IRQ3 held until the adapter returns
+    (`Machine::hold_irq`, `release_irq` in the runtime's adapter export),
+    so the slice callbacks run at the guest's next safepoint as on the
+    device (Findings). DPCR gets libpress's enables; CHCR0/1 aren't
+    touched. Waits spin like libpress's loops, a quantum per thousand
+    iterations, to its timeout (0x100001), which prints through the
+    game's `printf` and resets the MDEC and both channels. The void
+    functions return what libpress leaves in v0 (DMA0's or DMA1's CHCR
+    address, the reset's control word, `printf`'s result).
+  - **Conformance:** 5 mdec cases (`sdk-psyq/src/cases/mdec.rs`), 4
+    level 1 with seeded arguments (resets by mode, bad ones included,
+    over an idle MDEC, a decode taking input or DMA1 waiting for it; random
+    run-length streams in colour and monochrome at every depth, signed or
+    not, sliced into DMA1 transfers of 8-384 words, before and after their
+    input, past the end; random quantization tables, loaded into a busy
+    MDEC to the timeout; the sync calls' polling and waiting modes, both
+    timeouts) and a level-2 sequence (a movie player's calls: frames
+    sliced under an out callback, DMA1 before its input, output left
+    over into the next frame, new tables mid-stream, a reset with DMA1
+    waiting, a short input waited out, bad options, the callbacks off).
+    Observed: output buffers (pattern-filled, hashed), the command word
+    `DecDCTin` rewrites, `DecDCTGetEnv`'s tables, the busy bits, callback
+    counts after each call, Vcount around the timeouts (37 frames). The
+    chip harness now loads the overlays a case's functions are in
+    (`resident`; it refuses one over the cases' scratch, now bounded by
+    `cases::SCRATCH_LEN`). `psxw conform bof4 --chip mdec`: PASS, 17 case
+    runs (4 seeds). On the tree merged with main (chip cd): `--chip irq`
+    (33 runs), `--chip gpu` (49), `--chip sio0` (34), `--chip cd`
+    (22) pass in bof4, and `--chip irq` (33), `--chip gpu` (49), `--chip
+    sio0` (34), `--chip cd` (19) in btn (4 seeds each).
+  - **Runs:** bof4 `title-to-field` (25,300 frames): every expect passes
+    at the same frame as on `--device mdec` (counter 12390 at frame
+    24768); the movie plays from frame 1,198 (counter 762) to about
+    2,000, 1 `DecDCTReset`, 91 `DecDCTin` and 1,630 `DecDCTout` calls,
+    its sectors through chip cd's native path. Against `--device mdec`,
+    RAM hashed every 50 frames is equal at all 506 checkpoints but the 25
+    from 1,200 to 2,400, where 1 to 4 dead stack bytes differ (Findings);
+    over 2,001 frames the renderer's command stream is identical (5,763,570
+    words in 985 submits, same hash, same displays), so are the movie's
+    slices. Natively no guest code touches the MDEC (188 register
+    accesses on the device), and DMA accesses drop from 14,326 to 2,449.
+    btn and bof4, 1,200 frames, `--check boot --check no-trap --check
+    no-shadow-io`: pass (btn 952,146 `VSync` calls, bof4 3,268 and its
+    first decoded frame: 2 `DecDCTin`, 40 `DecDCTout`); bof4 on `--device
+    mdec` passes the same (10 MDEC register accesses). btn
+    `title-to-gameplay` (6,000 frames): pass.
 
 ## Findings
 
@@ -679,3 +752,45 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   frames on `--device all`, the only accesses wider than a word in either
   game are SPU stores, no access is unaligned, and no load is wider than
   a word.
+- **An adapter's interrupt is taken at its own return; the original's at
+  the guest's next safepoint** (task 9e, D64). A first set of libpress
+  adapters raised IRQ3 for DMA1's completion as the device does, and
+  `driver::run` took it as the adapter returned, so the slice callbacks
+  (`LoadImage` of each 16-pixel column, the next `DecDCTout`) ran before
+  bof4's player went on. On the device the original's register write
+  raises it inside guest code, and the player first decodes the next
+  frame's run-length codes (`DecDCTvlc2`, called right after
+  `DecDCTout`) up to a safepoint. From the first decoded frame (1,198) a
+  word the player updates each frame, `0x80116BB8`, read 10 less natively
+  (`0x138F` against `0x1399`; as hblanks, about a safepoint quantum); the
+  movie, the frame counter and the expects were the same. Holding the
+  interrupt until the adapter returns (`Machine::hold_irq`) removed it.
+  Open for chip gpu: its adapters' DMA2 completions are still taken at
+  their return, which may be what its finding on bof4's DrawSync-measured
+  draw time (9 hblanks less natively) sees; `dma_done_held` would apply.
+- **Dead stack under the movie** (task 9e). With the interrupt held, RAM
+  during the movie differs from `--device mdec` only below the stack:
+  `0x801FF73A`, `0x801FF762` and `0x801FFF3A` hold `0x10` on the device
+  (the high half of libpress's wait counter, `0x100000` at `16(sp)`), and
+  `0x801FF768` `0x80` natively. Not reproduced, as libgpu's frames
+  aren't; by frame 3,000 RAM is equal.
+- **The device's DMA1 doesn't wait for an idle MDEC.** A `DecDCTout`
+  with no decode in progress takes what the output holds and zeros past
+  it, at once; hardware would wait for the MDEC's data-out request. The
+  adapters reproduce the device (principle 6): `DecDCTout` before its
+  `DecDCTin` reads zeros unless the MDEC is still taking an earlier
+  command's input. A DMA count of zero blocks is one block on both sides
+  (the controller's `words()`). bof4 always calls `DecDCTin` first.
+- **Where bof4's movie is.** In `title-to-field` the first libpress call
+  (`DecDCTReset(0)`) comes between frames 1,150 and 1,190, the first
+  decode at frame 1,198 (counter 762), the last near 2,000; the frames
+  780-850 the task named are the counter's range, not the replay's.
+  The player's out callback calls `StCdInterrupt` first when libcd's ring
+  deferred its interrupt, so chip cd's ring adapter runs inside DMA1's
+  callback.
+- **Chip cases and overlays.** bof4 places libpress in an overlay
+  (`ovl_4414`, `0x801CC800`-`0x801E02A0`), which a fresh conformance
+  machine doesn't have. The chip harness writes the overlays a case's
+  functions resolve into before it starts (§3: the bytes in RAM decide),
+  and fails if one lies over the cases' scratch RAM (`SCRATCH`, now with
+  `SCRATCH_LEN`, 48 KiB) or over another the case needs.
