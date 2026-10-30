@@ -65,6 +65,8 @@ import { Calls, ScriptHost, mod } from "./script.js";
 
 const ABI_VERSION = 12;
 const NOTHING_PRESSED = 0xffff;
+/** How far ahead of the vblanks a recorded counter may be (see `pad_state`). */
+const RECORD_AHEAD = 1 << 20;
 // Where the guest's window is, unless the module says (psxw-abi
 // guest::WINDOW; a debug build's is at 2 GiB).
 const WINDOW_BASE = 0x01000000;
@@ -430,9 +432,11 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       else buttons = Atomics.load(pad, 1 + (port & 1));
       if (recording) {
         // Before the game zeroes its counter the word is garbage; a
-        // replay reads such values as nothing pressed too.
+        // replay reads such values as nothing pressed too. The counter
+        // may still run ahead of the vblanks: a loaded save's play time.
+        // Up to 2^20 entries (a 4 MB file); btn's garbage is past that.
         const c = new DataView(mem()).getUint32(windowBase + (recording.clock & 0x1ffffc), true);
-        if (c <= frame) {
+        if (c <= frame + RECORD_AHEAD) {
           const e = (recording.entries[c] ||= [NOTHING_PRESSED, NOTHING_PRESSED]);
           e[port & 1] = buttons < 0 ? NOTHING_PRESSED : buttons & 0xffff;
         }
