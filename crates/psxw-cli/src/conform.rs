@@ -285,7 +285,8 @@ fn libmcrd(ctx: &Ctx, s: &mut Side, _frames: u32) -> Result<()> {
 /// frames; the callback removed; then as a GPU DMA callback around a
 /// `DrawOTag`. On the original side every interrupt goes through the
 /// BIOS's custom exit into libetc's own dispatcher, which ends in
-/// ReturnFromException (D45).
+/// ReturnFromException (D45). `ResetCallback`'s result points at libetc's
+/// private context, which adapters don't have (D59): seen as zero or not.
 fn libetc(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
     let (cb, state) = ctx.callback()?;
     let ot = SCRATCH;
@@ -294,7 +295,8 @@ fn libetc(ctx: &Ctx, s: &mut Side, frames: u32) -> Result<()> {
         let v = word(&s.c.read(state, 4));
         s.observe(what, vec![format!("state {v:#010x}")]);
     };
-    s.call(ctx, "ResetCallback", [0; 4])?;
+    let v = s.c.call(ctx.addr("ResetCallback")?, [0; 4])? as u32;
+    s.observe("ResetCallback() is a pointer".into(), vec![(v != 0).to_string()]);
     s.call(ctx, "CheckCallback", [0; 4])?;
     s.call(ctx, "GetVideoMode", [0; 4])?;
     s.call(ctx, "SetVideoMode", [1, 0, 0, 0])?;

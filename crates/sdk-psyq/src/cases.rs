@@ -17,6 +17,8 @@
 //! commands, the audio); library state only through functions that read
 //! it; callbacks by their effect on a word, to the frame.
 
+mod irq;
+
 /// What a case runs against: one game's build, one side.
 pub trait Harness {
     /// Whether the game links `name`.
@@ -88,7 +90,9 @@ pub fn observe_ram(h: &mut dyn Harness, what: &str, addr: u32, len: usize) {
 
 /// Every case.
 pub fn all() -> Vec<Case> {
-    Vec::new()
+    let mut v = Vec::new();
+    v.extend(irq::cases());
+    v
 }
 
 /// The chip each hardware adapter belongs to (D59). BIOS-internals
@@ -106,8 +110,7 @@ mod tests {
     /// The gate below fails when one of these gets its cases, so the list
     /// only shrinks; phase 1 ends with it empty.
     const OWED: &[&str] = &[
-        "SetRCnt", "GetRCnt", "StartRCnt", "StopRCnt", "ResetRCnt", "CdInit", "CdReset", "CdControl", "CdControlF", "CdControlB",
-        "CdSync", "CdReady", "CdGetSector", "CdGetSector2", "CdRead", "CdReadSync", "CdReadBreak", "CdReadCallback", "CdSyncCallback",
+        "CdInit", "CdReset", "CdControl", "CdControlF", "CdControlB", "CdSync", "CdReady", "CdGetSector", "CdGetSector2", "CdRead", "CdReadSync", "CdReadBreak", "CdReadCallback", "CdSyncCallback",
         "CdReadyCallback", "CdDataCallback", "CdFlush", "CdDataSync", "CdStatus", "CdMode", "CdLastCom", "CdSearchFile",
     ];
 

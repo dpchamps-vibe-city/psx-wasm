@@ -266,10 +266,11 @@ fn boot_checks(ws: &Workspace, game: &str, o: &Options, r: &RunReport) -> Result
     let loaded = r.events.iter().filter(|e| e["event"] == "overlay-resident").count();
     v.push(Check { name: "overlays", pass: bad.is_empty(), detail: format!("{loaded} loads verified; mismatches {bad:?}") });
     v.push(Check { name: "no-trap", pass: r.stop == Stop::FrameLimit, detail: format!("{:?}", r.stop) });
-    // Calls to libetc's VSync (a build probe): at least one per two frames.
+    // Calls to libetc's VSync (a build probe, or its adapter when chip irq
+    // runs native): at least one per two frames.
     let inputs = psxw_lift::run::load(ws, game)?;
     let vsync = inputs.map.resolve(&inputs.map.main, "VSync").map(|r| r.addr);
-    let waits = vsync.map_or(0, |a| count(r, &format!("probe.{a:08X}")));
+    let waits = vsync.map_or(0, |a| count(r, &format!("probe.{a:08X}")) + count(r, "adapter.VSync"));
     v.push(Check {
         name: "vsync-waits",
         pass: waits >= 600,

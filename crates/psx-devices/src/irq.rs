@@ -1,7 +1,8 @@
 //! The interrupt controller's registers (psx-spx "Interrupts"): I_STAT at
-//! 1F801070h, I_MASK at 1F801074h. Used when original SDK code runs
-//! against register-level devices (conformance runs); with adapters, the
-//! runtime delivers interrupts as events and nothing reads these.
+//! 1F801070h, I_MASK at 1F801074h. Devices raise their lines here. Original
+//! SDK code reads and writes them through the bus; libetc's adapters (chip
+//! irq native, D59) use the same registers, since libraries that stay
+//! original share them.
 
 pub const VBLANK: u32 = 0;
 pub const GPU: u32 = 1;

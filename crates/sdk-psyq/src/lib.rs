@@ -7,15 +7,18 @@
 //! runs callbacks meanwhile). Semantics follow the SDK's own code, as
 //! psyq-decomp records it.
 //!
-//! Scope: libapi's `counter.o`/`pad.o`/`patch.o`/`first.o`, the libcd data
-//! path, and libcard/libmcx's thin BIOS wrappers.
+//! Scope: libetc's interrupt layer and libapi's `counter.o` (chip irq),
+//! libapi's `pad.o`/`patch.o`/`first.o`, the libcd data path, and
+//! libcard/libmcx's thin BIOS wrappers.
 //!
-//! Some libraries need no adapters: they run as the game's own code over
-//! register-level devices ([`DEVICE_LIBRARIES`], decision D40).
+//! A chip whose adapters don't cover a game runs its libraries as the
+//! game's own code over register-level devices ([`DEVICE_LIBRARIES`],
+//! D40, D59).
 
 pub mod cases;
 pub mod libapi;
 pub mod libcd;
+pub mod libetc;
 pub mod libmc;
 pub mod layout;
 pub mod validated;
@@ -26,6 +29,18 @@ pub type M = Machine<Psyq>;
 pub type Result = std::result::Result<Flow<Psyq>, String>;
 pub type Adapter = fn(&mut M, [u32; 4]) -> Result;
 
+/// A register of a device the adapters share with the emulated chips (the
+/// interrupt and DMA controllers, the root counters, GPUSTAT), read with
+/// the device's own semantics; not guest I/O.
+pub(crate) fn reg(m: &mut M, addr: u32, size: u32) -> std::result::Result<u32, String> {
+    m.reg_read(addr, size)
+}
+
+/// Write such a register.
+pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::Result<(), String> {
+    m.reg_write(addr, size, v)
+}
+
 /// Libraries that run as original code, their I/O-window accesses reaching
 /// the runtime's register-level devices (`psx_bios::io`), instead of
 /// being replaced.
@@ -35,10 +50,10 @@ pub type Adapter = fn(&mut M, [u32; 4]) -> Result;
 /// - libgpu (D42): the GPU front end takes GP0/GP1 words, so libgpu's own
 ///   code drives it through the ports and DMA; an ordering table is one
 ///   DMA linked-list walk in Rust.
-/// - libetc (D45): its interrupt layer is entered through the BIOS's
-///   custom exception exit (a longjmp into `startIntr`'s `setjmp`) and
-///   leaves with ReturnFromException; both are non-local exits the lift
-///   and link tiers lower to wasm exceptions.
+/// - libetc (D45), when chip irq is emulated: its interrupt layer is
+///   entered through the BIOS's custom exception exit (a longjmp into
+///   `startIntr`'s `setjmp`) and leaves with ReturnFromException; both are
+///   non-local exits the lift and link tiers lower to wasm exceptions.
 /// - libspu and libsnd (D47): the SPU is register-level (`psx-spu`, exact
 ///   against the oracle), so libspu's own code programs it, and libsnd's
 ///   few direct register writes reach it too.
@@ -69,6 +84,7 @@ pub mod cond {
 pub struct Psyq {
     pub cd: libcd::Cd,
     pub mc: libmc::Mc,
+    pub etc: libetc::Etc,
 }
 
 impl Sdk for Psyq {
@@ -89,9 +105,22 @@ impl Sdk for Psyq {
         }
     }
 
-    /// Vblank and DMA completion reach the guest as interrupts (libetc
-    /// runs over them, D45).
+    /// Vblank and DMA completion reach the guest as interrupts: through
+    /// libetc's adapters' dispatcher ([`libetc`]) when chip irq is native,
+    /// through libetc's own when it is emulated (D45).
     fn on_vblank(_m: &mut M) {}
+
+    fn irq_dispatch(m: &M) -> Option<u32> {
+        libetc::dispatch_step(m)
+    }
+
+    fn irq_step(m: &mut M, step: u32) {
+        libetc::irq_step(m, step)
+    }
+
+    fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
+        libetc::stand_in(m, addr, state)
+    }
 }
 
 pub(crate) fn ret(v: u32) -> Result {
@@ -107,6 +136,7 @@ pub(crate) fn block(until: psx_bios::Wait, then: impl FnOnce(&mut M) -> Flow<Psy
 pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&'static str, &'static str)> = Vec::new();
     v.extend(libapi::COUNTERS.iter().map(|n| (*n, "irq")));
+    v.extend(libetc::ADAPTERS.iter().map(|(n, _)| (*n, "irq")));
     v.extend(libcd::ADAPTERS.iter().map(|(n, _)| (*n, "cd")));
     v
 }
@@ -115,6 +145,7 @@ pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
 pub fn adapters() -> Vec<(&'static str, Adapter)> {
     let mut v: Vec<(&'static str, Adapter)> = Vec::new();
     v.extend(libapi::ADAPTERS);
+    v.extend(libetc::ADAPTERS);
     v.extend(libcd::ADAPTERS);
     v.extend(libmc::ADAPTERS);
     v
@@ -123,6 +154,7 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
 #[cfg(test)]
 pub mod testing {
     use super::*;
+    use psx_bios::IrqStep;
     use psx_devices::mem::VecMem;
     use psxw_abi::BootOptions;
 
@@ -176,17 +208,69 @@ pub mod testing {
         Machine::new(Box::new(VecMem::default()), Box::new(Host { disc }), Box::new(Regs(0x801F_F000)), opts, Psyq::default())
     }
 
+    /// A machine with the register-level devices on its bus, as the
+    /// runtime has.
+    pub fn machine_with_bus() -> M {
+        let mut m = machine(vec![], BootOptions::default());
+        m.io = Some(Default::default());
+        m
+    }
+
     /// Call an adapter and run its flow to completion.
     pub fn call(m: &mut M, f: Adapter, a: [u32; 4]) -> u32 {
         let r = f(m, a);
         finish(m, r)
     }
 
-    /// Run a flow to completion the way the runtime's driver does (no
-    /// callbacks run; they stay queued).
+    std::thread_local! {
+        static IRQ_CALLS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Run the exception handler's queued steps as the runtime's driver
+    /// does, with guest calls doing nothing: the adapters' dispatcher
+    /// steps and stand-in functions run, and the guest functions they call
+    /// are logged ([`irq_calls`]). Callbacks the kernel queues (`m.calls`)
+    /// stay.
+    pub fn drain(m: &mut M) {
+        if m.crit || m.in_irq {
+            return;
+        }
+        while let Some(s) = m.irq_calls.pop_front() {
+            match s {
+                IrqStep::Sdk(s) => Psyq::irq_step(m, s),
+                IrqStep::Chain(c, _) => guest(m, c.addr),
+                IrqStep::Exit => {}
+            }
+        }
+    }
+
+    /// A guest call: a stand-in runs (as the runtime's `untranslated`
+    /// does), anything else is logged.
+    pub fn guest(m: &mut M, addr: u32) {
+        let mut state = 0;
+        while let Some(step) = Psyq::stand_in(m, addr, state) {
+            match step {
+                psx_bios::StandIn::Call(c, next) => {
+                    guest(m, c.addr);
+                    state = next;
+                }
+                psx_bios::StandIn::Return(_) => return,
+            }
+        }
+        IRQ_CALLS.with(|v| v.borrow_mut().push(addr));
+    }
+
+    /// The guest functions interrupts called since the last look.
+    pub fn irq_calls() -> Vec<u32> {
+        IRQ_CALLS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+
+    /// Run a flow to completion the way the runtime's driver does (kernel
+    /// callbacks stay queued; see [`drain`]).
     pub fn finish(m: &mut M, f: Result) -> u32 {
         let mut f = f.unwrap();
         loop {
+            drain(m);
             match f {
                 Flow::Return(v) => return v as u32,
                 Flow::Block { until, then } => {
@@ -194,6 +278,7 @@ pub mod testing {
                     while !m.holds(until) {
                         let limit = m.clock.now + psx_devices::clock::CPU_HZ;
                         m.step(limit);
+                        drain(m);
                         guard += 1;
                         assert!(guard < 100_000, "wait never satisfied: {until:?}");
                     }
@@ -201,5 +286,12 @@ pub mod testing {
                 }
             }
         }
+    }
+
+    /// Let `n` vblanks pass, interrupts dispatched.
+    pub fn vblanks(m: &mut M, n: u64) {
+        let until = m.vblanks + n;
+        let f: Result = Ok(Flow::Block { until: psx_bios::Wait::Vblanks(until), then: Box::new(|_| Flow::Return(0)) });
+        finish(m, f);
     }
 }

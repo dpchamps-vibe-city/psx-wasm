@@ -51,6 +51,12 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
             if step.0 == IrqStep::Exit && m.kernel.custom_exit == 0 {
                 continue;
             }
+            // The adapters' dispatcher: Rust, no guest call; it queues the
+            // callbacks it runs at the front.
+            if let IrqStep::Sdk(s) = step.0 {
+                S::irq_step(&mut m, s);
+                continue;
+            }
             m.in_irq = true;
             m.rfe = false;
             step
@@ -74,6 +80,7 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
                     }
                 }
             }
+            IrqStep::Sdk(_) => unreachable!("run above"),
             IrqStep::Exit => {
                 let buf = rt.borrow().kernel.custom_exit;
                 let resume = rt.borrow().mem.r32(buf);

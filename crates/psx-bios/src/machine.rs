@@ -91,6 +91,10 @@ pub enum IrqStep {
     /// An element's first function, and its second to call with the
     /// first's result when that is nonzero.
     Chain(GuestCall, Option<u32>),
+    /// A step of the SDK's own interrupt dispatcher when its adapters run
+    /// it (libetc's, D59): [`Sdk::irq_step`] runs it at its turn, and may
+    /// queue further steps (callbacks among them) at the front.
+    Sdk(u32),
     /// The end of the handler: the custom exit (`HookEntryInt`, B0h:19h)
     /// if one is set, entered like a longjmp to its buffer with 1.
     Exit,
@@ -107,6 +111,15 @@ pub enum Event {
     Sdk(u32, u32),
     /// The register-level CD controller has work due (D58).
     Cdc,
+}
+
+/// A step of a stand-in function ([`Sdk::stand_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandIn {
+    /// Call this guest function, then continue from this state.
+    Call(GuestCall, u32),
+    /// Return this.
+    Return(u64),
 }
 
 /// What a BIOS call or adapter does next.
@@ -146,6 +159,23 @@ pub trait Sdk: Sized {
     fn on_vblank(m: &mut Machine<Self>);
     /// A DMA channel finished a transfer (device libraries' DMA).
     fn on_dma(_m: &mut Machine<Self>, _ch: usize) {}
+    /// The exception handler takes an interrupt: the step to run after the
+    /// `SysEnqIntRP` chains and before the exit, when the adapters own the
+    /// SDK's interrupt dispatcher (libetc's, D59). With the SDK's original
+    /// code, its dispatcher is the custom exit instead (D45).
+    fn irq_dispatch(_m: &Machine<Self>) -> Option<u32> {
+        None
+    }
+    /// Run an [`IrqStep::Sdk`] step.
+    fn irq_step(_m: &mut Machine<Self>, _step: u32) {}
+    /// Guest code called `addr`, which no guest function implements: if it
+    /// is a function pointer the adapters handed out for SDK code they
+    /// replace (libetc's own interrupt handlers, D59), its next step from
+    /// `state` (0 on entry). The runtime makes the guest calls it asks for
+    /// as nested calls, like the original's, and comes back with the state.
+    fn stand_in(_m: &mut Machine<Self>, _addr: u32, _state: u32) -> Option<StandIn> {
+        None
+    }
 }
 
 pub struct Machine<S> {
@@ -265,7 +295,10 @@ impl<S: Sdk> Machine<S> {
         let next = self.clock.next_time().unwrap_or(limit).min(limit);
         if self.crit || self.in_irq {
             // Time passes; interrupts wait for the critical section to end.
-            self.clock.advance_to(next.max(self.clock.now + 1));
+            // Once an event is overdue nothing else can happen before
+            // `limit`.
+            let to = if next > self.clock.now { next } else { limit };
+            self.clock.advance_to(to.max(self.clock.now + 1));
             return;
         }
         self.run_until(next);
@@ -295,7 +328,10 @@ impl<S: Sdk> Machine<S> {
                 if let Some(t) = self.timers[n as usize].next_irq(n as usize, video, now + 1) {
                     self.clock.schedule(t, Event::Timer(n));
                 }
-                if self.kernel.timer_irq_enabled(n) {
+                // The kernel's root counter handler delivers RCntCNTn when
+                // the counter's interrupt is unmasked (StartRCnt,
+                // InterruptCallback).
+                if self.io.as_ref().is_some_and(|io| io.irq.mask & 1 << (psx_devices::irq::TIMER0 + n as u32) != 0) {
                     self.deliver_event(0xF200_0000 | n as u32, 0x0002);
                 }
                 self.raise_irq(psx_devices::irq::TIMER0 + n as u32);

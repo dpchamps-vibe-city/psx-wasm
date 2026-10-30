@@ -3,12 +3,14 @@
 //! patches), `first.o` (memory card directory). The other 33 members are
 //! BIOS trampolines and run translated, into the runtime's BIOS.
 //!
-//! `counter.o` follows psyq-decomp `libapi/counter`: `SetRCnt` writes the
-//! mode (0x48: reset at target, repeating IRQ; gate, clock source and IRQ
-//! enable from the spec's mode bits) and the target; `StartRCnt` unmasks
-//! the counter's IRQ.
+//! `counter.o` (chip irq, D59) follows PsyQ 4.7's object: `SetRCnt`
+//! writes the mode (0x48: reset at target, repeating IRQ; sync, clock
+//! source and IRQ at target from the spec's mode bits) and the target;
+//! `StartRCnt` and `StopRCnt` unmask and mask the counter's interrupt in
+//! I_MASK (its table: counters 0-2, then RCntCNT3, vblank), which the
+//! kernel's root counter handler and libetc's dispatcher both go by.
 
-use crate::{Adapter, M, Result, ret};
+use crate::{Adapter, M, Result, reg, ret, set_reg};
 
 /// The root-counter adapters (`counter.o`): chip irq (D59).
 pub const COUNTERS: &[&str] = &["SetRCnt", "GetRCnt", "StartRCnt", "StopRCnt", "ResetRCnt"];
@@ -30,12 +32,16 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("firstfile", firstfile),
 ];
 
+/// `counter.o`'s I_MASK bits per counter spec (its table runs on into
+/// zeros).
+const RCNT_IRQ: [u32; 4] = [0x10, 0x20, 0x40, 0x01];
+
 fn counter(spec: u32) -> Option<usize> {
     let n = (spec & 0xFFFF) as usize;
     (n < 3).then_some(n)
 }
 
-fn set_rcnt(m: &mut M, a: [u32; 4]) -> Result {
+pub(crate) fn set_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let Some(n) = counter(a[0]) else { return ret(0) };
     let mode_in = a[2];
     let mut mode: u16 = 0x48;
@@ -66,18 +72,15 @@ fn get_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 
 fn start_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let n = (a[0] & 0xFFFF) as usize;
-    if n < 3 {
-        m.kernel.timer_irq[n] = true;
-        m.reschedule_timer(n);
-    }
+    let mask = reg(m, psx_devices::irq::I_MASK, 4)?;
+    set_reg(m, psx_devices::irq::I_MASK, 4, mask | RCNT_IRQ.get(n).copied().unwrap_or(0))?;
     ret((n < 3) as u32)
 }
 
 fn stop_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let n = (a[0] & 0xFFFF) as usize;
-    if n < 3 {
-        m.kernel.timer_irq[n] = false;
-    }
+    let mask = reg(m, psx_devices::irq::I_MASK, 4)?;
+    set_reg(m, psx_devices::irq::I_MASK, 4, mask & !RCNT_IRQ.get(n).copied().unwrap_or(0))?;
     ret(1)
 }
 

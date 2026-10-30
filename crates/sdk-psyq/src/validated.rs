@@ -6,9 +6,10 @@
 //! hardware). Add an object here once its adapters pass conformance (or
 //! the oracles) against it.
 //!
-//! PsyQ 4.7 (btn's link; signature database `470`). Validated by the
-//! adapters' unit tests against psyq-decomp's 4.7 sources, `psxw conform`
-//! where a scenario exists, and the whole-game oracles.
+//! PsyQ 4.7 (btn's and bof4's links; signature database `470`). Validated
+//! by the adapters' unit tests against the 4.7 objects and psyq-decomp's
+//! sources, `psxw conform` (scenarios, and the chip cases in both games),
+//! and the whole-game oracles.
 
 pub const VALIDATED: &[(&str, &str)] = &[
     ("libapi/c112", "6d011673eb04bf3a24a7326b3e0c93884881d829922f15cd3c1829b2c7dcbd4f"),
@@ -36,6 +37,8 @@ pub const VALIDATED: &[(&str, &str)] = &[
     ("libcd/s_022", "d765636c71f72f252321924479ff32eed4b8fdb1a9b842d109995c6ec86bbbb6"),
     ("libcd/s_023", "b551454f7b9bbe671b4e68d1d7f67f69159c213379a4620c901f0428df98e823"),
     ("libcd/s_024", "20c3a8daad2ca1ef691428fa27cad0dd0e0113eeae8224c3066e369cf4b7a5f1"),
+    ("libetc/intr", "09b0feea2c632554bb610534332bc10cf1708c337d9cfd65247ac9400a35799e"),
+    ("libetc/vsync", "5ced3e577ea12a54481e823fd26a28b831c29d427c4728d4c35233f3c46095a8"),
     ("libmcx/mcxcmd2", "58e691a13329379c176821716b5baf24e9e9c75b1429e4970cd620e00efc6d5e"),
     ("libmcx/mcxcmd23", "92804c396fb540fcda4c0e0081118fd7ebd1ca6bc816cefd95be8b1ac8a9a7bc"),
     ("libmcx/mcxcmd24", "9926ec52d6649a8cebb51eaca0bad13eb020056a15b5bdf8b8e5b989a2c16f02"),

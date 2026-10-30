@@ -36,7 +36,7 @@ manifest, without changes to the toolchain's code.
 | SPU | **Register level.** libspu and libsnd are original code over `psx-spu`: 24 ADPCM voices with reverb, on their own 44.1 kHz clock (D47). |
 | CD-ROM | **Per game** (D58). Where libcd's adapters validate and cover everything the game reaches (btn), they drive a drive model over the user's disc image. Otherwise (bof4) libcd runs as original code over a register-level CD controller (`psx-devices::cdc`). libds and libpress are original code over the CD controller and the MDEC (`psx-devices::mdec`). |
 | Pad | **Register level.** libpad is original code over SIO0 (`psx-devices::sio`, D40). |
-| Interrupts, timers, DMA | **Register level.** libetc is original code over the interrupt controller, the root counters and the DMA controller. The BIOS runs the `SysEnqIntRP` chains and enters libetc's dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
+| Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
 | BIOS/kernel | A Rust implementation of the A0/B0/C0 services the SDK calls, including threads (D57) and the memory card functions (D43). |
 
 So the CPU is not emulated: all code is compiled ahead of time. The
@@ -48,9 +48,10 @@ everything a game can observe, exactly and for any SDK version. Adapters
 remain where a library's policy keeps them (§5).
 [`emulation-layers.md`](emulation-layers.md) draws the layers, and
 [`status-btn-vs-bof4.md`](status-btn-vs-bof4.md) compares the two games.
-A plan to move each chip back to native adapters, degrading to its device
-model where the adapters don't cover a game, is being written in
-[`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md).
+D59 moves each chip back to native adapters, degrading to its device
+model where the adapters don't cover a game
+([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):
+so far the CD in btn and the interrupt layer (chip irq) in both games.
 
 ## What the inputs look like (measured)
 
@@ -391,9 +392,10 @@ expects native, and the build fails if one falls back. `--device
 accesses per chip, and `psxw run --check no-io` requires none.
 
 **Where the boundary sits today.** The device models carry most chips:
-the original code runs over register-level models of the interrupt
-controller, the root counters, DMA, the GPU, the SPU, SIO0, the CD
-controller and the MDEC. Each move below the API (D40, D42, D45, D47,
+the original code runs over register-level models of the GPU, the SPU,
+SIO0, the CD controller (bof4) and the MDEC, and of the DMA controller
+they use. Adapters drive the interrupt controller and the root counters
+(chip irq) in both games, and the CD drive in btn. Each move below the API (D40, D42, D45, D47,
 D58) bought exactness by construction and independence from the SDK
 version, because the original library decides every value a game can
 observe. Together they made the layer beneath the SDK an emulated device
@@ -462,7 +464,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 | Library | Policy |
 |---|---|
 | libapi | `adapter`. Translated; BIOS calls go to the Rust BIOS (D13). Adapters for `pad.o` and `patch.o` (BIOS pad buffers and patches) and `first.o` (`firstfile`, the memory card directory). `counter.o` (`SetRCnt`… program the timers) is `adapter-or-device`, in chip irq. `chclrpad.o` and `padstop.o` touch no hardware and run as guest code. |
-| libetc | `adapter-or-device`, chip irq. On the device: original code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
+| libetc | `adapter-or-device`, chip irq. Native (btn, bof4): adapters for `intr.o`'s and `vsync.o`'s functions, their state in the runtime, over the interrupt controller, DPCR/DICR, root counter 1 and GPUSTAT, which stay the devices' registers because other libraries use them too ("Time, interrupts and blocking"). On the device: original code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
 | libgpu | `adapter-or-device`, chip gpu. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
 | libcd | `adapter-or-device`, chip cd (D58). The adapters sit at the drive (`CdInit`, `CdControl*`, `CdRead*`, `CdSync`, `CdReady`, the callbacks, `CdSearchFile`). btn binds them; bof4's game code and libds reach libcd's drive layer past them (`CD_cw`, `CD_init`, `StUnSetRing`), so its CD is emulated: libcd runs as original code over the CD controller. |
 | libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's adapters, or over the original (D58). |
@@ -504,11 +506,16 @@ Game-visible time is **virtual and deterministic**:
   runs out, the runtime advances virtual time by a quantum (20,000 CPU
   cycles by default, `BootOptions::safepoint_quantum`) and delivers what
   fell due.
-- **Waiting is spinning.** libetc's `VSync` and libgpu's `DrawSync` are
-  original code (D42, D45), so they wait the way they do on hardware, by
-  polling. `VSync(0)` spins until libetc's own vblank handler, delivered at
-  one of the loop's safepoints, advances `Vcount`. A spin loop like
-  `while (!cd_done);` makes progress the same way.
+- **Waiting is spinning.** libgpu's `DrawSync` is original code (D42),
+  and so is libetc's `VSync` with chip irq on its device (D45): they wait
+  the way they do on hardware, by polling. `VSync(0)` spins until libetc's
+  vblank handler, delivered at one of the loop's safepoints, advances
+  `Vcount`. A spin loop like `while (!cd_done);` makes progress the same
+  way. An adapter that replaces a spin waits the way the spin does (D59):
+  `VSync`'s adapter moves time a quantum at a time, delivering what fell
+  due and then running the handlers, as at the loop's safepoints. When
+  interrupts are taken is observable: taken at once, bof4's CD streaming
+  goes another way (plans/unified-adaptor-layer, phase 1 findings).
 - **Blocking runtime calls jump.** A runtime call that must wait (the
   BIOS's `WaitEvent`, a libcd adapter's `CdSync(0)` or `CdReadSync(0)`)
   advances time event by event until it is satisfied.
@@ -523,9 +530,21 @@ Game-visible time is **virtual and deterministic**:
 
 **Interrupts are the BIOS's exception handler, run at safepoints** (D45).
 An IRQ becomes steps: every `SysEnqIntRP` element, priority 0 to 3, then
-the exit. The exit is the custom one `HookEntryInt` installed if there is
-one (libetc's), entered like a longjmp into the `setjmp` that made its
-buffer. `ReturnFromException` leaves from any depth.
+the SDK's dispatcher when adapters run it, then the exit. The exit is the
+custom one `HookEntryInt` installed if there is one (libetc's, with chip
+irq on its device), entered like a longjmp into the `setjmp` that made
+its buffer. `ReturnFromException` leaves from any depth.
+- **libetc's adapters' dispatcher** (chip irq native, D59) is Rust steps
+  in the same queue: for each pending line libetc handles, in line order,
+  acknowledge I_STAT and queue the line's handler as a guest call at the
+  front, then look again until none is left, as `intr.o`'s loop does.
+  libetc's own vblank and DMA handlers are stand-in functions at addresses
+  no game code has: libsnd takes line 0 and calls the handler it replaced,
+  so a guest call to one runs it in the runtime (`untranslated`), its
+  callbacks as nested guest calls. The interrupt controller, DMA
+  controller and root counters stay the devices' registers, which the
+  adapters change with the devices' own semantics; the emulated chips'
+  devices raise their interrupts there as before.
 - **Translated code follows this** through wasm exceptions:
   - a `setjmp` (A0h:13h) caller saves its registers inline;
   - the return address is a continuation entry that reloads them;
@@ -536,8 +555,8 @@ buffer. `ReturnFromException` leaves from any depth.
 
 Drawing is synchronous inside the runtime: a GPU DMA completes instantly
 in virtual time, sets DICR and raises IRQ3 (D42). Its completion callback
-still arrives at the next safepoint, through libetc's dispatcher, not
-re-entrantly inside `DrawOTag`. CD timing is a runtime toggle (D19), with
+still arrives at the next safepoint, through libetc's dispatcher (its
+adapters' or its own), not re-entrantly inside `DrawOTag`. CD timing is a runtime toggle (D19), with
 a per-game default in `game.toml` (`cd_timing`); the drive model behind
 libcd's adapters and the CD controller (D58) share it:
 - *realistic*, because loading screens animate while reads are in flight;

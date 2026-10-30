@@ -419,9 +419,24 @@ pub extern "C" fn safepoint() {
     with(|rt| driver::safepoint(&rt.m, &mut Guest, rt.quantum));
 }
 
+/// Guest code called an address no guest function implements. A function
+/// pointer the adapters handed out (libetc's own interrupt handlers when
+/// chip irq is native, D59) runs here, its guest calls nested like the
+/// original's; anything else is a trap.
 #[unsafe(export_name = "untranslated")]
 pub extern "C" fn untranslated(addr: u32) -> u64 {
-    fatal(4, &format!("no implementation for guest address {addr:#010x}"))
+    let mut state = 0;
+    loop {
+        let step = with(|rt| <Psyq as psx_bios::Sdk>::stand_in(&mut rt.m.borrow_mut(), addr, state));
+        match step {
+            Some(psx_bios::StandIn::Call(call, next)) => {
+                Guest.invoke(call);
+                state = next;
+            }
+            Some(psx_bios::StandIn::Return(v)) => return v,
+            None => fatal(4, &format!("no implementation for guest address {addr:#010x}")),
+        }
+    }
 }
 
 #[unsafe(export_name = "bios")]

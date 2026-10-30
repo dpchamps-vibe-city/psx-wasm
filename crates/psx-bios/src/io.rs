@@ -139,8 +139,23 @@ impl Io {
 }
 
 impl<S: Sdk> Machine<S> {
-    /// Read `size` bytes of the register at `addr` (physical).
+    /// A guest read of `size` bytes of the register at `addr` (physical),
+    /// counted per chip for the run report.
     pub fn io_read(&mut self, addr: u32, size: u32) -> Result<u32, String> {
+        let v = self.reg_read(addr, size)?;
+        let now = self.clock.now;
+        if let Some(io) = self.io.as_mut() {
+            io.note(now, addr, size, v, false);
+        }
+        Ok(v)
+    }
+
+    /// Read `size` bytes of the register at `addr` (physical) with the
+    /// device's own semantics: for guest code ([`Self::io_read`]), and for
+    /// adapters that share a device's state with the emulated chips (the
+    /// interrupt and DMA controllers, D59), whose accesses aren't guest
+    /// I/O.
+    pub fn reg_read(&mut self, addr: u32, size: u32) -> Result<u32, String> {
         let now = self.clock.now;
         let video = self.clock.video;
         if SPU.contains(&addr) {
@@ -188,17 +203,25 @@ impl<S: Sdk> Machine<S> {
             return Err(format!("read of unmodelled I/O register {addr:#010x} ({size} bytes)"));
         };
         let v = v & mask(size);
-        if let Some(io) = self.io.as_mut() {
-            io.note(now, addr, size, v, false);
-        }
         if Cdc::handles(addr) {
             self.cdc_sync();
         }
         Ok(v)
     }
 
-    /// Write `size` bytes of `v` to the register at `addr` (physical).
+    /// A guest write of `size` bytes of `v` to the register at `addr`
+    /// (physical), counted per chip for the run report.
     pub fn io_write(&mut self, addr: u32, size: u32, v: u32) -> Result<(), String> {
+        let now = self.clock.now;
+        if let Some(io) = self.io.as_mut() {
+            io.note(now, addr, size, v & mask(size), true);
+        }
+        self.reg_write(addr, size, v)
+    }
+
+    /// Write `size` bytes of `v` to the register at `addr` (physical) with
+    /// the device's own semantics (see [`Self::reg_read`]).
+    pub fn reg_write(&mut self, addr: u32, size: u32, v: u32) -> Result<(), String> {
         let now = self.clock.now;
         let video = self.clock.video;
         if SPU.contains(&addr) {
@@ -207,7 +230,6 @@ impl<S: Sdk> Machine<S> {
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
         io.sio0.update(now, &mut io.irq);
         let v = v & mask(size);
-        io.note(now, addr, size, v, true);
         if SPU.contains(&addr) {
             let off = addr - SPU.start;
             let halves = match size {
@@ -573,7 +595,7 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// The BIOS exception handler's walk of the `SysEnqIntRP` chains,
-    /// then its exit.
+    /// then the SDK's dispatcher when adapters run it, then its exit.
     pub fn queue_irq_chains(&mut self) {
         for prio in 0..4u32 {
             let Some(chain) = self.kernel.int_handlers.get(&prio) else { continue };
@@ -584,6 +606,9 @@ impl<S: Sdk> Machine<S> {
                     self.irq_calls.push_back(IrqStep::Chain(GuestCall { addr: verifier, args: [0; 4] }, (handler != 0).then_some(handler)));
                 }
             }
+        }
+        if let Some(s) = S::irq_dispatch(self) {
+            self.irq_calls.push_back(IrqStep::Sdk(s));
         }
         self.irq_calls.push_back(IrqStep::Exit);
     }

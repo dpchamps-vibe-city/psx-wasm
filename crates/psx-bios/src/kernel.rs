@@ -40,8 +40,6 @@ pub struct Kernel {
     pub pad_started: bool,
     pub heap: (u32, u32),
     pub files: BTreeMap<u32, File>,
-    /// Root counter IRQs unmasked (StartRCnt).
-    pub timer_irq: [bool; 3],
     /// `ChangeClearRCnt` / `ChangeClearPad` flags.
     pub clear_rcnt: [u32; 4],
     pub clear_pad: u32,
@@ -104,10 +102,6 @@ impl Kernel {
             }
         }
         calls
-    }
-
-    pub fn timer_irq_enabled(&self, n: u8) -> bool {
-        self.timer_irq.get(n as usize).copied().unwrap_or(false)
     }
 
     /// Kernel pad handler: at each vblank, write each port's state into

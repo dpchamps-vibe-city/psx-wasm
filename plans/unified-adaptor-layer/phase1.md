@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4 done; 5–6 harness in place)
+**Status:** in progress (tasks 1–4 and 9a done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -20,14 +20,15 @@ per-function detail. The scan reproduces every constant-address access
 the translator sees in either game's SDK code.
 
 **141 adapters** across both games: btn needs 109, bof4 90. 78 reach a
-chip or BIOS internals; 63 are state accessors. 23 exist.
+chip or BIOS internals; 63 are state accessors. 31 exist (23 before
+chip irq, task 9a).
 
 | Library | Reach hardware | State accessors | Have |
 |---|---|---|---|
 | libapi | 3 | 2 | 5 |
 | libcard | 2 (BIOS internals) | 0 | 2 |
 | libcd | 20 | 5 | 12 |
-| libetc | 8 | 0 | 0 |
+| libetc | 8 | 0 | 8 |
 | libgpu | 17 | 12 | 0 |
 | libmcx | 1 | 18 | 4 |
 | libpad | 5 | 1 | 0 |
@@ -123,7 +124,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 
    | Order | Chip | Libraries | Adapters | Notes |
    |---|---|---|---|---|
-   | a | IRQ, timers, vblank | libetc, libapi | 8 + 7 (7 exist) | Old libetc set in `111e045^`. Must coexist with D45's exception path for code that hooks interrupts itself. |
+   | a ✓ | IRQ, timers, vblank | libetc, libapi | 11 + 5, all exist | Done 2026-10-29 (progress log). Old libetc set in `111e045^`. Coexists with D45's exception path: the BIOS chains run first, a custom exit still runs after. |
    | b | GPU | libgpu | 27 | Old set (24) in `02180f4^`. libgs rides on it. |
    | c | SIO0 | libpad | 6 | Old set (7) in `609a64a^`. Must reproduce libpad's observable state machine (D40's reason for removing it). |
    | d | CD | libcd (libds and streaming ride on it) | 24 (11 exist) | **Choose the seam first:** the low layer (`CD_*`, `StCdInterrupt`) under both games, or public adapters and the low layer over one drive model. btn's 11 existing public adapters are reworked to fit. |
@@ -187,6 +188,50 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   has `chips` and `emulated`; `--device <chips|all>`; `[chips] native` in
   `game.toml` (btn: cd); `io_accesses` in the run report; `--check
   no-io`.
+- **2026-10-29, task 9a: chip irq native in btn and bof4.** 11 libetc
+  adapters (`sdk-psyq/src/libetc.rs`): `ResetCallback`, `StopCallback`,
+  `RestartCallback`, `CheckCallback`, `InterruptCallback`, `DMACallback`,
+  `VSyncCallback`, `VSyncCallbacks`, `GetIntrMask`, `SetIntrMask`, `VSync`,
+  one code for both games, written from the 4.7 objects (`psxw sdk
+  disasm`). `counter.o`'s `StartRCnt`/`StopRCnt` now set I_MASK from its
+  table, as the original does. `libetc/intr` and `libetc/vsync` are
+  validated; both games bind all 16 irq adapters and report irq native,
+  and `game.toml` expects it (btn: cd, irq; bof4: irq).
+  - **How.** libetc's state (handlers, mask, Vcount, Hcount, the VSync
+    channels and DMA callbacks) is in the runtime; the interrupt
+    controller, DPCR/DICR, root counter 1 and GPUSTAT stay the devices'
+    registers, which the adapters use with the devices' semantics
+    (`Machine::reg_read`/`reg_write`, not counted as guest I/O) because
+    original libraries share them (libpad tests I_STAT, libgpu sets DPCR).
+    The dispatcher runs as `IrqStep::Sdk` steps after the `SysEnqIntRP`
+    chains (new `Sdk::irq_dispatch`/`irq_step`): pending lines in order,
+    I_STAT acknowledged, each handler a guest call queued at the front, a
+    re-check until none is left, as `intr.o`'s loop does. libetc's own
+    vblank and DMA handlers are stand-in functions (`Sdk::stand_in`,
+    reached through the runtime's `untranslated`), because libsnd takes
+    line 0 and calls the handler it replaced. `VSync` waits the way its
+    spin does: a safepoint quantum at a time, interrupts taken between
+    quanta (Findings).
+  - **Conformance:** 9 irq cases (`sdk-psyq/src/cases/irq.rs`), 8 level 1
+    with seeded arguments and a level-2 sequence (init, vblank callbacks
+    and `VSync` waits, vblank masked and unmasked, a GPU DMA callback
+    around libgpu's own, root counter 2's interrupt). `psxw conform btn
+    --chip irq` and `psxw conform bof4 --chip irq`: PASS, 33 case runs each
+    (4 seeds). bof4 got a `[conform]` callback (`func_8013BBA8`, a leaf
+    that counts its calls in a byte). `psxw conform btn --lib libetc`:
+    PASS, 60 steps. The `OWED` list lost the five counter adapters.
+  - **Runs:** btn and bof4, 1,200 frames, `--check boot --check no-trap
+    --check no-shadow-io`: pass native and on `--device irq`. bof4
+    `title-to-field` (25,300 frames, 34 s): every expect passes, at the
+    same frame as on the device (counter 12390 at frame 24768). btn
+    `title-to-gameplay` (6,000 frames): pass. In 1,200 frames of btn's
+    boot `VSync` is called 999,299 times (a polling loop); bof4's
+    replay makes 120,200 `VSync`, 97,902 `SetIntrMask` and 21,417
+    `DMACallback` calls.
+  - **Runtime:** the kernel's RCntCNTn events follow I_MASK now (they
+    followed a flag only the old `StartRCnt` adapter set, so with
+    `counter.o` original they never fired); a critical section's overdue
+    events no longer step time one cycle at a time to a `Wait::Cycle`.
 
 ## Findings
 
@@ -205,3 +250,54 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   GPU DMA that never runs), and the frame counter never leaves 0 under
   `--device all`. btn's libcd has never run original before. Chip d owns
   it: exit criterion 4 needs it.
+- **Interrupt latency is observable; `VSync` waits like its spin** (task
+  9a). A first `VSync` adapter blocked event by event, as blocking runtime
+  calls do (§6), so interrupts raised while a game waited were handled at
+  the cycle they rose. The original spins, and the machine only takes
+  interrupts at the loop's safepoints, up to a quantum (20,000 cycles)
+  late. bof4 saw it: from counter 456 (the Capcom logo) libds's CD stream
+  ran, an MDEC movie played (45% more sectors read, 4x the MDEC work),
+  and the game fell 782 counter steps behind, so `title-to-field` missed
+  its expects. With the late service, as on the device, libds re-issues
+  its read every 4 frames and no movie plays. The adapter now spins a
+  quantum at a time (deliver what fell due, then the handlers) and both
+  modes reach every expect at the same frame. Decision: adapters that
+  replace a waiting loop wait the way the loop does; the device is the
+  oracle (README, principle 6). Open: hardware services interrupts within
+  microseconds, so the device timing, and the replay authored over it,
+  may encode an artifact of the CD controller or of libds under late
+  service. Chip d and the Beetle oracle should settle it.
+- **btn's boot hits libgpu's GPU timeout in every mode**, not only with
+  the CD on the device: `GPU timeout: que=0, stat=56802000` at frame 99
+  with irq on the device, frame 64 native. libgpu gives up after 0xF0000
+  polls of `VSync(-1)`; the original's call spends a loop iteration of
+  safepoint budget (its stable read of root counter 1), the adapter none,
+  so polls go twice as fast in virtual time. btn then runs about 18 game
+  frames ahead of device mode for the rest of a run. Replays are keyed to
+  the frame counter and pass both ways; level 4 will see the offset.
+- **libsnd takes line 0 and chains to libetc's handler.** `_SsStart`
+  calls `InterruptCallback(0, 0)`, keeps the previous handler, installs
+  its tick handler, which calls the kept one first. So libetc's own
+  handlers must be callable: they are stand-in functions at
+  `0xBFC7_0010` (vblank) and `0xBFC7_0020` (DMA), which the runtime runs
+  when guest code calls them. Without that btn trapped at frame 99.
+- **What the irq adapters don't reproduce, deliberately.** libetc's
+  context pointer (`ResetCallback`, `StopCallback`, `RestartCallback`
+  return `0xBFC7_0000`; neither game uses the value, and cases observe it
+  as zero or not); callback arguments (zeros, where the original leaves
+  I_STAT or DICR's address in a0); a ReturnFromException from a callback
+  inside libetc's own handler. `GetVideoMode`/`SetVideoMode` stay guest
+  code: no hardware, no state shared with the adapters.
+- **PAL would time out on both sides.** `vsync.o`'s countdown is
+  `(n-1) << 15` iterations, 20 cycles each under the safepoint model:
+  655,380 cycles for the one-vblank wait, shorter than a PAL frame
+  (677,376). A PAL game calling `VSync(0)` within 22,000 cycles after a
+  vblank gets "VSync: timeout" on the device and natively alike. Both
+  games here are NTSC.
+- **The HLE BIOS's ResetEntryInt (B0h:18h) keeps the custom exit.** With
+  libetc on the device, `StopCallback` leaves its dispatcher installed,
+  which then prints "unexpected interrupt" and returns. Only bof4's `Exec`
+  path calls `StopCallback`, and the BIOS doesn't support `Exec`.
+- **`--check boot`'s vsync-waits** counted a build probe on `VSync`'s
+  guest entry, which an adapter doesn't have; it counts `adapter.VSync`
+  too now.

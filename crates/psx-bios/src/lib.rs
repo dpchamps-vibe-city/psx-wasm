@@ -13,7 +13,7 @@ pub mod kernel;
 pub mod machine;
 pub mod threads;
 
-pub use machine::{Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, Wait};
+pub use machine::{Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, StandIn, Wait};
 
 #[cfg(test)]
 pub mod testing {
@@ -113,9 +113,14 @@ mod tests {
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
         m.timers[2].write_mode(0x58, 0);
         m.timers[2].target = 999;
-        m.kernel.timer_irq[2] = true;
         m.reschedule_timer(2);
+        // Masked, the kernel's handler doesn't see it.
+        m.io = Some(Default::default());
         m.run_until(1000);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
+        // StartRCnt(RCntCNT2) unmasks IRQ6.
+        m.io_write(0x1F80_1074, 4, 1 << 6).unwrap();
+        m.run_until(2000);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
         // Interrupt-mode events queue their handler.

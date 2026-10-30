@@ -49,6 +49,19 @@ cd_timing = "realistic"
 # runs at half rate or loads. Found by diffing RAM across frames.
 frame_counter = "D_80116B20"
 
+[conform]
+# Chip cases (psxw conform bof4 --chip C) install this as their interrupt
+# callback: a leaf that adds one to byte 7 of the block at 0x8011C998 (the
+# top byte of this word counts its calls) and otherwise writes only that
+# block, from the index at its byte 5.
+callback = "func_8013BBA8"
+callback_state = "D_8011C99C"
+
+[chips]
+# The chips this game runs native through their adapters (D59); a build
+# that falls back to one's device fails. The rest are emulated.
+native = ["irq"]
+
 [ci]
 # The layout probe compares game struct layouts under the matching
 # compiler and clang. bof4-decomp's headers declare no game types yet, and
@@ -60,7 +73,7 @@ replay = "title-to-field"
 
 [ci.skip]
 difftest = "M13: no decompiled C yet, so nothing to compare against its translation"
-conform = "M13: no object is newly validated for this game (build.json unvalidated_objects is empty); the scenarios are written against btn's links"
+conform = "the --lib scenarios are written against btn's links (callbacks, libmcrd); the chip cases run here: psxw conform bof4 --chip irq passes (phase 1 task 9a)"
 mods = "M9: no mods for this game yet"
 web-gpu = "M9: the browser host for this game is out of M13's scope"
 web-conform = "M9: the browser host for this game is out of M13's scope"
