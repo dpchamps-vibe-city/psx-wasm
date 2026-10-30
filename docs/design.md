@@ -612,7 +612,8 @@ a per-game default in `game.toml` (`cd_timing`); the CD controller (D58)
 has it, whether libcd's adapters drive its core or libcd's own code its
 registers (D62):
 - *realistic*, because loading screens animate while reads are in flight;
-- *instant*, an enhancement.
+- *instant*, an enhancement: no seek time; the sectors' rate and the
+  command latency stay the drive's, which SDK code relies on.
 
 The game thread runs in a **Web Worker**. The runtime calls the host at
 every vblank, in two imports (ABI 10, D54): `host.vblank` carries

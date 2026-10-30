@@ -1,7 +1,8 @@
 //! The CD-ROM: sectors from the user's disc image, verified by EDC; ISO9660
 //! lookup; and the drive's position, mode and timing, which the libcd
 //! adapters drive. Timing is either realistic (seek plus 75 or 150 sectors
-//! a second) or instant (D19); either way it is a function of virtual time.
+//! a second) or instant (D19: no seeks, the same sectors a second); either
+//! way it is a function of virtual time.
 
 use crate::clock::CPU_HZ;
 
@@ -194,6 +195,12 @@ pub fn read_file(disc: &mut dyn Disc, e: &DirEntry) -> Option<Vec<u8>> {
 pub enum Timing {
     #[default]
     Realistic,
+    /// Seeks take no time. Sectors still come a sector's time apart, and
+    /// commands answer after their latency: with no time between sectors
+    /// a read would deliver the whole disc within one cycle, and SDK code
+    /// relies on both (libcd's `CdRead` sets up for a read after issuing
+    /// it, and waits for the Pause that ends it; libds takes a sector in
+    /// its DMA callback before the next comes).
     Instant,
 }
 
@@ -229,13 +236,9 @@ pub struct Drive {
 }
 
 impl Drive {
-    /// CPU cycles per sector at the current speed.
+    /// CPU cycles per sector at the current speed (either timing).
     pub fn sector_cycles(&self) -> u64 {
-        match self.timing {
-            Timing::Instant => 0,
-            Timing::Realistic if self.mode & mode::DOUBLE_SPEED != 0 => CPU_HZ / 150,
-            Timing::Realistic => CPU_HZ / 75,
-        }
+        if self.mode & mode::DOUBLE_SPEED != 0 { CPU_HZ / 150 } else { CPU_HZ / 75 }
     }
 
     /// Seek estimate: a fixed settle time plus a stroke proportional to
@@ -253,9 +256,9 @@ impl Drive {
         CPU_HZ / 50 + (CPU_HZ * 3 / 10) * d.min(full) / full
     }
 
-    /// Command acknowledgement latency.
+    /// Command acknowledgement latency (either timing).
     pub fn ack_cycles(&self) -> u64 {
-        if self.timing == Timing::Instant { 0 } else { CPU_HZ / 1000 }
+        CPU_HZ / 1000
     }
 }
 

@@ -17,7 +17,7 @@
 //! to call [`Cdc::run`] again, and the latencies come from the
 //! [`crate::cd::Drive`] timing model (realistic or instant).
 
-use crate::cd::{self, Disc, Drive, RAW, Timing};
+use crate::cd::{self, Disc, Drive, RAW};
 use crate::xa;
 use std::collections::VecDeque;
 
@@ -314,16 +314,6 @@ impl Cdc {
         }
     }
 
-    fn sector_cycles(&self) -> u64 {
-        // XA audio plays at the disc's real rate even under instant timing.
-        if self.drive.mode & cd::mode::XA_ADPCM != 0 && self.drive.timing == Timing::Instant {
-            let speed = if self.drive.mode & cd::mode::DOUBLE_SPEED != 0 { 150 } else { 75 };
-            crate::clock::CPU_HZ / speed
-        } else {
-            self.drive.sector_cycles()
-        }
-    }
-
     fn stop_reading(&mut self) {
         self.reading = false;
         self.seeking = false;
@@ -367,7 +357,7 @@ impl Cdc {
                 let seek = self.seek();
                 self.seeking = seek > 0;
                 self.reading = true;
-                let t = now + seek + self.sector_cycles();
+                let t = now + seek + self.drive.sector_cycles();
                 self.schedule(t, Job::Sector);
             }
             0x07 => {
@@ -465,7 +455,7 @@ impl Cdc {
         self.seeking = false;
         let lba = self.drive.head;
         self.drive.head += 1;
-        let t = now + self.sector_cycles();
+        let t = now + self.drive.sector_cycles();
         self.schedule(t, Job::Sector);
         let mut raw = Box::new([0u8; RAW]);
         if !disc.read_raw(lba, &mut raw) {
@@ -710,6 +700,36 @@ mod tests {
         assert_eq!(until_int(&mut c, &mut now), INT2);
         assert_eq!(ack(&mut c), [stat::MOTOR]);
         assert_eq!(c.next_due(), None);
+        assert!(c.edc_errors.is_empty());
+    }
+
+    #[test]
+    fn instant_reads_skip_the_seek_not_the_sectors() {
+        let mut c = Cdc { end: 100_000, ..Default::default() };
+        c.drive.timing = cd::Timing::Instant;
+        // With no time between sectors, `run` would never return.
+        assert!(c.drive.sector_cycles() > 0 && c.drive.ack_cycles() > 0);
+        let mut now = 0;
+        c.write(BASE, 1, 0);
+        c.write(BASE + 2, 0x1F, 0);
+        for (op, p) in [(0x0E, vec![0x80]), (0x02, cd::lba_to_msf(90_000).to_vec()), (0x06, vec![])] {
+            cmd(&mut c, &mut now, op, &p);
+            assert_eq!(until_int(&mut c, &mut now), INT3);
+            ack(&mut c);
+        }
+        // The seek across the disc takes no time, but the sectors come a
+        // sector's time apart, the first included: a read never runs ahead
+        // of virtual time, nor delivers at the cycle of its command.
+        let (start, t) = (now, crate::clock::CPU_HZ / 150);
+        assert_eq!(start, 3 * c.drive.ack_cycles());
+        for k in 1..=3u64 {
+            assert_eq!(c.next_due(), Some(start + k * t));
+            c.run(start + k * t - 1, &mut Fill);
+            assert_eq!(c.sectors, k - 1);
+            assert_eq!(until_int(&mut c, &mut now), INT1);
+            assert_eq!((now, c.sectors), (start + k * t, k));
+            ack(&mut c);
+        }
         assert!(c.edc_errors.is_empty());
     }
 }
