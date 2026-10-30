@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4, 8, 9a, 9b and 9c done; 5–6 harness in place)
+**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c and 9d done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -20,14 +20,15 @@ per-function detail. The scan reproduces every constant-address access
 the translator sees in either game's SDK code.
 
 **141 adapters** across both games: btn needs 109, bof4 90. 78 reach a
-chip or BIOS internals; 63 are state accessors. 37 exist (23 before
-chip irq, task 9a; 31 before chip sio0, task 9c).
+chip or BIOS internals; 63 are state accessors. 46 of them exist (23
+before chip irq, task 9a; 31 before chip sio0, task 9c; chip cd, 9d,
+traded libcd's 12 public-layer adapters for 8 of its drive layer here).
 
 | Library | Reach hardware | State accessors | Have |
 |---|---|---|---|
 | libapi | 3 | 2 | 5 |
 | libcard | 2 (BIOS internals) | 0 | 2 |
-| libcd | 20 | 5 | 12 |
+| libcd | 20 | 5 | 8 (the drive layer and the ring's interrupt; 5 more are internal, 9d) |
 | libetc | 8 | 0 | 8 |
 | libgpu | 17 | 12 | 13 (the rest stay original over them, 9b) |
 | libmcx | 1 | 18 | 4 |
@@ -125,9 +126,9 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    | Order | Chip | Libraries | Adapters | Notes |
    |---|---|---|---|---|
    | a ✓ | IRQ, timers, vblank | libetc, libapi | 11 + 5, all exist | Done 2026-10-29 (progress log). Old libetc set in `111e045^`. Coexists with D45's exception path: the BIOS chains run first, a custom exit still runs after. |
-   | b ✓ | GPU | libgpu | 15: 13 of the 17 that reach it, `GetODE`, `_GPU_ResetCallback` | Done 2026-10-29 (progress log). The font and kanji functions and the 12 accessors stay original over libgpu's state in guest RAM (D60). libgs rides on it. Old set (24) in `02180f4^`. |
+   | b ✓ | GPU | libgpu | 15: 13 of the 17 that reach it, `GetODE`, `_GPU_ResetCallback` | Done 2026-10-29 (progress log). The font and kanji functions and the 12 accessors stay original over libgpu's state in guest RAM (D61). libgs rides on it. Old set (24) in `02180f4^`. |
    | c ✓ | SIO0 | libpad | 6 (+ PadStopCom) | Done 2026-10-29 (progress log). Old set (7) in `609a64a^`. Reproduces libpad's observable state machine (D40's reason for removing it) and its interrupt's time (D60). |
-   | d | CD | libcd (libds and streaming ride on it) | 24 (11 exist) | **Choose the seam first:** the low layer (`CD_*`, `StCdInterrupt`) under both games, or public adapters and the low layer over one drive model. btn's 11 existing public adapters are reworked to fit. |
+   | d ✓ | CD | libcd (libds and streaming ride on it) | 13: `bios_1`'s 9, `CD_getsector`, `CD_getsector2`, `StCdInterrupt`, `StUnSetRing` | Done 2026-10-29 (progress log). The seam is libcd's drive layer under both games (D62); the public layer, libds and the rest of the ring stay original over it, its state in libcd's own globals. btn's 22 public-layer adapters are gone. |
    | e | MDEC | libpress | 3 | Needs the decode function (task 7). |
    | f | SPU | libspu, libsnd | 26 + 1 | Needs the mixer API (task 7). The largest set. |
    | g | Memory card (PocketStation) | libmcx | 19 (4 exist) | btn only. |
@@ -327,6 +328,84 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     frame 64, with the same message; its 1,200 frames make 1,609 `VSync`
     calls natively, 999,299 on the device (the timeout's spin polls
     `VSync(-1)`).
+- **2026-10-29, task 9d: chip cd native in btn and bof4.** 13 libcd
+  adapters (`sdk-psyq/src/libcd.rs`): `bios_1`'s `CD_init`,
+  `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_flush`, `CD_vol`,
+  `CD_initvol`, `CD_datasync`; `bios_2`'s `CD_getsector`, `bios_3`'s
+  `CD_getsector2`; the ring's `StCdInterrupt` (`c_011`) and `StUnSetRing`
+  (`c_003`), one code for both games, written from the 4.7 objects
+  (`psxw sdk disasm`). The five objects are validated (`bios_1..3` have
+  one key in both games); both games report cd native and `game.toml`
+  expects it (btn and bof4: cd, gpu, irq, sio0). btn's 22 public-layer
+  adapters (`CdInit` … `CdSearchFile`) and their 16 validated objects are
+  gone: btn's `CdRead`, `CdSearchFile` and the callbacks are original
+  code now, as bof4's libds and ring are.
+  - **The seam (D62).** The drive layer is where the games meet: btn
+    calls libcd's public layer, bof4 libds, the ring and `CD_*` itself,
+    and both go through the same `bios_1`. Everything that reaches the CD
+    controller or DMA3 itself is in the set; the rest of libcd, libds and
+    the ring run original over it. The other choice (public adapters and
+    low-layer adapters over one drive state in the runtime) fails on
+    libds, which writes the drive layer's callback slots itself
+    (`DS_init`, `DS_close`).
+  - **How.** State stays where libcd keeps it: `bios_1`'s `.data`
+    (`CD_cbsync`, `CD_cbready`, `CD_status`, `CD_mode`, `CD_com`,
+    `CD_pos`, the interrupt states, the per-command tables) and `.bss`
+    (the result buffers callbacks get), and the ring's globals, all found
+    from `Psyq::at` through the objects' relocated code (D61), so
+    `CdStatus`, `CdMode`, `CdLastCom`, `CdLastPos`, the callback setters
+    and `St*` stay original. The adapters drive the CD controller's core
+    (`Cdc::issue`, `pending`, `take_response`, `acknowledge`,
+    `set_enable`, `request`, `read_data`, `set_volume`), not its ports.
+    Its IRQ2 reaches line 2's handler, a stand-in at `0xBFC7_0030` that
+    `CD_init` installs through the guest's own `ResetCallback` and
+    `InterruptCallback` (`Flow::Call`), so it runs with chip irq native or
+    on its device; it takes each interrupt as `bios_1`'s routine does and
+    calls the ready and sync callbacks nested. Sectors move by DMA3 on the
+    shared DMA controller (DPCR, DICR's byte store, MADR/BCR/CHCR), so
+    `CdDataCallback`'s and the ring's frame callback come through
+    libetc's DMA handler as on the device. Waits spin a quantum at a time
+    toward the original's 0x3C0000-pass timeout, poll the controller
+    inside callbacks, and leave the guest's budget full (D60).
+    `StCdInterrupt` runs the ring as the original does, calling
+    `CdReady`, `init_ring_status` and `StFunc2`, from a frame below the
+    caller's stack. The disc's DMA3 data is reported to mods' overlay
+    patches in both modes now.
+  - **Conformance:** 7 cd cases (`sdk-psyq/src/cases/cd.rs`), 5 level 1
+    with seeded arguments (init and the handler; commands with and
+    without parameters, waited for or not; reads by DMA3 whole or in two,
+    `CD_getsector2`, `CD_datasync`; the volume matrix with the first
+    movie's XA audio; the ring, sector by sector or once a frame, with
+    its frame callback) and 2 level 2 (btn: `CdInit`, `CdSearchFile`,
+    `CdRead`, the sync and ready callbacks and the accessors; bof4:
+    `DsInit`, `StSetRing`, `StSetStream`, `DsRead2` of the disc's first
+    movie with XA, frames taken as they come, `StUnSetRing`). The harness
+    now has the game's disc and finds its first movie (the first file
+    starting an STR frame: bof4 LBA 259934, btn none), function addresses
+    for callbacks, and the audio in the device observation. `psxw conform
+    btn --chip cd`: PASS, 19 case runs (4 seeds; the ring and stream cases
+    need functions btn doesn't link); `psxw conform bof4 --chip cd`: PASS,
+    22 (`cd.files` needs btn's public layer). On the merged tree `--chip
+    irq` (33 runs), `--chip gpu` (49) and `--chip sio0` (34) pass in both
+    games; `btn --modes` and `bof4 --modes` (level 4) pass.
+  - **Runs:** btn and bof4, 1,200 frames, `--check boot --check no-trap
+    --check no-shadow-io`: pass native and on `--device cd`; with libetc
+    original, the CD handler under its own dispatcher, on `--device irq`
+    (bof4) and `--device irq,gpu` (btn, whose `--device irq` trips chip
+    gpu's shadow write, Findings). Natively no guest
+    code touches the CD's registers: btn's 1,200 frames read 648 sectors
+    with 86 `CD_cw`, 238 `CD_ready`, 1,294 `CD_getsector` calls; bof4's
+    1,086 sectors with 971 `CD_cw`, 3,830 `CD_sync`, 977 `CD_flush`, 1,070
+    `CD_getsector`, 24 `StCdInterrupt`. bof4 `title-to-field` (25,300
+    frames, 19 s, 10,755 sectors): every expect passes at the same frame
+    as before (counter 12390 at frame 24768). btn `title-to-gameplay`
+    (6,000 frames, 8,503 sectors): pass.
+  - **Infrastructure:** `psx_devices::cdc` gained its core calls (the
+    register paths unchanged), `psx_devices::cd::list`, and
+    `psxw_host_native::Conform` a disc and `audio()`; conformance runs
+    tell the controller about the disc (`cdc_insert`). This branch first
+    built the same adapter-address and `Flow::Call` mechanisms as chip gpu
+    and took chip gpu's on merging.
 
 ## Findings
 
@@ -344,7 +423,16 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   timeout: que=0, stat=d6800000, chcr=01000401` at frame 99 (a linked-list
   GPU DMA that never runs), and the frame counter never leaves 0 under
   `--device all`. btn's libcd has never run original before. Chip d owns
-  it: exit criterion 4 needs it.
+  it: exit criterion 4 needs it. *Resolved (task 9d):* it no longer
+  reproduces. On `--device cd`, btn runs 1,500 frames with the GPU timeout
+  at frame 64 as natively (the timeout every mode has, task 9a's finding)
+  and its frame counter equals the native one at frames 300, 600, 1,000
+  and 1,500 (95, 235, 435, 685); on `--device all` the counter leaves 0
+  (667 at frame 1,500) and both `--modes` runs pass. Chip cd's change
+  touches nothing the device path runs, so chip irq's runtime fixes
+  (RCntCNTn events following I_MASK, critical sections' overdue events)
+  most likely fixed it; not bisected. btn's libcd now runs original in
+  every mode, natively over the drive layer's adapters.
 - **Interrupt latency is observable; `VSync` waits like its spin** (task
   9a). A first `VSync` adapter blocked event by event, as blocking runtime
   calls do (§6), so interrupts raised while a game waited were handled at
@@ -488,3 +576,50 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   `DrawSync` (the front end is always ready between whole commands); the
   queue pump's address (`DMACallback(2, …)` returns the stand-in while it
   is registered); the stack contents libgpu's frames leave below `sp`.
+- **The CD's seam is its drive layer** (task 9d, D62): decided without
+  the human's input, as the task said. See the progress log.
+- **btn's `CdRead` retries sectors late in `title-to-gameplay`,** in both
+  modes: 5 "CdRead: sector error / retry" pairs at frames 5,972-5,994
+  natively, 5,971-5,997 with the CD on its device. `CdRead` reads each
+  sector's header and finds another sector than it expected; the
+  controller replaces a sector the CPU hasn't taken with the next one, as
+  hardware loses it. Likely cause, not verified: an interrupt handler or
+  critical section longer than a sector period (6.7 ms at double speed)
+  under the safepoint cost model (20 cycles per loop iteration). The
+  replay passes; open for the oracle.
+- **Run reports' `cd_loads` are empty now.** The old `CdRead` adapter
+  timed each load (M7 task 7's evidence); with `CdRead` original nothing
+  sees a load whole. Sectors and EDC are still counted (the controller's).
+- **Stand-in addresses share dispatch slots with RAM.** The table indexes
+  `addr & 0x3F_FFFC`, so libetc's, libcd's and libgpu's stand-ins
+  (`0xBFC7_0010` … `0xBFC7_0100`) share slots with `0x8007_0010` …: a
+  game with a function exactly there would never reach the stand-in.
+  Neither game has one (checked in both games' tiers).
+- **bof4's map calls `CdReadyCallback` `CdSetDebug`** (`libcd/s_015`; the
+  signatures name it `CdReadyCallback`, the two have the same code). Cases
+  resolve functions by name, so bof4's level-1 ring case calls
+  `StCdInterrupt` itself and its callbacks come through libds in
+  `cd.stream`.
+- **What the cd adapters don't reproduce, deliberately.** The debug
+  printouts (`CD_debug`; only `CD_init`'s address line is logged), the
+  memory controller's delay writes around transfers, the handler's
+  address (`CD_initintr` returns the stand-in natively, `bios_1`'s
+  routine on the device: cases observe set or not), v0 left by the void
+  `StCdInterrupt`, and the original's hang when `StCdInterrupt` finds the
+  sector buffer empty (it waits for data that never comes; the adapter
+  moves on). `CD_initvol` writes the SPU's registers with the device's
+  semantics until chip spu has adapters.
+- **Late interrupt service and libds** (task 9a's open question): chip cd
+  doesn't change it. IRQ2 is taken at the same safepoints natively and on
+  the device, from one controller, and bof4's replay reaches every expect
+  at the same frame both ways. Whether hardware's prompt service sends
+  bof4's intro elsewhere still needs the Beetle oracle (not run here).
+- **btn with chip irq on its device and chip gpu native fails
+  `no-shadow-io`** (found by task 9d on the tree merged with main): `psxw
+  build btn --device irq`, 1,200 frames: 16 bytes of `0xFF` reach the I/O
+  window's shadow at `0x1F801C44` (the SPU's voice registers) at frame 65,
+  just after libgpu's timeout reset. The same with the CD on its device
+  too (`--device irq,cd`) and with SIO0 (`--device irq,sio0`); not with
+  the GPU on its device as well (`--device irq,gpu`), and not in bof4. So
+  it is chip gpu's adapters under libetc's own dispatcher, not the CD's;
+  left to chip gpu's owner.

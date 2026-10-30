@@ -113,8 +113,8 @@ register protocol around them.
 | Chip | Core | Status |
 |---|---|---|
 | GPU | packet decoder (`psx_devices::gpu`) and renderer (`psx-render-gl`) | ✓ |
-| CD | disc image, ISO9660, drive timing (`psx_devices::cd`) | ✓ |
-| XA audio | decoder (`psx_devices::xa`) | ◐ no route to the mixer without the CD controller |
+| CD | disc image, ISO9660, drive timing (`psx_devices::cd`), driven through the CD controller's core (`psx_devices::cdc`, phase 1 task 9d) | ✓ |
+| XA audio | decoder (`psx_devices::xa`) | ✓ the controller decodes it into the SPU's CD input, natively as on the device (task 9d) |
 | SPU | voice DSP (`psx-spu`) | ✗ register API only; needs a mixer API |
 | MDEC | decode core inside `psx_devices::mdec` | ◐ register-driven; needs a decode function |
 | SIO0 | host pad state | ✓ |
