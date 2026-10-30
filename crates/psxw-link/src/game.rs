@@ -143,7 +143,7 @@ pub(crate) fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::GTE_EXEC, vec![i], vec![]),
         (psx::IO_ACCESS, vec![i, i], vec![]),
         (psx::IO_TRAP, vec![i, i], vec![]),
-        ("adapter", vec![i; 5], vec![V::I64]),
+        (psx::ADAPTER, vec![i; 6], vec![V::I64]),
         (psx::PROBE, vec![i], vec![]),
         (psx::RETURN_FROM_EXCEPTION, vec![], vec![]),
         (psx::MOD_LOG, vec![i, i], vec![]),
@@ -177,7 +177,9 @@ enum Synth {
     ToO32 { input: usize, name: String, sig: FuncType, target: u32 },
     /// o32 wrapper around a C function.
     O32Wrap { input: usize, func: u32 },
-    AdapterThunk(u32),
+    /// Runtime adapter `id` in place of the function at guest address
+    /// `addr` (D60: the adapter reads its object's relocated operands there).
+    AdapterThunk { id: u32, addr: u32 },
     /// Dispatch on the code resident at an address shared by overlays.
     OverlayStub(u32),
     /// C `call_indirect` with a signature (the MIPS address trails).
@@ -342,7 +344,7 @@ impl Ctx<'_> {
         Some(match tier {
             Tier::Lift { input, func } => self.guest[&(input, func)],
             Tier::C { input, func } => self.synth(Synth::O32Wrap { input, func }),
-            Tier::Adapter(id) => self.synth(Synth::AdapterThunk(id)),
+            Tier::Adapter(id) => self.synth(Synth::AdapterThunk { id, addr }),
         })
     }
 
@@ -816,15 +818,16 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let callee = ctx.guest[&(input, func)];
             (o32(), marshal::o32_to_c(&sig, proto, callee, sp, window), format!("o32:{guest_name}"))
         }
-        Synth::AdapterThunk(id) => {
+        Synth::AdapterThunk { id, addr } => {
             let mut f = Function::new([]);
             f.instruction(&I::I32Const(id as i32));
+            f.instruction(&I::I32Const(addr as i32));
             for l in 0..4 {
                 f.instruction(&I::LocalGet(l));
             }
-            f.instruction(&I::Call(ctx.import("adapter")));
+            f.instruction(&I::Call(ctx.import(psx::ADAPTER)));
             f.instruction(&I::End);
-            (o32(), f, format!("adapter#{id}"))
+            (o32(), f, format!("adapter#{id}@{addr:08X}"))
         }
         Synth::OverlayStub(addr) => {
             let cands = ctx.spec.overlays.get(&addr).cloned().unwrap_or_default();

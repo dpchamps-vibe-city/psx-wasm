@@ -857,7 +857,9 @@ impl Conform {
         if opts.frames == 0 {
             opts.frames = u64::MAX;
         }
-        let (mut store, instance) = instantiate(&opts, None)?;
+        // A disc when the options name one (the CD chip's cases read it).
+        let disc = if opts.disc.as_os_str().is_empty() { None } else { Some(Disc::open(&opts.disc)?) };
+        let (mut store, instance) = instantiate(&opts, disc)?;
         let memory = instance.get_memory(&mut store, "memory").context("no memory")?;
         let window = store.data().window as usize;
         for (addr, bytes) in ram {
@@ -932,6 +934,11 @@ impl Conform {
     /// The renderer commands so far, hashed (see `RenderStats::hash`).
     pub fn render_hash(&self) -> u64 {
         self.store.data().render.hash
+    }
+
+    /// The audio so far: frames, audible frames, and their hash.
+    pub fn audio(&self) -> (u64, u64, u64) {
+        self.store.data().audio.as_ref().map_or((0, 0, 0), audio::Sink::so_far)
     }
 
     /// Vblanks so far.

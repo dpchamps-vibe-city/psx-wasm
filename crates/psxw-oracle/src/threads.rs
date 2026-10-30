@@ -185,7 +185,7 @@ const BODY_FRAME: u32 = 0x40;
 fn b0(m: &mut Machine<NoSdk>, func: u32, a: [u32; 4]) -> Result<u32> {
     match psx_bios::bios::call(m, 0xB0, func, a).map_err(|e| anyhow::anyhow!(e))? {
         Flow::Return(v) => Ok(v as u32),
-        Flow::Block { .. } => bail!("B0h:{func:02X}h blocked"),
+        Flow::Block { .. } | Flow::Call { .. } => bail!("B0h:{func:02X}h blocked"),
     }
 }
 

@@ -414,6 +414,8 @@ impl<S: Sdk> Machine<S> {
                     self.mem.w32(addr, w);
                     addr = addr.wrapping_add(4) & 0x1F_FFFC;
                 }
+                // Disc data arrived: mods' overlay data patches apply.
+                self.loaded.push((0x8000_0000 | (d.madr[ch] & 0x1F_FFFC), 4 * d.words(ch)));
             }
             (DMA_SPU, 0 | 1, true) => {
                 let words: Vec<u32> = (0..d.words(ch)).map(|i| self.mem.r32(addr.wrapping_add(4 * i) & 0x1F_FFFC)).collect();

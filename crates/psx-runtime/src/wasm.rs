@@ -359,6 +359,11 @@ pub extern "C" fn psxw_conform_init(options: u32, sp: u32, gp: u32) {
         let mut m = rt.m.borrow_mut();
         m.regs.set_sp(sp);
         m.regs.set_gp(gp);
+        // With a disc (the CD chip's cases), the controller knows its
+        // tracks and region, as after a boot.
+        if m.host.has_disc() {
+            m.cdc_insert();
+        }
     });
 }
 
@@ -728,14 +733,16 @@ pub extern "C" fn gte_exec(cmd: u32) {
     gte().exec(cmd)
 }
 
-/// An SDK function replaced by an adapter (o32 arguments).
+/// An SDK function at guest address `addr` replaced by an adapter (o32
+/// arguments); the adapter sees `addr` as `Psyq::at` (D60).
 #[unsafe(export_name = "adapter")]
-pub extern "C" fn adapter(id: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
+pub extern "C" fn adapter(id: u32, addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
     with(|rt| {
         let Some(&(name, f)) = rt.adapters.get(id as usize) else { fatal(10, &format!("adapter {id} unknown")) };
         let flow = {
             let mut m = rt.m.borrow_mut();
             m.count(&format!("adapter.{name}"));
+            m.sdk.at = addr;
             f(&mut m, [a0, a1, a2, a3])
         };
         match flow {

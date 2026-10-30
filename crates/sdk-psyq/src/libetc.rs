@@ -82,7 +82,7 @@ const LINES: usize = 11;
 /// The link's safepoint budget (psxw-build): guest loop iterations per
 /// safepoint, each of which moves virtual time by the boot options'
 /// quantum. A spin loop's iteration costs quantum / budget cycles.
-const LOOP_BUDGET: u64 = 1000;
+pub(crate) const LOOP_BUDGET: u64 = 1000;
 
 /// What handles an interrupt line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -505,7 +505,7 @@ fn vsync(m: &mut M, a: [u32; 4]) -> Result {
 
 /// The safepoint quantum: virtual time a guest loop's thousand iterations
 /// take ([`LOOP_BUDGET`]).
-fn quantum(m: &M) -> u64 {
+pub(crate) fn quantum(m: &M) -> u64 {
     if m.opts.safepoint_quantum == 0 { 20_000 } else { m.opts.safepoint_quantum as u64 }
 }
 

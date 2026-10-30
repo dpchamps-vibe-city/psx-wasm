@@ -128,6 +128,10 @@ pub enum Flow<S> {
     /// Wait until `until` holds (time advancing, callbacks running), then
     /// continue with `then`.
     Block { until: Wait, then: Box<dyn FnOnce(&mut Machine<S>) -> Flow<S>> },
+    /// Call a guest function now, as the replaced SDK code's own nested
+    /// call (no time passes, nothing is delivered), then continue with
+    /// `then` and its result (D60).
+    Call { call: GuestCall, then: Box<dyn FnOnce(&mut Machine<S>, u64) -> Flow<S>> },
 }
 
 impl<S> Flow<S> {

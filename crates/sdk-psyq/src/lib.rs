@@ -8,8 +8,9 @@
 //! psyq-decomp records it.
 //!
 //! Scope: libetc's interrupt layer and libapi's `counter.o` (chip irq),
-//! libapi's `pad.o`/`patch.o`/`first.o`, the libcd data path, and
-//! libcard/libmcx's thin BIOS wrappers.
+//! libapi's `pad.o`/`patch.o`/`first.o`, libcd's drive layer and the
+//! streaming ring's interrupt (chip cd), and libcard/libmcx's thin BIOS
+//! wrappers.
 //!
 //! A chip whose adapters don't cover a game runs its libraries as the
 //! game's own code over register-level devices ([`DEVICE_LIBRARIES`],
@@ -57,27 +58,13 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 /// - libspu and libsnd (D47): the SPU is register-level (`psx-spu`, exact
 ///   against the oracle), so libspu's own code programs it, and libsnd's
 ///   few direct register writes reach it too.
-/// - libcd and libds (D58): the CD controller (`psx_devices::cdc`) takes
-///   their commands and delivers sectors and XA audio. libcd's adapters
-///   stay for the objects they are validated against (`adapter-or-device`).
+/// - libcd and libds (D58), when chip cd is emulated: the CD controller
+///   (`psx_devices::cdc`) takes their commands and delivers sectors and XA
+///   audio. Native, libcd's drive layer is adapters over the same
+///   controller's core (D61).
 /// - libpress: the MDEC (`psx_devices::mdec`) decodes what its own code
 ///   feeds it by DMA0, and DMA1 takes the pixels.
 pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress", "libapi"];
-
-/// Event kinds the adapters schedule.
-pub mod ev {
-    /// A CD command completes (data: command).
-    pub const CD_COMPLETE: u32 = 1;
-    /// The next sector of a read arrives (data: generation).
-    pub const CD_SECTOR: u32 = 2;
-}
-
-/// Conditions blocked adapters wait for.
-pub mod cond {
-    pub const CD_COMMAND_DONE: u32 = 1;
-    pub const CD_READ_DONE: u32 = 2;
-    pub const CD_DATA_READY: u32 = 3;
-}
 
 /// Adapter state.
 #[derive(Debug, Default)]
@@ -85,24 +72,18 @@ pub struct Psyq {
     pub cd: libcd::Cd,
     pub mc: libmc::Mc,
     pub etc: libetc::Etc,
+    /// The guest address of the SDK function the running adapter replaces
+    /// (D60): the runtime sets it before each call.
+    pub at: u32,
 }
 
 impl Sdk for Psyq {
-    fn on_event(m: &mut M, kind: u32, data: u32) {
-        match kind {
-            ev::CD_COMPLETE => libcd::on_complete(m, data),
-            ev::CD_SECTOR => libcd::on_sector(m, data),
-            _ => m.log(&format!("sdk: unknown event {kind}")),
-        }
+    fn on_event(m: &mut M, kind: u32, _data: u32) {
+        m.log(&format!("sdk: unknown event {kind}"));
     }
 
-    fn ready(m: &M, c: u32) -> bool {
-        match c {
-            cond::CD_COMMAND_DONE => m.sdk.cd.busy_until.is_none(),
-            cond::CD_READ_DONE => m.sdk.cd.read.is_none(),
-            cond::CD_DATA_READY => m.sdk.cd.ready_sector.is_some() || m.sdk.cd.read.is_none() && m.sdk.cd.streaming.is_none(),
-            _ => true,
-        }
+    fn ready(_m: &M, _c: u32) -> bool {
+        true
     }
 
     /// Vblank and DMA completion reach the guest as interrupts: through
@@ -119,7 +100,7 @@ impl Sdk for Psyq {
     }
 
     fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
-        libetc::stand_in(m, addr, state)
+        libetc::stand_in(m, addr, state).or_else(|| libcd::stand_in(m, addr, state))
     }
 }
 
@@ -127,6 +108,7 @@ pub(crate) fn ret(v: u32) -> Result {
     Ok(Flow::ret(v))
 }
 
+#[allow(dead_code)]
 pub(crate) fn block(until: psx_bios::Wait, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Result {
     Ok(Flow::Block { until, then: Box::new(then) })
 }
@@ -283,6 +265,10 @@ pub mod testing {
                         assert!(guard < 100_000, "wait never satisfied: {until:?}");
                     }
                     f = then(m);
+                }
+                Flow::Call { call, then } => {
+                    guest(m, call.addr);
+                    f = then(m, 0);
                 }
             }
         }

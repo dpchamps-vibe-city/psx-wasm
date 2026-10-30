@@ -126,6 +126,11 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
                 let mut m = rt.borrow_mut();
                 flow = then(&mut m);
             }
+            Flow::Call { call, then } => {
+                let v = inv.invoke(call);
+                let mut m = rt.borrow_mut();
+                flow = then(&mut m, v);
+            }
         }
     }
 }

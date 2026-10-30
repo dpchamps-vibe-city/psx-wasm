@@ -99,7 +99,7 @@ mod tests {
     fn ret(f: Result<Flow<testing::NoSdk>, String>) -> u32 {
         match f.unwrap() {
             Flow::Return(v) => v as u32,
-            Flow::Block { .. } => panic!("blocked"),
+            Flow::Block { .. } | Flow::Call { .. } => panic!("blocked"),
         }
     }
 

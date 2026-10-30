@@ -17,6 +17,7 @@
 //! commands, the audio); library state only through functions that read
 //! it; callbacks by their effect on a word, to the frame.
 
+mod cd;
 mod irq;
 
 /// What a case runs against: one game's build, one side.
@@ -37,6 +38,17 @@ pub trait Harness {
     /// A guest function that counts its calls in a word, and that word
     /// (game.toml `[conform]`), for callbacks.
     fn callback(&self) -> Option<(u32, u32)>;
+    /// The first sector of the disc's first movie (an STR file), for the
+    /// CD chip's streaming cases: a fact of the disc, found the same way in
+    /// every game.
+    fn movie(&self) -> Option<u32> {
+        None
+    }
+    /// The guest address of a function the game links, for cases that hand
+    /// one to the SDK as a callback.
+    fn addr(&self, _name: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// Free RAM for a case's buffers: below the stack, above game data.
@@ -92,6 +104,7 @@ pub fn observe_ram(h: &mut dyn Harness, what: &str, addr: u32, len: usize) {
 pub fn all() -> Vec<Case> {
     let mut v = Vec::new();
     v.extend(irq::cases());
+    v.extend(cd::cases());
     v
 }
 
@@ -109,10 +122,7 @@ mod tests {
     /// Adapters whose cases their chip's task (phase 1 task 9) still owes.
     /// The gate below fails when one of these gets its cases, so the list
     /// only shrinks; phase 1 ends with it empty.
-    const OWED: &[&str] = &[
-        "CdInit", "CdReset", "CdControl", "CdControlF", "CdControlB", "CdSync", "CdReady", "CdGetSector", "CdGetSector2", "CdRead", "CdReadSync", "CdReadBreak", "CdReadCallback", "CdSyncCallback",
-        "CdReadyCallback", "CdDataCallback", "CdFlush", "CdDataSync", "CdStatus", "CdMode", "CdLastCom", "CdSearchFile",
-    ];
+    const OWED: &[&str] = &[];
 
     /// The CI gate (phase 1 task 5): every hardware adapter has a level-1
     /// case, and its chip a level-2 sequence.

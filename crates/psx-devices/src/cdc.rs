@@ -517,6 +517,81 @@ impl Cdc {
     }
 }
 
+/// The controller without its register protocol (D61): what the native
+/// libcd adapters drive. Each call does what the named register access
+/// does, so the adapters and SDK code on the ports see one controller with
+/// one timing (commands, interrupts, sectors, XA audio).
+impl Cdc {
+    /// A command with its parameters (the parameter FIFO, then the command
+    /// register).
+    pub fn issue(&mut self, c: u8, params: &[u8], now: u64) {
+        self.params.clear();
+        self.params.extend(params.iter().take(16));
+        self.command(c, now);
+    }
+
+    /// A command's first response isn't out yet (BUSYSTS).
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    /// The interrupt presented: 1-5, or 0 for none (the flag register's
+    /// low bits).
+    pub fn pending(&self) -> u8 {
+        self.int
+    }
+
+    /// The response bytes of the interrupt presented, read out (the
+    /// response FIFO, at most `max`).
+    pub fn take_response(&mut self, max: usize) -> Vec<u8> {
+        let n = self.response.len().min(max);
+        self.response.drain(..n).collect()
+    }
+
+    /// Acknowledge the interrupt presented (flags written 7): the next
+    /// queued one is presented.
+    pub fn acknowledge(&mut self) {
+        self.int = 0;
+        self.response.clear();
+        if let Some(p) = self.queue.pop_front() {
+            self.present(p);
+        }
+    }
+
+    /// The interrupt enable register.
+    pub fn set_enable(&mut self, mask: u8) {
+        self.int_enable = mask & 0x1F;
+    }
+
+    /// The request register's BFRD bit: on, the sector buffer goes into
+    /// the data FIFO (unless it still holds unread bytes); off, the FIFO
+    /// empties.
+    pub fn request(&mut self, on: bool) {
+        if !on {
+            self.fifo.clear();
+            self.fifo_pos = 0;
+        } else if self.fifo_pos >= self.fifo.len() {
+            self.fill_fifo();
+        }
+    }
+
+    /// The data FIFO holds bytes (DRQSTS).
+    pub fn data_ready(&self) -> bool {
+        self.fifo_pos < self.fifo.len()
+    }
+
+    /// `n` bytes of the data FIFO, as the CPU reads them.
+    pub fn read_data(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| self.fifo_byte()).collect()
+    }
+
+    /// The CD-to-SPU volume matrix (L→L, L→R, R→R, R→L), applied.
+    pub fn set_volume(&mut self, vol: [u8; 4]) {
+        self.vol_next = vol;
+        self.vol = vol;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

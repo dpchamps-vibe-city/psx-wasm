@@ -631,6 +631,7 @@ struct ChipSide<'a> {
     ctx: &'a Ctx<'a>,
     log: Vec<Observation>,
     callback: Option<(u32, u32)>,
+    movie: Option<u32>,
 }
 
 impl sdk_psyq::cases::Harness for ChipSide<'_> {
@@ -660,12 +661,44 @@ impl sdk_psyq::cases::Harness for ChipSide<'_> {
     }
 
     fn device(&mut self) -> String {
-        format!("render {:016x}", self.c.render_hash())
+        let (frames, audible, hash) = self.c.audio();
+        format!("render {:016x} audio {frames} frames, {audible} audible, {hash:016x}", self.c.render_hash())
     }
 
     fn callback(&self) -> Option<(u32, u32)> {
         self.callback
     }
+
+    fn movie(&self) -> Option<u32> {
+        self.movie
+    }
+
+    fn addr(&self, name: &str) -> Option<u32> {
+        self.ctx.addr(name).ok()
+    }
+}
+
+/// The first sector of the disc's first movie: the first file, by
+/// position, one of whose first eight sectors starts an STR frame (a data
+/// sector whose user data begins 0x0160, 0x8001). A fact of the disc,
+/// found the same way for every game.
+fn first_movie(cue: &std::path::Path) -> Option<u32> {
+    use psx_devices::cd;
+    let mut disc = psxw_host_native::disc::Disc::open(cue).ok()?;
+    let mut dirs = vec![cd::root(&mut disc)?];
+    let mut files = Vec::new();
+    while let Some(d) = dirs.pop() {
+        for e in cd::list(&mut disc, &d) {
+            if e.dir { dirs.push(e) } else { files.push(e) }
+        }
+    }
+    files.sort_by_key(|e| e.lba);
+    files.iter().find_map(|f| {
+        (0..8.min(f.size.div_ceil(2048))).map(|i| f.lba + i).find(|&lba| {
+            let mut raw = [0u8; cd::RAW];
+            disc.read_raw(lba, &mut raw) && raw[15] == 2 && raw[0x12] & 0x20 == 0 && raw[0x18..0x1C] == [0x60, 0x01, 0x01, 0x80]
+        })
+    })
 }
 
 /// One case's outcome in one game.
@@ -708,9 +741,15 @@ pub fn run_chip(ws: &Workspace, game: &str, chip: &str, seeds: u64) -> Result<bo
     let device = psxw_build::game::build(ws, &psxw_build::game::Options { device: vec![chip.into()], ..psxw_build::game::Options::new(game) })?.0;
     let ctx = Ctx { inputs: &inputs };
     let callback = ctx.callback().ok();
+    // The game's disc, for the CD chip's cases, and its first movie.
+    let disc = ws.disc(game).ok();
+    let movie = disc.as_deref().and_then(first_movie);
+    if chip == "cd" {
+        eprintln!("conform: disc {:?}, first movie at {movie:?}", disc.as_deref().map(|d| d.display().to_string()));
+    }
     let side = |wasm: &str| -> Result<ChipSide<'_>> {
-        let o = Options { wasm: wasm.into(), replay: Some(replay(600)), deadline_secs: 20, ..Default::default() };
-        Ok(ChipSide { c: Conform::new(&o, &ram, sp, gp)?, ctx: &ctx, log: vec![], callback })
+        let o = Options { wasm: wasm.into(), disc: disc.clone().unwrap_or_default(), replay: Some(replay(600)), deadline_secs: 20, ..Default::default() };
+        Ok(ChipSide { c: Conform::new(&o, &ram, sp, gp)?, ctx: &ctx, log: vec![], callback, movie })
     };
     let mut results = Vec::new();
     for case in sdk_psyq::cases::all().into_iter().filter(|c| c.chip == chip) {
