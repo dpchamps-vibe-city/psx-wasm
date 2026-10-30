@@ -46,7 +46,7 @@ mod mods;
 mod modtest;
 mod passthrough;
 mod writers;
-mod sdk;
+pub mod sdk;
 mod modes;
 
 fn main() {
