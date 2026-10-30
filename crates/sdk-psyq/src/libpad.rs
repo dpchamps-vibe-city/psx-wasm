@@ -34,14 +34,16 @@
 //!   mode 100; a port with nothing found writes `FF 00` to its buffer
 //!   every vblank, one whose pad went away keeps its buffer for eleven
 //!   more vblanks first.
-//! - **The interrupt takes the original's time** (D60). Its busy-waits on
-//!   SIO0 and root counter 2 each end at the next safepoint, a quantum
-//!   later ([`Spin`]): seven for a poll, five for a refused command, three
-//!   for an empty port, so half a frame with two pads. The adapters spend
-//!   them in the exception, delivering nothing, and the guest resumes
-//!   with its safepoint budget started over, as after the original's last
-//!   wait. Games see it: bof4's `title-to-field` falls hundreds of frames
-//!   behind the device without either.
+//! - **The interrupt takes the original's time** (D60, D66). Its
+//!   busy-waits on SIO0 and root counter 2 poll once a loop-header pass,
+//!   and both see the cycle each pass is made at, so a wait ends at the
+//!   first pass at or after what it waits for ([`Spin`]): about 640
+//!   passes (12,800 cycles) for a poll and an empty port. The adapters
+//!   spend the passes from the guest's budget in the exception, a quantum
+//!   passing (nothing delivered) each time it runs out, as the original's
+//!   loops do. Games see it: bof4's `title-to-field` falls hundreds of
+//!   frames behind the device without the time; and when each wait took a
+//!   quantum (half a frame with two pads), btn's CD outran its CPU.
 //!
 //! **State.** The port records, receive buffers and pending results are
 //! here, in the runtime: only libpad's own code reads them (`psxw sdk
@@ -59,9 +61,8 @@
 //! command (actuator levels, `PadSetAct`) aren't computed: a digital pad
 //! ignores them. Multitap and light-gun paths aren't linked in these
 //! games. `PadSetAct`'s return value, the record's address, is 0. The
-//! waits' times assume the safepoint quantum exceeds the /ACK pulse (a
-//! wait for /ACK to drop, which the original makes after each byte, is
-//! never long under the default 20,000 cycles).
+//! waits' times leave out the original's wait for /ACK to fall after
+//! each byte (the pulse lasts 32 cycles, a pass or two).
 
 use crate::{Adapter, M, Result, reg, ret, set_reg};
 
@@ -204,7 +205,8 @@ pub fn irq_step(m: &mut M, _step: u32) {
     if !vblank(m, I_MASK) || !vblank(m, I_STAT) || !m.sdk.pad.direct {
         return;
     }
-    let mut spin = Spin { quantum: crate::libetc::quantum(m), now: 0 };
+    let budget = crate::libetc::LOOP_BUDGET;
+    let mut spin = Spin { pass: (m.quantum() / budget).max(1), now: 0, passes: 0 };
     for chan in 0..2 {
         take_pending(m, chan);
         match exchange(m, chan, &mut spin) {
@@ -215,14 +217,7 @@ pub fn irq_step(m: &mut M, _step: u32) {
             }
         }
     }
-    if spin.now > 0 {
-        let until = m.clock.now + spin.now;
-        m.clock.advance_to(until);
-        // The guest resumes with its safepoint budget as the original's
-        // last safepoint left it: full. Left as it was, the game would get
-        // less (or more) done before its next quantum than on the device.
-        m.regs.reset_budget();
-    }
+    spend_in_exception(m, spin.passes);
 }
 
 /// SIO0 at libpad's rate (baud 88h, factor 1): cycles a byte takes, and
@@ -238,21 +233,47 @@ const COMMAND_WAIT: u64 = 0x3C * 8;
 const ACK_WAIT: u64 = 0x190 * 8;
 const DATA_ACK_WAIT: u64 = 0x1AE * 8;
 
-/// libpad's busy-waits as the runtime runs a guest loop: virtual time
-/// only moves at its safepoints, a quantum at a time (§6), so a wait ends
-/// at the first safepoint at or after what it waits for. `now` counts
-/// from the handler's start.
+/// libpad's busy-waits as the runtime runs a guest loop: each poll is a
+/// loop-header pass, and SIO0 and root counter 2 see the cycle it is made
+/// at (D66), so a wait ends at the first pass at or after what it waits
+/// for. `now` counts from the handler's start.
 pub struct Spin {
-    quantum: u64,
+    /// Cycles a pass takes.
+    pass: u64,
     now: u64,
+    /// Passes made.
+    passes: u64,
 }
 
 impl Spin {
     fn until(&mut self, t: u64) {
         if t > self.now {
-            self.now += (t - self.now).div_ceil(self.quantum.max(1)) * self.quantum.max(1);
+            let k = (t - self.now).div_ceil(self.pass);
+            self.now += k * self.pass;
+            self.passes += k;
         }
     }
+}
+
+/// `n` loop-header passes of code running in the exception: the guest's
+/// budget spent as the original's loops spend it, a quantum passing
+/// (nothing delivered) each time it runs out.
+pub(crate) fn spend_in_exception(m: &mut M, n: u64) {
+    let budget = crate::libetc::LOOP_BUDGET;
+    let left = m.regs.budget() as u64;
+    if left == 0 {
+        let t = m.clock.now + n * m.quantum() / budget;
+        m.clock.advance_to(t);
+        return;
+    }
+    if n < left {
+        m.regs.set_budget((left - n) as u32);
+        return;
+    }
+    let r = n - left;
+    let t = m.clock.now + (1 + r / budget) * m.quantum();
+    m.clock.advance_to(t);
+    m.regs.set_budget((budget - r % budget) as u32);
 }
 
 /// What a slot's device answers, a byte at a time: a digital pad
@@ -700,10 +721,11 @@ mod tests {
         assert_eq!(state(&mut m, 0), 1);
         assert_eq!(call(&mut m, pad_info_mode, [0, 1, 0, 0]), 4);
         assert_eq!(m.sdk.pad.ports[0].current, CONFIG);
-        // The handler's waits take a quantum each: a refused command five,
-        // nothing connected three.
-        let spent = |m: &M| (m.clock.now - m.clock.video.vblank_at(m.vblanks)) / 20_000;
-        assert_eq!(spent(&m), 8);
+        // The handler's waits end at the pass that sees what they wait for
+        // (D66): a refused command and nothing connected take 628 passes.
+        // This machine has no guest budget, so the passes are its time.
+        let spent = |m: &M| m.clock.now - m.clock.video.vblank_at(m.vblanks);
+        assert_eq!(spent(&m), 12_560);
         for _ in 0..11 {
             assert_eq!(state(&mut m, 0), 1);
             vblanks(&mut m, 1);
@@ -711,8 +733,8 @@ mod tests {
         assert_eq!(m.sdk.pad.ports[0].state, STATE_FIND_CTP1);
         vblanks(&mut m, 1);
         assert_eq!(state(&mut m, 0), 1, "the poll's reply is pending");
-        // A poll: seven.
-        assert_eq!(spent(&m), 10);
+        // A poll and nothing connected: 642 passes.
+        assert_eq!(spent(&m), 12_840);
         vblanks(&mut m, 1);
         assert_eq!(state(&mut m, 0), 2);
         assert_eq!(call(&mut m, pad_info_mode, [0, 100, 0, 0]), 12);

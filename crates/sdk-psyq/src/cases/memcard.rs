@@ -15,7 +15,7 @@
 //! - **Per vblank:** `McxSync(1, …)` and the command number and result it
 //!   writes (sentinels before), as a game polls; where the guest resumes
 //!   in the frame (root counter 1, in hblanks), which the wait before the
-//!   address byte moves a quantum (D60); the interrupt mask.
+//!   address byte moves by its passes (D60, D66); the interrupt mask.
 //! - **The commands' buffers** (scratch RAM, seeded) after the transfer:
 //!   a callback that wrote one would show.
 

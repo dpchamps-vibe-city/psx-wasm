@@ -16,10 +16,11 @@
 //! - **`PadSetAct` returns nothing:** v0 is libpad's record address on the
 //!   original, so its result isn't observed.
 //! - **The interrupt takes time.** The original busy-waits on SIO0 and
-//!   root counter 2 inside the vblank interrupt; under the safepoint model
-//!   each wait is a quantum, half a frame in all with two pads. Where the
-//!   game resumes in the frame is observed in hblanks (exactly: both sides
-//!   step time in the same quanta).
+//!   root counter 2 inside the vblank interrupt, a loop-header pass per
+//!   poll, both at the cycle the pass is made (D66). Where the game
+//!   resumes in the frame is observed in hblanks: both sides spend the
+//!   same passes, but for the original's wait for each /ACK to fall (a
+//!   pass or two a byte, well under an hblank).
 
 use super::{Case, Harness, Rng, SCRATCH, call, observe_ram};
 

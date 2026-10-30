@@ -203,6 +203,10 @@ pub trait Sdk: Sized {
     }
 }
 
+/// The link's safepoint budget: loop-header passes per quantum
+/// (psxw-build's, which the link compiles into every loop header).
+pub const LOOP_BUDGET: u64 = 1000;
+
 pub struct Machine<S> {
     pub mem: Box<dyn Mem>,
     pub host: Box<dyn Host>,
@@ -243,6 +247,9 @@ pub struct Machine<S> {
     /// waits for the guest's next one (D63). The driver takes it at the
     /// adapter's return.
     pub quiet: bool,
+    /// Events are being delivered: devices see the clock itself, not the
+    /// guest's place in its quantum ([`Self::guest_now`]).
+    pub delivering: bool,
     pub sdk: S,
     /// Calls per BIOS function and adapter, for the run report.
     pub counts: BTreeMap<String, u64>,
@@ -279,6 +286,7 @@ impl<S: Sdk> Machine<S> {
             in_irq: false,
             held_irq: false,
             quiet: false,
+            delivering: false,
             sdk,
             counts: BTreeMap::new(),
             loaded: Vec::new(),
@@ -319,13 +327,36 @@ impl<S: Sdk> Machine<S> {
     pub fn run_until(&mut self, until: u64) -> bool {
         let mut any = false;
         if !self.crit && !self.in_irq {
+            let was = std::mem::replace(&mut self.delivering, true);
             while let Some(e) = self.clock.pop_until(until) {
                 self.deliver(e);
                 any = true;
             }
+            self.delivering = was;
         }
         self.clock.advance_to(until);
         any
+    }
+
+    /// The safepoint quantum: virtual time a guest loop's [`LOOP_BUDGET`]
+    /// header passes take (§6).
+    pub fn quantum(&self) -> u64 {
+        if self.opts.safepoint_quantum == 0 { 20_000 } else { self.opts.safepoint_quantum as u64 }
+    }
+
+    /// The cycle the guest is at for SIO0 and root counter 2 (D66):
+    /// virtual time moves a quantum at a safepoint, but the loop passes the
+    /// guest has made since its budget started over took their share of
+    /// that quantum. A busy-wait on a byte, its /ACK or the counter so sees
+    /// the cycle each poll is made at and ends when the hardware's would,
+    /// not at the next safepoint. While events are delivered, or with no
+    /// guest to ask, it is the clock.
+    pub fn guest_now(&self) -> u64 {
+        let left = self.regs.budget() as u64;
+        if self.delivering || left == 0 || left > LOOP_BUDGET {
+            return self.clock.now;
+        }
+        self.clock.now + (LOOP_BUDGET - left) * self.quantum() / LOOP_BUDGET
     }
 
     /// Advance to the next event (or `limit`) and deliver it.
@@ -401,9 +432,16 @@ impl<S: Sdk> Machine<S> {
     pub fn reschedule_timer(&mut self, n: usize) {
         self.clock.cancel(|e| *e == Event::Timer(n as u8));
         let video = self.clock.video;
-        if let Some(t) = self.timers[n].next_irq(n, video, self.clock.now) {
+        if let Some(t) = self.timers[n].next_irq(n, video, self.timer_now(n)) {
             self.clock.schedule(t, Event::Timer(n as u8));
         }
+    }
+
+    /// The cycle root counter `n` is read and written at: root counter 2,
+    /// which libpad and libmcx busy-wait on, at the guest's (D66); the
+    /// others at the clock's.
+    pub fn timer_now(&self, n: usize) -> u64 {
+        if n == 2 { self.guest_now() } else { self.clock.now }
     }
 
     /// BIOS DeliverEvent: callbacks for interrupt-mode events, ready status

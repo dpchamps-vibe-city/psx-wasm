@@ -71,3 +71,14 @@ press = [
   "LEFT@2350:60",
   "UP@2450:60",
 ]
+# Reached-state checks, so a replay that stalls can't pass: the farm
+# (scene 2) after the opening and the names (scene 13), from counter about
+# 2030; the mayor's arrival walk leaves the player facing 3 (counter 2244),
+# and at 2700, near the end, the game is still on the farm, the mayor
+# talking. A game that never gets past loading never reaches these
+# counters, and fails them.
+expect = [
+  "gCurrentSceneId==2@2100",
+  "gPrimaryObjectFacing:2==3@2600",
+  "gCurrentSceneId==2@2700",
+]

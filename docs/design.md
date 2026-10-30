@@ -523,7 +523,10 @@ Game-visible time is **virtual and deterministic**:
   set at link time; mods' loops don't spend it). When the budget
   runs out, the runtime advances virtual time by a quantum (20,000 CPU
   cycles by default, `BootOptions::safepoint_quantum`) and delivers what
-  fell due.
+  fell due. Between safepoints SIO0 and root counter 2 see the share of
+  the quantum the guest's passes have taken (`Machine::guest_now`, D66),
+  so a busy-wait on a byte, its /ACK or the counter ends when the
+  hardware's would, not at the next safepoint.
 - **Waiting is spinning.** libgpu's `DrawSync` is original code (D42),
   and so is libetc's `VSync` with chip irq on its device (D45): they wait
   the way they do on hardware, by polling. `VSync(0)` spins until libetc's
@@ -2125,6 +2128,9 @@ that machine instead of approximating it:
   about 20,000 cycles. The adapters spend the same quanta, delivering
   nothing, and then start the guest's safepoint budget over as the
   original's last safepoint does (psxw-abi `guest::BUDGET_RESET`).
+  *Later:* D66 ends each wait at the pass that sees what it waits for,
+  its passes spent from the budget: about 640 passes (12,800 cycles) for
+  a pad and an empty port.
 
 *Why:* conformance against the device is exact on every observation,
 per vblank (buffers, states, types, failure counts, where the game
@@ -2233,6 +2239,10 @@ makes commands, interrupts and sectors arrive at the same cycle in both
 modes, so conformance compares only the library logic. Decided without
 the human's input, as the task said (plans/unified-adaptor-layer, phase 1
 findings).
+
+*Later:* with `CdRead` original, btn needs its CPU to take each sector
+within a sector period, which libpad's quantum-long busy-waits prevented
+with two pads: D66.
 
 **D63. libspu's seam is where it touches the SPU; its adapters drive a
 mixer API and spend the original's time** (unified adapter layer, phase 1
@@ -2385,7 +2395,8 @@ and nothing after it (McxErrInvalid), an empty slot nothing (McxErrNoCard).
   answers.
 - **Time as on the device.** The address byte's wait ends at the next
   safepoint, a quantum in the vblank interrupt, after which the guest's
-  budget starts over (D60). An /ACK raises IRQ7 at its time without
+  budget starts over (D60). *Later:* 58 loop-header passes, spent from
+  the guest's budget (D66). An /ACK raises IRQ7 at its time without
   walking the chains, as SIO0's device does, so the next interrupt the
   machine takes runs `_mcxDsrEntry`.
 - **The root counters' "reached" flags** (mode bits 11 and 12, the target
@@ -2406,3 +2417,61 @@ of more than a few bytes doesn't end before the vblank's timeout, and
 would read the block's directory frame and write it back. Decided without
 the human's input, as the task said (plans/unified-adaptor-layer, phase 1
 findings).
+
+**D66. SIO0 and root counter 2 see the cycle the guest is at** (unified
+adapter layer, phase 1; found by btn's replays stalling after D62).
+Virtual time moves a quantum at a safepoint, so a busy-wait on a device
+ended only at the next safepoint: libpad's vblank interrupt waits on
+SIO0's bytes and /ACK and on root counter 2 about seven times a pad, so
+with two pads it took half a frame (14 quanta, 280,000 cycles) where
+hardware takes about 20,000. No other interrupt is taken meanwhile, and
+the CD delivers a sector every 225,792 cycles at double speed: the next
+sector replaced the one the CPU hadn't taken, as on hardware when the
+CPU is late, so libcd's `CdRead` (original since D62) found each
+sector's header wrong and retried forever. btn never left its loading
+screen under a replay (two pads), natively and on every device; with one
+pad (ten quanta) it got by. Before D62 btn's `CdRead` was an adapter
+that didn't care, and the old finding "btn with its CD on the device
+stalls" was this.
+- **The rule:** a guest's access to SIO0 or to root counter 2 sees
+  `Machine::guest_now`: the clock plus the share of the quantum the loop
+  passes since the guest's budget last started over have taken (passes
+  spent × quantum / budget, 20 cycles a pass by default). A poll sees the
+  byte arrive, the /ACK or the count at the cycle the pass is made, so
+  the wait ends when the hardware's would, to a pass. Events are still
+  delivered only at safepoints; while they are, both see the clock.
+  SIO0's time never runs back, and a counter written ahead of the clock
+  reads as written until the clock catches up.
+- **Adapters that replace such a wait** count it the same way: libpad's
+  handler (D60) and libmcx's address-byte wait (D65) end each wait at the
+  first pass at or after what it waits for and spend the passes from the
+  guest's budget, a quantum passing (nothing delivered) each time it runs
+  out (`libpad::spend_in_exception`). libpad's interrupt now takes about
+  640 passes (12,800 cycles) for a pad and an empty port; libmcx's wait
+  58.
+- **Not root counters 0 and 1, nor the other devices.** A first version
+  gave every counter the guest's cycle: then each guest read of root
+  counter 1 (libetc's `VSync` reads it) became a function of the guest's
+  budget, and the adapters that replace a loop without spending the
+  original's passes (`VSync`'s spin, libgpu's waits) moved bof4's native
+  run off its runs with chip gpu and chip irq on their devices (from
+  frames 102 and 735).
+  Counter 2 is what libpad's and libmcx's waits read. Counters 0 and 1,
+  the CD controller, the SPU, the GPU, the MDEC and DMA keep the clock.
+
+*Why:* a pass costing 20 cycles is the model; a busy-wait costing a whole
+quantum whatever it waits for is an artifact of it, and it made the CPU
+in libpad's interrupt many times slower than hardware, which the CD's
+real-time sectors exposed. Giving SIO0 alone the guest's cycle left the
+counter waits at a quantum each (four quanta for two pads): btn played
+through, but `CdRead` still logged 231 sector errors in `title-to-gameplay`;
+with counter 2 too, none. Both modes agree: chip sio0's and chip
+memcard's conformance compare the passes' time to the hblank. A CD
+controller that kept unread sectors doesn't help (libcd acknowledges an
+interrupt before it reads its sector, so the next one is presented
+first), and a smaller quantum would shrink the artifact everywhere at the
+cost of more safepoints. bof4 feels it: its pad interrupt is shorter, and
+`title-to-field` reaches the field about 370 frames later than when the
+replay was authored (counter 12390 at frame 25,138, was 24,768; the
+replay now runs 26,000 frames). Decided without the human's input
+(plans/unified-adaptor-layer, phase 1 findings).

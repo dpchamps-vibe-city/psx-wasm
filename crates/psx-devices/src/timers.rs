@@ -52,6 +52,8 @@ impl Timer {
 
     /// Counter value at `now`.
     pub fn value(&self, n: usize, video: Video, now: u64) -> u16 {
+        // Written ahead of `now` (the guest's cycle, D66): as written.
+        let now = now.max(self.base_cycle);
         let t = Self::ticks(n, self.mode, video, self.base_cycle, now) + self.base_value as u64;
         let p = self.period();
         if (self.base_value as u64) < p {
@@ -114,6 +116,7 @@ impl Timer {
         if !(at_target || at_wrap) || (self.fired && self.mode & 0x40 == 0) {
             return None;
         }
+        let now = now.max(self.base_cycle);
         let cur = self.value(n, video, now) as u64;
         let p = self.period();
         // Ticks until the counter next equals the target / 0xFFFF.

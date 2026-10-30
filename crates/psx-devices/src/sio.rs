@@ -210,7 +210,9 @@ impl Sio0 {
     /// Bring the port up to cycle `now`, processing every event before it
     /// at its own time (as the oracle's scheduler does).
     pub fn update(&mut self, now: u64, irq: &mut Irq, cards: &mut Cards) {
-        let now = now as i64;
+        // Time never runs back: a guest that polled ahead of the clock
+        // (D66) has already taken SIO0 this far.
+        let now = (now as i64).max(self.last);
         while let Some(t) = self.next_event().filter(|&t| t <= now) {
             self.step(t, irq, cards);
         }

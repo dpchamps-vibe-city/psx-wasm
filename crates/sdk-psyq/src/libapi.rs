@@ -58,7 +58,7 @@ pub(crate) fn set_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     if mode_in & 0x1000 != 0 {
         mode |= 0x10;
     }
-    let now = m.clock.now;
+    let now = m.timer_now(n);
     m.timers[n].target = a[1] as u16;
     m.timers[n].write_mode(mode, now);
     m.reschedule_timer(n);
@@ -67,7 +67,7 @@ pub(crate) fn set_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 
 fn get_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let Some(n) = counter(a[0]) else { return ret(0) };
-    ret(m.timers[n].value(n, m.clock.video, m.clock.now) as u32)
+    ret(m.timers[n].value(n, m.clock.video, m.timer_now(n)) as u32)
 }
 
 fn start_rcnt(m: &mut M, a: [u32; 4]) -> Result {
@@ -86,7 +86,7 @@ fn stop_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 
 fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let Some(n) = counter(a[0]) else { return ret(0) };
-    let (video, now) = (m.clock.video, m.clock.now);
+    let (video, now) = (m.clock.video, m.timer_now(n));
     m.timers[n].write_count(n, video, now, 0);
     m.reschedule_timer(n);
     ret(1)

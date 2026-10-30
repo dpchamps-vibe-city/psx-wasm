@@ -366,9 +366,14 @@ pub fn evaluate_with(ws: &Workspace, game: &str, args: &[&str], tweak: impl FnOn
         results.push(Check { name: "no-io", pass: hits.is_empty(), detail: if hits.is_empty() { "no register accesses".into() } else { hits.join(", ") } });
     }
     // The replay's reached-state checks: each value when the counter first
-    // reaches its mark.
+    // reaches its mark: the first frame it is there, else the first it
+    // went past it and stayed. A word that holds something else for a
+    // while before the game sets it up (btn's, at boot) can lie past the
+    // mark, then fall back.
     for (k, e) in expects.iter().enumerate() {
-        let at = r.trace.iter().position(|&c| c >= e.counter);
+        let t = &r.trace;
+        let stayed = || (0..t.len()).find(|&i| t[i] >= e.counter && t[i..].iter().all(|&c| c >= e.counter));
+        let at = t.iter().position(|&c| c == e.counter).or_else(stayed);
         let (pass, detail) = match at {
             None => (false, format!("{}: the counter never reached {} (last {:?})", e.text, e.counter, r.trace.last())),
             Some(i) => {

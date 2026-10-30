@@ -180,13 +180,15 @@ impl<S: Sdk> Machine<S> {
     /// I/O.
     pub fn reg_read(&mut self, addr: u32, size: u32) -> Result<u32, String> {
         let now = self.clock.now;
+        // SIO0 runs at the guest's cycle (D66).
+        let sio = self.guest_now();
         let video = self.clock.video;
         if SPU.contains(&addr) {
             self.spu_run();
         }
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
         let cards = &mut self.kernel.cards.slots;
-        io.sio0.update(now, &mut io.irq, cards);
+        io.sio0.update(sio, &mut io.irq, cards);
         let v = if SPU.contains(&addr) {
             let off = addr - SPU.start;
             let half = |o: u32| io.spu.spu.read(o) as u32;
@@ -200,9 +202,10 @@ impl<S: Sdk> Machine<S> {
             // Wider reads (the data FIFO's halfwords) take bytes in turn.
             (0..size.min(4)).fold(0, |v, i| v | (io.cdc.read(addr) as u32) << (8 * i))
         } else if Sio0::handles(addr) {
-            io.sio0.read(addr, now, &mut io.irq, cards)
+            io.sio0.read(addr, sio, &mut io.irq, cards)
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
+            let now = if n == 2 { sio } else { now };
             let t = &mut self.timers[n];
             let reg = match (addr >> 2) & 3 {
                 0 => t.value(n, video, now) as u32,
@@ -248,6 +251,8 @@ impl<S: Sdk> Machine<S> {
     /// the device's own semantics (see [`Self::reg_read`]).
     pub fn reg_write(&mut self, addr: u32, size: u32, v: u32) -> Result<(), String> {
         let now = self.clock.now;
+        // SIO0 runs at the guest's cycle (D66).
+        let sio = self.guest_now();
         let video = self.clock.video;
         if SPU.contains(&addr) {
             self.spu_run();
@@ -255,7 +260,7 @@ impl<S: Sdk> Machine<S> {
         self.sio0_cards(addr, v);
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
         let cards = &mut self.kernel.cards.slots;
-        io.sio0.update(now, &mut io.irq, cards);
+        io.sio0.update(sio, &mut io.irq, cards);
         let v = v & mask(size);
         if SPU.contains(&addr) {
             let off = addr - SPU.start;
@@ -289,9 +294,10 @@ impl<S: Sdk> Machine<S> {
             io.cdc.write(addr, v as u8, now);
             self.cdc_sync();
         } else if Sio0::handles(addr) {
-            io.sio0.write(addr, size, v, now, &mut io.irq, cards);
+            io.sio0.write(addr, size, v, sio, &mut io.irq, cards);
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
+            let now = if n == 2 { sio } else { now };
             match (addr >> 2) & 3 {
                 0 => self.timers[n].write_count(n, video, now, v as u16),
                 1 => self.timers[n].write_mode(v as u16, now),

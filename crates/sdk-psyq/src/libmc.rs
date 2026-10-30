@@ -38,9 +38,9 @@
 //! card answers.
 //!
 //! **Time.** The wait before the address byte (`_mcxSioRW`'s, on root
-//! counter 2) ends at the next safepoint, a quantum later, inside the
-//! vblank interrupt: the adapter spends it and starts the guest's budget
-//! over, as libpad's do (D60). An /ACK raises IRQ7 in the interrupt
+//! counter 2) polls once a loop-header pass, the counter at each pass's
+//! cycle (D66), so it ends after 58 passes inside the vblank interrupt:
+//! the adapter spends them from the guest's budget, as libpad's do (D60). An /ACK raises IRQ7 in the interrupt
 //! controller at its time, as SIO0's device does, which leaves it pending
 //! until the next interrupt the machine takes walks the chains.
 //!
@@ -299,14 +299,13 @@ fn sio_rw(m: &mut M, b: u8) -> std::result::Result<u8, String> {
     Ok(got)
 }
 
-/// A busy-wait in the interrupt ends at the next safepoint: the time
-/// passes, nothing is delivered, and the guest resumes with its budget
-/// started over (D60).
+/// A busy-wait in the interrupt: a loop-header pass per poll, each at the
+/// cycle it is made (D66), so it ends at the first pass at or after `t`;
+/// the passes spend the guest's budget, a quantum passing (nothing
+/// delivered) each time it runs out (D60).
 fn spin(m: &mut M, t: u64) {
-    let q = crate::libetc::quantum(m).max(1);
-    let until = m.clock.now + t.div_ceil(q) * q;
-    m.clock.advance_to(until);
-    m.regs.reset_budget();
+    let pass = (crate::libetc::quantum(m) / crate::libetc::LOOP_BUDGET).max(1);
+    crate::libpad::spend_in_exception(m, t.div_ceil(pass));
 }
 
 /// JOY_CTRL 40h, then mode 0Dh, baud 88h and control 0: the port reset.
@@ -754,7 +753,7 @@ mod tests {
             assert_eq!(steps[1], IrqStep::Sdk(STEP_START_TAIL));
             let t = m.clock.now;
             adapter(&mut m, dsr_entry, DSR_ENTRY);
-            assert_eq!(m.clock.now - t, 20_000, "the address byte's wait: a quantum");
+            assert_eq!(m.clock.now - t, 58 * 20, "the address byte's wait: its 58 passes (D66)");
             irq_step(&mut m, STEP_START_TAIL);
             assert_eq!((get(&m, DATA + data::STAT), get(&m, DATA + data::TX_LEN), m.mem.r8(TX_BUF)), (RUNNING, 1, 0x81 + (port as u8 & 0xF)));
             assert_eq!(m.kernel.int_handlers[&1], vec![DATA + data::DSR_ENT]);

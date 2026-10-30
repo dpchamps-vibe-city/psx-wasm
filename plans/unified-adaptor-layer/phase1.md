@@ -693,6 +693,55 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     for btn passes its checks with output that differs between the
     modes. To rerun once the fix lands.
 
+- **2026-10-29, btn's replays stall (task 9d's regression), D66.** Since
+  `650da93` btn never left loading under any replay, natively and with
+  `--device all`: `CdRead: sector error` / `retry...` from frame 97 on,
+  30 render words, the frame counter at 0. Task 9d had missed it (it read
+  the last ten log lines, and `title-to-gameplay` had no expect lines).
+  - **Cause:** libpad's vblank interrupt busy-waits on SIO0 and root
+    counter 2, and under the safepoint model each wait ended at the next
+    safepoint: with two pads (every replay) the interrupt took 14 quanta,
+    280,000 cycles, longer than a sector period at double speed (225,792).
+    The controller replaced the sector the CPU hadn't taken with the next,
+    as hardware does, and `CdRead`, original since D62, found each header
+    wrong and retried forever. One pad (no replay) took ten quanta and got
+    by, which is why task 9d's runs passed. A quantum of 10,000 or 5,000
+    cycles made the errors go away (an experiment, reverted); a controller
+    that queued unread sectors didn't (libcd acknowledges INT1 before
+    reading the sector, so the queue's next one is presented).
+  - **Fix (D66):** SIO0 and root counter 2 see `Machine::guest_now`, the
+    clock plus the share of the quantum the guest's loop passes have
+    taken, so a poll sees the byte, /ACK or count at the cycle it is made.
+    libpad's handler and libmcx's address-byte wait count passes the same
+    way and spend them from the guest's budget
+    (`libpad::spend_in_exception`): about 640 passes (12,800 cycles) for a
+    pad and an empty port, 58 for libmcx's wait. SIO0 alone left the
+    counter waits at a quantum each: btn played through but logged 231
+    sector errors in `title-to-gameplay`; with counter 2, none. Giving
+    every counter the guest's cycle moved bof4's native run off the device
+    with chips irq and gpu (from frames 735 and 102): root counter 1,
+    which `VSync` reads, then depended on the budget that the adapters
+    replacing loops don't spend.
+  - **Replays:** `title-to-gameplay` has three expect lines (the farm,
+    scene 2, at counter 2100; the player facing 3 after the mayor's walk
+    at 2600; still on the farm at 2700), which a stalled game can't pass.
+    btn's counter word holds 66158592 from frame 76 to 84 before the game
+    zeroes it, so an expect is now taken where the counter first equals
+    its mark, else where it first went past it and stayed (`psxw run`).
+    bof4's `title-to-field` reaches the field about 370 frames later
+    (counter 12390 at frame 25,138, was 24,768) and runs 26,000 frames.
+  - **Checks, on main after the chip memcard merge (`6b4405d`):** unit
+    tests (sdk-psyq, psx-bios, psx-devices, psxw-cli, psx-runtime) pass.
+    Natively: btn `title-to-gameplay` passes its three expects (frames
+    4,725, 5,725, 5,925; 10,511,025 render words; no sector error), btn
+    `card-load` passes `--check card` and gets to the card (`_card_info`
+    81 times, `_card_load` 3; no sector error), bof4 `title-to-field`
+    passes its five expects. `psxw conform btn --chip cd` (19 runs),
+    `--chip sio0` (34), `--chip memcard` (9) and `psxw conform bof4 --chip
+    cd` (22): PASS, 4 seeds. Level 4 (`--modes`) wasn't rerun: for btn it
+    has the boot GPU timeout's offset between the modes (task 9a's
+    finding, frames 64 and 99).
+
 ## Findings
 
 - **The state-accessor rule, refined.** An accessor is a function that
@@ -709,16 +758,11 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   timeout: que=0, stat=d6800000, chcr=01000401` at frame 99 (a linked-list
   GPU DMA that never runs), and the frame counter never leaves 0 under
   `--device all`. btn's libcd has never run original before. Chip d owns
-  it: exit criterion 4 needs it. *Resolved (task 9d):* it no longer
-  reproduces. On `--device cd`, btn runs 1,500 frames with the GPU timeout
-  at frame 64 as natively (the timeout every mode has, task 9a's finding)
-  and its frame counter equals the native one at frames 300, 600, 1,000
-  and 1,500 (95, 235, 435, 685); on `--device all` the counter leaves 0
-  (667 at frame 1,500) and both `--modes` runs pass. Chip cd's change
-  touches nothing the device path runs, so chip irq's runtime fixes
-  (RCntCNTn events following I_MASK, critical sections' overdue events)
-  most likely fixed it; not bisected. btn's libcd now runs original in
-  every mode, natively over the drive layer's adapters.
+  it: exit criterion 4 needs it. *Task 9d called it resolved, wrongly:*
+  it checked runs without a replay, which connect one pad. Under a
+  replay (two pads) it was the stall below, and since task 9d, with
+  btn's `CdRead` original in every mode, it stalled natively too.
+  *Resolved by D66* (progress log, "btn's replays stall").
 - **Interrupt latency is observable; `VSync` waits like its spin** (task
   9a). A first `VSync` adapter blocked event by event, as blocking runtime
   calls do (§6), so interrupts raised while a game waited were handled at
@@ -864,15 +908,12 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   is registered); the stack contents libgpu's frames leave below `sp`.
 - **The CD's seam is its drive layer** (task 9d, D62): decided without
   the human's input, as the task said. See the progress log.
-- **btn's `CdRead` retries sectors late in `title-to-gameplay`,** in both
-  modes: 5 "CdRead: sector error / retry" pairs at frames 5,972-5,994
-  natively, 5,971-5,997 with the CD on its device. `CdRead` reads each
-  sector's header and finds another sector than it expected; the
-  controller replaces a sector the CPU hasn't taken with the next one, as
-  hardware loses it. Likely cause, not verified: an interrupt handler or
-  critical section longer than a sector period (6.7 ms at double speed)
-  under the safepoint cost model (20 cycles per loop iteration). The
-  replay passes; open for the oracle.
+- **btn's `CdRead` never got a sector through under a replay** (task 9d's
+  regression; D66). Task 9d saw only the last ten log lines of
+  `title-to-gameplay` and called five sector errors late in the run
+  benign; in fact `CdRead: sector error` / `retry` repeated from frame 97
+  on, every replay stalled in loading (30 render words, counter 0), and
+  the replay passed because it had no expect lines. It has three now.
 - **Run reports' `cd_loads` are empty now.** The old `CdRead` adapter
   timed each load (M7 task 7's evidence); with `CdRead` original nothing
   sees a load whole. Sectors and EDC are still counted (the controller's).

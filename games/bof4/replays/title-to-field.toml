@@ -14,7 +14,10 @@
 #
 # One pad: with a second one plugged in, the game takes another path and
 # draws nothing.
-frames = 25300
+# Since D66 the pad interrupt takes about 13,000 cycles, not ten quanta,
+# and the field comes about 370 frames later than when the replay was
+# authored (counter 12390 at frame 25138, was 24768).
+frames = 26000
 pads = 1
 press = [
   "START@850", "START@950", "CROSS@1000", "START@1100",
