@@ -60,7 +60,7 @@ callback_state = "D_8011C99C"
 [chips]
 # The chips this game runs native through their adapters (D59); a build
 # that falls back to one's device fails. The rest are emulated.
-native = ["cd", "irq"]
+native = ["cd", "gpu", "irq"]
 
 [ci]
 # The layout probe compares game struct layouts under the matching

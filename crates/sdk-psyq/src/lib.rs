@@ -8,9 +8,9 @@
 //! psyq-decomp records it.
 //!
 //! Scope: libetc's interrupt layer and libapi's `counter.o` (chip irq),
-//! libapi's `pad.o`/`patch.o`/`first.o`, libcd's drive layer and the
-//! streaming ring's interrupt (chip cd), and libcard/libmcx's thin BIOS
-//! wrappers.
+//! libgpu's `sys.o` (chip gpu), libapi's `pad.o`/`patch.o`/`first.o`,
+//! libcd's drive layer and the streaming ring's interrupt (chip cd), and
+//! libcard/libmcx's thin BIOS wrappers.
 //!
 //! A chip whose adapters don't cover a game runs its libraries as the
 //! game's own code over register-level devices ([`DEVICE_LIBRARIES`],
@@ -20,6 +20,7 @@ pub mod cases;
 pub mod libapi;
 pub mod libcd;
 pub mod libetc;
+pub mod libgpu;
 pub mod libmc;
 pub mod layout;
 pub mod validated;
@@ -48,9 +49,9 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 /// - libpad (D40): its observable state (PadGetState's sequence, buffer
 ///   bytes, return values) is its own state machine over a few SIO0 bytes
 ///   per frame; the device is a port of the oracle's.
-/// - libgpu (D42): the GPU front end takes GP0/GP1 words, so libgpu's own
-///   code drives it through the ports and DMA; an ordering table is one
-///   DMA linked-list walk in Rust.
+/// - libgpu (D42), when chip gpu is emulated: the GPU front end takes
+///   GP0/GP1 words, so libgpu's own code drives it through the ports and
+///   DMA; an ordering table is one DMA linked-list walk in Rust.
 /// - libetc (D45), when chip irq is emulated: its interrupt layer is
 ///   entered through the BIOS's custom exception exit (a longjmp into
 ///   `startIntr`'s `setjmp`) and leaves with ReturnFromException; both are
@@ -72,6 +73,7 @@ pub struct Psyq {
     pub cd: libcd::Cd,
     pub mc: libmc::Mc,
     pub etc: libetc::Etc,
+    pub gpu: libgpu::Gpu,
     /// The guest address of the SDK function the running adapter replaces
     /// (D60): the runtime sets it before each call.
     pub at: u32,
@@ -100,7 +102,7 @@ impl Sdk for Psyq {
     }
 
     fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
-        libetc::stand_in(m, addr, state).or_else(|| libcd::stand_in(m, addr, state))
+        libetc::stand_in(m, addr, state).or_else(|| libgpu::stand_in(m, addr, state)).or_else(|| libcd::stand_in(m, addr, state))
     }
 }
 
@@ -119,6 +121,7 @@ pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&'static str, &'static str)> = Vec::new();
     v.extend(libapi::COUNTERS.iter().map(|n| (*n, "irq")));
     v.extend(libetc::ADAPTERS.iter().map(|(n, _)| (*n, "irq")));
+    v.extend(libgpu::ADAPTERS.iter().map(|(n, _)| (*n, "gpu")));
     v.extend(libcd::ADAPTERS.iter().map(|(n, _)| (*n, "cd")));
     v
 }
@@ -128,6 +131,7 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     let mut v: Vec<(&'static str, Adapter)> = Vec::new();
     v.extend(libapi::ADAPTERS);
     v.extend(libetc::ADAPTERS);
+    v.extend(libgpu::ADAPTERS);
     v.extend(libcd::ADAPTERS);
     v.extend(libmc::ADAPTERS);
     v

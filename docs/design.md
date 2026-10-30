@@ -32,7 +32,7 @@ manifest, without changes to the toolchain's code.
 | R3000 CPU | **Gone.** clang compiles the game and SDK C to wasm. Any residual asm is translated ahead of time (the lift tier). Nothing decodes MIPS at run time. |
 | Memory map | **Kept.** RAM, the scratchpad, and every symbol sit at their original addresses inside a wasm memory window, and pointer values are the PSX's own. This is a choice of data layout, not hardware emulation. |
 | GTE | **Modelled.** A fixed-point library (`psx-gte`) holding the GTE's register file, which COP2 instructions and the `gte_*` macros drive. |
-| GPU | **Register level.** libgpu is original code over a GPU front end that takes GP0/GP1 words and answers GPUSTAT/GPUREAD (`psx-devices::gpu`), fed by the DMA controller (D42). The front end decodes packets into renderer commands; the host's WebGL2 backend draws them into a VRAM model. |
+| GPU | **Native, per chip** (D59, D60). libgpu's `sys.o` adapters (btn, bof4) give the GPU front end (`psx-devices::gpu`) its GP0/GP1 words and run its transfers on the DMA controller the other chips share; libgpu's state stays in guest RAM, where the library's code that stays original reads it. As the fallback, libgpu is original code over the front end, which answers GPUSTAT/GPUREAD, fed by the DMA controller (D42). The front end decodes packets into renderer commands; the host's WebGL2 backend draws them into a VRAM model. |
 | SPU | **Register level.** libspu and libsnd are original code over `psx-spu`: 24 ADPCM voices with reverb, on their own 44.1 kHz clock (D47). |
 | CD-ROM | **Native, per chip** (D59, D61). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). libpress is original code over the MDEC (`psx-devices::mdec`). |
 | Pad | **Register level.** libpad is original code over SIO0 (`psx-devices::sio`, D40). |
@@ -51,7 +51,8 @@ remain where a library's policy keeps them (§5).
 D59 moves each chip back to native adapters, degrading to its device
 model where the adapters don't cover a game
 ([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):
-so far the CD (chip cd) and the interrupt layer (chip irq) in both games.
+so far the CD (chip cd), the interrupt layer (chip irq) and the GPU (chip gpu)
+in both games.
 
 ## What the inputs look like (measured)
 
@@ -392,10 +393,11 @@ expects native, and the build fails if one falls back. `--device
 accesses per chip, and `psxw run --check no-io` requires none.
 
 **Where the boundary sits today.** The device models carry most chips:
-the original code runs over register-level models of the GPU, the SPU,
-SIO0 and the MDEC, and of the DMA controller
-they use. Adapters drive the interrupt controller and the root counters
-(chip irq) and the CD (chip cd: libcd's drive layer over the CD controller's core) in both games. Each move below the API (D40, D42, D45, D47,
+the original code runs over register-level models of the SPU, SIO0 and
+the MDEC, and of the DMA controller they use. Adapters drive the
+interrupt controller and the root counters (chip irq), the GPU (chip gpu)
+and the CD (chip cd: libcd's drive layer over the CD controller's core)
+in both games. Each move below the API (D40, D42, D45, D47,
 D58) bought exactness by construction and independence from the SDK
 version, because the original library decides every value a game can
 observe. Together they made the layer beneath the SDK an emulated device
@@ -465,7 +467,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 |---|---|
 | libapi | `adapter`. Translated; BIOS calls go to the Rust BIOS (D13). Adapters for `pad.o` and `patch.o` (BIOS pad buffers and patches) and `first.o` (`firstfile`, the memory card directory). `counter.o` (`SetRCnt`… program the timers) is `adapter-or-device`, in chip irq. `chclrpad.o` and `padstop.o` touch no hardware and run as guest code. |
 | libetc | `adapter-or-device`, chip irq. Native (btn, bof4): adapters for `intr.o`'s and `vsync.o`'s functions, their state in the runtime, over the interrupt controller, DPCR/DICR, root counter 1 and GPUSTAT, which stay the devices' registers because other libraries use them too ("Time, interrupts and blocking"). On the device: original code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
-| libgpu | `adapter-or-device`, chip gpu. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
+| libgpu | `adapter-or-device`, chip gpu. Native (btn, bof4): adapters for `sys.o`'s functions that reach the GPU (`ResetGraph`, `DrawSync`, `DrawOTag`, `PutDrawEnv`, `PutDispEnv`, the image transfers …), over the front end and DMA2/DMA6, with libgpu's state (`GEnv`, its command queue, its packets) where libgpu keeps it, found through the object's relocated code (D60). The rest of libgpu (the font and kanji functions, `DrawSyncCallback`, `ClearOTag`, `SetDrawEnv`, the primitive helpers) and libgs stay guest code over them. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
 | libcd | `adapter-or-device`, chip cd (D58, D61). Native (btn, bof4): adapters for the drive layer (`bios_1`'s `CD_init`, `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_flush`, `CD_vol`, `CD_initvol`, `CD_datasync`; `CD_getsector`, `CD_getsector2`) and the streaming ring's `StCdInterrupt` and `StUnSetRing`, over the CD controller's core and DMA3, their state in the library's own globals; the public layer (`CdInit`, `CdControl*`, `CdRead*`, `CdSearchFile`, the callbacks and accessors) and the rest of streaming run as original code over them. On the device: original code over the CD controller's registers (D58). |
 | libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's drive layer, adapted or original (D58, D61). |
 | libpress | `adapter-or-device`, chip mdec. On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
@@ -558,7 +560,9 @@ its buffer. `ReturnFromException` leaves from any depth.
 Drawing is synchronous inside the runtime: a GPU DMA completes instantly
 in virtual time, sets DICR and raises IRQ3 (D42). Its completion callback
 still arrives at the next safepoint, through libetc's dispatcher (its
-adapters' or its own), not re-entrantly inside `DrawOTag`. CD timing is a runtime toggle (D19), with
+adapters' or its own), not re-entrantly inside `DrawOTag`. libgpu's DrawSync
+callback is libgpu's own call: it runs inside the call that drained the
+queue, natively as on the device (D60). CD timing is a runtime toggle (D19), with
 a per-game default in `game.toml` (`cd_timing`); the CD controller (D58)
 has it, whether libcd's adapters drive its core or libcd's own code its
 registers (D61):
@@ -2046,6 +2050,53 @@ which made the layer beneath the SDK an emulator, and generalizes D41
 and D58 (libspu's and libcd's adapter-or-device policies) from one
 library to every chip. The device models stay, as the fallback and as
 the oracle. (plans/unified-adaptor-layer)
+
+**D60. An adapter finds its object's data through the object's own code,
+and calls the guest the way that code does** (unified adapter layer, task
+9b). libgpu keeps its state in its own data: `GEnv` (graph type, queue
+switch, VRAM size, the DrawSync callback, the last DRAWENV and DISPENV),
+the command queue, and packets (ClearImage's fill, MoveImage's copy, the
+ordering table's terminator). Code that stays original reads it: the
+draw-area helpers `SetDrawArea` and `SetDrawEnv` call (`sys:0x1650`,
+`sys:0x16e8`, static functions each game names differently), `DrawSyncCallback`, `ClearOTag`, `GetDrawEnv`, the
+font functions. So libgpu's adapters keep that state where libgpu keeps it
+(D59's second option), and need its addresses, which differ per game.
+- **The replaced function's address.** The adapter thunk passes it
+  (`psx.adapter(id, addr, a0..a3)`, ABI 12), and the runtime gives it to
+  the adapter (`Psyq::at`). The object is a validated one, so the
+  function's place in its text is known, and the relocated operands of
+  its code (a `lui`/`lo16` pair, a `jal`) give the object's `.data`,
+  `.bss` and `_que`, and the functions it calls in other libraries
+  (`ResetCallback`, `GetVideoMode`, `DMACallback`). The identity key fixes
+  every other bit of those instructions; an operand that isn't where the
+  object has it is an error. No per-game table.
+- **Nested guest calls.** An adapter can call a guest function and go on
+  with its result (`Flow::Call`), as the original's `jal` does:
+  `ResetGraph` calls `ResetCallback`, `PutDispEnv` `GetVideoMode`, the
+  queue `DMACallback`, and the queue's pump the DrawSync callback, inside
+  the call that drained the queue, with the callback's own address in
+  `a0` as libgpu leaves it. Callbacks and
+  libetc's state land where the original puts them, whichever way chip
+  irq runs. libgpu's pump, which it makes DMA2's callback, is a stand-in
+  function (`libgpu::PUMP`), like libetc's own handlers.
+- **Shared devices stay shared.** The GPU's transfers are DMA2 and DMA6 on
+  the DMA controller, programmed as libgpu programs them and with the
+  controller's semantics (as chip irq uses I_MASK and DICR): DPCR gates
+  them, DICR and IRQ3 reach whatever DMA callbacks are set, a transfer
+  DPCR doesn't enable waits for it, and the GPU recording hook still sees
+  linked lists. GP0/GP1 words go to the front end directly.
+- **Waits spin like libgpu's loops,** a safepoint quantum per thousand
+  iterations, counted toward libgpu's timeout (0xF0000 iterations or 240
+  vblanks), which resets the queue and the GPU as libgpu does: btn's boot
+  draws before `ResetGraph`, with DMA2 off, and times out at the same
+  frame natively as on the device.
+
+*Why:* keeping libgpu's state in the runtime would need an adapter for
+every accessor, and two are static functions the build can't bind by
+name. The identity key makes an object's code operands as fixed as a
+struct layout. Calling the guest where the original does keeps callback
+order, arguments and timing without the gpu adapters knowing how libetc
+runs.
 
 **D61. The CD's seam is libcd's drive layer, its state kept where libcd
 keeps it** (unified adapter layer, phase 1 task 9d). Chip cd's adapters

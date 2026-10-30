@@ -662,7 +662,7 @@ impl sdk_psyq::cases::Harness for ChipSide<'_> {
 
     fn device(&mut self) -> String {
         let (frames, audible, hash) = self.c.audio();
-        format!("render {:016x} audio {frames} frames, {audible} audible, {hash:016x}", self.c.render_hash())
+        format!("render {:016x} display {:016x} audio {frames} frames, {audible} audible, {hash:016x}", self.c.render_hash(), self.c.present_hash())
     }
 
     fn callback(&self) -> Option<(u32, u32)> {

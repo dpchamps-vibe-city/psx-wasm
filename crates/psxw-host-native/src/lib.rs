@@ -720,6 +720,7 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
         let s = c.data_mut();
         s.render.presents += 1;
         s.render.last_present = Some([w[0], w[1], w[2], w[3], w[4]]);
+        s.render.present_hash = w.iter().fold(if s.render.present_hash == 0 { 0xcbf2_9ce4_8422_2325 } else { s.render.present_hash }, |h, w| (h ^ *w as u64).wrapping_mul(0x100_0000_01b3));
         let frame = s.frame + 1;
         let want_vram = s.opts.vram_hash_at.contains(&frame);
         let dump = s.opts.dump_frames.clone().filter(|(_, every)| frame % (*every).max(1) == 0);
@@ -934,6 +935,11 @@ impl Conform {
     /// The renderer commands so far, hashed (see `RenderStats::hash`).
     pub fn render_hash(&self) -> u64 {
         self.store.data().render.hash
+    }
+
+    /// The displays presented so far, hashed (`RenderStats::present_hash`).
+    pub fn present_hash(&self) -> u64 {
+        self.store.data().render.present_hash
     }
 
     /// The audio so far: frames, audible frames, and their hash.
