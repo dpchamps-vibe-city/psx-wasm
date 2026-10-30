@@ -72,6 +72,8 @@ const RECORD_AHEAD = 1 << 20;
 const WINDOW_BASE = 0x01000000;
 const FRAME_LIMIT = "psxw: frame limit";
 const RESYNC_MS = 250;
+// A vblank slower than this is logged with where its time went.
+const SLOW_MS = 33;
 
 // The running game's queued calls and script mods, for the page's messages.
 let session = null;
@@ -272,6 +274,20 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const ringSamples = audioRing ? new Int16Array(audioRing, 8) : null;
   const frameTimes = [];
   let lastVblank = 0;
+  // Where a vblank's wall time went: the host's calls by kind (ms, and
+  // how many), the rest being the game and the runtime. A vblank that
+  // takes more than SLOW_MS is logged with it; the slowest go in the
+  // run's report. The audio ring's cushion (audio.js) covers about 46 ms.
+  const spent = { render: 0, renders: 0, readback: 0, shadow: 0, present: 0, disc: 0, sectors: 0, turn: 0 };
+  const slowest = [];
+  const timed = (kind, f) => {
+    const t = performance.now();
+    try {
+      return f();
+    } finally {
+      spent[kind] += performance.now() - t;
+    }
+  };
 
   let exports = null;
   let windowBase = WINDOW_BASE;
@@ -329,7 +345,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   };
   const vblank = (f) => {
     frame = Number(f);
-    if (frame % 60 === 0 && !lost) shadow = renderer.vram();
+    if (frame % 60 === 0 && !lost) shadow = timed("shadow", () => renderer.vram());
     if (hashAt.has(frame)) {
       ramHashes[frame] = (exports.psxw_ram_hash() & 0xffffffffffffffffn).toString(16).padStart(16, "0");
       vramHashes[frame] = renderer.vram_hash();
@@ -382,7 +398,22 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const pace = (f) => {
     const n = Number(f);
     const now = performance.now();
-    if (lastVblank) frameTimes.push(now - lastVblank);
+    if (lastVblank) {
+      const ms = now - lastVblank;
+      frameTimes.push(ms);
+      if (ms > period) {
+        const r = (v) => Math.round(v * 10) / 10;
+        const s = { frame: n, ms: r(ms), render: r(spent.render), submits: spent.renders, readback: r(spent.readback), shadow: r(spent.shadow), present: r(spent.present), disc: r(spent.disc), sectors: spent.sectors, turn: r(spent.turn) };
+        slowest.push(s);
+        slowest.sort((a, b) => b.ms - a.ms);
+        slowest.length = Math.min(slowest.length, 20);
+        if (ms > SLOW_MS) {
+          const game = r(ms - spent.render - spent.readback - spent.shadow - spent.present - spent.disc - spent.turn);
+          logLine(2, `slow vblank: ${s.ms} ms (render ${s.render} ms in ${s.submits} submits, readback ${s.readback}, VRAM backup ${s.shadow}, present ${s.present}, disc ${s.disc} ms for ${s.sectors} sectors, event loop ${s.turn}, the rest ${game} ms)`);
+        }
+      }
+    }
+    for (const k of Object.keys(spent)) spent[k] = 0;
     if (!options.verify) {
       const wait = origin + n * period - now;
       if (wait > 0) Atomics.wait(sleeper, 0, 0, wait);
@@ -401,7 +432,9 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
             scriptingReady = true;
             postMessage({ type: "scripting-ready" });
           }
+          const t = performance.now();
           await nextTask();
+          spent.turn += performance.now() - t;
           pace(f);
         })
       : pace,
@@ -416,14 +449,17 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       return 1;
     },
     disc_read(lba, count, mode, dst) {
-      let at = dst >>> 0;
-      for (let i = 0; i < count; i++) {
-        if (!disc.readRaw(lba + i, raw)) return -1;
-        const src = mode === 0 ? raw : userData(raw);
-        bytes(at, src.length).set(src);
-        at += src.length;
-      }
-      return 0;
+      spent.sectors += count;
+      return timed("disc", () => {
+        let at = dst >>> 0;
+        for (let i = 0; i < count; i++) {
+          if (!disc.readRaw(lba + i, raw)) return -1;
+          const src = mode === 0 ? raw : userData(raw);
+          bytes(at, src.length).set(src);
+          at += src.length;
+        }
+        return 0;
+      });
     },
     pad_state(port, out) {
       let buttons;
@@ -469,22 +505,26 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       if (event.event === "report") events.push(event);
     },
     render_submit(p, len) {
-      if (!lost) renderer.submit(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + len)));
+      if (lost) return;
+      spent.renders++;
+      timed("render", () => renderer.submit(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + len))));
     },
     render_readback(x, y, w, h, dst) {
       if (lost) return; // the game reads whatever its buffer held
-      const px = renderer.readback(x, y, w, h);
+      const px = timed("readback", () => renderer.readback(x, y, w, h));
       bytes(dst, px.byteLength).set(new Uint8Array(px.buffer, px.byteOffset, px.byteLength));
     },
     present(p) {
       if (lost) return;
-      renderer.present(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20)));
-      // A page that falls behind misses frames rather than queueing them.
-      if (framesPosted - Atomics.load(pad, 4) < 2) {
-        const bitmap = canvas.transferToImageBitmap();
-        framesPosted++;
-        postMessage({ type: "frame", frame, bitmap }, [bitmap]);
-      }
+      timed("present", () => {
+        renderer.present(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20)));
+        // A page that falls behind misses frames rather than queueing them.
+        if (framesPosted - Atomics.load(pad, 4) < 2) {
+          const bitmap = canvas.transferToImageBitmap();
+          framesPosted++;
+          postMessage({ type: "frame", frame, bitmap }, [bitmap]);
+        }
+      });
     },
     // Recording (ABI 6) is the native host's; the browser never asks.
     gpu_record_begin() {
@@ -633,6 +673,6 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const frameMs = { p50: pct(50), p95: pct(95), p99: pct(99), max: pct(100) };
   const audio = { frames: audioFrames, hash: audioHash.hex() };
   const tests = { watched: options.watch ? watched : undefined, logs: logs || undefined, events };
-  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs, audio, yields: suspend, stop: reason, ...tests });
+  postMessage({ type: "hashes", ram: ramHashes, vram: vramHashes, frames: frame, seconds, lagFrames, frameMs, slowest, audio, yields: suspend, stop: reason, ...tests });
   postMessage({ type: "stopped", reason, frame });
 }

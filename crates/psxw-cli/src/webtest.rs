@@ -612,7 +612,7 @@ fn pacing(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
             "{b}: {} frames in {wall:.3} s, drift {drift:+.2} frames, {} late; frame ms {}",
             reached, r["lagFrames"], r["frameMs"]
         );
-        report.push(serde_json::json!({ "browser": b, "frames": reached, "seconds": wall, "drift": drift, "late": r["lagFrames"], "frame_ms": r["frameMs"], "within_one_frame": ok }));
+        report.push(serde_json::json!({ "browser": b, "frames": reached, "seconds": wall, "drift": drift, "late": r["lagFrames"], "frame_ms": r["frameMs"], "slowest": r["slowest"], "within_one_frame": ok }));
     }
     let path = ws.out_dir().join("web").join(format!("pacing-{game}{tag}.json"));
     std::fs::write(
