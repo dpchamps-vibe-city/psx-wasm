@@ -932,6 +932,12 @@ impl Conform {
         Ok(report["counts"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect()).unwrap_or_default())
     }
 
+    /// The pad input from here on: another replay (its header says which
+    /// ports are plugged), read at the same frames.
+    pub fn set_replay(&mut self, replay: Vec<u8>) {
+        self.store.data_mut().opts.replay = Some(replay);
+    }
+
     /// The renderer commands so far, hashed (see `RenderStats::hash`).
     pub fn render_hash(&self) -> u64 {
         self.store.data().render.hash

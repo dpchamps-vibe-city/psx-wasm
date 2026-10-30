@@ -20,6 +20,7 @@
 mod cd;
 mod gpu;
 mod irq;
+mod sio0;
 
 /// What a case runs against: one game's build, one side.
 pub trait Harness {
@@ -50,6 +51,11 @@ pub trait Harness {
     /// one to the SDK as a callback.
     fn addr(&self, _name: &str) -> Option<u32> {
         None
+    }
+    /// Plug a pad into port 2, or pull it, from the next vblank on (both
+    /// sides start with two pads, port 1's buttons scripted).
+    fn plug_port2(&mut self, _plugged: bool) -> Result<(), String> {
+        Err("this harness can't change the pads".into())
     }
 }
 
@@ -106,6 +112,7 @@ pub fn observe_ram(h: &mut dyn Harness, what: &str, addr: u32, len: usize) {
 pub fn all() -> Vec<Case> {
     let mut v = Vec::new();
     v.extend(irq::cases());
+    v.extend(sio0::cases());
     v.extend(gpu::cases());
     v.extend(cd::cases());
     v

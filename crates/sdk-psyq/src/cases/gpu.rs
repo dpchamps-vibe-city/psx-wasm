@@ -1,4 +1,4 @@
-//! Chip gpu's cases: libgpu's `sys.o` (D59, D60; phase 1 task 9b).
+//! Chip gpu's cases: libgpu's `sys.o` (D59, D61; phase 1 task 9b).
 //!
 //! Observation notes, beyond the module's specs:
 //! - **The device effect** is the renderer's command stream and the

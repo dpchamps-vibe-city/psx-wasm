@@ -406,29 +406,38 @@ type Done = fn(&mut M, Bios1) -> Option<u32>;
 /// until `done` gives the result, or with `once` after one look (0). A
 /// thousand passes per safepoint quantum, interrupts taken between quanta;
 /// inside a callback each quantum polls the controller instead. After
-/// [`TIMEOUT_PASSES`]: "CD timeout", `CD_flush`, -1.
+/// [`TIMEOUT_PASSES`]: "CD timeout", `CD_flush`, -1. A wait that spun
+/// leaves the guest's safepoint budget as the loop's last safepoint did:
+/// full (D60).
 fn wait(m: &mut M, b: Bios1, what: &'static str, once: bool, done: Done, then: Then) -> Flow<Psyq> {
     let deadline = m.clock.now + (TIMEOUT_PASSES + 1) * quantum(m) / LOOP_BUDGET;
-    pass(m, b, what, once, deadline, done, then)
+    pass(m, b, what, once, deadline, false, done, then)
 }
 
-fn pass(m: &mut M, b: Bios1, what: &'static str, once: bool, deadline: u64, done: Done, then: Then) -> Flow<Psyq> {
+#[allow(clippy::too_many_arguments)]
+fn pass(m: &mut M, b: Bios1, what: &'static str, once: bool, deadline: u64, spun: bool, done: Done, then: Then) -> Flow<Psyq> {
+    let end = move |m: &mut M, v: u32, then: Then| {
+        if spun {
+            m.regs.reset_budget();
+        }
+        then(m, v)
+    };
     if m.clock.now >= deadline {
         let com = m.mem.r8(b.data + d::COM);
         m.log(&format!("CD timeout: {what}: com={com} sync={} ready={}", b.intr(m, 0), b.intr(m, 1)));
         flush(m, b);
-        return then(m, u32::MAX);
+        return end(m, u32::MAX, then);
     }
     let rest: Next = Box::new(move |m: &mut M| {
         if let Some(v) = done(m, b) {
-            return then(m, v);
+            return end(m, v, then);
         }
         if once {
-            return then(m, 0);
+            return end(m, 0, then);
         }
         let until = m.clock.now + quantum(m);
         m.run_until(until);
-        Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, what, once, deadline, done, then)) }
+        Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, what, once, deadline, true, done, then)) }
     });
     // In a callback (libetc's dispatcher, or any exception) no interrupt
     // is taken: the loop polls the controller itself.

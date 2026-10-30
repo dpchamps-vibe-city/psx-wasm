@@ -32,10 +32,10 @@ manifest, without changes to the toolchain's code.
 | R3000 CPU | **Gone.** clang compiles the game and SDK C to wasm. Any residual asm is translated ahead of time (the lift tier). Nothing decodes MIPS at run time. |
 | Memory map | **Kept.** RAM, the scratchpad, and every symbol sit at their original addresses inside a wasm memory window, and pointer values are the PSX's own. This is a choice of data layout, not hardware emulation. |
 | GTE | **Modelled.** A fixed-point library (`psx-gte`) holding the GTE's register file, which COP2 instructions and the `gte_*` macros drive. |
-| GPU | **Native, per chip** (D59, D60). libgpu's `sys.o` adapters (btn, bof4) give the GPU front end (`psx-devices::gpu`) its GP0/GP1 words and run its transfers on the DMA controller the other chips share; libgpu's state stays in guest RAM, where the library's code that stays original reads it. As the fallback, libgpu is original code over the front end, which answers GPUSTAT/GPUREAD, fed by the DMA controller (D42). The front end decodes packets into renderer commands; the host's WebGL2 backend draws them into a VRAM model. |
+| GPU | **Native, per chip** (D59, D61). libgpu's `sys.o` adapters (btn, bof4) give the GPU front end (`psx-devices::gpu`) its GP0/GP1 words and run its transfers on the DMA controller the other chips share; libgpu's state stays in guest RAM, where the library's code that stays original reads it. As the fallback, libgpu is original code over the front end, which answers GPUSTAT/GPUREAD, fed by the DMA controller (D42). The front end decodes packets into renderer commands; the host's WebGL2 backend draws them into a VRAM model. |
 | SPU | **Register level.** libspu and libsnd are original code over `psx-spu`: 24 ADPCM voices with reverb, on their own 44.1 kHz clock (D47). |
 | CD-ROM | **Native, per chip** (D59, D62). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). libpress is original code over the MDEC (`psx-devices::mdec`). |
-| Pad | **Register level.** libpad is original code over SIO0 (`psx-devices::sio`, D40). |
+| Pad | **Native** (D59, D60). libpad's adapters run its direct-connection engine (btn and bof4): at each vblank interrupt, one exchange per port with a digital-pad model fed by the host's buttons, the detection steps and the buffers as libpad's own state machine makes them, and the time its busy-waits take. As the fallback, libpad is original code over SIO0 (`psx-devices::sio`, D40). |
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
 | BIOS/kernel | A Rust implementation of the A0/B0/C0 services the SDK calls, including threads (D57) and the memory card functions (D43). |
 
@@ -51,8 +51,8 @@ remain where a library's policy keeps them (§5).
 D59 moves each chip back to native adapters, degrading to its device
 model where the adapters don't cover a game
 ([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):
-so far the CD (chip cd), the interrupt layer (chip irq) and the GPU (chip gpu)
-in both games.
+so far the CD (chip cd), the interrupt layer (chip irq), the GPU (chip
+gpu) and the pads (chip sio0) in both games.
 
 ## What the inputs look like (measured)
 
@@ -393,11 +393,11 @@ expects native, and the build fails if one falls back. `--device
 accesses per chip, and `psxw run --check no-io` requires none.
 
 **Where the boundary sits today.** The device models carry most chips:
-the original code runs over register-level models of the SPU, SIO0 and
-the MDEC, and of the DMA controller they use. Adapters drive the
-interrupt controller and the root counters (chip irq), the GPU (chip gpu)
-and the CD (chip cd: libcd's drive layer over the CD controller's core)
-in both games. Each move below the API (D40, D42, D45, D47,
+the original code runs over register-level models of the SPU and the
+MDEC, and of the DMA controller they use. Adapters drive the interrupt
+controller and the root counters (chip irq), the GPU (chip gpu), the pads
+(chip sio0) and the CD (chip cd: libcd's drive layer over the CD
+controller's core) in both games. Each move below the API (D40, D42, D45, D47,
 D58) bought exactness by construction and independence from the SDK
 version, because the original library decides every value a game can
 observe. Together they made the layer beneath the SDK an emulated device
@@ -467,13 +467,13 @@ The PsyQ policy (`boundary/psyq.toml`):
 |---|---|
 | libapi | `adapter`. Translated; BIOS calls go to the Rust BIOS (D13). Adapters for `pad.o` and `patch.o` (BIOS pad buffers and patches) and `first.o` (`firstfile`, the memory card directory). `counter.o` (`SetRCnt`… program the timers) is `adapter-or-device`, in chip irq. `chclrpad.o` and `padstop.o` touch no hardware and run as guest code. |
 | libetc | `adapter-or-device`, chip irq. Native (btn, bof4): adapters for `intr.o`'s and `vsync.o`'s functions, their state in the runtime, over the interrupt controller, DPCR/DICR, root counter 1 and GPUSTAT, which stay the devices' registers because other libraries use them too ("Time, interrupts and blocking"). On the device: original code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
-| libgpu | `adapter-or-device`, chip gpu. Native (btn, bof4): adapters for `sys.o`'s functions that reach the GPU (`ResetGraph`, `DrawSync`, `DrawOTag`, `PutDrawEnv`, `PutDispEnv`, the image transfers …), over the front end and DMA2/DMA6, with libgpu's state (`GEnv`, its command queue, its packets) where libgpu keeps it, found through the object's relocated code (D60). The rest of libgpu (the font and kanji functions, `DrawSyncCallback`, `ClearOTag`, `SetDrawEnv`, the primitive helpers) and libgs stay guest code over them. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
+| libgpu | `adapter-or-device`, chip gpu. Native (btn, bof4): adapters for `sys.o`'s functions that reach the GPU (`ResetGraph`, `DrawSync`, `DrawOTag`, `PutDrawEnv`, `PutDispEnv`, the image transfers …), over the front end and DMA2/DMA6, with libgpu's state (`GEnv`, its command queue, its packets) where libgpu keeps it, found through the object's relocated code (D61). The rest of libgpu (the font and kanji functions, `DrawSyncCallback`, `ClearOTag`, `SetDrawEnv`, the primitive helpers) and libgs stay guest code over them. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
 | libcd | `adapter-or-device`, chip cd (D58, D62). Native (btn, bof4): adapters for the drive layer (`bios_1`'s `CD_init`, `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_flush`, `CD_vol`, `CD_initvol`, `CD_datasync`; `CD_getsector`, `CD_getsector2`) and the streaming ring's `StCdInterrupt` and `StUnSetRing`, over the CD controller's core and DMA3, their state in the library's own globals; the public layer (`CdInit`, `CdControl*`, `CdRead*`, `CdSearchFile`, the callbacks and accessors) and the rest of streaming run as original code over them. On the device: original code over the CD controller's registers (D58). |
 | libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's drive layer, adapted or original (D58, D62). |
 | libpress | `adapter-or-device`, chip mdec. On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
 | libspu | `adapter-or-device`, chip spu. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
 | libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 volume registers); on the device those writes reach the SPU (D47). |
-| libpad | `adapter-or-device`, chip sio0. On the device: original code over SIO0 (D40). Its state machine is the behaviour games observe, and the device is a port of the oracle's. |
+| libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), their state in the runtime, the games' buffers in guest RAM; `PadStartCom` installs a `SysEnqIntRP` element the kernel runs as an adapter step. On the device: original code over SIO0 (D40), a port of the oracle's. |
 | libmcrd | `guest`, over the HLE BIOS card functions (D43). |
 | libcard | `adapter`. Its `_patch_card` patches Sony BIOS code in kernel RAM (D43). |
 | libmcx | `adapter`. |
@@ -518,9 +518,14 @@ Game-visible time is **virtual and deterministic**:
   due and then running the handlers, as at the loop's safepoints. When
   interrupts are taken is observable: taken at once, bof4's CD streaming
   goes another way (plans/unified-adaptor-layer, phase 1 findings).
-  libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin the same way (D62);
-  inside a callback, where no interrupt is taken, they poll the CD
-  controller as the original does.
+  So is how long a handler spins, and where it leaves the guest's
+  safepoint budget: libpad's adapters spend the quanta its SIO0 and root
+  counter waits take in the vblank interrupt (nothing delivered
+  meanwhile), then start the budget over as the original's last
+  safepoint did (`Regs::reset_budget`, psxw-abi `guest::BUDGET_RESET`;
+  D60). libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin as `VSync`'s
+  do (D62); inside a callback, where no interrupt is taken, they poll the
+  CD controller as the original does.
 - **Blocking runtime calls jump.** A runtime call that must wait (the
   BIOS's `WaitEvent`) advances time event by event until it is satisfied.
 - **Asynchronous events.** CD sector delivery, DMA completion, root counter
@@ -549,6 +554,10 @@ its buffer. `ReturnFromException` leaves from any depth.
   controller and root counters stay the devices' registers, which the
   adapters change with the devices' own semantics; the emulated chips'
   devices raise their interrupts there as before.
+- **Elements the adapters own** (`Sdk::chain_element`, D60): libpad's
+  `PadStartCom` queues an element at an address no game code has, and the
+  kernel's walk runs it as an adapter step in its place in the chain
+  (libpad's vblank poll, when vblank is unmasked and pending).
 - **Translated code follows this** through wasm exceptions:
   - a `setjmp` (A0h:13h) caller saves its registers inline;
   - the return address is a continuation entry that reloads them;
@@ -562,7 +571,7 @@ in virtual time, sets DICR and raises IRQ3 (D42). Its completion callback
 still arrives at the next safepoint, through libetc's dispatcher (its
 adapters' or its own), not re-entrantly inside `DrawOTag`. libgpu's DrawSync
 callback is libgpu's own call: it runs inside the call that drained the
-queue, natively as on the device (D60). CD timing is a runtime toggle (D19), with
+queue, natively as on the device (D61). CD timing is a runtime toggle (D19), with
 a per-game default in `game.toml` (`cd_timing`); the CD controller (D58)
 has it, whether libcd's adapters drive its core or libcd's own code its
 registers (D62):
@@ -794,7 +803,8 @@ a call into guest code.
   in virtual time (D58).
 - **sio.** SIO0 at register level (1F801040h-1F80104Eh, IRQ7), a
   bit-level port of the oracle's FrontIO and digital pad, so libpad's own
-  state machine sees the timing it sees on the oracle (D40). Memory cards
+  state machine sees the timing it sees on the oracle (D40): chip sio0's
+  fallback, and the oracle for libpad's adapters (D60). Memory cards
   are raw 128 KiB `.mcr` images in host storage, read and written through
   the BIOS card functions (D43).
 - **SDK adapters.** The thin, object-keyed layer from §5.
@@ -1011,7 +1021,7 @@ emulators now, a real console when one is available.
 | CD timing | Device target: measured envelope; ours must fall inside it | Hardware only. Emulators approximate drive timing |
 | MDEC | Device target (`mdec_run`: decoded output at every depth) | Provisional |
 | Memory card | Exact by construction (format checksums; the game accepts its own saves) | Verified |
-| Pad | Exact report formats; the original libpad over SIO0, a port of the oracle's (D40) | Verified |
+| Pad | Exact report formats; the original libpad over SIO0, a port of the oracle's (D40); libpad's adapters against it (D60) | Verified |
 | BIOS | Device target running BIOS calls (`bios_threads` for threads); a legitimately dumped BIOS image can also be translated and run as the oracle | Provisional |
 
 Byte-exact GPU verdicts at 1× require exact rasterization in the WebGL2
@@ -2051,7 +2061,44 @@ and D58 (libspu's and libcd's adapter-or-device policies) from one
 library to every chip. The device models stay, as the fallback and as
 the oracle. (plans/unified-adaptor-layer)
 
-**D60. An adapter finds its object's data through the object's own code,
+**D60. libpad's adapters run libpad's engine, including its time**
+(unified adapter layer, phase 1 task 9c). D40 kept libpad original
+because games observe its state machine. Chip sio0's adapters reproduce
+that machine instead of approximating it:
+- **The seam** is the calls games make (`PadInitDirect`, `PadStartCom`,
+  `PadGetState`, `PadInfoMode`, `PadSetAct`, `PadSetActAlign`) plus
+  `PadStopCom`, which shares `PadStartCom`'s element. Their state (the
+  port records, receive buffers, pending replies) is in the runtime; the
+  games' buffers are guest RAM, written as the original writes them.
+- **The engine** is libpad's direct-connection code, from the 4.7
+  objects: per vblank, each port's pending reply processed, then an
+  exchange whose bytes a digital-pad model answers (SIO0's device model
+  is a digital pad too). Replies land a port late, detection asks for
+  config mode twelve times, failures count, as on the original.
+- **The interrupt is a kernel chain element the adapters own**
+  (`Sdk::chain_element`): `PadStartCom` queues an address no game code
+  has at priority 2, and the kernel runs it in its place in the chain.
+  The pads latch their buttons at the vblank, as SIO0's do.
+- **Its busy-waits take their time.** Each of the original's waits on
+  SIO0 or root counter 2 ends at the next safepoint, a quantum later,
+  inside the interrupt: half a frame with two pads, where hardware takes
+  about 20,000 cycles. The adapters spend the same quanta, delivering
+  nothing, and then start the guest's safepoint budget over as the
+  original's last safepoint does (psxw-abi `guest::BUDGET_RESET`).
+
+*Why:* conformance against the device is exact on every observation,
+per vblank (buffers, states, types, failure counts, where the game
+resumes in the frame). bof4's `title-to-field` showed the time is
+observable: with no time spent its counter fell 322 frames behind and
+two expects failed; with the time but the budget left as it was, the
+game took another path from frame 110 (its main loop does up to a
+quantum's iterations less a frame); with both, btn's and bof4's replays
+match the device frame for frame. The same rule as D59's for `VSync`:
+an adapter that replaces a busy-wait waits the way it does. The device
+models only a digital pad, so the extended commands (analog modes,
+actuators) stay unexercised on both sides.
+
+**D61. An adapter finds its object's data through the object's own code,
 and calls the guest the way that code does** (unified adapter layer, task
 9b). libgpu keeps its state in its own data: `GEnv` (graph type, queue
 switch, VRAM size, the DrawSync callback, the last DRAWENV and DISPENV),

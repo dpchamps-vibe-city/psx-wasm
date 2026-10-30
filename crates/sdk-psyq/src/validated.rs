@@ -34,4 +34,14 @@ pub const VALIDATED: &[(&str, &str)] = &[
     ("libmcx/mcxcmd24", "9926ec52d6649a8cebb51eaca0bad13eb020056a15b5bdf8b8e5b989a2c16f02"),
     ("libmcx/mcxinit", "207348a4d4a238743aeaa735bfdac5f1d7899a7c87d4c6039159e40685919d65"),
     ("libmcx/mcxmain", "0613d35f2626d3c3fd435be6119f3483c4cf1aa6035b98b1c130317047025d55"),
+    // libpad's calls, and the vblank engine behind them (pddirres,
+    // pdresres), which the adapters reproduce.
+    ("libpad/pdcmd1", "65c474183d32625a87f9200f812955e6e5a2a9fcf54a333891e7bcf07cfa3232"),
+    ("libpad/pdcmd2", "ec5a41120721b65782d3d4141e202e6a017c21a1fd1a238b4bcdc23c7fb423a9"),
+    ("libpad/pddirini", "02dbfaddb39ba68986c0288ad97accced6cc0abb01bcd3e0f716afe3ef781b37"),
+    ("libpad/pddirres", "94965b212e2647077d77c7b94572f65be8ac996e72d5e91a3c25b286293cdd1b"),
+    ("libpad/pdent2", "657636a8ac63dd77546bcc1a6a091be2ae72e720306aeacbf42fdc7988f35e0a"),
+    ("libpad/pdent3", "7d2897d55e85c6baa151a0c941b652c08c249d884715441d3e6a6de54d9c1c25"),
+    ("libpad/pdmaiini", "e18ba4711badfc36e67e6915d33234c40e111f65113f360848256adeb65bf86d"),
+    ("libpad/pdresres", "f513971cf3615a3314cdba2bd6b63e7640e1bbe0c5316786d64174ba65c1da29"),
 ];

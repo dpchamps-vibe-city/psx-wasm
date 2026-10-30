@@ -50,7 +50,7 @@ pub mod replay;
 ///   instrumented when the game switches threads and stubs otherwise; the
 ///   BIOS keeps the kernel's thread tables in guest RAM ([`kernel`]).
 /// - 12: an adapter call carries the replaced function's guest address
-///   ([`psx::ADAPTER`], D60).
+///   ([`psx::ADAPTER`], D61).
 pub const ABI_VERSION: u32 = 12;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
@@ -212,7 +212,7 @@ pub mod psx {
     /// `(id, addr, a0, a1, a2, a3) -> i64`: an SDK function the build
     /// replaced with runtime adapter `id`, at guest address `addr`. The
     /// adapter finds its object's data through the relocated operands of
-    /// the original code there (D60).
+    /// the original code there (D61).
     pub const ADAPTER: &str = "adapter";
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
@@ -247,6 +247,10 @@ pub mod guest {
     /// [`super::DEBUG_WINDOW_BASE`]). Hosts read it from the module's
     /// exports; a module without it has the default.
     pub const WINDOW: &str = "guest_window";
+    /// `() -> ()`: the safepoint budget starts over, as at a safepoint. For
+    /// adapters that replace a busy-wait (D59, D60): the guest resumes
+    /// with the budget the original's last safepoint would have left it.
+    pub const BUDGET_RESET: &str = "guest_budget_reset";
     /// binaryen Asyncify's control functions (D57): `(data_ptr) -> ()`
     /// start an unwind or a rewind over the data structure at `data_ptr`
     /// (current position, end, then the saved frames); `() -> ()` stop

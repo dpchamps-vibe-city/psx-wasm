@@ -1,4 +1,4 @@
-//! libgpu (chip gpu, D59, D60): `libgpu/sys`'s functions that reach the
+//! libgpu (chip gpu, D59, D61): `libgpu/sys`'s functions that reach the
 //! GPU, as adapters over the GPU core and the DMA controller.
 //!
 //! **libgpu's state stays where libgpu keeps it** (D59's second option):
@@ -14,7 +14,7 @@
 //! `DrawSync`, and libgs.
 //!
 //! **Where that state is.** An adapter learns the guest address of the
-//! function it replaces (`Psyq::at`, D60). The object is the validated
+//! function it replaces (`Psyq::at`, D61). The object is the validated
 //! PsyQ 4.7 `libgpu/sys`, so each adapted function's place in its text is
 //! known, and the relocated operands of its code (a `lui`/`lo16` pair, a
 //! `jal`) give the addresses of its `.data`, `.bss`, `_que` and the

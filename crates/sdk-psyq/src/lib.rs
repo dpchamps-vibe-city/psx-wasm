@@ -8,8 +8,9 @@
 //! psyq-decomp records it.
 //!
 //! Scope: libetc's interrupt layer and libapi's `counter.o` (chip irq),
-//! libgpu's `sys.o` (chip gpu), libapi's `pad.o`/`patch.o`/`first.o`,
-//! libcd's drive layer and the streaming ring's interrupt (chip cd), and
+//! libgpu's `sys.o` (chip gpu), libpad's direct connection (chip sio0),
+//! libapi's `pad.o`/`patch.o`/`first.o`, libcd's drive layer and the
+//! streaming ring's interrupt (chip cd), and
 //! libcard/libmcx's thin BIOS wrappers.
 //!
 //! A chip whose adapters don't cover a game runs its libraries as the
@@ -22,6 +23,7 @@ pub mod libcd;
 pub mod libetc;
 pub mod libgpu;
 pub mod libmc;
+pub mod libpad;
 pub mod layout;
 pub mod validated;
 
@@ -46,9 +48,10 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 /// Libraries that run as original code, their I/O-window accesses reaching
 /// the runtime's register-level devices (`psx_bios::io`), instead of
 /// being replaced.
-/// - libpad (D40): its observable state (PadGetState's sequence, buffer
-///   bytes, return values) is its own state machine over a few SIO0 bytes
-///   per frame; the device is a port of the oracle's.
+/// - libpad (D40), when chip sio0 is emulated: its observable state
+///   (PadGetState's sequence, buffer bytes, return values) is its own
+///   state machine over a few SIO0 bytes per frame; the device is a port
+///   of the oracle's.
 /// - libgpu (D42), when chip gpu is emulated: the GPU front end takes
 ///   GP0/GP1 words, so libgpu's own code drives it through the ports and
 ///   DMA; an ordering table is one DMA linked-list walk in Rust.
@@ -73,9 +76,10 @@ pub struct Psyq {
     pub cd: libcd::Cd,
     pub mc: libmc::Mc,
     pub etc: libetc::Etc,
+    pub pad: libpad::Pad,
     pub gpu: libgpu::Gpu,
     /// The guest address of the SDK function the running adapter replaces
-    /// (D60): the runtime sets it before each call.
+    /// (D61): the runtime sets it before each call.
     pub at: u32,
 }
 
@@ -90,15 +94,25 @@ impl Sdk for Psyq {
 
     /// Vblank and DMA completion reach the guest as interrupts: through
     /// libetc's adapters' dispatcher ([`libetc`]) when chip irq is native,
-    /// through libetc's own when it is emulated (D45).
-    fn on_vblank(_m: &mut M) {}
+    /// through libetc's own when it is emulated (D45). The pads latch their
+    /// buttons ([`libpad`]).
+    fn on_vblank(m: &mut M) {
+        libpad::on_vblank(m);
+    }
 
     fn irq_dispatch(m: &M) -> Option<u32> {
         libetc::dispatch_step(m)
     }
 
     fn irq_step(m: &mut M, step: u32) {
+        if step == libpad::STEP {
+            return libpad::irq_step(m, step);
+        }
         libetc::irq_step(m, step)
+    }
+
+    fn chain_element(_m: &M, elem: u32) -> Option<u32> {
+        (elem == libpad::ELEMENT).then_some(libpad::STEP)
     }
 
     fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
@@ -121,6 +135,7 @@ pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&'static str, &'static str)> = Vec::new();
     v.extend(libapi::COUNTERS.iter().map(|n| (*n, "irq")));
     v.extend(libetc::ADAPTERS.iter().map(|(n, _)| (*n, "irq")));
+    v.extend(libpad::ADAPTERS.iter().map(|(n, _)| (*n, "sio0")));
     v.extend(libgpu::ADAPTERS.iter().map(|(n, _)| (*n, "gpu")));
     v.extend(libcd::ADAPTERS.iter().map(|(n, _)| (*n, "cd")));
     v
@@ -131,6 +146,7 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     let mut v: Vec<(&'static str, Adapter)> = Vec::new();
     v.extend(libapi::ADAPTERS);
     v.extend(libetc::ADAPTERS);
+    v.extend(libpad::ADAPTERS);
     v.extend(libgpu::ADAPTERS);
     v.extend(libcd::ADAPTERS);
     v.extend(libmc::ADAPTERS);

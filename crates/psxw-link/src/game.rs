@@ -178,7 +178,7 @@ enum Synth {
     /// o32 wrapper around a C function.
     O32Wrap { input: usize, func: u32 },
     /// Runtime adapter `id` in place of the function at guest address
-    /// `addr` (D60: the adapter reads its object's relocated operands there).
+    /// `addr` (D61: the adapter reads its object's relocated operands there).
     AdapterThunk { id: u32, addr: u32 },
     /// Dispatch on the code resident at an address shared by overlays.
     OverlayStub(u32),
@@ -199,6 +199,8 @@ enum Synth {
     GpSet,
     /// `guest.guest_window`: the window's wasm address.
     Window,
+    /// `guest.guest_budget_reset()`: the safepoint budget starts over.
+    BudgetReset,
     /// Asyncify's control function `name` for a guest that never switches
     /// threads (D57): the state is always normal, and the rest trap.
     AsyncifyStub(&'static str),
@@ -948,6 +950,13 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             f.instruction(&I::End);
             (FuncType { params: vec![], results: vec![V::I32] }, f, "guest_window".into())
         }
+        Synth::BudgetReset => {
+            let mut f = Function::new([]);
+            f.instruction(&I::I32Const(ctx.spec.budget as i32));
+            f.instruction(&I::GlobalSet(ctx.budget));
+            f.instruction(&I::End);
+            (FuncType { params: vec![], results: vec![] }, f, guest::BUDGET_RESET.into())
+        }
         Synth::AsyncifyStub(name) => {
             let mut f = Function::new([]);
             let name: &'static str = name;
@@ -1662,6 +1671,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         ("guest_gp_get", ctx.synth(Synth::GpGet)),
         ("guest_gp_set", ctx.synth(Synth::GpSet)),
         (guest::WINDOW, ctx.synth(Synth::Window)),
+        (guest::BUDGET_RESET, ctx.synth(Synth::BudgetReset)),
     ];
     // Asyncify adds the real ones after the link when the game switches
     // threads (D57).
