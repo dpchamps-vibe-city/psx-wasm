@@ -78,6 +78,16 @@ pub trait Regs {
     /// (psxw-abi `guest::BUDGET_RESET`): an adapter that replaces a
     /// busy-wait leaves it as the wait's last safepoint would.
     fn reset_budget(&mut self) {}
+    /// The guest's safepoint budget: loop-header passes left before its
+    /// next safepoint (psxw-abi `guest::BUDGET_GET`), 1 to the link's
+    /// budget; 0 where there is no guest to ask. An adapter that replaces
+    /// code with loops spends what the original's loops would
+    /// (`set_budget`, psxw-abi `guest::BUDGET_SET`), with a safepoint each
+    /// time it runs out.
+    fn budget(&self) -> u32 {
+        0
+    }
+    fn set_budget(&mut self, _v: u32) {}
 }
 
 /// A guest function to call with o32 arguments.
@@ -228,6 +238,11 @@ pub struct Machine<S> {
     /// does: the kernel takes it at the guest's next safepoint, once the
     /// adapter's call has returned ([`Self::release_irq`], D64).
     pub held_irq: bool,
+    /// The running adapter returns as the code it replaces does, with no
+    /// runtime call there, so its return is no safepoint: what is pending
+    /// waits for the guest's next one (D63). The driver takes it at the
+    /// adapter's return.
+    pub quiet: bool,
     pub sdk: S,
     /// Calls per BIOS function and adapter, for the run report.
     pub counts: BTreeMap<String, u64>,
@@ -263,6 +278,7 @@ impl<S: Sdk> Machine<S> {
             crit: false,
             in_irq: false,
             held_irq: false,
+            quiet: false,
             sdk,
             counts: BTreeMap::new(),
             loaded: Vec::new(),

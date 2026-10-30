@@ -100,7 +100,11 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
     loop {
         match flow {
             Flow::Return(v) => {
-                drain(rt, inv);
+                // An adapter whose original makes no runtime call here
+                // returns without a safepoint (`Machine::quiet`, D63).
+                if !std::mem::take(&mut rt.borrow_mut().quiet) {
+                    drain(rt, inv);
+                }
                 return v;
             }
             Flow::Block { until, then } => {

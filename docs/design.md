@@ -33,7 +33,7 @@ manifest, without changes to the toolchain's code.
 | Memory map | **Kept.** RAM, the scratchpad, and every symbol sit at their original addresses inside a wasm memory window, and pointer values are the PSX's own. This is a choice of data layout, not hardware emulation. |
 | GTE | **Modelled.** A fixed-point library (`psx-gte`) holding the GTE's register file, which COP2 instructions and the `gte_*` macros drive. |
 | GPU | **Native, per chip** (D59, D61). libgpu's `sys.o` adapters (btn, bof4) give the GPU front end (`psx-devices::gpu`) its GP0/GP1 words and run its transfers on the DMA controller the other chips share; libgpu's state stays in guest RAM, where the library's code that stays original reads it. As the fallback, libgpu is original code over the front end, which answers GPUSTAT/GPUREAD, fed by the DMA controller (D42). The front end decodes packets into renderer commands; the host's WebGL2 backend draws them into a VRAM model. |
-| SPU | **Register level.** libspu and libsnd are original code over `psx-spu`: 24 ADPCM voices with reverb, on their own 44.1 kHz clock (D47). |
+| SPU | **Native, per chip** (D59, D63). libspu's functions that touch the SPU (`spu.o`'s reset, register and transfer layer, the voice, key, mask, common and reverb functions) and libsnd's `_SsInit` are adapters (btn and bof4) over `psx-spu`'s mixer API, its DMA4 transfers on the shared DMA controller with their completions held to the guest's next safepoint; libspu's and libsnd's state stays in guest RAM, so the rest of libspu and all of the libsnd sequencer are original code over them. The core: 24 ADPCM voices with reverb, on their own 44.1 kHz clock. As the fallback, libspu and libsnd are original code over the SPU's registers and DMA4 (D47). |
 | CD-ROM | **Native, per chip** (D59, D62). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). |
 | MDEC | **Native, per chip** (D59, D64). libpress's adapters (bof4, the game that links it) give the MDEC's decode core (`psx-devices::mdec`) the run-length codes `DecDCTin` names and put its pixels into `DecDCTout`'s buffer, without its register protocol. DMA0 and DMA1 complete on the shared DMA controller, so their callbacks come through libetc's DMA handler, at the guest's next safepoint as on the device. As the fallback, libpress is original code over the MDEC's registers, DMA0 in and DMA1 out (D58). |
 | Pad | **Native** (D59, D60). libpad's adapters run its direct-connection engine (btn and bof4): at each vblank interrupt, one exchange per port with a digital-pad model fed by the host's buttons, the detection steps and the buffers as libpad's own state machine makes them, and the time its busy-waits take. As the fallback, libpad is original code over SIO0 (`psx-devices::sio`, D40). |
@@ -52,9 +52,10 @@ remain where a library's policy keeps them (§5).
 D59 moves each chip back to native adapters, degrading to its device
 model where the adapters don't cover a game
 ([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):
-so far the CD (chip cd), the interrupt layer (chip irq), the GPU (chip
-gpu) and the pads (chip sio0) in both games, and the MDEC (chip mdec) in
-bof4, the game that links libpress.
+every chip but the GTE in both games: the CD (chip cd), the interrupt
+layer (chip irq), the GPU (chip gpu), the pads (chip sio0) and the SPU
+(chip spu), and the MDEC (chip mdec) in bof4, the game that links
+libpress.
 
 ## What the inputs look like (measured)
 
@@ -398,12 +399,14 @@ expects native, and the build fails if one falls back. `--device
 <chip,…|all>` forces chips onto their devices. A run reports register
 accesses per chip, and `psxw run --check no-io` requires none.
 
-**Where the boundary sits today.** The device models carry most chips:
-the original code runs over register-level models of the SPU and of the
-DMA controller it uses. Adapters drive the interrupt controller and the
-root counters (chip irq), the GPU (chip gpu), the pads (chip sio0) and the
-CD (chip cd: libcd's drive layer over the CD controller's core) in both
-games, and the MDEC (chip mdec: libpress over its decode core) in bof4. Each move below the API (D40, D42, D45, D47,
+**Where the boundary sits today.** Adapters drive every chip but the GTE
+in both games: the interrupt controller and the root counters (chip irq),
+the GPU (chip gpu), the pads (chip sio0), the CD (chip cd: libcd's drive
+layer over the CD controller's core) and the SPU (chip spu: libspu's
+lowest layer over the mixer API), and the MDEC (chip mdec: libpress over
+its decode core) in bof4; no guest code touches a register
+(`--check no-io`). The register-level devices stay, as the fallback and
+as the conformance oracle. Each move below the API (D40, D42, D45, D47,
 D58) bought exactness by construction and independence from the SDK
 version, because the original library decides every value a game can
 observe. Together they made the layer beneath the SDK an emulated device
@@ -477,8 +480,8 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libcd | `adapter-or-device`, chip cd (D58, D62). Native (btn, bof4): adapters for the drive layer (`bios_1`'s `CD_init`, `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_flush`, `CD_vol`, `CD_initvol`, `CD_datasync`; `CD_getsector`, `CD_getsector2`) and the streaming ring's `StCdInterrupt` and `StUnSetRing`, over the CD controller's core and DMA3, their state in the library's own globals; the public layer (`CdInit`, `CdControl*`, `CdRead*`, `CdSearchFile`, the callbacks and accessors) and the rest of streaming run as original code over them. On the device: original code over the CD controller's registers (D58). |
 | libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's drive layer, adapted or original (D58, D62). |
 | libpress | `adapter-or-device`, chip mdec. Native (bof4; D64): adapters for every `libpress.o` function that reaches the MDEC or its DMA (`DecDCTReset`, `DecDCTPutEnv`, `DecDCTin`, `DecDCTout`, `DecDCTinSync`, `DecDCToutSync`) over the MDEC's decode function, completing DMA0 and DMA1 on the shared controller. libpress's tables stay in its `.data` (D61), so `DecDCTGetEnv` and the callback setters stay guest code, as do the run-length coders (`DecDCTvlc*`). On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
-| libspu | `adapter-or-device`, chip spu. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
-| libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 volume registers); on the device those writes reach the SPU (D47). |
+| libspu | `adapter-or-device`, chip spu. Native (btn, bof4; D63): adapters where libspu touches the SPU: `spu.o`'s `_spu_init`, `_spu_FsetRXX`, `_spu_FsetRXXa`, `_spu_Fw` (SPU RAM by DMA4 or the FIFO) and `_spu_FiDMA` (DMA4's callback), and the functions that program it themselves (`SpuSetKey`, `SpuSetVoiceAttr`, `SpuSetCommonAttr`, `_SpuSetAnyVoice`, the reverb functions, `SpuClearReverbWorkArea`, the key and envelope readers), over the mixer API (`psx_spu::mixer`). libspu's state stays in its `.data`, found through the objects' code (D61), so `SpuInit`, `SpuStart`, `SpuWritePartly`, `SpuSetTransferStartAddr`, `SpuIsTransferCompleted`, the allocator and the voice-mask wrappers stay guest code over them. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
+| libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 registers from its table); natively it is an adapter (D63) that calls the original `_SsVmInit` and writes libsnd's globals where libsnd keeps them; the rest of libsnd reaches the SPU through libspu's adapters. On the device those writes reach the SPU (D47). |
 | libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), their state in the runtime, the games' buffers in guest RAM; `PadStartCom` installs a `SysEnqIntRP` element the kernel runs as an adapter step. On the device: original code over SIO0 (D40), a port of the oracle's. |
 | libmcrd | `guest`, over the HLE BIOS card functions (D43). |
 | libcard | `adapter`. Its `_patch_card` patches Sony BIOS code in kernel RAM (D43). |
@@ -501,9 +504,12 @@ calls and vblanks, with no disc, on `game.wasm` and on `game-orig-L.wasm`,
 where `L` is its original code over the devices. What the game can observe
 after each step (return values, the SDK buffers it reads) must agree.
 Scenarios exist for libpad, libgpu, libmcrd, libetc, libsnd and libspu.
-Where `L` is already a device library, both sides run the original, and
-the scenario's own checks carry the verdict: libgpu's fill and tile read
-back exactly, libspu's voice is audible, libsnd's tick runs at its rate.
+The scenarios' own checks add to the comparison: libgpu's fill and tile
+read back exactly, libspu's voice is audible, libsnd's tick runs at its
+rate. The chip cases (`psxw conform <game> --chip C`, D59) compare each
+chip's adapters with its device the same way, call by call, the device
+effect at the core included (the renderer's commands, the displays, the
+audio, the SPU's state).
 
 ### 6. Time, interrupts and blocking
 
@@ -532,6 +538,11 @@ Game-visible time is **virtual and deterministic**:
   D60). libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin as `VSync`'s
   do (D62); inside a callback, where no interrupt is taken, they poll the
   CD controller as the original does.
+  Loops that aren't waits count too: libspu's adapters spend the passes
+  the translated original's loops make (voice loops, the FIFO's
+  halfwords, the copies), reading and setting the guest's budget
+  (psxw-abi `guest::BUDGET_GET`/`SET`), with a safepoint where it runs
+  out, and call libspu's own delay loop where it does (D63).
 - **Blocking runtime calls jump.** A runtime call that must wait (the
   BIOS's `WaitEvent`) advances time event by event until it is satisfied.
 - **Asynchronous events.** CD sector delivery, DMA completion, root counter
@@ -542,6 +553,10 @@ Game-visible time is **virtual and deterministic**:
   the original ended with a register write holds the interrupt the same
   way (`Machine::hold_irq`): it is queued as the adapter returns, for the
   guest's next safepoint, not taken at the adapter's own return (D64).
+  And an adapter whose original makes no runtime call before it returns
+  doesn't make its return a safepoint (`Machine::quiet`, D63): a
+  completion raised in `_spu_Fw` waits past `_spu_FsetRXXa`, the next
+  adapter `SpuWritePartly` calls, as it waits past the original's.
 - **Wall-clock time only paces presentation.** The same disc, build and
   input log always produce the same frames. That gives replays, golden-frame
   tests in CI, and bisection for free.
@@ -2204,6 +2219,72 @@ makes commands, interrupts and sectors arrive at the same cycle in both
 modes, so conformance compares only the library logic. Decided without
 the human's input, as the task said (plans/unified-adaptor-layer, phase 1
 findings).
+
+**D63. libspu's seam is where it touches the SPU; its adapters drive a
+mixer API and spend the original's time** (unified adapter layer, phase 1
+task 9f). Both games call libspu's public functions directly and from
+libsnd's sequencer, which stays original (D14), and libsnd's `SsInit`
+reaches the SPU through `SpuInit` and `_SsInit`.
+- **The seam** is every libspu function whose own code reaches the SPU
+  or DMA4 that code outside it calls: `spu.o`'s layer (`_spu_init`,
+  `_spu_FsetRXX`, `_spu_FsetRXXa`, `_spu_Fw`, and `_spu_FiDMA`, DMA4's
+  callback, reached through the pointer `SpuStart` gives `DMACallback`:
+  an adapter bound by name, so no stand-in), the functions that program
+  the SPU themselves through `_spu_RXX` (`SpuSetKey`, `SpuSetVoiceAttr`,
+  `SpuSetCommonAttr`, `_SpuSetAnyVoice`/`_SpuGetAnyVoice`, the reverb
+  functions, `SpuSetNoiseClock`, the key, envelope and volume readers,
+  `SpuClearReverbWorkArea`), and libsnd's `_SsInit`: 21 adapters, 19
+  bound in each game. libspu's and libsnd's state stays in their
+  `.data`, found through the objects' code (D61), so `SpuInit`,
+  `_SpuInit`, `SpuStart`, `SpuWritePartly`, `SpuSetTransferStartAddr`,
+  `SpuIsTransferCompleted`, the allocator, the voice-mask wrappers,
+  `SsInit` and the rest of libsnd stay original over them. `_SsInit`
+  calls the original `_SsVmInit`; adapters call the guest where their
+  original does (D61): `_spu_Fw1ts` (libspu's delay loop),
+  `_spu_note2pitch`, `_SpuIsInAllocateArea_`, `printf`, `DeliverEvent`,
+  `WaitEvent`, the transfer callback.
+- **The core** is `psx-spu` through its mixer API (`psx_spu::mixer`,
+  phase 1 task 7): voices, the 24-bit masks, the volumes, SPUCNT, the
+  reverb registers, the transfer address and FIFO, each setter the
+  register write it stands for, so a voice programmed through it is the
+  register path's voice by construction; `Machine::with_spu` brings the
+  SPU up to now first, as a register access does. `_spu_FsetRXX`'s
+  registers by index map onto it. DMA4's words go through the core's
+  transfer port, MADR4/BCR4 on the shared controller, and its completion
+  is held (D64).
+- **Time is the translated original's.** Its loops spend the guest's
+  safepoint budget, and so do the adapters: they read and set it (new
+  guest exports `guest_budget_get`/`guest_budget_set`, psxw-abi
+  `guest::BUDGET_GET`/`SET`, `Regs::budget`/`set_budget`) and spend the
+  passes the original's loops make, with a safepoint where it runs out,
+  at the same place among their SPU writes. The passes are the
+  translation's, measured against the original over the device with the
+  budget observed after every conformance call: clang unrolls short
+  constant loops (the register queue's 10 halfwords, `_SsInit`'s 16
+  registers and its mark table's inner loop, `_spu_init`'s voices two at
+  a time, the reverb parameters a word at a time) and makes
+  `SpuGetKeyStatus`'s search a count of trailing zeros. The delay loop is
+  the original's own code. And an adapter's return is no safepoint
+  (`Machine::quiet`, which the driver takes at the adapter's return):
+  the original makes no runtime call there.
+- **Observed** in conformance: the SPU's whole state, hashed at the core
+  (`Spu::state_hash`, the runtime export `psxw_spu_hash`, in
+  `Harness::device` with the audio), the budget left after every call,
+  and RAM below the cases' scratch in 64 KB blocks.
+
+*Why:* with the state in guest RAM nothing above the seam needs an
+adapter, and the deepest seam leaves the most of libspu original. Over
+the shared core the native SPU is the device's to the tick: btn's 1,200
+frames and bof4's `title-to-field` (25,300 frames, 18.7 million audio
+frames) give the same audio hash both ways, the frame counters are equal
+every frame, and conformance compares the SPU's state after every call.
+Time decided it: a first `SpuInit` that spent 22 budget passes too many
+moved every later safepoint, and without quiet returns btn made one
+`VSync` poll more than the device from frame 395, where a transfer's
+completion ran at the return of `_spu_FsetRXXa`, the adapter
+`SpuWritePartly` calls after `_spu_Fw`, instead of at the guest's next
+safepoint. Decided without the human's input, as the task said
+(plans/unified-adaptor-layer, phase 1 findings).
 
 **D64. libpress's adapters drive the MDEC's decode function, and hold
 the interrupts its register writes raised** (unified adapter layer, phase

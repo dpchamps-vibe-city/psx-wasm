@@ -1185,6 +1185,7 @@ version = "0.0.0"
 dependencies = [
  "psx-bios",
  "psx-devices",
+ "psx-spu",
  "psxw-abi",
 ]
 

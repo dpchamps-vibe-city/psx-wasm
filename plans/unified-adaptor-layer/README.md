@@ -115,7 +115,7 @@ register protocol around them.
 | GPU | packet decoder (`psx_devices::gpu`) and renderer (`psx-render-gl`) | ✓ |
 | CD | disc image, ISO9660, drive timing (`psx_devices::cd`), driven through the CD controller's core (`psx_devices::cdc`, phase 1 task 9d) | ✓ |
 | XA audio | decoder (`psx_devices::xa`) | ✓ the controller decodes it into the SPU's CD input, natively as on the device (task 9d) |
-| SPU | voice DSP (`psx-spu`) | ✗ register API only; needs a mixer API |
+| SPU | voice DSP (`psx-spu`) | ✓ the mixer API (`psx_spu::mixer`: voices, masks, volumes, control, reverb, transfers, each the register write it stands for), with a state hash for conformance (9f) |
 | MDEC | decode core inside `psx_devices::mdec` | ✓ `Mdec::input`/`output`, shared by DMA0/DMA1 and libpress's adapters (9e) |
 | SIO0 | host pad state | ✓ |
 | IRQ, timers, vblank | virtual clock, guest callback queue | ✓ |
