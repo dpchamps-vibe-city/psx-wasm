@@ -157,7 +157,11 @@ library's functions (§5) with a range check on the masked address
 (`rewrite::io_call`). An access in the I/O range calls the runtime's bus,
 `psx.io_access` (`psx-bios::io`): a load calls it before reading, so the
 device puts the register's value in place, and a store calls it after
-writing, so the device takes the value. Any other function's access reads
+writing, so the device takes the value. clang merges adjacent register
+accesses into wider and unaligned ones (lifted libspu sets four voice
+registers with one 8-byte store), so the bus splits each access into the
+naturally aligned registers it covers, a word at most, in address order
+(`Machine::io_access`). Any other function's access reads
 and writes plain memory, the window's *I/O shadow*. A `--debug-io` build
 traps on those (`psx.io_trap`), and `psxw run --check no-shadow-io`
 reports the first frame where a shadow byte changed without a device

@@ -406,6 +406,42 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     tell the controller about the disc (`cdc_insert`). This branch first
     built the same adapter-address and `Flow::Call` mechanisms as chip gpu
     and took chip gpu's on merging.
+- **2026-10-29, exit criterion 4: btn on `--device irq` passes
+  `no-shadow-io`.** The 16 shadow bytes at frame 65 (Findings) weren't
+  chip gpu's. They were the runtime's `psx.io_access`, which capped every
+  device-library access at 4 bytes. clang merges adjacent stores, and
+  lifted libspu's `_spu_init` sets each voice's volumes, pitch and start
+  address (`sh` ×4) with one 8-byte store. The SPU got the volumes, and
+  the pitch (3FFFh) and start address (200h) stayed in the shadow. A
+  temporary probe found the store at cycle 36,660,000 (frame 64) both
+  natively and on `--device irq`. Natively the shadow matched again by the
+  next vblank; with libetc original, vblank 65 came first. The other reported configurations
+  (`irq,cd`, `irq,sio0`) are the same. Counted by width over 1,200
+  frames on `--device all`, btn makes 26 8-byte SPU stores and bof4 52;
+  each lost its upper word. No other chip gets one, and no access is
+  unaligned.
+  - **Fix:** `Machine::io_access` (`psx-bios::io`) takes any width the
+    rewrite emits (1 to 8 bytes, `kind & 0xFF`). It splits the access into
+    the naturally aligned register accesses that cover it, a word at most,
+    in address order, so an unaligned merge is split too. The runtime's
+    `psx.io_access` calls it, and the shadow notes the whole access. The
+    same code runs in both games and every mode. Tests:
+    `io::tests::accesses_split_into_aligned_registers` and
+    `wide_window_accesses_reach_every_register` (an 8-byte store reaches
+    the voice's four registers, an unaligned one the right two, and an
+    8-byte load fills the window from all four).
+  - **Runs:** btn on `--device irq`, `irq,cd` and `irq,sio0`, 120 frames:
+    `no-shadow-io` passes. btn and bof4, 1,200 frames, `--check boot
+    --check no-trap --check no-shadow-io`: pass native and on `--device
+    irq`. btn's VSync counts are unchanged from the tree before the fix
+    (952,146 native and 327,620 on the device); bof4's are 3,268 both ways.
+    `psxw conform btn|bof4 --chip irq|gpu`: PASS. The first `bof4 --chip
+    gpu` run failed `gpu.sequence`. On the device side, the `DrawSync(0)`
+    before `ResetGraph` spins libgpu's timeout (about a million
+    `VSync(-1)` polls), and it hit the harness's 20 s wall-clock deadline
+    for a call. Other jobs had the machine at load average 12. The rerun
+    passed, 29 s for the whole chip. The deadline is wall-clock, so a
+    loaded machine can fail that case.
 
 ## Findings
 
@@ -622,4 +658,24 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   too (`--device irq,cd`) and with SIO0 (`--device irq,sio0`); not with
   the GPU on its device as well (`--device irq,gpu`), and not in bof4. So
   it is chip gpu's adapters under libetc's own dispatcher, not the CD's;
-  left to chip gpu's owner.
+  left to chip gpu's owner. *Resolved (progress log, exit criterion 4):*
+  it wasn't chip gpu. The bytes are SPU registers that lifted libspu
+  (`_spu_init`) wrote with one merged 8-byte store, and the runtime's
+  `io_access` passed only the first word to the SPU. It happened in every
+  mode and both games. The check only compares the shadow at vblanks, and
+  only btn on `--device irq` (with or without the CD or SIO0) put a vblank
+  between the store and the next accesses to those registers.
+  `--device irq,gpu` changes the boot's pace, and no vblank fell there. A `--debug-io` build didn't trap because the store is
+  a device library's and goes to `io_access`, not `io_trap`. The bus now
+  takes each access as the aligned registers it covers.
+- **clang changes the shape of a device library's register accesses.**
+  Lifted code's loads and stores are plain C (only loop heads have a
+  barrier), and clang merges neighbours, so a device can get one wide or
+  unaligned access where the original made several narrow ones. The bus
+  splits an access into aligned registers in address order. That is the
+  original's order when its stores ascend, as `_spu_init`'s do. A merge of
+  stores the original made in another order would reach the device in
+  address order. That hasn't been seen. Counted by width over 1,200
+  frames on `--device all`, the only accesses wider than a word in either
+  game are SPU stores, no access is unaligned, and no load is wider than
+  a word.
