@@ -11,6 +11,8 @@
 #   sand flier, "I: Awakening", the crash, Nina and Cray at the wreck).
 #   Control starts near 12300; CROSS after that would talk to Cray.
 # - UP, RIGHT, DOWN, LEFT for 30 steps each from 12400.
+# - SQUARE at 12650 opens the field menu, which calls into the overlay
+#   `ovl_4504` at a function its split starts two instructions late.
 #
 # One pad: with a second one plugged in, the game takes another path and
 # draws nothing.
@@ -56,7 +58,7 @@ press = [
   "CROSS@11440", "CROSS@11480", "CROSS@11520", "CROSS@11560", "CROSS@11600", "CROSS@11640", "CROSS@11680", "CROSS@11720",
   "CROSS@11760", "CROSS@11800", "CROSS@11840", "CROSS@11880", "CROSS@11920", "CROSS@11960", "CROSS@12000", "CROSS@12040",
   "CROSS@12080", "CROSS@12120", "CROSS@12160", "CROSS@12200", "CROSS@12240", "CROSS@12280",
-  "UP@12400:30", "RIGHT@12450:30", "DOWN@12500:30", "LEFT@12550:30",
+  "UP@12400:30", "RIGHT@12450:30", "DOWN@12500:30", "LEFT@12550:30", "SQUARE@12650:4",
 ]
 # Nina's facing (a halfword of her actor state): its high byte is twice the
 # direction plus one once she has turned (3 up, 2 right, 1 down, 0 left).

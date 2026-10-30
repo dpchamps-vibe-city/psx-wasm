@@ -206,6 +206,66 @@ fn data_pointers(
     out
 }
 
+/// Most instructions a data pointer may enter before a text range.
+const EARLY_ENTRY: u32 = 8;
+
+/// Code the inputs' split filed as data: a function table entry (a data
+/// word beside one holding a known function start) pointing at a
+/// container's data just before one of its text ranges, where every word
+/// up to the range is an instruction a function can begin with: not a nop,
+/// no control transfer, no memory access off $zero (what a RAM pointer
+/// decodes as), reading only what a caller passes (a0-a3, gp, sp) or what
+/// an earlier one wrote. bof4's `ovl_4504` begins a function two
+/// instructions before its text, and `ovl_4444` calls it through such a
+/// table. Words of data that pass for such code make an unused function.
+fn early_entries(program: &Program, originals: &Originals) -> BTreeSet<(String, u32)> {
+    const PASSED: u32 = 0xF0 | 1 << 28 | 1 << 29;
+    let starts: BTreeSet<u32> = program.containers.values().flat_map(|c| c.starts.keys().copied()).collect();
+    let mut text_starts: BTreeMap<u32, Vec<&str>> = BTreeMap::new();
+    for (id, code) in &program.containers {
+        for t in &code.text {
+            text_starts.entry(t.start).or_default().push(id);
+        }
+    }
+    let entry_like = |c: &str, from: u32, to: u32| {
+        let mut set = PASSED;
+        (from..to).step_by(4).all(|pc| {
+            let Some(w) = originals.word(c, pc).filter(|&w| w != 0) else { return false };
+            let i = decode::decode(w);
+            use decode::Op::*;
+            // A RAM pointer decodes as a load or store off $zero.
+            let absolute = i.rs == 0 && matches!(i.op, Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Sb | Sh | Swl | Sw | Swr | Lwc2 | Swc2);
+            let plain = !matches!(i.op, Invalid | Syscall | Break | Rfe) && !i.op.has_delay_slot() && !absolute;
+            let ok = plain && i.reads() & !set == 0;
+            if let Some(r) = i.writes() {
+                set |= 1 << r;
+            }
+            ok
+        })
+    };
+    let mut out = BTreeSet::new();
+    for (id, code) in &program.containers {
+        for r in &code.data {
+            let mut a = (r.start + 3) & !3;
+            while a + 4 <= r.end {
+                let w = originals.word(id, a);
+                let beside = [a.wrapping_sub(4), a + 4].iter().any(|&n| originals.word(id, n).is_some_and(|v| starts.contains(&v)));
+                a += 4;
+                let Some(w) = w.filter(|w| w & 3 == 0 && beside) else { continue };
+                for (&start, ids) in text_starts.range(w + 1..=w.saturating_add(4 * EARLY_ENTRY)) {
+                    for &tc in ids {
+                        let target = &program.containers[tc];
+                        if target.data.iter().any(|d| d.contains(&w)) && entry_like(tc, w, start) {
+                            out.insert((tc.to_string(), w));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Translate to a fixed point over function starts and inline functions.
 ///
 /// A function with no C is inlined at its call sites (and fall-throughs)
@@ -215,6 +275,13 @@ fn data_pointers(
 /// ABI-conformant by construction, so its entry reads are uninitialized
 /// locals, not arguments.
 pub fn translate_all(program: &mut Program, originals: &Originals, containers: &[String]) -> Outcome {
+    // In address order: one an earlier one's range already holds is only
+    // a start.
+    for (c, a) in early_entries(program, originals) {
+        if program.code(&c).is_some_and(|code| code.in_text(a)) || program.extend_text(&c, a, 4 * EARLY_ENTRY) {
+            program.add(&c, a, None, Source::DataPointer, true);
+        }
+    }
     let mut rounds = 0;
     let mut inline: BTreeMap<(String, u32), u32> = BTreeMap::new();
     let mut inline_reasons: BTreeMap<(String, u32), String> = BTreeMap::new();
@@ -592,6 +659,52 @@ mod tests {
         let c = |a: u32| out.ok.iter().find(|t| t.func.addr == a).map(|t| t.c.clone()).expect("translated");
         assert!(c(child).contains("r2 = psxw_chain_get()"), "{}", c(child));
         assert!(c(BASE).contains(&format!("(psxw_chain_set(r2), psxw_f_{child:08X}(r4, r5, r6, r7))")), "{}", c(BASE));
+    }
+
+    /// A function table entry two instructions before a text range (code
+    /// the split filed as data, bof4's `ovl_4504`) becomes a start and moves
+    /// the range; one at a string there doesn't.
+    #[test]
+    fn early_entry_before_text() {
+        const BASE: u32 = 0x8001_0000;
+        let words: [u32; 15] = [
+            BASE + 0x10, // table: the string,
+            BASE + 0x34, // a known function,
+            BASE + 0x18, // the entry
+            0,
+            0x0064_3825, // "%8d\0" (decodes as or a3, v1, a0)
+            0x0064_3825,
+            0x3C02_8011, // entry: lui v0, 0x8011
+            0x9442_4900, // lhu v0, 0x4900(v0)
+            0x1040_0002, // text: beqz v0, 1f
+            0,
+            0x2402_0001, // addiu v0, zero, 1
+            0x03E0_0008, // 1: jr ra
+            0,
+            0x03E0_0008, // other: jr ra
+            0,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let start = |name: &str, size: u32| Start { name: Some(name.into()), size: Some(size), sources: [Source::Symbol].into(), boundary: true };
+        let mut program = Program {
+            main: "test".into(),
+            containers: [(
+                "test".to_string(),
+                Code {
+                    id: "test".into(),
+                    text: vec![BASE + 0x20..BASE + 0x3C],
+                    data: vec![BASE..BASE + 0x20],
+                    starts: [(BASE + 0x20, start("split", 0x14)), (BASE + 0x34, start("other", 8))].into(),
+                },
+            )]
+            .into(),
+        };
+        let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
+        let out = translate_all(&mut program, &originals, &["test".into()]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert!(out.ok.iter().any(|t| t.func.addr == BASE + 0x18));
+        assert!(!out.ok.iter().any(|t| t.func.addr == BASE + 0x10));
+        assert_eq!(program.code("test").unwrap().text[0].start, BASE + 0x18);
     }
 
     /// A wrapper whose last act is a call returns that callee's v0, as a

@@ -142,6 +142,22 @@ impl Program {
         }
     }
 
+    /// Move the start of the text range that begins at most `within` bytes
+    /// after `addr` back to `addr`: the inputs filed the code before it as
+    /// data. Returns whether a range moved.
+    pub fn extend_text(&mut self, container: &str, addr: u32, within: u32) -> bool {
+        let Some(code) = self.containers.get_mut(container) else { return false };
+        let Some(t) = code.text.iter_mut().find(|t| t.start > addr && t.start - addr <= within) else { return false };
+        let end = std::mem::replace(&mut t.start, addr);
+        code.data.retain_mut(|d| {
+            if d.start <= addr && d.end == end {
+                d.end = addr;
+            }
+            d.start < d.end
+        });
+        true
+    }
+
     /// Mark an existing start with another source; returns whether it is
     /// new to that start.
     pub fn add_source(&mut self, container: &str, addr: u32, source: Source) -> bool {
