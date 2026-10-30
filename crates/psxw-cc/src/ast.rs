@@ -74,7 +74,9 @@ impl Ast {
     }
 
     /// End of the first file-scope node at or after `after` that defines
-    /// `struct name` / `union name` with a body.
+    /// `struct name` / `union name` with a body. A bare `struct X { … };`
+    /// is a specifier node whose `;` is a separate token; the end is past
+    /// that `;`.
     pub fn record_definition_end(&self, keyword: &str, name: &str, after: usize) -> Option<usize> {
         let root = self.tree.root_node();
         let mut cursor = root.walk();
@@ -82,7 +84,10 @@ impl Ast {
         root.named_children(&mut cursor)
             .filter(|n| n.start_byte() >= after)
             .find(|n| self.defines_record(*n, &kind, name))
-            .map(|n| n.end_byte())
+            .map(|n| match n.next_sibling() {
+                Some(s) if s.kind() == ";" => s.end_byte(),
+                _ => n.end_byte(),
+            })
     }
 
     fn defines_record(&self, node: Node, kind: &str, name: &str) -> bool {
@@ -250,6 +255,16 @@ mod tests {
         let f = &ast.functions()[0];
         assert_eq!(f.name, "outer");
         assert_eq!(ast.nested_functions(f), vec!["plain".to_string(), "inner".to_string()]);
+    }
+
+    #[test]
+    fn record_definition_ends_past_its_semicolon() {
+        let bare = "extern struct D a[];\nstruct D {\n int x;\n};\nint y;\n";
+        let ast = super::parse(bare);
+        assert_eq!(ast.record_definition_end("struct", "D", 20), Some(bare.find("};").unwrap() + 2));
+        let typedef = "extern struct E b[];\ntypedef struct E {\n int x;\n} E;\nint y;\n";
+        let ast = super::parse(typedef);
+        assert_eq!(ast.record_definition_end("struct", "E", 20), Some(typedef.find("} E;").unwrap() + 4));
     }
 }
 

@@ -30,6 +30,8 @@ pub struct Options {
 pub struct Context {
     pub map: AddressMap,
     pub originals: Originals,
+    /// The manifest's `[census.size_mismatch]`: symbol → evidence.
+    pub accepted_sizes: std::collections::BTreeMap<String, String>,
 }
 
 pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
@@ -92,7 +94,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         .collect::<Result<_>>()?;
     tu_reports.sort_by(|a, b| (&a.container, &a.name).cmp(&(&b.container, &b.name)));
 
-    let ctx = Context { map, originals };
+    let ctx = Context { map, originals, accepted_sizes: manifest.census.size_mismatch.clone() };
     let layout = if opts.probe {
         Some(checks::layout(&clang, &snap, &manifest, &ctx.map, &ws.checkout(pin), &out_dir, opts.only_header.as_deref())?)
     } else {

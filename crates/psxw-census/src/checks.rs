@@ -170,12 +170,11 @@ pub(crate) fn data(ctx: &Context, tus: &[TuReport]) -> DataReport {
             *placed.entry((owner.clone(), res.addr)).or_default() += 1;
             if let Some(size) = res.size {
                 if size != def.size {
-                    r.size_mismatches.push(named(
-                        &owner,
-                        &s.name,
-                        Some(res.addr),
-                        format!("clang {} bytes, symbol file {size} ({})", def.size, tu.name),
-                    ));
+                    let detail = format!("clang {} bytes, symbol file {size} ({})", def.size, tu.name);
+                    match ctx.accepted_sizes.get(&s.name) {
+                        Some(why) => r.accepted_size_mismatches.push(named(&owner, &s.name, Some(res.addr), format!("{detail}: {why}"))),
+                        None => r.size_mismatches.push(named(&owner, &s.name, Some(res.addr), detail)),
+                    }
                 }
             }
             if obj.segment_of(def).name.starts_with(".bss") {
@@ -204,6 +203,8 @@ pub(crate) fn data(ctx: &Context, tus: &[TuReport]) -> DataReport {
         }
     }
     r.multiply_defined = placed.values().filter(|&&n| n > 1).count() as u32;
+    r.stale_accepted_sizes =
+        ctx.accepted_sizes.keys().filter(|k| !r.accepted_size_mismatches.iter().any(|n| &n.name == *k)).cloned().collect();
     r
 }
 

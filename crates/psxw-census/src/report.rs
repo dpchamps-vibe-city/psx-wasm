@@ -65,6 +65,12 @@ pub struct DataReport {
     pub multiply_defined: u32,
     pub mismatches: Vec<Named>,
     pub size_mismatches: Vec<Named>,
+    /// Size mismatches the manifest's `[census.size_mismatch]` documents
+    /// (the detail ends with its evidence); they don't fail the census.
+    pub accepted_size_mismatches: Vec<Named>,
+    /// `[census.size_mismatch]` entries that matched no mismatch (the
+    /// decomp fixed the declaration, or a partial run didn't compile it).
+    pub stale_accepted_sizes: Vec<String>,
     pub unplaceable: Vec<Named>,
 }
 
@@ -218,6 +224,10 @@ impl Report {
         );
         list(&mut s, "mismatch", &d.mismatches);
         list(&mut s, "size mismatch", &d.size_mismatches);
+        list(&mut s, "accepted size mismatch", &d.accepted_size_mismatches);
+        for k in &d.stale_accepted_sizes {
+            let _ = writeln!(s, "  stale [census.size_mismatch] entry: {k} (its size matches, or it wasn't compiled)");
+        }
         list(&mut s, "unplaceable", &d.unplaceable);
 
         if let Some(l) = &self.layout {

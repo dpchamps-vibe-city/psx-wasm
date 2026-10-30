@@ -29,7 +29,19 @@ pub struct GameManifest {
     #[serde(default)]
     pub ci: CiSection,
     #[serde(default)]
+    pub census: CensusSection,
+    #[serde(default)]
     pub chips: ChipsSection,
+}
+
+/// `[census]`: the census's documented exceptions.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CensusSection {
+    /// C data definitions whose size differs from the symbol file's, each
+    /// with its evidence (a decomp that under-declares a buffer). They are
+    /// reported as accepted, never as matches.
+    #[serde(default)]
+    pub size_mismatch: BTreeMap<String, String>,
 }
 
 /// `[chips]` (D59): the chips the game is expected to run native. A build
