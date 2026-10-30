@@ -17,6 +17,7 @@
 //! commands, the audio); library state only through functions that read
 //! it; callbacks by their effect on a word, to the frame.
 
+mod gpu;
 mod irq;
 mod sio0;
 
@@ -33,7 +34,8 @@ pub trait Harness {
     /// Record an observation.
     fn observe(&mut self, what: &str, value: String);
     /// The device effect so far, at the core's API both sides reach: the
-    /// renderer's command stream and the audio, hashed.
+    /// renderer's command stream, the displays presented at each vblank
+    /// (what GP1 set), and the audio, hashed.
     fn device(&mut self) -> String;
     /// A guest function that counts its calls in a word, and that word
     /// (game.toml `[conform]`), for callbacks.
@@ -99,6 +101,7 @@ pub fn all() -> Vec<Case> {
     let mut v = Vec::new();
     v.extend(irq::cases());
     v.extend(sio0::cases());
+    v.extend(gpu::cases());
     v
 }
 

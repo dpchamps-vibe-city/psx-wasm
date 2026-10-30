@@ -49,7 +49,9 @@ pub mod replay;
 ///   control functions ([`guest::ASYNCIFY_START_UNWIND`] and the rest),
 ///   instrumented when the game switches threads and stubs otherwise; the
 ///   BIOS keeps the kernel's thread tables in guest RAM ([`kernel`]).
-pub const ABI_VERSION: u32 = 11;
+/// - 12: an adapter call carries the replaced function's guest address
+///   ([`psx::ADAPTER`], D61).
+pub const ABI_VERSION: u32 = 12;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -207,6 +209,11 @@ pub mod psx {
     /// `(fmt, va) -> ()`: a mod's `psxmod_log(fmt, ...)`: printf-style,
     /// the arguments in clang's va-buffer at guest address `va`.
     pub const MOD_LOG: &str = "mod_log";
+    /// `(id, addr, a0, a1, a2, a3) -> i64`: an SDK function the build
+    /// replaced with runtime adapter `id`, at guest address `addr`. The
+    /// adapter finds its object's data through the relocated operands of
+    /// the original code there (D61).
+    pub const ADAPTER: &str = "adapter";
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
     pub const ADAPTER_PREFIX: &str = "adapter.";
