@@ -230,7 +230,8 @@ type K = Box<dyn FnOnce(&mut M, u32) -> Flow<Psyq>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Busy {
-    /// The MDEC is taking a command's input (status bit 29).
+    /// The MDEC's command is busy (status bit 29): taking input, or a
+    /// decode whose output DMA1 hasn't read.
     In,
     /// DMA1 is running (CHCR1 bit 24).
     Out,
@@ -238,7 +239,7 @@ enum Busy {
 
 fn busy(m: &M, b: Busy) -> bool {
     match b {
-        Busy::In => m.io.as_ref().is_some_and(|io| io.mdec.busy()),
+        Busy::In => m.io.as_ref().is_some_and(|io| io.mdec.command_busy()),
         Busy::Out => m.sdk.press.out.is_some(),
     }
 }

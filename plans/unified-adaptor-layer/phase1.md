@@ -1201,3 +1201,35 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   the next INT1). So instant keeps the drive's sector rate and command
   latency: at 600 frames btn renders 141,683 words (realistic 128,620)
   and bof4 844,850, no CD errors, realistic unchanged.
+- **bof4's movies tore and flashed magenta in every mode**, found in the
+  browser after phase 1. Two bugs in the cores both modes share, so the
+  level 4 comparison (native against the device, frame for frame) agreed
+  on wrong pictures; nothing compared them with a picture of the movie.
+  - **A byte store to DICR acknowledged every DMA flag.** The
+    controller merged the byte into the register and took the old flags
+    it copied back as 1s written to them. libcd's streaming ring sets
+    channel 3's interrupt enable with a byte store to DICR+2
+    (`StCdInterrupt`, natively and on the device), so DMA1's and DMA2's
+    pending completions vanished; the player's slice callback never ran
+    and `DecDCTin` waited out libpress's timeout (the magenta frames are
+    a buffer nothing was decoded into). Only flags written as 1 are
+    acknowledged now.
+  - **The MDEC finished a decode the moment its input arrived.** The
+    player starts with `DecDCTin` and one `DecDCTout`, and its next
+    `DecDCTin` comes before a safepoint has run the slice callbacks, so
+    the second frame went in behind 19 unread slices of the first, and
+    every frame after was offset by them (the picture rotated, its
+    seam moving as more were lost). On hardware the decoder stalls on
+    its full output and can't take the rest of its input, so status bit
+    29 (busy "receiving or processing parameters") holds the next
+    command back; here it stays set while more than the data-out FIFO's
+    32 words of output are unread (`Mdec::command_busy`), and libpress's
+    input wait reads it.
+- **Counting adapter calls cost more than the adapters.** During btn's
+  loads libcd's `CdReadSync` polls `VSync(-1)` some 28,000 times a
+  vblank. Each adapter call formatted `adapter.<name>` and looked it up
+  in the machine's string-keyed counters, and `VSync` worked out root
+  counter 1 (128-bit arithmetic) before it saw the mode: three quarters
+  of a load's time natively, 5.2 ms a vblank against the device's 5 ms,
+  enough to miss frames in a browser (the audio ring runs dry and
+  crackles). Adapter calls are counted by id now (d7009b3): 1.1 ms.

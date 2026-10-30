@@ -77,9 +77,11 @@ impl Dma {
                 (0..7).find(|&ch| self.ready(ch))
             }
             DICR => {
-                let w = merge(self.dicr);
-                let acked = self.dicr & !(w & 0x7F00_0000) & 0x7F00_0000;
-                self.dicr = (w & 0x00FF_803F) | acked;
+                // A flag is acknowledged by a 1 written to it, not by a
+                // byte store elsewhere in the register (libcd's streaming
+                // ring sets channel 3's enable with one to DICR+2).
+                let ack = (v << shift) & lane & 0x7F00_0000;
+                self.dicr = (merge(self.dicr) & 0x00FF_803F) | (self.dicr & 0x7F00_0000 & !ack);
                 None
             }
             _ => {
@@ -140,6 +142,8 @@ mod tests {
         d.write(DICR, 4, 1 << 23 | 1 << 18);
         assert!(d.complete(GPU));
         assert_eq!(d.read(DICR) >> 24, 0x84);
+        d.write(DICR + 2, 1, 0x80 | 1 << 2 | 1 << 3);
+        assert_eq!(d.read(DICR) >> 24, 0x84, "a byte store to the enables acknowledges nothing");
         d.write(DICR, 4, 1 << 23 | 1 << 18 | 1 << 26);
         assert_eq!(d.read(DICR) >> 24, 0);
         assert_eq!(d.chcr[GPU] & CHCR_BUSY, 0);

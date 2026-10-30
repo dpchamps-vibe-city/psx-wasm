@@ -23,6 +23,12 @@ use std::collections::VecDeque;
 pub const DATA: u32 = 0x1F80_1820;
 pub const STATUS: u32 = 0x1F80_1824;
 
+/// Words the data-out FIFO holds. A decode's command stays busy while
+/// more of its output than this is unread: the decoder stalls with its
+/// output full, so it takes the rest of its input, and finishes, only as
+/// DMA1 or the data port reads.
+const OUT_FIFO: usize = 32;
+
 /// psx-spx "MDEC Decompression": the zigzag order of coefficients.
 const ZIGZAG: [usize; 64] = [
     0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9, 11, 18, 24, 31, 40, 44, 53, 10, 19,
@@ -117,7 +123,7 @@ impl Mdec {
         };
         let left = self.cmd.map_or(0xFFFF, |(_, n)| n.wrapping_sub(1) & 0xFFFF);
         (self.out.is_empty() as u32) << 31
-            | (self.cmd.is_some() as u32) << 29
+            | (self.command_busy() as u32) << 29
             | ((self.enable_in && self.cmd.is_some()) as u32) << 28
             | ((self.enable_out && !self.out.is_empty()) as u32) << 27
             | depth << 25
@@ -408,6 +414,16 @@ impl Mdec {
         self.cmd.is_some()
     }
 
+    /// Status bit 29, busy "receiving or processing parameters" (psx-spx):
+    /// a command taking input, or a decode whose output hasn't been read
+    /// down to the data-out FIFO. Decoding is instant here, so its output
+    /// stands for the macroblocks hardware hasn't decoded yet; a game that
+    /// sends the next command when this clears (libpress's `DecDCTin`)
+    /// first reads all of the last one's.
+    pub fn command_busy(&self) -> bool {
+        self.cmd.is_some() || self.out.len() > OUT_FIFO
+    }
+
     /// The next decoded word (1F801820h, or DMA1).
     pub fn read(&mut self) -> u32 {
         self.out.pop_front().unwrap_or(0)
@@ -467,6 +483,7 @@ mod tests {
         assert!(!m.busy());
         assert_eq!(m.macroblocks, 1);
         assert_eq!(m.available(), 128, "16×16 halfwords");
+        assert_ne!(m.status() & 1 << 29, 0, "busy until its output is read");
         let first = m.read();
         assert!(m.status() & 1 << 27 != 0);
         let px = first as u16;
@@ -474,7 +491,9 @@ mod tests {
         let (r, g, b) = (px & 31, px >> 5 & 31, px >> 10 & 31);
         assert!(r == g && g == b, "grey: {r} {g} {b}");
         assert!(r > 16, "brighter than mid-grey: {r}");
-        assert!((1..128).all(|_| m.read() == first), "flat");
+        assert!((1..128 - OUT_FIFO).all(|_| m.read() == first), "flat");
+        assert_eq!(m.status() & 1 << 29, 0, "the rest fits the data-out FIFO");
+        assert!((0..OUT_FIFO).all(|_| m.read() == first), "flat");
     }
 
     /// The decode function gives what the data port does, however the
