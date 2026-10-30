@@ -733,7 +733,9 @@ pub extern "C" fn gte_exec(cmd: u32) {
 }
 
 /// An SDK function at guest address `addr` replaced by an adapter (o32
-/// arguments); the adapter sees `addr` as `Psyq::at` (D61).
+/// arguments); the adapter sees `addr` as `Psyq::at` (D61). Interrupts it
+/// held, as a guest register access raises them, are queued as it returns,
+/// for the guest's next safepoint (D64).
 #[unsafe(export_name = "adapter")]
 pub extern "C" fn adapter(id: u32, addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
     with(|rt| {
@@ -745,7 +747,11 @@ pub extern "C" fn adapter(id: u32, addr: u32, a0: u32, a1: u32, a2: u32, a3: u32
             f(&mut m, [a0, a1, a2, a3])
         };
         match flow {
-            Ok(f) => driver::run(&rt.m, &mut Guest, f),
+            Ok(f) => {
+                let v = driver::run(&rt.m, &mut Guest, f);
+                rt.m.borrow_mut().release_irq();
+                v
+            }
             Err(e) => fatal(11, &format!("{name}: {e}")),
         }
     })

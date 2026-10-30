@@ -55,4 +55,6 @@ pub const VALIDATED: &[(&str, &str)] = &[
     ("libpad/pdent3", "7d2897d55e85c6baa151a0c941b652c08c249d884715441d3e6a6de54d9c1c25"),
     ("libpad/pdmaiini", "e18ba4711badfc36e67e6915d33234c40e111f65113f360848256adeb65bf86d"),
     ("libpad/pdresres", "f513971cf3615a3314cdba2bd6b63e7640e1bbe0c5316786d64174ba65c1da29"),
+    // libpress's MDEC functions (bof4 places it in an overlay).
+    ("libpress/libpress", "c750d3ede6ee193e0d881ed3ded57994c4f32625514c0cb9f53f447d62d6e879"),
 ];

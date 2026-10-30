@@ -440,6 +440,33 @@ fn start(inputs: &psxw_lift::run::Inputs) -> Result<(Vec<(u32, Vec<u8>)>, u32, u
     Ok((vec![(exe.t_addr, text)], sp, exe.gp0))
 }
 
+/// The overlays that hold functions a chip case calls (libpress, in bof4),
+/// as RAM to write before it starts: resident, as when the game calls
+/// them (docs/design.md §3: the bytes in RAM decide). An overlay over the
+/// cases' scratch RAM, or over another one the case needs, is an error.
+fn resident(inputs: &psxw_lift::run::Inputs, needs: &[&str]) -> Result<Vec<(u32, Vec<u8>)>> {
+    let map = &inputs.map;
+    let ids: std::collections::BTreeSet<String> =
+        needs.iter().filter_map(|n| map.resolve(&map.main, n)?.container).filter(|c| *c != map.main).collect();
+    let scratch = sdk_psyq::cases::SCRATCH..sdk_psyq::cases::SCRATCH + sdk_psyq::cases::SCRATCH_LEN;
+    let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+    for id in ids {
+        let file = inputs.originals.file(&id).with_context(|| format!("no original bytes for overlay {id}"))?;
+        for (range, vram) in inputs.originals.segments(&id) {
+            let bytes = file.get(range.start as usize..range.end as usize).with_context(|| format!("overlay {id} shorter than its segments"))?;
+            let at = *vram..vram + bytes.len() as u32;
+            if at.start < scratch.end && scratch.start < at.end {
+                bail!("overlay {id} ({:#010x}..{:#010x}) is over the chip cases' scratch RAM", at.start, at.end);
+            }
+            if let Some((a, b)) = out.iter().find(|(a, b)| at.start < a + b.len() as u32 && *a < at.end) {
+                bail!("overlay {id} at {:#010x} is over another a case needs, at {a:#010x}..{:#010x}", at.start, a + b.len() as u32);
+            }
+            out.push((*vram, bytes.to_vec()));
+        }
+    }
+    Ok(out)
+}
+
 /// A scenario run on `game.wasm` with the server renderer, recorded for
 /// replay on another host: its steps and results, then the final VRAM and
 /// the audio it produced.
@@ -721,9 +748,9 @@ pub fn run_chip(ws: &Workspace, game: &str, chip: &str, seeds: u64) -> Result<bo
     let device = psxw_build::game::build(ws, &psxw_build::game::Options { device: vec![chip.into()], ..psxw_build::game::Options::new(game) })?.0;
     let ctx = Ctx { inputs: &inputs };
     let callback = ctx.callback().ok();
-    let side = |wasm: &str| -> Result<ChipSide<'_>> {
+    let side = |wasm: &str, ram: &[(u32, Vec<u8>)]| -> Result<ChipSide<'_>> {
         let o = Options { wasm: wasm.into(), replay: Some(replay(CHIP_FRAMES)), deadline_secs: 20, ..Default::default() };
-        Ok(ChipSide { c: Conform::new(&o, &ram, sp, gp)?, ctx: &ctx, log: vec![], callback })
+        Ok(ChipSide { c: Conform::new(&o, ram, sp, gp)?, ctx: &ctx, log: vec![], callback })
     };
     let mut results = Vec::new();
     for case in sdk_psyq::cases::all().into_iter().filter(|c| c.chip == chip) {
@@ -734,10 +761,11 @@ pub fn run_chip(ws: &Workspace, game: &str, chip: &str, seeds: u64) -> Result<bo
             results.push(CaseResult { case: case.name.into(), level: case.level, verdict, first_difference: None, native_log: vec![], device_log: vec![] });
             continue;
         }
+        let ram = [ram.clone(), resident(&inputs, case.needs)?].concat();
         for seed in 0..if case.level == 1 { seeds } else { 1 } {
             let mut logs = Vec::new();
             for wasm in [&native.wasm, &device.wasm] {
-                let mut s = side(wasm)?;
+                let mut s = side(wasm, &ram)?;
                 let r = (case.run)(&mut s, &mut sdk_psyq::cases::Rng::new(seed));
                 if let Err(e) = r {
                     s.log.push(Observation { step: "error".into(), values: vec![e] });

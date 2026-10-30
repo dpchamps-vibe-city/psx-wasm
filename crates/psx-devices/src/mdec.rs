@@ -1,12 +1,17 @@
 //! The MDEC, the motion decoder (psx-spx "Macroblock Decoder (MDEC)"): at
 //! 1F801820h a command or parameter word goes in and decoded data comes
 //! out; at 1F801824h the status reads and the control writes. Input comes
-//! by DMA0 and output leaves by DMA1. libpress's own code drives it (FMV).
+//! by DMA0 and output leaves by DMA1. libpress's own code drives it (FMV)
+//! when chip mdec is emulated.
 //!
 //! Commands: (1) decode run-length-coded macroblocks into 4-, 8-, 15- or
 //! 24-bit pixels, (2) set the quantization tables, (3) set the IDCT's
 //! scale table. Decoding is instant in virtual time: a macroblock's
 //! pixels are ready as soon as its last halfword arrives.
+//!
+//! [`Mdec::input`] and [`Mdec::output`] are the core without its ports:
+//! the device's DMA0 and DMA1 use them, and so do libpress's adapters when
+//! chip mdec runs native (D64).
 //!
 //! The arithmetic follows psx-spx's description of the hardware, with the
 //! fixed-point details (coefficient scaling, the IDCT's rounding, the
@@ -137,40 +142,70 @@ impl Mdec {
         self.enable_out = v & 0x2000_0000 != 0;
     }
 
-    /// A word at 1F801820h or by DMA0: a command, or its next parameter.
+    /// A word at 1F801820h: a command, or its next parameter.
     pub fn write(&mut self, v: u32) {
-        let Some((cmd, left)) = self.cmd else {
-            self.word = v;
-            let n = v & 0xFFFF;
-            let cmd = match v >> 29 {
-                1 => Cmd::Decode { depth: v >> 27 & 3, signed: v >> 26 & 1 != 0, bit15: v >> 25 & 1 != 0 },
-                2 => Cmd::Quant { color: v & 1 != 0 },
-                3 => Cmd::Scale,
-                _ => return,
+        self.input(&[v]);
+    }
+
+    /// Words in, as the data port, DMA0 or chip mdec's adapters deliver
+    /// them: commands and their parameters, decoded at once (the decode
+    /// function, without the register protocol: phase 1 task 7). How the
+    /// words are split between calls doesn't change what comes out.
+    pub fn input(&mut self, words: &[u32]) {
+        // Halfwords of a decode not decoded yet.
+        let mut fresh = false;
+        for &v in words {
+            let Some((cmd, left)) = self.cmd else {
+                self.command(v);
+                continue;
             };
-            let words = match cmd {
-                Cmd::Decode { .. } => n,
-                Cmd::Quant { color } => if color { 32 } else { 16 },
-                Cmd::Scale => 32,
-            };
-            if words > 0 {
-                self.cmd = Some((cmd, words));
+            match cmd {
+                Cmd::Decode { .. } => {
+                    self.input.push_back(v as u16);
+                    self.input.push_back((v >> 16) as u16);
+                    fresh = true;
+                }
+                _ => self.table_bytes.extend(v.to_le_bytes()),
             }
-            return;
-        };
-        match cmd {
-            Cmd::Decode { .. } => {
-                self.input.push_back(v as u16);
-                self.input.push_back((v >> 16) as u16);
-                self.decode(cmd);
+            if left == 1 {
+                if fresh {
+                    self.decode(cmd);
+                    fresh = false;
+                }
+                self.finish(cmd);
+                self.cmd = None;
+            } else {
+                self.cmd = Some((cmd, left - 1));
             }
-            _ => self.table_bytes.extend(v.to_le_bytes()),
         }
-        if left == 1 {
-            self.finish(cmd);
-            self.cmd = None;
-        } else {
-            self.cmd = Some((cmd, left - 1));
+        if let (true, Some((cmd, _))) = (fresh, self.cmd) {
+            self.decode(cmd);
+        }
+    }
+
+    /// `n` decoded words out, as DMA1 or chip mdec's adapters take them:
+    /// what has been decoded, then zeros (an empty output reads as zero).
+    pub fn output(&mut self, n: usize) -> Vec<u32> {
+        (0..n).map(|_| self.read()).collect()
+    }
+
+    /// A command word, with none in progress.
+    fn command(&mut self, v: u32) {
+        self.word = v;
+        let n = v & 0xFFFF;
+        let cmd = match v >> 29 {
+            1 => Cmd::Decode { depth: v >> 27 & 3, signed: v >> 26 & 1 != 0, bit15: v >> 25 & 1 != 0 },
+            2 => Cmd::Quant { color: v & 1 != 0 },
+            3 => Cmd::Scale,
+            _ => return,
+        };
+        let words = match cmd {
+            Cmd::Decode { .. } => n,
+            Cmd::Quant { color } => if color { 32 } else { 16 },
+            Cmd::Scale => 32,
+        };
+        if words > 0 {
+            self.cmd = Some((cmd, words));
         }
     }
 
@@ -440,5 +475,52 @@ mod tests {
         assert!(r == g && g == b, "grey: {r} {g} {b}");
         assert!(r > 16, "brighter than mid-grey: {r}");
         assert!((1..128).all(|_| m.read() == first), "flat");
+    }
+
+    /// The decode function gives what the data port does, however the
+    /// words are split: a 24-bit decode of two macroblocks with AC terms,
+    /// padding, then a command that runs past its input.
+    #[test]
+    fn input_in_any_split_matches_the_port() {
+        let mut halves: Vec<u16> = Vec::new();
+        for mb in 0..2u16 {
+            for b in 0..6u16 {
+                halves.push((3 + mb) << 10 | (0x30 + 7 * b) & 0x3FF);
+                halves.extend([1 << 10 | 0x3F0, 0x005, 4 << 10 | (b + 1), 0xFE00]);
+            }
+        }
+        halves.resize(64, 0xFE00);
+        let mut words: Vec<u32> = vec![0x3000_0000 | 32];
+        words.extend(halves.chunks(2).map(|p| p[0] as u32 | (p[1] as u32) << 16));
+        // A second decode that wants 40 words and gets 32: still taking
+        // input at the end.
+        words.push(0x3800_0000 | 40);
+        words.extend(words[1..33].to_vec());
+        let run = |splits: &[usize]| {
+            let mut m = Mdec::default();
+            m.control(0x6000_0000);
+            tables(&mut m);
+            let mut at = 0;
+            for &s in splits.iter().chain([&words.len()]) {
+                m.input(&words[at..s]);
+                at = s;
+            }
+            (m.busy(), m.status(), m.macroblocks, m.output(m.available() + 3))
+        };
+        let port = {
+            let mut m = Mdec::default();
+            m.control(0x6000_0000);
+            tables(&mut m);
+            for &w in &words {
+                m.write(w);
+            }
+            (m.busy(), m.status(), m.macroblocks, m.output(m.available() + 3))
+        };
+        assert_eq!(port.2, 4);
+        assert!(port.0, "the second decode waits for input");
+        assert_eq!(port.3[port.3.len() - 3..], [0, 0, 0], "zeros past the output");
+        for splits in [&[][..], &[1], &[7, 8, 9], &[33, 34], &[20, 50, 60]] {
+            assert_eq!(run(splits), port, "split at {splits:?}");
+        }
     }
 }

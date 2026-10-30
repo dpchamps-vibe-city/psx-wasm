@@ -9,6 +9,7 @@
 //!
 //! Scope: libetc's interrupt layer and libapi's `counter.o` (chip irq),
 //! libgpu's `sys.o` (chip gpu), libpad's direct connection (chip sio0),
+//! libpress's MDEC functions (chip mdec),
 //! libapi's `pad.o`/`patch.o`/`first.o`, the libcd data path, and
 //! libcard/libmcx's thin BIOS wrappers.
 //!
@@ -23,6 +24,7 @@ pub mod libetc;
 pub mod libgpu;
 pub mod libmc;
 pub mod libpad;
+pub mod libpress;
 pub mod layout;
 pub mod validated;
 
@@ -64,8 +66,9 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 /// - libcd and libds (D58): the CD controller (`psx_devices::cdc`) takes
 ///   their commands and delivers sectors and XA audio. libcd's adapters
 ///   stay for the objects they are validated against (`adapter-or-device`).
-/// - libpress: the MDEC (`psx_devices::mdec`) decodes what its own code
-///   feeds it by DMA0, and DMA1 takes the pixels.
+/// - libpress, when chip mdec is emulated: the MDEC (`psx_devices::mdec`)
+///   decodes what its own code feeds it by DMA0, and DMA1 takes the
+///   pixels.
 pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress", "libapi"];
 
 /// Event kinds the adapters schedule.
@@ -91,6 +94,7 @@ pub struct Psyq {
     pub etc: libetc::Etc,
     pub pad: libpad::Pad,
     pub gpu: libgpu::Gpu,
+    pub press: libpress::Press,
     /// The guest address of the SDK function the running adapter replaces
     /// (D61): the runtime sets it before each call.
     pub at: u32,
@@ -158,6 +162,7 @@ pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
     v.extend(libetc::ADAPTERS.iter().map(|(n, _)| (*n, "irq")));
     v.extend(libpad::ADAPTERS.iter().map(|(n, _)| (*n, "sio0")));
     v.extend(libgpu::ADAPTERS.iter().map(|(n, _)| (*n, "gpu")));
+    v.extend(libpress::ADAPTERS.iter().map(|(n, _)| (*n, "mdec")));
     v.extend(libcd::ADAPTERS.iter().map(|(n, _)| (*n, "cd")));
     v
 }
@@ -169,6 +174,7 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     v.extend(libetc::ADAPTERS);
     v.extend(libpad::ADAPTERS);
     v.extend(libgpu::ADAPTERS);
+    v.extend(libpress::ADAPTERS);
     v.extend(libcd::ADAPTERS);
     v.extend(libmc::ADAPTERS);
     v
@@ -239,10 +245,14 @@ pub mod testing {
         m
     }
 
-    /// Call an adapter and run its flow to completion.
+    /// Call an adapter and run its flow to completion; then the
+    /// interrupts it held, as the guest's next safepoint takes them.
     pub fn call(m: &mut M, f: Adapter, a: [u32; 4]) -> u32 {
         let r = f(m, a);
-        finish(m, r)
+        let v = finish(m, r);
+        m.release_irq();
+        drain(m);
+        v
     }
 
     std::thread_local! {

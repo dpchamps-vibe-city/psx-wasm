@@ -321,13 +321,54 @@ impl<S: Sdk> Machine<S> {
         let waits = |io: &Io, ch: usize| ch == DMA_MDEC_OUT && io.mdec.busy() && io.mdec.available() < io.dma.words(ch) as usize;
         while let Some(ch) = self.io.as_ref().and_then(|io| (0..7).find(|&c| io.dma.ready(c) && !waits(io, c))) {
             self.dma_transfer(ch)?;
-            let raise = self.io.as_mut().is_some_and(|io| io.dma.complete(ch));
-            S::on_dma(self, ch);
-            if raise {
-                self.raise_irq(irq::DMA);
-            }
+            self.dma_done(ch);
         }
         Ok(())
+    }
+
+    /// Channel `ch`'s transfer is over: the controller's completion (DICR's
+    /// flag when the channel's interrupt is enabled, IRQ3 when the master
+    /// flag rises).
+    pub fn dma_done(&mut self, ch: usize) {
+        let raise = self.io.as_mut().is_some_and(|io| io.dma.complete(ch));
+        S::on_dma(self, ch);
+        if raise {
+            self.raise_irq(irq::DMA);
+        }
+    }
+
+    /// The same for a transfer an adapter moved itself (chip mdec's DMA0
+    /// and DMA1, D64), as the guest register write that starts it on the
+    /// device would end it: IRQ3 held ([`Self::hold_irq`]), so whatever
+    /// DMA callbacks are set run at the guest's next safepoint.
+    pub fn dma_done_held(&mut self, ch: usize) {
+        let raise = self.io.as_mut().is_some_and(|io| io.dma.complete(ch));
+        S::on_dma(self, ch);
+        if raise {
+            self.hold_irq(irq::DMA);
+        }
+    }
+
+    /// Raise interrupt `bit` as a guest register access does: the line
+    /// now, the kernel's handler chains once the adapter's call returns to
+    /// the guest ([`Self::release_irq`]), so the guest's next safepoint
+    /// takes it, not the call's own return (D64).
+    pub fn hold_irq(&mut self, bit: u32) {
+        let Some(io) = self.io.as_mut() else { return };
+        io.irq.raise(bit);
+        self.held_irq = true;
+    }
+
+    /// An adapter's call returns to the guest, or waits: the interrupts it
+    /// held are queued, when still pending and interrupts are enabled, as
+    /// [`Self::raise_irq`] queues them.
+    pub fn release_irq(&mut self) {
+        if !std::mem::take(&mut self.held_irq) {
+            return;
+        }
+        if self.io.as_ref().is_some_and(|io| io.irq.pending()) && !self.crit && !self.in_irq {
+            self.queue_irq_chains();
+        }
     }
 
     fn dma_transfer(&mut self, ch: usize) -> Result<(), String> {
@@ -393,17 +434,18 @@ impl<S: Sdk> Machine<S> {
                 }
             }
             (DMA_MDEC_IN, 0 | 1, true) => {
+                let mut words = Vec::with_capacity(d.words(ch) as usize);
                 for _ in 0..d.words(ch) {
-                    let w = self.mem.r32(addr);
-                    if let Some(io) = self.io.as_mut() {
-                        io.mdec.write(w);
-                    }
+                    words.push(self.mem.r32(addr));
                     addr = addr.wrapping_add(step) & 0x1F_FFFC;
+                }
+                if let Some(io) = self.io.as_mut() {
+                    io.mdec.input(&words);
                 }
             }
             (DMA_MDEC_OUT, 0 | 1, false) => {
-                for _ in 0..d.words(ch) {
-                    let w = self.io.as_mut().map_or(0, |io| io.mdec.read());
+                let words = self.io.as_mut().map_or_else(Vec::new, |io| io.mdec.output(d.words(ch) as usize));
+                for w in words {
                     self.mem.w32(addr, w);
                     addr = addr.wrapping_add(step) & 0x1F_FFFC;
                 }

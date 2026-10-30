@@ -224,6 +224,10 @@ pub struct Machine<S> {
     pub crit: bool,
     /// A callback (interrupt handler) is running: no nested delivery.
     pub in_irq: bool,
+    /// An adapter raised an interrupt the way a guest register access
+    /// does: the kernel takes it at the guest's next safepoint, once the
+    /// adapter's call has returned ([`Self::release_irq`], D64).
+    pub held_irq: bool,
     pub sdk: S,
     /// Calls per BIOS function and adapter, for the run report.
     pub counts: BTreeMap<String, u64>,
@@ -258,6 +262,7 @@ impl<S: Sdk> Machine<S> {
             io: None,
             crit: false,
             in_irq: false,
+            held_irq: false,
             sdk,
             counts: BTreeMap::new(),
             loaded: Vec::new(),

@@ -19,6 +19,7 @@
 
 mod gpu;
 mod irq;
+mod mdec;
 mod sio0;
 
 /// What a case runs against: one game's build, one side.
@@ -49,6 +50,9 @@ pub trait Harness {
 
 /// Free RAM for a case's buffers: below the stack, above game data.
 pub const SCRATCH: u32 = 0x801C_0000;
+/// How much of it cases use: the harness refuses an overlay a case needs
+/// resident (a library a game places in one) that lies over it.
+pub const SCRATCH_LEN: u32 = 0xC000;
 
 pub struct Case {
     pub name: &'static str,
@@ -102,6 +106,7 @@ pub fn all() -> Vec<Case> {
     v.extend(irq::cases());
     v.extend(sio0::cases());
     v.extend(gpu::cases());
+    v.extend(mdec::cases());
     v
 }
 
