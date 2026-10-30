@@ -13,3 +13,6 @@ wasm-encoder = { version = "0.262.0", features = ["wasmparser"] }
 gimli = "0.33.0"
 psxw-cc = { path = "../psxw-cc" }
 serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0.154"

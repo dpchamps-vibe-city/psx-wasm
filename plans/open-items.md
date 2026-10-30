@@ -1,7 +1,7 @@
 # Open items
 
 Every open task, blocked item, human-needed input, unresolved finding and
-erratum, as of 2026-10-29. Milestone history is in [`completed/`](completed/).
+erratum, as of 2026-10-30. Milestone history is in [`completed/`](completed/).
 Each item says what it is, why it's open, and where it came from.
 
 - **Last full gate runs:** `psxw ci btn` passed every gate on 2026-10-27
@@ -262,6 +262,59 @@ disagree`) and 6 (`psxw oracle export`/`import`) are done.
   disc has two tracks, and Track 2 has never been exercised. If it's
   audio, the CD needs a Play path and SPU CD input. *From:* M13 Context,
   Risks, task 14.
+
+## Debug builds of threaded games (D53, D57)
+
+The DWARF repair in `toolchain/binaryen-dwarf/` (plans
+`debug-builds-threaded-games*.md`). Its 2026-10-30 fixes: dead locals
+after a resume, statement rows, the Docker builder.
+- **Rerun the browser and real-game acceptance.** The README's results
+  were recorded with the previous `value-provenance.patch` at `16dafb7`,
+  and main has moved on (emulation changes since). Rerun the bof4
+  `title-to-field`, btn `title-to-gameplay` and `card-load` release/debug
+  comparisons and the three `game-browser.mjs` cases, then update
+  `acceptance.json`. *From:* the 2026-10-30 fixes.
+- **Release cost of FastISel.** Release builds now compile with FastISel
+  and `-g` (D53). Compare bof4's and btn's release `game.wasm` size and
+  replay speed with the previous SelectionDAG builds; `wasm-opt -O2`
+  should recover most of the selection, unmeasured. *From:* the
+  2026-10-30 fixes.
+- **The real-game browser checks prove less than their counts.** bof4's
+  "24 correct, 8 unavailable": all 8 unavailable are `r29`; 4 of the 24
+  are `*(unsigned int*)0x80114a00`, a memory read that uses no variable
+  location; 12 are `r16`–`r18`, which FastISel's DWARF gives as
+  compile-time constants (`DW_OP_constu`), so the Binaryen repair isn't
+  involved. Only the 8 `r2`/`r3` checks go through it, and every check
+  expects the same value at every hit, so a wrong location holding that
+  value passes. Add checks whose value changes between hits, and a
+  variable dead across a switch. *From:* review of the threaded DWARF
+  repair, 2026-10-30.
+- **Game facts in the toolchain directory.** The browser cases
+  `toolchain/binaryen-dwarf/tests/{bof4,btn,bof4-mod}.json` hold disc file
+  names, guest addresses, decomp line numbers and pinned SHAs; they belong
+  under `games/<id>/`. A comment in `psxw-link/src/dwarf.rs` names a btn
+  function (`ClearVramRectAndWait`). *From:* the same review.
+- **The browser checks aren't a `psxw` command.** `game-browser.mjs`
+  needs Puppeteer, a Chromium and the extension by environment variable,
+  and re-implements the host's imports (replay offsets, disc reads) rather
+  than using `web/`'s, so it will drift. *From:* the same review.
+- **Debug metadata cost.** Location lists now have an entry per original
+  opcode. Moddable debug bof4 was 580 MB (527 MB DWARF) and peaked at
+  18.5 GB RSS building, with no unpatched baseline to compare. Leads:
+  merge entries separated only by Flatten's temporaries; the reader runs
+  a second full `dwarf2yaml` just to find stack-location ranges and copies
+  every `.debug_*` section; `psxw-link`'s `opcode_ends` keeps a BTreeMap
+  entry per output opcode. *From:* the same review.
+- **`CodeMap::exclude_expansions` misses same-size rewrites.** Its
+  pre-filter (`d - b > c - a`) skips an input instruction rewritten into
+  several opcodes that aren't longer in bytes, as when padded relocation
+  LEBs compact. The `first_end < end` test after it is exact on its own.
+  *From:* the same review.
+- **Leftovers in `.worktrees/main-wt-1/.toolchain/`** from the repair's
+  research, about 3.3 GB: `llvm-dwarf` (an LLVM source tree, 2.9 GB),
+  `binaryen-dwarf-{build,source,reference}`, `native-build-env`,
+  `dl-dwarf`, and `binaryen-dwarf-<hash>` builds of earlier patches. Only
+  the newest `binaryen-dwarf-<hash>` is used. *From:* the same review.
 
 ## Bugs
 

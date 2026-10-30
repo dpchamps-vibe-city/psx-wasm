@@ -71,7 +71,7 @@ pub fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

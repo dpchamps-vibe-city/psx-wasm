@@ -16,6 +16,14 @@ dist = "binaryen-version_133"
 url = "https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz"
 sha256 = "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489"
 
+[toolchain.binaryen-src]
+# The same Binaryen's source (fba5005, version 133). Threaded games' debug
+# builds patch it to keep the DWARF through Asyncify and build it in Docker
+# (psxw_inputs::toolchain::dwarf_binaryen, toolchain/binaryen-dwarf/).
+dist = "binaryen-fba5005a132d85d578be5bd010e0487ed8e2ce3e"
+url = "https://codeload.github.com/WebAssembly/binaryen/tar.gz/fba5005a132d85d578be5bd010e0487ed8e2ce3e"
+sha256 = "02ac4342e030c85a1849f3d0094c04cfa04c9ec11e5978f70349a588a659eac5"
+
 [toolchain.wasm-bindgen]
 # The wasm-bindgen CLI, the same version as the wasm-bindgen crate in
 # Cargo.lock (glow's web backend); generates the browser host's JS glue.

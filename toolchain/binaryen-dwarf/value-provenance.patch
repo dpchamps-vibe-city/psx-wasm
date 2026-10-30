@@ -1,0 +1,1417 @@
+diff --git a/src/passes/Asyncify.cpp b/src/passes/Asyncify.cpp
+index 94a3261..406ef43 100644
+--- a/src/passes/Asyncify.cpp
++++ b/src/passes/Asyncify.cpp
+@@ -799,6 +799,8 @@ public:
+     onlyList.checkPatternsMatches();
+   }
+ 
++  bool changesState(Function* func) { return map[func].canChangeState; }
++
+   bool needsInstrumentation(Function* func) {
+     auto& info = map[func];
+     return info.canChangeState && !info.isTopMostRuntime;
+@@ -1847,6 +1849,7 @@ struct Asyncify : public Pass {
+     // below only need to run there.
+     PassUtils::FuncSet instrumentedFuncs;
+     for (auto& func : module->functions) {
++      func->debugCanChangeAsyncifyState = analyzer.changesState(func.get());
+       if (analyzer.needsInstrumentation(func.get())) {
+         instrumentedFuncs.insert(func.get());
+       }
+diff --git a/src/passes/Flatten.cpp b/src/passes/Flatten.cpp
+index 10c791f..64c8f58 100644
+--- a/src/passes/Flatten.cpp
++++ b/src/passes/Flatten.cpp
+@@ -349,7 +349,12 @@ struct Flatten
+       // use a local
+       auto type = curr->type;
+       Index temp = builder.addVar(getFunction(), type);
+-      ourPreludes.push_back(builder.makeLocalSet(temp, curr));
++      auto* spill = builder.makeLocalSet(temp, curr);
++      ourPreludes.push_back(spill);
++      if (!getFunction()->debugInputStacks.empty() &&
++          getFunction()->expressionLocations.contains(curr)) {
++        getFunction()->debugValueSpills[curr] = {temp, spill};
++      }
+       replaceCurrent(builder.makeLocalGet(temp, type));
+     }
+ 
+@@ -369,6 +374,7 @@ struct Flatten
+   }
+ 
+   void visitFunction(Function* curr) {
++    curr->debugValuesFlattened = true;
+     auto* originalBody = curr->body;
+     // if the body is a block with a result, turn that into a return
+     if (curr->body->type.isConcrete()) {
+diff --git a/src/wasm-binary.h b/src/wasm-binary.h
+index eb53aab..5616743 100644
+--- a/src/wasm-binary.h
++++ b/src/wasm-binary.h
+@@ -1595,6 +1595,7 @@ class WasmBinaryReader {
+ 
+   bool debugInfo = true;
+   bool DWARF = false;
++  std::vector<BinaryLocations::Span> debugStackRanges;
+   bool skipFunctionBodies = false;
+ 
+   // Internal state.
+diff --git a/src/wasm-debug.h b/src/wasm-debug.h
+index c76afb2..c82eb7e 100644
+--- a/src/wasm-debug.h
++++ b/src/wasm-debug.h
+@@ -39,6 +39,9 @@ void dumpDWARF(const Module& wasm);
+ // will disable optimizations that currently cause issues with debug info.)
+ bool shouldPreserveDWARF(PassOptions& options, Module& wasm);
+ 
++// Input PC intervals whose location expressions reference the operand stack.
++std::vector<BinaryLocations::Span> stackLocationRanges(const Module& wasm);
++
+ // Update the DWARF sections.
+ void writeDWARFSections(Module& wasm, const BinaryLocations& newLocations);
+ 
+diff --git a/src/wasm-ir-builder.h b/src/wasm-ir-builder.h
+index a5f3ccd..cdf8eca 100644
+--- a/src/wasm-ir-builder.h
++++ b/src/wasm-ir-builder.h
+@@ -84,6 +84,9 @@ public:
+     this->codeSectionOffset = codeSectionOffset;
+   }
+ 
++  // Snapshot single-value producer identities at a relevant input PC.
++  void recordDebugInputStack(BinaryLocation pc);
++
+   // The current function, used to create scratch locals, add annotations, etc.
+   void setFunction(Function* func) { this->func = func; }
+ 
+diff --git a/src/wasm.h b/src/wasm.h
+index 3007b07..4fa0285 100644
+--- a/src/wasm.h
++++ b/src/wasm.h
+@@ -2486,6 +2486,18 @@ public:
+     delimiterLocations;
+   BinaryLocations::FunctionLocations funcLocation;
+ 
++  // DWARF operand-stack identities, only at PCs used by stack locations.
++  std::map<BinaryLocation, std::vector<Expression*>> debugInputStacks;
++  struct DebugValueSpill {
++    Index local;
++    Expression* assignment;
++  };
++  std::unordered_map<Expression*, DebugValueSpill> debugValueSpills;
++  bool debugValuesFlattened = false;
++  // Asyncify's own effect summary, including its import/only-list contract.
++  // Unknown after other transformations must remain conservative.
++  std::optional<bool> debugCanChangeAsyncifyState;
++
+   // Annotations on expressions. As with debug info, we do not store these on
+   // Expressions as we assume most instances are unannotated, and do not want to
+   // add constant memory overhead.
+diff --git a/src/wasm/wasm-binary.cpp b/src/wasm/wasm-binary.cpp
+index fa857fd..022dff8 100644
+--- a/src/wasm/wasm-binary.cpp
++++ b/src/wasm/wasm-binary.cpp
+@@ -2192,6 +2192,7 @@ void WasmBinaryReader::preScan() {
+   getInt32(); // version
+ 
+   bool foundDWARF = false;
++  Module debugSections;
+ 
+   while (more()) {
+     uint8_t sectionCode = getInt8();
+@@ -2217,6 +2218,11 @@ void WasmBinaryReader::preScan() {
+         // DWARF sections contain code offsets.
+         needCodeLocations = true;
+         foundDWARF = true;
++        CustomSection section;
++        section.name = sectionName.toString();
++        section.data.assign(input.begin() + pos,
++                            input.begin() + oldPos + payloadLen);
++        debugSections.customSections.push_back(std::move(section));
+       } else if (debugInfo &&
+                  sectionName == BinaryConsts::CustomSections::Name) {
+         readNames(oldPos, payloadLen);
+@@ -2235,6 +2241,10 @@ void WasmBinaryReader::preScan() {
+     DWARF = false;
+   }
+ 
++  if (foundDWARF) {
++    debugStackRanges = Debug::stackLocationRanges(debugSections);
++  }
++
+   // Reset.
+   pos = 0;
+ }
+@@ -3474,6 +3484,15 @@ void WasmBinaryReader::readFunctions() {
+           throwError(err->msg);
+         }
+         while (pos < endOfFunction) {
++          auto pc = pos - codeSectionLocation;
++          auto range = std::upper_bound(
++            debugStackRanges.begin(), debugStackRanges.end(), pc,
++            [](size_t pc, const BinaryLocations::Span& range) {
++              return pc < range.start;
++            });
++          if (range != debugStackRanges.begin() && pc < std::prev(range)->end) {
++            builder.recordDebugInputStack(pc);
++          }
+           auto inst = readInst();
+           if (auto* err = inst.getErr()) {
+             throwError(err->msg);
+diff --git a/src/wasm/wasm-debug.cpp b/src/wasm/wasm-debug.cpp
+index 5db5b2e..ce32a29 100644
+--- a/src/wasm/wasm-debug.cpp
++++ b/src/wasm/wasm-debug.cpp
+@@ -36,6 +36,11 @@
+ #endif
+ 
+ #include "llvm/ObjectYAML/DWARFYAML.h"
++#include "llvm/Support/LEB128.h"
++#include "../../third_party/llvm-project/DWARFVisitor.h"
++#include "llvm/DebugInfo/DWARF/DWARFExpression.h"
++#include "cfg/cfg-traversal.h"
++#include "ir/properties.h"
+ #include "llvm/include/llvm/DebugInfo/DWARFContext.h"
+ 
+ std::error_code dwarf2yaml(llvm::DWARFContext& DCtx, llvm::DWARFYAML::Data& Y);
+@@ -289,9 +294,9 @@ struct LineState {
+   }
+ 
+   bool needToEmit() {
+-    // Zero values imply we can ignore this line.
+-    // https://github.com/WebAssembly/debugging/issues/9#issuecomment-567720872
+-    return line != 0 && addr != 0;
++    // Address zero is a tombstone. Line zero is an explicit source gap;
++    // dropping it incorrectly attributes following code to the preceding row.
++    return addr != 0;
+   }
+ 
+   // Given an old state, emit the diff from it to this state into a new line
+@@ -685,6 +690,9 @@ struct LocationUpdater {
+   }
+ };
+ 
++#include "wasm-dwarf-values.h"
++#include "wasm-dwarf-rebuild.h"
++
+ static bool isNonzeroTombstone(BinaryLocation location) {
+   return location == AllOnesAddress || location == LegacyTombstoneAddress;
+ }
+@@ -703,7 +711,8 @@ static void updateDebugLines(llvm::DWARFYAML::Data& data,
+     LineState state(table, sequenceId);
+     // All the addresses we need to write out.
+     std::vector<BinaryLocation> newAddrs;
+-    std::unordered_map<BinaryLocation, LineState> newAddrInfo;
++    std::map<BinaryLocation, LineState> newAddrInfo;
++    std::map<BinaryLocation, LineState> inputRows;
+     // If the address was zeroed out, we must omit the entire range (we could
+     // also leave it unchanged, so that the debugger ignores it based on the
+     // initial zero; but it's easier and better to just not emit it at all).
+@@ -724,6 +733,7 @@ static void updateDebugLines(llvm::DWARFYAML::Data& data,
+         // An expression may not exist for this line table item, if we optimized
+         // it away.
+         BinaryLocation oldAddr = state.addr;
++        inputRows.insert_or_assign(oldAddr, state);
+         BinaryLocation newAddr = 0;
+         if (locationUpdater.hasOldExprStart(oldAddr)) {
+           newAddr = locationUpdater.getNewExprStart(oldAddr);
+@@ -765,6 +775,73 @@ static void updateDebugLines(llvm::DWARFYAML::Data& data,
+         }
+       }
+     }
++    // Flatten/Asyncify add instructions with no source provenance. Describe
++    // only surviving original opcode spans, not the enclosing IR subtree or
++    // an interval stretching through unwind/rewind scaffolding. Restore the
++    // original row at each following opcode and insert explicit line-zero gaps.
++    for (auto& func : locationUpdater.wasm.functions) {
++      if (!func->debugValuesFlattened || func->imported()) {
++        continue;
++      }
++      auto first = inputRows.lower_bound(func->funcLocation.declarations);
++      if (first == inputRows.end() || first->first >= func->funcLocation.end) {
++        continue;
++      }
++      auto output = locationUpdater.newLocations.functions.find(func.get());
++      if (output == locationUpdater.newLocations.functions.end()) {
++        continue;
++      }
++      newAddrInfo.erase(newAddrInfo.lower_bound(output->second.declarations),
++                        newAddrInfo.lower_bound(output->second.end));
++      LineState gap = first->second;
++      gap.line = gap.col = gap.discriminator = 0;
++      gap.isStmt = gap.basicBlock = gap.prologueEnd = gap.epilogueBegin = false;
++      // An input row starts one statement, so its flags go only to the
++      // first output opcode it covers. Its other opcodes (which Flatten may
++      // also have moved, e.g. past a call) continue it. Copying is_stmt to
++      // each of them would stop a line breakpoint once per opcode.
++      std::vector<std::pair<BinaryLocation, LineState>> rows;
++      std::unordered_map<BinaryLocation, BinaryLocation> starts;
++      for (auto& [expr, input] : func->expressionLocations) {
++        if (Properties::isControlFlowStructure(expr)) {
++          continue;
++        }
++        auto point = locationUpdater.newLocations.expressions.find(expr);
++        auto source = inputRows.upper_bound(input.start);
++        if (point == locationUpdater.newLocations.expressions.end() ||
++            source == inputRows.begin() || point->second.start >= point->second.end) {
++          continue;
++        }
++        --source;
++        if (source->first < func->funcLocation.declarations) {
++          continue;
++        }
++        auto row = source->second;
++        row.addr = point->second.start;
++        rows.emplace_back(source->first, row);
++        auto [start, inserted] = starts.try_emplace(source->first, row.addr);
++        start->second = std::min(start->second, row.addr);
++        auto zero = gap;
++        zero.addr = point->second.end;
++        newAddrInfo.insert_or_assign(zero.addr, zero);
++      }
++      // Starts override gaps at adjacent original opcode boundaries.
++      for (auto& [from, row] : rows) {
++        if (starts.at(from) != row.addr) {
++          row.isStmt = row.basicBlock = row.prologueEnd = row.epilogueBegin =
++            false;
++        }
++        newAddrInfo.insert_or_assign(row.addr, row);
++      }
++      gap.addr = output->second.declarations;
++      newAddrInfo.try_emplace(gap.addr, gap);
++      gap.addr = output->second.end;
++      newAddrInfo.try_emplace(gap.addr, gap);
++    }
++    newAddrs.clear();
++    for (auto& [pc, state] : newAddrInfo) {
++      newAddrs.push_back(pc);
++    }
+     // Sort the new addresses (which may be substantially different from the
+     // original layout after optimization).
+     std::sort(newAddrs.begin(), newAddrs.end());
+@@ -880,7 +957,7 @@ static void updateDIE(const llvm::DWARFDebugInfoEntry& DIE,
+         // This is an offset into the debug line section.
+         yamlValue.Value =
+           locationUpdater.getNewDebugLineLocation(yamlValue.Value);
+-      } else if (attr == llvm::dwarf::DW_AT_location &&
++      } else if (isLocationListAttribute(attr) &&
+                  attrSpec.Form == llvm::dwarf::DW_FORM_sec_offset) {
+         BinaryLocation locOffset = yamlValue.Value;
+         locationUpdater.locToUnitMap[locOffset] = compileUnitIndex;
+@@ -1428,6 +1505,81 @@ static void updateLoc(llvm::DWARFYAML::Data& yaml,
+   }
+ }
+ 
++// Rebuild lists, including their base and termination records, then rewrite
++// every DIE reference. Changing a local index may change its LEB byte count;
++// splitting a range must not leave subsequent variables pointing into it.
++static void updateValueLocations(llvm::DWARFYAML::Data& data,
++                                 const LocationUpdater& updater,
++                                 const BinaryenDWARFInfo& info) {
++  ValueLocationUpdater values(updater, info);
++  std::unordered_map<uint64_t, uint64_t> offsets;
++  std::vector<llvm::DWARFYAML::Loc> output, list;
++  uint64_t offset = 0;
++  uint32_t base = 0;
++  bool atStart = true;
++  auto append = [&](llvm::DWARFYAML::Loc loc) {
++    offset += 8;
++    if (loc.Start != uint32_t(-1) && (loc.Start || loc.End)) {
++      offset += 2 + loc.Location.size();
++    }
++    output.push_back(std::move(loc));
++  };
++  for (auto& loc : data.Locs) {
++    if (atStart) {
++      offsets.emplace(loc.CompileUnitOffset, offset);
++      base = updater.getCompileUnitBasesForLoc(loc.CompileUnitOffset).first;
++      append({uint32_t(-1), 0, {}, 0});
++      atStart = false;
++    }
++    if (loc.Start == uint32_t(-1)) {
++      base = loc.End;
++    } else if (loc.Start == 0 && loc.End == 0) {
++      std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
++        return std::tie(a.Start, a.End) < std::tie(b.Start, b.End);
++      });
++      for (auto& entry : list) {
++        append(std::move(entry));
++      }
++      list.clear();
++      append({0, 0, {}, 0});
++      atStart = true;
++    } else if (uint64_t(loc.End) + base <= uint32_t(-1)) {
++      auto entries = values.relocate(loc, loc.Start + base, loc.End + base);
++      list.insert(list.end(), std::make_move_iterator(entries.begin()),
++                  std::make_move_iterator(entries.end()));
++    }
++  }
++  if (!atStart) {
++    Fatal() << "Unterminated DWARF location list";
++  }
++  std::map<AbbrevKey, const llvm::DWARFYAML::Abbrev*> abbrevs;
++  for (auto& abbrev : data.AbbrevDecls) {
++    abbrevs[{abbrev.ListOffset, abbrev.Code}] = &abbrev;
++  }
++  for (auto& cu : data.CompileUnits) {
++    for (auto& entry : cu.Entries) {
++      auto foundAbbrev = abbrevs.find({cu.AbbrOffset, entry.AbbrCode});
++      if (foundAbbrev == abbrevs.end()) {
++        continue;
++      }
++      auto* abbrev = foundAbbrev->second;
++      for (size_t i = 0; i < abbrev->Attributes.size(); ++i) {
++        auto attr = abbrev->Attributes[i];
++        if (isLocationListAttribute(attr.Attribute) &&
++            attr.Form == llvm::dwarf::DW_FORM_sec_offset) {
++          auto found = offsets.find(entry.Values[i].Value);
++          if (found == offsets.end()) {
++            Fatal() << "Unmapped DWARF location-list reference";
++          }
++          entry.Values[i].Value = found->second;
++        }
++      }
++    }
++  }
++  data.Locs.swap(output);
++  rebuildInlineLocations(data, info, values, offset);
++}
++
+ void writeDWARFSections(Module& wasm, const BinaryLocations& newLocations) {
+   BinaryenDWARFInfo info(wasm);
+ 
+@@ -1460,7 +1612,12 @@ void writeDWARFSections(Module& wasm, const BinaryLocations& newLocations) {
+     repairDIEAddressRanges(info, data, locationUpdater);
+   }
+ 
+-  updateLoc(data, locationUpdater);
++  if (std::any_of(wasm.functions.begin(), wasm.functions.end(),
++                  [](const auto& f) { return f->debugValuesFlattened; })) {
++    updateValueLocations(data, locationUpdater, info);
++  } else {
++    updateLoc(data, locationUpdater);
++  }
+ 
+   // Convert to binary sections.
+   auto newSections =
+@@ -1492,6 +1649,10 @@ void writeDWARFSections(Module& wasm, const BinaryLocations& newLocations) {
+ 
+ bool shouldPreserveDWARF(PassOptions& options, Module& wasm) { return false; }
+ 
++std::vector<BinaryLocations::Span> stackLocationRanges(const Module& wasm) {
++  return {};
++}
++
+ #endif // BUILD_LLVM_DWARF
+ 
+ } // namespace wasm::Debug
+diff --git a/src/wasm/wasm-dwarf-rebuild.h b/src/wasm/wasm-dwarf-rebuild.h
+new file mode 100644
+index 0000000..1c2f8fb
+--- /dev/null
++++ b/src/wasm/wasm-dwarf-rebuild.h
+@@ -0,0 +1,284 @@
++/*
++ * Copyright 2026 WebAssembly Community Group participants
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Inline expressions have implicit scope-wide validity. Turn them into lists
++// before emitting transformed code: even an unchanged local/frame base must
++// not describe synthetic unwind/rewind instructions. Rebuild DIE references,
++// not just the section length, when an expression becomes a list reference.
++using AbbrevKey = std::pair<uint64_t, uint64_t>;
++
++struct DebugInfoLayout : llvm::DWARFYAML::Visitor {
++  uint64_t offset = 0, base = 0, header = 0;
++  std::vector<uint64_t> units, entries;
++  DebugInfoLayout(llvm::DWARFYAML::Data& data)
++    : llvm::DWARFYAML::Visitor(data) {
++    traverseDebugInfo();
++  }
++  void onStartCompileUnit(llvm::DWARFYAML::Unit& cu) override {
++    base = offset;
++    units.push_back(base);
++    header = cu.Length.isDWARF64() ? 12 : 4;
++    offset += header + (cu.Version >= 5 ? 8 : 7);
++  }
++  void onEndCompileUnit(llvm::DWARFYAML::Unit& cu) override {
++    cu.Length.setLength(offset - base - header);
++  }
++  void onStartDIE(llvm::DWARFYAML::Unit&,
++                  llvm::DWARFYAML::Entry& die) override {
++    entries.push_back(offset);
++    offset += llvm::getULEB128Size(die.AbbrCode);
++  }
++  void onValue(uint8_t) override { ++offset; }
++  void onValue(uint16_t) override { offset += 2; }
++  void onValue(uint32_t) override { offset += 4; }
++  void onValue(uint64_t value, bool leb = false) override {
++    offset += leb ? llvm::getULEB128Size(value) : 8;
++  }
++  void onValue(int64_t value, bool leb = false) override {
++    offset += leb ? llvm::getSLEB128Size(value) : 8;
++  }
++  void onValue(llvm::StringRef value) override { offset += value.size() + 1; }
++  void onValue(llvm::MemoryBufferRef value) override {
++    offset += value.getBufferSize();
++  }
++};
++
++static void rebuildInlineLocations(llvm::DWARFYAML::Data& data,
++                                   const BinaryenDWARFInfo& info,
++                                   ValueLocationUpdater& values,
++                                   uint64_t locOffset) {
++  std::map<AbbrevKey, llvm::DWARFYAML::Abbrev> abbrevs;
++  std::map<uint64_t, uint64_t> nextCodes;
++  for (auto& abbrev : data.AbbrevDecls) {
++    if (abbrev.Code) {
++      abbrevs[{abbrev.ListOffset, abbrev.Code}] = abbrev;
++      nextCodes[abbrev.ListOffset] =
++        std::max(nextCodes[abbrev.ListOffset], uint64_t(abbrev.Code) + 1);
++    }
++  }
++  // Original references are immutable across the layout fixed point.
++  struct Reference {
++    llvm::DWARFYAML::FormValue* value;
++    uint64_t target, unit;
++    bool absolute;
++  };
++  std::vector<Reference> refs;
++  std::vector<uint64_t> oldEntries, oldUnits;
++  size_t unitIndex = 0;
++  bool changed = false;
++  auto append = [&](llvm::DWARFYAML::Loc loc) {
++    locOffset += 8;
++    if (loc.Start != uint32_t(-1) && (loc.Start || loc.End)) {
++      locOffset += 2 + loc.Location.size();
++    }
++    data.Locs.push_back(std::move(loc));
++  };
++  for (auto& cu : info.context->compile_units()) {
++    auto& unit = data.CompileUnits[unitIndex++];
++    oldUnits.push_back(cu->getOffset());
++    struct Scope {
++      FunctionValueLocations* function = nullptr;
++      std::vector<BinaryLocations::Span> ranges;
++    };
++    std::vector<Scope> parents;
++    size_t entryIndex = 0;
++    for (auto& die : cu->dies()) {
++      auto& entry = unit.Entries[entryIndex++];
++      oldEntries.push_back(die.getOffset());
++      if (!entry.AbbrCode) {
++        continue;
++      }
++      auto depth = die.getDepth();
++      if (parents.size() > depth) {
++        parents.resize(depth);
++      }
++      Scope scope = parents.empty() ? Scope{} : parents.back();
++      auto dwarfDie = llvm::DWARFDie(cu.get(), &die);
++      auto ranges = dwarfDie.getAddressRanges();
++      if (!ranges) {
++        llvm::consumeError(ranges.takeError());
++        scope.ranges.clear();
++      } else if (!ranges->empty()) {
++        scope.ranges.clear();
++        for (auto range : *ranges) {
++          if (range.LowPC < range.HighPC && range.HighPC <= UINT32_MAX) {
++            scope.ranges.push_back(
++              {uint32_t(range.LowPC), uint32_t(range.HighPC)});
++          }
++        }
++      }
++      if (die.getTag() == llvm::dwarf::DW_TAG_subprogram &&
++          dwarfDie.find(llvm::dwarf::DW_AT_low_pc)) {
++        scope.function = scope.ranges.empty()
++                           ? nullptr
++                           : values.find(scope.ranges.front().start);
++      }
++      parents.push_back(scope);
++      auto original = abbrevs.at({unit.AbbrOffset, entry.AbbrCode});
++      auto replacement = original;
++      bool replaced = false;
++      for (size_t i = 0; i < original.Attributes.size(); ++i) {
++        auto attr = original.Attributes[i];
++        auto& value = entry.Values[i];
++        switch (attr.Form) {
++          case llvm::dwarf::DW_FORM_ref1:
++          case llvm::dwarf::DW_FORM_ref2:
++          case llvm::dwarf::DW_FORM_ref4:
++          case llvm::dwarf::DW_FORM_ref8:
++          case llvm::dwarf::DW_FORM_ref_udata:
++            refs.push_back(
++              {&value, value.Value + cu->getOffset(), cu->getOffset(), false});
++            break;
++          case llvm::dwarf::DW_FORM_ref_addr:
++            refs.push_back({&value, value.Value, cu->getOffset(), true});
++            break;
++          default:
++            break;
++        }
++        if (!scope.function || !isLocationListAttribute(attr.Attribute) ||
++            attr.Form != llvm::dwarf::DW_FORM_exprloc) {
++          continue;
++        }
++        if (unit.Version != 4 || unit.AddrSize != 4 ||
++            unit.Length.isDWARF64()) {
++          Fatal() << "Flatten value repair requires wasm32 DWARF 4";
++        }
++        std::vector<uint8_t> bytes(value.BlockData.begin(),
++                                   value.BlockData.end());
++        std::vector<ValueLocationOp> ops;
++        // LLDB's wasm register-backed frame base is consumed directly from
++        // exprloc; its generic location-list frame-base evaluator does not
++        // implement DW_OP_WASM_location. Keep this original-local identity.
++        // All dependent variable expressions are still split into proven
++        // normal-only opcode intervals, so no synthetic PC exposes a value.
++        if (attr.Attribute == llvm::dwarf::DW_AT_frame_base &&
++            decodeValueLocation(bytes, ops) && ops.size() == 2 && ops[0].wasm &&
++            ((ops[0].kind == 0 &&
++              ops[0].index < scope.function->func->getNumLocals()) ||
++             (ops[0].kind == 1 &&
++              ops[0].index < values.updater.wasm.globals.size())) &&
++            bytes[ops[1].begin] == llvm::dwarf::DW_OP_stack_value) {
++          continue;
++        }
++        auto start = locOffset;
++        append({uint32_t(-1), 0, {}, 0});
++        for (auto range : scope.ranges) {
++          auto locations = values.relocate(
++            {range.start, range.end, bytes, 0}, range.start, range.end);
++          for (auto& loc : locations) {
++            append(std::move(loc));
++          }
++        }
++        append({0, 0, {}, 0});
++        value.BlockData.clear();
++        value.Value = start;
++        replacement.Attributes[i].Form = llvm::dwarf::DW_FORM_sec_offset;
++        replaced = changed = true;
++      }
++      if (replaced) {
++        // Reuse identical replacement shapes within this abbreviation table.
++        auto begin = abbrevs.lower_bound({unit.AbbrOffset, 0});
++        auto end = abbrevs.upper_bound({unit.AbbrOffset, UINT64_MAX});
++        auto found = std::find_if(begin, end, [&](auto& item) {
++          auto& a = item.second;
++          if (a.ListOffset != replacement.ListOffset ||
++              a.Tag != replacement.Tag || a.Children != replacement.Children ||
++              a.Attributes.size() != replacement.Attributes.size()) {
++            return false;
++          }
++          for (size_t i = 0; i < a.Attributes.size(); ++i) {
++            if (a.Attributes[i].Attribute !=
++                  replacement.Attributes[i].Attribute ||
++                a.Attributes[i].Form != replacement.Attributes[i].Form ||
++                a.Attributes[i].Value != replacement.Attributes[i].Value) {
++              return false;
++            }
++          }
++          return true;
++        });
++        if (found == end) {
++          replacement.Code = nextCodes[unit.AbbrOffset]++;
++          entry.AbbrCode = replacement.Code;
++          abbrevs[{unit.AbbrOffset, replacement.Code}] = std::move(replacement);
++        } else {
++          entry.AbbrCode = found->second.Code;
++        }
++      }
++    }
++  }
++  if (!changed) {
++    return;
++  }
++  // Rebuild abbreviation tables and their CU offsets too.
++  data.AbbrevDecls.clear();
++  std::map<uint64_t, uint64_t> abbrevOffsets;
++  uint64_t offset = 0, current = UINT64_MAX;
++  for (auto& [key, abbrev] : abbrevs) {
++    if (key.first != current) {
++      if (current != UINT64_MAX) {
++        data.AbbrevDecls.push_back({0, {}, {}, {}, abbrevOffsets.at(current)});
++        ++offset;
++      }
++      current = key.first;
++      abbrevOffsets[current] = offset;
++    }
++    abbrev.ListOffset = abbrevOffsets.at(current);
++    offset +=
++      llvm::getULEB128Size(abbrev.Code) + llvm::getULEB128Size(abbrev.Tag) + 1;
++    for (auto attr : abbrev.Attributes) {
++      offset +=
++        llvm::getULEB128Size(attr.Attribute) + llvm::getULEB128Size(attr.Form);
++      if (attr.Form == llvm::dwarf::DW_FORM_implicit_const) {
++        offset += llvm::getSLEB128Size(attr.Value);
++      }
++    }
++    offset += 2;
++    data.AbbrevDecls.push_back(abbrev);
++  }
++  data.AbbrevDecls.push_back({0, {}, {}, {}, abbrevOffsets.at(current)});
++  for (auto& unit : data.CompileUnits) {
++    unit.AbbrOffset = abbrevOffsets.at(unit.AbbrOffset);
++  }
++  // Fixed-width references converge immediately; ref_udata may change size.
++  // Always map from the ORIGINAL target, never from a previous iteration.
++  for (unsigned iteration = 0; iteration < 32; ++iteration) {
++    DebugInfoLayout layout(data);
++    std::unordered_map<uint64_t, uint64_t> entries, units;
++    for (size_t i = 0; i < oldEntries.size(); ++i) {
++      entries[oldEntries[i]] = layout.entries[i];
++    }
++    for (size_t i = 0; i < oldUnits.size(); ++i) {
++      units[oldUnits[i]] = layout.units[i];
++    }
++    bool stable = true;
++    for (auto& ref : refs) {
++      if (!entries.contains(ref.target)) {
++        Fatal() << "Unmapped DWARF DIE reference";
++      }
++      auto target =
++        entries.at(ref.target) - (ref.absolute ? 0 : units.at(ref.unit));
++      stable &= ref.value->Value == target;
++      ref.value->Value = target;
++    }
++    if (stable) {
++      for (auto& arange : data.ARanges) {
++        arange.CuOffset = units.at(arange.CuOffset);
++      }
++      return;
++    }
++  }
++  Fatal() << "DWARF DIE layout did not converge";
++}
+diff --git a/src/wasm/wasm-dwarf-values.h b/src/wasm/wasm-dwarf-values.h
+new file mode 100644
+index 0000000..60b01a2
+--- /dev/null
++++ b/src/wasm/wasm-dwarf-values.h
+@@ -0,0 +1,679 @@
++/*
++ * Copyright 2026 WebAssembly Community Group participants
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// PSXW Binaryen 133 candidate repair. Included by wasm-debug.cpp after
++// LocationUpdater. No executable instructions are added by this analysis.
++
++// Decode whole expressions. In particular, WASM indices are ULEBs, not bytes.
++// Keep unknown expressions unavailable rather than retaining a stale location.
++struct ValueLocationOp {
++  size_t begin, end;
++  bool wasm = false;
++  uint32_t kind = 0, index = 0;
++};
++
++static bool readLocationULEB(const std::vector<uint8_t>& bytes,
++                             size_t& at,
++                             uint32_t& value) {
++  value = 0;
++  for (unsigned shift = 0; shift < 35; shift += 7) {
++    if (at == bytes.size()) {
++      return false;
++    }
++    auto byte = bytes[at++];
++    if (shift == 28 && (byte & 0xf0)) {
++      return false;
++    }
++    value |= uint32_t(byte & 0x7f) << shift;
++    if (!(byte & 0x80)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++static void writeLocationULEB(std::vector<uint8_t>& bytes, uint32_t value) {
++  do {
++    auto byte = uint8_t(value & 0x7f);
++    value >>= 7;
++    bytes.push_back(byte | (value ? 0x80 : 0));
++  } while (value);
++}
++
++static bool decodeValueLocation(const std::vector<uint8_t>& bytes,
++                                std::vector<ValueLocationOp>& ops) {
++  llvm::StringRef data(reinterpret_cast<const char*>(bytes.data()),
++                       bytes.size());
++  llvm::DWARFExpression expr(llvm::DataExtractor(data, true, 4), 4, 4);
++  size_t begin = 0;
++  for (auto op : expr) {
++    if (op.isError() || op.getEndOffset() > bytes.size() ||
++        op.getEndOffset() <= begin) {
++      return false;
++    }
++    // Relative expression branches need their own displacement relocation.
++    // Nested entry values need provenance at entry, not the current PC.
++    if (op.getCode() == llvm::dwarf::DW_OP_bra ||
++        op.getCode() == llvm::dwarf::DW_OP_skip ||
++        op.getCode() == llvm::dwarf::DW_OP_entry_value ||
++        op.getCode() == llvm::dwarf::DW_OP_GNU_entry_value) {
++      return false;
++    }
++    ValueLocationOp result{begin, size_t(op.getEndOffset())};
++    if (op.getCode() == llvm::dwarf::DW_OP_WASM_location) {
++      result.wasm = true;
++      size_t at = begin + 1;
++      if (!readLocationULEB(bytes, at, result.kind) || result.kind > 2 ||
++          !readLocationULEB(bytes, at, result.index) || at != result.end) {
++        return false;
++      }
++    }
++    ops.push_back(result);
++    begin = result.end;
++  }
++  return begin == bytes.size();
++}
++
++static bool hasStackLocation(const std::vector<ValueLocationOp>& ops) {
++  return std::any_of(ops.begin(), ops.end(), [](const auto& op) {
++    return op.wasm && op.kind == 2;
++  });
++}
++
++static bool isLocationListAttribute(llvm::dwarf::Attribute attr) {
++  switch (attr) {
++    case llvm::dwarf::DW_AT_location:
++    case llvm::dwarf::DW_AT_string_length:
++    case llvm::dwarf::DW_AT_return_addr:
++    case llvm::dwarf::DW_AT_data_member_location:
++    case llvm::dwarf::DW_AT_frame_base:
++    case llvm::dwarf::DW_AT_segment:
++    case llvm::dwarf::DW_AT_static_link:
++    case llvm::dwarf::DW_AT_use_location:
++    case llvm::dwarf::DW_AT_vtable_elem_location:
++      return true;
++    default:
++      return false;
++  }
++}
++
++std::vector<BinaryLocations::Span> stackLocationRanges(const Module& wasm) {
++  BinaryenDWARFInfo info(wasm);
++  llvm::DWARFYAML::Data data;
++  if (dwarf2yaml(*info.context, data)) {
++    Fatal() << "Failed to parse input DWARF for value provenance";
++  }
++  std::unordered_map<uint64_t, uint32_t> bases;
++  std::vector<BinaryLocations::Span> ranges;
++  for (auto& cu : info.context->compile_units()) {
++    auto baseAttr = cu->getUnitDIE().find(llvm::dwarf::DW_AT_low_pc);
++    uint32_t base = baseAttr ? baseAttr->getAsAddress().getValueOr(0) : 0;
++    for (auto& die : cu->dies()) {
++      auto* abbrev = die.getAbbreviationDeclarationPtr();
++      if (!abbrev) {
++        continue;
++      }
++      for (auto& attr : abbrev->attributes()) {
++        if (!isLocationListAttribute(attr.Attr)) {
++          continue;
++        }
++        auto location = llvm::DWARFDie(cu.get(), &die).find(attr.Attr);
++        if (location) {
++          if (auto offset = location->getAsSectionOffset()) {
++            bases[*offset] = base;
++          } else if (auto block = location->getAsBlock()) {
++            std::vector<uint8_t> bytes(block->begin(), block->end());
++            std::vector<ValueLocationOp> ops;
++            if (decodeValueLocation(bytes, ops) && hasStackLocation(ops)) {
++              for (auto scope = llvm::DWARFDie(cu.get(), &die); scope;
++                   scope = scope.getParent()) {
++                auto addresses = scope.getAddressRanges();
++                if (!addresses) {
++                  llvm::consumeError(addresses.takeError());
++                  break;
++                }
++                if (addresses->empty()) {
++                  continue;
++                }
++                for (auto range : *addresses) {
++                  if (range.LowPC < range.HighPC &&
++                      range.HighPC <= UINT32_MAX) {
++                    ranges.push_back(
++                      {uint32_t(range.LowPC), uint32_t(range.HighPC)});
++                  }
++                }
++                break;
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++  uint32_t base = 0;
++  bool atStart = true;
++  for (auto& loc : data.Locs) {
++    if (atStart) {
++      base = bases[loc.CompileUnitOffset];
++      atStart = false;
++    }
++    if (loc.Start == uint32_t(-1)) {
++      base = loc.End;
++    } else if (loc.Start == 0 && loc.End == 0) {
++      atStart = true;
++    } else {
++      std::vector<ValueLocationOp> ops;
++      if (decodeValueLocation(loc.Location, ops) && hasStackLocation(ops) &&
++          uint64_t(loc.End) + base <= uint32_t(-1) && loc.Start < loc.End) {
++        ranges.push_back({loc.Start + base, loc.End + base});
++      }
++    }
++  }
++  std::sort(ranges.begin(), ranges.end(), [](auto a, auto b) {
++    return a.start < b.start;
++  });
++  std::vector<BinaryLocations::Span> merged;
++  for (auto range : ranges) {
++    if (!merged.empty() && range.start <= merged.back().end) {
++      merged.back().end = std::max(merged.back().end, range.end);
++    } else {
++      merged.push_back(range);
++    }
++  }
++  return merged;
++}
++
++// A forward must-definition analysis on the actual output CFG. A lexical
++// assignment-before-PC test is unsound at joins, on backedges and on rewind
++// paths. A fact is a local definitely holding what the DWARF expects:
++// - A spill local holds its recorded producer. Only that assignment
++//   establishes it; any other write, including an Asyncify restore, kills it.
++// - Any other local holds the original program's value. Every write
++//   establishes it: original code, or a restore of the value saved at the
++//   unwind. On rewind entry no local holds it. Asyncify restores only the
++//   locals live at a call, so a dead local stays invalid after a resume
++//   (its zero-initialized value is not the program's).
++// One bit per local: lifted functions have thousands of Flatten spills, and
++// every block holds three states.
++struct ValueFacts {
++  Index size = 0;
++  std::vector<uint64_t> words;
++  ValueFacts() = default;
++  ValueFacts(Index size, bool all)
++    : size(size), words((size + 63) / 64, all ? ~uint64_t(0) : 0) {}
++  bool contains(Index i) const {
++    return i < size && (words[i / 64] >> (i % 64) & 1);
++  }
++  void insert(Index i) { words[i / 64] |= uint64_t(1) << (i % 64); }
++  void erase(Index i) { words[i / 64] &= ~(uint64_t(1) << (i % 64)); }
++  void intersect(const ValueFacts& other) {
++    for (size_t i = 0; i < words.size(); ++i) {
++      words[i] &= other.words[i];
++    }
++  }
++  bool operator==(const ValueFacts& other) const = default;
++};
++using ValueStates = std::array<std::optional<ValueFacts>, 3>;
++
++struct ValueFlowBlock {
++  std::vector<Expression*> actions;
++  ValueStates in, out;
++};
++
++struct ValueFlow
++  : CFGWalker<ValueFlow, UnifiedExpressionVisitor<ValueFlow>, ValueFlowBlock> {
++  using Base =
++    CFGWalker<ValueFlow, UnifiedExpressionVisitor<ValueFlow>, ValueFlowBlock>;
++  bool ignoreBranchesOutsideOfFunc = true;
++  bool asyncify;
++  std::map<std::pair<BasicBlock*, BasicBlock*>, std::pair<Expression*, bool>>
++    conditions;
++  std::unordered_set<Expression*> definitions;
++  ValueFacts spills;
++  std::unordered_set<Expression*> queries;
++  std::unordered_map<Expression*, ValueFacts> available;
++  std::unordered_set<Expression*> normalOnly;
++
++  void visitExpression(Expression* expr) {
++    if (currBasicBlock && (expr->is<LocalSet>() || expr->is<GlobalSet>() ||
++                           expr->is<Call>() || expr->is<CallIndirect>() ||
++                           expr->is<CallRef>() || queries.contains(expr))) {
++      currBasicBlock->contents.actions.push_back(expr);
++    }
++  }
++
++  void transfer(Expression* expr, ValueFacts& state) {
++    if (auto* set = expr->dynCast<LocalSet>()) {
++      if (!spills.contains(set->index) || definitions.contains(expr)) {
++        state.insert(set->index);
++      } else {
++        state.erase(set->index);
++      }
++    }
++  }
++
++  static void doStartIfTrue(ValueFlow* self, Expression** currp) {
++    auto* from = self->currBasicBlock;
++    Base::doStartIfTrue(self, currp);
++    self->conditions[{from, self->currBasicBlock}] = {
++      (*currp)->cast<If>()->condition, true};
++  }
++
++  static void doStartIfFalse(ValueFlow* self, Expression** currp) {
++    auto* from = self->ifLastBlockStack.back();
++    Base::doStartIfFalse(self, currp);
++    self->conditions[{from, self->currBasicBlock}] = {
++      (*currp)->cast<If>()->condition, false};
++  }
++
++  static void doEndIf(ValueFlow* self, Expression** currp) {
++    auto* from = self->ifLastBlockStack.back();
++    Base::doEndIf(self, currp);
++    if (!(*currp)->cast<If>()->ifFalse) {
++      self->conditions[{from, self->currBasicBlock}] = {
++        (*currp)->cast<If>()->condition, false};
++    }
++  }
++
++  std::optional<int32_t> evaluate(Expression* expr, int32_t state) {
++    if (auto* get = expr->dynCast<GlobalGet>()) {
++      if (asyncify && get->name == Name("__asyncify_state")) {
++        return state;
++      }
++    } else if (auto* c = expr->dynCast<Const>()) {
++      if (c->type == Type::i32) {
++        return c->value.geti32();
++      }
++    } else if (auto* binary = expr->dynCast<Binary>()) {
++      auto left = evaluate(binary->left, state),
++           right = evaluate(binary->right, state);
++      switch (binary->op) {
++        case EqInt32:
++          if (left && right) {
++            return *left == *right;
++          }
++          break;
++        case NeInt32:
++          if (left && right) {
++            return *left != *right;
++          }
++          break;
++        case OrInt32:
++          if (left && right) {
++            return *left | *right;
++          }
++          break;
++        case AndInt32:
++          if ((left && !*left) || (right && !*right)) {
++            return 0;
++          }
++          if (left && right) {
++            return *left & *right;
++          }
++          break;
++        default:
++          break;
++      }
++    }
++    return std::nullopt;
++  }
++
++  std::optional<bool> evaluateCondition(Expression* expr, int32_t state) {
++    if (auto* binary = expr->dynCast<Binary>();
++        binary && binary->op == OrInt32) {
++      auto left = evaluateCondition(binary->left, state);
++      auto right = evaluateCondition(binary->right, state);
++      if ((left && *left) || (right && *right)) {
++        return true;
++      }
++      if (left && right) {
++        return false;
++      }
++      return std::nullopt;
++    }
++    auto value = evaluate(expr, state);
++    return value ? std::optional<bool>(bool(*value)) : std::nullopt;
++  }
++
++  static void merge(std::optional<ValueFacts>& dest, const ValueFacts& from) {
++    if (!dest) {
++      dest = from;
++    } else {
++      dest->intersect(from);
++    }
++  }
++
++  void transferStates(Expression* expr, ValueStates& states) {
++    for (auto& state : states) {
++      if (state) {
++        transfer(expr, *state);
++      }
++    }
++    bool mayChangeState = true;
++    if (auto* call = expr->dynCast<Call>()) {
++      if (auto* target = getModule()->getFunctionOrNull(call->target)) {
++        mayChangeState = target->debugCanChangeAsyncifyState.value_or(true);
++      }
++    }
++    if (asyncify && mayChangeState &&
++        (expr->is<Call>() || expr->is<CallIndirect>() || expr->is<CallRef>())) {
++      // A callee may start unwinding or finish rewinding. No local changes,
++      // and no assumed correlation with a particular pending call site.
++      std::optional<ValueFacts> facts;
++      for (auto& state : states) {
++        if (state) {
++          merge(facts, *state);
++        }
++      }
++      states = {facts, facts, facts};
++    }
++    if (asyncify) {
++      if (auto* set = expr->dynCast<GlobalSet>();
++          set && set->name == Name("__asyncify_state")) {
++        ValueStates result;
++        for (size_t i = 0; i < 3; ++i) {
++          if (!states[i]) {
++            continue;
++          }
++          auto value = evaluate(set->value, i);
++          for (size_t j = 0; j < 3; ++j) {
++            if (!value || *value == int32_t(j)) {
++              merge(result[j], *states[i]);
++            }
++          }
++        }
++        states = std::move(result);
++      }
++    }
++  }
++
++  ValueFlow(Function* func, Module& module)
++    : asyncify(module.getGlobalOrNull(Name("__asyncify_state")) != nullptr) {
++    auto locals = func->getNumLocals();
++    ValueFacts universe(locals, true), normalEntry(locals, true);
++    spills = ValueFacts(locals, false);
++    for (auto& [producer, spill] : func->debugValueSpills) {
++      definitions.insert(spill.assignment);
++      spills.insert(spill.local);
++      normalEntry.erase(spill.local);
++    }
++    for (auto& [expr, span] : func->expressionLocations) {
++      // Control-flow structure locations refer to a different traversal
++      // position than a postorder action. Do not claim availability there.
++      if (!Properties::isControlFlowStructure(expr)) {
++        queries.insert(expr);
++      }
++    }
++    setFunction(func);
++    setModule(&module);
++    doWalkFunction(func);
++    auto live = findLiveBlocks();
++    unlinkDeadBlocks(live);
++    for (auto& block : basicBlocks) {
++      if (live.contains(block.get())) {
++        block->contents.in = {universe, universe, universe};
++        block->contents.out = {universe, universe, universe};
++      }
++    }
++    bool changed;
++    do {
++      changed = false;
++      for (auto& block : basicBlocks) {
++        if (!live.contains(block.get())) {
++          continue;
++        }
++        ValueStates state;
++        if (block.get() == entry) {
++          // Normal entry: parameters hold the arguments and variables the
++          // zeros the original program also starts with.
++          state[0] = normalEntry;
++          if (asyncify) {
++            state[1] = state[2] = ValueFacts(locals, false);
++          }
++        } else {
++          for (auto* from : block->in) {
++            auto condition = conditions.find({from, block.get()});
++            for (size_t i = 0; i < 3; ++i) {
++              if (!from->contents.out[i]) {
++                continue;
++              }
++              if (condition != conditions.end()) {
++                auto test = evaluateCondition(condition->second.first, i);
++                if (test && bool(*test) != condition->second.second) {
++                  continue;
++                }
++              }
++              merge(state[i], *from->contents.out[i]);
++            }
++          }
++        }
++        block->contents.in = state;
++        for (auto* action : block->contents.actions) {
++          transferStates(action, state);
++        }
++        if (state != block->contents.out) {
++          block->contents.out = std::move(state);
++          changed = true;
++        }
++      }
++    } while (changed);
++    for (auto& block : basicBlocks) {
++      if (!live.contains(block.get())) {
++        continue;
++      }
++      auto state = block->contents.in;
++      for (auto* action : block->contents.actions) {
++        if (queries.contains(action)) {
++          if (state[0] && !state[1] && !state[2]) {
++            normalOnly.insert(action);
++          }
++          // A PC can also execute during rewind. Only describe facts true
++          // in every state reaching it, not merely in normal execution.
++          std::optional<ValueFacts> facts;
++          for (auto& mode : state) {
++            if (mode) {
++              merge(facts, *mode);
++            }
++          }
++          if (facts) {
++            available.emplace(action, *facts);
++          }
++        }
++        transferStates(action, state);
++      }
++    }
++    // Keep only the answers; the CFG's per-block states are not needed.
++    basicBlocks.clear();
++    conditions.clear();
++  }
++};
++
++struct ValueLocationPoint {
++  Expression* expr;
++  BinaryLocations::Span input, output;
++};
++
++struct FunctionValueLocations {
++  Function* func;
++  std::vector<ValueLocationPoint> points;
++  std::unique_ptr<ValueFlow> flow;
++  // DW_AT_frame_base. A frame-relative location also needs a local frame
++  // base to hold its value; an unknown one makes it unavailable.
++  enum class FrameBase { Unknown, Global, Local } frameBase = FrameBase::Unknown;
++  Index frameBaseLocal = 0;
++};
++
++// Indexed once per function, not a scan of the game for each variable entry.
++struct ValueLocationUpdater {
++  const LocationUpdater& updater;
++  std::vector<FunctionValueLocations> functions;
++
++  ValueLocationUpdater(const LocationUpdater& updater,
++                       const BinaryenDWARFInfo& info)
++    : updater(updater) {
++    for (auto& func : updater.wasm.functions) {
++      if (func->imported() || !func->debugValuesFlattened) {
++        continue;
++      }
++      FunctionValueLocations locations{func.get(), {}, nullptr};
++      for (auto& [expr, input] : func->expressionLocations) {
++        auto output = updater.newLocations.expressions.find(expr);
++        if (output != updater.newLocations.expressions.end() &&
++            !Properties::isControlFlowStructure(expr) &&
++            output->second.start < output->second.end) {
++          locations.points.push_back({expr, input, output->second});
++        }
++      }
++      std::sort(locations.points.begin(),
++                locations.points.end(),
++                [](const auto& a, const auto& b) {
++                  return a.input.start < b.input.start;
++                });
++      functions.push_back(std::move(locations));
++    }
++    std::sort(
++      functions.begin(), functions.end(), [](const auto& a, const auto& b) {
++        return a.func->funcLocation.declarations <
++               b.func->funcLocation.declarations;
++      });
++    for (auto& cu : info.context->compile_units()) {
++      for (auto& entry : cu->dies()) {
++        llvm::DWARFDie die(cu.get(), &entry);
++        if (die.getTag() != llvm::dwarf::DW_TAG_subprogram) {
++          continue;
++        }
++        auto low = die.find(llvm::dwarf::DW_AT_low_pc);
++        auto base = die.find(llvm::dwarf::DW_AT_frame_base);
++        if (!low || !base) {
++          continue;
++        }
++        auto pc = low->getAsAddress();
++        auto block = base->getAsBlock();
++        if (!pc || !block || *pc > UINT32_MAX) {
++          continue;
++        }
++        auto* f = find(uint32_t(*pc));
++        std::vector<uint8_t> bytes(block->begin(), block->end());
++        std::vector<ValueLocationOp> ops;
++        if (!f || !decodeValueLocation(bytes, ops) || ops.size() != 2 ||
++            !ops[0].wasm || bytes[ops[1].begin] != llvm::dwarf::DW_OP_stack_value) {
++          continue;
++        }
++        if (ops[0].kind == 0) {
++          f->frameBase = FunctionValueLocations::FrameBase::Local;
++          f->frameBaseLocal = ops[0].index;
++        } else if (ops[0].kind == 1) {
++          f->frameBase = FunctionValueLocations::FrameBase::Global;
++        }
++      }
++    }
++  }
++
++  FunctionValueLocations* find(uint32_t pc) {
++    auto it = std::upper_bound(
++      functions.begin(), functions.end(), pc, [](uint32_t pc, const auto& f) {
++        return pc < f.func->funcLocation.declarations;
++      });
++    if (it == functions.begin()) {
++      return nullptr;
++    }
++    --it;
++    return pc < it->func->funcLocation.end ? &*it : nullptr;
++  }
++
++  bool rewrite(FunctionValueLocations& f,
++               const ValueLocationPoint& point,
++               const std::vector<uint8_t>& bytes,
++               const std::vector<ValueLocationOp>& ops,
++               std::vector<uint8_t>& output) {
++    if (!f.flow) {
++      f.flow = std::make_unique<ValueFlow>(f.func, updater.wasm);
++    }
++    // A static location cannot distinguish normal execution from a rewind
++    // visit to the same opcode before the saved locals have been restored.
++    auto state = f.flow->available.find(point.expr);
++    if (!f.flow->normalOnly.contains(point.expr) ||
++        state == f.flow->available.end()) {
++      return false;
++    }
++    auto& facts = state->second;
++    for (auto op : ops) {
++      // Locals, including the frame base under DW_OP_fbreg, must still hold
++      // the program's value here: not after a resume that left them dead.
++      if (bytes[op.begin] == llvm::dwarf::DW_OP_fbreg &&
++          (f.frameBase == FunctionValueLocations::FrameBase::Unknown ||
++           (f.frameBase == FunctionValueLocations::FrameBase::Local &&
++            !facts.contains(f.frameBaseLocal)))) {
++        return false;
++      }
++      if (op.wasm && op.kind == 0 && !facts.contains(op.index)) {
++        return false;
++      }
++      if (!op.wasm || op.kind != 2) {
++        output.insert(
++          output.end(), bytes.begin() + op.begin, bytes.begin() + op.end);
++        continue;
++      }
++      auto stack = f.func->debugInputStacks.find(point.input.start);
++      if (stack == f.func->debugInputStacks.end() ||
++          op.index >= stack->second.size()) {
++        return false;
++      }
++      auto spill = f.func->debugValueSpills.find(stack->second[op.index]);
++      if (spill == f.func->debugValueSpills.end() ||
++          !facts.contains(spill->second.local)) {
++        return false;
++      }
++      output.push_back(llvm::dwarf::DW_OP_WASM_location);
++      writeLocationULEB(output, 0);
++      writeLocationULEB(output, spill->second.local);
++    }
++    return output.size() <= UINT16_MAX;
++  }
++
++  std::vector<llvm::DWARFYAML::Loc>
++  relocate(const llvm::DWARFYAML::Loc& loc, uint32_t begin, uint32_t end) {
++    std::vector<llvm::DWARFYAML::Loc> result;
++    auto* f = find(begin);
++    if (!f) {
++      auto b = updater.getNewStart(begin), e = updater.getNewEnd(end);
++      if (b && e > b) {
++        result.push_back({b, e, loc.Location, 0});
++      }
++      return result;
++    }
++    std::vector<ValueLocationOp> ops;
++    if (!decodeValueLocation(loc.Location, ops)) {
++      return result;
++    }
++    auto point = std::lower_bound(
++      f->points.begin(),
++      f->points.end(),
++      begin,
++      [](const auto& point, uint32_t pc) { return point.input.start < pc; });
++    for (; point != f->points.end() && point->input.start < end; ++point) {
++      std::vector<uint8_t> expression;
++      if (rewrite(*f, *point, loc.Location, ops, expression)) {
++        result.push_back(
++          {point->output.start, point->output.end, std::move(expression), 0});
++      }
++    }
++    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
++      return std::tie(a.Start, a.End) < std::tie(b.Start, b.End);
++    });
++    return result;
++  }
++};
+diff --git a/src/wasm/wasm-ir-builder.cpp b/src/wasm/wasm-ir-builder.cpp
+index bdc0da8..0b98fb4 100644
+--- a/src/wasm/wasm-ir-builder.cpp
++++ b/src/wasm/wasm-ir-builder.cpp
+@@ -211,6 +211,29 @@ Result<> IRBuilder::packageHoistedValue(const HoistedVal& hoisted,
+   return Ok{};
+ }
+ 
++void IRBuilder::recordDebugInputStack(BinaryLocation pc) {
++  if (!func) {
++    return;
++  }
++  std::vector<Expression*> values;
++  for (auto& scope : scopeStack) {
++    // Block parameters, tuples and unreachable stacks need a richer identity
++    // model. Absence here means unavailable, not a guessed stack slot.
++    if (scope.unreachable || scope.inputType.isConcrete()) {
++      return;
++    }
++    for (auto* expr : scope.exprStack) {
++      if (expr->type.isTuple()) {
++        return;
++      }
++      if (expr->type.isConcrete()) {
++        values.push_back(expr);
++      }
++    }
++  }
++  func->debugInputStacks.emplace(pc, std::move(values));
++}
++
+ void IRBuilder::push(Expression* expr, Origin origin) {
+   auto& scope = getScope();
+   if (expr->type == Type::unreachable) {
