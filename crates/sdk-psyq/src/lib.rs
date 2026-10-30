@@ -319,3 +319,54 @@ pub mod testing {
         finish(m, f);
     }
 }
+
+/// Exit criterion 1 of the unified adapter layer, phase 1 (D59): the
+/// adapters are one set of code for every game. Their non-test code names
+/// no game (its id or serial, from `games/*/game.toml`) and holds no guest
+/// RAM address (a game's layout is found through the object's own code,
+/// D61), so a per-game table or branch fails here.
+#[cfg(test)]
+mod agnostic {
+    #[test]
+    fn adapters_name_no_game_and_no_ram_address() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let games = root.join("../../games");
+        let mut ids: Vec<String> = Vec::new();
+        for g in std::fs::read_dir(&games).unwrap().flatten() {
+            let text = std::fs::read_to_string(g.path().join("game.toml")).unwrap_or_default();
+            for key in ["id", "serial"] {
+                if let Some(v) = text.lines().find_map(|l| l.trim().strip_prefix(&format!("{key} = \"")).and_then(|r| r.split('"').next())) {
+                    ids.push(v.to_string());
+                }
+            }
+        }
+        assert!(!ids.is_empty(), "no game manifests found under {}", games.display());
+        let mut bad = Vec::new();
+        for f in std::fs::read_dir(root.join("src")).unwrap().flatten() {
+            let path = f.path();
+            if path.extension().is_none_or(|x| x != "rs") || path.file_name().is_some_and(|n| n == "cases.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Non-test code only, comments stripped.
+            let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+            for (i, line) in code.lines().enumerate() {
+                let line = line.split("//").next().unwrap_or_default();
+                for id in &ids {
+                    if line.contains(&format!("\"{id}\"")) {
+                        bad.push(format!("{}:{}: names game {id}", path.display(), i + 1));
+                    }
+                }
+                let lower = line.to_ascii_lowercase().replace('_', "");
+                for (at, _) in lower.match_indices("0x80").chain(lower.match_indices("0xa0")) {
+                    let digits: String = lower[at + 2..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                    let low = u32::from_str_radix(&digits, 16).unwrap_or(0) & 0x00FF_FFFF;
+                    if digits.len() == 8 && (1..0x20_0000).contains(&low) {
+                        bad.push(format!("{}:{}: guest RAM address 0x{digits}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "game-specific code in the adapters:\n  {}", bad.join("\n  "));
+    }
+}

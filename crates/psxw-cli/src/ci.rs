@@ -174,6 +174,23 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         Ok((pass, detail.join(", ")))
     })());
 
+    // D59: the SDK's reach table in the repo is the scan's (when the SDK's
+    // objects are here), and the scan misses no access the translator sees.
+    gate!("sdk-reach", "D59", (|| {
+        let sdk = ws.game(game)?.game.sdk.unwrap_or_default();
+        if !psxw_sdk::objects_dir(ws, &sdk).is_ok_and(|d| d.is_dir()) {
+            return Ok((true, format!("{sdk}: no library objects in this checkout; the committed table stands")));
+        }
+        let ok = crate::sdk::run(ws, &["--sdk", &sdk, "--game", game, "--check"])?;
+        Ok((ok, format!("{} matches the scan of {sdk}'s objects", psxw_inputs::boundary::Reach::path(&ws.root, &sdk).display())))
+    })());
+    // D59 level 4: the replay native and with every chip on its device.
+    gate!("fallback", "D59", (|| {
+        built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;
+        let ok = crate::modes::run(ws, game, None)?;
+        Ok((ok, "the replay native and on every device: checks pass, checkpoints reached (out/conform/<game>/modes)".into()))
+    })());
+
     if let Some(name) = &ci.replay {
         gate!("replay", "M13", (|| {
             built.as_ref().map_err(|_| anyhow::anyhow!("no build"))?;

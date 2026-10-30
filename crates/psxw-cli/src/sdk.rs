@@ -3,7 +3,7 @@
 //! phase 1 task 2).
 //!
 //! ```text
-//! psxw sdk scan [--sdk psyq-470] [--objects DIR] [--game G]…
+//! psxw sdk scan [--sdk psyq-470] [--objects DIR] [--game G]… [--check]
 //! ```
 //!
 //! Writes `out/sdk/<sdk>/scan.json` (every function's facts) and
@@ -40,12 +40,15 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
     let mut sdk = "psyq-470".to_string();
     let mut objects = None;
     let mut games: Vec<String> = Vec::new();
+    // Fail on a stale committed reach table instead of rewriting it (CI).
+    let mut check = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {
             "--sdk" => sdk = it.next().context("--sdk needs a value")?.to_string(),
             "--objects" => objects = Some(std::path::PathBuf::from(it.next().context("--objects needs a directory")?)),
             "--game" => games.push(it.next().context("--game needs a value")?.to_string()),
+            "--check" => check = true,
             other => bail!("unknown sdk scan option {other}"),
         }
     }
@@ -78,7 +81,12 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
     }
     let path = psxw_inputs::boundary::Reach::path(&ws.root, &sdk);
     let text = serde_json::to_string_pretty(&reach_table)? + "\n";
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+    let stale = std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str());
+    if stale && check {
+        eprintln!("sdk scan: {} is stale: run `psxw sdk scan --sdk {sdk}` and commit it", path.display());
+        return Ok(false);
+    }
+    if stale {
         std::fs::create_dir_all(path.parent().context("reach table directory")?)?;
         std::fs::write(&path, &text)?;
         eprintln!("sdk scan: wrote {} (changed)", path.display());

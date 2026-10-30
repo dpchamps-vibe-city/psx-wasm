@@ -249,6 +249,12 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;
     let adapters = crate::runtime::adapters(&runtime)?;
+    // One adapter per SDK function, the same code in every game (D59): a
+    // name twice in the runtime's table is a per-game variant.
+    let mut names = BTreeSet::new();
+    if let Some(dup) = adapters.iter().find(|n| !names.insert(n.as_str())) {
+        bail!("the runtime has two adapters named {dup}: adapters are one per SDK function, the same in every game (D59)");
+    }
 
     let mut inputs = psxw_lift::run::load(ws, &opts.game)?;
     let commit = inputs.commit.clone();

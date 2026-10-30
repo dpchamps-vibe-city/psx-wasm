@@ -622,6 +622,13 @@ pub fn run(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     if let Err(e) = &ro {
         eprintln!("conform: the original side failed: {e:#}");
     }
+    // A scenario naming a function the game doesn't link is skipped there,
+    // like a chip case (level 3 runs it in the games that link it).
+    let unlinked = |r: &Result<()>| r.as_ref().err().map(|e| format!("{e:#}")).filter(|e| e.ends_with("is not in the main container"));
+    if let (Some(why), Some(_)) = (unlinked(&ra), unlinked(&ro)) {
+        println!("conform {game} {lib}: skipped ({why})");
+        return Ok(true);
+    }
     let (a, o) = (a.finish(&dir, "adapter")?, o.finish(&dir, "original")?);
     let diffs: Vec<(Observation, Observation)> =
         a.log.iter().zip(&o.log).filter(|(x, y)| x != y).take(16).map(|(x, y)| (x.clone(), y.clone())).collect();
