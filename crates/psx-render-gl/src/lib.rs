@@ -336,9 +336,18 @@ impl Renderer {
                 }
                 Command::Present(desc) => self.present_frame(&desc),
                 Command::Sync(rects) => {
+                    // One copy of the rectangles' bounds: outside them the
+                    // two copies already agree, and a blit call costs far
+                    // more than the pixels it moves.
+                    let mut b: Option<(u32, u32, u32, u32)> = None;
                     for pair in rects.chunks_exact(2) {
                         let r = render::Rect::from_words(pair[0], pair[1]);
-                        self.sync(r.x, r.y, r.w, r.h);
+                        for (x, y, w, h, _, _) in pieces(r.x, r.y, r.w, r.h) {
+                            b = Some(b.map_or((x, y, x + w, y + h), |(x0, y0, x1, y1)| (x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h))));
+                        }
+                    }
+                    if let Some((x0, y0, x1, y1)) = b {
+                        self.sync(x0, y0, x1 - x0, y1 - y0);
                     }
                 }
                 Command::ClutLoad { slot, x, y, count } => unsafe {
