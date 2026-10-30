@@ -75,8 +75,9 @@ Nothing in code may be specific to either.
 
 | Plan | Status | Depends on |
 |---|---|---|
-| [Unified adapter layer, phase 1](unified-adaptor-layer/phase1.md): every adapter btn and bof4 need; both games native except the GTE | not started | M13 |
+| [Unified adapter layer, phase 1](unified-adaptor-layer/phase1.md): every adapter btn and bof4 need; both games native except the GTE | in progress | M13 |
 | [Unified adapter layer, phase 2](unified-adaptor-layer/phase2.md): the rest of PsyQ 4.7 | not started | phase 1 |
+| [Debug builds of threaded games](debug-builds-threaded-games.md): `--debug` is refused for games that switch threads (bof4) | problem statement only | — |
 
 ## Completed
 
