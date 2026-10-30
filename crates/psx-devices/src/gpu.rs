@@ -911,8 +911,8 @@ impl Gpu {
     }
 
     /// A primitive that reads `reads` (its texels) and plots `cover`
-    /// within `writes`; with semi-transparency or the mask check it reads
-    /// what it plots over too.
+    /// within `writes`; with semi-transparency, the mask check or
+    /// `reads_cover` it reads what it plots over too.
     ///
     /// The batch is drawn in layers with a sync between each two, each
     /// layer in the primitives' order, so a primitive goes in the first
@@ -921,10 +921,10 @@ impl Gpu {
     /// other one not below it, nor below a primitive that samples where
     /// it plots. A translucent model's triangles that cover each other
     /// then take as many syncs as it has surfaces, not one each.
-    fn add_prim(&mut self, rec: [u32; PRIM_WORDS], reads: Areas, writes: Areas, cover: &[Span]) {
+    fn add_prim(&mut self, rec: [u32; PRIM_WORDS], reads: Areas, writes: Areas, cover: &[Span], reads_cover: bool) {
         self.ensure_state();
         self.before_reads(&reads);
-        let reader = rec[0] & (prim::SEMI | prim::MASK_CHECK) != 0;
+        let reader = reads_cover || rec[0] & (prim::SEMI | prim::MASK_CHECK) != 0;
         let (top, earlier) = self.written.scan(cover);
         let mut layer = top.map_or(0, |t| t + reader as u32);
         let sampled = self.layers.iter().rposition(|l| l.texels.iter().any(|t| writes.iter().any(|w| w.overlaps(t))));
@@ -1137,11 +1137,36 @@ impl Gpu {
         let vs = v.iter().map(|p| ((p.uv >> 8) & 0xFF) as i32);
         let u = (us.clone().min().unwrap_or(0) - 1, us.max().unwrap_or(0) + 1);
         let vv = (vs.clone().min().unwrap_or(0) - 1, vs.max().unwrap_or(0) + 1);
+        if rec[0] & prim::TEXTURED != 0 && Self::samples_itself(&page, rec[2], v) {
+            // Its texels are the pixels it plots: a destination read. A
+            // quad goes in as the GPU draws it, its two triangles one
+            // after the other: where both plot a pixel on their shared
+            // edge, the second reads what the first plotted.
+            let mut first = rec;
+            first[0] = (rec[0] & !prim::KIND_MASK) | prim::TRIANGLE;
+            first[12..15].fill(0);
+            let mut second = first;
+            second[3..12].copy_from_slice(&rec[6..15]);
+            for t in [first, second].into_iter().take(1 + quad as usize) {
+                let cover = self.polygon_cover(&t, false);
+                self.add_prim(t, Areas::none(), writes, &cover, true);
+            }
+            return;
+        }
         let texels = Self::texture_reads(&page, rec[2], u, vv);
         rec[0] |= Self::serial(rec[0], &texels, &writes);
         let reads = Self::reads_for(rec[0], &texels);
         let cover = self.polygon_cover(&rec, quad);
-        self.add_prim(rec, reads, writes, &cover);
+        self.add_prim(rec, reads, writes, &cover, false);
+    }
+
+    /// Whether a polygon samples exactly the pixels it plots (a model
+    /// tinted in place): 15-bit texels, no texture window, and each
+    /// vertex's coordinates its own position on the page. The GPU's
+    /// gradients are then exactly 1 and 0, so every pixel reads itself.
+    fn samples_itself(page: &TexPage, window: u32, v: &[Vertex]) -> bool {
+        let (px, py) = ((page.x64 * 64) as i32, (page.y256 * 256) as i32);
+        page.mode == 2 && window & 0x3FF == 0 && v.iter().all(|p| px + (p.uv & 0xFF) as i32 == p.x && py + ((p.uv >> 8) & 0xFF) as i32 == p.y)
     }
 
     /// [`prim::SERIAL`] when a textured primitive can sample where it
@@ -1191,7 +1216,7 @@ impl Gpu {
         let exact = [p0, p1].iter().all(|p| (0..1024).contains(&p.x) && (0..1024).contains(&p.y));
         let writes =
             self.plot_areas(p0.x.min(p1.x), p0.x.max(p1.x), p0.y.min(p1.y), p0.y.max(p1.y), exact);
-        self.add_prim(rec, Areas::none(), writes, &writes.spans());
+        self.add_prim(rec, Areas::none(), writes, &writes.spans(), false);
     }
 
     // ---------------------------------------------------------------
@@ -1252,7 +1277,7 @@ impl Gpu {
         let texels = Self::texture_reads(&page, self.window, u, v);
         rec[0] |= Self::serial(flags, &texels, &writes);
         let reads = Self::reads_for(flags, &texels);
-        self.add_prim(rec, reads, writes, &writes.spans());
+        self.add_prim(rec, reads, writes, &writes.spans(), false);
     }
 
     // ---------------------------------------------------------------
@@ -1874,6 +1899,33 @@ mod tests {
             })
             .collect();
         assert_eq!(shape, [vec![10, 100], vec![], vec![10, 100]]);
+    }
+
+    /// A model tinted in place (each vertex's texture coordinates its own
+    /// position on a 15-bit page) reads only the pixels it plots: drawn
+    /// whole, one sync after what it tints, not row by row.
+    #[test]
+    fn polygon_sampling_itself_is_a_destination_read() {
+        let mut g = gpu();
+        let (a, b) = ([(130, 10), (180, 10), (130, 60)], [(180, 10), (180, 60), (130, 60)]);
+        for t in [a, b] {
+            g.gp0_words(&[0x2000_00FF, pack_xy(t[0].0, t[0].1), pack_xy(t[1].0, t[1].1), pack_xy(t[2].0, t[2].1)]);
+        }
+        let page = (2 | 2 << 7) << 16;
+        let uv = |(x, y): (i32, i32)| (x - 128) as u32 | (y as u32) << 8;
+        for t in [a, b] {
+            g.gp0_words(&[0x2480_8080, pack_xy(t[0].0, t[0].1), uv(t[0]), pack_xy(t[1].0, t[1].1), uv(t[1]) | page, pack_xy(t[2].0, t[2].1), uv(t[2])]);
+        }
+        let cs = decode(&cmds(&mut g));
+        let shape: Vec<_> = cs
+            .iter()
+            .filter_map(|c| match c {
+                C::Draw(r) => Some(r.iter().map(|p| p[0] & (prim::TEXTURED | prim::SERIAL)).collect::<Vec<_>>()),
+                C::Sync(_) => Some(vec![]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shape, [vec![0, 0], vec![], vec![prim::TEXTURED, prim::TEXTURED]]);
     }
 
     #[test]
