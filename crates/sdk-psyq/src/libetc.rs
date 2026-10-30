@@ -157,15 +157,20 @@ pub struct Etc {
     pub saved_sp: u32,
 }
 
-/// The stack top `intr.o`'s context sets (`stack[1024 - 20]`): `.data` is
-/// what `ResetCallback`'s first `lui`/`lw` pair (`.text` +0) loads, less
-/// 0x10E0; the driver table at `.data` + 0x10C0 holds the context's
-/// address in its eighth word, and the stack follows the context's 0x68
-/// bytes of fields.
-fn intr_stack(m: &M, reset: u32) -> u32 {
-    let Some(at) = crate::libspu::pair(m, reset, reset + 4) else { return 0 };
-    let context = m.mem.r32(at - 0x10E0 + 0x10C0 + 0x1C);
-    if context == 0 { 0 } else { context + 0x68 + (1024 - 20) * 4 }
+/// `intr.o`'s stack, its context's `stack[1024]`, from `ResetCallback` at
+/// `reset` (`r32` reads a guest word): `.data` is what its first
+/// `lui`/`lw` pair (`.text` +0) loads, less 0x10E0; the driver table at
+/// `.data` + 0x10C0 holds the context's address in its eighth word, and
+/// the stack follows the context's 0x68 bytes of fields. The original's
+/// dispatcher starts at `stack[1024 - 20]`.
+pub fn intr_stack(r32: &mut dyn FnMut(u32) -> u32, reset: u32) -> Option<std::ops::Range<u32>> {
+    let (hi, lo) = (r32(reset), r32(reset.wrapping_add(4)));
+    if hi >> 26 != 0x0F || (lo >> 21) & 31 != (hi >> 16) & 31 {
+        return None;
+    }
+    let data = (hi << 16).wrapping_add(lo as u16 as i16 as u32).wrapping_sub(0x10E0);
+    let context = r32(data.wrapping_add(0x10C0 + 0x1C));
+    (context != 0).then(|| context + 0x68..context + 0x68 + 4 * 1024)
 }
 
 // --- The dispatcher -------------------------------------------------------
@@ -397,7 +402,8 @@ fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     let e = &mut m.sdk.etc;
     (e.dispatching, e.lines, e.mask, e.saved_mask, e.saved_dpcr) = (false, Default::default(), 0, 0, 0);
     e.active = true;
-    m.sdk.etc.stack = intr_stack(m, m.sdk.at);
+    let reset = m.sdk.at;
+    m.sdk.etc.stack = intr_stack(&mut |a| m.mem.r32(a), reset).map_or(0, |s| s.end - 4 * 20);
     set_reg(m, RCNT1_MODE, 4, 0x100)?;
     m.sdk.etc.vcount = 0;
     m.sdk.etc.vsync = [0; 8];

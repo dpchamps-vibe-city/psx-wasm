@@ -237,16 +237,22 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// What the libraries' state and the SPU amount to after `what`: the
 /// budget left, the device effect (the SPU's state, the audio), RAM below
 /// the scratch area in 64 KB blocks (the blocks that differ from zero
-/// filled, by index).
+/// filled, by index). libetc's interrupt stack is left out, as the
+/// harness's stack is: the frames there are each side's own (the
+/// original's dispatcher has one above the handlers').
 fn look(h: &mut dyn Harness, what: &str) {
     let b = h.budget();
     h.observe(&format!("{what}: budget"), b.to_string());
     let d = h.device();
     h.observe(&format!("{what}: device"), d);
+    let stack = h.symbol("ResetCallback").and_then(|f| crate::libetc::intr_stack(&mut |a| u32::from_le_bytes(h.read(a, 4)[..4].try_into().unwrap()), f));
     let mut blocks = Vec::new();
     let mut at = 0x8000_0000u32;
     while at < SCRATCH {
-        let ram = h.read(at, 0x1_0000);
+        let mut ram = h.read(at, 0x1_0000);
+        for a in stack.iter().flat_map(|s| s.start.max(at)..s.end.min(at + 0x1_0000)) {
+            ram[(a - at) as usize] = 0;
+        }
         blocks.push(format!("{:x}", fnv(&ram) & 0xFFFF_FFFF));
         at += 0x1_0000;
     }
