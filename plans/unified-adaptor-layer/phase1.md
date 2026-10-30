@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c, 9d, 9e, 9f and 9g done; 5–6 harness in place)
+**Status:** in progress (tasks 1–5, 7, 8 and 9, every chip a to g, done; 6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -128,7 +128,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
      the controller through core calls, not its registers).
 8. [x] **Bump the psyq-decomp pin** (done: `654b236`). libpad, libpress and libmcx were
    decompiled after `302b6ae`.
-9. [ ] **Adapters, chip by chip**, in this order. Each chip is done when
+9. [x] **Adapters, chip by chip**, in this order. Each chip is done when
    its adapters pass levels 1–3 in both games and both games report the
    chip native.
 
@@ -676,19 +676,22 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     (125 steps), `--lib libmcrd` (21) and `--lib libetc` (60).
   - **Runs:** btn 1,200 frames, `--check boot --check no-trap --check
     no-shadow-io`: pass native and on `--device memcard` (952,146 `VSync`
-    calls both ways; `McxStartCom` once). btn `card-load` with `--check
-    card` passes native and on `--device memcard`, the two runs equal
-    (RAM and VRAM hashes, 3,000 frames, the same 1,698,611,325 cycles);
-    on the device libmcx's verifier reads I_STAT/I_MASK 14,227 times,
-    natively no guest code touches a register of the chip. btn
-    `title-to-gameplay` (6,000 frames): pass. bof4 (no libmcx): 1,200
-    frames pass, `title-to-field` passes every expect at the same frame
-    (counter 12390 at frame 24768). With chip spu merged btn builds with
-    every chip native and passes `--check no-io` (1,200 frames, and
-    `card-load`). Level 4 (`psxw conform <game> --modes`): btn passes
-    native and with all six chips on their devices, memcard included;
-    bof4 passes, RAM differing at the checkpoints only in the
-    runtime-side bytes chip spu's entry names.
+    calls both ways; `McxStartCom` once). Over 3,000 frames with no replay
+    the two are equal (RAM and VRAM hashed at 6 checkpoints, 1,371,263
+    render words, the same 1,698,611,325 cycles); on the device libmcx's
+    verifier reads I_STAT/I_MASK 7,325 times, natively no guest code
+    touches a register of the chip. With chip spu merged btn builds with
+    every chip native and passes `--check no-io` (1,200 frames). bof4 (no
+    libmcx): 1,200 frames pass, `title-to-field` passes every expect at
+    the same frame (counter 12390 at frame 24768). Level 4 (`psxw conform
+    <game> --modes`): bof4 passes, its output (renderer, displays, audio)
+    identical in both modes. **btn's replays say nothing here:** chip
+    cd's regression since `650da93` stalls btn in loading under any
+    replay (`CdRead: sector error` from frame 97, 30 render words), in
+    every mode, so `card-load` (its checks, `--check card` included,
+    pass) and `title-to-gameplay` never reach the card menu, and level 4
+    for btn passes its checks with output that differs between the
+    modes. To rerun once the fix lands.
 
 ## Findings
 
@@ -1058,13 +1061,17 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   directory frame and write it back with the flag (and a new card's FLAG
   would give McxErrNewCard). Open, with the safepoint model: hardware
   takes each /ACK within microseconds.
-- **btn's replays reach no libmcx command.** btn calls `McxStartCom` at
-  boot; `McxCardType` with `McxSync(0)` comes from the card checks in
+- **Where btn calls libmcx, and what showed it.** btn calls `McxStartCom`
+  at boot; `McxCardType` with `McxSync(0)` comes from the card checks in
   `ovl_31` (after `MemCardAccept`, for two of its results) and `ovl_15`,
-  and every command from `ovl_10`, a PocketStation menu. `card-load`
-  takes the BIOS's path only (its run calls no other libmcx function), so
-  the cases are what exercise the transfers; the replay checks the BIOS
-  card path is undisturbed.
+  and every command from `ovl_10`, a PocketStation menu. The cases are
+  what exercise the transfers: under the chip cd regression btn's
+  replays stall before the title (progress log), so `card-load` called
+  no libmcx function but `McxStartCom`. Open: rerun `card-load` and
+  `title-to-gameplay` (and btn's level 4) once that fix lands; on the
+  way to its "No loadable diary" message, if `card-load` passes
+  `ovl_31`'s check, slot 1 answers McxErrInvalid two vblanks later in
+  both modes.
 - **What the old libmcx adapters got wrong.** They answered at once,
   where the original's answer comes at the second vblank (a game's
   `McxSync(0)` waits that long); `McxSync` wrote 1 as the command number
