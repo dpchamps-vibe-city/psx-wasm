@@ -1,119 +1,114 @@
-# Threaded-game DWARF
+# C debugging through Asyncify
 
-The debug Asyncify path uses this **separately pinned Binaryen 133 source
-build**. Release Binaryen, the D57 instrumentation algorithm, `psx.bios` as
-the only unwinding import, the 2 GiB debug window, served C paths and Rust
-merge are unchanged. There is no final debug `wasm-opt -O2` pass and no
-source-map replacement for variable debugging.
+This directory contains a patched build of Binaryen's `wasm-opt` used to keep
+C source breakpoints and variable inspection working in games that switch
+threads.
 
-`inputs.lock`'s `[toolchain.binaryen-src]` pins the source archive; the
-patches here are applied to it in order. The upstream scope-range repair is commit `06f14fc522372ed89e2b350ca0948eb34006d981`
-([#8964](https://github.com/WebAssembly/binaryen/pull/8964)), backported to
-`fba5005a132d85d578be5bd010e0487ed8e2ce3e`. The second patch repairs value
-provenance, ranges, expressions and synthetic source gaps. The source-only
-upstream backport retains its author/license; its upstream tests are not
-included in that backport.
+Binaryen transforms WebAssembly code. Its **Asyncify** transformation lets a
+function suspend and later resume; psx-wasm uses this to switch the emulated
+PlayStation's threads. **DWARF** is the debug information that tells a debugger
+which C line is running and where to find each variable. Ordinary source maps
+provide source locations, but not the variable and type information needed here.
 
-## Producer boundary
+> **Validation status:** the integration test is recorded as passing with the
+> current patch. The browser and full-game results below are from an older
+> patch and still need to be rerun after the 2026-10-30 changes. See
+> [recorded results](#recorded-results) and the
+> [open tasks](../../plans/open-items.md#debug-builds-of-threaded-games-d53-d57).
 
-- The reader snapshots operand producers **only at relevant input DWARF
-  stack-location intervals**, including inline-expression scopes. Flatten
-  records the actual producer, spill local and assignment, indexed by function.
-- A forward must-definition analysis of the **emitted CFG** handles joins,
-  loops and backedges. It distinguishes Asyncify's normal/unwind/rewind states,
-  using Asyncify's own call-effect analysis and import/onlylist contract.
-  A restored local does not establish a producer identity. A PC reachable
-  during rewind as well as normal execution cannot describe a normal-only value.
-- Original locals are facts too. On rewind entry none holds the program's
-  value; any write (original code, or Asyncify's restore of a saved local)
-  establishes it. Asyncify saves only the locals live at a suspension, so a
-  variable whose last use precedes one is unavailable after it, not the
-  re-entered frame's zero. A `DW_OP_fbreg` location also needs its local
-  frame base to hold its value.
-- Whole expressions are decoded, not matched as four magic bytes. Local indices
-  use bounded ULEBs, including indices above 127. Complete pieces and ordinary
-  compound operations are retained. Unproved stack values, control-flow/tuple
-  results, reader-synthesized values, and unsupported branching/nested/unknown
-  expressions become **unavailable**, never guessed.
-- Location lists are rebuilt, with references updated after size/range changes.
-  Inline function-scope expressions become lists of proven original-opcode
-  intervals. Abbreviations, CU lengths, DIE references (including variable-width
-  references) and aranges CU references are rebuilt too. This resizing supports
-  the project's wasm32 DWARF 4; unsupported CU formats fail explicitly.
-- Existing line-zero rows survive, and new line-zero gaps exclude synthetic
-  code. An input row's statement flags go only to the first output opcode it
-  covers: a line breakpoint stops once, not once per opcode. The Rust guest-rewrite boundary also excludes expansion interiors from
-  location lists/source rows: masking a store consumes its original stack value
-  before the next original instruction. Updating only its endpoints was unsafe.
-  The rows it adds around an interior don't start statements either.
-- Simple validated local/global frame bases remain inline: the tested DevTools
-  consumer cannot evaluate a Wasm frame-base expression in a location list.
-  Dependent variables still have normal-only, original-opcode validity ranges.
+## What goes wrong without the patch?
 
-### LLVM input controls
+Before Asyncify adds its suspension code, Binaryen's **Flatten** pass moves
+values from the Wasm operand stack into temporary local variables. The existing
+DWARF updater moves code addresses, but does not update those variable
+locations. A debugger can therefore look for a value on the operand stack even
+though it now lives in a local.
 
-The pinned clang can supply incorrect metadata **before Binaryen**:
+Resuming a function creates another problem: Asyncify restores only the locals
+needed by subsequent execution. A variable whose last use was before the
+suspension may still be visible in the C scope, but its value is no longer
+available. Reporting the new call frame's zero-initialized local is incorrect.
 
-1. `worker(input)` claims a reused local is the original argument for the whole
-   function (16/17 instead of the actual 5/6). The Rust input importer omits fixed
-   whole-function parameter descriptions in compiler-written locals. Valid
-   ranged/compound parameters and frame bases are not blanket-deleted.
-2. Its default DAG selector drops later assignments in lifted bof4 C: scheduler
-   `r16/r17/r18` incorrectly become constants zero. All game C compiles at
-   **`-O2`** with `-mllvm -fast-isel=true` (`psxw_cc::CODEGEN_FLAGS`), which
-   keeps these records. This changes instruction selection, not the IR
-   optimization level. FastISel's code changes with `-g` (437 of 1,078 sampled
-   objects), so every object is compiled once, with `-g`, and release links the
-   same objects without the DWARF (D53). The startup function `801395A0` still
-   has no additional compiler stack frame (the rejected `-O0` control added
-   176 bytes).
-3. Missing aggregate pieces are materialized as zero by the tested consumer.
-   LLVM can also describe only the used low bits of an i64 as the whole value.
-   The importer rejects incomplete pieces (including missing tails), scalar
-   constants/stack-values standing in for whole aggregates, and storage-free
-   arithmetic descriptions. Declaration origins, typedefs and qualifiers supply
-   the type/bit coverage; address-backed structures and complete pieces remain.
-   `fixture.c` with `-DLLVM_INPUT_REPRO` reproduces the partial-piece/i64 cases.
-   The real btn test also rejects `vram_clear`'s false `RECT = 0` description.
+The Wasm can run correctly, and the DWARF can pass structural verification,
+while the debugger displays wrong values. These patches repair the descriptions
+where possible and mark values **unavailable** where they cannot be proved.
 
-These are conservative metadata controls, not LLVM instruction changes or a
-claim to have fixed every optimizing-compiler debugging defect. The fixture
-is the retained minimal argument reproducer; no upstream issue was filed.
+## Which Binaryen build is this?
+
+The source is **Binaryen 133**, commit
+`fba5005a132d85d578be5bd010e0487ed8e2ce3e`, pinned under
+`[toolchain.binaryen-src]` in [`inputs.lock`](../../inputs.lock).
+The build applies these patches in order:
+
+| Patch | Purpose |
+| --- | --- |
+| [`upstream-scope-ranges.patch`](upstream-scope-ranges.patch) | Repairs invalid code ranges for functions and variable scopes. Backported from upstream [#8964](https://github.com/WebAssembly/binaryen/pull/8964), commit `06f14fc522372ed89e2b350ca0948eb34006d981`. |
+| [`value-provenance.patch`](value-provenance.patch) | Tracks where values move during Flatten, checks whether they remain available through Asyncify, and repairs variable locations and source-line gaps. |
+
+Release builds still use the unpatched Binaryen 133 distribution. Keeping the
+same base version lets the tests check that these patches change debug
+information, not executable sections, without also introducing a toolchain
+upgrade. The newer upstream scope-range fix alone does not repair variable
+locations. Its backport here includes source changes and the original
+license/attribution, but not its upstream tests.
 
 ## Build
 
-The first debug build of a threaded game builds this `wasm-opt`
-(`psxw_inputs::toolchain::dwarf_binaryen`); it needs Docker. It fetches and
-hash-checks `[toolchain.binaryen-src]`, builds the `psxw-binaryen-build:local`
-image from `build.Dockerfile` on `[oracle]`'s pinned base image and Debian
-snapshot (so the compiler is pinned too), and builds a static `wasm-opt` in it
-with no network. The result goes to `.toolchain/binaryen-dwarf-<hash>/`, keyed
-by the source pin, the base image, the snapshot, the build script, the
-Dockerfile and the patches, with `provenance.json` and the build log beside it.
-Release builds keep `[toolchain.binaryen]`.
+Run from the repository root, with the usual game inputs available:
 
 ```sh
 psxw build bof4 --debug
 psxw build-web bof4 --debug --moddable
 ```
 
-## Reproduce acceptance
+Here `bof4` is Breath of Fire IV. The second command builds a web bundle with
+script-mod support.
+
+The first debug build of a threaded game builds the patched tool automatically.
+**Docker is required for that initial build.** The builder downloads and
+hash-checks the source, creates a compiler image from
+[`build.Dockerfile`](build.Dockerfile), and compiles a static `wasm-opt` with
+network access disabled. The image uses the base image and Debian package
+snapshot pinned in `inputs.lock`'s `[oracle]` section.
+
+The result is cached at `.toolchain/binaryen-dwarf-<hash>/bin/wasm-opt`, alongside
+`build.log` and `provenance.json` (input and binary hashes). Changes to the
+source pin, patches, Dockerfile, build script, base image, or package snapshot
+select a new cache directory. The implementation is
+[`dwarf_binaryen`](../../crates/psxw-inputs/src/toolchain.rs).
+
+## Run the tests
+
+All commands below run from the repository root.
+
+### Integration test: no game disc or browser required
+
+Requires Docker, the project's pinned clang toolchain, and Node.js:
 
 ```sh
 cargo test --locked -p psxw-link --test threaded_dwarf -- --ignored --nocapture
 ```
 
-This compiles ordinary, wide-index, FastISel and LLVM-input-reproducer variants
-at `-O2 -g`. It compares **every non-custom section** against unpatched Binaryen
-for roundtrip, Flatten and scoped Asyncify; verifies DWARF; exercises real
-suspension for `root`/`branchy` with inputs 0, 1, 5 and 100; inspects actual V8
-state; and applies the project's actual Rust merge. The wide case forces spill
-indices above 127. An unproved cross-suspension `left` must be unavailable, and
-so must `dead_across`'s `dead`, last used before its suspension (the unpatched
-tool still describes it there). No line gains statement rows over the input.
-Missing prerequisites fail the opt-in test rather than count as a skipped pass.
+This builds [`tests/fixture.c`](tests/fixture.c) at `-O2 -g` and checks:
 
-For the **real C/C++ DevTools extension**, not a custom DWARF evaluator:
+- Every non-custom Wasm section matches unpatched Binaryen after a no-pass
+  roundtrip, Flatten, and Asyncify restricted to selected functions.
+- DWARF passes verification, including after the project's Rust linker combines
+  the guest code with the runtime.
+- Variables resolve to the expected values in V8 after actual suspension and
+  resumption. Branch and loop cases run with inputs 0, 1, 5, and 100.
+- Missing values are reported as unavailable, including a local no longer
+  needed after suspension. Source lines do not gain extra statement markers.
+- Local indices above 127, an alternative clang instruction selector, and
+  known malformed compiler descriptions are exercised by separate variants.
+
+It is an opt-in test because it builds Binaryen. Missing prerequisites fail the
+test rather than silently skipping it. Outputs go to `out/threaded-dwarf-tests/`.
+
+### Browser test: C/C++ variable inspection
+
+Run the integration test first to create the fixture modules. Then provide a
+Chromium browser, an unpacked **C/C++ DevTools Support** extension, and Puppeteer:
 
 ```sh
 export PSXW_CHROMIUM=/path/to/chromium
@@ -121,9 +116,21 @@ export PSXW_DWARF_EXTENSION=/path/to/unpacked/extension
 export PSXW_PUPPETEER_MODULE=/absolute/path/to/puppeteer/lib/esm/puppeteer/puppeteer.js
 node toolchain/binaryen-dwarf/tests/browser.mjs out/threaded-dwarf-tests/fast/merged.wasm
 node toolchain/binaryen-dwarf/tests/browser.mjs out/threaded-dwarf-tests/fast/merged.wasm typed
+```
 
-# The real-game cases require local discs, the corresponding builds, a web
-# bundle's renderer pkg, and the existing named replay files in out/oracle/replays.
+`PSXW_PUPPETEER_MODULE` is optional if Node can import `puppeteer` normally. The
+`typed` case checks structures, pointers, floating-point values, and 64-bit
+integers. These tests use a fresh browser profile, HTTP-served C sources, C
+source breakpoints, and the real DevTools C-expression evaluator—not a custom
+DWARF evaluator.
+
+### Full-game browser tests
+
+These additionally need local game discs, the corresponding game builds, a
+built web renderer (`pkg/`), and the replay files named by the test configs in
+`out/oracle/replays/`:
+
+```sh
 export PSXW_DWARF_DISC_DIR=/path/to/bof4/disc-directory
 node toolchain/binaryen-dwarf/tests/game-browser.mjs toolchain/binaryen-dwarf/tests/bof4.json
 node toolchain/binaryen-dwarf/tests/game-browser.mjs toolchain/binaryen-dwarf/tests/bof4-mod.json
@@ -131,75 +138,117 @@ export PSXW_DWARF_DISC_DIR=/path/to/btn/disc-directory
 node toolchain/binaryen-dwarf/tests/game-browser.mjs toolchain/binaryen-dwarf/tests/btn.json
 ```
 
-`PSXW_DWARF_RENDERER_DIR` optionally selects another built renderer `pkg/`.
-Without `PSXW_PUPPETEER_MODULE`, the scripts import `puppeteer` normally. Each
-uses a fresh profile, HTTP-served Wasm/C, the actual DevTools frontend, **C source
-breakpoints** and its paused-frame C evaluator. Every physical stop is checked;
-synthetic gaps can give one C line multiple disjoint breakpoint locations.
-Game checks compare against independently read guest memory/TCB/SP and known
-caller semantics, report correctness and unavailability separately, and require
-all requested breakpoints. The script-mod case uses the production
-`ScriptHost`/`ModLoader`, and requires both entry and exit hooks to run.
+`btn` is Harvest Moon: Back to Nature; it does not use Asyncify and serves as a
+control. Set `PSXW_DWARF_RENDERER_DIR` to select another renderer `pkg/` directory.
+The browser environment variables from the preceding section still apply.
 
-Tested: Chromium 151.0.7922.137 (Brave), Puppeteer 24.31.0, official C/C++
-DevTools Support 0.2.5854.1. Its official CRX SHA-256 was
-`f4c7d9951929acccb602e3cb0e73ece394ecafc1e2094419887d95bf54bd8fce`.
-No browser, extension, private disc or game-derived source is bundled here.
+The tests check every breakpoint stop and compare C expressions with independent
+reads of emulated memory, thread records, and stack pointers. They count correct,
+incorrect, and unavailable results separately. The script-mod case also requires
+both entry and exit hooks to run through the production mod loader.
 
-## Accepted results
+Previously tested with Chromium 151.0.7922.137 (Brave), Puppeteer 24.31.0, and
+C/C++ DevTools Support 0.2.5854.1. The extension archive's SHA-256 is recorded in
+[`acceptance.json`](acceptance.json). Browsers, extensions, discs, and
+game-derived source are not bundled here.
 
-Recorded at `16dafb7` with the previous `value-provenance.patch` (sha256
-`9f4f07ce…`), before the 2026-10-30 fixes: dead locals after a resume, statement
-rows, the Docker builder. The fixture test above passes with the new patch; the
-browser and real-game checks below are to be rerun (`plans/open-items.md`).
+## How the repair works
 
-- Worker, after two actual suspensions and Rust merge: `before` 16/17,
-  `resumed` 198/211, `stack_value` and `*(&stack_value)` 32/34. The false
-  `input` description is unavailable. Result 508; buffer pointer restored to
-  4104. Branch/loop result 794 after three suspensions, with `result = 729`.
-- Mixed-type control: frame-relative structures/pointers, float 1.5/3.5,
-  double 2.25/4.25/5.5, and i64 4294967303/8589934600/42949672967 are correct
-  after suspension. Its `resumed` is legitimately unavailable at the sampled row.
-- Actual bof4, through guest rewriting, scoped Asyncify and Rust merge:
-  scheduler constants 0x80110000/127/0x80114a00, worker record pointer matching
-  RAM, and resumed BIOS result 1. Eight physical stops across two TCBs and
-  repeated switches: **24 correct checks, 8 unavailable**, no wrong values.
-  The script-hook debug base adds **8 correct, 4 unavailable**, with real entry
-  and exit through the normal mod chain. Bof4's decompiled C functions are
-  empty stubs; useful game-variable coverage here is its lifted C, not invented
-  locals in those stubs.
-- Actual btn (uninstrumented, full DWARF): decompiled `scene_ptr`, global scene
-  and render-context pointer, structure capacity 12000, overlay `flags`, and
-  `Rand(limit)`'s 65535 argument with its independently checked C caller, and
-  frame-relative `mode` / `*(&mode)` = 128 in the CD loader:
-  **28 correct, 7 unavailable**. The changing rectangle falsely described by
-  clang as constant zero is explicitly unavailable. Suspended frame-relative
-  structures/types are additionally covered by the mixed-type fixture.
-- LLVM statistics distinguish retained descriptions from sampled correctness:
-  bof4 has 557,064 of 667,169 source-variable descriptions with locations; btn
-  37,421 of 43,254. Parent-scope byte coverage is about 57% in each (synthetic
-  gaps intentionally have none). This is not near-total variable deletion and
-  is not a claim that every variable is available at every optimized PC.
-- Rendered release/debug comparisons: bof4 `title-to-field` (26,000 frames),
-  btn `title-to-gameplay` (6,000), and btn `card-load` (3,000). **Every report
-  field matched after removing only the WAV pathname**, including timing,
-  cycles, CD activity, RAM/VRAM hashes, audio and reached-state checks. WAV
-  bytes also matched. VRAM checks used the actual render server, not an empty
-  no-render hash map. See `acceptance.json` for the retained hashes/measurements.
-- Regular bof4 instruments the same 2,951-function set (17,777 defined; one
-  exception handler excluded). The scope algorithm/release tool are unchanged.
-  Moddable bases have their existing extra wrapper/dispatch scope. The final
-  clean pin's complete moddable-bof4 Asyncify output was byte-identical to the
-  game-tested producer output, not merely its executable sections.
-- Full DWARF verifies for both games and the script-mod debug base. With warm
-  input/object caches, regular bof4 took 2m54s / 7,638,076 KiB peak RSS and is
-  208,171,127 bytes; btn 15.47s / 711,700 KiB and 9,550,341 bytes. Moddable web
-  bof4 took 7m10s / 18,469,996 KiB and is 580,335,229 bytes (526,712,214 DWARF
-  bytes). These are measured local costs, not cold-build promises. The larger
-  range/line metadata is intentional and remains debug-only.
+1. **Track the original value.** While reading Wasm, record which instruction
+   produced each stack value referenced by DWARF. Track only the code ranges
+   that need this information.
+2. **Record where it moves.** When Flatten stores that value in a temporary
+   local, record the local and the assignment that establishes its value.
+3. **Check every path to a location.** Analyze the transformed control-flow
+   graph, including branches and loops. Distinguish normal execution,
+   suspension ("unwind"), and resumption ("rewind"), using Asyncify's own
+   information about which calls can change state. A location is retained only
+   where the analysis proves it valid. Restoring an original local can make it
+   available again; restoring a temporary is not, by itself, proof that it
+   contains the recorded producer's value.
+4. **Rewrite the DWARF.** Replace stack locations with proven local locations
+   and split their valid code ranges as needed. Decode full expressions,
+   including multi-byte local indices and supported multi-part values. Rebuild
+   location lists and their references when their sizes change.
+5. **Leave generated code unmapped.** Preserve source-line-zero entries, which
+   mean "no source line," and add gaps around transformation-generated code.
+   Do not turn every instruction belonging to one source statement into a new
+   breakpoint stop. A C line can still have several separate code ranges.
 
-Optimized-out values remain normal. Unknown locations are not reconstructed
-from runtime numbers, variable names, or source lines. Scratchpad and
-KUSEG/KSEG1 pointer inspection retains D53's existing limitations. A consumer
-may also turn a cast of an unavailable pointer into zero; use its named-value
-availability, not such a cast, as evidence of a valid location.
+This is not a general solution for every Binaryen pass or DWARF format. The
+location-rebuilding path targets **wasm32 DWARF 4**; unsupported compilation-unit
+formats fail explicitly. Unproved stack values, multi-value/control-flow
+results, and unsupported expressions become unavailable rather than guessed.
+Simple frame-base expressions—the descriptions used to locate stack-backed C
+variables—stay inline because the tested DevTools extension cannot evaluate
+their Wasm form inside a location list. Their dependent variables still have
+restricted validity ranges.
+
+## Related fixes outside these patches
+
+Binaryen cannot fix debug information that was already wrong when clang
+produced it. The project also handles several known input problems:
+
+- **Reused argument locals.** Clang can describe an argument as occupying one
+  local for the whole function even after reusing that local. The Rust DWARF
+  importer removes these unsafe descriptions, without dropping all parameters.
+- **Lost assignments.** The default clang instruction selector can leave
+  generated game variables described as constant zero after they change. Game C
+  uses `-O2 -g -mllvm -fast-isel=true` instead. Because this selector can generate
+  different code with and without `-g`, release and debug builds share the same
+  compiled objects; release linking drops the DWARF. This is not an `-O0` build.
+- **Incomplete values.** The importer rejects unsupported partial descriptions
+  of structures and 64-bit values that the debugger might otherwise display
+  as complete, zero-filled values. Address-backed structures and supported
+  complete descriptions are retained. Compile the fixture with
+  `-DLLVM_INPUT_REPRO` to reproduce the partial-description cases.
+
+The Rust linker also excludes extra instructions introduced by its own guest
+code rewrites from variable-location and source-line ranges. Moving only the
+endpoints would incorrectly extend old descriptions through the new code.
+
+These are conservative workarounds, not a complete LLVM debugging fix. The
+argument reproducer is retained in the fixture; no upstream issue was filed for
+it. The debug pipeline still uses the Rust module merger and does **not** run a
+final `wasm-opt -O2` pass. The patches do not change which functions Asyncify
+instruments or which import triggers suspension (`psx.bios`).
+
+## Recorded results
+
+**Historical, not a certification of the current patch.** These results were
+recorded at project revision `16dafb7`, with patch SHA-256 `9f4f07ce…`, before the
+2026-10-30 fixes for locals lost after resumption, statement markers, and the
+Docker builder. Full records and hashes are in
+[`acceptance.json`](acceptance.json); reruns remain on the
+[open-task list](../../plans/open-items.md#debug-builds-of-threaded-games-d53-d57).
+
+- **Standalone fixture:** after two suspensions and the Rust merge, `resumed`
+  correctly displayed 198 and 211; the function returned 508. The branch/loop
+  case returned 794 after three suspensions. Mixed-type tests recovered
+  structures, pointers, floats, doubles, and 64-bit integers.
+- **Game browser checks:** bof4 reported 24 correct / 8 unavailable, its
+  script-mod variant 8 / 4, and btn 28 / 7, with no incorrect results. These
+  counts are not all independent tests of repaired variable locations:
+  constants and direct memory reads contribute to them. Bof4's checks cover C
+  generated from machine code, not its empty decompiled function stubs.
+  Stronger checks with values that change between stops are still needed.
+- **Debug information retained:** 557,064 of 667,169 bof4 variable descriptions
+  and 37,421 of 43,254 btn descriptions had locations. This measures retention,
+  not correctness or availability at every instruction. Full DWARF verification
+  passed for both games and the script-mod build.
+- **Execution comparisons:** release/debug replay reports matched for bof4's
+  `title-to-field` (26,000 frames), btn's `title-to-gameplay` (6,000), and
+  `card-load` (3,000). Only the WAV pathname was excluded; timing, memory,
+  rendered video-memory hashes, and audio matched, including WAV bytes.
+
+Debug metadata is large. With warm caches, the recorded bof4 build took about
+2m54s and produced a 208 MB module; the script-mod web build took 7m10s and
+produced 580 MB, of which 527 MB was DWARF. The latter peaked at about 18 GiB of
+memory. These are local measurements, not cold-build estimates, and there is no
+unpatched baseline isolating the repair's overhead.
+
+Optimized-out variables remain normal. Debugger reads through some PlayStation
+address aliases and scratchpad addresses remain unsupported (see the debug-build
+section of [`docs/design.md`](../../docs/design.md)). Also, casting an unavailable
+pointer can make the tested debugger display zero: check the named variable's
+availability rather than treating that cast as a valid value.

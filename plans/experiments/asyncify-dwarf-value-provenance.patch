@@ -1,0 +1,126 @@
+# Research-only patch against Binaryen fba5005a132d85d578be5bd010e0487ed8e2ce3e.
+# NOT a production fix: incomplete control-flow validity, expression coverage,
+# location-list rebuilding and synthetic-state handling. Unsupported cases retain
+# their old metadata. See ../debug-builds-threaded-games-dwarf-repair.md.
+# Apply only to a disposable checkout: patch -p1 < this-file
+--- a/src/wasm.h
++++ b/src/wasm.h
+@@ -2486,6 +2486,10 @@
+     delimiterLocations;
+   BinaryLocations::FunctionLocations funcLocation;
+ 
++  // Research-only DWARF value provenance: not a complete validity analysis.
++  std::unordered_map<BinaryLocation, std::vector<Expression*>> debugInputStacks;
++  std::unordered_map<Expression*, std::pair<Index, Expression*>> debugValueSpills;
++
+   // Annotations on expressions. As with debug info, we do not store these on
+   // Expressions as we assume most instances are unannotated, and do not want to
+   // add constant memory overhead.
+--- a/src/wasm-ir-builder.h
++++ b/src/wasm-ir-builder.h
+@@ -84,6 +84,9 @@
+     this->codeSectionOffset = codeSectionOffset;
+   }
+ 
++  // Research-only snapshot of single-value stack producers at an input PC.
++  void recordDebugInputStack(BinaryLocation pc);
++
+   // The current function, used to create scratch locals, add annotations, etc.
+   void setFunction(Function* func) { this->func = func; }
+ 
+--- a/src/wasm/wasm-ir-builder.cpp
++++ b/src/wasm/wasm-ir-builder.cpp
+@@ -211,6 +211,19 @@
+   return Ok{};
+ }
+ 
++void IRBuilder::recordDebugInputStack(BinaryLocation pc) {
++  if (!func) { return; }
++  std::vector<Expression*> values;
++  for (auto& scope : scopeStack) {
++    if (scope.unreachable || scope.inputType.isConcrete()) { return; }
++    for (auto* expr : scope.exprStack) {
++      if (expr->type.isTuple()) { return; }
++      if (expr->type.isConcrete()) { values.push_back(expr); }
++    }
++  }
++  func->debugInputStacks.emplace(pc, std::move(values));
++}
++
+ void IRBuilder::push(Expression* expr, Origin origin) {
+   auto& scope = getScope();
+   if (expr->type == Type::unreachable) {
+--- a/src/wasm/wasm-binary.cpp
++++ b/src/wasm/wasm-binary.cpp
+@@ -3474,6 +3474,9 @@
+           throwError(err->msg);
+         }
+         while (pos < endOfFunction) {
++          if (needCodeLocations) {
++            builder.recordDebugInputStack(pos - codeSectionLocation);
++          }
+           auto inst = readInst();
+           if (auto* err = inst.getErr()) {
+             throwError(err->msg);
+--- a/src/passes/Flatten.cpp
++++ b/src/passes/Flatten.cpp
+@@ -349,7 +349,11 @@
+       // use a local
+       auto type = curr->type;
+       Index temp = builder.addVar(getFunction(), type);
+-      ourPreludes.push_back(builder.makeLocalSet(temp, curr));
++      auto* spill = builder.makeLocalSet(temp, curr);
++      ourPreludes.push_back(spill);
++      if (getFunction()->expressionLocations.contains(curr)) {
++        getFunction()->debugValueSpills[curr] = {temp, spill};
++      }
+       replaceCurrent(builder.makeLocalGet(temp, type));
+     }
+ 
+--- a/src/wasm/wasm-debug.cpp
++++ b/src/wasm/wasm-debug.cpp
+@@ -985,6 +985,34 @@
+   return isTombstone(loc.Start) && isTombstone(loc.End);
+ }
+ 
++// Research-only proof of producer identity through Flatten. Deliberately
++// limited to same-size single-value expressions; not a complete repair.
++static void repairFlattenedStackLoc(llvm::DWARFYAML::Loc& loc,
++                                    const LocationUpdater& updater,
++                                    BinaryLocation oldPC,
++                                    BinaryLocation newPC) {
++  auto& bytes = loc.Location;
++  if (bytes.size() != 4 || bytes[0] != 0xed || bytes[1] != 2 ||
++      bytes[2] >= 128 || bytes[3] != 0x9f || !newPC) { return; }
++  for (auto& f : updater.wasm.functions) {
++    if (oldPC < f->funcLocation.declarations || oldPC >= f->funcLocation.end) { continue; }
++    auto input = f->debugInputStacks.find(oldPC);
++    if (input == f->debugInputStacks.end() || bytes[2] >= input->second.size()) { return; }
++    auto spill = f->debugValueSpills.find(input->second[bytes[2]]);
++    if (spill == f->debugValueSpills.end() || spill->second.first >= 128) { return; }
++    auto position = updater.newLocations.expressions.find(spill->second.second);
++    // A lexical-order check is only sufficient for the straight-line probe.
++    // A production fix needs CFG validity, interval splitting and synthetic gaps.
++    if (position == updater.newLocations.expressions.end() || newPC < position->second.end) { return; }
++    std::cerr << "research: " << f->name << " input PC " << oldPC
++              << " stack " << unsigned(bytes[2]) << " -> local "
++              << spill->second.first << " at output PC " << newPC << '\n';
++    bytes[1] = 0;
++    bytes[2] = spill->second.first;
++    return;
++  }
++}
++
+ // Update the .debug_loc section.
+ static void updateLoc(llvm::DWARFYAML::Data& yaml,
+                       const LocationUpdater& locationUpdater) {
+@@ -1049,6 +1077,9 @@
+       // a new address for it.
+       newStart = locationUpdater.getNewStart(loc.Start + oldBase);
+       newEnd = locationUpdater.getNewEnd(loc.End + oldBase);
++      if (newStart && newEnd > newStart) {
++        repairFlattenedStackLoc(loc, locationUpdater, loc.Start + oldBase, newStart);
++      }
+       if (newStart == 0 || newEnd == 0 || newStart > newEnd) {
+         // This part of the loc no longer has a mapping, or after the mapping
+         // it is no longer a proper span, so we must ignore it.
