@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4 and 9a done; 5–6 harness in place)
+**Status:** in progress (tasks 1–4, 9a and 9b done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -29,7 +29,7 @@ chip irq, task 9a).
 | libcard | 2 (BIOS internals) | 0 | 2 |
 | libcd | 20 | 5 | 12 |
 | libetc | 8 | 0 | 8 |
-| libgpu | 17 | 12 | 0 |
+| libgpu | 17 | 12 | 13 (the rest stay original over them, 9b) |
 | libmcx | 1 | 18 | 4 |
 | libpad | 5 | 1 | 0 |
 | libpress | 3 | 0 | 0 |
@@ -125,7 +125,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    | Order | Chip | Libraries | Adapters | Notes |
    |---|---|---|---|---|
    | a ✓ | IRQ, timers, vblank | libetc, libapi | 11 + 5, all exist | Done 2026-10-29 (progress log). Old libetc set in `111e045^`. Coexists with D45's exception path: the BIOS chains run first, a custom exit still runs after. |
-   | b | GPU | libgpu | 27 | Old set (24) in `02180f4^`. libgs rides on it. |
+   | b ✓ | GPU | libgpu | 15: 13 of the 17 that reach it, `GetODE`, `_GPU_ResetCallback` | Done 2026-10-29 (progress log). The font and kanji functions and the 12 accessors stay original over libgpu's state in guest RAM (D60). libgs rides on it. Old set (24) in `02180f4^`. |
    | c | SIO0 | libpad | 6 | Old set (7) in `609a64a^`. Must reproduce libpad's observable state machine (D40's reason for removing it). |
    | d | CD | libcd (libds and streaming ride on it) | 24 (11 exist) | **Choose the seam first:** the low layer (`CD_*`, `StCdInterrupt`) under both games, or public adapters and the low layer over one drive model. btn's 11 existing public adapters are reworked to fit. |
    | e | MDEC | libpress | 3 | Needs the decode function (task 7). |
@@ -233,6 +233,57 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     `counter.o` original they never fired); a critical section's overdue
     events no longer step time one cycle at a time to a `Wait::Cycle`.
 
+- **2026-10-29, task 9b: chip gpu native in btn and bof4.** 15 libgpu
+  adapters (`sdk-psyq/src/libgpu.rs`), all in `sys.o`: `ResetGraph`,
+  `SetDispMask`, `DrawSync`, `ClearImage`, `LoadImage`, `StoreImage`,
+  `MoveImage`, `MoveImage2`, `ClearOTagR`, `DrawOTag`, `PutDrawEnv`,
+  `DrawOTagEnv`, `PutDispEnv`, `GetODE`, `_GPU_ResetCallback`, one code for
+  both games, written from the 4.7 object (`psxw sdk disasm`;
+  psyq-decomp's C where it matches). `libgpu/sys` is validated (the same
+  object, key `02b22171…`, in both games); both games report gpu native
+  and `game.toml` expects it (btn: cd, gpu, irq; bof4: gpu, irq).
+  - **How (D60).** libgpu's state stays in guest RAM where libgpu keeps
+    it (`GEnv`, the queue, its packets), so `DrawSyncCallback`,
+    `SetGraphDebug`, `ClearOTag`, `GetDrawEnv`, `SetDrawEnv`, the
+    draw-area helpers and the font and kanji functions stay original over
+    it. An adapter learns the guest address of the function it replaces
+    (`psx.adapter(id, addr, …)`, ABI 12) and finds the object's `.data`,
+    `.bss`, `_que` and its calls into libetc from the relocated operands
+    of its code. Adapters make nested guest calls where libgpu does
+    (`Flow::Call`): `ResetCallback`, `GetVideoMode`, `DMACallback`, the
+    DrawSync callback. GP0/GP1 words go to the GPU front end; DMA2/DMA6
+    run on the DMA controller with its own semantics (DPCR, DICR, IRQ3,
+    the recording hook), I_MASK masked around queue work as libgpu does.
+    The queue pump (DMA2's callback when work is queued) is a stand-in at
+    `0xBFC7_0100`. Waits spin like libgpu's loops, a quantum per thousand
+    iterations toward its timeout.
+  - **Conformance:** 13 gpu cases (`sdk-psyq/src/cases/gpu.rs`), 12 level
+    1 with seeded arguments (resets by mode, the display mask, DrawSync
+    with and without a callback, image transfers with rectangles past
+    VRAM's edges, MoveImage/MoveImage2, ordering tables, draw and display
+    environments around the mode boundaries and in PAL, the field,
+    `_GPU_ResetCallback`) and a level-2 sequence (a transfer before
+    `ResetGraph` that waits for DPCR until libgpu's timeout, then the
+    environments, the queue under a DrawSync callback, every transfer,
+    the display, the lesser resets). `psxw conform btn --chip gpu` and
+    `psxw conform bof4 --chip gpu`: PASS, 49 case runs each (4 seeds).
+    The device observation now includes the displays presented
+    (`RenderStats::present_hash`), so what GP1 set is compared too.
+    `psxw conform btn --lib libgpu` (134 steps) and `--lib libetc` (60):
+    PASS; `--chip irq`: PASS in both games (33 runs each).
+  - **Runs:** btn and bof4, 1,200 frames, `--check boot --check no-trap
+    --check no-shadow-io`: pass native and on `--device gpu`. bof4
+    `title-to-field` (25,300 frames): every expect passes, at the same
+    frame as on the device (counter 12390 at frame 24768). btn
+    `title-to-gameplay` (6,000 frames): pass. Native against `--device
+    gpu` over 1,200 frames, the renderer's command stream and the
+    displays are identical (btn 395,228 words in 539 submits, bof4
+    1,008,991 in 766); RAM at frame 1200 differs in 2 bytes in btn and 11
+    in bof4 (Findings). btn's boot still hits libgpu's GPU timeout at
+    frame 64, with the same message; its 1,200 frames make 1,609 `VSync`
+    calls natively, 999,299 on the device (the timeout's spin polls
+    `VSync(-1)`).
+
 ## Findings
 
 - **The state-accessor rule, refined.** An accessor is a function that
@@ -301,3 +352,49 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 - **`--check boot`'s vsync-waits** counted a build probe on `VSync`'s
   guest entry, which an adapter doesn't have; it counts `adapter.VSync`
   too now.
+- **libgpu's state stays in guest RAM** (task 9b, D60). Keeping it in the
+  runtime would need adapters for its 12 accessors, and two of them
+  (`sys:0x1650`, `sys:0x16e8`, the draw-area packets `SetDrawArea` and
+  `SetDrawEnv` build with VRAM's size) are static functions btn and bof4 name
+  differently, so the build can't bind them by name. With the state where
+  libgpu keeps it they stay original, and so do the font and kanji
+  functions, the primitive helpers and libgs.
+- **The scan's gpu set and the build's differ.** The scan counts 29
+  functions: `FntFlush`, `FntLoad`, `KanjiFntOpen` and `KanjiFntFlush`
+  reach the GPU only through `DrawOTag`, `LoadImage` and `DrawSync`, which
+  are adapted, and the 12 accessors share state. The build's reach table
+  counts only what a function's own code (or its unresolved pointer
+  calls) touches, so those run as guest code over the adapters, and the
+  chip is native with 13 of the 17 plus `GetODE` and
+  `_GPU_ResetCallback`.
+- **An unadapted libgpu function reads the I/O shadow when gpu is
+  native.** A case called `GetODE`, which neither game reaches: its own
+  code read GPUSTAT from the window's shadow, not the device, and
+  returned 0. It is adapted now. The other `sys.o` functions that reach
+  the GPU (`DrawPrim`, `SetGraphQueue`, `ClearImage2`, `LoadImage2`,
+  `StoreImage2`, `DrawOTag2`) have no adapter: a game that reaches one
+  falls back to the device ("reached past its adapters"), as D59 means it
+  to. Phase 2 adds them.
+- **libgpu's own loops take virtual time only on the device.** The
+  original spends safepoint budget in its loops (ResetGraph's queue
+  clear, 6,384 iterations, about 0.2 frames; the DRAWENV `memcpy` and the
+  queue copies on every call); the adapters spend none. Observed over
+  1,200 frames: btn's RAM differs only in libgpu's timeout deadline (one
+  Vcount apart) and a dead stack byte; bof4's in dead stack and in the
+  draw time its DrawSync callback measures with `VSync(1)` (9 hblanks,
+  one safepoint quantum, less natively). Replays pass both ways; cases
+  let a vblank pass after heavy calls. Not modelled: the budget's phase
+  at a call isn't visible to the runtime, so it couldn't be exact.
+- **Replays didn't catch a broken queue.** A first build ran the oldest
+  queue entry for every queued call (a shadowed constant). bof4 sets a
+  DrawSync callback, so all its drawing goes through the queue, and
+  `title-to-field` still passed every expect: replays check game state,
+  not frames. The level-2 case found it (a `StoreImage` that read
+  nothing back). The native-against-device render hash (used above) and
+  level 4's frame comparison are what see rendering.
+- **What the gpu adapters don't reproduce, deliberately.** Debug output
+  (`SetGraphDebug(n)`, n > 0: libgpu's rectangle checks and `GPU_printf`
+  traces; both games set 0); waits for GPUSTAT's ready bits outside
+  `DrawSync` (the front end is always ready between whole commands); the
+  queue pump's address (`DMACallback(2, …)` returns the stand-in while it
+  is registered); the stack contents libgpu's frames leave below `sp`.

@@ -54,6 +54,9 @@ pub struct RenderStats {
     /// FNV-1a over every renderer command word submitted, in order: the
     /// GPU's output however it was batched (conformance compares it).
     pub hash: u64,
+    /// FNV-1a over every display presented, in order (conformance
+    /// compares it: what GP1 set, which the commands don't carry).
+    pub present_hash: u64,
 }
 
 pub type SharedRender = std::sync::Arc<std::sync::Mutex<Box<dyn Render>>>;
