@@ -19,7 +19,11 @@
 //! handles, in line order, it acknowledges I_STAT and calls the line's
 //! handler, and looks again until none is left. Handlers are guest calls
 //! in the exception, queued at the front so the dispatcher sees what each
-//! one changed, like the original's loops over the registers.
+//! one changed, like the original's loops over the registers. They run on
+//! `intr.o`'s own stack, where the original's exit from the exception
+//! enters its dispatcher: the interrupted code's may be the scratchpad,
+//! which DMA doesn't reach (btn's menu; libcd reads sector headers into
+//! its callback's frame).
 //!
 //! **libetc's own handlers are functions.** Line 0 is its vblank handler
 //! (Vcount, then the eight `VSyncCallbacks` channels), line 3 its DMA
@@ -146,6 +150,22 @@ pub struct Etc {
     /// returned.
     pub last: u32,
     pub hcount: u32,
+    /// The top of `intr.o`'s own stack, where its dispatcher runs the
+    /// handlers (0: not found, they run on the interrupted code's), and
+    /// the interrupted code's sp while it does.
+    pub stack: u32,
+    pub saved_sp: u32,
+}
+
+/// The stack top `intr.o`'s context sets (`stack[1024 - 20]`): `.data` is
+/// what `ResetCallback`'s first `lui`/`lw` pair (`.text` +0) loads, less
+/// 0x10E0; the driver table at `.data` + 0x10C0 holds the context's
+/// address in its eighth word, and the stack follows the context's 0x68
+/// bytes of fields.
+fn intr_stack(m: &M, reset: u32) -> u32 {
+    let Some(at) = crate::libspu::pair(m, reset, reset + 4) else { return 0 };
+    let context = m.mem.r32(at - 0x10E0 + 0x10C0 + 0x1C);
+    if context == 0 { 0 } else { context + 0x68 + (1024 - 20) * 4 }
 }
 
 // --- The dispatcher -------------------------------------------------------
@@ -201,6 +221,14 @@ fn dispatch(m: &mut M) -> std::result::Result<(), String> {
         // "unexpected interrupt": the original returns from the exception.
         return Ok(());
     }
+    // The exception's first pass: onto libetc's stack, as the original's
+    // exit from the exception (`HookEntryInt`) enters it. The interrupted
+    // code's may be the scratchpad, where no DMA reaches (libcd reads
+    // sector headers into its callback's frame).
+    if !m.sdk.etc.dispatching && m.sdk.etc.stack != 0 {
+        m.sdk.etc.saved_sp = m.regs.sp();
+        m.regs.set_sp(m.sdk.etc.stack);
+    }
     m.sdk.etc.dispatching = true;
     let p = pending(m)?;
     if p != 0 {
@@ -220,6 +248,9 @@ fn dispatch(m: &mut M) -> std::result::Result<(), String> {
         }
     } else {
         m.sdk.etc.spurious = 0;
+    }
+    if m.sdk.etc.stack != 0 {
+        m.regs.set_sp(m.sdk.etc.saved_sp);
     }
     m.sdk.etc.dispatching = false;
     Ok(())
@@ -366,6 +397,7 @@ fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     let e = &mut m.sdk.etc;
     (e.dispatching, e.lines, e.mask, e.saved_mask, e.saved_dpcr) = (false, Default::default(), 0, 0, 0);
     e.active = true;
+    m.sdk.etc.stack = intr_stack(m, m.sdk.at);
     set_reg(m, RCNT1_MODE, 4, 0x100)?;
     m.sdk.etc.vcount = 0;
     m.sdk.etc.vsync = [0; 8];
@@ -639,6 +671,38 @@ mod tests {
         m.run_until(m.clock.now + 0x200);
         crate::testing::drain(&mut m);
         assert_eq!(irq_calls(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn handlers_run_on_intr_stack() {
+        use psx_bios::Sdk;
+        let mut m = machine_with_bus();
+        // btn's ResetCallback: `lui v0, 0x8005; lw v0, 0x7594(v0)` loads
+        // .data + 0x10E0; the driver table's eighth word is the context.
+        m.mem.w32(0x8003_2D94, 0x3C02_8005);
+        m.mem.w32(0x8003_2D98, 0x8C42_7594);
+        m.mem.w32(0x8005_7594 - 0x10E0 + 0x10DC, 0x8005_650C);
+        m.sdk.at = 0x8003_2D94;
+        call(&mut m, reset_callback, [0; 4]);
+        assert_eq!(m.sdk.etc.stack, 0x8005_7524);
+        call(&mut m, vsync_callback, [0x8001_0004, 0, 0, 0]);
+        // Interrupted with its stack in the scratchpad (btn's menu).
+        m.regs.set_sp(0x1F80_0378);
+        m.raise_irq(psx_devices::irq::VBLANK);
+        let mut sps = Vec::new();
+        while let Some(s) = m.irq_calls.pop_front() {
+            match s {
+                IrqStep::Sdk(s) => Psyq::irq_step(&mut m, s),
+                IrqStep::Chain(c, _) => {
+                    sps.push(m.regs.sp());
+                    crate::testing::guest(&mut m, c.addr);
+                }
+                IrqStep::Exit => {}
+            }
+        }
+        assert_eq!(irq_calls(), vec![0x8001_0004]);
+        assert_eq!(sps, vec![0x8005_7524]);
+        assert_eq!(m.regs.sp(), 0x1F80_0378, "the interrupted code's sp back");
     }
 
     #[test]
