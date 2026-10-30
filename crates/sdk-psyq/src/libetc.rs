@@ -525,10 +525,10 @@ fn gpustat(m: &mut M) -> u32 {
 /// field must have changed too.
 fn vsync(m: &mut M, a: [u32; 4]) -> Result {
     let mode = a[0] as i32;
-    let delta = rcnt1(m).wrapping_sub(m.sdk.etc.hcount) & 0xFFFF;
     if mode < 0 {
         return ret(m.sdk.etc.vcount);
     }
+    let delta = rcnt1(m).wrapping_sub(m.sdk.etc.hcount) & 0xFFFF;
     if mode == 1 {
         return ret(delta);
     }

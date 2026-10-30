@@ -266,6 +266,10 @@ struct Rt {
     m: RefCell<Machine<Psyq>>,
     quantum: u64,
     adapters: Vec<(&'static str, sdk_psyq::Adapter)>,
+    /// Calls of each adapter, for the run report's `adapter.<name>`: kept
+    /// apart from the machine's counters because polling loops make
+    /// thousands a frame.
+    calls: Vec<Cell<u64>>,
     cop0: RefCell<[u32; 32]>,
     /// One pending console call, separate from the borrowed machine.
     execute: Cell<Option<(u32, GuestCall)>>,
@@ -341,6 +345,7 @@ fn init(options: u32) {
         m: RefCell::new(m),
         quantum,
         adapters: sdk_psyq::adapters(),
+        calls: sdk_psyq::adapters().iter().map(|_| Cell::new(0)).collect(),
         cop0: RefCell::new([0; 32]),
         execute: Cell::new(None),
         executing: Cell::new(false),
@@ -753,7 +758,8 @@ pub extern "C" fn adapter(id: u32, addr: u32, a0: u32, a1: u32, a2: u32, a3: u32
         let Some(&(name, f)) = rt.adapters.get(id as usize) else { fatal(10, &format!("adapter {id} unknown")) };
         let flow = {
             let mut m = rt.m.borrow_mut();
-            m.count(&format!("adapter.{name}"));
+            let n = &rt.calls[id as usize];
+            n.set(n.get() + 1);
             m.sdk.at = addr;
             f(&mut m, [a0, a1, a2, a3])
         };
@@ -777,7 +783,11 @@ pub extern "C" fn psxw_report() {
         // SAFETY: the run is over (stopped by a trap or returned); no
         // frame holding a borrow will execute again.
         let m = unsafe { &*rt.m.as_ptr() };
-        let counts: Vec<String> = m.counts.iter().map(|(k, v)| format!("{k:?}:{v}")).collect();
+        let mut all = m.counts.clone();
+        for ((name, _), n) in rt.adapters.iter().zip(&rt.calls).filter(|(_, n)| n.get() > 0) {
+            *all.entry(format!("adapter.{name}")).or_default() += n.get();
+        }
+        let counts: Vec<String> = all.iter().map(|(k, v)| format!("{k:?}:{v}")).collect();
         let cdc = m.io.as_ref().map(|io| &io.cdc);
         let errors: Vec<String> =
             m.sdk.cd.edc_errors.iter().chain(cdc.iter().flat_map(|c| &c.edc_errors)).map(|e| format!("{e:?}")).collect();

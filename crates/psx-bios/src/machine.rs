@@ -298,8 +298,15 @@ impl<S: Sdk> Machine<S> {
         m
     }
 
+    /// A run-report counter. Adapters and BIOS calls count every call, so a
+    /// key is allocated only the first time.
     pub fn count(&mut self, what: &str) {
-        *self.counts.entry(what.to_string()).or_default() += 1;
+        match self.counts.get_mut(what) {
+            Some(n) => *n += 1,
+            None => {
+                self.counts.insert(what.to_string(), 1);
+            }
+        }
     }
 
     pub fn log(&mut self, msg: &str) {
