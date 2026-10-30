@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c, 9d and 9e done; 5–6 harness in place)
+**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c, 9d, 9e and 9g done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -20,10 +20,11 @@ per-function detail. The scan reproduces every constant-address access
 the translator sees in either game's SDK code.
 
 **141 adapters** across both games: btn needs 109, bof4 90. 78 reach a
-chip or BIOS internals; 63 are state accessors. 49 of them exist (23
+chip or BIOS internals; 63 are state accessors. 46 of them exist (23
 before chip irq, task 9a; 31 before chip sio0, task 9c; chip cd, 9d,
 traded libcd's 12 public-layer adapters for 8 of its drive layer here;
-chip mdec, 9e, added libpress's 3).
+chip mdec, 9e, added libpress's 3; chip memcard, 9g, kept 1 of libmcx's
+4, its accessors original over libmcx's state).
 
 | Library | Reach hardware | State accessors | Have |
 |---|---|---|---|
@@ -32,7 +33,7 @@ chip mdec, 9e, added libpress's 3).
 | libcd | 20 | 5 | 8 (the drive layer and the ring's interrupt; 5 more are internal, 9d) |
 | libetc | 8 | 0 | 8 |
 | libgpu | 17 | 12 | 13 (the rest stay original over them, 9b) |
-| libmcx | 1 | 18 | 4 |
+| libmcx | 1 | 18 | 1 (and `_mcxDsrEntry`, internal; the accessors stay original over libmcx's state, 9g) |
 | libpad | 5 | 1 | 6 |
 | libpress | 3 | 0 | 3 (and the 3 internal ones, 9e) |
 | libsnd | 1 | 19 | 0 |
@@ -132,7 +133,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    | d ✓ | CD | libcd (libds and streaming ride on it) | 13: `bios_1`'s 9, `CD_getsector`, `CD_getsector2`, `StCdInterrupt`, `StUnSetRing` | Done 2026-10-29 (progress log). The seam is libcd's drive layer under both games (D62); the public layer, libds and the rest of the ring stay original over it, its state in libcd's own globals. btn's 22 public-layer adapters are gone. |
    | e ✓ | MDEC | libpress | 6: the 3 bof4 calls and the 3 internal ones | Done 2026-10-29 (progress log). bof4 only (btn links no libpress). Over the MDEC's decode function (task 7), DMA0/DMA1 completed on the shared controller, IRQ3 held to the guest's next safepoint (D64). |
    | f | SPU | libspu, libsnd | 26 + 1 | Needs the mixer API (task 7). The largest set. |
-   | g | Memory card (PocketStation) | libmcx | 19 (4 exist) | btn only. |
+   | g ✓ | Memory card (PocketStation) | libmcx | 2: `McxStartCom`, `_mcxDsrEntry` | Done 2026-10-29 (progress log). btn only. A chip group (`memcard`) whose device is SIO0 with the BIOS's cards; the commands, `McxSync` and `McxStopCom` stay original over libmcx's state in guest RAM (D65). Old set (6) in `66ef76c`. |
 
 10. [ ] **Both games fully native.** btn's and bof4's build reports show
     every chip native except the GTE. Every replay passes in adapter mode
@@ -516,6 +517,82 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     mdec` passes the same (10 MDEC register accesses). btn
     `title-to-gameplay` (6,000 frames): pass.
 
+- **2026-10-29, task 9g: chip memcard native in btn.** libmcx, the
+  PocketStation library, is a chip group, `memcard` (D65), with 2
+  adapters (`sdk-psyq/src/libmc.rs`): `McxStartCom` and `_mcxDsrEntry`,
+  written from the 4.7 objects (`psxw sdk disasm`; psyq-decomp's C for
+  `mcxinit`, `mcxmain` and most of `mcxresi`). `libmcx/mcxinit`,
+  `mcxmain`, `mcxresi` and `mcxdsr` are validated (the old entries for
+  `mcxcmd2`, `mcxcmd23`, `mcxcmd24` went with their adapters); btn
+  reports memcard native and `game.toml` expects it (cd, gpu, irq,
+  memcard, sio0). bof4 links no libmcx. The six old libmcx adapters
+  (`McxStartCom` doing nothing, `McxStopCom`, `McxSync`, `McxCardType`,
+  `McxAllInfo`, `McxExecApl` answering at once) are gone. Inventory: 46
+  of the 141 exist.
+  - **How (D65).** libmcx's state stays in its `.data` and common blocks,
+    found from `McxStartCom`'s and `_mcxDsrEntry`'s places (D61) through
+    `mcxresi`'s elements, its vblank handler's and `_mcxStepSio`'s
+    operands, so the 16 command functions btn calls, their Tx/Rx
+    callbacks, `McxSync` (its `McxSync(0)` spin included) and
+    `McxStopCom` stay original. `McxStartCom` appends libmcx's vblank
+    element to priority 2's chain through the table of tables, as
+    `mcxinit` does; the kernel runs libmcx's two elements as adapter
+    steps (`chain_element` maps its own records): the vblank handler
+    (time-outs, `SetUIFS`'s retries, starting a reserved transfer) and
+    the /ACK element, whose handler is `_mcxDsrEntry`, called as a guest
+    function. `_mcxDsrEntry` is `_mcxStepSio` over a wire (the slot
+    selected, the byte received, the port's interrupt flag), the
+    command's callbacks called where it calls them (`Flow::Call`), the
+    bulk path (`_mcxFastDsrEnt` from C) and the ends. A slot's card is
+    the BIOS's image answering as a standard card
+    (`psx_devices::memcard::Responder`, new: 81h and the FLAG, `R`/`W`,
+    every other command refused). The address byte's wait spends a
+    quantum and starts the guest's budget over (D60); an /ACK raises IRQ7
+    at its time, left for the next interrupt to take, as SIO0's device
+    does.
+  - **The device side, made to run.** The HLE kernel keeps its exception
+    control blocks in RAM (psxw-abi `kernel::EXCB`, from 100h), walks
+    what is linked there after its own chain and unlinks it in
+    `SysDeqIntRP`: original `McxStartCom` links its element itself. SIO0's
+    device gets the two card slots (Beetle's `InputDevice_Memcard`, /ACK
+    100h cycles after a byte), over the BIOS's images, which `psx-bios`
+    passes to every SIO0 access and loads when a card's address first
+    goes out (Findings). The root
+    counters report mode bits 11 and 12 (target and FFFFh reached since
+    the last read, cleared by it), which libmcx's wait on root counter 2
+    needs (Findings). DEVICE_LIBRARIES has libmcx.
+  - **Conformance:** 3 memcard cases (`sdk-psyq/src/cases/memcard.rs`), 2
+    level 1 with seeded arguments (`McxStartCom` once or twice, vblank
+    masked first or not, then a card-type query to either slot; one of
+    the 16 commands with seeded arguments to a seeded port, slot 1, slot
+    2, a sub-address or anything to FFh, a second command refused while
+    it runs, polled per vblank, its buffers) and a level-2 session
+    (nothing reserved, both slots' card type through `McxSync(0)`, every
+    command to both slots, `McxStopCom` with a transfer running and
+    `McxStartCom` timing it out, `McxExecFlag` on the card). Observed per
+    vblank: `McxSync(1)`, the command number and result it writes, where
+    the guest resumes in the frame (hblanks), the interrupt mask.
+    `psxw conform btn --chip memcard`: PASS, 17 case runs (8 seeds):
+    slot 1 gives McxErrInvalid and slot 2 McxErrNoCard, two vblanks after
+    the call, the start's vblank resuming a quantum (9 hblanks) later on
+    both sides. Unit tests over a stand-in object layout
+    (`libmc::tests`), the responder's frame read and write, SIO0's card
+    slots, the timers' flags and the RAM chain. On the tree merged with
+    main (chips cd and mdec): `--chip irq` (33 runs), `gpu` (49), `sio0`
+    (34), `cd` (19) pass in btn, and `irq` (33), `gpu` (49), `sio0` (34),
+    `cd` (22), `mdec` (17) in bof4; `psxw conform btn --lib libpad`
+    (125 steps), `--lib libmcrd` (21) and `--lib libetc` (60).
+  - **Runs:** btn 1,200 frames, `--check boot --check no-trap --check
+    no-shadow-io`: pass native and on `--device memcard` (952,146 `VSync`
+    calls both ways; `McxStartCom` once). btn `card-load` with `--check
+    card` passes native and on `--device memcard`, the two runs equal
+    (RAM and VRAM hashes, 3,000 frames, the same 1,698,611,325 cycles);
+    on the device libmcx's verifier reads I_STAT/I_MASK 14,227 times,
+    natively no guest code touches a register of the chip. btn
+    `title-to-gameplay` (6,000 frames): pass. bof4 (no libmcx): 1,200
+    frames pass, `title-to-field` passes every expect at the same frame
+    (counter 12390 at frame 24768).
+
 ## Findings
 
 - **The state-accessor rule, refined.** An accessor is a function that
@@ -794,3 +871,72 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   functions resolve into before it starts (§3: the bytes in RAM decide),
   and fails if one lies over the cases' scratch RAM (`SCRATCH`, now with
   `SCRATCH_LEN`, 48 KiB) or over another the case needs.
+- **libmcx is a chip, memcard, not BIOS internals** (task 9g, D65). It
+  drives SIO0, IRQ7 and root counter 2 itself; its acts on the kernel
+  are its element, appended to priority 2's chain directly through the
+  table of tables at 100h (so original libmcx registered nothing under
+  the HLE kernel, whose chains were Rust lists), and a patch of the
+  exception vector its bulk path takes only when entered from there.
+  With the kernel's blocks in RAM, original libmcx runs over SIO0, the
+  oracle the adapters are compared against. A separate chip from sio0:
+  its devices are the slots' cards, not the pads, and sio0's mode in both
+  games needn't follow libmcx's in btn.
+- **The root counters lacked mode bits 11 and 12** (found by the memcard
+  cases). `_mcxChkRC2wait` adds a wrap's 10000h when the mode says the
+  counter reached FFFFh (or the target, when it resets there), which a
+  mode read clears; libpad's own wait adds the target instead and never
+  needed them. Without the bits the device's wait for 1,160 cycles lasted
+  from 1 to 23 quanta by root counter 2's phase (and could last for
+  ever), against 1 natively: the cases saw the guest resume at hblank 92
+  or 213 instead of 9. `Timer::read_mode` now reports and clears them.
+- **SIO0's /ACK interrupt is taken at the next interrupt the machine
+  raises**, not at the next safepoint: the device raises I_STAT's bit as
+  it is brought up to date at a register access, and nothing walks the
+  chains until another line (a vblank, a root counter) rises. The
+  adapters do the same (the /ACK is an event that only raises the line).
+  libmcx's bytes after the address therefore go one per interrupt, and
+  its vblank handler times out a transfer still running: a standard card
+  answers `McxExecFlag`'s `R` and `W`, but the transfer (140 bytes) ends
+  in McxErrInvalid in both modes, where hardware would read the block's
+  directory frame and write it back with the flag (and a new card's FLAG
+  would give McxErrNewCard). Open, with the safepoint model: hardware
+  takes each /ACK within microseconds.
+- **btn's replays reach no libmcx command.** btn calls `McxStartCom` at
+  boot; `McxCardType` with `McxSync(0)` comes from the card checks in
+  `ovl_31` (after `MemCardAccept`, for two of its results) and `ovl_15`,
+  and every command from `ovl_10`, a PocketStation menu. `card-load`
+  takes the BIOS's path only (its run calls no other libmcx function), so
+  the cases are what exercise the transfers; the replay checks the BIOS
+  card path is undisturbed.
+- **What the old libmcx adapters got wrong.** They answered at once,
+  where the original's answer comes at the second vblank (a game's
+  `McxSync(0)` waits that long); `McxSync` wrote 1 as the command number
+  (the original writes the command's, 13h for `McxCardType`) and left
+  its out-parameters alone when nothing was reserved (the original
+  zeroes them); `McxStartCom` did nothing (no vblank acknowledge or mask,
+  no `ChangeClearRCnt(3, 0)`).
+- **`hardware_unbound` sees libmcx's constant-address internals only**
+  (`_mcxSetRC2wait`, `_mcxChkRC2wait`, `_mcxSioRW`, `_mcxFastDsrEnt`, all
+  unreachable): it uses the translator's facts, so the internals that
+  reach SIO0 through libmcx's register pointers (`_mcxInitSioMode`,
+  `_mcxStepSio`, the handler, the verifiers) aren't listed. Their
+  unreachability is the chip decision's, which uses the reach table and
+  reports memcard native.
+- **`_mcxStartFastDsr` runs as guest code in both modes.** An Rx callback
+  calls it when a PocketStation's length arrives (never without one): it
+  asks the BIOS for the C0h table (0x674 here, zeros), writes its vector
+  stub at entry 6 + 70h, so at 70h, and flushes the cache. Harmless in
+  RAM the HLE BIOS doesn't use; the bulk bytes then reach
+  `_mcxFastDsrEnt` from `_mcxDsrEntry` (`_mcxCallFromC`), which the
+  adapter reproduces.
+- **A PocketStation isn't modelled**, so libmcx's success paths (a
+  command's reply, `_mcxStepSio`'s last-byte read, the bulk transfer of
+  `ReadDev`/`WriteDev`/`SetUIFS`) are implemented from the objects but
+  unexercised on either side, as libpad's DualShock paths are.
+- **When SIO0's cards are loaded is observable.** A first version loaded
+  the BIOS's images at SIO0's first access, so libpad's original code on
+  the device (`psxw conform btn --lib libpad`) loaded a fresh card and the
+  BIOS wrote it back at the next vblank, which the scenario saw and the
+  adapter side didn't. The cards load when a card's address (81h) first
+  goes out, on the device and natively alike; a pad driver never sends
+  it.

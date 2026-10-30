@@ -11,8 +11,8 @@
 //! libgpu's `sys.o` (chip gpu), libpad's direct connection (chip sio0),
 //! libpress's MDEC functions (chip mdec),
 //! libapi's `pad.o`/`patch.o`/`first.o`, libcd's drive layer and the
-//! streaming ring's interrupt (chip cd), and
-//! libcard/libmcx's thin BIOS wrappers.
+//! streaming ring's interrupt (chip cd), libmcx's port driver (chip
+//! memcard), and libcard's thin BIOS wrappers.
 //!
 //! A chip whose adapters don't cover a game runs its libraries as the
 //! game's own code over register-level devices ([`DEVICE_LIBRARIES`],
@@ -71,7 +71,10 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 /// - libpress, when chip mdec is emulated: the MDEC (`psx_devices::mdec`)
 ///   decodes what its own code feeds it by DMA0, and DMA1 takes the
 ///   pixels.
-pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress", "libapi"];
+/// - libmcx, when chip memcard is emulated: SIO0 (`psx_devices::sio`), its
+///   cards the BIOS's images, and its element in the kernel's chain
+///   through the table of tables (D65).
+pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress", "libapi", "libmcx"];
 
 /// Adapter state.
 #[derive(Debug, Default)]
@@ -88,7 +91,10 @@ pub struct Psyq {
 }
 
 impl Sdk for Psyq {
-    fn on_event(m: &mut M, kind: u32, _data: u32) {
+    fn on_event(m: &mut M, kind: u32, data: u32) {
+        if kind == libmc::EV_ACK {
+            return libmc::on_ack(m, data);
+        }
         m.log(&format!("sdk: unknown event {kind}"));
     }
 
@@ -112,11 +118,14 @@ impl Sdk for Psyq {
         if step == libpad::STEP {
             return libpad::irq_step(m, step);
         }
+        if libmc::owns(step) {
+            return libmc::irq_step(m, step);
+        }
         libetc::irq_step(m, step)
     }
 
-    fn chain_element(_m: &M, elem: u32) -> Option<u32> {
-        (elem == libpad::ELEMENT).then_some(libpad::STEP)
+    fn chain_element(m: &M, elem: u32) -> Option<u32> {
+        (elem == libpad::ELEMENT).then_some(libpad::STEP).or_else(|| libmc::chain_element(m, elem))
     }
 
     fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
@@ -143,6 +152,7 @@ pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
     v.extend(libgpu::ADAPTERS.iter().map(|(n, _)| (*n, "gpu")));
     v.extend(libpress::ADAPTERS.iter().map(|(n, _)| (*n, "mdec")));
     v.extend(libcd::ADAPTERS.iter().map(|(n, _)| (*n, "cd")));
+    v.extend(libmc::MCX.iter().map(|(n, _)| (*n, "memcard")));
     v
 }
 
@@ -156,6 +166,7 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     v.extend(libpress::ADAPTERS);
     v.extend(libcd::ADAPTERS);
     v.extend(libmc::ADAPTERS);
+    v.extend(libmc::MCX);
     v
 }
 

@@ -29,11 +29,13 @@ pub const VALIDATED: &[(&str, &str)] = &[
     ("libetc/intr", "09b0feea2c632554bb610534332bc10cf1708c337d9cfd65247ac9400a35799e"),
     ("libetc/vsync", "5ced3e577ea12a54481e823fd26a28b831c29d427c4728d4c35233f3c46095a8"),
     ("libgpu/sys", "02b22171147b3ca173f009f2cd944c513074ba6db33d956ed051c67cdba18e04"),
-    ("libmcx/mcxcmd2", "58e691a13329379c176821716b5baf24e9e9c75b1429e4970cd620e00efc6d5e"),
-    ("libmcx/mcxcmd23", "92804c396fb540fcda4c0e0081118fd7ebd1ca6bc816cefd95be8b1ac8a9a7bc"),
-    ("libmcx/mcxcmd24", "9926ec52d6649a8cebb51eaca0bad13eb020056a15b5bdf8b8e5b989a2c16f02"),
+    // libmcx's adapters (McxStartCom, _mcxDsrEntry), and the objects whose
+    // code and data they read (the elements, the vblank handler,
+    // _mcxStepSio, the bulk transfer's words).
+    ("libmcx/mcxdsr", "a566997a1397665ea2126a77ab548e3ee5cf68e2aa32f22a764e5fb96621e877"),
     ("libmcx/mcxinit", "207348a4d4a238743aeaa735bfdac5f1d7899a7c87d4c6039159e40685919d65"),
     ("libmcx/mcxmain", "0613d35f2626d3c3fd435be6119f3483c4cf1aa6035b98b1c130317047025d55"),
+    ("libmcx/mcxresi", "287468efa03dffc7e83b6e96967958b4ad9ca31cca3019bd631dbbf74d4a8737"),
     // libpad's calls, and the vblank engine behind them (pddirres,
     // pdresres), which the adapters reproduce.
     ("libpad/pdcmd1", "65c474183d32625a87f9200f812955e6e5a2a9fcf54a333891e7bcf07cfa3232"),

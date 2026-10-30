@@ -256,9 +256,218 @@ impl Card {
     }
 }
 
+/// A memory card's side of the controller port, a byte at a time (psx-spx
+/// "Memory Card Read/Write Commands"; Beetle PSX's `InputDevice_Memcard`,
+/// the emulator oracle's). SIO0's device clocks it bit by bit
+/// (`crate::sio`); adapters that drive a card without the port's registers
+/// take it a byte at a time.
+///
+/// The card answers address 81h with its FLAG (bit 3: a new card, until a
+/// sector is written), then a read (`R`, 52h) or a write (`W`, 57h) of one
+/// 128-byte frame: its ID bytes (5Ah 5Dh), the sector echoed, the
+/// acknowledges (5Ch 5Dh), the frame, its checksum (the sector's two bytes
+/// and the data, XORed) and the end byte (47h good, 4Eh a bad checksum,
+/// FFh a bad sector; a read of a bad sector confirms FFFFh and ends). Every
+/// byte the card answers is followed by its /ACK, except the transfer's
+/// last. Any other address or command, and Beetle's unsupported `S`, end
+/// the transfer: nothing is answered or acknowledged until the card is
+/// selected again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Responder {
+    state: Phase,
+    write: bool,
+    sector: u16,
+    sum: u8,
+    good: bool,
+    pos: usize,
+    data: Vec<u8>,
+    /// What the card sends during the host's next byte (`None`: nothing,
+    /// the line stays high and nothing is acknowledged).
+    next: Option<u8>,
+}
+
+/// What the card takes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Address,
+    Command,
+    Id,
+    Msb,
+    Lsb,
+    /// The sector's low byte, then a read's acknowledges and confirmed
+    /// sector.
+    Header(u8),
+    Data,
+    Tail(u8),
+    Done,
+}
+
+impl Default for Responder {
+    fn default() -> Self {
+        Responder { state: Phase::Address, write: false, sector: 0, sum: 0, good: false, pos: 0, data: vec![], next: None }
+    }
+}
+
+impl Responder {
+    /// The card is selected (DTR rises): a new transfer.
+    pub fn select(&mut self) {
+        *self = Responder::default();
+    }
+
+    /// What the card sends during the host's next byte (`Some`: it
+    /// acknowledged the last one).
+    pub fn next(&self) -> Option<u8> {
+        self.next
+    }
+
+    /// The host's byte `rx` has arrived, with `card` in the slot: the
+    /// card's answer during the following byte (`Some`: it acknowledges).
+    pub fn byte(&mut self, card: Option<&mut Card>, rx: u8) -> Option<u8> {
+        let Some(card) = card else {
+            self.state = Phase::Done;
+            self.next = None;
+            return None;
+        };
+        let valid = (self.sector as u32) < FRAMES;
+        let (state, next) = match (self.state, self.write) {
+            (Phase::Address, _) if rx == 0x81 => (Phase::Command, Some(if card.new_card { 0x08 } else { 0x00 })),
+            (Phase::Command, _) if rx == b'R' || rx == b'W' => {
+                self.write = rx == b'W';
+                (Phase::Id, Some(0x5A))
+            }
+            (Phase::Id, _) => (Phase::Msb, Some(0x5D)),
+            (Phase::Msb, _) => (Phase::Lsb, Some(0x00)),
+            (Phase::Lsb, _) => {
+                self.sector = (rx as u16) << 8;
+                self.sum = rx;
+                (Phase::Header(0), Some(rx))
+            }
+            (Phase::Header(0), w) => {
+                self.sector |= rx as u16;
+                self.sum ^= rx;
+                self.pos = 0;
+                self.data = vec![0; FRAME];
+                if w { (Phase::Data, Some(rx)) } else { (Phase::Header(1), Some(0x5C)) }
+            }
+            // A read: 5Dh, the confirmed sector, the data, the checksum,
+            // 'G'.
+            (Phase::Header(1), false) => (Phase::Header(2), Some(0x5D)),
+            (Phase::Header(2), false) => (Phase::Header(3), Some(if valid { (self.sector >> 8) as u8 } else { 0xFF })),
+            (Phase::Header(3), false) if !valid => (Phase::Tail(9), Some(0xFF)),
+            (Phase::Header(3), false) => (Phase::Header(4), Some(self.sector as u8)),
+            (Phase::Header(4), false) => {
+                self.data.copy_from_slice(card.frame(self.sector as u32));
+                (Phase::Data, Some(self.data[0]))
+            }
+            (Phase::Data, false) => {
+                self.sum ^= self.data[self.pos];
+                self.pos += 1;
+                match self.data.get(self.pos) {
+                    Some(&b) => (Phase::Data, Some(b)),
+                    None => (Phase::Tail(0), Some(self.sum)),
+                }
+            }
+            (Phase::Tail(0), false) => (Phase::Tail(9), Some(b'G')),
+            // A write: the data and the checksum, each echoed a byte late,
+            // then 5Ch 5Dh and the end byte; the frame is written with it.
+            (Phase::Data, true) => {
+                self.data[self.pos] = rx;
+                self.sum ^= rx;
+                self.pos += 1;
+                (if self.pos == FRAME { Phase::Tail(1) } else { Phase::Data }, Some(rx))
+            }
+            (Phase::Tail(1), true) => {
+                self.good = rx == self.sum;
+                (Phase::Tail(2), Some(0x5C))
+            }
+            (Phase::Tail(2), true) => (Phase::Tail(3), Some(0x5D)),
+            (Phase::Tail(3), true) => {
+                let end = if !valid {
+                    0xFF
+                } else if !self.good {
+                    b'N'
+                } else {
+                    card.write_frame(self.sector as u32, &self.data);
+                    b'G'
+                };
+                (Phase::Tail(9), Some(end))
+            }
+            _ => (Phase::Done, None),
+        };
+        self.state = state;
+        self.next = next;
+        next
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One transfer, a byte at a time: the card's answer during each byte
+    /// (FFh while it sends nothing), and whether it acknowledged it.
+    fn transfer(card: &mut Option<Card>, bytes: &[u8]) -> Vec<(u8, bool)> {
+        let mut r = Responder::default();
+        r.select();
+        bytes
+            .iter()
+            .map(|&b| {
+                let out = r.next().unwrap_or(0xFF);
+                let ack = r.byte(card.as_mut(), b).is_some();
+                (out, ack)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn address_and_flag_then_other_commands_end_the_transfer() {
+        let mut card = Some(Card::formatted());
+        assert_eq!(transfer(&mut card, &[0x81, 0x58, 0x00]), [(0xFF, true), (0x08, false), (0xFF, false)]);
+        card.as_mut().unwrap().new_card = false;
+        assert_eq!(transfer(&mut card, &[0x81, b'S', 0x00]), [(0xFF, true), (0x00, false), (0xFF, false)]);
+        assert_eq!(transfer(&mut card, &[0x01, 0x42]), [(0xFF, false), (0xFF, false)], "a pad's address");
+        assert_eq!(transfer(&mut None, &[0x81, b'R']), [(0xFF, false), (0xFF, false)], "no card");
+    }
+
+    #[test]
+    fn read_a_frame() {
+        let mut card = Some(Card::formatted());
+        let mut cmd = vec![0x81, b'R', 0, 0, 0x00, 0x01, 0, 0, 0, 0];
+        cmd.extend([0; FRAME + 2]);
+        let got = transfer(&mut card, &cmd);
+        let replies: Vec<u8> = got.iter().map(|g| g.0).collect();
+        assert_eq!(replies[..10], [0xFF, 0x08, 0x5A, 0x5D, 0x00, 0x00, 0x5C, 0x5D, 0x00, 0x01]);
+        let frame = card.as_ref().unwrap().frame(1).to_vec();
+        assert_eq!(replies[10..10 + FRAME], frame[..]);
+        let sum = frame.iter().fold(0x00 ^ 0x01, |a, b| a ^ b);
+        assert_eq!(replies[10 + FRAME..], [sum, b'G']);
+        assert!(got[..got.len() - 1].iter().all(|g| g.1) && !got[got.len() - 1].1, "every byte acknowledged but the last");
+        // A bad sector: FFFFh confirmed, and the transfer ends.
+        let got = transfer(&mut card, &[0x81, b'R', 0, 0, 0x04, 0x00, 0, 0, 0, 0, 0]);
+        assert_eq!(got[8..], [(0xFF, true), (0xFF, false), (0xFF, false)]);
+    }
+
+    #[test]
+    fn write_a_frame() {
+        let mut card = Some(Card::formatted());
+        let data: Vec<u8> = (0..FRAME as u32).map(|i| (i * 3) as u8).collect();
+        let sum = data.iter().fold(0x00 ^ 0x40, |a, b| a ^ b);
+        let mut cmd = vec![0x81, b'W', 0, 0, 0x00, 0x40];
+        cmd.extend(&data);
+        cmd.extend([sum, 0, 0, 0]);
+        let got = transfer(&mut card, &cmd);
+        assert_eq!(got[6..9].iter().map(|g| g.0).collect::<Vec<_>>(), [0x40, data[0], data[1]], "echoed a byte late");
+        assert_eq!(got[got.len() - 3..], [(0x5C, true), (0x5D, true), (b'G', false)]);
+        let c = card.as_ref().unwrap();
+        assert_eq!(c.frame(0x40), &data[..]);
+        assert!(!c.new_card && c.dirty);
+        // A bad checksum isn't written.
+        let mut bad = cmd.clone();
+        bad[6] ^= 1;
+        let got = transfer(&mut card, &bad);
+        assert_eq!(got[got.len() - 1], (b'N', false));
+        assert_eq!(card.as_ref().unwrap().frame(0x40), &data[..]);
+    }
 
     #[test]
     fn formatted_card_is_valid() {

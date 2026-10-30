@@ -21,6 +21,7 @@ mod cd;
 mod gpu;
 mod irq;
 mod mdec;
+mod memcard;
 mod sio0;
 
 /// What a case runs against: one game's build, one side.
@@ -120,12 +121,13 @@ pub fn all() -> Vec<Case> {
     v.extend(gpu::cases());
     v.extend(mdec::cases());
     v.extend(cd::cases());
+    v.extend(memcard::cases());
     v
 }
 
 /// The chip each hardware adapter belongs to (D59). BIOS-internals
-/// adapters (libapi's pad and patch members, libcard, libmcx's BIOS card
-/// path) have none: they are mandatory and need no device side.
+/// adapters (libapi's pad and patch members, libcard) have none: they
+/// are mandatory and need no device side.
 pub fn chip_of(adapter: &str) -> Option<&'static str> {
     crate::chip_adapters().into_iter().find(|(n, _)| *n == adapter).map(|(_, c)| c)
 }

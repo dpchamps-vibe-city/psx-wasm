@@ -269,6 +269,8 @@ impl<S: Sdk> Machine<S> {
         };
         let first = m.clock.video.vblank_at(1);
         m.clock.schedule(first, Event::Vblank);
+        // The kernel's exception control blocks are there from power-on.
+        m.lay_out_excb();
         m
     }
 

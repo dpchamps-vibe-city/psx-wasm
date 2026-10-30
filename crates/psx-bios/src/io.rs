@@ -27,6 +27,7 @@ use psx_devices::gpu::Gpu;
 use psx_devices::irq::{self, Irq};
 use psx_devices::mdec::Mdec;
 use psx_devices::sio::Sio0;
+use psxw_abi::kernel as k;
 use std::collections::BTreeMap;
 
 const TIMERS: std::ops::Range<u32> = 0x1F80_1100..0x1F80_1130;
@@ -184,7 +185,8 @@ impl<S: Sdk> Machine<S> {
             self.spu_run();
         }
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
-        io.sio0.update(now, &mut io.irq);
+        let cards = &mut self.kernel.cards.slots;
+        io.sio0.update(now, &mut io.irq, cards);
         let v = if SPU.contains(&addr) {
             let off = addr - SPU.start;
             let half = |o: u32| io.spu.spu.read(o) as u32;
@@ -198,13 +200,14 @@ impl<S: Sdk> Machine<S> {
             // Wider reads (the data FIFO's halfwords) take bytes in turn.
             (0..size.min(4)).fold(0, |v, i| v | (io.cdc.read(addr) as u32) << (8 * i))
         } else if Sio0::handles(addr) {
-            io.sio0.read(addr, now, &mut io.irq)
+            io.sio0.read(addr, now, &mut io.irq, cards)
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
-            let t = &self.timers[n];
+            let t = &mut self.timers[n];
             let reg = match (addr >> 2) & 3 {
                 0 => t.value(n, video, now) as u32,
-                1 => t.mode as u32 | 0x400,
+                // Reading the mode clears its "reached" flags.
+                1 => t.read_mode(n, video, now) as u32,
                 2 => t.target as u32,
                 _ => 0,
             };
@@ -249,8 +252,10 @@ impl<S: Sdk> Machine<S> {
         if SPU.contains(&addr) {
             self.spu_run();
         }
+        self.sio0_cards(addr, v);
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
-        io.sio0.update(now, &mut io.irq);
+        let cards = &mut self.kernel.cards.slots;
+        io.sio0.update(now, &mut io.irq, cards);
         let v = v & mask(size);
         if SPU.contains(&addr) {
             let off = addr - SPU.start;
@@ -284,7 +289,7 @@ impl<S: Sdk> Machine<S> {
             io.cdc.write(addr, v as u8, now);
             self.cdc_sync();
         } else if Sio0::handles(addr) {
-            io.sio0.write(addr, size, v, now, &mut io.irq);
+            io.sio0.write(addr, size, v, now, &mut io.irq, cards);
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
             match (addr >> 2) & 3 {
@@ -640,6 +645,55 @@ impl<S: Sdk> Machine<S> {
         self.host.present(&desc);
     }
 
+    /// SIO0's memory cards are the BIOS's (D43): code that drives the port
+    /// itself (libmcx on its device) finds the cards the BIOS's functions
+    /// see, loaded when it first sends a card's address (81h), as the
+    /// adapters load them (a pad driver never does).
+    fn sio0_cards(&mut self, addr: u32, v: u32) {
+        if Sio0::handles(addr) && addr & 0xF == 0 && v as u8 == 0x81 {
+            self.cards_ready();
+        }
+    }
+
+    /// The kernel's exception control blocks in guest RAM, from the table
+    /// of tables (psx-spx "BIOS Memory Map"): a chain head per priority.
+    /// `SysEnqIntRP` keeps its chains in the kernel (`int_handlers`); SDK
+    /// code that links an element itself (libmcx's `McxStartCom` appends
+    /// to priority 2 through 100h) lands here, and the handler walks these
+    /// after the kernel's (D65).
+    pub fn lay_out_excb(&mut self) {
+        self.mem.w32(k::EXCB_ENTRY, 0xA000_0000 | k::EXCB);
+        self.mem.w32(k::EXCB_ENTRY + 4, k::EXCB_SIZE);
+        self.mem.write(k::EXCB, &[0; k::EXCB_SIZE as usize]);
+    }
+
+    /// The elements linked into priority `prio`'s block in RAM, in order.
+    fn excb_chain(&self, prio: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut e = self.mem.r32(k::EXCB + 8 * prio);
+        while e != 0 && out.len() < 64 && !out.contains(&e) {
+            out.push(e);
+            e = self.mem.r32(e);
+        }
+        out
+    }
+
+    /// `SysDeqIntRP` unlinks `elem` from priority `prio`'s block in RAM too.
+    pub fn excb_unlink(&mut self, prio: u32, elem: u32) {
+        if prio >= 4 {
+            return;
+        }
+        let mut link = k::EXCB + 8 * prio;
+        for e in self.excb_chain(prio) {
+            if e == elem {
+                let next = self.mem.r32(e);
+                self.mem.w32(link, next);
+                return;
+            }
+            link = e;
+        }
+    }
+
     /// Raise interrupt `bit` on the bus (if there is one) and, when it is
     /// unmasked, queue the kernel's handler chains.
     pub fn raise_irq(&mut self, bit: u32) {
@@ -664,8 +718,15 @@ impl<S: Sdk> Machine<S> {
     /// then the SDK's dispatcher when adapters run it, then its exit.
     pub fn queue_irq_chains(&mut self) {
         for prio in 0..4u32 {
-            let Some(chain) = self.kernel.int_handlers.get(&prio) else { continue };
-            for &h in chain.iter().rev() {
+            let mut chain: Vec<u32> = self.kernel.int_handlers.get(&prio).map(|c| c.iter().rev().copied().collect()).unwrap_or_default();
+            // Elements linked into the RAM block (D65) come after the
+            // kernel's, as on a chain whose tail they were appended to.
+            for e in self.excb_chain(prio) {
+                if !chain.contains(&e) {
+                    chain.push(e);
+                }
+            }
+            for h in chain {
                 // An element the adapters own runs as their step, in its
                 // place in the chain.
                 if let Some(s) = S::chain_element(self, h) {
@@ -755,6 +816,30 @@ mod tests {
         assert_eq!((m.io_read(0x1F80_1814, 4).unwrap() >> 17) & 3, 1);
         m.io_write(0x1F80_1124, 2, 0x0200).unwrap();
         assert_eq!(m.io_read(0x1F80_1124, 2).unwrap(), 0x0600);
+    }
+
+    /// An element linked into the RAM block through the table of tables
+    /// (libmcx's `McxStartCom` does it) runs after the kernel's chain of
+    /// its priority; `SysDeqIntRP` unlinks it there.
+    #[test]
+    fn elements_linked_in_ram() {
+        let mut m = machine();
+        m.io = Some(Default::default());
+        m.io_write(0x1F80_1074, 4, 1).unwrap();
+        let (kernel, linked) = (0x8000_1000, 0x8000_1100);
+        for (e, v) in [(kernel, 0x8000_2000), (linked, 0x8000_2100)] {
+            m.mem.w32(e + 4, v + 0x1000);
+            m.mem.w32(e + 8, v);
+        }
+        m.kernel.int_handlers.entry(2).or_default().push(kernel);
+        let block = m.mem.r32(psxw_abi::kernel::EXCB_ENTRY) + 8 * 2;
+        m.mem.w32(block, linked);
+        m.mem.w32(linked, 0);
+        m.raise_irq(psx_devices::irq::VBLANK);
+        let verifiers: Vec<u32> = m.irq_calls.drain(..).filter_map(|s| if let IrqStep::Chain(c, _) = s { Some(c.addr) } else { None }).collect();
+        assert_eq!(verifiers, [0x8000_2000, 0x8000_2100]);
+        crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]).unwrap();
+        assert_eq!(m.mem.r32(block), 0);
     }
 
     #[test]

@@ -37,6 +37,7 @@ manifest, without changes to the toolchain's code.
 | CD-ROM | **Native, per chip** (D59, D62). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). |
 | MDEC | **Native, per chip** (D59, D64). libpress's adapters (bof4, the game that links it) give the MDEC's decode core (`psx-devices::mdec`) the run-length codes `DecDCTin` names and put its pixels into `DecDCTout`'s buffer, without its register protocol. DMA0 and DMA1 complete on the shared DMA controller, so their callbacks come through libetc's DMA handler, at the guest's next safepoint as on the device. As the fallback, libpress is original code over the MDEC's registers, DMA0 in and DMA1 out (D58). |
 | Pad | **Native** (D59, D60). libpad's adapters run its direct-connection engine (btn and bof4): at each vblank interrupt, one exchange per port with a digital-pad model fed by the host's buttons, the detection steps and the buffers as libpad's own state machine makes them, and the time its busy-waits take. As the fallback, libpad is original code over SIO0 (`psx-devices::sio`, D40). |
+| Memory card | **Native, per chip** (D59, D65), for libmcx, the PocketStation library (btn): its adapters run its card-port driver without SIO0's registers, a slot's card being the BIOS's image answering as a standard card does (`psx-devices::memcard`), libmcx's state where libmcx keeps it. As the fallback, libmcx is original code over SIO0, whose cards are the same images. The cards themselves are the BIOS's (D43). |
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
 | BIOS/kernel | A Rust implementation of the A0/B0/C0 services the SDK calls, including threads (D57) and the memory card functions (D43). |
 
@@ -53,8 +54,9 @@ D59 moves each chip back to native adapters, degrading to its device
 model where the adapters don't cover a game
 ([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):
 so far the CD (chip cd), the interrupt layer (chip irq), the GPU (chip
-gpu) and the pads (chip sio0) in both games, and the MDEC (chip mdec) in
-bof4, the game that links libpress.
+gpu) and the pads (chip sio0) in both games, the MDEC (chip mdec) in
+bof4, the game that links libpress, and the memory card port (chip
+memcard) in btn, the game that links libmcx.
 
 ## What the inputs look like (measured)
 
@@ -377,7 +379,8 @@ Guest code is decompiled C or translated, exactly like game code (§4).
 
 **Chips (D59).** The boundary file groups the chip libraries: irq
 (libetc, libapi's `counter.o`), gpu (libgpu), sio0 (libpad), cd (libcd,
-libds), mdec (libpress), spu (libspu, libsnd). `psxw build` decides each
+libds), mdec (libpress), spu (libspu, libsnd), memcard (libmcx, the
+memory card slots on SIO0). `psxw build` decides each
 chip as a whole:
 - **native** when every placed object of the group that defines an
   adapter's function is validated, the game binds adapters there, and the
@@ -403,7 +406,9 @@ the original code runs over register-level models of the SPU and of the
 DMA controller it uses. Adapters drive the interrupt controller and the
 root counters (chip irq), the GPU (chip gpu), the pads (chip sio0) and the
 CD (chip cd: libcd's drive layer over the CD controller's core) in both
-games, and the MDEC (chip mdec: libpress over its decode core) in bof4. Each move below the API (D40, D42, D45, D47,
+games, the MDEC (chip mdec: libpress over its decode core) in bof4, and
+the memory card port (chip memcard: libmcx's driver over the BIOS's
+cards) in btn. Each move below the API (D40, D42, D45, D47,
 D58) bought exactness by construction and independence from the SDK
 version, because the original library decides every value a game can
 observe. Together they made the layer beneath the SDK an emulated device
@@ -482,7 +487,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), their state in the runtime, the games' buffers in guest RAM; `PadStartCom` installs a `SysEnqIntRP` element the kernel runs as an adapter step. On the device: original code over SIO0 (D40), a port of the oracle's. |
 | libmcrd | `guest`, over the HLE BIOS card functions (D43). |
 | libcard | `adapter`. Its `_patch_card` patches Sony BIOS code in kernel RAM (D43). |
-| libmcx | `adapter`. |
+| libmcx | `adapter-or-device`, chip memcard (D65): the PocketStation library, which drives the card slots on SIO0 itself. Native (btn): adapters for `McxStartCom` (vblank in I_STAT/I_MASK, its element appended to the kernel's priority-2 chain through the table of tables) and `_mcxDsrEntry` (each byte of a transfer, the card answering as a standard card does), with the vblank handler and both elements' verifiers run as adapter steps in their places; libmcx's state stays where libmcx keeps it (D61's way), so the command functions, `McxSync` and `McxStopCom` are guest code over it. On the device: original code over SIO0, its cards the BIOS's images, its element in the kernel's RAM chain. |
 | libgs | `guest`. It only writes packets into RAM; libgpu's `DrawOTag` is the device step. |
 | libgte | `guest`, with COP2 through `psx-gte`. |
 | libmath, libc, libc2 | `guest`. `rand` must be the original, or the game plays differently. |
@@ -567,6 +572,11 @@ its buffer. `ReturnFromException` leaves from any depth.
   `PadStartCom` queues an element at an address no game code has, and the
   kernel's walk runs it as an adapter step in its place in the chain
   (libpad's vblank poll, when vblank is unmasked and pending).
+  libmcx's `McxStartCom` instead appends its element to priority 2's
+  chain itself, through the table of tables at 100h: the kernel keeps
+  its exception control blocks there, in RAM, and walks the elements
+  linked there after its own chain's (D65). With chip memcard native,
+  libmcx's two elements run as adapter steps in their places.
 - **Translated code follows this** through wasm exceptions:
   - a `setjmp` (A0h:13h) caller saves its registers inline;
   - the return address is a continuation entry that reloads them;
@@ -746,7 +756,9 @@ a call into guest code.
   events in a fixed order by calling guest callbacks.
 - **The bus** (`psx-bios::io`). Device libraries' I/O-window accesses land
   here (§1). It holds the interrupt controller (`psx-devices::irq`), the
-  root counters (`timers`, computed from virtual time rather than ticked),
+  root counters (`timers`, computed from virtual time rather than ticked;
+  a mode read reports, and clears, the target and FFFFh reached since the
+  last, D65),
   the DMA controller (`dma`: transfers complete instantly in virtual time,
   then set DICR and raise IRQ3), and the devices below. A raised interrupt
   queues the BIOS exception handler's steps (§6).
@@ -817,7 +829,10 @@ a call into guest code.
   state machine sees the timing it sees on the oracle (D40): chip sio0's
   fallback, and the oracle for libpad's adapters (D60). Memory cards
   are raw 128 KiB `.mcr` images in host storage, read and written through
-  the BIOS card functions (D43).
+  the BIOS card functions (D43); on SIO0 the same images answer as a
+  standard card does (`psx-devices::memcard::Responder`, Beetle's: the
+  FLAG, `R` and `W`), for code that drives the card port itself (libmcx
+  on its device, D65), and libmcx's adapters use that core too.
 - **SDK adapters.** The thin, object-keyed layer from §5.
 
 ### Host scripting
@@ -2247,3 +2262,67 @@ checkpoint except dead stack, and the renderer's command stream is the
 same, the movie's slices included. The same rule as D59's and D60's: the
 device decides when a callback runs. Decided without the human's input,
 as the task said (plans/unified-adaptor-layer, phase 1 findings).
+
+**D65. libmcx is a chip, memcard: its adapters drive the card port
+without SIO0's registers, and its device is SIO0 with the BIOS's cards**
+(unified adapter layer, phase 1 task 9g). btn links libmcx, the
+PocketStation library: it calls `McxStartCom` at boot and has code that
+asks a slot for its card type (`McxCardType`, then `McxSync`) and a
+PocketStation menu that calls every command. libmcx drives the card slots
+itself: a command reserves a transfer in libmcx's state, its vblank
+element sends the slot's address after a wait on root counter 2, each
+/ACK's interrupt (IRQ7, its priority-1 element `_mcxDsrEntry`) the next
+byte, and a transfer still running at the next vblank has timed out.
+There is no PocketStation, so a card in the slot acknowledges the address
+and nothing after it (McxErrInvalid), an empty slot nothing (McxErrNoCard).
+- **A chip, not BIOS internals.** libmcx reaches SIO0, IRQ7 and root
+  counter 2 itself; its only acts on the kernel are its element, which
+  `McxStartCom` appends to priority 2's chain through the table of tables
+  at 100h, not with `SysEnqIntRP`, and a patch of the exception vector
+  for a bulk transfer's fast path, which it takes only when called from
+  the vector (never under the HLE BIOS; called from C it returns
+  normally). So the HLE kernel keeps its exception control blocks in RAM
+  where the table of tables points (psxw-abi `kernel::EXCB`), walks the
+  elements linked there after its own chain, and unlinks them in
+  `SysDeqIntRP`; then original libmcx runs, over SIO0. Its chip is
+  `memcard`, apart from sio0: the two drive different devices on SIO0's
+  wire (pads answer 01h, cards 81h), neither's adapters touch the port's
+  registers, and sio0's mode (both games) needn't follow libmcx's (btn).
+- **The seam** is the two functions that drive hardware, `McxStartCom`
+  and `_mcxDsrEntry`; the vblank handler and both elements' verifiers run
+  as adapter steps in their elements' places (`Sdk::chain_element` maps
+  libmcx's own records). libmcx's state stays in its `.data` and `.bss`
+  (D61's way: found through `mcxinit`'s, `mcxresi`'s and `mcxmain`'s
+  relocated code), so the command functions, their callbacks (which the
+  adapter calls where `_mcxStepSio` does), `McxSync` and `McxStopCom`
+  stay original. The six old libmcx adapters answered at once, and
+  `McxSync`'s command number and zeroed out-parameters were wrong.
+- **The card is the BIOS's image on both paths** (D43's cards):
+  `psx_devices::memcard::Responder`, a standard card as Beetle's is (81h
+  and its FLAG, `R` and `W` frame transfers, every other command refused),
+  clocked bit by bit by SIO0's device for libmcx on its device, a byte at
+  a time by the adapters. `McxExecFlag` sends `R` and `W`, which a card
+  answers.
+- **Time as on the device.** The address byte's wait ends at the next
+  safepoint, a quantum in the vblank interrupt, after which the guest's
+  budget starts over (D60). An /ACK raises IRQ7 at its time without
+  walking the chains, as SIO0's device does, so the next interrupt the
+  machine takes runs `_mcxDsrEntry`.
+- **The root counters' "reached" flags** (mode bits 11 and 12, the target
+  and FFFFh reached since the mode was last read; a read clears them) are
+  now modelled. libmcx counts root counter 2's wraps with them; without
+  them its 1,160-cycle wait lasted from one quantum to many, or forever,
+  by the counter's phase on the device.
+
+*Why:* the options were a chip with SIO0 as its device, or a
+BIOS-internals library with mandatory adapters. The second has no oracle;
+with the kernel's blocks in RAM the original runs, and `psxw conform btn
+--chip memcard` compares the adapters against it on every command, both
+slots and the timing to the hblank. The device's timing decides
+(principle 6): under it each byte after the address waits for the next
+interrupt the machine takes (a vblank, a root counter's), so a transfer
+of more than a few bytes doesn't end before the vblank's timeout, and
+`McxExecFlag` on a standard card times out (McxErrInvalid) where hardware
+would read the block's directory frame and write it back. Decided without
+the human's input, as the task said (plans/unified-adaptor-layer, phase 1
+findings).
