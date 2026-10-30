@@ -761,7 +761,10 @@ pub fn run_chip(ws: &Workspace, game: &str, chip: &str, seeds: u64) -> Result<bo
         eprintln!("conform: disc {:?}, first movie at {movie:?}", disc.as_deref().map(|d| d.display().to_string()));
     }
     let side = |wasm: &str| -> Result<ChipSide<'_>> {
-        let o = Options { wasm: wasm.into(), disc: disc.clone().unwrap_or_default(), replay: Some(replay(CHIP_FRAMES)), deadline_secs: 20, ..Default::default() };
+        // A wall-clock bound per call that catches a hang, not a slow one: a
+        // case may spin libgpu's timeout on the device side (a million
+        // VSync(-1) polls), which took over 20 s on a loaded machine.
+        let o = Options { wasm: wasm.into(), disc: disc.clone().unwrap_or_default(), replay: Some(replay(CHIP_FRAMES)), deadline_secs: 120, ..Default::default() };
         Ok(ChipSide { c: Conform::new(&o, &ram, sp, gp)?, ctx: &ctx, log: vec![], callback, movie })
     };
     let mut results = Vec::new();
