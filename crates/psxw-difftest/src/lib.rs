@@ -531,9 +531,13 @@ fn run_shard(
         .filter(|((c, _), _)| *c == container || *c == map.main)
         .map(|((_, a), (_, m))| (*a, m.clone()))
         .collect();
+    let strings = [container.as_str(), map.main.as_str()];
+    // Text only: a NUL-terminated run of printable bytes.
+    let text = |a: u32| rodata.string_at(&strings, a).filter(|s| s.len() > 1 && s[..s.len() - 1].iter().all(|&b| b.is_ascii_graphic() || b" \t\n\r".contains(&b)));
+    let same_string = |a: u32, b: u32| matches!((text(a), text(b)), (Some(x), Some(y)) if x == y);
     let mut out = Vec::new();
     for p in shard {
-        out.push(run_pair(&mut h, p, opts.seeds, base_seed, &masks, opts.verbose)?);
+        out.push(run_pair(&mut h, p, opts.seeds, base_seed, &masks, &same_string, opts.verbose)?);
     }
     Ok(out)
 }
@@ -561,6 +565,7 @@ fn run_pair(
     seeds: u32,
     base_seed: u64,
     masks: &BTreeMap<u32, Vec<u32>>,
+    same_string: &dyn Fn(u32, u32) -> bool,
     verbose: bool,
 ) -> Result<PairReport> {
     let fc = h.func(&format!("c.{:08X}", p.addr))?;
@@ -600,7 +605,7 @@ fn run_pair(
             let c_pages: BTreeMap<usize, Vec<u8>> = c.dirty.iter().map(|&pg| (pg, h.page(pg).to_vec())).collect();
             h.restore(&c.dirty);
             let t = h.run(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE * scale);
-            verdict = compare(h, p, &c, &t, &c_pages, masks);
+            verdict = compare(h, p, &c, &t, &c_pages, masks, same_string);
             let mut all = c.dirty.clone();
             all.extend(t.dirty.iter().copied());
             if verdict.is_err() && verbose {
@@ -671,11 +676,16 @@ fn compare(
     t: &Run,
     c_pages: &BTreeMap<usize, Vec<u8>>,
     masks: &BTreeMap<u32, Vec<u32>>,
+    same_string: &dyn Fn(u32, u32) -> bool,
 ) -> std::result::Result<Agree, (&'static str, String)> {
     // Pointers into the stack can't be compared: clang and GCC lay out
-    // frames differently. Any two stack addresses are equivalent.
+    // frames differently. Any two stack addresses are equivalent. Nor can
+    // pointers to a string the original holds twice: the linker puts the
+    // C's literal on identical original bytes, and GCC keeps a copy per
+    // function where clang keeps one per file. The same string is
+    // equivalent.
     let stack = (runner::STACK_TOP - runner::STACK_EXCLUDE)..(runner::STACK_TOP + 64);
-    let word_eq = |a: u32, b: u32, mask: u32| a & mask == b & mask || (stack.contains(&a) && stack.contains(&b));
+    let word_eq = |a: u32, b: u32, mask: u32| a & mask == b & mask || (stack.contains(&a) && stack.contains(&b)) || same_string(a, b);
     let diverges = |o: &Outcome| matches!(o, Outcome::Fuel) || *o == Outcome::Trap("call-out limit".into());
     match (&c.outcome, &t.outcome) {
         // Both sides loop forever on this input (e.g. waiting for a flag

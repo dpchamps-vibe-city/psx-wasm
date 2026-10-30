@@ -81,6 +81,20 @@ impl Rodata {
         }
         None
     }
+
+    /// The NUL-terminated string at `addr` in `container`'s (then the main
+    /// container's) read-only data, its NUL included.
+    pub fn string_at(&self, containers: &[&str], addr: u32) -> Option<&[u8]> {
+        for c in containers {
+            for (base, bytes) in self.ranges.get(*c).into_iter().flatten() {
+                let Some(rest) = addr.checked_sub(*base).and_then(|o| bytes.get(o as usize..)) else { continue };
+                if !rest.is_empty() {
+                    return rest.iter().position(|&b| b == 0).map(|n| &rest[..=n]);
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Default)]
