@@ -548,13 +548,18 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
       const size = ringSamples.length / 2;
       let w = Atomics.load(ringHead, 0);
       const r = Atomics.load(ringHead, 1);
-      for (let i = 0; i < frames; i++) {
+      // Empty after the first vblank's audio: the worklet played it all and
+      // waits for its cushion again, a gap you hear.
+      if (w === r && audioFrames > frames) logLine(2, "audio: the ring ran dry");
+      let i = 0;
+      for (; i < frames; i++) {
         const next = (w + 1) % size;
         if (next === r) break;
         ringSamples[2 * w] = s[2 * i];
         ringSamples[2 * w + 1] = s[2 * i + 1];
         w = next;
       }
+      if (i < frames) logLine(2, `audio: the ring is full, ${frames - i} frames dropped`);
       Atomics.store(ringHead, 0, w);
     },
   };
