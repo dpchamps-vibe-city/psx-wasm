@@ -324,7 +324,11 @@ fn sequence(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     call(h, "GetIntrMask", &[])?;
     h.vblanks(3)?;
     observe_word(h, "root counter 2 interrupts", state);
-    call(h, "GetRCnt", &[RCNT | 2])?;
+    // Counter 2 runs at the guest's cycle (D66): how far into its period
+    // depends on the loop passes each side's code made since the last
+    // safepoint, so to 0x400 counts (`irq.counters` reads it exactly).
+    let v = h.call("GetRCnt", &[RCNT | 2])?;
+    h.observe("GetRCnt(RCntCNT2) / 0x400", format!("{:#x}", v / 0x400));
     call(h, "InterruptCallback", &[6, 0])?;
     call(h, "ResetRCnt", &[RCNT | 2])?;
     call(h, "StartRCnt", &[RCNT | 2])?;
