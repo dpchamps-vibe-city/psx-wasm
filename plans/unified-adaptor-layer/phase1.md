@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–5, 7, 8 and 9, every chip a to g, done; 6 harness in place)
+**Status:** done (2026-10-29). Every task is ticked; exit criterion 5 (`psxw ci`) is the user's to run (see the progress log, "Phase 1 closes").
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -112,10 +112,13 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
      scenarios;
    - a CI gate fails any adapter without a level-1 case and a level-2
      sequence for its chip.
-6. [ ] **Level 4: adapter mode vs device mode.** A build switch forces
+6. [x] **Level 4: adapter mode vs device mode.** A build switch forces
    every chip onto its device. Each game's replays run both ways and are
    compared at counter checkpoints (reuse
-   `psxw oracle ramdiff --compare-frames`).
+   `psxw oracle ramdiff --compare-frames`). Done: `--device all` and
+   `psxw conform <game> --modes` (the replay's checks in both modes, the
+   renderer commands, displays and audio over the whole run, RAM by symbol
+   at the counter checkpoints); the `fallback` gate in `psxw ci`.
 7. [x] **Cores without the protocol** (README, "Native backends"):
    - a mixer API over `psx-spu`'s voice DSP (done, 9f: `psx_spu::mixer`,
      each setter the register write it stands for, and `Spu::state_hash`);
@@ -142,9 +145,11 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    | f ✓ | SPU | libspu, libsnd | 21: `spu.o`'s 5, the 15 functions that program the SPU themselves, `_SsInit` | Done 2026-10-29 (progress log). The seam is where libspu touches the SPU, over the mixer API (task 7), its state where libspu and libsnd keep it (D63); `SpuInit`, `SpuWritePartly`, the wrappers, the accessors and all of libsnd but `_SsInit` stay original. Their time is the translated original's (budget passes, quiet returns). |
    | g ✓ | Memory card (PocketStation) | libmcx | 2: `McxStartCom`, `_mcxDsrEntry` | Done 2026-10-29 (progress log). btn only. A chip group (`memcard`) whose device is SIO0 with the BIOS's cards; the commands, `McxSync` and `McxStopCom` stay original over libmcx's state in guest RAM (D65). Old set (6) in `66ef76c`. |
 
-10. [ ] **Both games fully native.** btn's and bof4's build reports show
+10. [x] **Both games fully native.** btn's and bof4's build reports show
     every chip native except the GTE. Every replay passes in adapter mode
-    and in device mode, and level 4 compares them.
+    and in device mode, and level 4 compares them. Done, with the
+    verification state at the end of phase 1 in the progress log
+    ("Phase 1 closes").
 
 ## Exit criteria (all automated)
 
@@ -741,6 +746,36 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     cd` (22): PASS, 4 seeds. Level 4 (`--modes`) wasn't rerun: for btn it
     has the boot GPU timeout's offset between the modes (task 9a's
     finding, frames 64 and 99).
+
+- **2026-10-29, phase 1 closes** (main at ac60058). Every chip runs
+  native in both games: `psxw build` reports "emulated: none" for btn
+  (cd, gpu, irq, memcard, sio0, spu) and bof4 (cd, gpu, irq, mdec, sio0,
+  spu), and both `game.toml` files expect it. btn binds 86 adapters, bof4
+  92, 96 between them (BIOS-call and BIOS-internals ones included).
+  The state of each exit criterion, with the last run that backs it:
+  1. **Same code everywhere:** `psxw build` refuses a runtime with two
+     adapters of one name; sdk-psyq's `agnostic` test fails on non-test
+     adapter code that names a game or holds a guest RAM address (it
+     catches a planted one). Passing at ac60058.
+  2. **Conformance, levels 1–3:** no adapter is on `OWED`. Every chip's
+     cases passed in each game that links it on the merged tree before
+     D66 (c02c4a6 plus chip memcard): irq 33, gpu 49, sio0 34, cd 19/22,
+     spu 47, mdec 17 (bof4), memcard 9 (btn). After D66 (ac60058) cd,
+     sio0 and memcard were rerun and pass; irq, gpu, spu and mdec weren't.
+  3. **Both games native:** as above.
+  4. **Fallback:** every chip's `--device <chip>` build boots both games
+     (each chip's task). Level 4 passed for bof4 at c02c4a6 with the
+     renderer commands, displays and audio identical in both modes over
+     25,300 frames. btn's level 4 never ran clean before the D66 fix, and
+     neither game's was rerun after it: the user judged the runs too
+     costly for this round. `psxw conform <game> --modes` runs it.
+  5. **`psxw ci btn` and `psxw ci bof4`:** not run (the user's call: they
+     take hours). The new gates in it are `conform` (now with every
+     native chip's cases, and for bof4 too), `sdk-reach` and `fallback`.
+  Native replays at ac60058: btn `title-to-gameplay` (its three new
+  expects) and `card-load --check card`, bof4 `title-to-field` (its five
+  expects; the field now arrives at frame 25,138, so the replay runs
+  26,000 frames).
 
 ## Findings
 
