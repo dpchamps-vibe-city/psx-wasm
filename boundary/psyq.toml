@@ -53,8 +53,8 @@ policy = "adapter-or-device"
 [library.libmcrd]  # guest code over the BIOS card functions
 policy = "guest"
 
-[library.libmcx]
-policy = "adapter"
+[library.libmcx]   # chip memcard; on its device, SIO0 with the BIOS's cards (D65)
+policy = "adapter-or-device"
 
 [library.libcard]
 policy = "adapter"
@@ -106,6 +106,9 @@ members = ["libpress"]
 
 [chip.spu]
 members = ["libspu", "libsnd"]
+
+[chip.memcard]     # the memory card slots on SIO0: libmcx (PocketStation)
+members = ["libmcx"]
 
 # The structs adapters read and write, generated into Rust constants by
 # `psxw layout <game>` from the game's SDK headers (offsets checked equal

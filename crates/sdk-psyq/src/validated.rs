@@ -46,11 +46,13 @@ pub const VALIDATED: &[(&str, &str)] = &[
     ("libspu/s_svv", "b7df3a8a01418e3a108f0708d9f8a9661bee2c44595ebbbd6f5942429936cba3"),
     ("libspu/spu", "2fe097129eda16085b3b00c2cad950afd23dc3c61e81c8a8bd253779f056a711"),
     ("libspu/sr_gaks", "ec8c372747bf8fee9cfd0121bb56f4489fca7930a639dbb59fff940f6767f07e"),
-    ("libmcx/mcxcmd2", "58e691a13329379c176821716b5baf24e9e9c75b1429e4970cd620e00efc6d5e"),
-    ("libmcx/mcxcmd23", "92804c396fb540fcda4c0e0081118fd7ebd1ca6bc816cefd95be8b1ac8a9a7bc"),
-    ("libmcx/mcxcmd24", "9926ec52d6649a8cebb51eaca0bad13eb020056a15b5bdf8b8e5b989a2c16f02"),
+    // libmcx's adapters (McxStartCom, _mcxDsrEntry), and the objects whose
+    // code and data they read (the elements, the vblank handler,
+    // _mcxStepSio, the bulk transfer's words).
+    ("libmcx/mcxdsr", "a566997a1397665ea2126a77ab548e3ee5cf68e2aa32f22a764e5fb96621e877"),
     ("libmcx/mcxinit", "207348a4d4a238743aeaa735bfdac5f1d7899a7c87d4c6039159e40685919d65"),
     ("libmcx/mcxmain", "0613d35f2626d3c3fd435be6119f3483c4cf1aa6035b98b1c130317047025d55"),
+    ("libmcx/mcxresi", "287468efa03dffc7e83b6e96967958b4ad9ca31cca3019bd631dbbf74d4a8737"),
     // libpad's calls, and the vblank engine behind them (pddirres,
     // pdresres), which the adapters reproduce.
     ("libpad/pdcmd1", "65c474183d32625a87f9200f812955e6e5a2a9fcf54a333891e7bcf07cfa3232"),

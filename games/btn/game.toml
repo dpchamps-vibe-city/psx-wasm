@@ -104,4 +104,4 @@ boot = { before = "main", doc = "once, when the executable starts" }
 [chips]
 # The chips this game runs native through their adapters (D59); a build
 # that falls back to one's device fails. The rest are emulated.
-native = ["cd", "gpu", "irq", "sio0", "spu"]
+native = ["cd", "gpu", "irq", "memcard", "sio0", "spu"]

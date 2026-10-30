@@ -119,7 +119,7 @@ register protocol around them.
 | MDEC | decode core inside `psx_devices::mdec` | ✓ `Mdec::input`/`output`, shared by DMA0/DMA1 and libpress's adapters (9e) |
 | SIO0 | host pad state | ✓ |
 | IRQ, timers, vblank | virtual clock, guest callback queue | ✓ |
-| Memory card | card images through the BIOS (`psx-bios::card`) | ✓ |
+| Memory card | card images through the BIOS (`psx-bios::card`); on the wire a standard card's answers over them (`psx_devices::memcard::Responder`), which SIO0's device and libmcx's adapters share | ✓ |
 
 ## Conformance
 

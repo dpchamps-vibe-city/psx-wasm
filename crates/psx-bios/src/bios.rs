@@ -481,6 +481,8 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             if let Some(v) = m.kernel.int_handlers.get_mut(&a[0]) {
                 v.retain(|&h| h != a[1]);
             }
+            // An element SDK code linked into the RAM blocks itself (D65).
+            m.excb_unlink(a[0], a[1]);
             r(0)
         }
         (0xC0, 0x1A) => {

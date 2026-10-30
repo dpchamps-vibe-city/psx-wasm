@@ -87,8 +87,9 @@ pub const RUNTIME_BASE: u32 = 0x0200_0000;
 pub mod kernel {
     use core::ops::Range;
     /// The table of tables: a (pointer, size) pair per table from 0x100.
-    /// These two entries are filled: the process control block, and the
-    /// thread control blocks.
+    /// These three entries are filled: the exception control blocks, the
+    /// process control block, and the thread control blocks.
+    pub const EXCB_ENTRY: u32 = 0x100;
     pub const PCB_ENTRY: u32 = 0x108;
     pub const TCB_ENTRY: u32 = 0x110;
     /// The PCB: one word, the current thread's TCB.
@@ -106,9 +107,14 @@ pub mod kernel {
     pub const TCB_SR: u32 = 0x94;
     pub const TCB_FREE: u32 = 0x1000;
     pub const TCB_USED: u32 = 0x4000;
+    /// The exception control blocks: per interrupt priority 0..3, the head
+    /// of its chain of elements (each linked through its first word) and an
+    /// unused word. Just below the PCB.
+    pub const EXCB: u32 = 0xDFE0;
+    pub const EXCB_SIZE: u32 = 0x20;
     /// Kernel RAM a game may read and write at constant addresses: the
     /// lift's kernel rule accepts these and still fails on the rest.
-    pub const RAM_BACKED: [Range<u32>; 2] = [PCB_ENTRY..TCB_ENTRY + 8, PCB..TCBS + MAX_TCBS * TCB_SIZE];
+    pub const RAM_BACKED: [Range<u32>; 2] = [EXCB_ENTRY..TCB_ENTRY + 8, EXCB..TCBS + MAX_TCBS * TCB_SIZE];
 
     /// Whether physical address `addr` lies in [`RAM_BACKED`].
     pub fn ram_backed(addr: u32) -> bool {
