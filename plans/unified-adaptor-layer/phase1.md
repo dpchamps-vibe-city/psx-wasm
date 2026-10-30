@@ -1180,3 +1180,12 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   adapter side didn't. The cards load when a card's address (81h) first
   goes out, on the device and natively alike; a pad driver never sends
   it.
+- **Instant CD timing is no seek time, nothing more** (360621c). With
+  sectors taking no time a read delivered the whole disc in one
+  `Cdc::run` (btn: out of memory at frame 65, in `CdSearchFile`); pacing
+  sectors by the CPU's acknowledge instead broke libcd's `CdRead` (it
+  sets its count after issuing ReadN, and waits 0x79 frames for the
+  closing Pause) and libds (it takes a sector in its DMA callback before
+  the next INT1). So instant keeps the drive's sector rate and command
+  latency: at 600 frames btn renders 141,683 words (realistic 128,620)
+  and bof4 844,850, no CD errors, realistic unchanged.
