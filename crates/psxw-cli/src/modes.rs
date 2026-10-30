@@ -7,6 +7,9 @@
 //! emulator, and reported; it is not gated, because the two modes may
 //! legitimately keep library state in different places (adapters in the
 //! runtime, the original in RAM) and settle a frame apart at a sync point.
+//! Nor is the host output: a run whose chips are timed differently lags
+//! the other by some frames, which is the tolerance (the checkpoints say
+//! by how much).
 
 use anyhow::{Context, Result};
 use psxw_inputs::Workspace;
@@ -49,9 +52,11 @@ pub fn run(ws: &Workspace, game: &str, replay: Option<&str>) -> Result<bool> {
     let counter = crate::wholegame::counter_addr(ws, game, &inputs)?;
     // Checkpoints: counter values a first traced run (native) reaches, one
     // every 600 frames (dumps happen where the counter equals a value).
+    // The device run may lag (its chips' timing differs; btn's runs about
+    // 40 frames behind over 6,000), so none in the run's last 600 frames.
     let (native, _) = psxw_build::game::build(ws, &psxw_build::game::Options::new(game))?;
     let (traced, _) = crate::run::evaluate_with(ws, game, &["--replay", &name, "--wasm", &native.wasm], |o| o.trace_u32 = Some(counter))?;
-    let mut points = ramdiff::points(&traced.trace, 600);
+    let mut points = ramdiff::points(&traced.trace[..traced.trace.len().saturating_sub(600)], 600);
     points.sort();
     points.dedup();
     let _ = spec;
