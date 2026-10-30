@@ -991,6 +991,7 @@ dependencies = [
  "psxw-cc",
  "psxw-inputs",
  "serde",
+ "serde_json",
  "wasm-encoder 0.262.0",
  "wasmparser 0.262.0",
 ]

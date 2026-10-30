@@ -1875,6 +1875,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
 fn debug_info(ctx: &Ctx, moved: &HashMap<(usize, u32), Vec<(u32, u32)>>, wasm: &mut Vec<u8>) -> Result<()> {
     use wasm_encoder::Section;
     let starts = crate::dwarf::body_starts(wasm)?;
+    let ends = crate::dwarf::opcode_ends(wasm)?;
     let mut by_input: BTreeMap<usize, Vec<crate::dwarf::FuncMap>> = BTreeMap::new();
     for (&(i, f), ops) in moved {
         let obj = &ctx.inputs[i].obj;
@@ -1887,7 +1888,7 @@ fn debug_info(ctx: &Ctx, moved: &HashMap<(usize, u32), Vec<(u32, u32)>>, wasm: &
     }
     let mut dwarf = crate::dwarf::Dwarf::new();
     for (i, funcs) in by_input {
-        let code = crate::dwarf::CodeMap::new(funcs);
+        let code = crate::dwarf::CodeMap::new(funcs).exclude_expansions(&ends);
         let (view, map, layout) = (&ctx.view, ctx.map, &ctx.layout);
         let mut data_addr = |sym: u32| layout.data_addr(view, map, i, sym).ok();
         let (sp, mod_sp, is_mod) = (ctx.sp, ctx.mod_sp, ctx.mod_of[i].is_some());

@@ -391,27 +391,23 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         ubsan_flags.push(format!("-fsanitize-ignorelist={}", ignorelist.display()));
     }
     let ubsan_flags: Vec<&str> = ubsan_flags.iter().map(String::as_str).collect();
-    // A debug build's objects carry DWARF, the decomp's relative paths
-    // under DEBUG_SOURCES' `source/game`. Objects compiled with other
-    // debug flags are rebuilt.
-    let debug_dir = out_dir(ws, &opts.game).join("debug");
-    let debug_flags = ["-g".to_string(), format!("-fdebug-compilation-dir={}", DEBUG_SOURCES[0])];
-    let debug_flags: Vec<&str> = debug_flags.iter().map(String::as_str).collect();
-    if opts.debug {
-        let stamp = debug_dir.join("flags");
-        let want = format!("{}\n{}\n", debug_flags.join(" "), debug_lift_flags().join(" "));
-        if std::fs::read_to_string(&stamp).ok().as_deref() != Some(want.as_str()) {
-            let _ = std::fs::remove_dir_all(&debug_dir);
-            std::fs::create_dir_all(&debug_dir)?;
-            std::fs::write(&stamp, &want)?;
-        }
-    }
+    // Every object carries DWARF, the decomp's relative paths under
+    // DEBUG_SOURCES' `source/game`: release and debug builds link the same
+    // objects (D53), and only a debug build keeps the DWARF.
+    let dwarf_flags = ["-g".to_string(), format!("-fdebug-compilation-dir={}", DEBUG_SOURCES[0])];
+    let dwarf_flags: Vec<&str> = dwarf_flags.iter().map(String::as_str).collect();
     // GCC 2.95's call structure (D50): every non-inline function weak and
     // noinline, as GCC at -O2 left every call to one. Each call the
     // original makes is then a call here (a mod's hook sees it), and
     // clang's inlining doesn't decide where loops spend the safepoint
     // budget, so hooking a function doesn't change the game's timing.
     let calls_dir = out_dir(ws, &opts.game).join("calls");
+    // Objects compiled with other flags are rebuilt.
+    if opts.ubsan {
+        psxw_cc::objects_compiled_with(&ubsan_dir, &ubsan_flags)?;
+    } else {
+        psxw_cc::objects_compiled_with(&calls_dir, &dwarf_flags)?;
+    }
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
@@ -424,13 +420,8 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
                 .collect();
             let text = std::fs::read_to_string(o.with_extension("i"))?;
             let variant = psxw_cc::ast::hook_variant(&text, &names);
-            let (dir, flags): (PathBuf, &[&str]) = if opts.ubsan {
-                (ubsan_dir.join(c), &ubsan_flags)
-            } else if opts.debug {
-                (debug_dir.join(c), &debug_flags)
-            } else {
-                (calls_dir.join(c), &[])
-            };
+            let (dir, flags): (PathBuf, &[&str]) =
+                if opts.ubsan { (ubsan_dir.join(c), &ubsan_flags) } else { (calls_dir.join(c), &dwarf_flags) };
             std::fs::create_dir_all(&dir)?;
             let vi = dir.join(format!("{stem}.i"));
             let vo = dir.join(format!("{stem}.o"));
@@ -536,18 +527,12 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         .filter(|t| psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10)))
         .map(|t| format!("{}:{}", t.func.container, t.cname))
         .collect();
-    ensure!(!(opts.debug && !switches.is_empty()), "debug builds of games that switch threads aren't supported (D57): Asyncify drops the DWARF");
     let failures = psxw_lift::run::write_and_compile(ws, &lift_dir, &lifted)?;
     if !failures.is_empty() {
         bail!("{} translations don't compile; run `psxw lift {}`", failures.len(), opts.game);
     }
-    if opts.debug {
-        debug_lift(&clang, &lift_dir, &debug_dir.join("lift"), &lifted)?;
-    }
     for t in &lifted {
-        let path = if opts.debug { debug_dir.join("lift") } else { lift_dir.clone() }
-            .join(&t.func.container)
-            .join(format!("{:08X}.o", t.func.addr));
+        let path = lift_dir.join(&t.func.container).join(format!("{:08X}.o", t.func.addr));
         let obj = WasmObject::read(&path)?;
         let local = obj
             .symbols
@@ -646,11 +631,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
 /// under the first, the generated C under the second. The paths are
 /// relative, so a debugger resolves them against game.wasm's URL, and the
 /// web bundle serves the files there ([`debug_source_roots`]).
-pub const DEBUG_SOURCES: [&str; 2] = ["source/game", "source/lift"];
-
-fn debug_lift_flags() -> [String; 2] {
-    ["-g".to_string(), format!("-fdebug-compilation-dir={}", DEBUG_SOURCES[1])]
-}
+pub const DEBUG_SOURCES: [&str; 2] = ["source/game", psxw_lift::run::DEBUG_SOURCE];
 
 /// The directories [`DEBUG_SOURCES`] stand for: the decomp's snapshot and
 /// the generated C.
@@ -658,39 +639,6 @@ pub fn debug_source_roots(ws: &Workspace, game: &str) -> Result<[(&'static str, 
     let inputs = psxw_lift::run::load(ws, game)?;
     let snap = psxw_inputs::snapshot::ensure(ws, &inputs.manifest.game.input, ws.game_pin(&inputs.manifest)?)?;
     Ok([(DEBUG_SOURCES[0], snap), (DEBUG_SOURCES[1], psxw_lift::run::out_dir(ws, &inputs))])
-}
-
-/// The translations again with DWARF, into `dir` (a debug build): each
-/// object is rebuilt when its generated C is newer. Clang runs in
-/// `lift_dir` and is given relative paths, which DWARF then has under
-/// `source/lift`.
-fn debug_lift(clang: &psxw_cc::Clang, lift_dir: &Path, dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
-    let failed: Vec<String> = lifted
-        .par_iter()
-        .map(|t| -> Result<Option<String>> {
-            let name = format!("{:08X}", t.func.addr);
-            let src = lift_dir.join(&t.func.container).join(format!("{name}.c"));
-            let obj = dir.join(&t.func.container).join(format!("{name}.o"));
-            let fresh = match (std::fs::metadata(&src).and_then(|m| m.modified()), std::fs::metadata(&obj).and_then(|m| m.modified())) {
-                (Ok(s), Ok(o)) => o >= s,
-                _ => false,
-            };
-            if fresh {
-                return Ok(None);
-            }
-            std::fs::create_dir_all(obj.parent().context("object directory")?)?;
-            let rel = Path::new(&t.func.container).join(format!("{name}.c"));
-            let flags = debug_lift_flags();
-            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-            let (ok, stderr) = clang.compile_generated(&rel, &obj, Path::new("."), &flags)?;
-            Ok((!ok).then(|| format!("{}: {}", src.display(), stderr.lines().next().unwrap_or_default())))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    ensure!(failed.is_empty(), "translations don't compile with -g:\n  {}", failed.join("\n  "));
-    Ok(())
 }
 
 /// The link, the merge with the runtime, and the reports.
@@ -735,7 +683,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
     let guest = dir.join(format!("guest{suffix}.wasm"));
     // The adapter table the guest's ids index, so a runtime swapped in
     // unmerged (the browser's dev mode) can be checked against it.
-    let mut guest_bytes = if spec.threads { asyncify(ws, &dir, &linked.wasm, &switches)? } else { linked.wasm.clone() };
+    let mut guest_bytes = if spec.threads { asyncify(ws, &dir, &linked.wasm, &switches, opts.debug)? } else { linked.wasm.clone() };
     {
         use wasm_encoder::Section;
         let data = adapters.join("\n").into_bytes();
@@ -1172,12 +1120,13 @@ fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
 /// Instrument the guest with Asyncify over the functions that can be on
 /// the stack at a thread switch (D57; `psxw_link::asyncify`). Only
 /// `psx.bios` unwinds. Prints the scope's size.
-fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>) -> Result<Vec<u8>> {
+fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>, debug: bool) -> Result<Vec<u8>> {
+    let tool = if debug { psxw_inputs::toolchain::dwarf_binaryen(ws)? } else { ws.tool("binaryen", "bin/wasm-opt")? };
     let scope = psxw_link::asyncify::scope(wasm, switches)?;
     let linked = dir.join("guest-linked.wasm");
     std::fs::write(&linked, wasm)?;
     // Binaryen's own function names (it renames duplicates), by index.
-    let map = Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg(&linked).arg("--print-function-map").output()?;
+    let map = Command::new(&tool).args(FEATURES).arg(&linked).arg("--print-function-map").output()?;
     ensure!(map.status.success(), "wasm-opt --print-function-map failed: {}", String::from_utf8_lossy(&map.stderr));
     let names: BTreeMap<u32, String> = String::from_utf8_lossy(&map.stdout)
         .lines()
@@ -1200,7 +1149,7 @@ fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>
         scope.excluded.len()
     );
     let out = dir.join("guest-asyncify.wasm");
-    run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?)
+    run(Command::new(&tool)
         .args(FEATURES)
         .arg(&linked)
         .arg("--asyncify")

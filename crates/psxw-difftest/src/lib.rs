@@ -191,7 +191,8 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             let h = dir.join(o.file_name().unwrap_or_default());
             let variant = h.with_extension("i");
             let text = format!(
-                "/* psxw harness variant: {HARNESS_FLAGS:?} */\n{}",
+                "/* psxw harness variant: {HARNESS_FLAGS:?} {:?} */\n{}",
+                psxw_cc::CODEGEN_FLAGS,
                 psxw_cc::ast::harness_variant(&std::fs::read_to_string(&i)?)
             );
             let same = std::fs::read_to_string(&variant).is_ok_and(|old| old == text);

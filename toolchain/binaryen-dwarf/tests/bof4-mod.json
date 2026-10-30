@@ -1,0 +1,30 @@
+{
+  "wasm": "out/web/bof4-moddable-debug/game.wasm",
+  "roots": {
+    "/game.wasm": "out/web/bof4-moddable-debug/game.wasm",
+    "/snapshot.json": "out/web/bof4-moddable-debug/snapshot.json",
+    "/acceptance-mod.js": "toolchain/binaryen-dwarf/tests/acceptance-mod.js",
+    "/web": "web",
+    "/pkg": "out/web/bof4-moddable-debug/pkg",
+    "/disc": ".inputs/discs/bof4",
+    "/source/game": ".inputs/bof4-57f7da1",
+    "/source/lift": "out/lift/bof4/57f7da1",
+    "/replay.rpl": "out/oracle/replays/bof4-title-to-field.rpl"
+  },
+  "files": ["Breath of Fire IV (Track 1).bin", "Breath of Fire IV (Track 2).bin"],
+  "cue": "Breath of Fire IV.cue",
+  "replay": true,
+  "frames": 600,
+  "memory": [2148616704],
+  "mods": ["/acceptance-mod.js"],
+  "breakpoints": [
+    {
+      "source": "/source/lift/exe/8013A4AC.c", "line": 21, "hits": 4,
+      "checks": [
+        {"expression": "r3", "memory": 2148616704},
+        {"expression": "r2", "expected": 1},
+        {"expression": "r29", "state": "sp", "optional": true}
+      ]
+    }
+  ]
+}

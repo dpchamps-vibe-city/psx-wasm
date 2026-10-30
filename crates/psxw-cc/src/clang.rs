@@ -77,6 +77,7 @@ impl Clang {
         std::fs::write(i_path, text)?;
         let mut cmd = self.base();
         cmd.args(["-c", "-O2", "-fno-builtin", "-fno-caret-diagnostics", "-ferror-limit=0"])
+            .args(crate::CODEGEN_FLAGS)
             .args(["-Xclang", "-fno-diagnostics-use-presumed-location"])
             .args(crate::UB_CONTAINMENT_FLAGS);
         for w in DOWNGRADED {
@@ -92,6 +93,7 @@ impl Clang {
     pub fn compile_generated(&self, src: &Path, obj: &Path, include: &Path, extra: &[&str]) -> Result<(bool, String)> {
         let mut cmd = self.base();
         cmd.args(["-c", "-O2", "-fno-builtin", "-nostdinc", "-fno-caret-diagnostics"])
+            .args(crate::CODEGEN_FLAGS)
             .args(["-Wno-unused-label", "-Wno-unused-variable", "-Wno-unused-but-set-variable"])
             .args(crate::UB_CONTAINMENT_FLAGS)
             .args(extra)
@@ -108,7 +110,7 @@ impl Clang {
     /// fixups), else the source's own.
     pub fn compile_mod(&self, i_path: &Path, obj: &Path, physical: bool) -> Result<(bool, String)> {
         let mut cmd = self.mod_base();
-        cmd.args(["-c", "-O2"]);
+        cmd.args(["-c", "-O2"]).args(crate::CODEGEN_FLAGS);
         if physical {
             cmd.args(["-Xclang", "-fno-diagnostics-use-presumed-location"]);
         }
@@ -156,7 +158,7 @@ impl Clang {
     /// differential harness's no-auto-inline variant.
     pub fn compile_variant(&self, i_path: &Path, obj: &Path, extra: &[&str]) -> Result<()> {
         let mut cmd = self.base();
-        cmd.args(["-c", "-O2", "-w", "-fno-builtin"]).args(crate::UB_CONTAINMENT_FLAGS).args(extra);
+        cmd.args(["-c", "-O2", "-w", "-fno-builtin"]).args(crate::CODEGEN_FLAGS).args(crate::UB_CONTAINMENT_FLAGS).args(extra);
         for w in DOWNGRADED {
             cmd.arg(format!("-Wno-error={w}"));
         }

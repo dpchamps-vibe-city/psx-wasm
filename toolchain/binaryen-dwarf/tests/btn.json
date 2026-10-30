@@ -1,0 +1,100 @@
+{
+  "wasm": "out/btn/game-debug.wasm",
+  "roots": {
+    "/game.wasm": "out/btn/game-debug.wasm",
+    "/web": "web",
+    "/pkg": "out/web/bof4-moddable-debug/pkg",
+    "/disc": ".inputs/discs/btn",
+    "/source/game": ".inputs/btn-c77a66f",
+    "/source/lift": "out/lift/btn/c77a66f",
+    "/replay.rpl": "out/oracle/replays/btn-title-to-gameplay.rpl"
+  },
+  "files": [
+    "hmb2n.bin"
+  ],
+  "cue": "hmb2n.cue",
+  "replay": true,
+  "frames": 600,
+  "memory": [
+    2147869596,
+    2147869632,
+    2147928132
+  ],
+  "indirectMemory": [
+    {
+      "pointer": 2147869632,
+      "offset": 296
+    }
+  ],
+  "breakpoints": [
+    {
+      "source": "/source/game/src/modules/game_loop.c",
+      "line": 463,
+      "hits": 6,
+      "checks": [
+        {
+          "expression": "(unsigned int)scene_ptr == ((unsigned int)gActiveRenderContext == 0x8005e5e8 ? 0x8005e71c : 0x8005e5e8)",
+          "expected": true
+        },
+        {
+          "expression": "(unsigned int)gActiveRenderContext",
+          "memory": 2147869632
+        },
+        {
+          "expression": "gCurrentSceneId",
+          "memory": 2147869596
+        },
+        {
+          "expression": "gActiveRenderContext->packetWorkCapacityBytes",
+          "memory": "2147869632+296"
+        },
+        {
+          "expression": "saved",
+          "optional": true,
+          "expected": -2147097112
+        }
+      ]
+    },
+    {
+      "source": "/source/game/src/overlays/ovl_27/modules/title_scene.c",
+      "line": 111,
+      "hits": 1,
+      "checks": [
+        {
+          "expression": "flags",
+          "memory": 2147928132
+        }
+      ]
+    },
+    {
+      "source": "/source/game/src/modules/random.c",
+      "line": 14,
+      "hits": 1,
+      "caller": "RunSceneUpdateLoop",
+      "checks": [
+        {
+          "expression": "limit",
+          "expected": 65535
+        }
+      ]
+    },
+    {
+      "source": "/source/game/src/modules/cd_loader.c",
+      "line": 88,
+      "hits": 1,
+      "checks": [
+        {"expression": "(unsigned int)mode", "expected": 128},
+        {"expression": "(unsigned int)*(&mode)", "expected": 128}
+      ]
+    },
+    {
+      "source": "/source/game/src/modules/vram_clear.c",
+      "line": 24,
+      "hits": 1,
+      "caller": "main",
+      "checks": [
+        {"expression": "rect.w", "expected": 640, "optional": true}
+      ]
+    }
+  ]
+}

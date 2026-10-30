@@ -1,0 +1,76 @@
+{
+  "status": "rerun-pending: recorded with the previous value-provenance.patch, before the 2026-10-30 fixes",
+  "project_base": "16dafb7",
+  "pin_lock_sha256": "38c7683c6b685de6864ecefd2ad7ceb91aeb10c69720768ac9fb014fdadd351b",
+  "value_patch_sha256": "9f4f07cea339f51cc9c69e556766bbcddc622f4b1f1c838f93afe53029d21854",
+  "observed_native_executable_sha256": "4f5e5bf6c3a7fbe4cc1a5b4bf5f92156d3ca64748a0e4804e827b77268bd599c",
+  "debug_c_policy": ["-O2", "-g", "-mllvm", "-fast-isel=true"],
+  "browser": {
+    "chromium": "151.0.7922.137",
+    "extension": "C/C++ DevTools Support 0.2.5854.1",
+    "extension_crx_sha256": "f4c7d9951929acccb602e3cb0e73ece394ecafc1e2094419887d95bf54bd8fce",
+    "puppeteer": "24.31.0",
+    "evaluator": "actual DevTools paused-frame C evaluator",
+    "fresh_profiles": true,
+    "all_physical_stops_checked": true,
+    "cases": {
+      "bof4": {"stops": 8, "distinct_tcbs": 2, "correct": 24, "unavailable": 8, "incorrect": 0},
+      "btn": {"stops": 10, "correct": 28, "unavailable": 7, "incorrect": 0},
+      "bof4_script_mod": {"stops": 4, "correct": 8, "unavailable": 4, "incorrect": 0, "entry_and_exit_hooks_executed": true}
+    }
+  },
+  "structural_controls": {
+    "roundtrip_flatten_asyncify_noncustom_sections_match_unpatched": true,
+    "ordinary_wide_fastisel_and_input_reproducer_tested": true,
+    "wide_spill_indices_at_least_128": true,
+    "real_suspend_resume_and_rust_merge": true,
+    "mixed_float_double_i64_struct_pointer_frame_relative_browser_checks": true,
+    "real_game_frame_relative_byte_and_dereference_checked": true,
+    "false_numeric_aggregate_description_explicitly_unavailable": true,
+    "full_game_and_moddable_dwarf_verify": true,
+    "final_clean_pin_complete_moddable_asyncify_output_byte_identical": true,
+    "workspace_tests": {"passed": 258, "failed": 0, "ignored": 1},
+    "opt_in_integration_test": "passed separately"
+  },
+  "scope": {"regular_bof4_instrumented": 2951, "regular_bof4_defined": 17777, "exception_handlers_excluded": 1, "canonical_function_set_matches_release": true, "algorithm_and_release_tool_unchanged": true},
+  "build_measurements": {
+    "cache_condition": "warm input/object caches; local wall time and peak RSS, not cold-build promises",
+    "bof4": {
+      "sha256": "00b743133d9ecab1af2ab9fb8fb864078bcb8ff0f4f7570d7f686e4a3f53cc53",
+      "bytes": 208171127, "dwarf_bytes": 190664802, "code_payload_bytes": 16745384,
+      "wall_seconds": 173.57, "peak_rss_kib": 7638076,
+      "source_variables": 667169, "source_variables_with_location": 557064
+    },
+    "btn": {
+      "sha256": "24f330fc525d1200eda1e82b4c6f6ba14c299f8b085d266582d024f71e733821",
+      "bytes": 9550341, "dwarf_bytes": 6989151, "code_payload_bytes": 2196016,
+      "wall_seconds": 15.47, "peak_rss_kib": 711700,
+      "source_variables": 43254, "source_variables_with_location": 37421
+    },
+    "bof4_moddable_web": {"bytes": 580335229, "dwarf_bytes": 526712214, "wall_seconds": 430.30, "peak_rss_kib": 18469996}
+  },
+  "replays": {
+    "comparison": "Every report field equal after removing only audio.wav pathname; WAV bytes also equal",
+    "renderer": "actual render server",
+    "bof4_title_to_field": {
+      "frames": 26000,
+      "ram_hashes": {"600": "d9096353208d379a", "2600": "431fdeeca35bae5f", "13000": "27af8133fb4ce9b3", "25138": "98560039b1457641", "26000": "fe40f7d0edd346af"},
+      "vram_hashes": {"600": "6516c61054705269", "2600": "7e35141abc611266", "13000": "eedf4be2d29d9a89", "25138": "9333a305aec7fae2", "26000": "aae77354aad24a0e"},
+      "audio": {"frames": 19168356, "audible_frames": 18268135, "hash": "184e59768505ae88"},
+      "reached_facing_states": ["0x0101@12390", "0x0701@12440", "0x0501@12490", "0x0301@12540", "0x0101@12590"]
+    },
+    "btn_title_to_gameplay": {
+      "frames": 6000,
+      "ram_hashes": {"600": "187c25a2a66e5a3c", "1200": "a969d8079c7a8dae", "2600": "d85f1fad09b6455a", "3000": "01fcc03672a9caf8"},
+      "vram_hashes": {"600": "7dd3a81245e901ab", "1200": "b4ce45b6f239cc8f", "2600": "9eaa398872e33f53", "3000": "bc9f30a6a7085da1"},
+      "audio": {"frames": 4423466, "audible_frames": 3731810, "hash": "bf72c0f70d31d345"},
+      "reached_states": ["gCurrentSceneId==2@2100", "gPrimaryObjectFacing:2==3@2600", "gCurrentSceneId==2@2700"]
+    },
+    "btn_card_load": {
+      "frames": 3000,
+      "ram_hashes": {"600": "187c25a2a66e5a3c", "1200": "a969d8079c7a8dae", "2600": "50db3db6bb053281", "3000": "7d78f1a7751fa5bb"},
+      "vram_hashes": {"600": "7dd3a81245e901ab", "1200": "b4ce45b6f239cc8f", "2600": "797628993915acd3", "3000": "acd8002de86b20f7"},
+      "audio": {"frames": 2211733, "audible_frames": 993302, "hash": "f0e069efa22229ea"}
+    }
+  }
+}

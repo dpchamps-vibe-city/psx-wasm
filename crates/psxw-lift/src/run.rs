@@ -177,10 +177,19 @@ pub fn out_dir(ws: &Workspace, inputs: &Inputs) -> PathBuf {
     ws.out_dir().join("lift").join(&inputs.manifest.game.id).join(&inputs.commit[..7])
 }
 
-/// Write each translation's C file and compile it; returns failures.
+/// Where the generated C's DWARF puts it (D53). Relative, so a debugger
+/// resolves it against game.wasm's URL.
+pub const DEBUG_SOURCE: &str = "source/lift";
+
+/// Write each translation's C file and compile it; returns failures. The
+/// objects carry DWARF under [`DEBUG_SOURCE`]: release and debug builds
+/// link the same ones, and only a debug build keeps the DWARF.
 pub fn write_and_compile(ws: &Workspace, dir: &Path, translations: &[&Translation]) -> Result<Vec<CompileFailure>> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join(crate::RT_HEADER_NAME), crate::RT_HEADER)?;
+    let compilation_dir = format!("-fdebug-compilation-dir={DEBUG_SOURCE}");
+    let flags = ["-g", compilation_dir.as_str()];
+    psxw_cc::objects_compiled_with(dir, &flags)?;
     let clang = Clang::new(ws.clang()?, dir.to_path_buf(), Vec::new(), Vec::new(), dir)?;
     let failures: Vec<Option<CompileFailure>> = translations
         .par_iter()
@@ -201,7 +210,9 @@ pub fn write_and_compile(ws: &Workspace, dir: &Path, translations: &[&Translatio
                 return Ok(None);
             }
             std::fs::write(&src, &text)?;
-            let (ok, stderr) = clang.compile_generated(&src, &obj, dir, &[])?;
+            // Clang runs in `dir`; the relative path is what DWARF records.
+            let rel = Path::new(&t.func.container).join(format!("{:08X}.c", t.func.addr));
+            let (ok, stderr) = clang.compile_generated(&rel, &obj, Path::new("."), &flags)?;
             Ok((!ok).then(|| CompileFailure {
                 function: format!("{} 0x{:08X} {}", t.func.container, t.func.addr, t.func.name),
                 source: src.display().to_string(),

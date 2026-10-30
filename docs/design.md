@@ -685,13 +685,20 @@ Two alternatives are held in reserve:
 `psxw build-web <game> --debug` builds a bundle whose `game.wasm` carries
 DWARF for every C function, decompiled or lifted. Chrome DevTools (with
 the C/C++ DevTools Support extension) or lldb then shows the C, sets
-breakpoints on its lines, and reads its variables. Three things make the
-debugger's view true:
-- **The DWARF follows the guest passes.** clang compiles with `-g`, and
-  psxw-link records where each input instruction lands while it rewrites.
+breakpoints on its lines, and reads its optimized variables. Four things
+make the debugger's view true:
+- **The DWARF follows the guest passes.** clang compiles every object with
+  `-g`, release builds' too, and psxw-link records where each input instruction lands while it rewrites.
   It rewrites every code address, range and line row through that record
   (`psxw_link::dwarf`). Data addresses are where the link put them, and
-  the stack pointer is the guest's `$sp`.
+  the stack pointer is the guest's `$sp`. Expanded guest rewrites have
+  synthetic source/location gaps, rather than stale operand-stack descriptions.
+- **Threaded builds repair value provenance.** A separately pinned Binaryen
+  tracks reader producers through Flatten and proves their output validity
+  across Asyncify's normal/unwind/rewind CFG, including that a local still
+  holds its value after a resume (Asyncify restores only live locals).
+  Unknown values are unavailable, not guessed. Ranges, expressions, references and line-zero gaps are rebuilt
+  ([implementation and acceptance](../toolchain/binaryen-dwarf/README.md)).
 - **The window is at `0x8000_0000`.** Every KSEG0 address is then its own
   wasm address. A debugger dereferences the game's pointers, reads its
   globals and finds its stack frames without knowing about the mask.
@@ -1865,10 +1872,22 @@ mods' commands and `psx.run` use the same slot (D54).
 **D53. A debug build carries the C's DWARF to the browser, at addresses a
 debugger can read.** `psxw build <game> --debug` gives `game-debug.wasm`,
 and `psxw build-web <game> --debug` gives `out/web/<game>-debug`.
-- **The C is compiled with `-g`** into its own directories
-  (`out/<game>/debug/`), lifted C included. A translated function then
-  shows its generated C, one MIPS instruction a line. `-g` doesn't change
-  clang's code (sampled: 95 of 95 objects identical).
+- **One compile serves both builds.** Every object, lifted C included, is
+  compiled once at `-O2 -g` with FastISel (`psxw_cc::CODEGEN_FLAGS`);
+  release links the same objects and drops the DWARF, so a debug build
+  runs the release build's code. A translated function shows its generated
+  C, one MIPS instruction a line.
+  - **FastISel:** the pinned LLVM's default selector, SelectionDAG, drops
+    later assignments from the DWARF (a lifted register shows a constant
+    zero for its whole function).
+  - **Why once:** under FastISel, `-g` alone changes the code of 437 of
+    1,078 sampled btn/bof4 objects (218 by instructions, e.g. a mask
+    FastISel can't fold past a debug record), against 2 under SelectionDAG
+    (2026-10-30).
+  - Fixed argument descriptions in compiler-reused locals and unsupported
+    partial descriptions are invalidated at input. This is not an `-O0`
+    mode: C spills use guest memory, and small worker stacks are no
+    debugger scratch space.
 - **psxw-link carries the DWARF through the guest passes**
   (`psxw_link::dwarf`). The rewrite records where each input instruction
   lands. Every code address, length, range, location list and line row
@@ -1888,7 +1907,9 @@ and `psxw build-web <game> --debug` gives `out/web/<game>-debug`.
   address, and `wasm-opt -O2` invalidates DWARF anyway. Our merge does
   what `wasm-merge` does with these two modules. It re-encodes the guest's
   code changing only call targets, maps where it moved, and applies that
-  map to the DWARF. No `wasm-opt` runs: clang already optimized the C.
+  map to the DWARF. There is no final `wasm-opt -O2`: clang already optimized
+  the C. Thread-switching games first use scoped Asyncify with the separately
+  pinned DWARF producer repair (D57), never the unpatched release tool.
 - **The source paths are relative, and the bundle serves the files.**
   The decomp's C compiles with `-fdebug-compilation-dir=source/game`, and
   the generated C with `source/lift` and paths relative to the lift
@@ -1899,8 +1920,15 @@ and `psxw build-web <game> --debug` gives `out/web/<game>-debug`.
   another machine couldn't open. The extension also fetches `game.wasm`
   itself, from its own origin, so `psxw serve` sends CORP `cross-origin`:
   `same-origin` blocked that fetch, and DevTools listed no C at all.
-- The debug build's guest RAM and audio hashes equal the plain build's
-  at frames 60, 300 and 600.
+- Rendered debug/release acceptance covers bof4 `title-to-field` (26,000
+  frames), btn `title-to-gameplay` (6,000) and `card-load` (3,000): timing,
+  RAM, VRAM, audio and reached states agree. Actual C/C++ DevTools checks
+  cover lifted thread locals after switches, decompiled C arguments/locals,
+  globals, structures/pointers, an overlay and script hooks on a debug base.
+  Correctness and availability are measured separately; source rows or
+  near-total variable deletion do not qualify as variable-debugging support.
+  Exact pins, measurements and reproduction are in
+  [toolchain/binaryen-dwarf](../toolchain/binaryen-dwarf/README.md).
 
 Limits:
 - **Some pointers still read wrong in the debugger.** Scratchpad
@@ -2006,12 +2034,14 @@ locals, so the wasm stack itself switches.
   the kernel's tables live in guest RAM (psxw-abi `kernel`: the table of
   tables' PCB and TCB entries, the PCB and the TCBs at E000h, sized by
   SYSTEM.CNF `TCB=`). Events stay in the runtime.
-- **How:** binaryen Asyncify (pinned, version 133) instruments the guest
+- **How:** binaryen Asyncify (pinned, version 133; the debug path uses its
+  separately pinned DWARF repair) instruments the guest
   after the link, only the functions that can be on the stack at a
   switch: the reverse closure of the functions making B0h:10h calls,
   through direct calls, plus every function making an indirect call (an
-  indirect call can reach any function in the dispatch table). For bof4
-  that's about 13% of functions. `psx.bios` is the one import that
+  indirect call can reach any function in the dispatch table). The pinned
+  regular bof4 build instruments 2,951 of 17,777 functions; moddable bases
+  have their existing additional wrappers/dispatch scope. `psx.bios` is the one import that
   unwinds. Functions with exception handlers (`guest_invoke_irq`) can't be
   instrumented and are left out; a switch from a callback or interrupt
   handler traps.
@@ -2023,6 +2053,13 @@ locals, so the wasm stack itself switches.
   ChangeThread it called, which returns 1 there.
 - **A game that never switches** gets stubs for Asyncify's exports, so
   its module is unchanged otherwise (ABI 11).
+- **Debugging keeps DWARF and variables.** Reader/Flatten producer identities
+  and output CFG must-definitions repair locations, excluding synthetic
+  unwind/rewind intervals and preserving line-zero gaps. Unsupported values
+  become unavailable. The exact source/patch pin is verified before use;
+  release instrumentation and tools are unchanged. Rust still performs the
+  debug merge, with no final optimization pass. See the producer's
+  [acceptance controls](../toolchain/binaryen-dwarf/README.md).
 - **Not taken:** wasm stack switching (host support is uneven, and it
   would split the browser host); one instance per thread over shared
   memory (a shared-memory build, and per-instance globals synced on every
