@@ -141,50 +141,108 @@ impl Areas {
 /// Pixels of a VRAM row: (row, first column, end column).
 type Span = (u32, u32, u32);
 
-/// The pixels written since the last SYNC, as primitives plot them. A
-/// primitive that reads its own destination (semi-transparency, the mask
-/// check) needs a sync only where it plots over one of them; bounding
-/// boxes can't tell that for neighbouring triangles of a mesh, which
-/// would sync between every two.
+/// Most layers a batch is split into; a primitive that would need another
+/// syncs everything first.
+const MAX_LAYERS: u32 = 64;
+
+/// Primitives of the open batch that are drawn together, in their order:
+/// none reads what another of its layer plots (see [`Gpu::add_prim`]).
+#[derive(Debug, Clone, Default)]
+struct Layer {
+    recs: Vec<u32>,
+    n: u32,
+    /// Where its primitives plot, and where they sample textures.
+    writes: Vec<Area>,
+    texels: Vec<Area>,
+}
+
+/// Which write last plotted each VRAM pixel since the last SYNC, as
+/// primitives plot them: a value above `batch` is the open batch's, its
+/// layer `value - batch - 1`; one above `synced`, an earlier batch's.
 #[derive(Clone, Default)]
 struct Written {
-    /// Per VRAM pixel, the generation that last wrote it.
-    stamp: Vec<u16>,
-    now: u16,
+    last: Vec<u32>,
+    synced: u32,
+    batch: u32,
 }
 
 impl std::fmt::Debug for Written {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Written({})", self.now)
+        write!(f, "Written {{ synced: {}, batch: {} }}", self.synced, self.batch)
     }
 }
 
 impl Written {
-    fn clear(&mut self) {
-        self.now = self.now.wrapping_add(1);
-        if self.now == 0 {
-            self.stamp.fill(0);
-            self.now = 1;
-        }
-    }
-
-    fn mark(&mut self, spans: &[Span]) {
-        if self.stamp.is_empty() {
-            self.stamp = vec![0; 1024 * 512];
-            self.now = self.now.max(1);
+    /// Of the pixels in `spans`: the open batch's highest layer that
+    /// plotted one, and whether an earlier batch's unsynced write did.
+    fn scan(&self, spans: &[Span]) -> (Option<u32>, bool) {
+        let (mut top, mut earlier) = (None, false);
+        if self.last.is_empty() {
+            return (top, earlier);
         }
         for &(row, x0, x1) in spans {
             let o = row as usize * 1024;
-            self.stamp[o + x0 as usize..o + x1 as usize].fill(self.now);
+            for &v in &self.last[o + x0 as usize..o + x1 as usize] {
+                if v > self.batch {
+                    let l = v - self.batch - 1;
+                    top = Some(top.map_or(l, |t: u32| t.max(l)));
+                } else if v > self.synced {
+                    earlier = true;
+                }
+            }
+        }
+        (top, earlier)
+    }
+
+    fn mark(&mut self, spans: &[Span], value: u32) {
+        if self.last.is_empty() {
+            self.last = vec![0; 1024 * 512];
+        }
+        for &(row, x0, x1) in spans {
+            let o = row as usize * 1024;
+            self.last[o + x0 as usize..o + x1 as usize].fill(value);
         }
     }
 
-    fn hits(&self, spans: &[Span]) -> bool {
-        !self.stamp.is_empty()
-            && spans.iter().any(|&(row, x0, x1)| {
-                let o = row as usize * 1024;
-                self.stamp[o + x0 as usize..o + x1 as usize].contains(&self.now)
-            })
+    /// The open batch went out in `layers` layers, a sync before each but
+    /// the first: all but its last layer's writes are synced.
+    fn closed(&mut self, layers: u32) {
+        if layers >= 2 {
+            self.synced = self.batch + layers - 1;
+        }
+        self.batch += MAX_LAYERS + 1;
+    }
+
+    /// A write outside a batch (a fill, an upload, a copy): to the next
+    /// batch, an earlier one's.
+    fn outside(&mut self, spans: &[Span]) {
+        if self.batch == self.synced {
+            self.batch += MAX_LAYERS + 1;
+        }
+        self.mark(spans, self.batch);
+    }
+
+    /// Everything is synced.
+    fn all_synced(&mut self) {
+        self.synced = self.batch;
+        if self.batch > u32::MAX / 2 {
+            self.last.fill(0);
+            (self.synced, self.batch) = (0, 0);
+        }
+    }
+}
+
+/// `w` into a list of areas, unless one holds it; past [`MAX_DIRTY`] the
+/// list becomes their union.
+fn push_area(list: &mut Vec<Area>, w: Area) {
+    if list.iter().any(|d| d.contains(&w)) {
+        return;
+    }
+    list.push(w);
+    if list.len() > MAX_DIRTY {
+        let all = list.iter().skip(1).fold(list[0], |a, d| a.union(d));
+        list.clear();
+        list.push(all);
     }
 }
 
@@ -317,8 +375,7 @@ pub struct Gpu {
     loads_in_batch: u32,
     // Output.
     out: Vec<u32>,
-    batch: Vec<u32>,
-    batch_len: u32,
+    layers: Vec<Layer>,
     emitted_state: Option<[u32; 3]>,
     dirty: Vec<Area>,
     written: Written,
@@ -375,8 +432,7 @@ impl Gpu {
             clut_slot: CLUT_SLOTS - 1,
             loads_in_batch: 0,
             out: Vec::new(),
-            batch: Vec::new(),
-            batch_len: 0,
+            layers: Vec::new(),
             emitted_state: None,
             dirty: Vec::new(),
             written: Written::default(),
@@ -522,13 +578,28 @@ impl Gpu {
     // ---------------------------------------------------------------
     // Output
 
-    /// Close the DRAW batch being built.
+    /// Close the DRAW batch being built: a DRAW per layer, a sync before
+    /// each but the first.
     pub fn flush(&mut self) {
-        if self.batch_len > 0 {
-            self.out.push(header(op::DRAW, 1 + self.batch.len() as u32));
-            self.out.push(self.batch_len);
-            self.out.append(&mut self.batch);
-            self.batch_len = 0;
+        let layers = std::mem::take(&mut self.layers);
+        let n = layers.len() as u32;
+        for (i, l) in layers.into_iter().enumerate() {
+            if i > 0 {
+                self.sync_dirty();
+            }
+            self.out.push(header(op::DRAW, 1 + l.recs.len() as u32));
+            self.out.push(l.n);
+            self.out.extend_from_slice(&l.recs);
+            for w in l.writes {
+                push_area(&mut self.dirty, w);
+            }
+        }
+        if n > 0 {
+            self.written.closed(n);
+            if self.written.batch > u32::MAX / 2 + u32::MAX / 4 {
+                self.sync_dirty();
+                self.written.all_synced();
+            }
         }
         self.loads_in_batch = 0;
     }
@@ -805,53 +876,78 @@ impl Gpu {
     /// Before reading `reads`: if any was written since the last sync,
     /// close the batch and sync everything written.
     fn before_reads(&mut self, reads: &Areas) {
-        if reads.iter().any(|r| self.dirty.iter().any(|d| d.overlaps(&r))) {
+        let open = self.layers.iter().flat_map(|l| &l.writes);
+        let dirty: Vec<Area> = self.dirty.iter().chain(open).copied().collect();
+        if reads.iter().any(|r| dirty.iter().any(|d| d.overlaps(&r))) {
             self.sync();
         }
     }
 
+    /// Close the batch and sync everything written.
     fn sync(&mut self) {
         self.flush();
+        self.sync_dirty();
+        self.written.all_synced();
+    }
+
+    fn sync_dirty(&mut self) {
+        if self.dirty.is_empty() {
+            return;
+        }
         self.out.push(header(op::SYNC, 1 + 2 * self.dirty.len() as u32));
         self.out.push(self.dirty.len() as u32);
         for d in self.dirty.drain(..) {
             self.out.extend_from_slice(&d.rect().words());
         }
-        self.written.clear();
     }
 
+    /// A write outside a batch (a fill, an upload, a copy's destination).
     fn wrote(&mut self, writes: &Areas) {
-        self.written.mark(&writes.spans());
-        self.add_dirty(writes);
-    }
-
-    fn add_dirty(&mut self, writes: &Areas) {
+        self.flush();
+        self.written.outside(&writes.spans());
         for w in writes.iter() {
-            if self.dirty.iter().any(|d| d.contains(&w)) {
-                continue;
-            }
-            self.dirty.push(w);
-        }
-        if self.dirty.len() > MAX_DIRTY {
-            let all = self.dirty.iter().skip(1).fold(self.dirty[0], |a, d| a.union(d));
-            self.dirty.clear();
-            self.dirty.push(all);
+            push_area(&mut self.dirty, w);
         }
     }
 
     /// A primitive that reads `reads` (its texels) and plots `cover`
     /// within `writes`; with semi-transparency or the mask check it reads
     /// what it plots over too.
+    ///
+    /// The batch is drawn in layers with a sync between each two, each
+    /// layer in the primitives' order, so a primitive goes in the first
+    /// layer that keeps what it sees: one that reads what it plots over
+    /// goes above the layer of the last write to any of its pixels, any
+    /// other one not below it, nor below a primitive that samples where
+    /// it plots. A translucent model's triangles that cover each other
+    /// then take as many syncs as it has surfaces, not one each.
     fn add_prim(&mut self, rec: [u32; PRIM_WORDS], reads: Areas, writes: Areas, cover: &[Span]) {
         self.ensure_state();
         self.before_reads(&reads);
-        if rec[0] & (prim::SEMI | prim::MASK_CHECK) != 0 && self.written.hits(cover) {
+        let reader = rec[0] & (prim::SEMI | prim::MASK_CHECK) != 0;
+        let (top, earlier) = self.written.scan(cover);
+        let mut layer = top.map_or(0, |t| t + reader as u32);
+        let sampled = self.layers.iter().rposition(|l| l.texels.iter().any(|t| writes.iter().any(|w| w.overlaps(t))));
+        layer = layer.max(sampled.unwrap_or(0) as u32);
+        if (reader && earlier) || layer >= MAX_LAYERS {
             self.sync();
+            layer = 0;
         }
-        self.batch.extend_from_slice(&rec);
-        self.batch_len += 1;
-        self.written.mark(cover);
-        self.add_dirty(&writes);
+        if self.layers.len() <= layer as usize {
+            self.layers.resize_with(layer as usize + 1, Layer::default);
+        }
+        self.written.mark(cover, self.written.batch + 1 + layer);
+        let l = &mut self.layers[layer as usize];
+        l.recs.extend_from_slice(&rec);
+        l.n += 1;
+        for w in writes.iter() {
+            push_area(&mut l.writes, w);
+        }
+        if rec[0] & prim::TEXTURED != 0 {
+            for t in reads.iter() {
+                push_area(&mut l.texels, t);
+            }
+        }
     }
 
     /// The pixels a polygon plots, as the GPU's edge walkers decide.
@@ -1520,7 +1616,11 @@ mod tests {
             g.gp0_words(&[0x2000_0000, pack_xy(0, 0), pack_xy(1, 0), pack_xy(0, 1)]); // after the terminator
             let recs = draws(&decode(&cmds(&mut g)));
             assert_eq!(recs.len(), pts as usize, "{cc:#x}");
-            for (n, r) in recs[..pts as usize - 1].iter().enumerate() {
+            // The triangle may go out before segments it doesn't touch (a
+            // translucent polyline's segments are layers of their own).
+            let lines: Vec<_> = recs.iter().filter(|r| r[0] & prim::KIND_MASK == prim::LINE).collect();
+            assert_eq!(lines.len(), pts as usize - 1, "{cc:#x}");
+            for (n, r) in lines.into_iter().enumerate() {
                 assert_eq!(r[0] & prim::KIND_MASK, prim::LINE);
                 assert!(r[0] & prim::DITHER != 0, "lines dither whenever dithering is on");
                 assert_eq!(r[0] & prim::SEMI != 0, cc & 2 != 0);
@@ -1529,7 +1629,7 @@ mod tests {
                 let c1 = if gouraud { 0x00FF_0000 | (n as u32 + 1) } else { 0xFF };
                 assert_eq!(r[6], c1);
             }
-            assert_eq!(recs[pts as usize - 1][0] & prim::KIND_MASK, prim::TRIANGLE);
+            assert_eq!(recs.iter().filter(|r| r[0] & prim::KIND_MASK == prim::TRIANGLE).count(), 1);
         }
     }
 
@@ -1720,7 +1820,10 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, ["state", "draw2", "sync", "draw2"]);
+        // The one elsewhere joins the first layer, before the one that
+        // reads the others.
+        assert_eq!(kinds, ["state", "draw", "sync", "draw"]);
+        assert_eq!(draws(&cs).len(), 4);
         // Texturing from a page a rectangle just drew into syncs too.
         g.gp0(0xE100_0100); // 15-bit, page 0
         g.gp0_words(&[0x6500_0000, pack_xy(300, 0), 0, 4 << 16 | 4]);
@@ -1749,6 +1852,28 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["state", "draw2", "sync", "draw"]);
+    }
+
+    /// Translucent surfaces over each other take a sync per layer, not per
+    /// primitive: A, A over A, B, B over B draw as [A, B], sync, [A, B].
+    #[test]
+    fn translucent_overdraw_syncs_per_layer() {
+        let mut g = gpu();
+        let a = [pack_xy(10, 10), pack_xy(40, 10), pack_xy(10, 40)];
+        let b = [pack_xy(100, 10), pack_xy(130, 10), pack_xy(100, 40)];
+        for t in [a, a, b, b] {
+            g.gp0_words(&[0x2200_00FF, t[0], t[1], t[2]]);
+        }
+        let cs = decode(&cmds(&mut g));
+        let shape: Vec<_> = cs
+            .iter()
+            .filter_map(|c| match c {
+                C::Draw(r) => Some(r.iter().map(|p| unpack_xy(p[3]).0).collect::<Vec<_>>()),
+                C::Sync(_) => Some(vec![]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shape, [vec![10, 100], vec![], vec![10, 100]]);
     }
 
     #[test]
