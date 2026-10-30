@@ -60,7 +60,7 @@ callback_state = "D_8011C99C"
 [chips]
 # The chips this game runs native through their adapters (D59); a build
 # that falls back to one's device fails. The rest are emulated.
-native = ["gpu", "irq", "mdec", "sio0"]
+native = ["cd", "gpu", "irq", "mdec", "sio0"]
 
 [ci]
 # The layout probe compares game struct layouts under the matching
@@ -73,7 +73,7 @@ replay = "title-to-field"
 
 [ci.skip]
 difftest = "M13: no decompiled C yet, so nothing to compare against its translation"
-conform = "the --lib scenarios are written against btn's links (callbacks, libmcrd); the chip cases run here: psxw conform bof4 --chip irq passes (phase 1 task 9a)"
+conform = "the --lib scenarios are written against btn's links (callbacks, libmcrd); the chip cases run here: psxw conform bof4 --chip irq and --chip cd pass (phase 1 tasks 9a, 9d)"
 mods = "M9: no mods for this game yet"
 web-gpu = "M9: the browser host for this game is out of M13's scope"
 web-conform = "M9: the browser host for this game is out of M13's scope"

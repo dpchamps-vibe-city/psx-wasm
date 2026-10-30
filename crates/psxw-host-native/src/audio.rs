@@ -80,6 +80,11 @@ impl Sink {
         Ok(())
     }
 
+    /// Frames, audible frames and the hash so far.
+    pub fn so_far(&self) -> (u64, u64, u64) {
+        (self.frames, self.audible, self.hash)
+    }
+
     /// Patch the WAV header's sizes and report.
     pub fn finish(self) -> AudioStats {
         let mut wav = None;

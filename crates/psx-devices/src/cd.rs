@@ -157,6 +157,11 @@ pub fn root(disc: &mut dyn Disc) -> Option<DirEntry> {
     })
 }
 
+/// A directory's entries, without itself and its parent.
+pub fn list(disc: &mut dyn Disc, dir: &DirEntry) -> Vec<DirEntry> {
+    records(disc, dir).into_iter().filter(|e| e.name != "\0" && e.name != "\x01").collect()
+}
+
 /// Find a file by path (`cdrom:\DIR\FILE.EXT;1`, `\FILE`, `FILE;1`):
 /// case-insensitive, version optional.
 pub fn find(disc: &mut dyn Disc, path: &str) -> Option<DirEntry> {

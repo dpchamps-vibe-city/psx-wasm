@@ -363,6 +363,11 @@ pub extern "C" fn psxw_conform_init(options: u32, sp: u32, gp: u32) {
         let mut m = rt.m.borrow_mut();
         m.regs.set_sp(sp);
         m.regs.set_gp(gp);
+        // With a disc (the CD chip's cases), the controller knows its
+        // tracks and region, as after a boot.
+        if m.host.has_disc() {
+            m.cdc_insert();
+        }
     });
 }
 
@@ -579,10 +584,6 @@ pub extern "C" fn kernel_call(addr: u32, _a0: u32, _a1: u32, _a2: u32, _a3: u32)
     fatal(8, &format!("call into BIOS kernel RAM at {addr:#010x}; this function needs an adapter"))
 }
 
-/// A device library's access to the I/O window (D40): a load is about to
-/// read window offset `off`, or a store has just written it. The device
-/// supplies or takes the value through the window; an unmodelled register
-/// is a trap.
 /// Any other function's access to the I/O window in a debug build.
 #[unsafe(export_name = "io_trap")]
 pub extern "C" fn io_trap(off: u32, _kind: u32) {
@@ -625,21 +626,17 @@ fn shadow_note(addr: u32, size: u32) {
     });
 }
 
+/// A device library's access to the I/O window (D40): a load of `kind &
+/// 0xFF` bytes (1 to 8) is about to read window offset `off`, or a store
+/// has just written it. The devices supply or take the value through the
+/// window, a register at a time (`Machine::io_access`); an unmodelled
+/// register is a trap.
 #[unsafe(export_name = "io_access")]
 pub extern "C" fn io_access(off: u32, kind: u32) {
     let addr = 0x1F00_0000 | (off & 0xFF_FFFF);
-    let size = (kind & 0xFF).min(4);
+    let size = kind & 0xFF;
     let store = kind & 0x100 != 0;
-    let r = with(|rt| {
-        let mut m = rt.m.borrow_mut();
-        if store {
-            let mut b = [0u8; 4];
-            Window.read(addr, &mut b[..size as usize]);
-            m.io_write(addr, size, u32::from_le_bytes(b))
-        } else {
-            m.io_read(addr, size).map(|v| Window.write(addr, &v.to_le_bytes()[..size as usize]))
-        }
-    });
+    let r = with(|rt| rt.m.borrow_mut().io_access(addr, size, store));
     if let Err(e) = r {
         fatal(9, &e)
     }

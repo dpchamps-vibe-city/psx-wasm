@@ -139,6 +139,28 @@ impl Io {
 }
 
 impl<S: Sdk> Machine<S> {
+    /// A device library's access to the I/O window (`psx.io_access`, D40):
+    /// `size` bytes at `addr` (physical) that a load is about to read from
+    /// `mem`, or that a store has just written there. clang merges adjacent
+    /// stores (and loads) the original made one register at a time into
+    /// wider and unaligned accesses (lifted libspu's voice loop sets four
+    /// halfwords with one 8-byte store), so the access reaches the devices
+    /// as the naturally aligned register accesses that cover it, at most a
+    /// word each, in address order.
+    pub fn io_access(&mut self, addr: u32, size: u32, store: bool) -> Result<(), String> {
+        for (at, n) in aligned_pieces(addr, size) {
+            if store {
+                let mut b = [0u8; 4];
+                self.mem.read(at, &mut b[..n as usize]);
+                self.io_write(at, n, u32::from_le_bytes(b))?;
+            } else {
+                let v = self.io_read(at, n)?;
+                self.mem.write(at, &v.to_le_bytes()[..n as usize]);
+            }
+        }
+        Ok(())
+    }
+
     /// A guest read of `size` bytes of the register at `addr` (physical),
     /// counted per chip for the run report.
     pub fn io_read(&mut self, addr: u32, size: u32) -> Result<u32, String> {
@@ -456,6 +478,8 @@ impl<S: Sdk> Machine<S> {
                     self.mem.w32(addr, w);
                     addr = addr.wrapping_add(4) & 0x1F_FFFC;
                 }
+                // Disc data arrived: mods' overlay data patches apply.
+                self.loaded.push((0x8000_0000 | (d.madr[ch] & 0x1F_FFFC), 4 * d.words(ch)));
             }
             (DMA_SPU, 0 | 1, true) => {
                 let words: Vec<u32> = (0..d.words(ch)).map(|i| self.mem.r32(addr.wrapping_add(4 * i) & 0x1F_FFFC)).collect();
@@ -678,6 +702,20 @@ pub fn chip(addr: u32) -> &'static str {
     }
 }
 
+/// `[addr, addr + size)` as naturally aligned accesses of 4, 2 or 1
+/// bytes, in address order.
+fn aligned_pieces(addr: u32, size: u32) -> impl Iterator<Item = (u32, u32)> {
+    let end = addr.wrapping_add(size);
+    let mut at = addr;
+    std::iter::from_fn(move || {
+        let left = end.wrapping_sub(at);
+        let n = [4, 2, 1].into_iter().find(|&n| at % n == 0 && n <= left)?;
+        let piece = (at, n);
+        at = at.wrapping_add(n);
+        Some(piece)
+    })
+}
+
 fn mask(size: u32) -> u32 {
     if size >= 4 { u32::MAX } else { (1 << (8 * size)) - 1 }
 }
@@ -717,5 +755,42 @@ mod tests {
         assert_eq!((m.io_read(0x1F80_1814, 4).unwrap() >> 17) & 3, 1);
         m.io_write(0x1F80_1124, 2, 0x0200).unwrap();
         assert_eq!(m.io_read(0x1F80_1124, 2).unwrap(), 0x0600);
+    }
+
+    #[test]
+    fn accesses_split_into_aligned_registers() {
+        let pieces = |a, n| super::aligned_pieces(a, n).collect::<Vec<_>>();
+        assert_eq!(pieces(0x1F80_1C40, 8), [(0x1F80_1C40, 4), (0x1F80_1C44, 4)]);
+        assert_eq!(pieces(0x1F80_1C42, 4), [(0x1F80_1C42, 2), (0x1F80_1C44, 2)]);
+        assert_eq!(pieces(0x1F80_1C42, 8), [(0x1F80_1C42, 2), (0x1F80_1C44, 4), (0x1F80_1C48, 2)]);
+        assert_eq!(pieces(0x1F80_1801, 2), [(0x1F80_1801, 1), (0x1F80_1802, 1)]);
+        assert_eq!(pieces(0x1F80_1810, 4), [(0x1F80_1810, 4)]);
+        assert_eq!(pieces(0x1F80_1810, 0), []);
+    }
+
+    /// An 8-byte store reaches every register it covers (lifted libspu's
+    /// `_spu_init` sets a voice's volumes, pitch and start address with
+    /// one), not only its first word; so does an 8-byte load.
+    #[test]
+    fn wide_window_accesses_reach_every_register() {
+        let mut m = machine();
+        m.io = Some(Default::default());
+        let voice4 = 0x1F80_1C40;
+        m.mem.write(voice4, &[0x11, 0x00, 0x22, 0x00, 0xFF, 0x3F, 0x00, 0x02]);
+        m.io_access(voice4, 8, true).unwrap();
+        let spu = |m: &mut crate::machine::Machine<_>, o| m.reg_read(voice4 + o, 2).unwrap();
+        assert_eq!([spu(&mut m, 0), spu(&mut m, 2), spu(&mut m, 4), spu(&mut m, 6)], [0x11, 0x22, 0x3FFF, 0x200]);
+        assert_eq!(m.io.as_ref().unwrap().accesses["SPU"], 2);
+        // Unaligned (two merged halfwords from +2): the right volume and
+        // the pitch, not the left volume.
+        m.mem.write(voice4 + 2, &[0x34, 0x12, 0x00, 0x10]);
+        m.io_access(voice4 + 2, 4, true).unwrap();
+        assert_eq!([spu(&mut m, 0), spu(&mut m, 2), spu(&mut m, 4), spu(&mut m, 6)], [0x11, 0x1234, 0x1000, 0x200]);
+        // A load puts every register it covers in the window.
+        m.mem.write(voice4, &[0; 8]);
+        m.io_access(voice4, 8, false).unwrap();
+        let mut b = [0u8; 8];
+        m.mem.read(voice4, &mut b);
+        assert_eq!(b, [0x11, 0x00, 0x34, 0x12, 0x00, 0x10, 0x00, 0x02]);
     }
 }
