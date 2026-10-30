@@ -74,6 +74,10 @@ pub trait Regs {
     fn set_sp(&mut self, v: u32);
     fn gp(&self) -> u32;
     fn set_gp(&mut self, v: u32);
+    /// The guest's safepoint budget starts over, as at a safepoint
+    /// (psxw-abi `guest::BUDGET_RESET`): an adapter that replaces a
+    /// busy-wait leaves it as the wait's last safepoint would.
+    fn reset_budget(&mut self) {}
 }
 
 /// A guest function to call with o32 arguments.
@@ -92,8 +96,9 @@ pub enum IrqStep {
     /// first's result when that is nonzero.
     Chain(GuestCall, Option<u32>),
     /// A step of the SDK's own interrupt dispatcher when its adapters run
-    /// it (libetc's, D59): [`Sdk::irq_step`] runs it at its turn, and may
-    /// queue further steps (callbacks among them) at the front.
+    /// it (libetc's, D59), or of a chain element they own
+    /// ([`Sdk::chain_element`]): [`Sdk::irq_step`] runs it at its turn,
+    /// and may queue further steps (callbacks among them) at the front.
     Sdk(u32),
     /// The end of the handler: the custom exit (`HookEntryInt`, B0h:19h)
     /// if one is set, entered like a longjmp to its buffer with 1.
@@ -174,6 +179,12 @@ pub trait Sdk: Sized {
     /// `state` (0 on entry). The runtime makes the guest calls it asks for
     /// as nested calls, like the original's, and comes back with the state.
     fn stand_in(_m: &mut Machine<Self>, _addr: u32, _state: u32) -> Option<StandIn> {
+        None
+    }
+    /// A `SysEnqIntRP` element the adapters installed for SDK code they
+    /// replace (libpad's vblank poll, D60), which has no fields in guest
+    /// RAM: the [`IrqStep::Sdk`] step to run in its place in the chain.
+    fn chain_element(_m: &Machine<Self>, _elem: u32) -> Option<u32> {
         None
     }
 }

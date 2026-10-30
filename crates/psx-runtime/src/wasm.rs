@@ -63,6 +63,7 @@ unsafe extern "C" {
     fn psxmod_init();
     fn psxmod_loaded(addr: u32, len: u32);
     fn guest_window() -> u32;
+    fn guest_budget_reset();
     fn asyncify_start_unwind(data: u32);
     fn asyncify_stop_unwind();
     fn asyncify_start_rewind(data: u32);
@@ -173,6 +174,9 @@ impl Regs for FfiRegs {
     }
     fn set_gp(&mut self, v: u32) {
         unsafe { guest_gp_set(v) }
+    }
+    fn reset_budget(&mut self) {
+        unsafe { guest_budget_reset() }
     }
 }
 

@@ -405,11 +405,16 @@ fn libsnd(ctx: &Ctx, s: &mut Side, _frames: u32) -> Result<()> {
 /// The scenario's pad input: nothing, then single buttons, chords and a
 /// long hold (port 1); port 2 idle.
 fn replay(frames: u32) -> Vec<u8> {
+    replay_pads(frames, 2)
+}
+
+/// The same with `pads` plugged (1: port 2 empty).
+fn replay_pads(frames: u32, pads: u32) -> Vec<u8> {
     let presses: Vec<String> = ["START@20", "CROSS@30:6", "UP+CIRCLE@40", "SQUARE+L1+R2@50:10", "SELECT@70:20"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    psxw_oracle::play::replay_from_presses("conform", frames + 2, &presses, 0, 2).expect("valid presses")
+    psxw_oracle::play::replay_from_presses("conform", frames + 2, &presses, 0, pads).expect("valid presses")
 }
 
 type Scenario = fn(&Ctx, &mut Side, u32) -> Result<()>;
@@ -666,7 +671,15 @@ impl sdk_psyq::cases::Harness for ChipSide<'_> {
     fn callback(&self) -> Option<(u32, u32)> {
         self.callback
     }
+
+    fn plug_port2(&mut self, plugged: bool) -> Result<(), String> {
+        self.c.set_replay(replay_pads(CHIP_FRAMES, if plugged { 2 } else { 1 }));
+        Ok(())
+    }
 }
+
+/// Vblanks of pad input a chip case gets.
+const CHIP_FRAMES: u32 = 600;
 
 /// One case's outcome in one game.
 #[derive(Serialize)]
@@ -709,7 +722,7 @@ pub fn run_chip(ws: &Workspace, game: &str, chip: &str, seeds: u64) -> Result<bo
     let ctx = Ctx { inputs: &inputs };
     let callback = ctx.callback().ok();
     let side = |wasm: &str| -> Result<ChipSide<'_>> {
-        let o = Options { wasm: wasm.into(), replay: Some(replay(600)), deadline_secs: 20, ..Default::default() };
+        let o = Options { wasm: wasm.into(), replay: Some(replay(CHIP_FRAMES)), deadline_secs: 20, ..Default::default() };
         Ok(ChipSide { c: Conform::new(&o, &ram, sp, gp)?, ctx: &ctx, log: vec![], callback })
     };
     let mut results = Vec::new();

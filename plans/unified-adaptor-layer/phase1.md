@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4 and 9a done; 5–6 harness in place)
+**Status:** in progress (tasks 1–4, 9a and 9c done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -20,8 +20,8 @@ per-function detail. The scan reproduces every constant-address access
 the translator sees in either game's SDK code.
 
 **141 adapters** across both games: btn needs 109, bof4 90. 78 reach a
-chip or BIOS internals; 63 are state accessors. 31 exist (23 before
-chip irq, task 9a).
+chip or BIOS internals; 63 are state accessors. 37 exist (23 before
+chip irq, task 9a; 31 before chip sio0, task 9c).
 
 | Library | Reach hardware | State accessors | Have |
 |---|---|---|---|
@@ -31,7 +31,7 @@ chip irq, task 9a).
 | libetc | 8 | 0 | 8 |
 | libgpu | 17 | 12 | 0 |
 | libmcx | 1 | 18 | 4 |
-| libpad | 5 | 1 | 0 |
+| libpad | 5 | 1 | 6 |
 | libpress | 3 | 0 | 0 |
 | libsnd | 1 | 19 | 0 |
 | libspu | 18 | 6 | 0 |
@@ -126,7 +126,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    |---|---|---|---|---|
    | a ✓ | IRQ, timers, vblank | libetc, libapi | 11 + 5, all exist | Done 2026-10-29 (progress log). Old libetc set in `111e045^`. Coexists with D45's exception path: the BIOS chains run first, a custom exit still runs after. |
    | b | GPU | libgpu | 27 | Old set (24) in `02180f4^`. libgs rides on it. |
-   | c | SIO0 | libpad | 6 | Old set (7) in `609a64a^`. Must reproduce libpad's observable state machine (D40's reason for removing it). |
+   | c ✓ | SIO0 | libpad | 6 (+ PadStopCom) | Done 2026-10-29 (progress log). Old set (7) in `609a64a^`. Reproduces libpad's observable state machine (D40's reason for removing it) and its interrupt's time (D60). |
    | d | CD | libcd (libds and streaming ride on it) | 24 (11 exist) | **Choose the seam first:** the low layer (`CD_*`, `StCdInterrupt`) under both games, or public adapters and the low layer over one drive model. btn's 11 existing public adapters are reworked to fit. |
    | e | MDEC | libpress | 3 | Needs the decode function (task 7). |
    | f | SPU | libspu, libsnd | 26 + 1 | Needs the mixer API (task 7). The largest set. |
@@ -154,8 +154,8 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 
 - **libpad's state machine (D40).** Games observe PadGetState stepping 0 →
   1 → 2 over the first frames, buffers starting `FF 00`, and port 2 polled
-  a vblank after port 1. The adapter must reproduce these. Level 2 checks
-  it against the original.
+  a vblank after port 1. Settled by task 9c (D60): the adapters run
+  libpad's engine, and its interrupt's time.
 - **The CD seam (task 9d)** is the decision that decides whether principle
   1 holds for the CD.
 - **Timing differences** between adapters (instant) and devices (modelled
@@ -232,6 +232,50 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     followed a flag only the old `StartRCnt` adapter set, so with
     `counter.o` original they never fired); a critical section's overdue
     events no longer step time one cycle at a time to a `Wait::Cycle`.
+- **2026-10-29, task 9c: chip sio0 native in btn and bof4.** 7 libpad
+  adapters (`sdk-psyq/src/libpad.rs`): `PadInitDirect`, `PadStartCom`,
+  `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct`,
+  `PadSetActAlign`, one code for both games, written from the 4.7
+  objects (`psxw sdk disasm`; psyq-decomp's matching C for `pddirres`
+  and most of `pdresres`). The scan's set is the six games call;
+  `PadStopCom` shares `PadStartCom`'s element, so it is adapted too. The
+  eight libpad members both games link (same keys) are validated; both
+  games report sio0 native, and `game.toml` expects it (btn: cd, irq,
+  sio0; bof4: irq, sio0). Inventory: 37 of the 141 exist.
+  - **How (D60).** libpad's direct-connection engine in Rust: the port
+    records, receive buffers and pending replies in the runtime, the
+    games' buffers in guest RAM. `PadStartCom` queues a `SysEnqIntRP`
+    element at an address no game code has; the kernel's walk runs it as
+    an `IrqStep::Sdk` step in its place (new `Sdk::chain_element`): when
+    vblank is unmasked and pending, each port's pending reply, then its
+    exchange, the bytes answered by a digital-pad model fed by the buttons
+    latched at the vblank (`Sdk::on_vblank`, as SIO0's device latches
+    them). The busy-waits' quanta (a poll seven, a refused config-mode
+    command five, an empty port three) pass in the exception, and the
+    guest's safepoint budget starts over after them (new
+    `Regs::reset_budget`, psxw-abi `guest::BUDGET_RESET`, a guest export
+    psxw-link synthesizes). The SIO0 registers aren't touched; vblank's
+    I_STAT/I_MASK bits through the shared devices' registers.
+  - **Conformance:** 10 sio0 cases (`sdk-psyq/src/cases/sio0.rs`), 8
+    level 1 with seeded arguments (port arguments across 00h-FFh, buffer
+    contents, info modes and ids, actuator tables, status bytes the game
+    writes, port 2 empty, plugged, pulled) and 2 level 2 (a session:
+    detection, the scripted presses, actuator calls, port 2 pulled and
+    back, `PadStopCom`, buffers moved, restart; and where the game
+    resumes in the frame after each vblank, in hblanks). New
+    `Harness::plug_port2` (`Conform::set_replay`). `psxw conform btn
+    --chip sio0` and `psxw conform bof4 --chip sio0`: PASS, 66 case runs
+    each (8 seeds). `psxw conform btn --lib libpad`: PASS, 125 steps (now
+    adapters against the original). Chip irq still passes in both games
+    (33 runs each), and `--lib libetc` (60 steps).
+  - **Runs:** btn and bof4, 1,200 frames, `--check boot --check no-trap
+    --check no-shadow-io`: pass native and on `--device sio0` (btn
+    999,299 `VSync` calls both ways; bof4 1,086 sectors and 763 main-loop
+    passes both ways). bof4 `title-to-field`: every expect passes, at the
+    same frames as on the device (counter 12390 at frame 24768); btn
+    `title-to-gameplay`: pass. Both replays' frame counters, traced every
+    vblank, are equal native and on the device (0 of 25,300 and 0 of
+    6,000 frames differ). No SIO0 or IRQ register access in a native run.
 
 ## Findings
 
@@ -301,3 +345,49 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 - **`--check boot`'s vsync-waits** counted a build probe on `VSync`'s
   guest entry, which an adapter doesn't have; it counts `adapter.VSync`
   too now.
+- **libpad's interrupt takes half a frame under the safepoint model**
+  (task 9c). Each of the original's busy-waits on SIO0 or root counter 2
+  ends at the next safepoint, a quantum (20,000 cycles) later, inside the
+  vblank interrupt: 7 quanta for a polled digital pad, 5 for a refused
+  config-mode command, 3 for an empty port. With two pads that is 280,000
+  cycles a vblank, half an NTSC frame, where hardware takes about 20,000
+  for both ports. Games see it (bof4's main loop drops to half rate in
+  places), and the replays were authored over it. A first adapter that
+  spent no time put bof4's `title-to-field` 322 frames behind the device
+  (counter 12390 at frame 25090) and missed its last two expects.
+  Decision (D60, as for `VSync` in task 9a): the adapters spend the
+  original's quanta. Open, like the `VSync` finding: the device timing is
+  an artifact of the time model; a finer quantum would change both modes
+  alike.
+- **The guest's safepoint budget is observable too** (task 9c). With the
+  quanta spent but the budget left as it was, bof4 took another path from
+  frame 110 (its expects read 0): the original's last wait leaves the
+  budget full, so the game does a quantum's worth of iterations before
+  time moves again; left alone, it does whatever was left. Starting the
+  budget over makes both replays equal to the device frame for frame;
+  starting it one or two iterations short made 648 and 1,331 of btn's
+  6,000 frames differ (btn's polling loops count iterations: libgpu's GPU
+  timeout counts `VSync(-1)` polls). `VSync`'s adapter (task 9a) leaves
+  the budget as it was; that didn't show because libpad's interrupt, on
+  the device then and native now, starts it over at every vblank, just
+  before `VSync` returns. Open for chip irq: a game that polls no pad
+  would see it.
+- **A digital pad only, on both sides.** SIO0's device (Beetle's
+  `InputDevice_Gamepad`) and the adapters' wire model answer a poll and
+  nothing else, so libpad's extended paths (config mode 43h, actuator
+  alignment 4Dh, the info tables, DualShock IDs) are unexercised:
+  `PadSetActAlign` always reports the engine busy, `PadInfoMode`'s ID
+  table is empty, the actuator bytes libpad sends after the command
+  aren't computed. A DualShock model in the device would need the same
+  in the adapters' wire, and the engine's command states past 1.
+- **The scan's reach for libpad is its function-pointer table.**
+  `PadGetState`, `PadInfoMode` and `PadSetAct` touch no register; they
+  call through `_padFuncPort2Info`, so the scan gives them everything
+  libpad's pointers can reach (DMA, IRQ, SIO0, exp2, timers). Adapting
+  them is what makes the chip native, and they read state the engine
+  keeps in the runtime anyway.
+- **`PadSetAct`'s result is libpad's record address** (v0 left by the
+  `_padFuncPort2Info` call); the adapter returns 0 and the cases don't
+  observe it. `PadInitDirect` and `PadStartCom` leave 1 in v0,
+  `PadStopCom` ExitCriticalSection's 0; the `--lib libpad` scenario
+  observes those, and the adapters return them.

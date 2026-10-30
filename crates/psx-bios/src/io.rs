@@ -600,6 +600,12 @@ impl<S: Sdk> Machine<S> {
         for prio in 0..4u32 {
             let Some(chain) = self.kernel.int_handlers.get(&prio) else { continue };
             for &h in chain.iter().rev() {
+                // An element the adapters own runs as their step, in its
+                // place in the chain.
+                if let Some(s) = S::chain_element(self, h) {
+                    self.irq_calls.push_back(IrqStep::Sdk(s));
+                    continue;
+                }
                 let verifier = self.mem.r32(h + 8);
                 let handler = self.mem.r32(h + 4);
                 if verifier != 0 {

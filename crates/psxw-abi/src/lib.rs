@@ -240,6 +240,10 @@ pub mod guest {
     /// [`super::DEBUG_WINDOW_BASE`]). Hosts read it from the module's
     /// exports; a module without it has the default.
     pub const WINDOW: &str = "guest_window";
+    /// `() -> ()`: the safepoint budget starts over, as at a safepoint. For
+    /// adapters that replace a busy-wait (D59, D60): the guest resumes
+    /// with the budget the original's last safepoint would have left it.
+    pub const BUDGET_RESET: &str = "guest_budget_reset";
     /// binaryen Asyncify's control functions (D57): `(data_ptr) -> ()`
     /// start an unwind or a rewind over the data structure at `data_ptr`
     /// (current position, end, then the saved frames); `() -> ()` stop

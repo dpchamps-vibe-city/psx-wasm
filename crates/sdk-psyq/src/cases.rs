@@ -18,6 +18,7 @@
 //! it; callbacks by their effect on a word, to the frame.
 
 mod irq;
+mod sio0;
 
 /// What a case runs against: one game's build, one side.
 pub trait Harness {
@@ -37,6 +38,11 @@ pub trait Harness {
     /// A guest function that counts its calls in a word, and that word
     /// (game.toml `[conform]`), for callbacks.
     fn callback(&self) -> Option<(u32, u32)>;
+    /// Plug a pad into port 2, or pull it, from the next vblank on (both
+    /// sides start with two pads, port 1's buttons scripted).
+    fn plug_port2(&mut self, _plugged: bool) -> Result<(), String> {
+        Err("this harness can't change the pads".into())
+    }
 }
 
 /// Free RAM for a case's buffers: below the stack, above game data.
@@ -92,6 +98,7 @@ pub fn observe_ram(h: &mut dyn Harness, what: &str, addr: u32, len: usize) {
 pub fn all() -> Vec<Case> {
     let mut v = Vec::new();
     v.extend(irq::cases());
+    v.extend(sio0::cases());
     v
 }
 
