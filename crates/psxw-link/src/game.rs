@@ -201,6 +201,10 @@ enum Synth {
     Window,
     /// `guest.guest_budget_reset()`: the safepoint budget starts over.
     BudgetReset,
+    /// `guest.guest_budget_get()` and `guest_budget_set(v)`: the safepoint
+    /// budget left, read and written (D63).
+    BudgetGet,
+    BudgetSet,
     /// Asyncify's control function `name` for a guest that never switches
     /// threads (D57): the state is always normal, and the rest trap.
     AsyncifyStub(&'static str),
@@ -957,6 +961,19 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             f.instruction(&I::End);
             (FuncType { params: vec![], results: vec![] }, f, guest::BUDGET_RESET.into())
         }
+        Synth::BudgetGet => {
+            let mut f = Function::new([]);
+            f.instruction(&I::GlobalGet(ctx.budget));
+            f.instruction(&I::End);
+            (FuncType { params: vec![], results: vec![V::I32] }, f, guest::BUDGET_GET.into())
+        }
+        Synth::BudgetSet => {
+            let mut f = Function::new([]);
+            f.instruction(&I::LocalGet(0));
+            f.instruction(&I::GlobalSet(ctx.budget));
+            f.instruction(&I::End);
+            (FuncType { params: vec![V::I32], results: vec![] }, f, guest::BUDGET_SET.into())
+        }
         Synth::AsyncifyStub(name) => {
             let mut f = Function::new([]);
             let name: &'static str = name;
@@ -1672,6 +1689,8 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         ("guest_gp_set", ctx.synth(Synth::GpSet)),
         (guest::WINDOW, ctx.synth(Synth::Window)),
         (guest::BUDGET_RESET, ctx.synth(Synth::BudgetReset)),
+        (guest::BUDGET_GET, ctx.synth(Synth::BudgetGet)),
+        (guest::BUDGET_SET, ctx.synth(Synth::BudgetSet)),
     ];
     // Asyncify adds the real ones after the link when the game switches
     // threads (D57).

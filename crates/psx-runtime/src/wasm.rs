@@ -64,6 +64,8 @@ unsafe extern "C" {
     fn psxmod_loaded(addr: u32, len: u32);
     fn guest_window() -> u32;
     fn guest_budget_reset();
+    fn guest_budget_get() -> i32;
+    fn guest_budget_set(v: i32);
     fn asyncify_start_unwind(data: u32);
     fn asyncify_stop_unwind();
     fn asyncify_start_rewind(data: u32);
@@ -177,6 +179,12 @@ impl Regs for FfiRegs {
     }
     fn reset_budget(&mut self) {
         unsafe { guest_budget_reset() }
+    }
+    fn budget(&self) -> u32 {
+        unsafe { guest_budget_get() as u32 }
+    }
+    fn set_budget(&mut self, v: u32) {
+        unsafe { guest_budget_set(v as i32) }
     }
 }
 
@@ -301,6 +309,12 @@ pub extern "C" fn psxw_ram_hash() -> u64 {
     let mut ram = vec![0u8; 0x20_0000];
     Window.read(0x8000_0000, &mut ram);
     boot::fnv(&ram)
+}
+
+/// The SPU's state, brought up to now, hashed (psxw-abi `SPU_HASH`).
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_spu_hash() -> u64 {
+    with(|rt| rt.m.borrow_mut().with_spu(|s| s.state_hash()).unwrap_or(0))
 }
 
 fn init(options: u32) {

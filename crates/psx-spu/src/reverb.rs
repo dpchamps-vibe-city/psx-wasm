@@ -208,3 +208,16 @@ mod tests {
         assert_eq!(Reverb::addr(&spu, 0, -2), 0x7F4FE);
     }
 }
+
+impl Reverb {
+    /// Its state into an FNV-1a hash (`Spu::state_hash`).
+    pub(crate) fn hash_into(&self, h: &mut u64) {
+        crate::mixer::fnv(h, &self.cur.to_le_bytes());
+        for side in self.input.iter().chain(self.output.iter()) {
+            for v in side {
+                crate::mixer::fnv(h, &v.to_le_bytes());
+            }
+        }
+        crate::mixer::fnv(h, &(self.pos as u32).to_le_bytes());
+    }
+}

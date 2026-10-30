@@ -9,3 +9,4 @@ license.workspace = true
 psxw-abi = { path = "../psxw-abi" }
 psx-devices = { path = "../psx-devices" }
 psx-bios = { path = "../psx-bios" }
+psx-spu = { path = "../psx-spu" }

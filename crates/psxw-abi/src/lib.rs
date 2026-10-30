@@ -257,6 +257,12 @@ pub mod guest {
     /// adapters that replace a busy-wait (D59, D60): the guest resumes
     /// with the budget the original's last safepoint would have left it.
     pub const BUDGET_RESET: &str = "guest_budget_reset";
+    /// `() -> i32`: the safepoint budget left (loop-header passes before
+    /// the next safepoint). With [`BUDGET_SET`], `(i32) -> ()`, for
+    /// adapters that replace code with loops (D63): they spend what the
+    /// original's loops would.
+    pub const BUDGET_GET: &str = "guest_budget_get";
+    pub const BUDGET_SET: &str = "guest_budget_set";
     /// binaryen Asyncify's control functions (D57): `(data_ptr) -> ()`
     /// start an unwind or a rewind over the data structure at `data_ptr`
     /// (current position, end, then the saved frames); `() -> ()` stop
@@ -333,6 +339,9 @@ pub mod exports {
     pub const ALLOC: &str = "psxw_alloc";
     /// `() -> i64`: FNV-1a of guest RAM.
     pub const RAM_HASH: &str = "psxw_ram_hash";
+    /// `() -> i64`: the SPU's state (registers, voices, SPU RAM) brought
+    /// up to now, hashed; for conformance (D63).
+    pub const SPU_HASH: &str = "psxw_spu_hash";
     /// `(options_ptr, sp, gp) -> ()`: set the runtime up without a disc,
     /// for a host that drives guest calls itself (conformance runs). The
     /// host has written guest RAM.

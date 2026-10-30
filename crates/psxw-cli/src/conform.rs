@@ -694,7 +694,8 @@ impl sdk_psyq::cases::Harness for ChipSide<'_> {
 
     fn device(&mut self) -> String {
         let (frames, audible, hash) = self.c.audio();
-        format!("render {:016x} display {:016x} audio {frames} frames, {audible} audible, {hash:016x}", self.c.render_hash(), self.c.present_hash())
+        let spu = self.c.spu_hash();
+        format!("render {:016x} display {:016x} audio {frames} frames, {audible} audible, {hash:016x} spu {spu:016x}", self.c.render_hash(), self.c.present_hash())
     }
 
     fn callback(&self) -> Option<(u32, u32)> {
@@ -712,6 +713,14 @@ impl sdk_psyq::cases::Harness for ChipSide<'_> {
     fn plug_port2(&mut self, plugged: bool) -> Result<(), String> {
         self.c.set_replay(replay_pads(CHIP_FRAMES, if plugged { 2 } else { 1 }));
         Ok(())
+    }
+
+    fn budget(&mut self) -> u32 {
+        self.c.budget()
+    }
+
+    fn symbol(&self, name: &str) -> Option<u32> {
+        self.ctx.addr(name).ok()
     }
 }
 

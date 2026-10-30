@@ -10,6 +10,7 @@
 //! Scope: libetc's interrupt layer and libapi's `counter.o` (chip irq),
 //! libgpu's `sys.o` (chip gpu), libpad's direct connection (chip sio0),
 //! libpress's MDEC functions (chip mdec),
+//! libspu where it touches the SPU and libsnd's `_SsInit` (chip spu),
 //! libapi's `pad.o`/`patch.o`/`first.o`, libcd's drive layer and the
 //! streaming ring's interrupt (chip cd), libmcx's port driver (chip
 //! memcard), and libcard's thin BIOS wrappers.
@@ -26,6 +27,8 @@ pub mod libgpu;
 pub mod libmc;
 pub mod libpad;
 pub mod libpress;
+pub mod libsnd;
+pub mod libspu;
 pub mod layout;
 pub mod validated;
 
@@ -61,8 +64,9 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 ///   entered through the BIOS's custom exception exit (a longjmp into
 ///   `startIntr`'s `setjmp`) and leaves with ReturnFromException; both are
 ///   non-local exits the lift and link tiers lower to wasm exceptions.
-/// - libspu and libsnd (D47): the SPU is register-level (`psx-spu`, exact
-///   against the oracle), so libspu's own code programs it, and libsnd's
+/// - libspu and libsnd (D47), when chip spu is emulated: the SPU is
+///   register-level (`psx-spu`, exact against the oracle), so libspu's own
+///   code programs it, and libsnd's
 ///   few direct register writes reach it too.
 /// - libcd and libds (D58), when chip cd is emulated: the CD controller
 ///   (`psx_devices::cdc`) takes their commands and delivers sectors and XA
@@ -85,6 +89,7 @@ pub struct Psyq {
     pub pad: libpad::Pad,
     pub gpu: libgpu::Gpu,
     pub press: libpress::Press,
+    pub spu: libspu::State,
     /// The guest address of the SDK function the running adapter replaces
     /// (D61): the runtime sets it before each call.
     pub at: u32,
@@ -152,6 +157,7 @@ pub fn chip_adapters() -> Vec<(&'static str, &'static str)> {
     v.extend(libgpu::ADAPTERS.iter().map(|(n, _)| (*n, "gpu")));
     v.extend(libpress::ADAPTERS.iter().map(|(n, _)| (*n, "mdec")));
     v.extend(libcd::ADAPTERS.iter().map(|(n, _)| (*n, "cd")));
+    v.extend(libspu::ADAPTERS.iter().chain(libsnd::ADAPTERS).map(|(n, _)| (*n, "spu")));
     v.extend(libmc::MCX.iter().map(|(n, _)| (*n, "memcard")));
     v
 }
@@ -165,6 +171,8 @@ pub fn adapters() -> Vec<(&'static str, Adapter)> {
     v.extend(libgpu::ADAPTERS);
     v.extend(libpress::ADAPTERS);
     v.extend(libcd::ADAPTERS);
+    v.extend(libspu::ADAPTERS);
+    v.extend(libsnd::ADAPTERS);
     v.extend(libmc::ADAPTERS);
     v.extend(libmc::MCX);
     v

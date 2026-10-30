@@ -25,6 +25,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 
 pub mod envelope;
+pub mod mixer;
 mod reverb;
 pub mod tables;
 

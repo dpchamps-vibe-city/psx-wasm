@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 1: btn and bof4
 
-**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c, 9d, 9e and 9g done; 5–6 harness in place)
+**Status:** in progress (tasks 1–4, 8, 9a, 9b, 9c, 9d, 9e, 9f and 9g done; 5–6 harness in place)
 **Depends on:** M13 (bof4 boots and plays through `title-to-field`).
 **Unlocks:** [phase 2](phase2.md).
 **Shared context:** [README.md](README.md): principles, vocabulary,
@@ -20,11 +20,13 @@ per-function detail. The scan reproduces every constant-address access
 the translator sees in either game's SDK code.
 
 **141 adapters** across both games: btn needs 109, bof4 90. 78 reach a
-chip or BIOS internals; 63 are state accessors. 46 of them exist (23
+chip or BIOS internals; 63 are state accessors. 58 of them exist (23
 before chip irq, task 9a; 31 before chip sio0, task 9c; chip cd, 9d,
 traded libcd's 12 public-layer adapters for 8 of its drive layer here;
-chip mdec, 9e, added libpress's 3; chip memcard, 9g, kept 1 of libmcx's
-4, its accessors original over libmcx's state).
+chip mdec, 9e, added libpress's 3; chip spu, 9f, 12 of libspu's, the
+rest of libspu and libsnd original over 9 adapters below them; chip
+memcard, 9g, kept 1 of libmcx's 4, its accessors original over
+libmcx's state).
 
 | Library | Reach hardware | State accessors | Have |
 |---|---|---|---|
@@ -36,8 +38,8 @@ chip mdec, 9e, added libpress's 3; chip memcard, 9g, kept 1 of libmcx's
 | libmcx | 1 | 18 | 1 (and `_mcxDsrEntry`, internal; the accessors stay original over libmcx's state, 9g) |
 | libpad | 5 | 1 | 6 |
 | libpress | 3 | 0 | 3 (and the 3 internal ones, 9e) |
-| libsnd | 1 | 19 | 0 |
-| libspu | 18 | 6 | 0 |
+| libsnd | 1 | 19 | 0 (`SsInit` and the accessors stay original over `_SsInit`, its internal, 9f) |
+| libspu | 18 | 6 | 12 (the other 6 and the accessors stay original over 8 internal ones: `spu.o`'s layer, the voice-mask helpers, `SpuSetNoiseClock`, 9f) |
 
 **State accessors need no adapter when the adapters keep the library's
 state where the original keeps it,** in guest RAM. libsnd shows why: only
@@ -115,7 +117,8 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    compared at counter checkpoints (reuse
    `psxw oracle ramdiff --compare-frames`).
 7. [ ] **Cores without the protocol** (README, "Native backends"):
-   - a mixer API over `psx-spu`'s voice DSP;
+   - a mixer API over `psx-spu`'s voice DSP (done, 9f: `psx_spu::mixer`,
+     each setter the register write it stands for, and `Spu::state_hash`);
    - an MDEC decode function (done, 9e: `Mdec::input`, `Mdec::output`);
    - an XA route from the drive to the mixer;
    - the GPU decoder and the drive, shared between adapters and devices.
@@ -132,7 +135,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    | c ✓ | SIO0 | libpad | 6 (+ PadStopCom) | Done 2026-10-29 (progress log). Old set (7) in `609a64a^`. Reproduces libpad's observable state machine (D40's reason for removing it) and its interrupt's time (D60). |
    | d ✓ | CD | libcd (libds and streaming ride on it) | 13: `bios_1`'s 9, `CD_getsector`, `CD_getsector2`, `StCdInterrupt`, `StUnSetRing` | Done 2026-10-29 (progress log). The seam is libcd's drive layer under both games (D62); the public layer, libds and the rest of the ring stay original over it, its state in libcd's own globals. btn's 22 public-layer adapters are gone. |
    | e ✓ | MDEC | libpress | 6: the 3 bof4 calls and the 3 internal ones | Done 2026-10-29 (progress log). bof4 only (btn links no libpress). Over the MDEC's decode function (task 7), DMA0/DMA1 completed on the shared controller, IRQ3 held to the guest's next safepoint (D64). |
-   | f | SPU | libspu, libsnd | 26 + 1 | Needs the mixer API (task 7). The largest set. |
+   | f ✓ | SPU | libspu, libsnd | 21: `spu.o`'s 5, the 15 functions that program the SPU themselves, `_SsInit` | Done 2026-10-29 (progress log). The seam is where libspu touches the SPU, over the mixer API (task 7), its state where libspu and libsnd keep it (D63); `SpuInit`, `SpuWritePartly`, the wrappers, the accessors and all of libsnd but `_SsInit` stay original. Their time is the translated original's (budget passes, quiet returns). |
    | g ✓ | Memory card (PocketStation) | libmcx | 2: `McxStartCom`, `_mcxDsrEntry` | Done 2026-10-29 (progress log). btn only. A chip group (`memcard`) whose device is SIO0 with the BIOS's cards; the commands, `McxSync` and `McxStopCom` stay original over libmcx's state in guest RAM (D65). Old set (6) in `66ef76c`. |
 
 10. [ ] **Both games fully native.** btn's and bof4's build reports show
@@ -517,6 +520,91 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     mdec` passes the same (10 MDEC register accesses). btn
     `title-to-gameplay` (6,000 frames): pass.
 
+- **2026-10-29, task 9f: chip spu native in btn and bof4.** 21 adapters,
+  20 in libspu (`sdk-psyq/src/libspu.rs`) and libsnd's `_SsInit`
+  (`sdk-psyq/src/libsnd.rs`), one code for both games, written from the
+  4.7 objects (`psxw sdk disasm`): `spu.o`'s `_spu_init`,
+  `_spu_FsetRXX`, `_spu_FsetRXXa`, `_spu_Fw`, `_spu_FiDMA`, and
+  `SpuSetKey`, `SpuGetKeyStatus`, `SpuGetAllKeysStatus`,
+  `SpuGetVoiceEnvelope`, `SpuGetVoiceVolume`, `SpuSetVoiceVolume`,
+  `SpuSetNoiseClock`, `_SpuSetAnyVoice`, `_SpuGetAnyVoice`,
+  `SpuSetReverb`, `SpuSetReverbDepth`, `SpuSetReverbModeParam`,
+  `SpuSetCommonAttr`, `SpuSetVoiceAttr`, `SpuClearReverbWorkArea`. Each
+  game binds 19 (btn links no `Spu*VoiceVolume`, bof4 no key-status
+  readers). The 17 objects they are in (16 of libspu and
+  `libsnd/ssinit`, the same keys in both games) are validated; both
+  games report spu native, and `game.toml` expects it, so both now run
+  every chip native but the GTE (btn: cd, gpu, irq, sio0, spu; bof4: cd,
+  gpu, irq, mdec, sio0, spu), with no guest register access (`--check
+  no-io` passes in both). Inventory: 61 of the 141 exist.
+  - **How (D63).** The seam is where libspu touches the SPU: its
+    lowest layer and the functions that program `_spu_RXX` themselves;
+    `SpuInit`, `_SpuInit`, `SpuStart` (which opens the DMA event and
+    gives `DMACallback` the address of `_spu_FiDMA`, an adapter),
+    `SpuWritePartly`, `SpuSetTransferStartAddr`, `SpuIsTransferCompleted`,
+    the allocator, the `SpuSet/GetNoise/ReverbVoice` wrappers, `SsInit`
+    and all of libsnd but `_SsInit` stay original. libspu's and libsnd's
+    state stays in their `.data`, found through the objects' code (D61),
+    and adapters call the guest where the original does: `_spu_Fw1ts`
+    (libspu's delay loop), `_spu_note2pitch`, `_SpuIsInAllocateArea_`,
+    `printf`, `DeliverEvent`, `WaitEvent`, the transfer callback,
+    `_SsVmInit`, `SpuClearReverbWorkArea` from `SpuSetReverbModeParam`.
+    The SPU is `psx-spu` through a new mixer API (`psx_spu::mixer`, task
+    7: each setter the register write it stands for) brought up to now
+    first (`Machine::with_spu`); DMA4 programs MADR4/BCR4 on the shared
+    controller, moves its words through the core's transfer port and
+    holds its completion (D64). The original's time: the adapters spend
+    the guest's safepoint budget as the translated loops do (new guest
+    exports `guest_budget_get`/`set`, `Regs::budget`/`set_budget`), and
+    return without a safepoint (`Machine::quiet`) where the original
+    makes no runtime call (Findings).
+  - **Conformance:** 14 spu cases (`sdk-psyq/src/cases/spu.rs`), 12
+    level 1 with seeded arguments (the reset cold and hot; writes by DMA
+    and through the FIFO at any address and length, with and without the
+    transfer callback; registers by index and as SPU RAM addresses;
+    every reverb work area, bad modes included, with the FIFO mode and a
+    callback set aside; keys on, off and invalid between vblanks, in
+    register-queue mode too; key status of any mask; random voice and
+    common attributes across their ranges and past them; voice volumes
+    as levels and sweeps; the noise and reverb masks by every op and the
+    noise clock; reverb modes with and without clearing, delay time,
+    feedback, depth; `SsInit` and `_SsInit`), each with the safepoint
+    budget's phase moved first by calls to `_spu_Fw1ts`, and 2 level 2
+    (a sound driver over libsnd and libspu: init through `SsInit`,
+    samples up by DMA and FIFO, a hall reverb, six voices by note through
+    the reverb and the noise, heard and released; transfers back to back
+    with and without the callback, polled across vblanks, around a
+    reverb clear, a voice playing over them). Observed after every step:
+    return values, the budget left, the SPU's whole state at the core
+    (new `Spu::state_hash`, runtime export `psxw_spu_hash`, now in
+    `Harness::device` for every chip) and the audio, RAM below the
+    cases' scratch in 64 KB blocks, callback counts. `psxw conform btn
+    --chip spu` and `psxw conform bof4 --chip spu`: PASS, 91 case runs
+    each (8 seeds; one case skipped in each, for the readers the game
+    doesn't link), with identical observations across the two games.
+    `--lib libspu` (11 steps) and `--lib libsnd` (11): PASS. On the tree
+    merged with main (chip mdec): `--chip irq` (33 runs), `gpu` (49),
+    `sio0` (34), `cd` (19 in btn, 22 in bof4) and `mdec` (17, bof4) pass
+    in both games (4 seeds).
+  - **Runs:** btn and bof4, 1,200 frames, `--check boot --check no-trap
+    --check no-shadow-io --check no-io`: pass, and `--check determinism`
+    (RAM and audio). Against `--device spu` (which passes the same boot
+    checks, 44,969 and 52,557 SPU register accesses) the audio is the
+    same (btn 884,693 frames, 511,326 audible, hash `37d8f3c0…`; bof4
+    884,693 frames, hash `ace3f991…`), `VSync` calls are equal (btn
+    952,146, bof4 3,268), and RAM at frame 1200 differs only in dead
+    stack (5 bytes in btn, 13 in bof4). bof4 `title-to-field` (25,300
+    frames): every expect passes at the device's frames (counter 12390 at
+    frame 24768), the frame counter is equal to `--device spu`'s every
+    frame, and so is the audio (18,652,285 frames, 17,299,810 audible,
+    the same hash). btn `title-to-gameplay` (6,000 frames): pass, frame
+    counter equal every frame, `VSync` calls equal (131,784,317).
+    Level 4 (`psxw conform <game> --modes`, every chip native against
+    every chip on its device): PASS in both; bof4's checkpoints all fall
+    at the same frames, the bytes that differ (235-247 in 18 symbols)
+    are libetc's, libpad's and libcd's runtime-side state, none of
+    libspu's or libsnd's.
+
 - **2026-10-29, task 9g: chip memcard native in btn.** libmcx, the
   PocketStation library, is a chip group, `memcard` (D65), with 2
   adapters (`sdk-psyq/src/libmc.rs`): `McxStartCom` and `_mcxDsrEntry`,
@@ -871,6 +959,66 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   functions resolve into before it starts (§3: the bytes in RAM decide),
   and fails if one lies over the cases' scratch RAM (`SCRATCH`, now with
   `SCRATCH_LEN`, 48 KiB) or over another the case needs.
+- **libspu's seam is below the scan's** (task 9f). The scan's set is the
+  public functions the games and libsnd call (18 of libspu, `SsInit`);
+  the build's chip decision, with libspu's state left in its `.data`,
+  needs only the functions whose own code reaches the SPU: 12 of those
+  18 and 8 internal ones (`spu.o`'s layer, `_SpuSetAnyVoice`,
+  `_SpuGetAnyVoice`, `SpuSetNoiseClock`, which libsnd's `vmNoiseOn`
+  calls), plus `_SsInit`. The other 6 public ones (`SpuWritePartly`,
+  `SpuSetTransferStartAddr`, the noise and reverb voice wrappers) run
+  original over them, as `SsInit`, `SpuInit` and the accessors do.
+  `SpuClearReverbWorkArea` reaches the SPU only through `_spu_t`, but is
+  adapted: the reach table lists it, and its loop waits on `WaitEvent`.
+- **Budget passes are the translation's, not the source's** (task 9f).
+  Counted from the MIPS loops, the first adapters spent 22 passes too
+  many in `SpuInit` and over 500 in `_SsInit`, and conformance showed it
+  at once (the budget left is observed after every call). Measured
+  against the original over the device: clang unrolls the constant loops
+  of 10 and 16 iterations (`_spu_init`'s register queue, `_SsInit`'s
+  registers and its mark table's inner loop), `_spu_init`'s 24 voices go
+  two a pass, `SpuSetReverbModeParam` copies its 68 bytes a word a pass,
+  `SpuGetKeyStatus`'s search for the lowest bit is a count of trailing
+  zeros (no pass), and `SpuClearReverbWorkArea`'s chunk loop passes once
+  per chunk after the first. 24-voice loops elsewhere stay one pass per
+  voice. A toolchain change that moves these shows in `--chip spu`; the
+  constants are in `libspu.rs`.
+- **An adapter's return is a safepoint the original doesn't have**
+  (task 9f). With DMA4's completion held (D64), btn still made one more
+  `VSync` poll than `--device spu` from frame 395: `SpuWritePartly` (guest
+  code) calls `_spu_Fw`, then `_spu_FsetRXXa`; natively both are
+  adapters, so the held IRQ3, released at `_spu_Fw`'s return, ran at
+  `_spu_FsetRXXa`'s, inside `SpuWritePartly`, and the game's poll of
+  `SpuIsTransferCompleted` saw the transfer done one call early. libspu's
+  adapters now return without a safepoint (`Machine::quiet`), as their
+  originals do; `VSync` counts and the frame counters match the device in
+  both games. The other chips' adapters still drain at their return;
+  where their originals make no runtime call at the end, the same rule
+  would apply (open).
+- **The register file keeps what was written.** `_spu_init`'s hot path
+  writes KOFF's high half as 0xFFFF (only its low 8 bits latch), and the
+  register reads back 0xFFFF; a first adapter wrote 0xFF and the SPU's
+  state hash differed. The mixer API writes each half as the original
+  does. Before main's wide-store fix (`5a3a920`) the device's `_spu_init`
+  lost the pitch and start address of every voice (8-byte stores cut to
+  4); the audio didn't show it (the voices are silent), the state hash
+  would have.
+- **What the spu adapters don't reproduce, deliberately.** libspu's
+  waits that would time out (a status bit the core never leaves set)
+  spend their 3,840 polls at once; RAM a callback reads during a
+  safepoint inside a RAM-only loop (`_SsInit`'s mark table) is written
+  whole, not halfway; the stack libspu's frames leave below `sp` (5 bytes
+  in btn's 1,200 frames, 13 in bof4's). Register-queue mode
+  (`_spu_env`) is followed, but no game here links `SpuSetEnv` or
+  `SpuFlush`. The M6 SPU recording hook (`TRACE_RECORD_SPU`) sees
+  register writes, so natively a window ends when an adapter touches the
+  SPU; record with `--device spu`.
+- **btn's `title-to-gameplay` is silent** on both sides (0 of 4.4 million
+  audio frames audible, natively and on `--device spu`, its first 1,200
+  frames included), while the same 1,200 frames without a replay (no
+  pads plugged) are half audible. Not chased (it predates chip spu and
+  is the same on the device); the replay comparison with sound is
+  bof4's `title-to-field` (17 million audible frames).
 - **libmcx is a chip, memcard, not BIOS internals** (task 9g, D65). It
   drives SIO0, IRQ7 and root counter 2 itself; its acts on the kernel
   are its element, appended to priority 2's chain directly through the

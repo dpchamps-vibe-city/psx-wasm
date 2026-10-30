@@ -22,6 +22,7 @@ mod gpu;
 mod irq;
 mod mdec;
 mod memcard;
+mod spu;
 mod sio0;
 
 /// What a case runs against: one game's build, one side.
@@ -38,7 +39,8 @@ pub trait Harness {
     fn observe(&mut self, what: &str, value: String);
     /// The device effect so far, at the core's API both sides reach: the
     /// renderer's command stream, the displays presented at each vblank
-    /// (what GP1 set), and the audio, hashed.
+    /// (what GP1 set), the audio, and the SPU's state (registers, voices,
+    /// SPU RAM), hashed.
     fn device(&mut self) -> String;
     /// A guest function that counts its calls in a word, and that word
     /// (game.toml `[conform]`), for callbacks.
@@ -58,6 +60,16 @@ pub trait Harness {
     /// sides start with two pads, port 1's buttons scripted).
     fn plug_port2(&mut self, _plugged: bool) -> Result<(), String> {
         Err("this harness can't change the pads".into())
+    }
+    /// The guest's safepoint budget left (loop-header passes before the
+    /// next safepoint): what the original's loops spend, observable as
+    /// time (D60, D63). 0 where the build has none.
+    fn budget(&mut self) -> u32 {
+        0
+    }
+    /// A data symbol's address in the game, where its symbols name it.
+    fn symbol(&self, _name: &str) -> Option<u32> {
+        None
     }
 }
 
@@ -122,6 +134,7 @@ pub fn all() -> Vec<Case> {
     v.extend(mdec::cases());
     v.extend(cd::cases());
     v.extend(memcard::cases());
+    v.extend(spu::cases());
     v
 }
 

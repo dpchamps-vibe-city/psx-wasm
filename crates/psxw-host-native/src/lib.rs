@@ -1,4 +1,4 @@
-//! The native host (plans/M02): runs `game.wasm` under wasmtime, headless.
+//! The ntive host (plans/M02): runs `game.wasm` under wasmtime, headless.
 //! It supplies the host interface (psxw-abi): the disc image, pad input
 //! from a replay, storage, logging, and the vblank (`host.vblank`), which
 //! is also where a run stops after its frame budget. It doesn't pace. Per-frame RAM hashes, dumps and a
@@ -956,6 +956,24 @@ impl Conform {
     /// Vblanks so far.
     pub fn frame(&self) -> u64 {
         self.store.data().frame
+    }
+
+    /// The SPU's state hashed (psxw-abi `SPU_HASH`), 0 for a module
+    /// without it.
+    pub fn spu_hash(&mut self) -> u64 {
+        match self.instance.get_typed_func::<(), u64>(&mut self.store, psxw_abi::exports::SPU_HASH) {
+            Ok(f) => f.call(&mut self.store, ()).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// The guest's safepoint budget left (psxw-abi `guest::BUDGET_GET`),
+    /// 0 for a module without it.
+    pub fn budget(&mut self) -> u32 {
+        match self.instance.get_typed_func::<(), i32>(&mut self.store, psxw_abi::guest::BUDGET_GET) {
+            Ok(f) => f.call(&mut self.store, ()).map_or(0, |v| v as u32),
+            Err(_) => 0,
+        }
     }
 
     /// Ends the run: its report (counters, logs).

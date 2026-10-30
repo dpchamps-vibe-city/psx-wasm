@@ -621,6 +621,20 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
+    /// The SPU core, brought up to now, for native adapters (D59): `f`
+    /// works through its mixer API (`psx_spu::mixer`), as at a register
+    /// access; its IRQ line is looked at after. Their writes don't go
+    /// through the registers, so an SPU window being recorded (M6's hook)
+    /// ends. `None` without a bus.
+    pub fn with_spu<R>(&mut self, f: impl FnOnce(&mut psx_spu::Spu) -> R) -> Option<R> {
+        self.spu_run();
+        let io = self.io.as_mut()?;
+        io.spu.window = None;
+        let r = f(&mut io.spu.spu);
+        self.spu_irq();
+        Some(r)
+    }
+
     /// The SPU's IRQ line rising raises IRQ9.
     fn spu_irq(&mut self) {
         let Some(io) = self.io.as_mut() else { return };
