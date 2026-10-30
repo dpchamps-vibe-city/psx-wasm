@@ -102,7 +102,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 4. [x] **Reporting.** Per chip, native or emulated and why, in
    `build.json` and in a summary line. Register accesses per chip in the
    run report. `--check no-io`.
-5. [ ] **Conformance harness**, levels 1–3 (README, "Conformance"):
+5. [x] **Conformance harness**, levels 1–3 (README, "Conformance"):
    - adapter cases written by symbol;
    - observation specs next to each adapter;
    - every case runs in every game that links the function;
@@ -114,13 +114,17 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
    every chip onto its device. Each game's replays run both ways and are
    compared at counter checkpoints (reuse
    `psxw oracle ramdiff --compare-frames`).
-7. [ ] **Cores without the protocol** (README, "Native backends"):
+7. [x] **Cores without the protocol** (README, "Native backends"):
    - a mixer API over `psx-spu`'s voice DSP (done, 9f: `psx_spu::mixer`,
      each setter the register write it stands for, and `Spu::state_hash`);
    - an MDEC decode function (done, 9e: `Mdec::input`, `Mdec::output`);
-   - an XA route from the drive to the mixer;
-   - the GPU decoder and the drive, shared between adapters and devices.
-8. [ ] **Bump the psyq-decomp pin.** libpad, libpress and libmcx were
+   - an XA route from the drive to the mixer (done, 9d: native and device
+     share one CD controller, `psx_devices::cdc`, whose decoded XA feeds the
+     SPU's CD input in both modes);
+   - the GPU decoder and the drive, shared between adapters and devices
+     (done: 9b gives the GPU front end GP0/GP1 words directly; 9d drives
+     the controller through core calls, not its registers).
+8. [x] **Bump the psyq-decomp pin** (done: `654b236`). libpad, libpress and libmcx were
    decompiled after `302b6ae`.
 9. [ ] **Adapters, chip by chip**, in this order. Each chip is done when
    its adapters pass levels 1–3 in both games and both games report the

@@ -20,6 +20,9 @@ struct ModeRun {
     emulated: String,
     pass: bool,
     checks: Vec<crate::run::Check>,
+    /// What the run sent the host: renderer commands, displays, audio
+    /// (hashes over the whole run), and the frame counter at the end.
+    output: Output,
 }
 
 #[derive(Serialize)]
@@ -28,6 +31,9 @@ struct ModesReport {
     game: String,
     replay: String,
     pass: bool,
+    /// The renderer commands, displays, audio and final frame counter are
+    /// the same in both modes.
+    same_output: bool,
     runs: Vec<ModeRun>,
     points: Vec<ramdiff::PointDiff>,
     unreached: Vec<u32>,
@@ -68,8 +74,14 @@ pub fn run(ws: &Workspace, game: &str, replay: Option<&str>) -> Result<bool> {
         for c in checks.iter().filter(|c| !c.pass) {
             eprintln!("  {}: {}", c.name, c.detail);
         }
+        let output = Output {
+            render: format!("{:016x} ({} words)", r.render.hash, r.render.words),
+            displays: format!("{:016x}", r.render.present_hash),
+            audio: format!("{} ({} frames)", r.audio.hash, r.audio.frames),
+            counter: r.trace.last().copied().unwrap_or(0),
+        };
         dumps.push((dir, r));
-        runs.push(ModeRun { mode: mode.into(), wasm: built.wasm, emulated: built.emulated, pass, checks });
+        runs.push(ModeRun { mode: mode.into(), wasm: built.wasm, emulated: built.emulated, pass, checks, output });
     }
     let sp = dumps[0].1.boot.as_ref().and_then(|b| b["sp"].as_u64()).context("the run reported no boot sp")? as u32;
     let layout = crate::wholegame::layout(ws, game, &inputs, sp)?;
@@ -94,10 +106,23 @@ pub fn run(ws: &Workspace, game: &str, replay: Option<&str>) -> Result<bool> {
         diffs.push(p);
     }
     let pass = runs.iter().all(|r| r.pass) && unreached.is_empty();
-    let report = ModesReport { schema_version: 1, game: game.into(), replay: name, pass, runs, points: diffs, unreached };
+    let same_output = runs[0].output == runs[1].output;
+    for (r, o) in runs.iter().map(|r| (&r.mode, &r.output)) {
+        println!("{r:>7}: render {}, displays {}, audio {}, counter {}", o.render, o.displays, o.audio, o.counter);
+    }
+    println!("output: {}", if same_output { "identical in both modes" } else { "differs between the modes" });
+    let report = ModesReport { schema_version: 1, game: game.into(), replay: name, pass, same_output, runs, points: diffs, unreached };
     std::fs::create_dir_all(&root)?;
     let json = root.join("report.json");
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
     println!("conform {game} modes: {} ({})", if pass { "PASS" } else { "FAIL" }, json.display());
     Ok(pass)
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+struct Output {
+    render: String,
+    displays: String,
+    audio: String,
+    counter: u32,
 }
