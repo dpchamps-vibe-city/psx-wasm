@@ -60,6 +60,13 @@ provisional (README, principle 6).
 
 ## Tasks
 
+0. [ ] **Calling contexts in the harness** (README, "Calling contexts").
+   A case's stack is fixed at the game's boot stack today, in the native
+   harness and in the browser one (`web-conform`), and no case runs from a
+   handler, in a critical section or on a thread. Give both harnesses the
+   contexts, run every phase 1 case in each (phase 1's adapters were only
+   checked in the first), and observe where callbacks run. Before task 3,
+   so new adapters are checked in every context from the start.
 1. [ ] **The synthetic conformance link.** Build a test program from PsyQ
    4.7's library objects and translate it with the lift. Run every phase 1
    conformance case on it too, as a cross-check against the games' links.
@@ -84,8 +91,8 @@ provisional (README, principle 6).
 
 1. Every function `psxw sdk scan` reports as reaching hardware in PsyQ 4.7
    has an adapter, or an exclusion with a reason.
-2. Every adapter passes levels 1–2 on the synthetic link, and level 3 in
-   every game that links it.
+2. Every adapter passes levels 1–2 on the synthetic link, in every calling
+   context, and level 3 in every game that links it.
 3. A PsyQ 4.7 game builds with every chip native, with no new adapters,
    for each chip whose device it uses.
 

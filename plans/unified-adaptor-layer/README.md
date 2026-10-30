@@ -144,6 +144,25 @@ fixed to btn's addresses. The suite has four levels:
 | Library globals | Only those that code staying original reads |
 | Callbacks | Order and arguments exactly; timing to the frame |
 | Timing | At sync points (after a `*Sync` returns, after N vblanks), not per cycle |
+| Where callbacks run | The stack a handler or callback gets, by region (the library's own, the interrupted code's), not by address |
+
+**Calling contexts.** An adapter can match the original in one context
+and differ in another, and a game calls the same function in several.
+Levels 1 and 2 run each case in every context the harness provides, and
+the results must match the original's in each, misuse included:
+
+| Context | What it catches |
+|---|---|
+| Main code, stack in main RAM | The baseline |
+| Stack in the scratchpad (1F800000h–1F8003FFh), which DMA doesn't reach | Buffers a library or its handlers DMA into on the stack. btn's menu keeps its stack there; libetc's adapter ran handlers on it, and libcd's CdRead retried forever on headers it couldn't read (7343c6a) |
+| Inside an interrupt handler or callback | Library calls made from callbacks with interrupts held: CdRead's retry issues CdControl from the CD callback, libsnd's tick calls libspu from the vblank handler |
+| In a critical section | Waits that need an interrupt: the original times out or spins, the adapter must do the same |
+| On a thread's stack (ChangeThread, D57) | Handlers that interrupt a thread, and calls from one |
+| Partway through a safepoint quantum | Reads of time the guest sees (root counter 2, SIO0: D66) |
+
+Level 4 can only find what a replay reaches, so each game's replays
+should take the paths where it switches context (its stack, its threads),
+not only the main loop's.
 
 ## Build reporting
 

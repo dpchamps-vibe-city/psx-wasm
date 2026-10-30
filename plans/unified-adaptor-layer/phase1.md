@@ -798,6 +798,18 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
   replay (two pads) it was the stall below, and since task 9d, with
   btn's `CdRead` original in every mode, it stalled natively too.
   *Resolved by D66* (progress log, "btn's replays stall").
+- **Conformance ran every case in one calling context** (found in the
+  browser, 2026-10-29). btn's in-game menu keeps its stack in the
+  scratchpad. libetc's adapter ran handlers on the interrupted code's
+  stack, where the original switches to `intr.o`'s own, so libcd's CdRead
+  callback took each sector header by DMA into the scratchpad, which DMA
+  doesn't reach, and retried forever ("CdRead: sector error"). Fixed in
+  7343c6a. No case caught it: the harness always calls from main code on
+  the game's boot stack, and stacks are outside every RAM comparison;
+  level 4's replays never open the menu. The README now makes calling
+  contexts part of conformance, and phase 2's task 0 gives the harness
+  them; phase 1's adapters are checked in the first context only until
+  then.
 - **Interrupt latency is observable; `VSync` waits like its spin** (task
   9a). A first `VSync` adapter blocked event by event, as blocking runtime
   calls do (§6), so interrupts raised while a game waited were handled at
