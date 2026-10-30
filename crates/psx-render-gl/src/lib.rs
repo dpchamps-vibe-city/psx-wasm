@@ -83,6 +83,20 @@ pub struct Renderer {
     readbacks: Vec<u16>,
     scratch: Vec<u32>,
     last_present: Option<PresentDesc>,
+    /// GL work since [`Renderer::take_stats`].
+    stats: Stats,
+}
+
+/// What the backend did, for hosts that report where a frame's time went:
+/// draw calls, syncs (copies to the read copy, each its own render pass),
+/// rows of primitives drawn one by one, uploads, colour-table loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub draws: u32,
+    pub syncs: u32,
+    pub serial_rows: u32,
+    pub uploads: u32,
+    pub clut_loads: u32,
 }
 
 fn gl_err(e: String) -> anyhow::Error {
@@ -218,6 +232,7 @@ impl Renderer {
                 readbacks: Vec::new(),
                 scratch: Vec::new(),
                 last_present: None,
+                stats: Stats::default(),
             };
             r.reset_vram();
             let err = r.gl.get_error();
@@ -286,6 +301,7 @@ impl Renderer {
                     self.draw_records(&mut rec, 1);
                 }
                 Command::Upload { rect, mask, pixels } => {
+                    self.stats.uploads += 1;
                     let mut bytes = Vec::with_capacity(rect.pixels() * 2);
                     for i in 0..rect.pixels() {
                         let p = (pixels[i / 2] >> (16 * (i % 2))) as u16;
@@ -326,6 +342,7 @@ impl Renderer {
                     }
                 }
                 Command::ClutLoad { slot, x, y, count } => unsafe {
+                    self.stats.clut_loads += 1;
                     self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_r));
                     self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_clut));
                     for (px, py, w, h, ox, _) in pieces(x, y, count, 1) {
@@ -413,6 +430,7 @@ impl Renderer {
     /// Draw one row of a primitive (`y` as the drawing-area test sees it),
     /// then sync that row.
     fn draw_row(&mut self, rec: &[u32], y: i32) {
+        self.stats.serial_rows += 1;
         let saved = self.clip;
         if y < saved.y0 || y > saved.y1 {
             return;
@@ -428,6 +446,7 @@ impl Renderer {
 
     /// Copy draw-copy regions to the read copy.
     fn sync(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        self.stats.syncs += 1;
         unsafe {
             self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_w));
             self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_r));
@@ -478,9 +497,15 @@ impl Renderer {
                     glow::PixelUnpackData::Slice(Some(bytes)),
                 );
                 gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, m as i32);
+                self.stats.draws += 1;
                 start += m;
             }
         }
+    }
+
+    /// What the backend did since the last call.
+    pub fn take_stats(&mut self) -> Stats {
+        std::mem::take(&mut self.stats)
     }
 
     /// Read a VRAM rectangle (wrapping) from the draw copy, after

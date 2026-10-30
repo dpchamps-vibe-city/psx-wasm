@@ -83,6 +83,13 @@ mod web {
             Ok(())
         }
 
+        /// The backend's work since the last call: draw calls, syncs, rows
+        /// drawn one by one, uploads, colour-table loads.
+        pub fn stats(&mut self) -> Vec<u32> {
+            let s = self.r.take_stats();
+            vec![s.draws, s.syncs, s.serial_rows, s.uploads, s.clut_loads]
+        }
+
         /// All of VRAM (1024 × 512), for hashes.
         pub fn vram(&mut self) -> Vec<u16> {
             self.r.read_vram(0, 0, 1024, 512)

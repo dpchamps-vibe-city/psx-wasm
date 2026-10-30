@@ -398,18 +398,21 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   const pace = (f) => {
     const n = Number(f);
     const now = performance.now();
+    // The backend's GL work this vblank: draws, syncs, rows drawn one by
+    // one, uploads, colour-table loads.
+    const gl = lost ? [0, 0, 0, 0, 0] : Array.from(renderer.stats());
     if (lastVblank) {
       const ms = now - lastVblank;
       frameTimes.push(ms);
       if (ms > period) {
         const r = (v) => Math.round(v * 10) / 10;
-        const s = { frame: n, ms: r(ms), render: r(spent.render), submits: spent.renders, readback: r(spent.readback), shadow: r(spent.shadow), present: r(spent.present), disc: r(spent.disc), sectors: spent.sectors, turn: r(spent.turn) };
+        const s = { frame: n, ms: r(ms), render: r(spent.render), submits: spent.renders, gl, readback: r(spent.readback), shadow: r(spent.shadow), present: r(spent.present), disc: r(spent.disc), sectors: spent.sectors, turn: r(spent.turn) };
         slowest.push(s);
         slowest.sort((a, b) => b.ms - a.ms);
         slowest.length = Math.min(slowest.length, 20);
         if (ms > SLOW_MS) {
           const game = r(ms - spent.render - spent.readback - spent.shadow - spent.present - spent.disc - spent.turn);
-          logLine(2, `slow vblank: ${s.ms} ms (render ${s.render} ms in ${s.submits} submits, readback ${s.readback}, VRAM backup ${s.shadow}, present ${s.present}, disc ${s.disc} ms for ${s.sectors} sectors, event loop ${s.turn}, the rest ${game} ms)`);
+          logLine(2, `slow vblank: ${s.ms} ms (render ${s.render} ms in ${s.submits} submits, readback ${s.readback}, VRAM backup ${s.shadow}, present ${s.present}, disc ${s.disc} ms for ${s.sectors} sectors, event loop ${s.turn}, the rest ${game} ms; GL: ${gl[0]} draws, ${gl[1]} syncs, ${gl[2]} rows one by one, ${gl[3]} uploads, ${gl[4]} table loads)`);
         }
       }
     }
