@@ -1,4 +1,4 @@
-//! libcd (chip cd, D61): its drive layer as adapters over the CD
+//! libcd (chip cd, D62): its drive layer as adapters over the CD
 //! controller's core, without the controller's register protocol.
 //!
 //! **The seam.** PsyQ's libcd has two layers. `bios_1`, `bios_2` and
@@ -20,7 +20,7 @@
 //! `CdLastPos`), and the callbacks get pointers to its result buffers. So
 //! the adapters keep that state in `bios_1`'s own `.data` and `.bss`, and
 //! the ring's in its own globals: every accessor stays original. An
-//! adapter is told the guest address it replaces (`Psyq::at`, D60), and its
+//! adapter is told the guest address it replaces (`Psyq::at`, D61), and its
 //! object's layout is fixed by the identity key it is validated for, so
 //! the addresses come from the object's own relocated code ([`Bios1`],
 //! [`Ring`]).

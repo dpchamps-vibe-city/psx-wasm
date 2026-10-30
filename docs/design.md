@@ -34,7 +34,7 @@ manifest, without changes to the toolchain's code.
 | GTE | **Modelled.** A fixed-point library (`psx-gte`) holding the GTE's register file, which COP2 instructions and the `gte_*` macros drive. |
 | GPU | **Native, per chip** (D59, D60). libgpu's `sys.o` adapters (btn, bof4) give the GPU front end (`psx-devices::gpu`) its GP0/GP1 words and run its transfers on the DMA controller the other chips share; libgpu's state stays in guest RAM, where the library's code that stays original reads it. As the fallback, libgpu is original code over the front end, which answers GPUSTAT/GPUREAD, fed by the DMA controller (D42). The front end decodes packets into renderer commands; the host's WebGL2 backend draws them into a VRAM model. |
 | SPU | **Register level.** libspu and libsnd are original code over `psx-spu`: 24 ADPCM voices with reverb, on their own 44.1 kHz clock (D47). |
-| CD-ROM | **Native, per chip** (D59, D61). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). libpress is original code over the MDEC (`psx-devices::mdec`). |
+| CD-ROM | **Native, per chip** (D59, D62). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). libpress is original code over the MDEC (`psx-devices::mdec`). |
 | Pad | **Register level.** libpad is original code over SIO0 (`psx-devices::sio`, D40). |
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
 | BIOS/kernel | A Rust implementation of the A0/B0/C0 services the SDK calls, including threads (D57) and the memory card functions (D43). |
@@ -468,8 +468,8 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libapi | `adapter`. Translated; BIOS calls go to the Rust BIOS (D13). Adapters for `pad.o` and `patch.o` (BIOS pad buffers and patches) and `first.o` (`firstfile`, the memory card directory). `counter.o` (`SetRCnt`… program the timers) is `adapter-or-device`, in chip irq. `chclrpad.o` and `padstop.o` touch no hardware and run as guest code. |
 | libetc | `adapter-or-device`, chip irq. Native (btn, bof4): adapters for `intr.o`'s and `vsync.o`'s functions, their state in the runtime, over the interrupt controller, DPCR/DICR, root counter 1 and GPUSTAT, which stay the devices' registers because other libraries use them too ("Time, interrupts and blocking"). On the device: original code over the IRQ controller, DMA and timers (D45). The BIOS enters its dispatcher through the custom exception exit (a longjmp into `startIntr`'s `setjmp`), and it leaves with ReturnFromException; the lift and link tiers lower both to wasm exceptions. |
 | libgpu | `adapter-or-device`, chip gpu. Native (btn, bof4): adapters for `sys.o`'s functions that reach the GPU (`ResetGraph`, `DrawSync`, `DrawOTag`, `PutDrawEnv`, `PutDispEnv`, the image transfers …), over the front end and DMA2/DMA6, with libgpu's state (`GEnv`, its command queue, its packets) where libgpu keeps it, found through the object's relocated code (D60). The rest of libgpu (the font and kanji functions, `DrawSyncCallback`, `ClearOTag`, `SetDrawEnv`, the primitive helpers) and libgs stay guest code over them. On the device: original code over the GPU front end and DMA (D42). The front end takes GP0/GP1 words, so libgpu's own code drives it; an ordering table is one DMA walk in Rust. |
-| libcd | `adapter-or-device`, chip cd (D58, D61). Native (btn, bof4): adapters for the drive layer (`bios_1`'s `CD_init`, `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_flush`, `CD_vol`, `CD_initvol`, `CD_datasync`; `CD_getsector`, `CD_getsector2`) and the streaming ring's `StCdInterrupt` and `StUnSetRing`, over the CD controller's core and DMA3, their state in the library's own globals; the public layer (`CdInit`, `CdControl*`, `CdRead*`, `CdSearchFile`, the callbacks and accessors) and the rest of streaming run as original code over them. On the device: original code over the CD controller's registers (D58). |
-| libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's drive layer, adapted or original (D58, D61). |
+| libcd | `adapter-or-device`, chip cd (D58, D62). Native (btn, bof4): adapters for the drive layer (`bios_1`'s `CD_init`, `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_flush`, `CD_vol`, `CD_initvol`, `CD_datasync`; `CD_getsector`, `CD_getsector2`) and the streaming ring's `StCdInterrupt` and `StUnSetRing`, over the CD controller's core and DMA3, their state in the library's own globals; the public layer (`CdInit`, `CdControl*`, `CdRead*`, `CdSearchFile`, the callbacks and accessors) and the rest of streaming run as original code over them. On the device: original code over the CD controller's registers (D58). |
+| libds | `adapter-or-device`, chip cd. It touches no register: guest code over libcd's drive layer, adapted or original (D58, D62). |
 | libpress | `adapter-or-device`, chip mdec. On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
 | libspu | `adapter-or-device`, chip spu. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
 | libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 volume registers); on the device those writes reach the SPU (D47). |
@@ -518,7 +518,7 @@ Game-visible time is **virtual and deterministic**:
   due and then running the handlers, as at the loop's safepoints. When
   interrupts are taken is observable: taken at once, bof4's CD streaming
   goes another way (plans/unified-adaptor-layer, phase 1 findings).
-  libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin the same way (D61);
+  libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin the same way (D62);
   inside a callback, where no interrupt is taken, they poll the CD
   controller as the original does.
 - **Blocking runtime calls jump.** A runtime call that must wait (the
@@ -565,7 +565,7 @@ callback is libgpu's own call: it runs inside the call that drained the
 queue, natively as on the device (D60). CD timing is a runtime toggle (D19), with
 a per-game default in `game.toml` (`cd_timing`); the CD controller (D58)
 has it, whether libcd's adapters drive its core or libcd's own code its
-registers (D61):
+registers (D62):
 - *realistic*, because loading screens animate while reads are in flight;
 - *instant*, an enhancement.
 
@@ -786,7 +786,7 @@ a call into guest code.
   controller (`psx-devices::cdc`, 1F801800h-3h, IRQ2, DMA3, D58) answers
   commands with INT3/INT2 after the timing model's latencies and delivers
   sectors through its data FIFO, XA through the decoder. Original libcd
-  code drives its registers; libcd's adapters (D61) drive its core
+  code drives its registers; libcd's adapters (D62) drive its core
   (`Cdc::issue`, `pending`, `acknowledge`, `request` …), the same
   controller without the register protocol.
 - **mdec.** The motion decoder (1F801820h/24h, DMA0 in, DMA1 out) for
@@ -2012,7 +2012,7 @@ everything observable. The per-library rule is this milestone's
 refinement of the recommended per-object one, which would have mixed
 adapter state with original code in bof4.
 
-*Later:* D59 decides per chip, and D61 moved libcd's adapters to its drive
+*Later:* D59 decides per chip, and D62 moved libcd's adapters to its drive
 layer: both games run it native, the controller is the fallback.
 
 **D59. Adapters first, the device as the fallback, decided per chip**
@@ -2098,7 +2098,7 @@ struct layout. Calling the guest where the original does keeps callback
 order, arguments and timing without the gpu adapters knowing how libetc
 runs.
 
-**D61. The CD's seam is libcd's drive layer, its state kept where libcd
+**D62. The CD's seam is libcd's drive layer, its state kept where libcd
 keeps it** (unified adapter layer, phase 1 task 9d). Chip cd's adapters
 are the functions that reach the CD controller or DMA3 themselves:
 `bios_1`'s `CD_init`, `CD_initintr`, `CD_cw`, `CD_sync`, `CD_ready`,
@@ -2118,7 +2118,7 @@ ring are original code over them, in every game.
   last command and position, and callbacks get pointers to its result
   buffers. So every accessor stays original.
 - **Found through the object's own code,** as libgpu's adapters find
-  theirs (D60): from the guest address it replaces (`Psyq::at`), and the
+  theirs (D61): from the guest address it replaces (`Psyq::at`), and the
   object's layout the identity key fixes, an adapter reads its globals'
   addresses, and its callees', from its own relocated `lui`/low-16 pairs
   and `jal`s at known offsets. It makes the original's guest calls

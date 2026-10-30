@@ -517,7 +517,7 @@ impl Cdc {
     }
 }
 
-/// The controller without its register protocol (D61): what the native
+/// The controller without its register protocol (D62): what the native
 /// libcd adapters drive. Each call does what the named register access
 /// does, so the adapters and SDK code on the ports see one controller with
 /// one timing (commands, interrupts, sectors, XA audio).

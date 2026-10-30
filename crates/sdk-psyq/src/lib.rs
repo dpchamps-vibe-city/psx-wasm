@@ -62,7 +62,7 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 /// - libcd and libds (D58), when chip cd is emulated: the CD controller
 ///   (`psx_devices::cdc`) takes their commands and delivers sectors and XA
 ///   audio. Native, libcd's drive layer is adapters over the same
-///   controller's core (D61).
+///   controller's core (D62).
 /// - libpress: the MDEC (`psx_devices::mdec`) decodes what its own code
 ///   feeds it by DMA0, and DMA1 takes the pixels.
 pub const DEVICE_LIBRARIES: &[&str] = &["libpad", "libgpu", "libetc", "libspu", "libsnd", "libcd", "libds", "libpress", "libapi"];

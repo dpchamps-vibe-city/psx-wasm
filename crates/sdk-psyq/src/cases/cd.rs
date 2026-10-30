@@ -1,5 +1,5 @@
 //! Chip cd's cases: libcd's drive layer (`bios_1`, `bios_2`, `bios_3`) and
-//! the streaming ring's interrupt (D61; phase 1 task 9d). The level-2
+//! the streaming ring's interrupt (D62; phase 1 task 9d). The level-2
 //! sequences run libcd's public layer (btn) and libds with the ring
 //! (bof4), original code on both sides, over the drive layer.
 //!
