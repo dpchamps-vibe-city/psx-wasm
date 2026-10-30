@@ -666,9 +666,9 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     both sides. Unit tests over a stand-in object layout
     (`libmc::tests`), the responder's frame read and write, SIO0's card
     slots, the timers' flags and the RAM chain. On the tree merged with
-    main (chips cd and mdec): `--chip irq` (33 runs), `gpu` (49), `sio0`
-    (34), `cd` (19) pass in btn, and `irq` (33), `gpu` (49), `sio0` (34),
-    `cd` (22), `mdec` (17) in bof4; `psxw conform btn --lib libpad`
+    main (chips cd, mdec and spu): `--chip irq` (33 runs), `gpu` (49),
+    `sio0` (34), `cd` (19), `spu` (47) pass in btn, and `irq` (33), `gpu`
+    (49), `sio0` (34), `cd` (22), `mdec` (17), `spu` (47) in bof4; `psxw conform btn --lib libpad`
     (125 steps), `--lib libmcrd` (21) and `--lib libetc` (60).
   - **Runs:** btn 1,200 frames, `--check boot --check no-trap --check
     no-shadow-io`: pass native and on `--device memcard` (952,146 `VSync`
@@ -679,7 +679,12 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
     natively no guest code touches a register of the chip. btn
     `title-to-gameplay` (6,000 frames): pass. bof4 (no libmcx): 1,200
     frames pass, `title-to-field` passes every expect at the same frame
-    (counter 12390 at frame 24768).
+    (counter 12390 at frame 24768). With chip spu merged btn builds with
+    every chip native and passes `--check no-io` (1,200 frames, and
+    `card-load`). Level 4 (`psxw conform <game> --modes`): btn passes
+    native and with all six chips on their devices, memcard included;
+    bof4 passes, RAM differing at the checkpoints only in the
+    runtime-side bytes chip spu's entry names.
 
 ## Findings
 
