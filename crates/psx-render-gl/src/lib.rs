@@ -333,7 +333,7 @@ impl Renderer {
                     let px = self.read_vram(r.x, r.y, r.w, r.h);
                     self.readbacks.extend_from_slice(&px);
                 }
-                Command::Present(desc) => self.present_frame(&desc),
+                Command::Present(desc) => self.present_frame(&desc)?,
                 Command::Sync(rects) => {
                     // One copy of the rectangles' bounds: outside them the
                     // two copies already agree, and a blit call costs far
@@ -606,7 +606,7 @@ impl Renderer {
     }
 
     /// Render the display area into the RGBA8 output (row 0 at the top).
-    fn present_frame(&mut self, desc: &PresentDesc) {
+    fn present_frame(&mut self, desc: &PresentDesc) -> Result<()> {
         self.last_present = Some(*desc);
         let (w, h) = (desc.width.clamp(1, 1024), desc.height.clamp(1, 512));
         unsafe {
@@ -617,17 +617,17 @@ impl Renderer {
                     gl.delete_framebuffer(f);
                     gl.delete_texture(t);
                 }
-                let Ok(t) = texture(gl, glow::RGBA8, w as i32, h as i32) else { return };
-                let Ok(f) = framebuffer(gl, t) else { return };
+                let t = texture(gl, glow::RGBA8, w as i32, h as i32).context("present: output texture")?;
+                let f = framebuffer(gl, t).context("present: output framebuffer")?;
                 self.out = Some((t, f, w, h));
             }
-            let Some((_, fbo, _, _)) = self.out else { return };
+            let Some((_, fbo, _, _)) = self.out else { bail!("present: no output framebuffer") };
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
             gl.viewport(0, 0, w as i32, h as i32);
             if desc.flags & PresentDesc::ENABLED == 0 {
                 gl.clear_color(0.0, 0.0, 0.0, 1.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
-                return;
+                return Ok(());
             }
             gl.use_program(Some(self.present));
             gl.bind_vertex_array(Some(self.vao));
@@ -638,6 +638,7 @@ impl Renderer {
             gl.uniform_1_i32(self.uni.present_flip.as_ref(), 1);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
+        Ok(())
     }
 
     /// The last presented frame, RGBA8 with row 0 at the top (frame
