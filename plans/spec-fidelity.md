@@ -369,12 +369,13 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
 
 1. [x] **Record the decision** (table above, phase 3).
    D68, `68ea1c3`; decided without the human under the /goal.
-2. [ ] **Kernel RAM.** Lay out the A0h, B0h and C0h tables at 200h, 874h
+2. [x] **Kernel RAM.** Lay out the A0h, B0h and C0h tables at 200h, 874h
    and 674h with stand-in entries that reach the Rust BIOS (as
    `Sdk::stand_in` routes adapter addresses, `psx-runtime/src/wasm.rs:455`);
    `GetB0Table`/`GetC0Table` return them; the vectors and kernel variables
    where psx-spx and OpenBIOS put them. A game calling through a table, or
    patching an entry, then works.
+   Done `4ec0ec4` (agent): each entry is a stand-in in ROM space (BFC0A000h + table base + 4·function); the runtime's `bios` export reads the entry, a stand-in runs the Rust BIOS, anything else is called as guest code. Vectors, dispatchers, the garbage area, the exception vector (retail opcodes), RAM-size variables and the BOOT argument laid out; `GetB0Table`/`GetC0Table` return 874h/674h (psx-spx; OpenBIOS returns its own). The layout is in D68. *Left:* a guest calling a stand-in through a function pointer reaches `untranslated(addr)`, which carries no arguments, and traps (needs the linker ABI change, below); SDK adapters and the Rust BIOS's own internal calls bypass the tables, so they don't see a patched entry.
 3. [x] **BIOS8. Event control blocks in kernel RAM**, through the table
    of tables, sized by `SYSTEM.CNF` `EVENT=` (`psx-bios/src/kernel.rs`).
    Done `5e52ad2`: after the TCBs (`psxw_abi::kernel::EVCBS`), through
@@ -417,11 +418,12 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    pad and card handler after `StartCARD2`; libmcx's wire reaches the
    port's card. D43 revised. The `bu` directory is still read from the
    image (the device table's work, task 8).
-8. [ ] **BIOS9. Files over the CD controller and a device table.** `open`,
+8. [x] **BIOS9. Files over the CD controller and a device table.** `open`,
    `read`, `lseek`, `close`, `firstfile`/`nextfile` go through `AddDrv`'s
    device table (`cdrom`, `bu`, `tty`); `cdrom` reads through the CD
    controller with its timing (`psx-bios/src/bios.rs:344-436`).
-9. [ ] **Every call psx-spx documents.** Group by group, each with
+   Done `ee8093a` (agent): FCBs and DCBs in kernel RAM through 140h/150h (`files.rs`); every file function through the DCB's pointers, a guest driver's through `Flow::Call`; `AddDrv`/`DelDrv` and the rest of device management; `cdrom` is OpenBIOS's port of the retail driver over the CD controller with drive timing (`cdrom.rs`), its interrupts as kernel elements at priority 0; `bu` over `card.rs`; `tty` the dummy console to the host log. The boot leaves the CD driver installed, and libetc's `ResetCallback` adapter calls `_96_remove` as the original does. Reading `cdrom` files needs whole sectors (OpenBIOS's check).
+9. [x] **Every call psx-spx documents.** Group by group, each with
    `BIOS_CALL` vectors (`psxw-oracle/src/handwritten.rs`, `bios()`). The
    harness's psx-wasm side is `psxw_oracle::bios::Device` (`7e748f0`): a
    vector's call on a bare psx-bios machine, v0 and the captures:
@@ -431,11 +433,18 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
      differs);
    - [x] events (`UnDeliverEvent`), timers, kernel memory (`d89a101`,
      `b9db230`);
-   - files and devices (after task 8);
+   - [x] files and devices (`ee8093a`);
    - [x] the A0h GPU functions over the GPU (`12c6040`);
-   - the A0h CD functions over the CD controller;
-   - `syscall` 4 and up (the exception event), `SystemError`, exception
-     hooks.
+   - [x] the A0h CD functions over the CD controller (`ee8093a`);
+   - [x] `syscall` 4 and up (the exception event), `SystemError`, exception
+     hooks (`6d62673`).
+
+   Done (agent): 15 more vectors; `psxw oracle check btn --device bios`
+   passes, 46 provisional, 0 failed, 13 disputed. OpenBIOS's CD and card
+   paths need interrupts, which the runner keeps off, so unit tests cover
+   them. Not implemented yet: GetSysSp, SetConf/GetConf, `bufs_cb_*`,
+   `ioabort_raw`, GetSystemInfo, `_card_info_subfunc`, Krom2Offset,
+   `_card_chan`, C(04h/05h/08h/09h), C(15h..19h).
 10. [x] **What can't be done fails with the reason.** `Exec`/`LoadExec`
     of an untranslated executable, `longjmp` across translated frames
     (see [Forced](#forced)): one error each, naming why.
@@ -451,6 +460,15 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    OpenBIOS).
 3. `psxw build btn` and `psxw build bof4` succeed.
 4. **Human:** `psxw ci btn` and `psxw ci bof4`, including saves.
+
+Status (2026-10-31): 1 passes (merged at `baf9c4e`); 2 passes (46
+provisional, 0 failed, 13 disputed); 3: both games build, every chip
+native; conformance for `memcard`/`cd` (btn) and `cd` (bof4) passes, and
+`sio0` (btn) after the merge. 4 waits for the human. What may move: fd
+numbering (stdio holds 0 and 1); `printf` through the console; from boot
+to `ResetCallback` the CD driver is installed (I_MASK CD|DMA, DPCR 9099h);
+a syscall element at priority 0; `_patch_gte` and `_remove_ChgclrPAD`
+write into ROM space (before, `_patch_gte` copied code over 0–38h).
 
 ## Phase 4: translator correctness
 
@@ -628,6 +646,29 @@ locals, or static translation.
   criteria). D67 recorded for phase 2 (`c3aa557`).
 
 ## Findings
+
+- **Phase 3's choices where psx-spx is silent or OpenBIOS differs**
+  (2026-10-31, agent; D68 has the layout). psx-spx followed:
+  `GetB0Table`/`GetC0Table`, the exception vector and garbage area's
+  retail opcodes, a device name's trailing hex digits as its port, the DCB
+  entry's size at 154h, `firstfile`/`nextfile` leaving errno, `cd`,
+  `undelete`, `testdevice`, `_get_errno`/`_get_error` (none in OpenBIOS),
+  `putchar`'s LF as CR LF, `rename`'s borrowed FCB, `ResetEntryInt`'s
+  structure, `CdGetLbn`'s -1s, `printf` through `putchar` to fd 1. Ours
+  where neither decides: the CD driver reads the response before
+  acknowledging; a busy driver fails a blocking call at once as
+  SystemError; the dummy writes to address 0 in the interrupt handler are
+  skipped; `bu`'s remove() is the dummy; the dummy tty writes to the host
+  log; syscall 4+ returns v0 = 0; `SysDeqIntRP` stays OpenBIOS's working
+  version so `_96_remove` works. Not modelled: BIOS CPU time; `break` →
+  DeliverEvent and SystemError (the runtime's `brk`); syscall 3 doesn't
+  switch threads; the boot's disc work (CdlInit, path table, executable)
+  is still the runtime's through the host.
+- **`untranslated` carries no arguments** (phase 3 task 2): a guest
+  calling a stand-in or a kernel element's function through a pointer
+  traps. The fix is a linker ABI change (`untranslated` takes a0–a3 and
+  routes stand-ins to `bios::call`); it waits for phases 5 and 6, which
+  change the link's dispatch.
 
 - **Phase 7, step 3's design: decompiled C's counts** (2026-10-31, under
   the /goal; recorded before building, as step 3 asks).
