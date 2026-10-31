@@ -881,24 +881,29 @@ fn reset_graph(m: &mut M, a: [u32; 4]) -> Result {
     Ok(Flow::Call {
         call: GuestCall { addr: s.reset_callback, args: [0; 4] },
         then: Box::new(move |m, _| {
-            let r = (|| -> std::result::Result<u32, String> {
-                let table = m.mem.r32(s.data + data::TABLE);
-                psx_bios::bios::call(m, 0xA0, 0x49, [table & 0xFF_FFFF, 0, 0, 0])?;
-                let t = reset(m, s, mode)? & 0xFF;
-                m.mem.w8(g + genv::TYPE, t as u8);
-                m.mem.w8(g + genv::QUEUE, 1);
-                let w = m.mem.r16(s.data + data::WIDTHS + 4 * t);
-                m.mem.w16(g + genv::WIDTH, w);
-                let h = m.mem.r16(s.data + data::HEIGHTS + 4 * t);
-                m.mem.w16(g + genv::HEIGHT, h);
-                m.mem.write(g + genv::DRAW, &[0xFF; drawenv::SIZEOF as usize]);
-                m.mem.write(g + genv::DISP, &[0xFF; dispenv::SIZEOF as usize]);
-                Ok(t)
-            })();
-            match r {
-                Ok(t) => Flow::ret(t),
-                Err(e) => fail(m, e),
-            }
+            let table = m.mem.r32(s.data + data::TABLE);
+            let flow = match psx_bios::bios::dispatch(m, 0xA0, 0x49, [table & 0xFF_FFFF, 0, 0, 0]) {
+                Ok(flow) => flow,
+                Err(e) => return fail(m, e),
+            };
+            psx_bios::machine::seq(m, flow, move |m, _| {
+                let r = (|| -> std::result::Result<u32, String> {
+                    let t = reset(m, s, mode)? & 0xFF;
+                    m.mem.w8(g + genv::TYPE, t as u8);
+                    m.mem.w8(g + genv::QUEUE, 1);
+                    let w = m.mem.r16(s.data + data::WIDTHS + 4 * t);
+                    m.mem.w16(g + genv::WIDTH, w);
+                    let h = m.mem.r16(s.data + data::HEIGHTS + 4 * t);
+                    m.mem.w16(g + genv::HEIGHT, h);
+                    m.mem.write(g + genv::DRAW, &[0xFF; drawenv::SIZEOF as usize]);
+                    m.mem.write(g + genv::DISP, &[0xFF; dispenv::SIZEOF as usize]);
+                    Ok(t)
+                })();
+                match r {
+                    Ok(t) => Flow::ret(t),
+                    Err(e) => fail(m, e),
+                }
+            })
         }),
     })
 }
@@ -1279,6 +1284,22 @@ mod tests {
         assert_eq!(run(&mut m, at::RESET_GRAPH, reset_graph, [1, 0, 0, 0]), 0);
         assert_eq!(m.mem.r32(DATA + data::QIN), 0);
         assert_eq!(m.mem.r8(g), 1, "GEnv kept");
+
+        // GPU_cw can be guest-patched too: wait for it before resetting and
+        // filling GEnv, retaining this object's addresses across reentry.
+        let mut m = game();
+        m.mem.w32(psx_bios::tables::entry(0xA0, 0x49).unwrap(), CALLBACK);
+        m.sdk.at = TEXT;
+        let Flow::Call { call, then } = reset_graph(&mut m, [0; 4]).unwrap() else { panic!("ResetCallback") };
+        assert_eq!(call.addr, RESET_CALLBACK);
+        m.sdk.at = 0x8007_0000;
+        let Flow::Call { call, then } = then(&mut m, 0) else { panic!("patched GPU_cw") };
+        assert_eq!(call, GuestCall { addr: CALLBACK, args: [(DATA + 8) & 0xFF_FFFF, 0, 0, 0] });
+        assert_eq!((m.mem.r8(g + genv::TYPE), m.mem.r8(g + genv::QUEUE)), (0, 0));
+        m.mem.w16(DATA + data::WIDTHS + 4, 640);
+        assert!(matches!(then(&mut m, 123), Flow::Return(1)));
+        assert_eq!((m.mem.r8(g + genv::TYPE), m.mem.r8(g + genv::QUEUE)), (1, 1));
+        assert_eq!(m.mem.r16(g + genv::WIDTH), 640);
     }
 
     #[test]

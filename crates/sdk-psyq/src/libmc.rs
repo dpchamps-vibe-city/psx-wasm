@@ -367,6 +367,7 @@ fn start_com(m: &mut M, _a: [u32; 4]) -> Result {
     let card_ent = pair(m, at + 0x14, at + 0x18).ok_or_else(|| err("_mcxTblCardEnt"))?;
     let tables = pair(m, at + 0xB0, at + 0xB4).ok_or_else(|| err("table of tables"))?;
     locate(m, card_ent.wrapping_sub(data::CARD_ENT))?;
+    psx_bios::bios::syscall(m, [1, 0, 0, 0])?;
     let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [2, card_ent, 0, 0])?;
     Ok(psx_bios::machine::seq(m, flow, move |m, _| {
         let head = get(m, get(m, tables)).wrapping_add(2 * 8);
@@ -385,7 +386,7 @@ fn start_com(m: &mut M, _a: [u32; 4]) -> Result {
         set_reg(m, I_MASK, 4, mask | 1).unwrap_or_else(|e| panic!("McxStartCom: {e}"));
         let flow = psx_bios::bios::dispatch(m, 0xC0, 0x0A, [3, 0, 0, 0]).unwrap_or_else(|e| panic!("McxStartCom: {e}"));
         psx_bios::machine::seq(m, flow, |m, _| {
-            m.crit = false;
+            psx_bios::bios::syscall(m, [2, 0, 0, 0]).unwrap_or_else(|e| panic!("McxStartCom: {e}"));
             Flow::ret(0)
         })
     }))
@@ -813,7 +814,7 @@ mod tests {
     fn start_dequeue(m: &mut M) {
         note(m, 0x03);
         assert_eq!(args(), [2, DATA + data::CARD_ENT, 0, 0]);
-        assert!(m.crit, "the caller's critical section is still held");
+        assert!(m.crit, "McxStartCom entered its critical section");
         assert_ne!(get(m, block(m)), DATA + data::CARD_ENT, "not appended yet");
         m.sdk.at = 0x8004_0000;
         crate::testing::call(m, zero, [0; 4]);
@@ -856,7 +857,7 @@ mod tests {
         crate::testing::double(START_CHANGE_CLEAR, start_change_clear);
         patch(&mut m, 0x03, START_DEQUEUE);
         patch(&mut m, 0x0A, START_CHANGE_CLEAR);
-        m.crit = true;
+        assert!(!m.crit, "the adapter, not its caller, enters critical");
         assert_eq!(adapter(&mut m, start_com, START_COM), 0);
         assert_eq!(notes(&m), [0x03, 0x0A], "the original's order");
         assert!(!m.crit, "the critical section is left after the last call");

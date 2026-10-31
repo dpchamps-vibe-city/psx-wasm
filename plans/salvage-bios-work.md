@@ -264,10 +264,11 @@ handoff's missing-call list.
   file without a separately approved design.
 - [ ] **Exception and hook paths.** Normal IRQ dispatch and recognised
   `ReturnFromException` already work. C(06h) chaining is rejected; `break` merely
-  logs rather than delivering the unresolved-exception event/error; SDK adapters
-  reject patched BIOS-table targets; non-CD built-in kernel-handler addresses
-  lack callable implementations. Fix meaningful native call/exception paths
-  through the existing driver, guest calls and lowering.
+  logs rather than delivering the unresolved-exception event/error. Native
+  kernel-handler pointers are now callable, and libapi/libetc/libpad plus libmcx
+  start/end and libgpu calls honor BIOS patches. Four libmcx void IRQ-step calls
+  still bypass patches. Complete the remaining paths through existing driver,
+  guest-call and lowering seams; do not infer a general exception context.
 - [x] **Coverage reporting.** Build reports distinguish working, partial,
   unsupported, documented fatal/no-op and dynamic unknown calls. The old
   `implemented` field remains a compatibility gate, not a completeness claim.
@@ -837,8 +838,21 @@ These artifacts remain at `37e37ed`; the later gets source is only locally gated
 No fresh full CI, browser or non-empty BIOS oracle result is claimed. ABI-17 CI
 failures/prerequisite gaps remain recorded above. New SDK continuation work is
 isolated in `5941fc75-3407-47dd-887d-3b601c2ea103`, same SDK lane: ONLY libmc's
-start_com and finish (three direct BIOS calls). Its void IRQ-step path remains
-parent-owned; no new driver/runtime framework is authorized.
+start_com and finish (three direct BIOS calls). That lane has completed as
+`b88bd21`, full-source reviewed and integrated as `61a8c11`. Parent checked the
+actual mcxinit.o and restored McxStartCom's Enter/ExitCriticalSection calls,
+including Exit's existing pending-IRQ queue behavior, without changing finish's
+IRQ context. The test now starts outside critical. Parent also routed libgpu's
+ResetGraph GPU_cw through patched dispatch, preserving its original argument and
+existing error handling; GPU reset/GEnv writes wait for that call to return.
+SDK 41/runtime 8 and wasm32 runtime check pass. These later changes are locally
+gated; release/game/replay/conformance artifacts are still at `37e37ed`.
+
+Four BIOS calls in libmcx's void IRQ-step path remain parent-owned. Read-only
+scout `a122da85-3103-4a9a-9839-7e88fdaf259a` investigates the existing static
+SDK-adapter binding seam for the vblank handler (mcxresi+80h), without an API,
+runtime or source change. It is feasibility evidence, not authority for a new
+framework or for modifying the existing wire/timing/backend behavior.
 
 ## Progress log
 
