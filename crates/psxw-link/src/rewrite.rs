@@ -148,6 +148,8 @@ pub fn rewrite_mapped<R: Resolver>(
     let relocs = obj.relocs_for(&f.body);
     let mut ri = 0;
     let mut last_const: Option<i32> = None;
+    // A relocated constant immediately before call_indirect names its callee.
+    let mut direct: Option<u32> = None;
     let mut ops = body.get_operators_reader()?;
     while !ops.eof() {
         let pos = ops.original_position() as u32;
@@ -229,10 +231,23 @@ pub fn rewrite_mapped<R: Resolver>(
             }};
         }
         match op {
-            Operator::Call { function_index } => {
-                let rl = reloc_of(RelocationType::FunctionIndexLeb).context("call without relocation")?;
-                let sig = obj.func_type(function_index).clone();
-                match r.call(rl.symbol, &sig, prev_const)? {
+            Operator::Call { .. } | Operator::CallIndirect { .. } => {
+                let lowered = match op {
+                    Operator::Call { function_index } => {
+                        let rl = reloc_of(RelocationType::FunctionIndexLeb).context("call without relocation")?;
+                        let sig = obj.func_type(function_index).clone();
+                        r.call(rl.symbol, &sig, prev_const)?
+                    }
+                    Operator::CallIndirect { type_index, .. } => {
+                        let sig = obj.types[type_index as usize].clone();
+                        match direct.take() {
+                            Some(symbol) => r.call(symbol, &sig, prev_const)?,
+                            None => Lowered::Call(r.call_indirect(&sig)?),
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                match lowered {
                     Lowered::Call(i) => {
                         out.instruction(&I::Call(i));
                     }
@@ -243,10 +258,15 @@ pub fn rewrite_mapped<R: Resolver>(
                     }
                 }
             }
-            Operator::CallIndirect { type_index, .. } => {
-                let sig = obj.types[type_index as usize].clone();
-                let helper = r.call_indirect(&sig)?;
-                out.instruction(&I::Call(helper));
+            // FastISel can call a prototype-less function through the table
+            // when the IR argument types differ but their wasm types agree.
+            // Resolve the symbol directly, without emitting its table address.
+            Operator::I32Const { .. }
+                if reloc_of(RelocationType::TableIndexSleb).is_some()
+                    && matches!(ops.clone().read(), Ok(Operator::CallIndirect { .. })) =>
+            {
+                direct = reloc_of(RelocationType::TableIndexSleb).map(|rl| rl.symbol);
+                last_const = prev_const;
             }
             Operator::GlobalGet { .. } => {
                 let rl = reloc_of(RelocationType::GlobalIndexLeb).context("global.get without relocation")?;
