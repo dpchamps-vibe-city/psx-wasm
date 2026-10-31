@@ -2568,3 +2568,35 @@ device events rather than as the kernel's chain, so their order and
 acknowledgement weren't the BIOS's. Decided without the human's input
 under the /goal that implements plans/spec-fidelity.md, whose decisions
 table proposes it.
+
+**D69. Overlay residency comes from what was loaded** (spec fidelity,
+phase 5; planned, the body changes with the code). The runtime keeps a
+residency table from the disc's writes into RAM (the BIOS's file reads,
+DMA3, `Machine::loaded`); every call into an overlay region dispatches on
+it, and a call whose target isn't resident traps naming what is. Revises
+D7, whose stub compares two code words and takes the first candidate by
+name: two overlays with the same prologue in one slot dispatch wrongly,
+and single-definer, intra-overlay and main/overlay-overlap calls go
+unchecked. Decided without the human's input under the /goal that
+implements plans/spec-fidelity.md, whose decisions table proposes it.
+
+**D70. The memory map is the console's** (spec fidelity, phase 6;
+planned, the body changes with the code). RAM is mirrored four times in
+8 MB; KSEG0/KSEG1 and KSEG2's cache control, the scratchpad's real extent,
+the expansion regions and the BIOS ROM are their own regions; elsewhere
+an access is a bus error, and a function pointer into unmapped space
+traps. Devices and the BIOS use the same map for guest pointers. Revises
+D5's single masked 16 MiB window. Its cost on every access is measured
+and recorded when it is built. Decided without the human's input under
+the /goal, as above.
+
+**D71. Virtual time comes from the original's instruction counts**
+(spec fidelity, phase 7; planned, the body changes with the code). Clang
+stops reshaping loops (no unrolling, vectorising or loop-to-`memory.fill`
+rewriting); lifted code spends the original's instruction count per
+basic block instead of a pass per loop header, and decompiled C the
+counts of its matching assembly. Revises §6, D18 and D66's loop-pass
+budget. Every game's timing moves, so replays, golden frames and
+`ramdiff` baselines are re-recorded once, after showing the new timing is
+closer to the oracle's. Decided without the human's input under the
+/goal, as above.
