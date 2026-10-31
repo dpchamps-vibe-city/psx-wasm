@@ -352,15 +352,18 @@ calls (TR1, B19).
 
 The BIOS implemented properly. Phase 1 fixed its bugs.
 
-1. [ ] **Record the decision** (table above, phase 3).
+1. [x] **Record the decision** (table above, phase 3).
+   D68, `68ea1c3`; decided without the human under the /goal.
 2. [ ] **Kernel RAM.** Lay out the A0h, B0h and C0h tables at 200h, 874h
    and 674h with stand-in entries that reach the Rust BIOS (as
    `Sdk::stand_in` routes adapter addresses, `psx-runtime/src/wasm.rs:455`);
    `GetB0Table`/`GetC0Table` return them; the vectors and kernel variables
    where psx-spx and OpenBIOS put them. A game calling through a table, or
    patching an entry, then works.
-3. [ ] **BIOS8. Event control blocks in kernel RAM**, through the table
+3. [x] **BIOS8. Event control blocks in kernel RAM**, through the table
    of tables, sized by `SYSTEM.CNF` `EVENT=` (`psx-bios/src/kernel.rs`).
+   Done `5e52ad2`: after the TCBs (`psxw_abi::kernel::EVCBS`), through
+   the table of tables' 120h entry, psx-spx's layout; every access is RAM.
 4. [ ] **BIOS7. Interrupt chains in RAM.** `SysEnqIntRP`/`SysDeqIntRP`
    link elements into the exception control blocks; the handler walks RAM
    only (`psx-bios/src/io.rs:684-767`); `Sdk::chain_element` keeps
