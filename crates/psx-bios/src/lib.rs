@@ -110,6 +110,10 @@ mod tests {
         // OpenEvent(RCntCNT2, EvSpINT, EvMdNOINTR, 0); EnableEvent.
         let h = ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0]));
         assert_eq!(h, 0xF100_0000);
+        // Its block in kernel RAM, through the table of tables (D68).
+        let evcb = m.mem.r32(psxw_abi::kernel::EVCB_ENTRY);
+        assert_eq!(evcb, 0xA000_0000 | psxw_abi::kernel::EVCBS);
+        assert_eq!(m.mem.bytes(evcb, 16), [2, 0, 0, 0xF2, 0, 0x10, 0, 0, 2, 0, 0, 0, 0, 0x20, 0, 0]);
         ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
         m.timers[2].write_mode(0x58, 0);
@@ -154,9 +158,9 @@ mod tests {
         let h = ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0]));
         ret(bios::call(&mut m, 0xB0, 0x09, [h, 0, 0, 0]));
         ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
-        assert_eq!(m.kernel.ev(h).unwrap().status, kernel::EV_UNUSED);
+        assert_eq!(m.ev(h).unwrap().status, kernel::EV_UNUSED);
         ret(bios::call(&mut m, 0xB0, 0x0D, [h, 0, 0, 0]));
-        assert_eq!(m.kernel.ev(h).unwrap().status, kernel::EV_UNUSED);
+        assert_eq!(m.ev(h).unwrap().status, kernel::EV_UNUSED);
         // The slot is free for the next OpenEvent.
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0])), h);
     }

@@ -71,7 +71,8 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
     let sp = stack.filter(|&s| s != 0).unwrap_or(0x801F_FF00);
     m.regs.set_sp(sp);
     m.regs.set_gp(gp0);
-    m.kernel.events = vec![Default::default(); events.clamp(1, 64) as usize];
+    // The kernel's event blocks live in its RAM (D68).
+    m.lay_out_events(events);
     // The kernel's thread tables live in guest RAM (D57).
     m.lay_out_threads(tcbs);
     // The CD controller, for SDK code that drives the drive (D58).

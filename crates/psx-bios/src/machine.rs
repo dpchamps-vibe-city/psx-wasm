@@ -324,7 +324,7 @@ impl<S: Sdk> Machine<S> {
             Wait::Vblanks(n) => self.vblanks >= n,
             Wait::Cycle(t) => self.clock.now >= t,
             Wait::Sdk(c) => S::ready(self, c),
-            Wait::Event(h) => self.kernel.event_ready(h),
+            Wait::Event(h) => self.event_ready(h),
         }
     }
 
@@ -458,7 +458,7 @@ impl<S: Sdk> Machine<S> {
     /// BIOS DeliverEvent: callbacks for interrupt-mode events, ready status
     /// for the rest.
     pub fn deliver_event(&mut self, class: u32, spec: u32) {
-        let calls = self.kernel.deliver(class, spec);
+        let calls = self.event_calls(class, spec);
         if class & 0xFF00_0000 != 0xF200_0000 {
             self.count(&format!("event.{class:08x}/{spec:x} -> {} callbacks", calls.len()));
         }
