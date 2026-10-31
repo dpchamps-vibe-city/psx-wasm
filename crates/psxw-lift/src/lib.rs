@@ -57,13 +57,19 @@ fn t1_after_slot(g: &Graph, facts: &Facts, b: u32) -> Option<u32> {
 
 /// Calls that need non-local control flow (`emit::Exceptions`): `setjmp`
 /// sites (a direct call to an A0h:13h trampoline, or the vector itself
-/// with t1 = 13h) and `ReturnFromException` (B0h:17h through the vector).
+/// with t1 = 13h) and returns from an exception: `ReturnFromException`
+/// (B0h:17h through the vector), or an exception handler's own `jr k0;
+/// rfe` (a jump with `rfe` in its delay slot is the R3000's return to the
+/// interrupted code).
 fn exception_sites(program: &Program, originals: &Originals, func: &Function, g: &Graph, facts: &Facts) -> emit::Exceptions {
     let mut x = emit::Exceptions { continuation: func.sources.contains(&Source::Continuation), ..Default::default() };
     for (n, d) in &g.nodes {
         let Node::Slot(b) = *n else { continue };
         let bios = |table: u8| matches!(d.transfer,
             Transfer::Call { callee: Callee::Bios { table: t }, .. } | Transfer::Jump(Dest::Tail(Callee::Bios { table: t })) if t == table);
+        if d.insn.op == decode::Op::Rfe && g.nodes[&Node::Normal(b)].insn.op == decode::Op::Jr {
+            x.rfe.insert(b);
+        }
         match &d.transfer {
             Transfer::Call { callee: Callee::Direct { addr, .. }, .. }
                 if bios_trampoline(program, originals, &func.container, *addr) == Some((0xA0, 0x13)) =>
@@ -934,6 +940,25 @@ mod tests {
         assert!(out.failed.is_empty(), "{:?}", out.failed);
         let c = &out.ok[0].c;
         assert!(c.contains(&format!("case 0x00000000u: return ((uint64_t)r3 << 32) | r2; default: psxw_bad_jump(0x{:08X}u, t_);", BASE + 0x24)), "{c}");
+    }
+
+    /// An exception handler's own epilogue restores ra from the interrupted
+    /// context and returns with `jr k0; rfe`: a return from the exception,
+    /// not a tail call to the interrupted code.
+    #[test]
+    fn handler_returns_from_exception() {
+        let words = [
+            0x3C1A_8001, // lui k0, 0x8001
+            0x8F5F_007C, // lw ra, 0x7C(k0)
+            0x8F5A_0080, // lw k0, 0x80(k0)
+            0,           // nop
+            0x0340_0008, // jr k0
+            0x4200_0010, // rfe
+        ];
+        let out = lift_words(&words, &[(BASE, 4 * words.len() as u32)]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let c = &out.ok[0].c;
+        assert!(c.contains("psxw_return_from_exception(); return 0;") && !c.contains("psxw_call_indirect"), "{c}");
     }
 
     /// `bltzal ra` tests ra as it was before the link overwrites it.
