@@ -29,7 +29,8 @@
 //! through its core calls ([`Cdc::issue`], [`Cdc::pending`] …), never its
 //! ports: one controller with one timing whether libcd runs native or as
 //! original code on the ports (`--device cd`). Its interrupt is IRQ2, and
-//! the handler on line 2 is a stand-in function ([`HANDLER`]) that
+//! the handler on line 2 is `bios_1`'s own, at its address: an adapter
+//! bound by its place (`libcd/bios_1:0x14a4`, a static function) that
 //! `CD_init` installs through the guest's own `InterruptCallback`, so
 //! libetc dispatches it whichever way libetc runs. Sector transfers go
 //! through DMA3 on the DMA controller the chips share, so DMA3's callback
@@ -47,7 +48,7 @@
 
 use crate::libetc::{LOOP_BUDGET, quantum};
 use crate::{Adapter, M, Psyq, Result, reg, ret, set_reg};
-use psx_bios::{Flow, GuestCall, StandIn, Wait};
+use psx_bios::{Flow, GuestCall, Wait};
 use psx_devices::cdc::Cdc;
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
@@ -64,11 +65,9 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("CD_getsector2", cd_getsector2),
     ("StCdInterrupt", st_cd_interrupt),
     ("StUnSetRing", st_unset_ring),
+    // bios_1's interrupt handler, static: bound by its place.
+    ("libcd/bios_1:0x14a4", handler),
 ];
-
-/// The stand-in for `bios_1`'s interrupt handler, which `CD_init` and
-/// `CD_initintr` install on line 2 (next to libetc's, [`crate::libetc`]).
-pub const HANDLER: u32 = 0xBFC7_0030;
 
 /// libcd command numbers the adapters issue themselves.
 pub mod com {
@@ -89,6 +88,8 @@ pub mod at {
     pub const CD_INITVOL: u32 = 0x1014;
     pub const CD_INITINTR: u32 = 0x1104;
     pub const CD_INIT: u32 = 0x1150;
+    /// The interrupt handler `CD_init` and `CD_initintr` install (static).
+    pub const HANDLER: u32 = 0x14a4;
     pub const CD_DATASYNC: u32 = 0x1330;
 }
 
@@ -363,34 +364,31 @@ fn callbacks(m: &M, b: Bios1, f: u32) -> (Option<GuestCall>, Option<GuestCall>) 
     (ready, sync)
 }
 
-/// The line-2 handler (`bios_1`'s, installed by `CD_init`): while the
-/// controller presents an interrupt, take it and call its callbacks.
-/// State: 0 at the top of the loop, 1 after a callback, 0x101 after the
-/// ready callback with the sync one still due.
-pub fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<StandIn> {
-    if addr != HANDLER {
-        return None;
-    }
-    let Some(b) = m.sdk.cd.bios1 else {
-        m.log("libcd: interrupt handler without CD_init");
-        return Some(StandIn::Return(0));
-    };
-    if state & 0x100 != 0 {
-        if let (_, Some(c)) = callbacks(m, b, 2) {
-            return Some(StandIn::Call(c, 1));
-        }
-    }
+/// `bios_1`'s interrupt handler, bound by its place: while the controller
+/// presents an interrupt, its callbacks (a data-ready one, with a sync one
+/// after it when both are due, or the sync one).
+fn handler(m: &mut M, _a: [u32; 4]) -> Result {
+    let b = bios1(m, at::HANDLER)?;
+    Ok(handler_pass(m, b))
+}
+
+fn handler_pass(m: &mut M, b: Bios1) -> Flow<Psyq> {
     loop {
         let f = getintr(m, b).unwrap_or_else(|e| {
             m.log(&format!("libcd interrupt: {e}"));
             0
         });
         if f == 0 {
-            return Some(StandIn::Return(0));
+            return Flow::ret(0);
         }
         match callbacks(m, b, f) {
-            (Some(r), _) => return Some(StandIn::Call(r, 1 | (f & 2) << 7)),
-            (None, Some(s)) => return Some(StandIn::Call(s, 1)),
+            (Some(r), _) => {
+                return call(r.addr, r.args, move |m, _| match callbacks(m, b, 2) {
+                    (_, Some(s)) if f & 2 != 0 => call(s.addr, s.args, move |m, _| handler_pass(m, b)),
+                    _ => handler_pass(m, b),
+                });
+            }
+            (None, Some(s)) => return call(s.addr, s.args, move |m, _| handler_pass(m, b)),
             (None, None) => {}
         }
     }
@@ -657,7 +655,8 @@ fn install(m: &mut M, b: Bios1, reset: u32, intr: u32, then: impl FnOnce(&mut M,
         m.mem.w32(b.data + o, 0);
     }
     let (reset, intr) = (jal(m, b.text + reset)?, jal(m, b.text + intr)?);
-    Ok(call(reset, [0; 4], move |_, _| call(intr, [2, HANDLER, 0, 0], then)))
+    let handler = b.text + at::HANDLER;
+    Ok(call(reset, [0; 4], move |_, _| call(intr, [2, handler, 0, 0], then)))
 }
 
 /// `CD_initintr`: the handler installed; `InterruptCallback`'s result.
@@ -1144,7 +1143,14 @@ mod tests {
         // on line 2 as libetc's InterruptCallback would put it.
         crate::libetc::fixture::install(&mut m);
         crate::libetc::fixture::reset(&mut m);
-        crate::libetc::fixture::interrupt(&mut m, 2, HANDLER);
+        crate::libetc::fixture::interrupt(&mut m, 2, TEXT + at::HANDLER);
+        // The handler as the game's thunk at its address reaches it.
+        crate::testing::double(TEXT + at::HANDLER, |m| {
+            let caller = std::mem::replace(&mut m.sdk.at, TEXT + at::HANDLER);
+            let r = handler(m, [0; 4]);
+            crate::testing::finish(m, r);
+            m.sdk.at = caller;
+        });
         m
     }
 

@@ -228,9 +228,6 @@ impl Sdk for Psyq {
         (elem == libpad::ELEMENT).then_some(libpad::STEP).or_else(|| libmc::chain_element(m, elem))
     }
 
-    fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
-        libcd::stand_in(m, addr, state)
-    }
 }
 
 pub(crate) fn ret(v: u32) -> Result {

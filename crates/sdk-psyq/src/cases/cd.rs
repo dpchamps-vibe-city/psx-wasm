@@ -58,7 +58,7 @@ pub fn cases() -> Vec<Case> {
             name: "cd.init",
             chip: "cd",
             level: 1,
-            covers: &["CD_init", "CD_initintr", "CD_flush", "CD_sync"],
+            covers: &["CD_init", "CD_initintr", "CD_flush", "CD_sync", "libcd/bios_1:0x14a4"],
             needs: &["CD_init", "CD_initintr", "CD_flush", "CD_cw", "CD_sync", "VSync"],
             run: init,
         },

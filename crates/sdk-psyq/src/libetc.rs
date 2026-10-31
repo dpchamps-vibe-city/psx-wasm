@@ -787,9 +787,10 @@ pub(crate) mod fixture {
     /// `intr_dma.o`'s handler: its adapter, as the game's thunk at its
     /// address reaches it.
     fn dma_handler(m: &mut M) {
-        m.sdk.at = DMA_HANDLER;
+        let caller = std::mem::replace(&mut m.sdk.at, DMA_HANDLER);
         let r = super::dma_handler(m, [0; 4]);
         crate::testing::finish(m, r);
+        m.sdk.at = caller;
     }
 }
 
