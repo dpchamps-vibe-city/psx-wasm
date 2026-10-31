@@ -1,6 +1,6 @@
 # Spec fidelity
 
-**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress; phase 6 done on its branch but for the human's runs.
+**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress; phase 6 done on its branch but for the human's runs; phase 7's steps 2 and 3 built, adapters' straight-line time partly, baselines the human's.
 **Depends on:** [unified adapter layer, phase 1](unified-adaptor-layer/phase1.md)
 (done): the adapters this plan corrects.
 **Replaces:** `plans/shortcuts.md` (the 2026-10-30 audit, commits
@@ -632,16 +632,31 @@ anything else.
    compile: lifted, decompiled, mods, difftest). game.wasm: btn
    2,914,801 → 2,753,059 bytes (−5.5%), bof4 16,571,334 → 15,918,085
    (−3.9%).
-3. [ ] **TR5, step 2. Lifted code spends the original's instruction
+3. [x] **TR5, step 2. Lifted code spends the original's instruction
    counts,** per basic block, instead of a pass per loop header
    (`psxw-link/src/rewrite.rs:356-363`, `game.rs:689-708`;
    `psx-runtime/src/wasm.rs:335`, `driver.rs:144-151`).
-4. [ ] **TR5, step 3. Decompiled C too.** Design how clang's blocks get
+   Done `a026f30` (agent): `PSXW_SPEND(n)` at each MIPS block's start, a
+   `volatile` asm on `psxw_budget`, which every link resolves to its
+   budget; loop headers check it (at or below 0: a safepoint, and a
+   quantum's budget added, the overrun carried). The budget is
+   sixteenths of an instruction, an instruction two cycles (Findings), a
+   quantum 10,000 instructions. ABI 16. Bulk memory spends nothing of its
+   own (TR9's charge revised, Findings).
+4. [x] **TR5, step 3. Decompiled C too.** Design how clang's blocks get
    the original's counts (the matching asm, through line tables); record
    it in Findings before building it.
+   Done `a026f30` (agent), as designed (Findings, "Phase 7, step 3's
+   design"): `Graph::loop_tree` (natural loops of the lifter's graph of
+   the C function), `psxw_link::cost` (regions paired by nesting and
+   order, a spend per straight-line segment). btn: 2,460 of 2,541 C
+   functions pair. The check's distribution is in Findings and D71.
+   Adapters spend their originals' instructions (`38bf58e`), but not all
+   yet: Findings, "Adapters' straight-line time".
 5. [ ] **Re-record baselines once:** replays, golden frames, `ramdiff`
    baselines, each after showing the new timing is closer to the oracle's
-   (`psxw oracle play`, `psxw oracle ramdiff`).
+   (`psxw oracle play`, `psxw oracle ramdiff`). The human's; commands
+   below, in Status.
 
 ### Exit criteria
 
@@ -649,6 +664,50 @@ anything else.
 2. `psxw build btn` and `psxw build bof4` succeed.
 3. **Human:** `psxw ci btn` and `psxw ci bof4` against the re-recorded
    baselines; `psxw oracle ramdiff` no worse than before.
+
+Status (2026-10-31): 1 and 2 pass on `worktree-agent-a91665ec38f961809`
+(`dee627e`..). `psxw difftest btn`: 2,620 pass, 3 excluded, the known
+`AlignPadActuators` mismatch and `Ovl11ProbeActorBounds` trap, as
+before. Conformance: chips irq, gpu and cd pass in btn, gpu, cd and mdec
+in bof4; sio0 (both), memcard (btn) and spu (both; btn 20 of 47 cases)
+fail on time where adapters don't yet spend their originals'
+straight-line instructions (Findings). Step 5 and 3 wait for the human,
+and, before them, the rest of the adapters' time.
+
+Step 5, the human's (each game; btn's replay `title-to-gameplay`,
+bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
+--no-probe` first if the `.i` files are older than this branch.
+
+    ./target/release/psxw build btn && ./target/release/psxw build bof4
+    # The oracle side (Beetle) and the comparison, before and after:
+    # on main (837ebb2) and on this branch, each with its own psxw.
+    ./target/release/psxw oracle play btn --replay title-to-gameplay
+    ./target/release/psxw oracle ramdiff btn --replay title-to-gameplay --every 300
+    ./target/release/psxw oracle play bof4 --replay title-to-field
+    ./target/release/psxw oracle ramdiff bof4 --replay title-to-field --every 600
+    # The replays against their checks: a reached-state check that fails
+    # or a stall means the timing moved the game; re-author the presses
+    # or `frames` (both are frame-counter values) and note it.
+    ./target/release/psxw run btn --replay title-to-gameplay --check determinism --check no-trap --check no-shadow-io
+    ./target/release/psxw run btn --replay card-load --check determinism --check no-trap
+    ./target/release/psxw run bof4 --replay title-to-field --check determinism --check no-trap --check no-shadow-io
+    # The game-recorded GPU and SPU vectors (golden frames and audio):
+    ./target/release/psxw oracle record btn --replay title-to-gameplay
+    ./target/release/psxw oracle record bof4 --replay title-to-field
+    ./target/release/psxw oracle capture --missing
+    ./target/release/psxw oracle check btn --device gpu
+    ./target/release/psxw oracle check btn --device spu
+    ./target/release/psxw oracle check bof4 --device gpu
+    ./target/release/psxw oracle check bof4 --device spu
+    # Then the gates:
+    ./target/release/psxw ci btn
+    ./target/release/psxw ci bof4
+
+The new timing is closer when `ramdiff` reaches the same counters with
+fewer differing symbols than on main, and the frame counter's rate (the
+counters at each 300th or 600th frame) is nearer Beetle's. If it is
+slower or faster throughout, `guest::CYCLES_PER_INSTRUCTION` is the knob
+(Findings).
 
 ## Risks
 
@@ -686,6 +745,16 @@ locals, or static translation.
 
 ## Progress log
 
+- **2026-10-31:** phase 7, steps 2 and 3 (agent, `dee627e`..`38bf58e`):
+  lifted code spends each MIPS block's instructions, decompiled C its
+  loops' estimate, loop headers check (D71, ABI 16); adapters' waits and
+  loops in instruction units, and some adapters' whole paths. A BIOS
+  call panicked since `77ee6fd` (every conformance device side and any
+  run): fixed, `dee627e`. Tests pass, both games build, difftest's
+  verdicts are as before. Conformance fails on time for chips sio0,
+  memcard and spu (Findings). Human: step 5 and `ci`, after the rest of
+  the adapters' time.
+
 - **2026-10-30:** plan created from the shortcuts audit
   (`plans/shortcuts.md`, `3eff117`–`0bae88a`), its bugs (moved from
   open-items) and the BIOS rework.
@@ -722,6 +791,72 @@ locals, or static translation.
   criteria). D67 recorded for phase 2 (`c3aa557`).
 
 ## Findings
+
+- **An instruction is two cycles** (2026-10-31, phase 7; D71). Built as
+  planned, an instruction a cycle, libetc's `VSync` timed out: its
+  countdown, 1 << 15 passes of 14 instructions (`vsync.o` +1A0h..+1BCh,
+  +1E8h..+1FCh), is 458,766 cycles, 81% of an NTSC frame, so `VSync(0)`
+  just after a vblank ran out before the next, printed "VSync: timeout"
+  and acknowledged the vblank itself, natively and with chip irq on its
+  device alike. On hardware it never does: the loop's three main-RAM
+  loads take about five cycles each (psx-spx), so a pass is nearer 26.
+  Stalls still aren't modelled one by one; `guest::CYCLES_PER_INSTRUCTION`
+  = 2 is their average for the code that matters here (VSync's countdown
+  becomes 1.6 frames, the old loop-pass model's 20 cycles a pass sat at
+  1.2), and step 5's comparison with Beetle is where it gets checked.
+  Decided under the /goal.
+- **TR9's charge revised** (2026-10-31, phase 7; D71): bulk copies and
+  fills spend nothing of their own. The original's instructions that move
+  the bytes are already its blocks' (lifted code, where clang only ever
+  merges stores the blocks count) or its region's (decompiled C), and
+  clang's zero-fills of locals (D27) have none. What is lost: a GCC
+  block-copy loop that the C's `memory.copy` stands for. It makes the
+  function's shapes differ, so the function is one region and the loop
+  counts once (`Ovl27CopySelectedPage`: 4 instructions for 4,893). 68 of
+  btn's 81 unpaired C functions have fewer wasm loops than the original.
+- **Step 3's check** (2026-10-31, btn @ c77a66f, difftest's 64 seeds;
+  D71): over 160,119 runs where both sides returned alike, |C − T| / T
+  at p50 4.9%, p75 20.0%, p90 44.5%, p95 62.3%, p99 97.2%, max 396%;
+  61.9% within 10%, 79.8% within 25%; totals C/T 1.049, signed median
+  0. Per function, 61.7% within 10%, 81.1% within 25%. By length (T in
+  instructions): under 20, p50 0.0% p90 47.2% (58,141 runs); 20–99, 6.7%
+  and 40.6%; 100–999, 6.9% and 47.4%; 1,000 and more, 15.5% and 97.2%
+  (4,549). Pairing: 2,460 of btn's 2,541 C functions (573 with loops);
+  81 one region. Analysis script: the report's per-pair `time` field
+  (`out/difftest/<game>/<commit>/difftest.json`), units in sixteenths.
+- **Adapters' straight-line time** (2026-10-31, phase 7). Conformance
+  compares the device side's original, which now spends every
+  instruction, with the adapter, which spent only its loops' passes, and
+  it sees the difference: chip spu reads the budget after every call;
+  chip irq reads root counter 2 right after `SetRCnt`; chips sio0 and
+  memcard see in which vblank a quantum falls inside the pad and card
+  interrupts (`sio0.interrupt-time`'s hblanks, `memcard.session`). So an
+  adapter spends its original's blocks on the path it takes
+  (`sdk_psyq::path`, offsets from `psxw sdk disasm`), each before what
+  the block does that time can see. Done and passing: libapi's counter
+  functions (chip irq passes in btn), libgpu's timeout check (26
+  instructions, chip gpu passes), libspu's `_spu_init` and FIFO writer,
+  `_spu_Fw`, `_spu_t`, `_spu_FiDMA`, `_spu_FsetRXX(a)`, the voice volume
+  and envelope functions, the noise clock, the any-voice functions,
+  `SpuSetCommonAttr` (btn's chip spu: 4 of 47 cases to 20). Left, and
+  failing: libpad's interrupt (`_padIntPad` and its callees: the pad
+  state machine's paths) for chip sio0; libmcx's DSR and vblank element
+  for chip memcard; libspu's `SpuSetVoiceAttr`, `SpuSetReverbModeParam`,
+  `SpuClearReverbWorkArea`, `SpuSetKey`, the key status and reverb
+  functions and libsnd's `_SsInit` for chip spu. libgpu's, libcd's,
+  libetc's and libpress's adapters don't spend their straight-line code
+  either; their chips' cases don't see it yet. Each is the same
+  mechanical work (the disassembly's blocks on each branch), checked by
+  the chip's cases. Until it is done, replays with those chips native
+  run a little fast against their originals.
+- **A BIOS call panicked** (2026-10-31): `77ee6fd` kept the machine
+  borrowed through `driver::run` in the runtime's `bios` import, so
+  every BIOS call from guest code trapped ("RefCell already borrowed"),
+  every conformance case's device side among them. Fixed, `dee627e`.
+- **difftest's fuel doubled** (2026-10-31): the spends add a few
+  operators per block and segment, most to the C's, and
+  `FindOldestSoundVoiceByGroup`'s seed that walks 2 G voice slots ran
+  out of fuel on the C side before its bus error.
 
 - **Phase 3's choices where psx-spx is silent or OpenBIOS differs**
   (2026-10-31, agent; D68 has the layout). psx-spx followed:

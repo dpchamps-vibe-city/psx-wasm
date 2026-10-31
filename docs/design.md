@@ -565,15 +565,18 @@ audio, the SPU's state).
 ### 6. Time, interrupts and blocking
 
 Game-visible time is **virtual and deterministic**:
-- **Safepoints move time.** psxw-link adds a decrement-and-test of a
-  budget global to every loop header in guest code (1,000 iterations,
-  set at link time; mods' loops don't spend it). When the budget
-  runs out, the runtime advances virtual time by a quantum (20,000 CPU
-  cycles by default, `BootOptions::safepoint_quantum`) and delivers what
-  fell due. Between safepoints SIO0 and root counter 2 see the share of
-  the quantum the guest's passes have taken (`Machine::guest_now`, D66),
-  so a busy-wait on a byte, its /ACK or the counter ends when the
-  hardware's would, not at the next safepoint.
+- **Safepoints move time.** Guest code spends a budget global as it runs
+  the original's instructions (D71): lifted code each MIPS basic block's,
+  decompiled C an estimate of the same per straight-line segment; mods
+  spend nothing. psxw-link adds a test of the budget to every loop
+  header. When it has run out, the runtime advances virtual time by a
+  quantum (20,000 CPU cycles by default, `BootOptions::safepoint_quantum`;
+  10,000 instructions at two cycles each) and delivers what fell due;
+  what was spent past it carries over. Between safepoints SIO0 and root
+  counter 2 see the share of the quantum the guest's instructions have
+  taken (`Machine::guest_now`, D66), so a busy-wait on a byte, its /ACK or
+  the counter ends when the hardware's would, not at the next
+  safepoint.
 - **Waiting is spinning.** libgpu's `DrawSync` is original code (D42),
   and so is libetc's `VSync` with chip irq on its device (D45): they wait
   the way they do on hardware, by polling. `VSync(0)` spins until libetc's
@@ -592,11 +595,12 @@ Game-visible time is **virtual and deterministic**:
   D60). libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin as `VSync`'s
   do (D62); inside a callback, where no interrupt is taken, they poll the
   CD controller as the original does.
-  Loops that aren't waits count too: libspu's adapters spend the passes
-  the translated original's loops make (voice loops, the FIFO's
+  Loops that aren't waits count too: libspu's adapters spend the
+  instructions the original's loops run (voice loops, the FIFO's
   halfwords, the copies), reading and setting the guest's budget
-  (psxw-abi `guest::BUDGET_GET`/`SET`), with a safepoint where it runs
-  out, and call libspu's own delay loop where it does (D63).
+  (psxw-abi `guest::BUDGET_GET`/`SET`), with a safepoint at a loop header
+  where it has run out, and call libspu's own delay loop where it does
+  (D63, D71).
 - **Blocking runtime calls jump.** A runtime call that must wait (the
   BIOS's `WaitEvent`) advances time event by event until it is satisfied.
 - **Asynchronous events.** CD sector delivery, DMA completion, root counter
@@ -2439,7 +2443,11 @@ reaches the SPU through `SpuInit` and `_SsInit`.
   registers and its mark table's inner loop, `_spu_init`'s voices two at
   a time, the reverb parameters a word at a time) and makes
   `SpuGetKeyStatus`'s search a count of trailing zeros. The delay loop is
-  the original's own code. And an adapter's return is no safepoint
+  the original's own code. *Later:* D71 spends the original's
+  instructions instead of passes, so clang's shape no longer counts: an
+  adapter spends what the original's instructions on its path take, with
+  a safepoint at a loop header where the budget has run out. And an
+  adapter's return is no safepoint
   (`Machine::quiet`, which the driver takes at the adapter's return):
   the original makes no runtime call there.
 - **Observed** in conformance: the SPU's whole state, hashed at the core
@@ -2589,7 +2597,10 @@ stalls" was this.
 - **The rule:** a guest's access to SIO0 or to root counter 2 sees
   `Machine::guest_now`: the clock plus the share of the quantum the loop
   passes since the guest's budget last started over have taken (passes
-  spent × quantum / budget, 20 cycles a pass by default). A poll sees the
+  spent × quantum / budget, 20 cycles a pass by default). *Later:* the
+  instructions spent since the last safepoint (D71), two cycles each,
+  past the quantum where the guest overran its budget before its next
+  loop header. A poll sees the
   byte arrive, the /ACK or the count at the cycle the pass is made, so
   the wait ends when the hardware's would, to a pass. Events are still
   delivered only at safepoints; while they are, both see the clock.
@@ -2601,7 +2612,8 @@ stalls" was this.
   guest's budget, a quantum passing (nothing delivered) each time it runs
   out (`libpad::spend_in_exception`). libpad's interrupt now takes about
   640 passes (12,800 cycles) for a pad and an empty port; libmcx's wait
-  58.
+  58. *Later:* a pass is its loop's instructions, counted in PsyQ 4.7's
+  objects (D71): libpad's waits 5 to 36, libmcx's 19 (31 passes).
 - **Not root counters 0 and 1, nor the other devices.** A first version
   gave every counter the guest's cycle: then each guest read of root
   counter 1 (libetc's `VSync` reads it) became a function of the guest's
@@ -2793,12 +2805,94 @@ D5's single masked 16 MiB window and D6's index.
 Decided without the human's input under the /goal, as above.
 
 **D71. Virtual time comes from the original's instruction counts**
-(spec fidelity, phase 7; planned, the body changes with the code). Clang
-stops reshaping loops (no unrolling, vectorising or loop-to-`memory.fill`
-rewriting); lifted code spends the original's instruction count per
-basic block instead of a pass per loop header, and decompiled C the
-counts of its matching assembly. Revises §6, D18 and D66's loop-pass
+(spec fidelity, phase 7, TR5). Revises §6, D18 and D66's loop-pass
 budget. Every game's timing moves, so replays, golden frames and
 `ramdiff` baselines are re-recorded once, after showing the new timing is
-closer to the oracle's. Decided without the human's input under the
-/goal, as above.
+closer to the oracle's (plans/spec-fidelity.md, phase 7 step 5).
+- **The budget** counts the original's instructions in fixed point,
+  sixteenths (psxw-abi `guest::BUDGET_UNIT`), from a global the guest
+  spends and loop headers check. Run out (at or below 0), the header calls
+  `psx.safepoint` and adds a quantum's budget, so what was spent past it
+  carries over; between checks it can go below 0, and `guest_now` sees
+  the overrun as time past the quantum. A quantum is 20,000 cycles and
+  10,000 instructions: an instruction is two cycles
+  (`guest::CYCLES_PER_INSTRUCTION`). Stalls aren't modelled one by one;
+  at one cycle an instruction, as planned, libetc's `VSync` countdown
+  (1 << 15 passes of 14 instructions) ran out before an NTSC frame did,
+  and `VSync(0)` timed out where hardware never does (a main-RAM load
+  takes about five cycles, psx-spx). Two is the average of the code that
+  matters here; step 5's comparison with the oracle is where it gets
+  checked.
+- **Lifted code** spends each MIPS basic block's instructions (a branch
+  with its delay slot; a block also starts after a call returns) as the
+  block starts: `PSXW_SPEND(n)` in `psxw_rt.h`, a `volatile` asm
+  (`global.get psxw_budget`, `i32.const`, `i32.sub`, `global.set`) with
+  no memory clobber, so clang keeps it in place and as often as the
+  block runs but optimises memory around it. clang relocates the global
+  (`R_WASM_GLOBAL_INDEX_LEB`); every link resolves `psxw_budget` to its
+  budget.
+- **Decompiled C** spends an estimate from the same original
+  (`psxw_link::cost`). The lifter's graph of the function (it is
+  translated for the C tier too) gives its own instructions by natural
+  loop (`Graph::loop_tree`: dominators, back edges, nesting; code the
+  entry doesn't reach counts nothing, an irreducible loop makes it one
+  region). The link pairs the wasm's `loop`s with those loops by nesting
+  and order; each pair, and the function outside its loops, is a region
+  whose ratio is the original's instructions in it over its wasm
+  operators (structure — `block`, `loop`, `end`, `else`, `nop` — not
+  counted). Each straight-line segment (the operators between two
+  control instructions) spends its operators × its region's ratio, in
+  the budget's fixed point, as it starts. Where the shapes differ the
+  whole function is one region. Line tables were considered and not
+  used (plans/spec-fidelity.md, Findings). btn: 2,460 of 2,541 C
+  functions pair (573 of them with loops); 81 are one region, 68 of
+  those because the wasm has fewer loops (GCC's block-copy loops are
+  clang's `memory.copy`).
+- **Bulk memory** (TR9's charge, a pass per word) spends nothing of its
+  own: the original's instructions that move the bytes are its blocks'
+  (lifted) or its region's (C), and clang's zero-fills of locals (D27)
+  have no original instructions. A GCC block-copy loop the C's
+  `memory.copy` stands for is lost to the one-region fallback.
+- **Adapters** spend what the original's instructions on their path
+  would: its blocks, counted in PsyQ 4.7's objects by their offsets
+  (`sdk_psyq::path`), each spent before what that block does that time
+  can see — a root counter 2 or SIO0 access, a loop header (where a
+  safepoint can fall), a guest call. Conformance checks it: chip spu
+  observes the budget after every call, chip irq root counter 2, chip
+  sio0 and memcard where a quantum falls in the pad and card interrupts.
+  Done: libapi's counter functions; libspu's `_spu_init` and its FIFO
+  writer, `_spu_Fw`, `_spu_t`, `_spu_FiDMA`, `_spu_FsetRXX(a)`, the voice
+  volume and envelope functions, the noise clock, the any-voice
+  functions, `SpuSetCommonAttr`. Waits and loops spend a pass at the
+  loop's own count (the timeout checks and calls each iteration makes
+  among them): libetc's `VSync` waits (14 and 6), libgpu's (40, 41, 38),
+  libcd's (35, 38, 30, 30), libpress's (16; `DecDCTPutEnv`'s copies 160),
+  libpad's handler waits (RC2 28, a reply 5, /ACK 20 and 36), libmcx's
+  (19 and 5), libapi's pad element (its whole 98); waits that spin
+  through quanta carry the budget as the original's loop does, instead
+  of starting it over. Not yet: the straight-line code of the other
+  adapters (libpad's interrupt handler, libmcx's, the rest of libspu and
+  libsnd's `_SsInit`, libgpu's, libcd's, libetc's dispatcher, libpress's),
+  so chip sio0, memcard and spu conformance fail on time
+  (plans/spec-fidelity.md, Findings).
+- **The check** (difftest, btn @ c77a66f, 64 seeds): every pair spends
+  exact counts as lift and the estimate as C over the same seeds. Over
+  160,119 runs where both sides returned alike, the error (C − T) / T
+  has |e| at p50 4.9%, p75 20.0%, p90 44.5%, p95 62.3%, p99 97.2% (max
+  396%); 61.9% of runs within 10%, 79.8% within 25%; the totals' ratio
+  C/T 1.049, the signed median 0. Per function (mean over seeds), 61.7%
+  within 10%, 81.1% within 25%. Short functions are exact or nearly
+  (under 20 instructions: median 0); long-running ones spread more (1,000
+  or more: p50 15.5%, p90 97%), where a region's static ratio misses
+  which of its blocks run, or where the original's loop is the C's
+  `memory.copy` (`Ovl27CopySelectedPage`: 4 instructions for 4,893).
+- **Cost** (game.wasm, against `837ebb2` plus the BIOS borrow fix): btn
+  2,755,566 to 2,969,071 bytes (+7.7%; gzip −9 712,112 to 765,949,
+  +7.6%), instructions (`llvm-objdump -d`) 1,051,081 to 1,162,869
+  (+10.6%); bof4 15,918,085 to 17,198,324 (+8.0%; gzip 3,266,332 to
+  3,505,982, +7.3%), instructions 6,586,271 to 7,258,422 (+10.2%). Frame
+  time is the human's run (plans/spec-fidelity.md).
+- **Function entries aren't checked:** every loop header is, and no
+  straight-line run outlasts a quantum by much.
+
+Decided without the human's input under the /goal, as above.
