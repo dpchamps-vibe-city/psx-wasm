@@ -576,6 +576,12 @@ human.
    against the previous build in Findings.
 3. **Human:** `psxw ci btn` and `psxw ci bof4`.
 
+Status (2026-10-31, 01:55): in progress on `worktree-agent-ad8770dee57c0dd1f`
+(6 commits, `0aa6ea5`..`40c6c46`, plus an uncommitted psxw-abi edit); the
+agent stopped on the account's usage limit before its final checks
+(`cargo test --workspace`, both builds, `psxw difftest btn`). Not merged:
+resume it, or verify and cherry-pick, before phase 7.
+
 ## Phase 7: time
 
 1. [x] **Record the decision** (§6, D18, D66). Done: D71.
