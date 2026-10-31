@@ -59,13 +59,16 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
         return Err(format!("{exe} is not a PS-X EXE"));
     }
     let (pc0, gp0, t_addr, t_size) = (le(&file, 0x10), le(&file, 0x14), le(&file, 0x18), le(&file, 0x1C));
-    let (b_addr, b_size, s_addr, s_size) = (le(&file, 0x28), le(&file, 0x2C), le(&file, 0x30), le(&file, 0x34));
+    let (b_addr, b_size) = (le(&file, 0x28), le(&file, 0x2C));
     let body = file.get(0x800..0x800 + t_size as usize).ok_or("EXE shorter than its header says")?;
     m.mem.write(t_addr, body);
     if b_size != 0 {
         m.mem.write(b_addr, &vec![0; b_size as usize]);
     }
-    let sp = if s_addr != 0 { s_addr.wrapping_add(s_size) } else { stack.unwrap_or(0x801F_FF00) };
+    // The boot replaces the header's stack with SYSTEM.CNF's STACK (size
+    // 0) before Exec, which leaves sp as the BIOS's own when that is 0
+    // (OpenBIOS `main.c`; psx-spx Exec, BIOS Memory Map).
+    let sp = stack.filter(|&s| s != 0).unwrap_or(0x801F_FF00);
     m.regs.set_sp(sp);
     m.regs.set_gp(gp0);
     m.kernel.events = vec![Default::default(); events.clamp(1, 64) as usize];
