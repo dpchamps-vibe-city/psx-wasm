@@ -12,6 +12,13 @@
 //! pad-enable flag, which the native pad handler reads
 //! (`psx_bios::kernel`).
 //!
+//! The BIOS functions these adapters replace are called through their
+//! guest-visible entries (`psx_bios::bios::dispatch`): a patched entry runs
+//! the guest's own function where the original makes the call, and the
+//! adapter follows it with [`psx_bios::machine::seq`]. The operands read
+//! from the object are taken before those calls, since a callback may enter
+//! another adapter and move `sdk.at` (D61).
+//!
 //! `counter.o` (chip irq, D59) follows PsyQ 4.7's object: `SetRCnt`
 //! writes the mode (0x48: reset at target, repeating IRQ; sync, clock
 //! source and IRQ at target from the spec's mode bits) and the target;
@@ -19,7 +26,8 @@
 //! I_MASK (its table: counters 0-2, then RCntCNT3, vblank), which the
 //! kernel's root counter handler and libetc's dispatcher both go by.
 
-use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
+use crate::{Adapter, M, Psyq, Result, reg, ret, set_reg};
+use psx_bios::Flow;
 
 /// The root-counter adapters (`counter.o`): chip irq (D59).
 pub const COUNTERS: &[&str] = &["SetRCnt", "GetRCnt", "StartRCnt", "StopRCnt", "ResetRCnt"];
@@ -104,20 +112,37 @@ fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 
 /// `InitPAD(buf1, siz1, buf2, siz2)`: pad.o's element queued, the BIOS's
 /// `InitPAD2` (B0:12h) with the same arguments, pad.o's flag set; 1.
+///
+/// The object's operands are taken here, where the runtime points `sdk.at`
+/// at this function, and not after the calls: a patched entry's callback
+/// may enter another adapter, whose call moves it (D61).
 fn init_pad(m: &mut M, a: [u32; 4]) -> Result {
-    bios(m, 0xB0, 0x5B, [0; 4])?;
-    queue_element(m)?;
-    bios(m, 0xB0, 0x12, a)?;
-    set_init_pad_flag(m)?;
-    ret(1)
+    let at = m.sdk.at;
+    let e = Element::find(m, at)?;
+    let flag = init_flag(m, at)?;
+    let flow = psx_bios::bios::dispatch(m, 0xB0, 0x5B, [0; 4])?;
+    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+        let flow = queue_element(m, e);
+        psx_bios::machine::seq(m, flow, move |m, _| {
+            let flow = psx_bios::bios::dispatch(m, 0xB0, 0x12, a).unwrap_or_else(|e| panic!("InitPAD: {e}"));
+            psx_bios::machine::seq(m, flow, move |m, _| {
+                m.mem.w32(flag, 1);
+                Flow::ret(1)
+            })
+        })
+    }))
 }
 
 /// `StartPAD`: `StartPAD2` (B0:13h), `ChangeClearPAD(0)`, `EnablePAD`; 1.
 fn start_pad(m: &mut M, _a: [u32; 4]) -> Result {
-    bios(m, 0xB0, 0x13, [0; 4])?;
-    bios(m, 0xB0, 0x5B, [0; 4])?;
-    m.kernel.pad_enable = true;
-    ret(1)
+    let flow = psx_bios::bios::dispatch(m, 0xB0, 0x13, [0; 4])?;
+    Ok(psx_bios::machine::seq(m, flow, |m, _| {
+        let flow = psx_bios::bios::dispatch(m, 0xB0, 0x5B, [0; 4]).unwrap_or_else(|e| panic!("StartPAD: {e}"));
+        psx_bios::machine::seq(m, flow, |m, _| {
+            m.kernel.pad_enable = true;
+            Flow::ret(1)
+        })
+    }))
 }
 
 /// `EnablePAD`, `DisablePAD`: whether the BIOS's pad handler reads the
@@ -138,46 +163,72 @@ fn disable_pad(m: &mut M, _a: [u32; 4]) -> Result {
 /// queued, the BIOS's `PAD_init2` (B0:15h) with the same arguments,
 /// pad.o's flag set; 1.
 fn pad_init(m: &mut M, a: [u32; 4]) -> Result {
-    bios(m, 0xB0, 0x5B, [0; 4])?;
-    queue_element(m)?;
-    bios(m, 0xB0, 0x15, a)?;
-    set_init_pad_flag(m)?;
-    ret(1)
+    let at = m.sdk.at;
+    let e = Element::find(m, at)?;
+    let flag = init_flag(m, at)?;
+    let flow = psx_bios::bios::dispatch(m, 0xB0, 0x5B, [0; 4])?;
+    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+        let flow = queue_element(m, e);
+        psx_bios::machine::seq(m, flow, move |m, _| {
+            let flow = psx_bios::bios::dispatch(m, 0xB0, 0x15, a).unwrap_or_else(|e| panic!("PAD_init: {e}"));
+            psx_bios::machine::seq(m, flow, move |m, _| {
+                m.mem.w32(flag, 1);
+                Flow::ret(1)
+            })
+        })
+    }))
 }
 
 /// pad.o's flag, which `ReadInitPadFlag` reads (libcard's `InitCARD`
 /// keeps the pads in the BIOS's handler only when it is set): `PAD_init`
 /// and `InitPAD` set it at the end, through the `lui`/`sw` pair at the same
-/// place in both.
-fn set_init_pad_flag(m: &mut M) -> std::result::Result<(), String> {
-    let at = m.sdk.at;
-    let flag = crate::libspu::pair(m, at + 0x6C, at + 0x70)
-        .ok_or_else(|| format!("libapi/pad at {at:#010x}: no init flag where PsyQ 4.7's object has it"))?;
-    m.mem.w32(flag, 1);
-    Ok(())
+/// place in both, once the BIOS's init call has returned.
+fn init_flag(m: &M, at: u32) -> std::result::Result<u32, String> {
+    crate::libspu::pair(m, at + 0x6C, at + 0x70)
+        .ok_or_else(|| format!("libapi/pad at {at:#010x}: no init flag where PsyQ 4.7's object has it"))
+}
+
+/// pad.o's own `SysEnqIntRP` element, as the helper `InitPAD` and
+/// `PAD_init` call (the `jal` at +4Ch) names it: the element and the
+/// handler and verifier written into it.
+#[derive(Clone, Copy)]
+struct Element {
+    addr: u32,
+    handler: u32,
+    verifier: u32,
+}
+
+impl Element {
+    /// The helper's operands in the object at `at`.
+    fn find(m: &M, at: u32) -> std::result::Result<Self, String> {
+        let err = || format!("libapi/pad at {at:#010x}: no element helper where PsyQ 4.7's object has it");
+        let h = crate::libspu::jal(m, at + 0x4C).ok_or_else(err)?;
+        let p = |o: u32| crate::libspu::pair(m, h + o, h + o + 4).ok_or_else(err);
+        // The helper's pair makes `_apiPadPatch + 4`; the element starts
+        // four bytes before it (its `next` word's place).
+        Ok(Element { addr: p(0x14)?.wrapping_sub(4), handler: p(0x20)?, verifier: p(0x2C)? })
+    }
 }
 
 /// pad.o's own `SysEnqIntRP` element, which `InitPAD` and `PAD_init`
-/// queue at priority 1 through the helper both call (the `jal` at +4Ch):
-/// its handler and verifier written in, then out of the chain and back
-/// in, in a critical section, as the helper does.
-fn queue_element(m: &mut M) -> std::result::Result<(), String> {
-    let at = m.sdk.at;
-    let err = || format!("libapi/pad at {at:#010x}: no element helper where PsyQ 4.7's object has it");
-    let h = crate::libspu::jal(m, at + 0x4C).ok_or_else(err)?;
-    let p = |m: &M, o: u32| crate::libspu::pair(m, h + o, h + o + 4).ok_or_else(err);
-    // The helper's pair makes `_apiPadPatch + 4`; the element starts four
-    // bytes before it (its `next` word's place).
-    let element = p(m, 0x14)?.wrapping_sub(4);
-    let (handler, verifier) = (p(m, 0x20)?, p(m, 0x2C)?);
-    psx_bios::bios::syscall(m, [1, 0, 0, 0])?;
-    for (o, v) in [(4, handler), (8, verifier), (0, 0), (12, 0)] {
-        m.mem.w32(element + o, v);
+/// queue at priority 1 through the helper both call: its handler and
+/// verifier written in, its `next` word cleared (the original helper's
+/// order), then out of the chain and back in, in a critical section, as
+/// the helper does. Its calls are the entry's own: a patched table runs
+/// the guest's function where the original makes the call.
+fn queue_element(m: &mut M, e: Element) -> Flow<Psyq> {
+    psx_bios::bios::syscall(m, [1, 0, 0, 0]).unwrap_or_else(|err| panic!("libapi/pad: {err}"));
+    for (o, v) in [(4, e.handler), (8, e.verifier), (0, 0), (12, 0)] {
+        m.mem.w32(e.addr + o, v);
     }
-    bios(m, 0xC0, 0x03, [1, element, 0, 0])?;
-    bios(m, 0xC0, 0x02, [1, element, 0, 0])?;
-    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
-    Ok(())
+    let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [1, e.addr, 0, 0]).unwrap_or_else(|err| panic!("libapi/pad: {err}"));
+    psx_bios::machine::seq(m, flow, move |m, _| {
+        let flow = psx_bios::bios::dispatch(m, 0xC0, 0x02, [1, e.addr, 0, 0]).unwrap_or_else(|err| panic!("libapi/pad: {err}"));
+        psx_bios::machine::seq(m, flow, move |m, _| {
+            psx_bios::bios::syscall(m, [2, 0, 0, 0]).unwrap_or_else(|err| panic!("libapi/pad: {err}"));
+            Flow::ret(0)
+        })
+    })
 }
 
 /// The element's verifier: vblank unmasked and pending.
@@ -195,9 +246,11 @@ fn element_handler(m: &mut M, _a: [u32; 4]) -> Result {
 }
 
 /// libapi's `firstfile` calls the BIOS's `firstfile2` (B0h:42h) and
-/// patches a BIOS bug in kernel RAM; the HLE BIOS has no such bug.
+/// patches a BIOS bug in kernel RAM; the HLE BIOS has no such bug. It
+/// calls the entry, so a patch's function runs and its result is what the
+/// adapter returns.
 fn firstfile(m: &mut M, a: [u32; 4]) -> Result {
-    psx_bios::bios::call(m, 0xB0, 0x42, a)
+    psx_bios::bios::dispatch(m, 0xB0, 0x42, a)
 }
 
 fn nop(_m: &mut M, _a: [u32; 4]) -> Result {
@@ -266,5 +319,105 @@ mod tests {
         assert_eq!(call(&mut m, pad_init, [0x8001_0000, 0x22, 0, 0]), 1);
         assert_eq!(m.mem.r32(FLAG), 1);
         assert_eq!(m.chain(1), vec![0x800B_79E8], "queued once, not twice");
+    }
+
+    /// Where the guest's patched functions note their turn.
+    const LOG: u32 = 0x8002_0000;
+    const ELEMENT: u32 = 0x800B_79E8;
+    const HANDLER: u32 = 0x8004_2D68;
+    const VERIFIER: u32 = 0x8004_2DD0;
+    /// Where another adapter's call leaves `sdk.at`.
+    const OTHER_AT: u32 = AT + 0x1000;
+    const CHANGE_CLEAR_PAD: u32 = 0x8006_0000;
+    const DEQUEUE: u32 = 0x8006_0004;
+    const ENQUEUE: u32 = 0x8006_0008;
+    const INIT_PAD2: u32 = 0x8006_000C;
+    const FIRSTFILE: u32 = 0x8006_0010;
+
+    fn note(m: &mut M, v: u32) {
+        let n = m.mem.r32(LOG);
+        m.mem.w32(LOG + 4 + 4 * n, v);
+        m.mem.w32(LOG, n + 1);
+    }
+
+    fn notes(m: &M) -> Vec<u32> {
+        let n = m.mem.r32(LOG);
+        (0..n).map(|i| m.mem.r32(LOG + 4 + 4 * i)).collect()
+    }
+
+    /// The arguments the guest call being served got.
+    fn args() -> [u32; 4] {
+        *crate::testing::irq_args().last().expect("a guest call's arguments")
+    }
+
+    /// A patch of `ChangeClearPAD`: guest code that makes a BIOS call,
+    /// enters another adapter (the runtime points `sdk.at` at it) and
+    /// leaves it there.
+    fn change_clear_pad(m: &mut M) {
+        note(m, 0x5B);
+        assert_eq!(args(), [0; 4]);
+        assert!(matches!(psx_bios::bios::call(m, 0xA0, 0x1B, [0x8002_0100, 0, 0, 0]).unwrap(), Flow::Return(3)));
+        m.sdk.at = OTHER_AT;
+        crate::testing::call(m, disable_pad, [0; 4]);
+    }
+
+    /// A patch of `SysDeqIntRP`: the element the helper wrote, its `next`
+    /// cleared (the original helper's order), the critical section held.
+    fn dequeue(m: &mut M) {
+        note(m, 0x03);
+        assert_eq!(args(), [1, ELEMENT, 0, 0]);
+        assert!(m.crit, "the helper is in its critical section");
+        assert_eq!(m.mem.r32(ELEMENT), 0, "the element's next is cleared before the dequeue");
+        assert_eq!((m.mem.r32(ELEMENT + 4), m.mem.r32(ELEMENT + 8)), (HANDLER, VERIFIER));
+    }
+
+    fn enqueue(m: &mut M) {
+        note(m, 0x02);
+        assert_eq!(args(), [1, ELEMENT, 0, 0]);
+        assert!(m.crit, "the critical section covers the enqueue too");
+    }
+
+    /// A patch of `InitPAD2`: the helper is done, so the critical section
+    /// is left and the element is the one it queued; the init flag is not
+    /// set until this call returns.
+    fn init_pad2(m: &mut M) {
+        note(m, 0x12);
+        assert_eq!(args(), [0x8001_0000, 0x22, 0x8001_0022, 0x22]);
+        assert!(!m.crit, "the helper leaves its critical section before the init call");
+        assert_eq!((m.mem.r32(ELEMENT), m.mem.r32(ELEMENT + 4), m.mem.r32(ELEMENT + 8)), (0, HANDLER, VERIFIER));
+        assert_eq!(m.mem.r32(FLAG), 0, "the init flag waits for the call's return");
+    }
+
+    #[test]
+    fn patched_pad_calls_follow_the_helper_order() {
+        let mut m = machine(vec![], Default::default());
+        btn_pad(&mut m);
+        m.mem.write(0x8002_0100, b"pad\0");
+        for (table, func, addr) in [(0xB0, 0x5B, CHANGE_CLEAR_PAD), (0xC0, 0x03, DEQUEUE), (0xC0, 0x02, ENQUEUE), (0xB0, 0x12, INIT_PAD2)] {
+            m.mem.w32(psx_bios::tables::entry(table, func).expect("a table entry"), addr);
+        }
+        crate::testing::double(CHANGE_CLEAR_PAD, change_clear_pad);
+        crate::testing::double(DEQUEUE, dequeue);
+        crate::testing::double(ENQUEUE, enqueue);
+        crate::testing::double(INIT_PAD2, init_pad2);
+        let chain = m.chain(1);
+        m.sdk.at = AT;
+        assert_eq!(call(&mut m, init_pad, [0x8001_0000, 0x22, 0x8001_0022, 0x22]), 1);
+        assert_eq!(notes(&m), [0x5B, 0x03, 0x02, 0x12], "the helper's calls, in its order");
+        assert_eq!(m.mem.r32(FLAG), 1, "pad.o's init flag, at the operands' address");
+        assert!(!m.crit);
+        assert_eq!(m.chain(1), chain, "the guest's enqueue runs, not the native service");
+        assert_eq!(m.sdk.at, OTHER_AT, "the callback's adapter call left sdk.at moved");
+    }
+
+    #[test]
+    fn firstfile_returns_the_patched_calls_result() {
+        let mut m = machine(vec![], Default::default());
+        m.mem.w32(psx_bios::tables::entry(0xB0, 0x42).expect("the firstfile entry"), FIRSTFILE);
+        let a = [0x8001_0000, 0x8005_0000, 0, 0];
+        let Flow::Call { call, then } = firstfile(&mut m, a).unwrap() else { panic!("firstfile did not call the entry") };
+        assert_eq!(call, psx_bios::GuestCall { addr: FIRSTFILE, args: a });
+        let Flow::Return(v) = then(&mut m, 0xFFFF_FFFE) else { panic!("firstfile did not return the call's result") };
+        assert_eq!(v, 0xFFFF_FFFE);
     }
 }
