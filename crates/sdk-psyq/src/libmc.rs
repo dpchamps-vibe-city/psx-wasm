@@ -356,30 +356,39 @@ fn quiet(m: &mut M) -> std::result::Result<(), String> {
 /// tables, as `mcxinit` does; vblank acknowledged and unmasked; root
 /// counter 3's events no longer cleared (`ChangeClearRCnt(3, 0)`); the
 /// critical section left (v0: ExitCriticalSection's 0).
+///
+/// Its BIOS calls are the entry's own, so a patched table runs the guest's
+/// function there and the rest waits for it (`psx_bios::machine::seq`). The
+/// operands are read here, before those calls: a callback that enters
+/// another adapter moves `sdk.at` (D61).
 fn start_com(m: &mut M, _a: [u32; 4]) -> Result {
     let at = m.sdk.at;
     let err = |what: &str| format!("libmcx/mcxinit at {at:#010x}: no {what} where PsyQ 4.7's object has it");
     let card_ent = pair(m, at + 0x14, at + 0x18).ok_or_else(|| err("_mcxTblCardEnt"))?;
     let tables = pair(m, at + 0xB0, at + 0xB4).ok_or_else(|| err("table of tables"))?;
     locate(m, card_ent.wrapping_sub(data::CARD_ENT))?;
-    bios(m, 0xC0, 0x03, [2, card_ent, 0, 0])?;
-    let head = get(m, get(m, tables)).wrapping_add(2 * 8);
-    match get(m, head) {
-        0 => put(m, head, card_ent),
-        mut e => {
-            while get(m, e) != 0 {
-                e = get(m, e);
+    let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [2, card_ent, 0, 0])?;
+    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+        let head = get(m, get(m, tables)).wrapping_add(2 * 8);
+        match get(m, head) {
+            0 => put(m, head, card_ent),
+            mut e => {
+                while get(m, e) != 0 {
+                    e = get(m, e);
+                }
+                put(m, e, card_ent);
             }
-            put(m, e, card_ent);
         }
-    }
-    put(m, card_ent, 0);
-    set_reg(m, I_STAT, 4, !1)?;
-    let mask = reg(m, I_MASK, 4)?;
-    set_reg(m, I_MASK, 4, mask | 1)?;
-    bios(m, 0xC0, 0x0A, [3, 0, 0, 0])?;
-    m.crit = false;
-    ret(0)
+        put(m, card_ent, 0);
+        set_reg(m, I_STAT, 4, !1).unwrap_or_else(|e| panic!("McxStartCom: {e}"));
+        let mask = reg(m, I_MASK, 4).unwrap_or_else(|e| panic!("McxStartCom: {e}"));
+        set_reg(m, I_MASK, 4, mask | 1).unwrap_or_else(|e| panic!("McxStartCom: {e}"));
+        let flow = psx_bios::bios::dispatch(m, 0xC0, 0x0A, [3, 0, 0, 0]).unwrap_or_else(|e| panic!("McxStartCom: {e}"));
+        psx_bios::machine::seq(m, flow, |m, _| {
+            m.crit = false;
+            Flow::ret(0)
+        })
+    }))
 }
 
 /// What follows a step of `_mcxStepSio`, with its result.
@@ -407,7 +416,9 @@ fn dsr_entry(m: &mut M, _a: [u32; 4]) -> Result {
 }
 
 /// After `_mcxStepSio`: 0 waits for the next /ACK; 1 is done; anything else
-/// is an error.
+/// is an error. The element's dequeue is the entry's own (`psx_bios::bios::
+/// dispatch`), so the books and `quiet` above it are done and the 0 waits
+/// for a patched function to return.
 fn finish(m: &mut M, l: Lib, r: i32) -> Result {
     match r {
         0 => return ret(0),
@@ -428,8 +439,9 @@ fn finish(m: &mut M, l: Lib, r: i32) -> Result {
         }
     }
     put(m, l.at(data::CMD_SEQ), 0);
-    bios(m, 0xC0, 0x03, [1, l.at(data::DSR_ENT), 0, 0])?;
-    ret(0)
+    let ent = l.at(data::DSR_ENT);
+    let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [1, ent, 0, 0])?;
+    Ok(psx_bios::machine::seq(m, flow, |_, _| Flow::ret(0)))
 }
 
 /// A guest call (the original's `jalr`), then `then` with its result.
@@ -762,5 +774,115 @@ mod tests {
             assert_eq!(reg(&mut m, I_MASK, 4).unwrap() & ACK_LINE, 0);
             assert!(!m.chain(1).contains(&(DATA + data::DSR_ENT)));
         }
+    }
+
+    /// Where the guest's patched functions note their turn.
+    const LOG: u32 = 0x8007_1000;
+    const START_DEQUEUE: u32 = 0x8007_1004;
+    const START_CHANGE_CLEAR: u32 = 0x8007_1008;
+    const FINISH_DEQUEUE: u32 = 0x8007_100C;
+
+    fn note(m: &mut M, v: u32) {
+        let n = m.mem.r32(LOG);
+        m.mem.w32(LOG + 4 + 4 * n, v);
+        m.mem.w32(LOG, n + 1);
+    }
+
+    fn notes(m: &M) -> Vec<u32> {
+        let n = m.mem.r32(LOG);
+        (0..n).map(|i| m.mem.r32(LOG + 4 + 4 * i)).collect()
+    }
+
+    /// The arguments the guest call being served got.
+    fn args() -> [u32; 4] {
+        *crate::testing::irq_args().last().expect("a guest call's arguments")
+    }
+
+    fn patch(m: &mut M, func: u32, addr: u32) {
+        m.mem.w32(psx_bios::tables::entry(0xC0, func).expect("a C0h table entry"), addr);
+    }
+
+    /// The chain's block the element is appended to.
+    fn block(m: &M) -> u32 {
+        get(m, get(m, TABLES)) + 2 * 8
+    }
+
+    /// A patch of `McxStartCom`'s `SysDeqIntRP`: nothing after the call has
+    /// run yet, and the guest's own code enters another adapter (the
+    /// runtime points `sdk.at` at it).
+    fn start_dequeue(m: &mut M) {
+        note(m, 0x03);
+        assert_eq!(args(), [2, DATA + data::CARD_ENT, 0, 0]);
+        assert!(m.crit, "the caller's critical section is still held");
+        assert_ne!(get(m, block(m)), DATA + data::CARD_ENT, "not appended yet");
+        m.sdk.at = 0x8004_0000;
+        crate::testing::call(m, zero, [0; 4]);
+    }
+
+    /// A patch of `McxStartCom`'s `ChangeClearRCnt(3, 0)`: the element is in
+    /// the chain, vblank acknowledged and unmasked, the critical section not
+    /// yet left.
+    fn start_change_clear(m: &mut M) {
+        note(m, 0x0A);
+        assert_eq!(args(), [3, 0, 0, 0]);
+        assert_eq!(get(m, block(m)), DATA + data::CARD_ENT, "appended before this call");
+        assert_eq!(m.io.as_ref().unwrap().irq.stat & 1, 0, "vblank acknowledged");
+        assert_eq!(m.io.as_ref().unwrap().irq.mask & 1, 1, "vblank unmasked");
+        assert!(m.crit, "the critical section is left after this call");
+    }
+
+    /// A patch of the transfer's end dequeue: the books and the quiet are
+    /// done, and the adapter returns only after it.
+    fn finish_dequeue(m: &mut M) {
+        note(m, 0x03);
+        assert_eq!(args(), [1, DATA + data::DSR_ENT, 0, 0]);
+        assert_eq!(get(m, DATA + data::STAT), DONE, "the transfer's books closed before the call");
+        assert_eq!(get(m, DATA + data::CMD_SEQ), 0);
+        assert_eq!(m.io.as_ref().unwrap().irq.stat & ACK_LINE, 0, "the /ACK acknowledged");
+        assert_eq!(m.io.as_ref().unwrap().irq.mask & ACK_LINE, 0, "the /ACK masked");
+    }
+
+    /// The patched entries run where the original calls them: each guest
+    /// function finishes before the state that follows it, a callback that
+    /// enters another adapter does not move libmcx's addresses, and the
+    /// native services do not also run.
+    #[test]
+    fn patched_start_and_finish_await_their_calls() {
+        // McxStartCom: the dequeue, the chain append and vblank's mask, then
+        // ChangeClearRCnt(3, 0), then the critical section left: 0.
+        let mut m = game();
+        let clear_rcnt = m.kernel.clear_rcnt;
+        crate::testing::double(START_DEQUEUE, start_dequeue);
+        crate::testing::double(START_CHANGE_CLEAR, start_change_clear);
+        patch(&mut m, 0x03, START_DEQUEUE);
+        patch(&mut m, 0x0A, START_CHANGE_CLEAR);
+        m.crit = true;
+        assert_eq!(adapter(&mut m, start_com, START_COM), 0);
+        assert_eq!(notes(&m), [0x03, 0x0A], "the original's order");
+        assert!(!m.crit, "the critical section is left after the last call");
+        assert_eq!(m.sdk.at, 0x8004_0000, "the callback's adapter call left sdk.at moved");
+        assert_eq!(get(&m, block(&m)), DATA + data::CARD_ENT, "appended at the captured table");
+        assert_eq!(get(&m, DATA + data::CARD_ENT), 0);
+        assert_eq!(m.io.as_ref().unwrap().irq.mask & 1, 1);
+        assert_eq!(m.kernel.clear_rcnt, clear_rcnt, "the guest's ChangeClearRCnt runs, not the native one");
+
+        // A transfer's end: the books and the quiet first, then the
+        // element's dequeue, and 0 once it has returned.
+        let mut m = game();
+        let l = locate(&mut m, DATA).unwrap();
+        // The transfer's /ACK element in priority 1's chain, where the vblank
+        // handler puts it.
+        psx_bios::bios::call(&mut m, 0xC0, 0x02, [1, DATA + data::DSR_ENT, 0, 0]).unwrap();
+        let chain = m.chain(1);
+        assert_eq!(chain[0], DATA + data::DSR_ENT);
+        let generation = m.sdk.mc.wire.generation;
+        crate::testing::double(FINISH_DEQUEUE, finish_dequeue);
+        patch(&mut m, 0x03, FINISH_DEQUEUE);
+        let flow = finish(&mut m, l, 1).unwrap();
+        assert_eq!(get(&m, DATA + data::STAT), DONE, "the books close before the call");
+        assert_eq!(crate::testing::finish(&mut m, Ok(flow)), 0);
+        assert_eq!(notes(&m), [0x03]);
+        assert_eq!(m.sdk.mc.wire.generation, generation.wrapping_add(1), "the port deselected first");
+        assert_eq!(m.chain(1), chain, "the guest's dequeue runs, not the native one");
     }
 }
