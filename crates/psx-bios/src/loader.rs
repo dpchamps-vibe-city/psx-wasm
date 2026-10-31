@@ -9,7 +9,7 @@
 //! guest-visible kernel RAM because a guest device callback writes it. As
 //! with the reference's static buffer, a re-entrant load shares it.
 
-use crate::files;
+use crate::{bios, files};
 use crate::machine::{seq, Flow, Machine, Sdk};
 
 /// The loader's sector buffer as its guest pointer (KSEG1).
@@ -17,7 +17,7 @@ const BUFFER: u32 = 0xA000_0000 | psxw_abi::kernel::LOAD_BUFFER;
 
 /// The header sector's size (`800h`); its bytes `10h..4Bh` (60) reach the
 /// caller's header buffer.
-const SECTOR: u32 = 0x800;
+const SECTOR: u32 = psxw_abi::kernel::LOAD_BUFFER_LEN;
 const HEADER_AT: u32 = 0x10;
 const HEADER_COPY: u32 = 0x3C;
 
@@ -42,20 +42,20 @@ pub fn load<S: Sdk>(m: &mut Machine<S>, filename: u32, header: u32) -> Result<Fl
 }
 
 fn load_exe<S: Sdk>(m: &mut Machine<S>, filename: u32, header: u32, body: bool) -> Result<Flow<S>, String> {
-    let open = m.open(filename, files::READ)?;
+    let open = bios::dispatch(m, 0xB0, 0x32, [filename, files::READ, 0, 0])?;
     Ok(seq(m, open, move |m, v| opened(m, header, body, v as u32)))
 }
 
 fn opened<S: Sdk>(m: &mut Machine<S>, header: u32, body: bool, fd: u32) -> Flow<S> {
-    if fd == u32::MAX {
+    if (fd as i32) < 0 {
         return Flow::ret(0);
     }
-    let read = m.transfer(fd, BUFFER, SECTOR, false).unwrap_or_else(|e| panic!("Load: {e}"));
+    let read = bios::dispatch(m, 0xB0, 0x34, [fd, BUFFER, SECTOR, 0]).unwrap_or_else(|e| panic!("Load: {e}"));
     seq(m, read, move |m, n| read_header(m, header, body, fd, n as u32))
 }
 
 fn read_header<S: Sdk>(m: &mut Machine<S>, header: u32, body: bool, fd: u32, n: u32) -> Flow<S> {
-    if n < SECTOR {
+    if (n as i32) < SECTOR as i32 {
         return finish(m, fd, 0, false);
     }
     let bytes = m.mem.bytes(BUFFER + HEADER_AT, HEADER_COPY as usize);
@@ -64,14 +64,14 @@ fn read_header<S: Sdk>(m: &mut Machine<S>, header: u32, body: bool, fd: u32, n: 
         return finish(m, fd, 1, false);
     }
     let (text, size) = (m.mem.r32(header + TEXT_ADDR), m.mem.r32(header + TEXT_SIZE));
-    let read = m.transfer(fd, text, size, false).unwrap_or_else(|e| panic!("Load: {e}"));
+    let read = bios::dispatch(m, 0xB0, 0x34, [fd, text, size, 0]).unwrap_or_else(|e| panic!("Load: {e}"));
     seq(m, read, move |m, _| finish(m, fd, 1, true))
 }
 
 /// Close `fd` and return `value`; `Load` also calls `FlushCache` before
 /// returning, as the retail function does after its body read.
 fn finish<S: Sdk>(m: &mut Machine<S>, fd: u32, value: u32, flush: bool) -> Flow<S> {
-    let close = m.close(fd).unwrap_or_else(|e| panic!("Load: {e}"));
+    let close = bios::dispatch(m, 0xB0, 0x36, [fd, 0, 0, 0]).unwrap_or_else(|e| panic!("Load: {e}"));
     seq(m, close, move |m, _| {
         if !flush {
             return Flow::ret(value);
@@ -182,6 +182,43 @@ mod tests {
 
     fn closed(m: &Machine<NoSdk>) {
         assert_eq!(m.mem.r32(fcb_at(2) + fcb::FLAGS), 0, "the file is closed");
+    }
+
+    #[test]
+    fn patched_file_calls_keep_signed_errors_and_cleanup_order() {
+        use crate::tables;
+        fn resume(m: &mut Machine<NoSdk>, flow: Flow<NoSdk>, addr: u32, args: [u32; 4], result: u32) -> Flow<NoSdk> {
+            let Flow::Call { call, then } = flow else { panic!("expected patched file call") };
+            assert_eq!(call, GuestCall { addr, args });
+            then(m, result as u64)
+        }
+        let mut m = machine();
+        let (open, read, close) = (FUNCS, FUNCS + 4, FUNCS + 8);
+        for (func, target) in [(0x32, open), (0x34, read), (0x36, close)] {
+            m.mem.w32(tables::entry(0xB0, func).unwrap(), target);
+        }
+        // Any negative open result is failure, not merely -1.
+        let flow = load(&mut m, PATH, HEADER_BUF).unwrap();
+        let flow = resume(&mut m, flow, open, [PATH, files::READ, 0, 0], 0x8000_0000);
+        assert!(matches!(flow, Flow::Return(0)));
+
+        // A negative header read must close without copying stale buffer data.
+        m.mem.write(HEADER_BUF, &[0x5A; 0x40]);
+        let flow = load(&mut m, PATH, HEADER_BUF).unwrap();
+        let flow = resume(&mut m, flow, open, [PATH, files::READ, 0, 0], 7);
+        let flow = resume(&mut m, flow, read, [7, BUFFER, SECTOR, 0], u32::MAX);
+        assert_eq!(m.mem.bytes(HEADER_BUF, 0x40), vec![0x5A; 0x40]);
+        let flow = resume(&mut m, flow, close, [7, 0, 0, 0], u32::MAX);
+        assert!(matches!(flow, Flow::Return(0)));
+
+        // Body and close errors do not change success after a complete header.
+        let flow = load(&mut m, PATH, HEADER_BUF).unwrap();
+        let flow = resume(&mut m, flow, open, [PATH, files::READ, 0, 0], 7);
+        m.mem.write(BUFFER, &header(TEXT, 16));
+        let flow = resume(&mut m, flow, read, [7, BUFFER, SECTOR, 0], SECTOR);
+        let flow = resume(&mut m, flow, read, [7, TEXT, 16, 0], u32::MAX);
+        let flow = resume(&mut m, flow, close, [7, 0, 0, 0], u32::MAX);
+        assert!(matches!(flow, Flow::Return(1)));
     }
 
     #[test]

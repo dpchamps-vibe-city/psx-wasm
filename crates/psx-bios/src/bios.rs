@@ -272,6 +272,7 @@ pub fn support(table: u32, func: u32) -> Support {
         // filesystem details, or configuration/identity restrictions. Public
         // wrappers inherit these gaps; a working happy path is not completeness.
         (0xA0, 0x13)
+        | (0xA0, 0x41 | 0x42)
         | (0xA0, 0x5D..=0x5F)
         | (0xA0, 0x60 | 0x62..=0x67)
         | (0xA0, 0x78 | 0x7C | 0x7E | 0x81)
@@ -1132,7 +1133,7 @@ mod tests {
         // Recognised but no required capability.
         assert_eq!(support(0xA0, 0x14), Support::Unsupported);
         assert_eq!(support(0xA0, 0x43), Support::Unsupported);
-        assert_eq!(support(0xA0, 0x42), Support::Unsupported);
+        assert_eq!(support(0xA0, 0x42), Support::Partial, "loader works over the incomplete file backends");
         assert_eq!(support(0xB0, 0x3E), Support::Unsupported);
         assert_eq!(support(0xC0, 0x09), Support::Unsupported);
         // Documented fatal and no-op behaviour.
@@ -1144,7 +1145,7 @@ mod tests {
         // implemented() stays the compatibility gate, not a working claim.
         assert!(implemented(0xA0, 0x14));
         assert!(implemented(0xA0, 0x0B));
-        assert!(!implemented(0xA0, 0x42));
+        assert!(implemented(0xA0, 0x42));
     }
 
     #[test]

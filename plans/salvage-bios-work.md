@@ -190,8 +190,8 @@ Five are documented no-ops, and A(52h)'s meaning needs verification.
 
 | Done | Entry | Function |
 |---|---|---|
-| [ ] | A(41h) | `LoadTest` |
-| [ ] | A(42h) | `Load` |
+| [x] | A(41h) | `LoadTest` |
+| [x] | A(42h) | `Load` |
 | [ ] | A(52h) | Resolve reference conflict: summary says `GetSysSp`, another section says `SystemError`; then implement the verified behaviour |
 | [ ] | A(9Ch) | `SetConf`: main-thread reset implemented; live non-main reset still blocked |
 | [x] | A(9Dh) | `GetConf` |
@@ -524,8 +524,23 @@ ABI-18 implementation.
   and the `692606a4-f7a9-48cd-80a1-f62952fc09fb` subagent artifacts. No source,
   replay, expectation, user card or input snapshot was changed.
 
-Next: provision missing oracle/previous-decomp prerequisites and triage the two
-mismatches separately. Neither game CI nor full BIOS completion is green.
+Bounded follow-up triage reproduced both mismatches at their original 64-seed
+inputs. The packet allocator is declared `s32`; the call-out model therefore
+returns scalar values, including -1. C folds the packet length into a word
+store, while the lifted original stores that byte separately then reloads the
+word. At pointer -1, those accesses straddle different masked-window aliases,
+explaining the reported bytes. Parent reviewed the return model and disassembly
+evidence. This does not establish a valid-pointer translator defect or baseline
+regression attribution; the latter remains unknown. The full report was restored
+byte-for-byte (SHA256 `513f26b56b8e2f87d5be16034622c28695cec41ae3e47c94a411d99267ee4b39`).
+The suggested pointer-return annotation would change the input model; it is not
+accepted as a domain-neutral fix. No exclusion, prototype/input-model edit or
+new compiler heuristic was applied. Evidence is in workflow
+`810c2b90-9237-4898-bca6-953b1a8efeff`'s `salvage/btn-difftest-triage.md` and logs.
+
+Next: provision missing oracle/previous-decomp prerequisites and decide the
+appropriate difftest input contract separately. Neither game CI nor full BIOS
+completion is green.
 
 ## Current kernel-call batch (ABI 18)
 
@@ -710,6 +725,26 @@ sector. Parent authorized one reserved kernel data buffer at 8040h..8840h,
 clear of existing data, native callable slots and kernel tables, using the
 existing RAM-backed-data approach. No SP manipulation, heap expansion, runtime
 interface or ABI-version change; static-buffer limitations must be reported.
+
+Load worker `f23d6f5` is integrated as `2760dc9` with parent corrections. A(41h)
+reads 800h bytes and copies exactly 60 bytes from offset 10h with no magic check;
+A(42h) additionally reads the body, ignores its result, closes and flushes cache.
+Parent fixed negative open/header-read comparisons and routed open/read/close
+through the actual patchable B0 entries, rather than bypassing their table.
+Tests cover a guest file device, default event count, exact copy, short/error
+reads, returning patched calls and cleanup order. BIOS 41/runtime 8/build 1
+plus wasm32 runtime check pass. Exec/LoadExec and warm boot are untouched;
+normal boot still uses its existing loader. Static scratch is shared on reentry,
+as in the reference. No game rebuild/replay or native-CD end-to-end loader
+comparison is claimed for this batch.
+
+A new isolated DeepSeek lane `f94473a0-cf46-47ee-b059-3acc641a0911` at
+`../psx-wasm-salvage-lanes/sdk-bios-flow`, branch `salvage/sdk-bios-flow`, base
+`2760dc9`, owns only libapi's init/start pad and firstfile BIOS-call continuations.
+It must honor patched table calls and callback reentry using existing Flow/seq,
+preserve the verified SDK helper's write/dequeue/enqueue ordering, and retain
+its own operand addresses across nested adapters. Other SDK families and all
+runtime/ABI architecture remain outside its contract; no subdelegation.
 
 ## Progress log
 
