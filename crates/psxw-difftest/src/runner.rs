@@ -19,6 +19,10 @@ pub const STACK_TOP: u32 = 0x801F_F000;
 /// Compared memory excludes the callee's frames and the caller's argument
 /// area: `[STACK_TOP - STACK_EXCLUDE, STACK_TOP + 64)`.
 pub const STACK_EXCLUDE: u32 = 0x1_0000;
+/// How far the domain check moves the original's stack down: a page and
+/// a doubleword, so frame-relative accesses land on another page and at
+/// another offset in it, with sp still 8-aligned.
+pub const STACK_SHIFT: u32 = 0x1008;
 /// All-ones bytes just below that area. A function given a random pointer
 /// may scan memory for an all-ones terminator (`0xFFFF`, `-1`) and run up
 /// into the stack frames, where C and the original lay out spills
@@ -33,6 +37,8 @@ const SNAPSHOT_LEN: usize = 0x0080_0400;
 const MAX_CALLOUTS: usize = 4096;
 /// The trap of an access the console's map has no memory for, on either side.
 pub const BUS_ERROR: &str = "bus error";
+/// The harness's bound on call-outs: a divergence, like running out of fuel.
+pub const CALLOUT_LIMIT: &str = "call-out limit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Callout {
@@ -145,7 +151,7 @@ impl Harness {
                 let (kind, target) = (kind as u32, target as u32);
                 let st = caller.data_mut();
                 if st.log.len() >= MAX_CALLOUTS {
-                    return Err(wasmtime::Error::msg("call-out limit"));
+                    return Err(wasmtime::Error::msg(CALLOUT_LIMIT));
                 }
                 st.log.push(Callout {
                     kind,
@@ -212,10 +218,19 @@ impl Harness {
         self.memory.data(&self.store)[at..at + len].to_vec()
     }
 
+    /// A page as a run starts from it: past the snapshot, `restore` zeroes.
     pub fn snapshot_page(&self, p: usize) -> &[u8] {
+        static ZERO: [u8; PAGE] = [0; PAGE];
         let start = p * PAGE;
         let end = (start + PAGE).min(self.snapshot.len());
-        if start >= self.snapshot.len() { &[] } else { &self.snapshot[start..end] }
+        if start >= self.snapshot.len() { &ZERO } else { &self.snapshot[start..end] }
+    }
+
+    /// Copy out the pages a run wrote, then put them back to the snapshot.
+    pub fn take_pages(&mut self, pages: &BTreeSet<usize>) -> BTreeMap<usize, Vec<u8>> {
+        let taken = pages.iter().map(|&p| (p, self.page(p).to_vec())).collect();
+        self.restore(pages);
+        taken
     }
 
     pub fn page(&self, p: usize) -> &[u8] {
@@ -251,19 +266,35 @@ impl Harness {
         stack_args: &[u32; 8],
         fuel_scale: u64,
     ) -> Run {
+        self.run_at(f, seed, args, scratch, stack_args, fuel_scale, STACK_TOP)
+    }
+
+    /// [`Harness::run`] with the stack at `top`: sp, the stack arguments
+    /// and the stack area all move with it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_at(
+        &mut self,
+        f: &TypedFunc<(i32, i32, i32, i32), i64>,
+        seed: u64,
+        args: [u32; 4],
+        scratch: &[u8],
+        stack_args: &[u32; 8],
+        fuel_scale: u64,
+        top: u32,
+    ) -> Run {
         let data = self.memory.data_mut(&mut self.store);
         let map = DIRTY_MAP as usize;
         data[map..map + PAGES].fill(0);
         let s = (SCRATCH & 0x00FF_FFFF) as usize + WINDOW_BASE;
         data[s..s + scratch.len()].copy_from_slice(scratch);
-        let a = ((STACK_TOP + 16) & 0x00FF_FFFF) as usize + WINDOW_BASE;
+        let a = ((top + 16) & 0x00FF_FFFF) as usize + WINDOW_BASE;
         for (k, w) in stack_args.iter().enumerate() {
             data[a + 4 * k..a + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
         }
         let st = self.store.data_mut();
         st.seed = seed;
         st.log.clear();
-        let _ = self.sp.set(&mut self.store, wasmtime::Val::I32(STACK_TOP as i32));
+        let _ = self.sp.set(&mut self.store, wasmtime::Val::I32(top as i32));
         if let Some(b) = self.budget {
             let _ = b.set(&mut self.store, wasmtime::Val::I32(0));
         }
@@ -287,8 +318,8 @@ impl Harness {
         dirty.extend(sp..sp + SCRATCH_LEN as usize / PAGE);
         // The whole stack area: adapters write outgoing arguments there
         // without marking, and each side must start from the same stack.
-        let lo = ((STACK_TOP - STACK_EXCLUDE) & 0x00FF_FFFF) as usize / PAGE;
-        dirty.extend(lo..=((STACK_TOP + 64) & 0x00FF_FFFF) as usize / PAGE);
+        let lo = ((top - STACK_EXCLUDE) & 0x00FF_FFFF) as usize / PAGE;
+        dirty.extend(lo..=((top + 64) & 0x00FF_FFFF) as usize / PAGE);
         // A store may straddle into the next page; past the window's last
         // page that is the guard page, which is tracked like the others.
         let next: Vec<usize> = dirty.iter().map(|p| p + 1).filter(|&p| p <= PAGES).collect();
