@@ -738,7 +738,7 @@ mod tests {
         assert!(!super::is_kernel(0x0000_0110));
         assert!(!super::is_kernel(0xA000_E010 + 0xC0 + 0x94));
         // Tables the BIOS doesn't lay out, and its patch area, are.
-        assert!(super::is_kernel(0x0000_0150));
+        assert!(super::is_kernel(0x0000_0158));
         assert!(super::is_kernel(0xA000_DF80));
         assert!(!super::is_kernel(0));
     }
