@@ -793,8 +793,7 @@ pub extern "C" fn psxw_report() {
             m.sdk.cd.edc_errors.iter().chain(cdc.iter().flat_map(|c| &c.edc_errors)).map(|e| format!("{e:?}")).collect();
         let cd_sectors = m.sdk.cd.sectors + cdc.map_or(0, |c| c.sectors);
         let events: Vec<String> = m
-            .kernel
-            .events
+            .events()
             .iter()
             .filter(|e| e.status != 0)
             .map(|e| format!("\"{:08x}/{:x} mode {:x} status {:x} func {:08x}\"", e.class, e.spec, e.mode, e.status, e.func))
