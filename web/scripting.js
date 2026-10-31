@@ -58,8 +58,8 @@ export function scripting(worker) {
         address = found[0];
       }
       const word = (v) => Number.isInteger(v) && v >= 0 && v <= 0xffffffff;
-      if (!word(address) || !address || address % 4 || (address & 0xffffff) >= 0x400000) {
-        throw new Error("address must be an aligned guest function address in RAM or the synthetic code range");
+      if (!word(address) || !address || address % 4) {
+        throw new Error("address must be an aligned guest function address (RAM or the synthetic code range)");
       }
       if (args.length > 4 || !args.every(word)) throw new Error("execute takes up to four unsigned 32-bit argument words");
       if (unavailable) throw new Error(unavailable);

@@ -557,7 +557,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 sig,
                 &words,
                 sp,
-                WINDOW_BASE,
+                rewrite::Window::masked(WINDOW_BASE),
                 &|f| {
                     f.instruction(&I::I32Const(callout::CALL as i32));
                     f.instruction(&I::I32Const(addr as i32));
@@ -600,7 +600,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 &helper,
                 &words,
                 sp,
-                WINDOW_BASE,
+                rewrite::Window::masked(WINDOW_BASE),
                 &|f| {
                     f.instruction(&I::I32Const(callout::INDIRECT as i32));
                     f.instruction(&I::LocalGet(target));
@@ -719,7 +719,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             let sig = obj.types[obj.funcs[*func as usize].ty as usize].clone();
             let proto = ctx.inputs[*input].protos.get(name);
             let callee = ctx.guest[&(*input, *func)];
-            let body = marshal::o32_to_c(&sig, proto, callee, sp, WINDOW_BASE);
+            let body = marshal::o32_to_c(&sig, proto, callee, sp, rewrite::Window::masked(WINDOW_BASE));
             (o32_sig(), body, format!("o32:{name}"))
         }
     })

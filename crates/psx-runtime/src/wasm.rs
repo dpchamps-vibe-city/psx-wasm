@@ -7,7 +7,7 @@ use crate::driver::{self, Invoke};
 use crate::hold::Hold;
 use psx_bios::{GuestCall, Host, Machine, Regs};
 use psx_devices::mem::Mem;
-use psxw_abi::{BootOptions, WINDOW_BASE, WINDOW_MASK};
+use psxw_abi::{BootOptions, WINDOW_BASE, map};
 use sdk_psyq::Psyq;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -188,35 +188,27 @@ impl Regs for FfiRegs {
     }
 }
 
-/// The guest window, where the guest put it (psxw-abi `guest::WINDOW`).
+/// The guest window, where the guest put it (psxw-abi `guest::WINDOW`):
+/// the BIOS's and the devices' guest pointers reach it through the
+/// console's map, as guest code's do (D70).
 struct Window;
 
 static WINDOW: AtomicU32 = AtomicU32::new(WINDOW_BASE);
 
-fn window(addr: u32) -> *mut u8 {
-    ((WINDOW.load(Relaxed) + (addr & WINDOW_MASK)) as usize) as *mut u8
+/// The wasm address of window offset `off`.
+fn window(off: u32) -> *mut u8 {
+    ((WINDOW.load(Relaxed) + off) as usize) as *mut u8
 }
 
 impl Mem for Window {
-    fn read(&self, addr: u32, out: &mut [u8]) {
-        let off = (addr & WINDOW_MASK) as usize;
-        if off + out.len() <= WINDOW_MASK as usize + 1 {
-            unsafe { core::ptr::copy_nonoverlapping(window(addr), out.as_mut_ptr(), out.len()) };
-        } else {
-            for (i, b) in out.iter_mut().enumerate() {
-                *b = unsafe { *window(addr.wrapping_add(i as u32)) };
-            }
-        }
+    fn window_read(&self, off: u32, out: &mut [u8]) {
+        unsafe { core::ptr::copy_nonoverlapping(window(off), out.as_mut_ptr(), out.len()) };
     }
-    fn write(&mut self, addr: u32, data: &[u8]) {
-        let off = (addr & WINDOW_MASK) as usize;
-        if off + data.len() <= WINDOW_MASK as usize + 1 {
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), window(addr), data.len()) };
-        } else {
-            for (i, b) in data.iter().enumerate() {
-                unsafe { *window(addr.wrapping_add(i as u32)) = *b };
-            }
-        }
+    fn window_write(&mut self, off: u32, data: &[u8]) {
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), window(off), data.len()) };
+    }
+    fn bus_error(&self, addr: u32, len: usize, store: bool) -> ! {
+        fatal(13, &psx_devices::mem::bus_error_text(addr, len, store))
     }
 }
 
@@ -402,7 +394,7 @@ pub extern "C" fn psxw_call(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u6
 /// machine borrowed; the driver runs it once that borrow is released.
 #[unsafe(no_mangle)]
 pub extern "C" fn psxw_execute(id: u32, addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> i32 {
-    if addr == 0 || addr & 3 != 0 || addr & WINDOW_MASK >= 0x0040_0000 {
+    if addr == 0 || addr & 3 != 0 || map::code_index(addr).is_none() {
         return -3;
     }
     RT.with(|c| {
@@ -629,8 +621,8 @@ pub extern "C" fn io_trap(off: u32, _kind: u32) {
 
 /// The I/O window's shadow in guest memory: what an access to a register
 /// through a pointer writes when it reaches no device.
-const SHADOW_BASE: u32 = 0x1F80_1000;
-const SHADOW_LEN: usize = 0x2000;
+const SHADOW_BASE: u32 = map::IO.start;
+const SHADOW_LEN: usize = (map::IO.end - map::IO.start) as usize;
 
 /// At a vblank, with `DEBUG_SHADOW_IO`: report every byte of the I/O
 /// window that changed since a device access left it (M13 task 9). Only
@@ -680,6 +672,45 @@ pub extern "C" fn io_access(off: u32, kind: u32) {
     shadow_note(addr, size);
     // A CD DMA wrote RAM: the guest hears of it before it runs on.
     with(|rt| driver::deliver_loaded(&rt.m, &mut Guest));
+}
+
+/// Guest code's access to anything but RAM through KUSEG or KSEG0 (psxw-abi
+/// `psx::MAP_ACCESS`, D70): the window offset its `len` bytes are at. An
+/// expansion region's load finds the open-bus byte in place; a store
+/// where stores do nothing writes bytes no one reads.
+#[unsafe(export_name = "map_access")]
+pub extern "C" fn map_access(addr: u32, len: u32, store: u32) -> u32 {
+    let store = store != 0;
+    let Some(off) = map::access(addr, len, store) else {
+        match map::place(addr) {
+            None => fatal(13, &psx_devices::mem::bus_error_text(addr, len as usize, store)),
+            Some(p) => fatal(13, &format!("{} bytes at {addr:#010x} run past the end of {:?}", len, p.region)),
+        }
+    };
+    if let (false, Some(map::Region::Expansion(v))) = (store, map::place(addr).map(|p| p.region)) {
+        unsafe { core::ptr::write_bytes(window(off), v, len as usize) };
+    }
+    off
+}
+
+/// A guest call through a function pointer outside RAM's KUSEG and KSEG0
+/// view (psxw-abi `psx::MAP_CODE`): its dispatch-table index.
+#[unsafe(export_name = "map_code")]
+pub extern "C" fn map_code(fp: u32) -> u32 {
+    map::code_index(fp).unwrap_or_else(|| match map::place(fp) {
+        None => fatal(13, &format!("bus error: call to {fp:#010x}")),
+        Some(p) => fatal(4, &format!("no implementation for guest address {fp:#010x} ({:?})", p.region)),
+    })
+}
+
+/// A host's view of guest memory (psxw-abi `exports::GUEST_PTR`).
+#[unsafe(no_mangle)]
+pub extern "C" fn psxw_guest_ptr(addr: u32, len: u32, store: u32) -> u32 {
+    let backed = map::place(addr).is_some_and(|p| !matches!(p.region, map::Region::Expansion(_)) && (store == 0 || p.region != map::Region::BiosRom));
+    match map::access(addr, len, store != 0) {
+        Some(off) if backed => window(off) as u32,
+        _ => 0,
+    }
 }
 
 /// A mod's `psxmod_log(fmt, ...)`: clang's va-buffer holds the arguments,

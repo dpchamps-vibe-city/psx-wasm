@@ -5,6 +5,7 @@
 
 use crate::decode::{Insn, Op};
 use crate::graph::{Callee, Dest, Graph, Node, Transfer};
+use psxw_abi::map;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Registers the callee may clobber, as the o32 ABI defines.
@@ -443,19 +444,18 @@ fn sites(g: &Graph, f: &mut Facts) {
     }
 }
 
-fn is_io(addr: u32) -> bool {
-    (0x1F80_1000..0x1F80_3000).contains(&(addr & 0x1FFF_FFFF))
+fn region(addr: u32) -> Option<map::Region> {
+    map::place(addr).map(|p| p.region)
 }
 
-/// Main RAM (its 8 MiB of mirrors) through KUSEG, KSEG0 or KSEG1, or the
-/// scratchpad through KUSEG or KSEG0 (psx-spx "Memory Map"): plain memory,
-/// where an access does nothing but read or write its bytes.
+fn is_io(addr: u32) -> bool {
+    region(addr) == Some(map::Region::Io)
+}
+
+/// Main RAM or the scratchpad in the console's map (psxw-abi `map`): plain
+/// memory, where an access does nothing but read or write its bytes.
 fn is_memory(addr: u32) -> bool {
-    let p = addr & 0x1FFF_FFFF;
-    let kuseg = addr < 0x2000_0000;
-    let ram = p < 0x0080_0000 && (kuseg || (0x8000_0000..0xC000_0000).contains(&addr));
-    let scratchpad = (0x1F80_0000..0x1F80_0400).contains(&p) && (kuseg || (0x8000_0000..0xA000_0000).contains(&addr));
-    ram || scratchpad
+    matches!(region(addr), Some(map::Region::Ram | map::Region::Scratchpad))
 }
 
 /// The BIOS kernel's RAM, but for the tables the runtime's BIOS keeps in

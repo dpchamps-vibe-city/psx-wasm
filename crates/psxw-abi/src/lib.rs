@@ -54,13 +54,19 @@ pub mod replay;
 /// - 13: overlay residency (D69): `guest.psxmod_loaded` hears of every
 ///   disc write into RAM, mods or not, and a call into an overlay region
 ///   with nothing resident to run traps through [`psx::NOT_RESIDENT`].
-pub const ABI_VERSION: u32 = 13;
+/// - 14: the console's memory map (D70, [`map`]): the guest maps every
+///   access but RAM's through `psx.map_access` and every function pointer
+///   but RAM's through `psx.map_code`; psx-wasm's own data and synthetic
+///   code move to [`OWN_BASE`]; hosts reach guest bytes through
+///   [`exports::GUEST_PTR`].
+pub const ABI_VERSION: u32 = 14;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
 
-/// wasm address of guest physical address 0. Folded into every guest
-/// load/store's `memarg` offset, so translation costs one `i32.and`.
+/// wasm address of window offset 0 (guest physical address 0). Folded into
+/// every guest load/store's `memarg` offset; the offset itself comes from
+/// [`map`].
 pub const WINDOW_BASE: u32 = 0x0100_0000;
 
 /// A debug build's window (D53): every KSEG0 address (`0x80xx_xxxx`) is its
@@ -74,9 +80,22 @@ pub const fn window_pages(base: u32) -> u64 {
     (base as u64 + WINDOW_MASK as u64 + 1).div_ceil(65536)
 }
 
-/// Applied to every guest effective address. Folds KUSEG/KSEG0/KSEG1 onto one
-/// physical view and keeps the scratchpad (`0x1F80_0000`) inside the window.
+/// The window is 16 MiB: every window offset is below it. The differential
+/// harness (psxw-difftest) masks guest addresses with it instead of
+/// mapping them; psx-wasm's own addresses ([`OWN_BASE`]) are their window
+/// offset under it.
 pub const WINDOW_MASK: u32 = 0x00FF_FFFF;
+
+/// psx-wasm's own guest addresses: AUX data, mods' data and stacks, and
+/// synthetic code. KSEG0 addresses in the physical space the console leaves
+/// unmapped (from 16 MiB up), so no original pointer reaches them; their
+/// low 24 bits are their window offset ([`own`]).
+pub const OWN_BASE: u32 = 0x8100_0000;
+
+/// The own guest address of window offset `offset`.
+pub const fn own(offset: u32) -> u32 {
+    OWN_BASE | offset
+}
 
 /// The runtime is linked with `--global-base` here; everything Rust owns
 /// lives above the default guest window (below a debug build's, its heap
@@ -177,41 +196,231 @@ pub mod kernel {
     }
 }
 
-/// Guest physical layout inside the window.
+/// The window's layout: what lies at each window offset ([`map`] says
+/// which guest addresses reach it).
 pub mod phys {
     pub const RAM: core::ops::Range<u32> = 0x0000_0000..0x0020_0000;
     /// clang-only data (string literals, constant pools) with no original
-    /// address. Occupies the region where hardware mirrors RAM.
+    /// address, at its own guest addresses ([`super::own`]).
     pub const AUX_DATA: core::ops::Range<u32> = 0x0020_0000..0x0060_0000;
-    /// Mods' globals, stacks and heaps (M11), above AUX in RAM's mirror;
+    /// Mods' globals, stacks and heaps (M11), at their own guest addresses;
     /// never the game's RAM. A static build's mods share it, its stack at
     /// the top ([`MOD_STACK`]); dynamically loaded mods each get a slice.
     pub const MOD_DATA: core::ops::Range<u32> = 0x0060_0000..0x0080_0000;
     /// The stack static mods run on, at the top of [`MOD_DATA`].
     pub const MOD_STACK: core::ops::Range<u32> = 0x007F_0000..0x0080_0000;
     pub const SCRATCHPAD: core::ops::Range<u32> = 0x0080_0000..0x0080_0400;
-    /// Hardware registers. Nothing backs them; debug builds trap here.
-    pub const IO: core::ops::Range<u32> = 0x0080_1000..0x0080_3000;
-    /// Runtime-private page: GTE register file, safepoint budget.
-    pub const RUNTIME_PRIVATE: core::ops::Range<u32> = 0x00F0_0000..0x0100_0000;
+    /// The I/O ports. Nothing backs them; debug builds trap here.
+    pub const IO: core::ops::Range<u32> = 0x0080_1000..0x0080_2000;
+    /// The BIOS ROM (zeros: the BIOS is the runtime's).
+    pub const BIOS_ROM: core::ops::Range<u32> = 0x00C0_0000..0x00C8_0000;
+    /// Runtime-private: the GTE register file.
+    pub const RUNTIME_PRIVATE: core::ops::Range<u32> = 0x00F0_0000..0x00F0_0100;
+    /// Where an access to an expansion region goes: a load finds the
+    /// region's open-bus byte here, a store's bytes are dropped here.
+    pub const OPEN_BUS: core::ops::Range<u32> = 0x00F0_0100..0x00F0_0110;
+    /// KSEG2's cache control registers.
+    pub const CACHE_CONTROL: core::ops::Range<u32> = 0x00FE_0000..0x00FE_0200;
 }
 
 /// Synthetic MIPS addresses for functions that have no original address
 /// (mod functions whose address is taken or stored in game data).
-pub const SYNTHETIC_CODE: core::ops::Range<u32> = 0x8020_0000..0x8040_0000;
+pub const SYNTHETIC_CODE: core::ops::Range<u32> = own(0x0020_0000)..own(0x0040_0000);
 
-/// Dispatch table index for a guest function pointer. The table spans
-/// RAM plus the synthetic range; unmapped entries trap with the address.
+/// Dispatch table index for a function's address: RAM's first copy or
+/// [`SYNTHETIC_CODE`] (any guest function pointer: [`map::code_index`]).
+/// Unmapped entries trap with the address.
 #[inline]
 pub const fn table_index(fp: u32) -> u32 {
     (fp & 0x003F_FFFC) >> 2
 }
 pub const TABLE_LEN: u32 = 0x0010_0000;
 
-/// Translate a guest pointer to its wasm address (the default window).
-#[inline]
-pub const fn guest_to_wasm(addr: u32) -> u32 {
-    (addr & WINDOW_MASK) + WINDOW_BASE
+/// The console's memory map (psx-spx "Memory Map" and "Memory Control",
+/// D70): what a guest address reaches, as window bytes, an expansion
+/// region's open bus, or a bus error.
+///
+/// - **Main RAM**, 2 MiB mirrored four times in the first 8 MiB, through
+///   KUSEG, KSEG0 and KSEG1.
+/// - **The scratchpad**, 1 KiB at `1F80_0000`, through KUSEG and KSEG0
+///   (not KSEG1).
+/// - **The I/O ports**, 4 KiB at `1F80_1000`.
+/// - **The expansion regions** at the sizes the BIOS leaves them
+///   (DEV0 512 KiB at `1F00_0000`, DEV8 128 bytes at `1F80_2000`, DEV1 one
+///   byte at `1FA0_0000`), with nothing attached: loads read FFh, 00h and
+///   00h (Beetle's; psx-spx doesn't say), stores do nothing.
+/// - **The BIOS ROM**, 512 KiB at `1FC0_0000` (not mirrored): stores do
+///   nothing.
+/// - **KSEG2's cache control**, 512 bytes at `FFFE_0000`.
+/// - psx-wasm's own data at [`OWN_BASE`] (KSEG0).
+///
+/// Anything else is a bus error, KUSEG above 512 MiB included.
+///
+/// Guest code takes RAM through KUSEG and KSEG0 inline ([`FAST_MASK`]) and
+/// calls `psx.map_access` for anything else.
+pub mod map {
+    use super::phys;
+    use core::ops::Range;
+
+    /// An address whose bits here are clear is RAM through KUSEG or KSEG0,
+    /// at window offset `addr & RAM_MIRROR`: guest code's inline path.
+    pub const FAST_MASK: u32 = 0x7F80_0000;
+    /// RAM's mirrors fold onto its 2 MiB.
+    pub const RAM_MIRROR: u32 = 0x001F_FFFF;
+    /// Guest addresses of psx-wasm's own data, through KSEG0 only.
+    pub const OWN: Range<u32> = super::own(phys::AUX_DATA.start)..super::own(phys::MOD_DATA.end);
+    /// The I/O ports' physical addresses.
+    pub const IO: Range<u32> = 0x1F80_1000..0x1F80_2000;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Region {
+        Ram,
+        Scratchpad,
+        Io,
+        /// An expansion region with nothing attached: loads read this byte,
+        /// stores do nothing.
+        Expansion(u8),
+        /// Read-only: stores do nothing.
+        BiosRom,
+        CacheControl,
+        /// psx-wasm's own data ([`OWN`]).
+        Own,
+    }
+
+    /// Where a guest address's byte is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Place {
+        pub region: Region,
+        /// Its window offset ([`phys::OPEN_BUS`] in an expansion region).
+        pub offset: u32,
+        /// Bytes from it to the end of its region (or RAM's mirror).
+        pub len: u32,
+    }
+
+    impl Place {
+        /// The window offset a store of `len` bytes from here writes:
+        /// [`phys::OPEN_BUS`] where stores do nothing.
+        pub fn store_offset(self) -> u32 {
+            match self.region {
+                Region::Expansion(_) | Region::BiosRom => phys::OPEN_BUS.start,
+                _ => self.offset,
+            }
+        }
+    }
+
+    /// What guest address `addr` reaches; `None`: a bus error.
+    pub fn place(addr: u32) -> Option<Place> {
+        let at = |region, base: u32, size: u32, window: u32| {
+            let o = addr.wrapping_sub(base) & (size - 1);
+            Some(Place { region, offset: window + o, len: size - o })
+        };
+        let p = addr & 0x1FFF_FFFF;
+        match addr >> 29 {
+            // KSEG2: the cache control registers only.
+            6 | 7 => {
+                let o = addr.wrapping_sub(0xFFFE_0000);
+                let size = phys::CACHE_CONTROL.end - phys::CACHE_CONTROL.start;
+                return if o < size { at(Region::CacheControl, 0xFFFE_0000, size, phys::CACHE_CONTROL.start) } else { None };
+            }
+            // KUSEG above 512 MiB.
+            1..=3 => return None,
+            4 if OWN.contains(&addr) => return Some(Place { region: Region::Own, offset: addr & super::WINDOW_MASK, len: OWN.end - addr }),
+            _ => {}
+        }
+        let open = |byte, base: u32, size: u32| {
+            let o = p - base;
+            Some(Place { region: Region::Expansion(byte), offset: phys::OPEN_BUS.start, len: size - o })
+        };
+        match p {
+            0..0x0080_0000 => at(Region::Ram, 0, RAM_MIRROR + 1, 0),
+            0x1F00_0000..0x1F08_0000 => open(0xFF, 0x1F00_0000, 0x8_0000),
+            0x1F80_0000..0x1F80_0400 if addr >> 29 != 5 => at(Region::Scratchpad, 0x1F80_0000, 0x400, phys::SCRATCHPAD.start),
+            0x1F80_1000..0x1F80_2000 => at(Region::Io, 0x1F80_1000, 0x1000, phys::IO.start),
+            0x1F80_2000..0x1F80_2080 => open(0, 0x1F80_2000, 0x80),
+            0x1FA0_0000..0x1FA0_0001 => open(0, 0x1FA0_0000, 1),
+            0x1FC0_0000..0x1FC8_0000 => at(Region::BiosRom, 0x1FC0_0000, 0x8_0000, phys::BIOS_ROM.start),
+            _ => None,
+        }
+    }
+
+    /// The window offset of a load (or a store) of `len` bytes at `addr`,
+    /// all in one region; `None`: a bus error. An expansion region's load
+    /// finds its byte at [`phys::OPEN_BUS`] only once the caller puts it
+    /// there.
+    pub fn access(addr: u32, len: u32, store: bool) -> Option<u32> {
+        let p = place(addr)?;
+        let room = match p.region {
+            Region::Expansion(_) => p.len.min(phys::OPEN_BUS.end - phys::OPEN_BUS.start),
+            Region::BiosRom if store => phys::OPEN_BUS.end - phys::OPEN_BUS.start,
+            _ => p.len,
+        };
+        (len <= room).then(|| if store { p.store_offset() } else { p.offset })
+    }
+
+    /// The dispatch-table index of function pointer `fp`: code in RAM
+    /// (through any segment and mirror) or [`super::SYNTHETIC_CODE`].
+    /// `None`: no code can be there (a bus error, or a region psx-wasm
+    /// has no code for: the scratchpad, I/O, the BIOS ROM, expansion).
+    pub fn code_index(fp: u32) -> Option<u32> {
+        if super::SYNTHETIC_CODE.contains(&fp) {
+            return Some(super::table_index(fp));
+        }
+        match place(fp)? {
+            Place { region: Region::Ram, offset, .. } => Some(offset >> 2),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn regions() {
+            let off = |a| place(a).map(|p| (p.region, p.offset));
+            // RAM's four mirrors through KUSEG, KSEG0 and KSEG1.
+            for a in [0x0000_1234, 0x8020_1234, 0xA040_1234, 0x8060_1234] {
+                assert_eq!(off(a), Some((Region::Ram, 0x1234)));
+            }
+            assert_eq!(off(0x8080_0000), None);
+            // The scratchpad isn't in KSEG1 and is 1 KiB.
+            assert_eq!(off(0x9F80_03FC), Some((Region::Scratchpad, 0x80_03FC)));
+            assert_eq!(off(0x1F80_0000), Some((Region::Scratchpad, 0x80_0000)));
+            assert_eq!(off(0xBF80_0000), None);
+            assert_eq!(off(0x1F80_0400), None);
+            assert_eq!(off(0xBF80_1070), Some((Region::Io, 0x80_1070)));
+            assert_eq!(off(0xBFC0_0100), Some((Region::BiosRom, 0xC0_0100)));
+            assert_eq!(off(0xBFC8_0000), None);
+            assert_eq!(place(0x1F00_0084).map(|p| p.region), Some(Region::Expansion(0xFF)));
+            assert_eq!(place(0x1F08_0000), None);
+            assert_eq!(off(0xFFFE_0130), Some((Region::CacheControl, 0xFE_0130)));
+            assert_eq!(off(0xFFFE_0200), None);
+            assert_eq!(off(0xC000_0000), None);
+            // KUSEG above 512 MiB is no mirror; own data is KSEG0 only.
+            assert_eq!(off(0x2000_0000), None);
+            assert_eq!(off(0x8120_0010), Some((Region::Own, 0x20_0010)));
+            assert_eq!(off(0x0120_0010), None);
+            // Every RAM address the inline path takes, the map agrees with.
+            for a in [0, 0x007F_FFFF, 0x8000_0000, 0x807F_FFFF] {
+                assert_eq!(a & FAST_MASK, 0);
+                assert_eq!(off(a), Some((Region::Ram, a & RAM_MIRROR)));
+            }
+        }
+
+        #[test]
+        fn accesses() {
+            assert_eq!(access(0x1F80_03FC, 4, false), Some(0x80_03FC));
+            assert_eq!(access(0x1F80_03FE, 4, false), None);
+            assert_eq!(access(0xBFC0_0000, 4, true), Some(phys::OPEN_BUS.start));
+            assert_eq!(access(0x1F00_0000, 4, false), Some(phys::OPEN_BUS.start));
+            assert_eq!(access(0x1F00_0000, 0x100, false), None);
+            assert_eq!(code_index(0xA001_0000), Some(0x4000));
+            assert_eq!(code_index(0x8021_0000), Some(0x4000));
+            assert_eq!(code_index(super::super::SYNTHETIC_CODE.start), Some(0x8_0000));
+            assert_eq!(code_index(0x1F80_0000), None);
+            assert_eq!(code_index(0x0080_0000), None);
+        }
+    }
 }
 
 /// Every dispatch-table entry has this wasm type, the "o32 indirect ABI":
@@ -261,6 +470,15 @@ pub mod psx {
     /// `(window offset, kind) -> ()`: the same, in any other function of a
     /// debug build: a trap (the function needs an adapter).
     pub const IO_TRAP: &str = "io_trap";
+    /// `(addr, len, store) -> offset`: the window offset of a load (store
+    /// non-zero: a store) of `len` bytes at guest `addr`, which isn't RAM
+    /// through KUSEG or KSEG0 ([`super::map::FAST_MASK`]): the console's
+    /// map ([`super::map::access`]). A bus error traps.
+    pub const MAP_ACCESS: &str = "map_access";
+    /// `(fp) -> index`: the dispatch-table index of a function pointer
+    /// outside RAM's KUSEG and KSEG0 view ([`super::map::code_index`]);
+    /// traps where no code can be.
+    pub const MAP_CODE: &str = "map_code";
     /// `(addr) -> ()`: a watched function was entered.
     pub const PROBE: &str = "probe";
     /// `() -> ()`: ReturnFromException (B0h:17h) is about to unwind the
@@ -400,6 +618,10 @@ pub mod exports {
     pub const ALLOC: &str = "psxw_alloc";
     /// `() -> i64`: FNV-1a of guest RAM.
     pub const RAM_HASH: &str = "psxw_ram_hash";
+    /// `(addr, len, store) -> ptr`: the wasm address of the `len` bytes a
+    /// load (store non-zero: a store) at guest `addr` reaches, all in one
+    /// region with bytes behind it ([`map`](super::map)); 0 otherwise.
+    pub const GUEST_PTR: &str = "psxw_guest_ptr";
     /// `() -> i64`: the SPU's state (registers, voices, SPU RAM) brought
     /// up to now, hashed; for conformance (D63).
     pub const SPU_HASH: &str = "psxw_spu_hash";

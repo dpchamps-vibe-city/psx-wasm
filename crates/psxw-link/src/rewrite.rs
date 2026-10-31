@@ -2,11 +2,13 @@
 //! `wasm-encoder`, applying relocations and the guest passes on the way
 //! (docs/design.md §8):
 //!
-//! 1. **Masking.** Every load, store, `memory.copy` and `memory.fill`
-//!    address becomes `(addr + offset) & WINDOW_MASK`, with the memarg
-//!    offset set to the window's base (`WINDOW_BASE`, or a debug build's).
-//!    A bulk copy or fill reaches the I/O hook as its bytes would, and
-//!    spends the safepoint budget (`Resolver::bulk_spend`).
+//! 1. **The memory map.** Every load, store, `memory.copy` and
+//!    `memory.fill` address `addr + offset` becomes its window offset under
+//!    the console's map (psxw-abi `map`, D70), with the memarg offset set to
+//!    the window's base (`WINDOW_BASE`, or a debug build's): RAM through
+//!    KUSEG and KSEG0 inline, anything else through `psx.map_access`
+//!    ([`Window`]). A bulk copy or fill reaches the I/O hook as its bytes
+//!    would, and spends the safepoint budget (`Resolver::bulk_spend`).
 //! 2. **Guest SP.** `__stack_pointer` becomes the guest's `$sp` global.
 //! 3. **Calls** are resolved by the linker, which may lower intrinsics to
 //!    plain instructions.
@@ -15,9 +17,9 @@
 
 use crate::object::{FuncType, WasmObject};
 use anyhow::{Context as _, Result, bail};
-use psxw_abi::{WINDOW_BASE, WINDOW_MASK};
+use psxw_abi::{WINDOW_BASE, WINDOW_MASK, map};
 use wasm_encoder::reencode::Reencode;
-use wasm_encoder::{Function, Instruction as I, MemArg, ValType};
+use wasm_encoder::{BlockType, Function, Instruction as I, MemArg, ValType};
 use wasmparser::{BinaryReader, FunctionBody, Operator, RelocationType};
 
 /// How a call to a symbol is lowered.
@@ -89,6 +91,96 @@ pub trait Resolver {
     fn window_base(&self) -> u32 {
         WINDOW_BASE
     }
+    /// `psx.map_access`: what an access outside RAM's inline path calls.
+    /// `None`: addresses are masked into the window instead (the
+    /// differential harness, which compares two translations of one
+    /// function and has no console behind it).
+    fn map_access(&mut self) -> Option<u32> {
+        None
+    }
+}
+
+/// How a module's guest addresses become window offsets ([`psxw_abi::map`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    /// The window's wasm address: every access's memarg offset.
+    pub base: u32,
+    /// `psx.map_access`, or `None` to mask (see [`Resolver::map_access`]).
+    pub map: Option<u32>,
+}
+
+impl Window {
+    pub fn masked(base: u32) -> Self {
+        Window { base, map: None }
+    }
+
+    /// With a guest address on the stack: the window offset of the `len`
+    /// bytes a load (or a store) there reaches. RAM through KUSEG and KSEG0
+    /// inline (one mask and one test, using scratch local `t`), anything
+    /// else through `psx.map_access`, which traps on a bus error.
+    pub fn offset(self, f: &mut Function, t: u32, len: u32, store: bool) {
+        let Some(map) = self.map else { return mask(f) };
+        f.instruction(&I::LocalTee(t));
+        f.instruction(&I::I32Const(map::FAST_MASK as i32));
+        f.instruction(&I::I32And);
+        f.instruction(&I::If(BlockType::Result(ValType::I32)));
+        f.instruction(&I::LocalGet(t));
+        f.instruction(&I::I32Const(len as i32));
+        f.instruction(&I::I32Const(store as i32));
+        f.instruction(&I::Call(map));
+        f.instruction(&I::Else);
+        f.instruction(&I::LocalGet(t));
+        f.instruction(&I::I32Const(map::RAM_MIRROR as i32));
+        f.instruction(&I::I32And);
+        f.instruction(&I::End);
+    }
+
+    /// The same with no scratch local, always through `psx.map_access`;
+    /// `len` pushes the byte count.
+    pub fn offset_call(self, f: &mut Function, store: bool, len: impl FnOnce(&mut Function)) {
+        let Some(map) = self.map else { return mask(f) };
+        len(f);
+        f.instruction(&I::I32Const(store as i32));
+        f.instruction(&I::Call(map));
+    }
+
+    /// The window offset of the `len` bytes at constant guest `addr`.
+    pub fn constant(self, addr: u32, len: u32, store: bool) -> Result<u32> {
+        match self.map {
+            None => Ok(addr & WINDOW_MASK),
+            Some(_) => map::access(addr, len, store).with_context(|| format!("{len} bytes at {addr:#010x}: bus error")),
+        }
+    }
+
+    /// A memarg at the window.
+    pub fn memarg(self, align: u32) -> MemArg {
+        masked(self.base, align)
+    }
+}
+
+fn mask(f: &mut Function) {
+    f.instruction(&I::I32Const(WINDOW_MASK as i32));
+    f.instruction(&I::I32And);
+}
+
+/// The dispatch-table index of the function pointer in local `a`
+/// (psxw-abi `map::code_index`): RAM through KUSEG and KSEG0 inline,
+/// anything else through `psx.map_code` (`map_code`), which traps where no
+/// code can be.
+pub fn code_index(f: &mut Function, a: u32, map_code: u32) {
+    f.instruction(&I::LocalGet(a));
+    f.instruction(&I::I32Const(map::FAST_MASK as i32));
+    f.instruction(&I::I32And);
+    f.instruction(&I::If(BlockType::Result(ValType::I32)));
+    f.instruction(&I::LocalGet(a));
+    f.instruction(&I::Call(map_code));
+    f.instruction(&I::Else);
+    f.instruction(&I::LocalGet(a));
+    f.instruction(&I::I32Const((map::RAM_MIRROR & !3) as i32));
+    f.instruction(&I::I32And);
+    f.instruction(&I::I32Const(2));
+    f.instruction(&I::I32ShrU);
+    f.instruction(&I::End);
 }
 
 struct TypeMap<'r, R: Resolver> {
@@ -128,7 +220,8 @@ pub fn rewrite_mapped<R: Resolver>(
     mut offsets: Option<&mut Vec<(u32, u32)>>,
 ) -> Result<Function> {
     let dirty = r.dirty_map();
-    let window = r.window_base();
+    let win = Window { base: r.window_base(), map: r.map_access() };
+    let window = win.base;
     let io = r.io_check();
     let f = &obj.funcs[func];
     let ty = &obj.types[f.ty as usize];
@@ -140,7 +233,7 @@ pub fn rewrite_mapped<R: Resolver>(
         locals.push((n, crate::marshal::val(t)));
         nlocals += n;
     }
-    // Scratch locals for the masking pass.
+    // Scratch locals for the memory pass.
     let t_i32 = nlocals;
     let t_i32b = nlocals + 1;
     let t_i64 = nlocals + 2;
@@ -148,7 +241,7 @@ pub fn rewrite_mapped<R: Resolver>(
     let t_f64 = nlocals + 4;
     let t_addr = nlocals + 5;
     // Bulk memory: destination, index and byte (see `Bulk`).
-    let bulk = Bulk { n: t_i32b, from: t_i32, dst: nlocals + 6, i: nlocals + 7, byte: nlocals + 8, addr: t_addr, window };
+    let bulk = Bulk { n: t_i32b, from: t_i32, dst: nlocals + 6, i: nlocals + 7, byte: nlocals + 8, addr: t_addr, win };
     locals.extend([(2, ValType::I32), (1, ValType::I64), (1, ValType::F32), (1, ValType::F64), (4, ValType::I32)]);
     let mut out = Function::new(locals);
     let index = func as u32 + obj.num_imported_funcs();
@@ -209,8 +302,7 @@ pub fn rewrite_mapped<R: Resolver>(
             ($memarg:expr, $ins:ident, $size:expr) => {{
                 let (off, rel) = mem_reloc(r)?.unwrap_or(($memarg.offset, None));
                 add_off(&mut out, off, rel);
-                out.instruction(&I::I32Const(WINDOW_MASK as i32));
-                out.instruction(&I::I32And);
+                win.offset(&mut out, t_addr, $size, false);
                 if let Some(check) = io {
                     io_guard(&mut out, t_addr, check, $size);
                 }
@@ -222,8 +314,7 @@ pub fn rewrite_mapped<R: Resolver>(
                 let (off, rel) = mem_reloc(r)?.unwrap_or(($memarg.offset, None));
                 out.instruction(&I::LocalSet($tmp));
                 add_off(&mut out, off, rel);
-                out.instruction(&I::I32Const(WINDOW_MASK as i32));
-                out.instruction(&I::I32And);
+                win.offset(&mut out, t_addr, $size, true);
                 if dirty.is_some() || io.is_some() {
                     out.instruction(&I::LocalTee(t_addr));
                 }
@@ -430,7 +521,7 @@ fn io_call(out: &mut Function, t_addr: u32, check: u32, kind: u32) {
 
 /// Scratch locals for `memory.copy` and `memory.fill`: byte count, source
 /// address (a fill's value), destination, index, the byte moved, and the
-/// masked address of an access.
+/// window offset of an access.
 #[derive(Clone, Copy)]
 struct Bulk {
     n: u32,
@@ -439,15 +530,16 @@ struct Bulk {
     i: u32,
     byte: u32,
     addr: u32,
-    window: u32,
+    win: Window,
 }
 
 impl Bulk {
     /// A bulk copy (`[dst, src, n]` on the stack) or fill (`[dst, value,
-    /// n]`): masked into the window, the destination's pages marked dirty,
-    /// and the budget spent ([`Resolver::bulk_spend`]). With an I/O hook,
-    /// one whose bytes reach the I/O window moves them one at a time
-    /// through it, as the loads and stores it stands for would.
+    /// n]`): each side's `n` bytes mapped into the window (all in one
+    /// region), the destination's pages marked dirty, and the budget spent
+    /// ([`Resolver::bulk_spend`]). With an I/O hook, one whose bytes reach
+    /// the I/O ports moves them one at a time through it, as the loads and
+    /// stores it stands for would.
     fn emit<R: Resolver>(self, out: &mut Function, r: &mut R, copy: bool, io: Option<u32>, dirty: Option<u32>) -> Result<()> {
         out.instruction(&I::LocalSet(self.n));
         out.instruction(&I::LocalSet(self.from));
@@ -463,13 +555,13 @@ impl Bulk {
             out.instruction(&I::Else);
         }
         out.instruction(&I::LocalGet(self.dst));
-        mask_plus_base(out, self.window);
+        self.wasm_addr(out, true);
         if dirty.is_some() {
             mark(out, self.addr, self.n, r.mark_range());
         }
         out.instruction(&I::LocalGet(self.from));
         if copy {
-            mask_plus_base(out, self.window);
+            self.wasm_addr(out, false);
             out.instruction(&I::LocalGet(self.n));
             out.instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 0 });
         } else {
@@ -485,11 +577,20 @@ impl Bulk {
         Ok(())
     }
 
-    /// Whether `[addr, addr + n)`, masked, reaches the I/O window.
+    /// The wasm address of the `n` bytes at the guest address on the stack.
+    fn wasm_addr(self, out: &mut Function, store: bool) {
+        self.win.offset_call(out, store, |f| {
+            f.instruction(&I::LocalGet(self.n));
+        });
+        out.instruction(&I::I32Const(self.win.base as i32));
+        out.instruction(&I::I32Add);
+    }
+
+    /// Whether `[addr, addr + n)` reaches the I/O ports (physically).
     fn touches_io(self, out: &mut Function, addr: u32) {
-        let io = psxw_abi::phys::IO;
+        let io = map::IO;
         out.instruction(&I::LocalGet(addr));
-        out.instruction(&I::I32Const(WINDOW_MASK as i32));
+        out.instruction(&I::I32Const(0x1FFF_FFFF));
         out.instruction(&I::I32And);
         out.instruction(&I::LocalTee(self.addr));
         out.instruction(&I::I32Const(io.end as i32));
@@ -504,12 +605,11 @@ impl Bulk {
 
     /// Byte by byte, each load and store through the I/O hook.
     fn bytes(self, out: &mut Function, copy: bool, check: u32, dirty: Option<u32>) {
-        let at = |out: &mut Function, base: u32| {
+        let at = |out: &mut Function, base: u32, store: bool| {
             out.instruction(&I::LocalGet(base));
             out.instruction(&I::LocalGet(self.i));
             out.instruction(&I::I32Add);
-            out.instruction(&I::I32Const(WINDOW_MASK as i32));
-            out.instruction(&I::I32And);
+            self.win.offset(out, self.addr, 1, store);
         };
         out.instruction(&I::I32Const(0));
         out.instruction(&I::LocalSet(self.i));
@@ -520,17 +620,17 @@ impl Bulk {
         out.instruction(&I::I32GeU);
         out.instruction(&I::BrIf(1));
         if copy {
-            at(out, self.from);
+            at(out, self.from, false);
             io_guard(out, self.addr, check, 1);
-            out.instruction(&I::I32Load8U(masked(self.window, 0)));
+            out.instruction(&I::I32Load8U(self.win.memarg(0)));
         } else {
             out.instruction(&I::LocalGet(self.from));
         }
         out.instruction(&I::LocalSet(self.byte));
-        at(out, self.dst);
+        at(out, self.dst, true);
         out.instruction(&I::LocalTee(self.addr));
         out.instruction(&I::LocalGet(self.byte));
-        out.instruction(&I::I32Store8(masked(self.window, 0)));
+        out.instruction(&I::I32Store8(self.win.memarg(0)));
         io_after_store(out, self.addr, check, 1);
         if let Some(map) = dirty {
             out.instruction(&I::LocalGet(self.addr));
@@ -555,12 +655,4 @@ fn mark(out: &mut Function, t_addr: u32, n: u32, helper: u32) {
     out.instruction(&I::LocalGet(n));
     out.instruction(&I::Call(helper));
     out.instruction(&I::LocalGet(t_addr));
-}
-
-/// `(addr & WINDOW_MASK) + window`, for bulk-memory operands.
-fn mask_plus_base(out: &mut Function, window: u32) {
-    out.instruction(&I::I32Const(WINDOW_MASK as i32));
-    out.instruction(&I::I32And);
-    out.instruction(&I::I32Const(window as i32));
-    out.instruction(&I::I32Add);
 }

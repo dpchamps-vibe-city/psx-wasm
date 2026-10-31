@@ -19,12 +19,13 @@ use anyhow::{Result, bail};
 use psxw_inputs::{AddressMap, originals::Originals};
 use std::collections::{BTreeMap, HashMap};
 
-/// Start of the AUX region (window offset `phys::AUX_DATA.start`).
-pub const AUX_BASE: u32 = 0x8000_0000 | psxw_abi::phys::AUX_DATA.start;
-pub const AUX_END: u32 = 0x8000_0000 | psxw_abi::phys::AUX_DATA.end;
+/// The AUX region (window offsets `phys::AUX_DATA`) at its own guest
+/// addresses (psxw-abi `own`).
+pub const AUX_BASE: u32 = psxw_abi::own(psxw_abi::phys::AUX_DATA.start);
+pub const AUX_END: u32 = psxw_abi::own(psxw_abi::phys::AUX_DATA.end);
 /// Static mods' data: from the mod area's start up to its stack.
-pub const MOD_BASE: u32 = 0x8000_0000 | psxw_abi::phys::MOD_DATA.start;
-pub const MOD_END: u32 = 0x8000_0000 | psxw_abi::phys::MOD_STACK.start;
+pub const MOD_BASE: u32 = psxw_abi::own(psxw_abi::phys::MOD_DATA.start);
+pub const MOD_END: u32 = psxw_abi::own(psxw_abi::phys::MOD_STACK.start);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum How {

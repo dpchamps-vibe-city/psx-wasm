@@ -9,10 +9,10 @@
 //! number of words, as they lie.
 
 use crate::object::FuncType;
+use crate::rewrite::Window;
 use anyhow::{Result, bail};
-use psxw_abi::WINDOW_MASK;
 use psxw_cc::protos::{Kind, Proto};
-use wasm_encoder::{Function, Instruction as I, MemArg, ValType};
+use wasm_encoder::{Function, Instruction as I, ValType};
 
 /// Words copied from a va-buffer after the fixed arguments when the
 /// variadic calls' arguments aren't known.
@@ -163,29 +163,27 @@ pub fn call_words(kinds: &[Kind], variadic: bool, calls: &[Vec<Kind>]) -> Result
     Ok((w, fixed))
 }
 
-fn memarg(window: u32, align: u32) -> MemArg {
-    MemArg { offset: window as u64, align, memory_index: 0 }
+/// The window offset of the guest word at the address on top of the stack
+/// (a stack argument: wherever the guest put its stack).
+fn word_offset(f: &mut Function, window: Window, store: bool) {
+    window.offset_call(f, store, |f| {
+        f.instruction(&I::I32Const(4));
+    });
 }
 
-/// Mask the guest address on top of the stack into the window.
-pub fn mask(f: &mut Function) {
-    f.instruction(&I::I32Const(WINDOW_MASK as i32));
-    f.instruction(&I::I32And);
-}
-
-/// Push guest word at `local + off` (the window at wasm address `window`).
-pub fn load_word(f: &mut Function, window: u32, local: u32, off: u32) {
+/// Push guest word at `local + off`.
+pub fn load_word(f: &mut Function, window: Window, local: u32, off: u32) {
     f.instruction(&I::LocalGet(local));
     if off != 0 {
         f.instruction(&I::I32Const(off as i32));
         f.instruction(&I::I32Add);
     }
-    mask(f);
-    f.instruction(&I::I32Load(memarg(window, 0)));
+    word_offset(f, window, false);
+    f.instruction(&I::I32Load(window.memarg(0)));
 }
 
 /// Push word `w` from the C side's parameters.
-pub fn push_word(f: &mut Function, window: u32, w: Word) {
+pub fn push_word(f: &mut Function, window: Window, w: Word) {
     match w {
         Word::Param(n) => {
             f.instruction(&I::LocalGet(n));
@@ -309,12 +307,12 @@ pub fn val(t: wasmparser::ValType) -> ValType {
 ///
 /// `before_args` pushes leading operands of the callee (e.g. call-out kind
 /// and target); `after_args` pushes trailing ones (e.g. the new sp).
-/// The guest window is at wasm address `window`.
+/// Guest addresses reach the window through `window`.
 pub fn c_to_o32(
     sig: &FuncType,
     words: &[Word],
     sp_global: u32,
-    window: u32,
+    window: Window,
     before_args: &dyn Fn(&mut Function),
     after_args: &dyn Fn(&mut Function, u32),
     call: &dyn Fn(&mut Function),
@@ -333,9 +331,9 @@ pub fn c_to_o32(
         f.instruction(&I::LocalGet(new_sp));
         f.instruction(&I::I32Const(4 * k as i32));
         f.instruction(&I::I32Add);
-        mask(&mut f);
+        word_offset(&mut f, window, true);
         push_word(&mut f, window, w);
-        f.instruction(&I::I32Store(memarg(window, 2)));
+        f.instruction(&I::I32Store(window.memarg(2)));
     }
     f.instruction(&I::LocalGet(new_sp));
     f.instruction(&I::GlobalSet(sp_global));
@@ -355,7 +353,7 @@ pub fn c_to_o32(
 /// Body of an o32→C wrapper `(a0..a3) -> i64` calling a C function with
 /// signature `sig` (function index `callee`). Structs by value and
 /// va-buffers are rebuilt on the guest stack below the caller's frame.
-pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u32, window: u32) -> Function {
+pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u32, window: Window) -> Function {
     let (kinds, variadic) = param_kinds(sig, proto);
     let (ws, _) = words(&kinds, variadic);
     // Locals: 0..3 = a0..a3, 4 = entry sp, 5 = scratch base.
@@ -396,9 +394,9 @@ pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u
             f.instruction(&I::LocalGet(scratch));
             f.instruction(&I::I32Const((at + 4 * j as u32) as i32));
             f.instruction(&I::I32Add);
-            mask(&mut f);
+            word_offset(&mut f, window, true);
             word(&mut f, k);
-            f.instruction(&I::I32Store(memarg(window, 2)));
+            f.instruction(&I::I32Store(window.memarg(2)));
         }
         at += 4 * ks.len() as u32;
     }
@@ -483,8 +481,8 @@ pub struct WrapGlobals {
     /// `$sp` and `hook_id` this wrapper's id, so the callee's call to the
     /// next link ([`c_to_o32_transparent`]) reuses the caller's frame.
     pub hook: Option<(u32, u32, i32)>,
-    /// The guest window's wasm address.
-    pub window: u32,
+    /// How guest addresses reach the window.
+    pub window: Window,
 }
 
 /// Body of an o32-to-C wrapper into a mod's C function `callee` (signature
@@ -535,9 +533,9 @@ pub fn o32_to_c_with(sig: &FuncType, proto: Option<&Proto>, callee: u32, shape: 
             f.instruction(&I::LocalGet(base));
             f.instruction(&I::I32Const((at + 4 * j as u32) as i32));
             f.instruction(&I::I32Add);
-            mask(&mut f);
+            word_offset(&mut f, window, true);
             word(&mut f, k);
-            f.instruction(&I::I32Store(memarg(window, 2)));
+            f.instruction(&I::I32Store(window.memarg(2)));
         }
         at += 4 * ks.len() as u32;
     }
@@ -637,7 +635,7 @@ pub fn o32_to_c_with(sig: &FuncType, proto: Option<&Proto>, callee: u32, shape: 
 /// reuses the patch's caller's frame (`hook_sp`) instead of reserving one,
 /// so the next link sees the `$sp` and stack arguments the hooked
 /// function's caller set up.
-pub fn c_to_o32_transparent(sig: &FuncType, words: &[Word], sp_global: u32, window: u32, hook: (u32, u32, i32), call: u32) -> Function {
+pub fn c_to_o32_transparent(sig: &FuncType, words: &[Word], sp_global: u32, window: Window, hook: (u32, u32, i32), call: u32) -> Function {
     let (hsp, hid, id) = hook;
     let n = sig.params.len() as u32;
     let old_sp = n;
@@ -661,9 +659,9 @@ pub fn c_to_o32_transparent(sig: &FuncType, words: &[Word], sp_global: u32, wind
         f.instruction(&I::LocalGet(new_sp));
         f.instruction(&I::I32Const(4 * k as i32));
         f.instruction(&I::I32Add);
-        mask(&mut f);
+        word_offset(&mut f, window, true);
         push_word(&mut f, window, w);
-        f.instruction(&I::I32Store(memarg(window, 2)));
+        f.instruction(&I::I32Store(window.memarg(2)));
     }
     f.instruction(&I::LocalGet(new_sp));
     f.instruction(&I::GlobalSet(sp_global));
@@ -716,7 +714,7 @@ mod tests {
         let narrow = [Kind::I8 { signed: true }, Kind::I8 { signed: false }, Kind::I16 { signed: true }, Kind::I16 { signed: false }];
         let sig = FuncType { params: vec![I32; 4], results: vec![] };
         let proto = Proto { name: "f".into(), defined: true, ret: Kind::Void, params: narrow.to_vec(), variadic: false, va_calls: Vec::new() };
-        let bytes = o32_to_c(&sig, Some(&proto), 0, 0, 0).into_raw_body();
+        let bytes = o32_to_c(&sig, Some(&proto), 0, 0, Window::masked(0)).into_raw_body();
         let body = FunctionBody::new(BinaryReader::new(&bytes, 0));
         let ops: Vec<O> = body.get_operators_reader().unwrap().into_iter().collect::<Result<_, _>>().unwrap();
         // What follows each parameter's word.

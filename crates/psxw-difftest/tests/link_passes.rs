@@ -93,7 +93,7 @@ fn guest_passes_and_adapters() {
     // The format string has no original address: AUX.
     assert_eq!(linked.aux.len(), 1);
     let fmt = linked.aux[0].2;
-    assert_eq!(fmt & 0xFFF0_0000, 0x8020_0000);
+    assert_eq!(fmt & 0xFFF0_0000, psxw_abi::own(psxw_abi::phys::AUX_DATA.start));
 
     let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
     let f = h.func("c").unwrap();

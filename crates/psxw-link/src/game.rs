@@ -20,7 +20,7 @@ use crate::mods::{Impl, Layer, ModSpec, PatchValue};
 use crate::object::{FuncType, NameClass, SymbolKind, WasmObject, classify_name};
 use crate::rewrite::{self, Lowered, Resolver};
 use anyhow::{Context as _, Result, bail, ensure};
-use psxw_abi::{TABLE_LEN, WINDOW_MASK, guest, psx, table_index};
+use psxw_abi::{TABLE_LEN, guest, psx, table_index};
 use psxw_inputs::AddressMap;
 use psxw_inputs::originals::Originals;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -218,6 +218,8 @@ pub(crate) fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::RETURN_FROM_EXCEPTION, vec![], vec![]),
         (psx::MOD_LOG, vec![i, i], vec![]),
         (psx::NOT_RESIDENT, vec![i, i], vec![]),
+        (psx::MAP_ACCESS, vec![i; 3], vec![i]),
+        (psx::MAP_CODE, vec![i], vec![i]),
     ]
 }
 
@@ -430,6 +432,11 @@ impl Ctx<'_> {
 
     fn import(&self, name: &str) -> u32 {
         self.imports[name]
+    }
+
+    /// How guest addresses reach the window: the console's map.
+    fn window(&self) -> rewrite::Window {
+        rewrite::Window { base: self.spec.window_base, map: Some(self.import(psx::MAP_ACCESS)) }
     }
 
     /// The o32 entry of the function at (container, addr): its hook chain
@@ -782,6 +789,10 @@ impl Resolver for R<'_, '_> {
         self.ctx.spec.window_base
     }
 
+    fn map_access(&mut self) -> Option<u32> {
+        Some(self.ctx.import(psx::MAP_ACCESS))
+    }
+
     fn dirty_map(&self) -> Option<u32> {
         None
     }
@@ -953,30 +964,24 @@ pub(crate) fn o32() -> FuncType {
 }
 
 /// `(addr, a0..a3) -> i64` through the dispatch table, trapping into
-/// `psx.untranslated` on an empty slot. `addr` is local `a`, arguments
-/// locals `args`.
-fn dispatch(f: &mut Function, a: u32, args: [u32; 4], untranslated: u32, o32_ty: u32) {
-    f.instruction(&I::LocalGet(a));
-    f.instruction(&I::I32Const(0x003F_FFFC));
-    f.instruction(&I::I32And);
-    f.instruction(&I::I32Const(2));
-    f.instruction(&I::I32ShrU);
+/// `psx.untranslated` on an empty slot (and in `psx.map_code` where no code
+/// can be). `addr` is local `a`, arguments locals `args`; local `idx` is
+/// scratch.
+fn dispatch(ctx: &Ctx, f: &mut Function, a: u32, args: [u32; 4], idx: u32) {
+    rewrite::code_index(f, a, ctx.import(psx::MAP_CODE));
+    f.instruction(&I::LocalTee(idx));
     f.instruction(&I::TableGet(0));
     f.instruction(&I::RefIsNull);
     f.instruction(&I::If(BlockType::Empty));
     f.instruction(&I::LocalGet(a));
-    f.instruction(&I::Call(untranslated));
+    f.instruction(&I::Call(ctx.import(psx::UNTRANSLATED)));
     f.instruction(&I::Return);
     f.instruction(&I::End);
     for l in args {
         f.instruction(&I::LocalGet(l));
     }
-    f.instruction(&I::LocalGet(a));
-    f.instruction(&I::I32Const(0x003F_FFFC));
-    f.instruction(&I::I32And);
-    f.instruction(&I::I32Const(2));
-    f.instruction(&I::I32ShrU);
-    f.instruction(&I::CallIndirect { type_index: o32_ty, table_index: 0 });
+    f.instruction(&I::LocalGet(idx));
+    f.instruction(&I::CallIndirect { type_index: ctx.o32_ty, table_index: 0 });
 }
 
 /// Check residency unit `k`'s code again if the disc wrote into it.
@@ -991,7 +996,8 @@ fn refresh_unknown(ctx: &mut Ctx, f: &mut Function, k: u32) {
 
 fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
     let sp = ctx.sp;
-    let window = ctx.spec.window_base;
+    let win = ctx.window();
+    let window = win.base;
     Ok(match s.clone() {
         Synth::ToO32 { input, name, sig, target } => {
             let proto = ctx.inputs[input].protos.get(&name);
@@ -999,7 +1005,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let calls = proto.map_or(&[][..], |p| &p.va_calls);
             let (words, _) = marshal::call_words(&kinds, variadic, calls)
                 .with_context(|| format!("{}: variadic calls to {name}", ctx.inputs[input].label))?;
-            let f = marshal::c_to_o32(&sig, &words, sp, window, &|_| {}, &|_, _| {}, &|f| {
+            let f = marshal::c_to_o32(&sig, &words, sp, win, &|_| {}, &|_, _| {}, &|f| {
                 f.instruction(&I::Call(target));
             });
             (sig, f, format!("o32_call:{name}"))
@@ -1014,7 +1020,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             };
             let proto = ctx.inputs[input].protos.get(&guest_name);
             let callee = ctx.guest[&(input, func)];
-            (o32(), marshal::o32_to_c(&sig, proto, callee, sp, window), format!("o32:{guest_name}"))
+            (o32(), marshal::o32_to_c(&sig, proto, callee, sp, win), format!("o32:{guest_name}"))
         }
         Synth::AdapterThunk { id, addr } => {
             let mut f = Function::new([]);
@@ -1094,8 +1100,9 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let mut f = Function::new([]);
             f.instruction(&I::I64Const(HASH_START as i64));
             for r in &u.text {
-                f.instruction(&I::I32Const((r.start & WINDOW_MASK) as i32));
-                f.instruction(&I::I32Const((r.start & WINDOW_MASK) as i32 + (r.end - r.start) as i32));
+                let at = win.constant(r.start, r.end - r.start, false).context("overlay text")? as i32;
+                f.instruction(&I::I32Const(at));
+                f.instruction(&I::I32Const(at + (r.end - r.start) as i32));
                 f.instruction(&I::Call(hash));
             }
             f.instruction(&I::I64Const(u.hash as i64));
@@ -1191,24 +1198,19 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let mut helper = sig.clone();
             helper.params.push(V::I32);
             let target = sig.params.len() as u32;
-            let (unt, o32_ty) = (ctx.import(psx::UNTRANSLATED), ctx.o32_ty);
+            let (map_code, o32_ty) = (ctx.import(psx::MAP_CODE), ctx.o32_ty);
             // The o32 arguments are already pushed when `call` runs; spill
             // them to fresh locals so the dispatch can push them again.
-            let f = marshal::c_to_o32(&helper, &words, sp, window, &|_| {}, &|_, _| {}, &|f| {
+            let f = marshal::c_to_o32(&helper, &words, sp, win, &|_| {}, &|_, _| {}, &|f| {
                 // stack: a0 a1 a2 a3 — leave them for the indirect call.
-                f.instruction(&I::LocalGet(target));
-                f.instruction(&I::I32Const(0x003F_FFFC));
-                f.instruction(&I::I32And);
-                f.instruction(&I::I32Const(2));
-                f.instruction(&I::I32ShrU);
+                rewrite::code_index(f, target, map_code);
                 f.instruction(&I::CallIndirect { type_index: o32_ty, table_index: 0 });
-                let _ = unt;
             });
             (helper, f, "icall".into())
         }
         Synth::Indirect => {
-            let mut f = Function::new([]);
-            dispatch(&mut f, 0, [1, 2, 3, 4], ctx.import(psx::UNTRANSLATED), ctx.o32_ty);
+            let mut f = Function::new([(1, ValType::I32)]);
+            dispatch(ctx, &mut f, 0, [1, 2, 3, 4], 5);
             f.instruction(&I::End);
             (FuncType { params: vec![V::I32; 5], results: vec![V::I64] }, f, "call_indirect".into())
         }
@@ -1216,9 +1218,11 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             // Locals 5 and 6: $sp and $gp at the call, restored when a
             // ReturnFromException unwinds (it returns to the interrupted
             // context, as the BIOS restores the saved registers). With
-            // mods, 7..9: the mod stack and the hook frame, likewise.
+            // mods, 7..9: the mod stack and the hook frame, likewise. The
+            // last local is the dispatch's.
             let mod_globals = if ctx.spec.mods.is_some() { vec![ctx.mod_sp, ctx.hook_sp, ctx.hook_id] } else { vec![] };
-            let mut f = Function::new([(2 + mod_globals.len() as u32, ValType::I32)]);
+            let idx = 7 + mod_globals.len() as u32;
+            let mut f = Function::new([(3 + mod_globals.len() as u32, ValType::I32)]);
             f.instruction(&I::GlobalGet(ctx.sp));
             f.instruction(&I::LocalSet(5));
             f.instruction(&I::GlobalGet(ctx.gp));
@@ -1229,7 +1233,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             }
             f.instruction(&I::Block(BlockType::Empty));
             f.instruction(&I::TryTable(BlockType::Result(ValType::I64), vec![Catch::One { tag: RFE_TAG, label: 0 }].into()));
-            dispatch(&mut f, 0, [1, 2, 3, 4], ctx.import(psx::UNTRANSLATED), ctx.o32_ty);
+            dispatch(ctx, &mut f, 0, [1, 2, 3, 4], idx);
             f.instruction(&I::End);
             f.instruction(&I::Return);
             f.instruction(&I::End);
@@ -1315,18 +1319,18 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
         }
         Synth::O32WrapOf { callee, sig, input, name } => {
             let proto = ctx.inputs[input].protos.get(&name);
-            (o32(), marshal::o32_to_c(&sig, proto, callee, sp, window), format!("o32:hook:{name}"))
+            (o32(), marshal::o32_to_c(&sig, proto, callee, sp, win), format!("o32:hook:{name}"))
         }
         Synth::CLayer { befores, core, afters, sig, input, name } => {
             let proto = ctx.inputs[input].protos.get(&name);
-            (sig.clone(), c_layer(ctx.mod_sp, window, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
+            (sig.clone(), c_layer(ctx.mod_sp, win, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
         }
         Synth::O32Layer { befores, core, afters, returns } => (o32(), o32_layer(&befores, core, &afters, returns), "hook:o32".into()),
         Synth::ModWrap { input, func, hook } => {
             let sig = ctx.func_sig(input, func);
             let name = guest_name(ctx, input, func);
             let proto = ctx.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: hook.map(|id| (ctx.hook_sp, ctx.hook_id, id)), window };
+            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: hook.map(|id| (ctx.hook_sp, ctx.hook_id, id)), window: win };
             let callee = ctx.guest[&(input, func)];
             (o32(), marshal::o32_to_c_with(&sig, proto, callee, marshal::Shape::O32, g), format!("o32:mod:{name}"))
         }
@@ -1334,7 +1338,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let sig = ctx.func_sig(input, func);
             let name = guest_name(ctx, input, func);
             let proto = ctx.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: None, window };
+            let g = marshal::WrapGlobals { sp, scratch: ctx.mod_sp, hook: None, window: win };
             let callee = ctx.guest[&(input, func)];
             let mut params = if result { vec![V::I64] } else { vec![] };
             params.extend([V::I32; 4]);
@@ -1345,7 +1349,7 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let proto = ctx.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
             let (words, _) = marshal::words(&kinds, variadic);
-            let f = marshal::c_to_o32_transparent(&sig, &words, sp, window, (ctx.hook_sp, ctx.hook_id, id), next);
+            let f = marshal::c_to_o32_transparent(&sig, &words, sp, win, (ctx.hook_sp, ctx.hook_id, id), next);
             (sig, f, format!("original:{name}"))
         }
         Synth::SlotC { slot, callee, sig } => {
@@ -1440,9 +1444,9 @@ pub(crate) fn o32_layer(befores: &[u32], core: u32, afters: &[u32], returns: boo
 /// A C-typed hook layer: the befores, then `core` (with copies of structs
 /// passed by value, so the afters see the arguments as passed), then the
 /// afters, each after taking the result first. `mod_sp`: the mod stack's
-/// global; `window`: the guest window's wasm address; `proto`: the hooked
-/// function's prototype facts.
-pub(crate) fn c_layer(mod_sp: u32, window: u32, proto: Option<&psxw_cc::protos::Proto>, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)], sig: &FuncType) -> Function {
+/// global; `window`: how guest addresses reach the window; `proto`: the
+/// hooked function's prototype facts.
+pub(crate) fn c_layer(mod_sp: u32, window: rewrite::Window, proto: Option<&psxw_cc::protos::Proto>, befores: &[(u32, bool)], core: u32, afters: &[(u32, bool)], sig: &FuncType) -> Function {
     let n = sig.params.len() as u32;
     let (kinds, _) = marshal::param_kinds(sig, proto);
     let byval: Vec<(u32, u32)> = if afters.iter().all(|(_, bare)| *bare) {
@@ -1481,11 +1485,12 @@ pub(crate) fn c_layer(mod_sp: u32, window: u32, proto: Option<&psxw_cc::protos::
             f.instruction(&I::I32Sub);
             f.instruction(&I::LocalTee(at));
             f.instruction(&I::GlobalSet(mod_sp));
-            for (l, _) in [(at, 0), (p, 0)] {
+            for (l, store) in [(at, true), (p, false)] {
                 f.instruction(&I::LocalGet(l));
-                f.instruction(&I::I32Const(WINDOW_MASK as i32));
-                f.instruction(&I::I32And);
-                f.instruction(&I::I32Const(window as i32));
+                window.offset_call(&mut f, store, |f| {
+                    f.instruction(&I::I32Const(size as i32));
+                });
+                f.instruction(&I::I32Const(window.base as i32));
                 f.instruction(&I::I32Add);
             }
             f.instruction(&I::I32Const(size as i32));
@@ -1536,10 +1541,19 @@ fn patch_bytes(ctx: &Ctx, v: &PatchValue) -> Result<Vec<u8>> {
     })
 }
 
-pub(crate) fn store_byte(f: &mut Function, window: u32, addr: u32, b: u8) {
-    f.instruction(&I::I32Const((addr & WINDOW_MASK) as i32));
+/// A data patch's byte `b` at guest `addr`.
+pub(crate) fn store_byte(f: &mut Function, window: rewrite::Window, addr: u32, b: u8) -> Result<()> {
+    f.instruction(&I::I32Const(window.constant(addr, 1, true).context("data patch")? as i32));
     f.instruction(&I::I32Const(b as i32));
-    f.instruction(&I::I32Store8(MemArg { offset: window as u64, align: 0, memory_index: 0 }));
+    f.instruction(&I::I32Store8(window.memarg(0)));
+    Ok(())
+}
+
+/// Load the guest word at constant `addr`.
+pub(crate) fn load_word(f: &mut Function, window: rewrite::Window, addr: u32) -> Result<()> {
+    f.instruction(&I::I32Const(window.constant(addr, 4, false)? as i32));
+    f.instruction(&I::I32Load(window.memarg(2)));
+    Ok(())
 }
 
 /// `psxmod_init`: the executable's data patches, in load order.
@@ -1549,9 +1563,10 @@ fn mod_init(ctx: &mut Ctx) -> Result<Function> {
         return Ok(call_registered(n, tables::ON_INIT, t, 0, None));
     }
     let mut f = Function::new([]);
+    let window = ctx.window();
     for d in ctx.spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_none()) {
         for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
-            store_byte(&mut f, ctx.spec.window_base, d.addr + k as u32, b);
+            store_byte(&mut f, window, d.addr + k as u32, b)?;
         }
     }
     f.instruction(&I::End);
@@ -1645,21 +1660,17 @@ fn mod_loaded(ctx: &mut Ctx) -> Result<Function> {
         f.instruction(&I::GlobalSet(g));
         f.instruction(&I::End);
     }
-    let window = ctx.spec.window_base;
-    let load = |f: &mut Function, a: u32| {
-        f.instruction(&I::I32Const((a & WINDOW_MASK) as i32));
-        f.instruction(&I::I32Load(MemArg { offset: window as u64, align: 2, memory_index: 0 }));
-    };
+    let window = ctx.window();
     let mut by: BTreeMap<String, Vec<(&crate::mods::DataPatch, u32)>> = BTreeMap::new();
     for &(d, g) in &patches {
         by.entry(d.container.clone()).or_default().push((d, g));
     }
     for group in by.values() {
         let id = group[0].0.resident.expect("overlay patch");
-        load(&mut f, id.at);
+        load_word(&mut f, window, id.at)?;
         f.instruction(&I::I32Const(id.words[0] as i32));
         f.instruction(&I::I32Eq);
-        load(&mut f, id.at + 4);
+        load_word(&mut f, window, id.at + 4)?;
         f.instruction(&I::I32Const(id.words[1] as i32));
         f.instruction(&I::I32Eq);
         f.instruction(&I::I32And);
@@ -1668,7 +1679,7 @@ fn mod_loaded(ctx: &mut Ctx) -> Result<Function> {
             f.instruction(&I::GlobalGet(g));
             f.instruction(&I::If(BlockType::Empty));
             for (k, b) in patch_bytes(ctx, &d.value)?.into_iter().enumerate() {
-                store_byte(&mut f, ctx.spec.window_base, d.addr + k as u32, b);
+                store_byte(&mut f, window, d.addr + k as u32, b)?;
             }
             f.instruction(&I::I32Const(0));
             f.instruction(&I::GlobalSet(g));
@@ -2107,7 +2118,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     if has_mods {
         // The mod stack (a guest address), the hook frame's sp and id, then
         // a pending flag per overlay data patch.
-        inits.extend([(0x8000_0000u32 | psxw_abi::phys::MOD_STACK.end) as i32, 0, 0]);
+        inits.extend([psxw_abi::own(psxw_abi::phys::MOD_STACK.end) as i32, 0, 0]);
         inits.extend(overlay_patches(&ctx).iter().map(|_| 0));
     }
     if spec.slots.is_some() {
@@ -2191,11 +2202,13 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             ctx.map.resolve(&ctx.inputs[input].container, n).map(|r| r.addr).context("function without address")
         };
         let bytes = ctx.layout.bytes_of(&ctx.view, map, i, si, &fa)?;
-        data.active(0, &ConstExpr::i32_const((spec.window_base + (addr & WINDOW_MASK)) as i32), bytes);
+        let at = ctx.window().constant(addr, bytes.len() as u32, true).context("AUX data")?;
+        data.active(0, &ConstExpr::i32_const((spec.window_base + at) as i32), bytes);
         aux.push((inputs[i].label.clone(), inputs[i].obj.symbols[si as usize].name.clone(), addr));
     }
     if !names_blob.is_empty() {
-        data.active(0, &ConstExpr::i32_const((spec.window_base + (names_at & WINDOW_MASK)) as i32), names_blob);
+        let at = ctx.window().constant(names_at, names_blob.len() as u32, true).context("overlay names")?;
+        data.active(0, &ConstExpr::i32_const((spec.window_base + at) as i32), names_blob);
     }
     module.section(&data);
     let mut fnames = NameMap::new();

@@ -23,19 +23,19 @@
 //! same keeping the image: a hot swap with the same data layout) and
 //! `psxmod_loaded` (overlay data patches as the disc writes them).
 
-use crate::game::{c_layer, o32, o32_layer, service, store_byte};
+use crate::game::{c_layer, load_word, o32, o32_layer, service, store_byte};
 use crate::link::Input;
 use crate::marshal;
 use crate::mods::{DataPatch, Impl, Layer, PatchValue};
 use crate::object::{FuncType, NameClass, RelocKind, SymbolKind, classify_name};
 use crate::rewrite::{self, Lowered, Resolver};
 use anyhow::{Context as _, Result, bail, ensure};
-use psxw_abi::{WINDOW_BASE, WINDOW_MASK, table_index};
+use psxw_abi::{WINDOW_BASE, table_index};
 use psxw_inputs::AddressMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements, EntityType, ExportKind,
-    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction as I, MemArg,
+    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction as I,
     MemoryType, Module, NameMap, NameSection, RefType, TableType, TypeSection, ValType,
 };
 use wasmparser::ValType as V;
@@ -200,6 +200,12 @@ impl M<'_> {
 
     fn nimports(&self) -> u32 {
         self.imports.len() as u32
+    }
+
+    /// How guest addresses reach the window: the console's map, through
+    /// the base's `map_access`.
+    fn window(&self) -> rewrite::Window {
+        rewrite::Window { base: WINDOW_BASE, map: Some(self.import_ix[psxw_abi::psx::MAP_ACCESS]) }
     }
 
     fn synth(&mut self, s: S) -> u32 {
@@ -389,6 +395,10 @@ impl Resolver for R<'_, '_> {
         None
     }
 
+    fn map_access(&mut self) -> Option<u32> {
+        self.m.window().map
+    }
+
     fn mark_range(&mut self) -> u32 {
         unreachable!("no dirty map in a mod module")
     }
@@ -402,17 +412,16 @@ impl Resolver for R<'_, '_> {
     }
 }
 
-fn dispatch_call(f: &mut Function, o32_ty: u32) {
-    // stack: a0..a3, addr
-    f.instruction(&I::I32Const(0x003F_FFFC));
-    f.instruction(&I::I32And);
-    f.instruction(&I::I32Const(2));
-    f.instruction(&I::I32ShrU);
+/// With a0..a3 on the stack: the o32 call of the function pointer in local
+/// `a` (`map_code`: the base's `map_code`).
+fn dispatch_call(f: &mut Function, o32_ty: u32, a: u32, map_code: u32) {
+    rewrite::code_index(f, a, map_code);
     f.instruction(&I::CallIndirect { type_index: o32_ty, table_index: 0 });
 }
 
 fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
     let sp = m.g_sp;
+    let win = m.window();
     Ok(match s.clone() {
         S::NextC { k, sig } => {
             let tix = m.intern(&sig);
@@ -460,7 +469,7 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             let proto = m.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
             let (words, _) = marshal::words(&kinds, variadic);
-            let f = marshal::c_to_o32(&sig, &words, sp, WINDOW_BASE, &|_| {}, &|_, _| {}, &|f| {
+            let f = marshal::c_to_o32(&sig, &words, sp, win, &|_| {}, &|_, _| {}, &|f| {
                 f.instruction(&I::Call(target));
             });
             (sig, f, format!("o32_call:{name}"))
@@ -471,10 +480,9 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             let mut helper = sig.clone();
             helper.params.push(V::I32);
             let target = sig.params.len() as u32;
-            let o32_ty = m.o32_ty;
-            let f = marshal::c_to_o32(&helper, &words, sp, WINDOW_BASE, &|_| {}, &|_, _| {}, &|f| {
-                f.instruction(&I::LocalGet(target));
-                dispatch_call(f, o32_ty);
+            let (o32_ty, map_code) = (m.o32_ty, m.import_ix[psxw_abi::psx::MAP_CODE]);
+            let f = marshal::c_to_o32(&helper, &words, sp, win, &|_| {}, &|_, _| {}, &|f| {
+                dispatch_call(f, o32_ty, target, map_code);
             });
             (helper, f, "icall".into())
         }
@@ -483,22 +491,21 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             for l in 1..5 {
                 f.instruction(&I::LocalGet(l));
             }
-            f.instruction(&I::LocalGet(0));
-            dispatch_call(&mut f, m.o32_ty);
+            dispatch_call(&mut f, m.o32_ty, 0, m.import_ix[psxw_abi::psx::MAP_CODE]);
             f.instruction(&I::End);
             (FuncType { params: vec![V::I32; 5], results: vec![V::I64] }, f, "call_indirect".into())
         }
         S::Support(name, sig) => (sig.clone(), crate::bodies::support(&name), name),
         S::CLayer { befores, core, afters, sig, input, name } => {
             let proto = m.inputs[input].protos.get(&name);
-            (sig.clone(), c_layer(m.g_mod_sp, WINDOW_BASE, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
+            (sig.clone(), c_layer(m.g_mod_sp, win, proto, &befores, core, &afters, &sig), format!("hook:{name}"))
         }
         S::O32Layer { befores, core, afters, returns } => (o32(), o32_layer(&befores, core, &afters, returns), "hook:o32".into()),
         S::ModWrap { input, func, hook } => {
             let sig = m.func_sig(input, func);
             let name = guest_name(m, input, func);
             let proto = m.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: hook.map(|id| (m.g_hook_sp, m.g_hook_id, id)), window: WINDOW_BASE };
+            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: hook.map(|id| (m.g_hook_sp, m.g_hook_id, id)), window: win };
             let callee = m.guest[&(input, func)];
             (o32(), marshal::o32_to_c_with(&sig, proto, callee, marshal::Shape::O32, g), format!("o32:mod:{name}"))
         }
@@ -506,7 +513,7 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             let sig = m.func_sig(input, func);
             let name = guest_name(m, input, func);
             let proto = m.inputs[input].protos.get(&name);
-            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: None, window: WINDOW_BASE };
+            let g = marshal::WrapGlobals { sp, scratch: m.g_mod_sp, hook: None, window: win };
             let callee = m.guest[&(input, func)];
             let mut params = if result { vec![V::I64] } else { vec![] };
             params.extend([V::I32; 4]);
@@ -516,7 +523,7 @@ fn body(m: &mut M, s: &S) -> Result<(FuncType, Function, String)> {
             let proto = m.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
             let (words, _) = marshal::words(&kinds, variadic);
-            (sig.clone(), marshal::c_to_o32_transparent(&sig, &words, sp, WINDOW_BASE, (m.g_hook_sp, m.g_hook_id, id), next), format!("original:{name}"))
+            (sig.clone(), marshal::c_to_o32_transparent(&sig, &words, sp, win, (m.g_hook_sp, m.g_hook_id, id), next), format!("original:{name}"))
         }
         S::Init { fresh } => (FuncType { params: vec![], results: vec![] }, init(m, fresh)?, if fresh { names::INIT.into() } else { names::RESUME.into() }),
         S::Loaded => (FuncType { params: vec![V::I32; 2], results: vec![] }, loaded(m)?, names::LOADED.into()),
@@ -532,51 +539,50 @@ fn guest_name(m: &M, input: usize, func: u32) -> String {
     }
 }
 
-/// Store the i32 on top of the stack at `window(global + off)`.
-fn store_rel(f: &mut Function, global: u32, off: u32, value: &dyn Fn(&mut Function)) {
+/// Store the i32 on top of the stack at guest `global + off`.
+fn store_rel(f: &mut Function, win: rewrite::Window, global: u32, off: u32, value: &dyn Fn(&mut Function)) {
     f.instruction(&I::GlobalGet(global));
     f.instruction(&I::I32Const(off as i32));
     f.instruction(&I::I32Add);
-    f.instruction(&I::I32Const(WINDOW_MASK as i32));
-    f.instruction(&I::I32And);
+    win.offset_call(f, true, |f| {
+        f.instruction(&I::I32Const(4));
+    });
     value(f);
-    f.instruction(&I::I32Store(MemArg { offset: WINDOW_BASE as u64, align: 0, memory_index: 0 }));
+    f.instruction(&I::I32Store(win.memarg(0)));
 }
 
 /// A data patch's write; a mod function's address is computed.
 fn patch(m: &M, f: &mut Function, d: &DataPatch) -> Result<()> {
+    let win = m.window();
     match &d.value {
         PatchValue::Bytes(b) => {
             for (k, x) in b.iter().enumerate() {
-                store_byte(f, WINDOW_BASE, d.addr + k as u32, *x);
+                store_byte(f, win, d.addr + k as u32, *x)?;
             }
         }
         PatchValue::FnPtr(imp) => {
             let n = m.function_number(m.impl_func(imp)?).context("fnptr function not linked")?;
             let code_base = m.g_code_base;
-            f.instruction(&I::I32Const((d.addr & WINDOW_MASK) as i32));
+            f.instruction(&I::I32Const(win.constant(d.addr, 4, true).context("data patch")? as i32));
             f.instruction(&I::GlobalGet(code_base));
             f.instruction(&I::I32Const(4 * n as i32));
             f.instruction(&I::I32Add);
-            f.instruction(&I::I32Store(MemArg { offset: WINDOW_BASE as u64, align: 0, memory_index: 0 }));
+            f.instruction(&I::I32Store(win.memarg(0)));
         }
     }
     Ok(())
 }
 
-fn resident(f: &mut Function, d: &DataPatch) {
+fn resident(f: &mut Function, win: rewrite::Window, d: &DataPatch) -> Result<()> {
     let id = d.resident.expect("overlay patch");
-    let load = |f: &mut Function, a: u32| {
-        f.instruction(&I::I32Const((a & WINDOW_MASK) as i32));
-        f.instruction(&I::I32Load(MemArg { offset: WINDOW_BASE as u64, align: 2, memory_index: 0 }));
-    };
-    load(f, id.at);
+    load_word(f, win, id.at)?;
     f.instruction(&I::I32Const(id.words[0] as i32));
     f.instruction(&I::I32Eq);
-    load(f, id.at + 4);
+    load_word(f, win, id.at + 4)?;
     f.instruction(&I::I32Const(id.words[1] as i32));
     f.instruction(&I::I32Eq);
     f.instruction(&I::I32And);
+    Ok(())
 }
 
 /// `psxmod_init` / `psxmod_resume`: place the image (fresh) with its
@@ -584,21 +590,24 @@ fn resident(f: &mut Function, d: &DataPatch) {
 /// resident now.
 fn init(m: &mut M, fresh: bool) -> Result<Function> {
     let mut f = Function::new([]);
+    let win = m.window();
     if fresh && !m.image.is_empty() {
+        let len = m.image.len() as i32;
         f.instruction(&I::GlobalGet(m.g_data_base));
-        f.instruction(&I::I32Const(WINDOW_MASK as i32));
-        f.instruction(&I::I32And);
+        win.offset_call(&mut f, true, |f| {
+            f.instruction(&I::I32Const(len));
+        });
         f.instruction(&I::I32Const(WINDOW_BASE as i32));
         f.instruction(&I::I32Add);
         f.instruction(&I::I32Const(0));
-        f.instruction(&I::I32Const(m.image.len() as i32));
+        f.instruction(&I::I32Const(len));
         f.instruction(&I::MemoryInit { mem: 0, data_index: 0 });
         for (at, fx) in m.fixups.clone() {
             let (g, off) = match fx {
                 Fixup::Data(o) => (m.g_data_base, o),
                 Fixup::Func(n) => (m.g_code_base, 4 * n),
             };
-            store_rel(&mut f, m.g_data_base, at, &|f| {
+            store_rel(&mut f, win, m.g_data_base, at, &|f| {
                 f.instruction(&I::GlobalGet(g));
                 f.instruction(&I::I32Const(off as i32));
                 f.instruction(&I::I32Add);
@@ -609,7 +618,7 @@ fn init(m: &mut M, fresh: bool) -> Result<Function> {
         match d.resident {
             None => patch(m, &mut f, d)?,
             Some(_) => {
-                resident(&mut f, d);
+                resident(&mut f, win, d)?;
                 f.instruction(&I::If(BlockType::Empty));
                 patch(m, &mut f, d)?;
                 f.instruction(&I::End);
@@ -651,7 +660,7 @@ fn loaded(m: &mut M) -> Result<Function> {
     }
     for (d, g) in &patches {
         f.instruction(&I::GlobalGet(*g));
-        resident(&mut f, d);
+        resident(&mut f, m.window(), d)?;
         f.instruction(&I::I32And);
         f.instruction(&I::If(BlockType::Empty));
         patch(m, &mut f, d)?;
@@ -809,6 +818,8 @@ pub fn link(map: &AddressMap, spec: &ModuleSpec, inputs: &[Input]) -> Result<Lin
     };
     add(&mut m, psxw_abi::psx::MOD_LOG)?;
     add(&mut m, psxw_abi::psx::UNTRANSLATED)?;
+    add(&mut m, psxw_abi::psx::MAP_ACCESS)?;
+    add(&mut m, psxw_abi::psx::MAP_CODE)?;
     for w in wanted {
         add(&mut m, w)?;
     }

@@ -273,6 +273,13 @@ const LOAD_FRAMES: u64 = 300;
 
 const FRAME_LIMIT: &str = "psxw: frame limit";
 
+/// The window offset of the `len` bytes at guest `addr` (psxw-abi `map`);
+/// a bus error panics.
+fn guest_at(addr: u32, len: usize, store: bool) -> usize {
+    let off = psxw_abi::map::access(addr, len as u32, store);
+    off.unwrap_or_else(|| panic!("{}", psx_devices::mem::bus_error_text(addr, len, store))) as usize
+}
+
 fn mem(caller: &mut Caller<'_, State>) -> Memory {
     caller.get_export("memory").and_then(|e| e.into_memory()).expect("game.wasm exports memory")
 }
@@ -801,8 +808,8 @@ fn instantiate(opts: &Options, disc: Option<Disc>) -> Result<(Store<State>, wasm
             let (t_addr, t_size) = (v["t_addr"].as_u64().unwrap_or(0) as u32, v["t_size"].as_u64().unwrap_or(0) as usize);
             let want = c.data_mut().disc.as_mut().and_then(|d| disc_exe_text(d, &exe));
             let m = mem(&mut c);
-            let at = (t_addr & 0x00FF_FFFF) as usize + c.data().window as usize;
-            let ok = want.is_some_and(|w| m.data(&c)[at..at + t_size] == w[..]);
+            let at = psxw_abi::map::access(t_addr, t_size as u32, false).map(|o| o as usize + c.data().window as usize);
+            let ok = want.zip(at).is_some_and(|(w, at)| m.data(&c)[at..at + t_size] == w[..]);
             let s = c.data_mut();
             s.boot_ok = Some(ok);
             s.boot = Some(v.clone());
@@ -864,7 +871,7 @@ impl Conform {
         let memory = instance.get_memory(&mut store, "memory").context("no memory")?;
         let window = store.data().window as usize;
         for (addr, bytes) in ram {
-            let at = (addr & 0x00FF_FFFF) as usize + window;
+            let at = guest_at(*addr, bytes.len(), true) + window;
             memory.data_mut(&mut store)[at..at + bytes.len()].copy_from_slice(bytes);
         }
         let ptr = boot_options(&mut store, &instance, &opts)?;
@@ -914,12 +921,12 @@ impl Conform {
     }
 
     pub fn read(&self, addr: u32, len: usize) -> Vec<u8> {
-        let at = (addr & 0x00FF_FFFF) as usize + self.store.data().window as usize;
+        let at = guest_at(addr, len, false) + self.store.data().window as usize;
         self.memory.data(&self.store)[at..at + len].to_vec()
     }
 
     pub fn write(&mut self, addr: u32, bytes: &[u8]) {
-        let at = (addr & 0x00FF_FFFF) as usize + self.store.data().window as usize;
+        let at = guest_at(addr, bytes.len(), true) + self.store.data().window as usize;
         self.memory.data_mut(&mut self.store)[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
