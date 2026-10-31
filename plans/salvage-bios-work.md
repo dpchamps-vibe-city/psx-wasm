@@ -413,8 +413,38 @@ Parent owns guest-visible kernel chains/tables and subsequent runtime control
 flow. The IRQ worker does not change BIOS kernel/runtime files; the GPU worker
 does not change SDK IRQ state. Resolve cross-lane hunks only during integration.
 
+Wave `8a735e9f-c16e-4ae8-acd0-09ae2839c736` is finished. All three writer
+patches were source-reviewed and integrated. The Qwen libc reviewer timed out
+at 1,800,000 ms while emitting its report; it made no tracked changes. Its
+partial "no issues found" output is **not** an accepted review gate. Parent
+review found and fixed a concrete `%n` ordering bug instead of rerunning it.
+
+### Third delegation wave
+
+Writers start from source checkpoint `1dc3509` in separate worktrees. No Qwen
+run is planned for this wave. DeepSeek workers own:
+
+| Lane | Boundary | Worktree / branch |
+|---|---|---|
+| Native files | Recover file/device dispatch and guest callbacks; preserve native CD/card operations, no controller driver | `../psx-wasm-salvage-lanes/files`, `salvage/files` |
+| SDK pads | libapi/libpad RAM state and native kernel integration, no SIO protocol | `../psx-wasm-salvage-lanes/sdk-pad`, `salvage/sdk-pad` |
+| BIOS oracle | Existing oracle BIOS backend and implemented-service vectors only | `../psx-wasm-salvage-lanes/oracle`, `salvage/oracle` |
+| Unrelated dispositions | Read-only source-backed keep/rework/defer report for renderer/browser/fallback/residency deltas | recovery tree, pinned source |
+
+Parent retains BIOS pointer thunks, ABI/linker/runtime control flow, executable
+and exception work, and final review. Shared-file conflicts are integrated by
+the parent, not by workers modifying one another's trees.
+
 ## Progress log
 
+- 2026-10-31: integrated wave two: division `d8ef9df` (parent additionally
+  fixed unparenthesized nested operands), native GPU APIs `466fba9`, SDK IRQ
+  RAM state and object-static binding `2bb22aa`. Integrated gates: C 20,
+  link-pass integration 5, BIOS 23, SDK 36, runtime 7 tests; build check passes.
+  Real SDK object/conformance and game gates still pending; worker fixtures
+  are not evidence that those gates passed. Parent libc review reproduced
+  `%n%s` reading stale data, then fixed immediate writes and the mod-log
+  caller in `1dc3509`; BIOS 23 tests and wasm32 runtime check pass.
 - 2026-10-31: recovered RAM-only interrupt chains (`7b24e6c`, adapted
   `6155844`), native card/pad gating (`a64e1b2`, `d7d8f48`) and kernel
   handler ordering (`e3e4374`, adapted `053035d`). Pad sampling still calls
