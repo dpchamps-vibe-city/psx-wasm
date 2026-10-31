@@ -687,10 +687,12 @@ bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
     ./target/release/psxw oracle ramdiff bof4 --replay title-to-field --every 600
     # The replays against their checks: a reached-state check that fails
     # or a stall means the timing moved the game; re-author the presses
-    # or `frames` (both are frame-counter values) and note it.
-    ./target/release/psxw run btn --replay title-to-gameplay --check determinism --check no-trap --check no-shadow-io
+    # (frame-counter values) or `frames` and note it. Timed, against the
+    # same on main, they give the frame time (the native host doesn't
+    # pace).
+    time ./target/release/psxw run btn --replay title-to-gameplay --check determinism --check no-trap --check no-shadow-io
     ./target/release/psxw run btn --replay card-load --check determinism --check no-trap
-    ./target/release/psxw run bof4 --replay title-to-field --check determinism --check no-trap --check no-shadow-io
+    time ./target/release/psxw run bof4 --replay title-to-field --check determinism --check no-trap --check no-shadow-io
     # The game-recorded GPU and SPU vectors (golden frames and audio):
     ./target/release/psxw oracle record btn --replay title-to-gameplay
     ./target/release/psxw oracle record bof4 --replay title-to-field

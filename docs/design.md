@@ -2886,12 +2886,13 @@ closer to the oracle's (plans/spec-fidelity.md, phase 7 step 5).
   or more: p50 15.5%, p90 97%), where a region's static ratio misses
   which of its blocks run, or where the original's loop is the C's
   `memory.copy` (`Ovl27CopySelectedPage`: 4 instructions for 4,893).
-- **Cost** (game.wasm, against `837ebb2` plus the BIOS borrow fix): btn
-  2,755,566 to 2,969,071 bytes (+7.7%; gzip −9 712,112 to 765,949,
-  +7.6%), instructions (`llvm-objdump -d`) 1,051,081 to 1,162,869
-  (+10.6%); bof4 15,918,085 to 17,198,324 (+8.0%; gzip 3,266,332 to
-  3,505,982, +7.3%), instructions 6,586,271 to 7,258,422 (+10.2%). Frame
-  time is the human's run (plans/spec-fidelity.md).
+- **Cost** (game.wasm, against `837ebb2`): btn 2,755,566 to 2,976,696
+  bytes (+8.0%; gzip −9 712,112 to 768,506, +7.9%), instructions
+  (`llvm-objdump -d`) 1,051,081 to 1,166,039 (+10.9%); bof4 15,918,085
+  to 17,206,813 (+8.1%; gzip 3,266,332 to 3,508,384, +7.4%),
+  instructions 6,586,271 to 7,262,144 (+10.3%). A spend is four
+  operators, a loop header's check ten. Frame time is the human's run
+  (plans/spec-fidelity.md).
 - **Function entries aren't checked:** every loop header is, and no
   straight-line run outlasts a quantum by much.
 
