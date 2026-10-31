@@ -326,4 +326,23 @@ declare double @"quoted name"(i64 noundef, double noundef, ptr byval(%struct.P) 
         assert_eq!(p[3].params[2], Kind::ByVal { size: 5, align: 1 });
         assert_eq!(p[3].o32_words(), 6);
     }
+
+    /// Plain `char` is signed, GCC's MIPS default, unless the reference
+    /// flags make it unsigned.
+    #[test]
+    fn char_follows_the_reference_flags() {
+        let Some(path) = psxw_inputs::Workspace::discover().ok().and_then(|ws| ws.clang().ok()) else {
+            return eprintln!("skipped: run `psxw toolchain fetch`");
+        };
+        let dir = std::env::temp_dir().join(format!("psxw-protos-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.i"), "int f(char c) { return c; }\n").unwrap();
+        for (flags, signed) in [(&["-O2"][..], true), (&["-funsigned-char"], false), (&["-funsigned-char", "-fsigned-char"], true)] {
+            let mut clang = Clang::new(path.clone(), dir.clone(), vec![], vec![], &dir).unwrap();
+            clang.reference(&flags.iter().map(|f| f.to_string()).collect::<Vec<_>>());
+            let p = for_tu(&clang, &dir.join("t.i")).unwrap();
+            assert_eq!(p[0].params, [Kind::I8 { signed }], "{flags:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
