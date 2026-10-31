@@ -226,7 +226,7 @@ impl<S: Sdk> Machine<S> {
         } else if addr & !3 == GP0 {
             io.gpu.read() >> (8 * (addr & 3))
         } else if addr & !3 == GP1 {
-            io.gpu.status() >> (8 * (addr & 3))
+            io.gpu.status(now, video) >> (8 * (addr & 3))
         } else {
             return Err(format!("read of unmodelled I/O register {addr:#010x} ({size} bytes)"));
         };

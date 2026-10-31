@@ -42,6 +42,7 @@
 //! reads the rectangle (the `render_readback` host import), and hands the
 //! pixels to [`Gpu::finish_readback`], which serves them through GPUREAD.
 
+use crate::clock::Video;
 use crate::raster::Triangle;
 use psxw_abi::render::{self, CLUT_SLOTS, PRIM_WORDS, PresentDesc, header, op, pack_xy, prim};
 
@@ -506,15 +507,16 @@ impl Gpu {
         }
     }
 
-    /// GPUSTAT (1F801814h), as far as it depends on what the front end
-    /// knows. Timing bits (31, 13) come from the field the caller set.
-    pub fn status(&self) -> u32 {
+    /// GPUSTAT (1F801814h) at CPU cycle `now`, as far as it depends on
+    /// what the front end knows. Bit 13 is the field the caller set, or 1
+    /// when not interlaced; bit 31 follows the beam ([`Gpu::odd_line`]).
+    pub fn status(&self, now: u64, video: Video) -> u32 {
         let d = &self.display;
         let mut s = (((d.mode << 1) & 0x7F) | ((d.mode >> 6) & 1)) << 16;
         s |= (d.mode & 0x80) << 7;
         s |= d.dma << 29;
-        s |= (self.field as u32) << 31;
-        s |= (!self.field as u32) << 13;
+        s |= (self.odd_line(now, video) as u32) << 31;
+        s |= ((d.mode & 0x20 == 0 || !self.field) as u32) << 13;
         s |= (self.irq as u32) << 24;
         s |= (d.off as u32) << 23;
         let reading = matches!(self.in_cmd, InCmd::Read { .. });
@@ -542,6 +544,22 @@ impl Gpu {
         s |= (self.mask_set as u32) << 11 | (self.mask_check as u32) << 12;
         s |= (p.disable as u32) << 15;
         s
+    }
+
+    /// GPUSTAT bit 31 at `now`: the parity of the VRAM line the display
+    /// reads (Beetle), per scanline in 240-line modes and per field in
+    /// 480-line ones; 0 in vblank (psx-spx). The machine's vblank is
+    /// scanline GP1(07h)'s end, and the display reads from its start.
+    fn odd_line(&self, now: u64, video: Video) -> bool {
+        let d = &self.display;
+        let lines = video.lines() as u32;
+        let since_vblank = (video.hblanks(now) % video.lines()) as u32;
+        let blank = (d.v_start + lines - d.v_end.min(lines)) % lines;
+        if since_vblank < blank {
+            return false;
+        }
+        let row = if d.interlaced_480() { self.field as u32 } else { since_vblank - blank };
+        (d.y + row) & 1 != 0
     }
 
     /// GPUREAD (1F801810h): VRAM data during a VRAM→CPU transfer whose
@@ -1609,7 +1627,7 @@ mod tests {
                 assert_eq!(r[1] & 0xF, 2);
                 assert_eq!((r[0] & prim::DEPTH_MASK) >> prim::DEPTH_SHIFT, 1);
                 assert!(cs.contains(&C::Clut(r[1] >> 16, 32, 511, 256)), "{cc:#x}: {cs:?}");
-                assert_eq!(g.status() & 0x1FF, 2 | 3 << 5 | 1 << 7, "the texture page updates the draw mode");
+                assert_eq!(g.status(0, Video::Ntsc) & 0x1FF, 2 | 3 << 5 | 1 << 7, "the texture page updates the draw mode");
             }
         }
     }
@@ -1795,7 +1813,7 @@ mod tests {
         // Commands queued behind the read wait for it.
         g.gp0_words(&[0x6800_0000, pack_xy(1, 0)]);
         assert_eq!(g.pending_readback(), Some(VramRect { x: 0, y: 0, w: 3, h: 1 }));
-        assert_eq!(g.status() & (1 << 27), 1 << 27);
+        assert_eq!(g.status(0, Video::Ntsc) & (1 << 27), 1 << 27);
         let first = decode(&cmds(&mut g));
         assert_eq!(draws(&first).len(), 1);
         g.finish_readback(Some(&[0x1111, 0x2222, 0x3333]));
@@ -1810,7 +1828,7 @@ mod tests {
     #[test]
     fn dma_request_by_direction() {
         let mut g = gpu();
-        let dreq = |g: &Gpu| g.status() >> 25 & 1;
+        let dreq = |g: &Gpu| g.status(0, Video::Ntsc) >> 25 & 1;
         assert_eq!(dreq(&g), 0);
         g.gp1(0x0400_0001);
         assert_eq!(dreq(&g), 1);
@@ -1959,8 +1977,8 @@ mod tests {
         let mut g = Gpu::new();
         g.gp0_words(&[0xE100_06AF, 0xE200_0000 | 0xF_FFFF, 0xE300_0000 | 3 << 10 | 5, 0xE400_0000 | 200 << 10 | 300]);
         g.gp0_words(&[0xE500_0000 | 1 << 11 | 2047, 0xE600_0002]);
-        assert_eq!(g.status() & 0x7FF, 0x6AF);
-        assert_eq!(g.status() & (3 << 11), 2 << 11);
+        assert_eq!(g.status(0, Video::Ntsc) & 0x7FF, 0x6AF);
+        assert_eq!(g.status(0, Video::Ntsc) & (3 << 11), 2 << 11);
         g.gp1(0x1000_0003);
         assert_eq!(g.read(), 3 << 10 | 5);
         g.gp1(0x1000_0004);
@@ -1981,7 +1999,7 @@ mod tests {
         assert_eq!(d.flags, PresentDesc::ENABLED | PresentDesc::DEPTH24 | PresentDesc::INTERLACED);
         assert_eq!(d.height, 480);
         g.gp1(0x0000_0000);
-        assert_eq!(g.status() & 0x7FF, 0);
+        assert_eq!(g.status(0, Video::Ntsc) & 0x7FF, 0);
         assert_eq!(g.present_desc().flags & PresentDesc::ENABLED, 0);
     }
 
@@ -1996,6 +2014,31 @@ mod tests {
         g.gp0_words(&[0x6000_00FF, pack_xy(0, 0), 8 << 16 | 8]);
         let flags: Vec<u32> = decode(&cmds(&mut g)).iter().filter_map(|c| if let C::State(_, f) = c { Some(*f) } else { None }).collect();
         assert_eq!(flags, [render::state::SKIP_EVEN, render::state::SKIP_ODD, 0]);
+    }
+
+    /// GPUSTAT bits 31 and 13 (psx-spx): 31 is 0 in vblank, then the
+    /// parity of the VRAM line read, per scanline in 240-line modes and
+    /// per field in 480-line ones; 13 is the field, or 1 when not
+    /// interlaced.
+    #[test]
+    fn field_bits_follow_the_beam() {
+        let mut g = gpu();
+        let v = Video::Ntsc;
+        // GP1(07h)'s reset range, 10h..100h: the display starts 263 - 256
+        // + 16 = 23 lines after the vblank.
+        let bits = |g: &Gpu, line: u64| {
+            let s = g.status(v.hblank_at(263 + line), v);
+            (s >> 31, s >> 13 & 1)
+        };
+        g.set_field(true);
+        assert_eq!([bits(&g, 22), bits(&g, 23), bits(&g, 24), bits(&g, 25)], [(0, 1), (0, 1), (1, 1), (0, 1)]);
+        g.gp1(0x0500_0000 | 1 << 10); // the display from VRAM line 1
+        assert_eq!(bits(&g, 23), (1, 1));
+        g.gp1(0x0500_0000);
+        g.gp1(0x0800_0024); // 480i
+        assert_eq!([bits(&g, 22), bits(&g, 23), bits(&g, 24)], [(0, 0), (1, 0), (1, 0)]);
+        g.set_field(false);
+        assert_eq!(bits(&g, 24), (0, 1));
     }
 
     #[test]
