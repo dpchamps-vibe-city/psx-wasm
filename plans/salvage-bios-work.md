@@ -133,17 +133,17 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 |---|---|
 | Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
-| Card, console and CD | Partial; CD blocking calls wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts. Seek/read/status honor patched A78/A7E/A7C commands and bounded acceptance retries, with per-call guest stack locals. Completion probes dispatch patched B0B TestEvent; long command-acceptance loops now yield through the existing loop budget so busy native work can progress. Remaining CD internals stay incomplete. CD opens preserve ISO versions and accept `?` filename matching. CD file reads now enforce sector alignment/EOF, transfer the full requested sectors and clip only the successful result/offset. |
+| Card, console and CD | Partial; CD blocking calls wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts. Seek/read/status honor patched A78/A7E/A7C commands and bounded acceptance retries, with per-call guest stack locals. Completion probes dispatch patched B0B TestEvent; long command-acceptance loops now yield through the existing loop budget so busy native work can progress. Remaining CD internals stay incomplete. CD opens preserve ISO versions and accept `?` filename matching. CD file reads enforce sector alignment/EOF and now use the existing native blocking helper, including patched commands/events/errors and scheduled completion. They transfer the full requested sectors and clip using live FCB metadata after success. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
 | Fonts and BIOS identity | Glyph-resource/identity decisions remain open. B53's resource-independent offset mapping needs better evidence: the proposed OpenBIOS table lookup aliases valid charset-3 codes and was rejected. No invented glyph pointers, dates or versions. |
-| Validation | CD file-read follow-up passes BIOS 57/runtime 11/SDK 42 tests and wasm32 check. Fresh native builds and all four unchanged replays pass for this batch, including the earlier acceptance-progress/TestEvent changes. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates remain at `9624526`, before this native batch. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | CD file-read Flow follow-up passes BIOS 58/runtime 11/SDK 42 tests and wasm32 check. Fresh native builds and all four unchanged replays pass for this batch; those replays do not call A60, whose new behavior is covered by the integration tests. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates remain at `9624526`, before this native batch. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD live-event waits, returning read-error retries, patchable seek/read/status command acceptance and B0B event polling implemented. Long command-acceptance loops now yield for native busy-work progress. CD file-read alignment/EOF and sector transfer corrections now pass focused tests/wasm32 check and fresh native builds/four replays. Remaining CD internals stay partial; flag-only chain-control proposal rejected. | Owns plan, integration and final acceptance |
+| Parent | `salvage/bios`, writer | CD live-event waits, returning read-error retries, patchable seek/read/status command acceptance and B0B event polling implemented. Long command-acceptance loops now yield for native busy-work progress. CD file reads now use the existing blocking helper, preserving its command patches, waits and returning errors; live-FCB clipping and zero-count failure are covered. Focused tests/wasm32 check and fresh builds/four replays pass. Remaining CD internals stay partial; flag-only chain-control proposal rejected. | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -362,7 +362,7 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
 
 - [x] Run workspace tests and build both games from the recovery branch's own
   toolchain/artifacts. Latest workspace run: `6deb05b`; subsequent batches have
-  focused tests. Latest release/runtime/game builds: CD file-read
+  focused tests. Latest release/runtime/game builds: CD file-read Flow
   batch below, ABI 18 (includes acceptance progress/TestEvent dispatch). Census
   and optional-test qualifications are recorded with their actual checkpoints.
 - [x] Run focused integration tests for changed families, including guest devices,
@@ -371,7 +371,7 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
   not validation; configured images/vectors/goldens are still missing. Keep
   emulator/OpenBIOS results provisional where appropriate.
 - [x] Run existing BTN title/card-load, BOF4 `title-to-field` and supplied
-  name-select crash replays: latest source is the CD file-read batch
+  name-select crash replays: latest source is the CD file-read Flow batch
   below, with unchanged expectations (includes acceptance progress/TestEvent dispatch).
   Card-load has no state assertions and does not certify save persistence.
 - [ ] Validate game-level save/reload persistence once the required recordings
@@ -1857,7 +1857,7 @@ Gates and artifacts for this batch (ABI 18):
   memcard and other conformance results retain their prior recorded epochs;
   game save/reload persistence remains unverified. No replay expectations changed.
 
-### CD file-read alignment and transfer follow-up
+### CD file-read alignment and transfer follow-up (`8c28f9a`, historical checkpoint)
 
 A(60h) `dev_cd_read` now rejects unaligned lengths/file positions, negative
 lengths and positions at or beyond EOF with FCB error 16h and return -1. Both
@@ -1932,6 +1932,100 @@ Gates and artifacts for this batch (ABI 18):
   as TMPDIR. No input/user-save/golden/replay-expectation writes.
 - No full-workspace/CI, browser, conformance or oracle rerun. Those gates keep
   their previously recorded epochs and unresolved prerequisites.
+
+### CD file-read Flow follow-up
+
+A60 now calls the existing `cd_block_read` helper directly and sequences its
+Flow before returning the byte count or setting the FCB error. This removes the
+separate HostDisc loop: native file reads use the shared drive's seek/read
+completion, live A78/A7E/B0B command/event patches and A1 SystemError path.
+The reference calls `cdromBlockReading` directly, **not through A(A5h)**;
+patching that public slot does not intercept the internal call. No extra
+scheduler, clock cost, BIOS register driver, runtime or ABI change was added.
+
+The sector/EOF precheck remains immediate and leaves invalid-request buffers
+untouched. The request's count, starting LBA and destination are captured before
+the helper runs. Only a full-count result succeeds; after it, offset and length
+are read again from the live FCB, with the reference's unsigned 32-bit
+comparison/subtraction/addition, and only the result/offset are clipped. Patches
+can therefore change the final file position without retargeting the pending
+read. Success does not clear errno. Completed native sectors and loaded ranges
+come only from `cd_step`; the file function does not repeat the transfer.
+
+Missing-sector END now calls SystemError(44h,17h); offset/error handling waits
+for that call to return. The default SystemError remains fatal, not an ordinary
+file-error return. A returning patch lets A60 set FCB error 10h and return -1;
+public read aliases then copy that error globally. Existing read-error retries
+and cancellation behavior are reused. A zero-byte request before EOF now reaches
+the helper: seek, then 99999 rejected native ReadN attempts and SystemError
+(44h,0Ch), not the former successful no-op. At/beyond EOF it still fails the
+initial alignment/EOF check. BIOS CD events must be installed; normal boot does
+this already. There is no implicit initialization or direct-host fallback after
+removal. Initial boot's separate executable reader is unchanged.
+
+Parent independently read pinned OpenBIOS `filesystem.c`, `helpers.c`,
+`helpers.h` and `common/psxlibc/stdio.h` at
+`4dc70d2931121a0fde858a0354192b6df4fa22e8`. Read-only DeepSeek scout
+`0d170c5e-461b-4c03-a4f7-de50617bba42` completed; its full 253-line report was
+read. Parent corrected the initial brief's A05/A5 notation and unverified table
+assumption before implementation; the scout confirmed the direct-call seam.
+Its proposed saturating subtraction for callback-edited FCBs was rejected:
+`offset`/`length` are uint32_t, and a safety clamp would invent a new contract.
+Its claim that the FCB lacks an identity field is also incorrect: DEVICE_ID
+exists, but native CD identity population/checking remains unimplemented.
+A60/A02/B34 stay `Partial`: status/path-table/disc-identity checks, plus the
+helper's remaining INT5/chain-service limitations, are not completed here.
+This is reference-backed behavior, not independent Sony oracle proof.
+
+Tests extend the existing file integration rather than adding a harness:
+
+- Native device-table reads initialize the normal CD events and drive existing
+  Flow waits. Sector data fixtures now include valid EDC. Invalid requests,
+  whole-request copying, clipped tails, red zones and partial failure remain
+  covered across B34/A02/direct A60, with deferred offset/error and guest-SP checks.
+- One new grouped test patches Seek/Read/TestEvent, writes software data with no
+  physical disc, changes live FCB metadata, checks exact operands/continuations,
+  and poisons A(A5h) to prove the internal-call distinction. It also exercises
+  zero-count rejection through a returning SystemError patch. These are Flow
+  callback test doubles, not a new compiled-wasm fixture.
+- First focused compile caught two test assertions accessing private `Cd::op`;
+  they were replaced with the existing clock's pending-Cd query, without changing
+  production visibility. Then all **9** file tests passed. BIOS **58** / runtime
+  **11** / SDK **42** and wasm32 runtime check pass; complete logs read.
+
+Independent read-only DeepSeek review `55a9fe7d-a579-437b-88fa-b5654064fe88`
+returned OK-with-notes; parent read its full 31-line report. No established
+production defect required a change. Default fatal errors, required CD events
+and the inherited retail read-retry minute-loss quirk are intentional consequences
+of reusing the helper, not reasons for a fallback or new error policy. Its claimed
+32768-sector/cancellation collision is rejected: the wait's ERR result is converted
+to SystemError/-1 inside `cd_block_read`, never returned raw to A60. Missing CD
+events exhaust **one** 99999-attempt Seek loop, not two loops as the review says.
+The new high-word-nonzero acceptance case alone does not distinguish v0-only
+handling; the existing helper tests already cover high-word-only false values.
+Parent accepted a bound on the file test helper's scheduled-wait stepping to
+avoid hanging on a regression; all nine file tests pass again after this test-only
+change. No repeated build or full gate was needed; production source is unchanged.
+The reviewer ran no tests or reference fetches; reference verification and gates
+are the parent's. Optional duplicated helper cancellation/default-fatal tests were
+not added. Historical `8c28f9a` text is labelled as such; current gaps are above.
+
+Fresh integration gates (ABI 18): release CLI, runtime and both normal native
+game builds pass. BTN **2603727 bytes / 86 adapters**, BOF4 **10217908 / 91**;
+all six chip groups native. Asyncify and BIOS coverage counts remain unchanged.
+All four unchanged replays pass explicit frame limits/no-trap: BTN title 6000
+(three expectations), card-load 3000 (none), BOF4 title 26000 (five), supplied
+crash 694 (none). All match boot text, have no EDC errors/I/O accesses and end
+outside critical/IRQ context with no held waits/queued calls. Sector counts
+remain 1419/697/12695/680; BTN's existing timeout/reset logs remain unclassified.
+The reports contain **no A60 calls**: these are regression gates, not proof of
+the new file path or game-level save persistence.
+
+Full logs and four run/check JSON reports are read/parsed in session scratch
+under `cd-file-flow-*`; previous own disposable card directories are preserved
+there before fresh run storage. Tests/builds use ignored `out/tmp-cd-live-wait`
+as TMPDIR. No input/user-save/golden/replay-expectation writes. No full-workspace/
+CI, browser, conformance or oracle rerun; those gates retain their recorded epochs.
 
 ## Progress log
 

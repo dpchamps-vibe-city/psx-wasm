@@ -40,11 +40,15 @@ retain their provenance; the active recovery status is recorded separately.
   ISO versions, default to `;1`, and support `?` filename matching without star
   expansion; shared disc lookup and CdGetLbn are unchanged. CD file reads now
   enforce 800h length/position alignment and reject positions at/beyond EOF.
-  They copy the full requested sectors before clipping the successful result
-  and offset, preserve completed sectors on later physical failure without
-  advancing the FCB, and leave errno unchanged on success. Status/path-table/
-  disc-identity checks, command-error sequencing and zero-count semantics are
-  still partial; this is not a new CD driver or scheduling path. CD read errors now
+  They now use the existing native blocking helper directly, honoring its live
+  command/event/error calls and scheduled completion, not the A(A5h) table slot.
+  Full requested sectors transfer before clipping against live post-callback
+  FCB metadata. Completed sectors survive later failure; FCB error 10h/return -1
+  occur only if SystemError returns (its default is fatal). Success preserves
+  errno. Zero-count reads before EOF now reach the helper's bounded command
+  failure, not a no-op; installed BIOS CD events are required, as boot provides.
+  Status/path-table/disc-identity checks remain partial. No new CD driver or
+  scheduler was added. CD read errors now
   retry after a returning SystemError patch, bounded to ten attempts. Blocking
   calls now use live ordered event flags, including early software wakes and
   disabled/consumed/reused slots and native cancellation. Seek/read/status now
@@ -70,13 +74,14 @@ retain their provenance; the active recovery status is recorded separately.
   B53's offset calculation itself needs no glyph resource, but the proposed
   OpenBIOS original-font lookup aliases valid 899Eh/899Fh codes. Parent rejected
   that mapping; reliable algorithm/vector evidence remains a separate gap.
-- **Validation:** the CD file-read follow-up passes BIOS 57 /
+- **Validation:** the CD file-read Flow follow-up passes BIOS 58 /
   runtime 11 / SDK 42 tests and wasm32 runtime check. Fresh release/runtime/both
   game builds and four unchanged replays pass for this batch, including prior
-  acceptance-progress/TestEvent dispatch. All six chip groups are native;
+  acceptance-progress/TestEvent dispatch. Replays do not call A60; the file
+  integration tests cover the new path. All six chip groups are native;
   ABI 18 and coverage classifications are unchanged. Logs, run/check JSON and
   preserved prior disposable run cards are in session scratch under
-  `cd-file-read-*`; tests/builds use the checkout's ignored
+  `cd-file-flow-*`; tests/builds use the checkout's ignored
   `out/tmp-cd-live-wait` as TMPDIR. Inputs and user saves were untouched.
   Independent code review is accepted; the active plan records its notes and
   the distinction between reference-backed behavior and retail oracle proof.

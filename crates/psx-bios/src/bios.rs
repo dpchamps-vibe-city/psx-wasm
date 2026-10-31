@@ -536,7 +536,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xA0, 0x5C) => r(m.tty_open(a[0])),
         (0xA0, 0x5D) => m.tty_in_out(a[0], a[1]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xA0, 0x5F) => r(m.dev_cd_open(a[0], a[1])),
-        (0xA0, 0x60) => r(m.dev_cd_read(a[0], a[1], a[2])),
+        (0xA0, 0x60) => m.dev_cd_read(a[0], a[1], a[2]),
         (0xA0, 0x61) => r(m.dev_cd_close(a[0])),
         (0xA0, 0x62) => r(m.dev_cd_firstfile(a[0], a[1], a[2])),
         (0xA0, 0x63) => r(m.dev_cd_nextfile(a[0], a[1])),
