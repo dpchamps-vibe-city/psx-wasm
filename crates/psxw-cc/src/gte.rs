@@ -268,7 +268,9 @@ fn eval(s: &str) -> Option<u32> {
 
 /// Lower one asm statement: its template (string contents, C escapes
 /// still in place) and what follows it in the parentheses. `None` unless
-/// every instruction is modelled.
+/// every instruction is modelled. The instructions run in order, with the
+/// R3000's load delay: one right after a load into a CPU register reads
+/// that register's old value (a `nop` counts as an instruction there).
 pub fn lower(template: &str, rest: &str) -> Option<String> {
     let secs = sections(rest);
     if secs.len() > 4 || !secs.first().is_none_or(|s| s.trim().is_empty()) {
@@ -282,60 +284,76 @@ pub fn lower(template: &str, rest: &str) -> Option<String> {
         return None;
     }
     let mut scratch = std::collections::BTreeSet::new();
-    let mut body = Vec::new();
     let mut gte = false;
     // A CPU register operand: `%k` (an input value or output slot) or
-    // `$n` (scratch, `$0` reads as zero).
-    let cpu = |o: &str, scratch: &mut std::collections::BTreeSet<u32>| -> Option<String> {
+    // `$n` (scratch, `$0` reads as zero). A read of the register the last
+    // instruction loaded (`old`: it and its saved value) gets the value
+    // from before that load.
+    let cpu = |o: &str, scratch: &mut std::collections::BTreeSet<u32>, old: Option<&(String, String)>| -> Option<String> {
         let o = o.trim();
-        if let Some(k) = o.strip_prefix('%') {
+        let name = if let Some(k) = o.strip_prefix('%') {
             let k: usize = k.parse().ok()?;
             ops.get(k)?;
-            return Some(format!("__op{k}"));
-        }
-        let n: u32 = o.strip_prefix('$')?.parse().ok().filter(|&n| n < 32)?;
-        if n == 0 {
-            return Some("0u".into());
-        }
-        scratch.insert(n);
-        Some(format!("__r{n}"))
+            format!("__op{k}")
+        } else {
+            let n: u32 = o.strip_prefix('$')?.parse().ok().filter(|&n| n < 32)?;
+            if n == 0 {
+                return Some("0u".into());
+            }
+            scratch.insert(n);
+            format!("__r{n}")
+        };
+        Some(match old {
+            Some((r, t)) if *r == name => t.clone(),
+            _ => name,
+        })
     };
     let c2 = |o: &str| -> Option<u32> { o.trim().strip_prefix('$')?.parse().ok().filter(|&n: &u32| n < 32) };
     // `off(base)` → C address expression.
-    let mem = |o: &str, scratch: &mut std::collections::BTreeSet<u32>| -> Option<String> {
+    let mem = |o: &str, scratch: &mut std::collections::BTreeSet<u32>, old: Option<&(String, String)>| -> Option<String> {
         let o = o.trim();
         let open = o.find('(')?;
         let off = o[..open].trim();
         let off: i64 = if off.is_empty() { 0 } else { off.parse().ok()? };
-        let base = cpu(o[open + 1..o.rfind(')')?].trim(), scratch)?;
+        let base = cpu(o[open + 1..o.rfind(')')?].trim(), scratch, old)?;
         Some(format!("({base} + (unsigned int){off})"))
     };
-    for insn in insns {
+    // The R3000's load delay: the instruction after a load into a CPU
+    // register (`lw`.., `mfc2`, `cfc2`) still reads the register's old
+    // value, which the load saves first when that instruction reads it; a
+    // `nop` in between is that instruction. Each line: the load's save
+    // (temporary, register), and the statement.
+    let mut body: Vec<(Option<(String, String)>, String)> = Vec::new();
+    let mut delayed: Option<(String, String)> = None;
+    let mut saves = std::collections::BTreeSet::new();
+    for (j, insn) in insns.into_iter().enumerate() {
         let (op, args) = insn.split_once(char::is_whitespace).map_or((insn, ""), |(a, b)| (a, b.trim()));
         let a: Vec<&str> = split_args(args);
+        let old = delayed.take();
+        let (s, old) = (&mut scratch, old.as_ref());
         let line = match (op, a.as_slice()) {
             ("nop", []) => continue,
-            ("lwc2", [r, m]) => format!("psx_gte_mtc2({}u, __psxw_lw({}));", c2(r)?, mem(m, &mut scratch)?),
-            ("swc2", [r, m]) => format!("__psxw_sw({}, psx_gte_mfc2({}u));", mem(m, &mut scratch)?, c2(r)?),
-            ("mtc2", [s, r]) => format!("psx_gte_mtc2({}u, {});", c2(r)?, cpu(s, &mut scratch)?),
-            ("ctc2", [s, r]) => format!("psx_gte_ctc2({}u, {});", c2(r)?, cpu(s, &mut scratch)?),
-            ("mfc2", [d, r]) => format!("{} = psx_gte_mfc2({}u);", cpu(d, &mut scratch)?, c2(r)?),
-            ("cfc2", [d, r]) => format!("{} = psx_gte_cfc2({}u);", cpu(d, &mut scratch)?, c2(r)?),
-            ("lw", [d, m]) => format!("{} = __psxw_lw({});", cpu(d, &mut scratch)?, mem(m, &mut scratch)?),
-            ("lh", [d, m]) => format!("{} = (unsigned int)(int)(short)__psxw_lhu({});", cpu(d, &mut scratch)?, mem(m, &mut scratch)?),
-            ("lhu", [d, m]) => format!("{} = __psxw_lhu({});", cpu(d, &mut scratch)?, mem(m, &mut scratch)?),
-            ("lb", [d, m]) => format!("{} = (unsigned int)(int)(signed char)__psxw_lbu({});", cpu(d, &mut scratch)?, mem(m, &mut scratch)?),
-            ("lbu", [d, m]) => format!("{} = __psxw_lbu({});", cpu(d, &mut scratch)?, mem(m, &mut scratch)?),
-            ("sw", [s, m]) => format!("__psxw_sw({}, {});", mem(m, &mut scratch)?, cpu(s, &mut scratch)?),
-            ("sh", [s, m]) => format!("__psxw_sh({}, {});", mem(m, &mut scratch)?, cpu(s, &mut scratch)?),
-            ("sb", [s, m]) => format!("__psxw_sb({}, {});", mem(m, &mut scratch)?, cpu(s, &mut scratch)?),
-            ("sll" | "srl" | "sra", [d, s, n]) => {
+            ("lwc2", [r, m]) => format!("psx_gte_mtc2({}u, __psxw_lw({}));", c2(r)?, mem(m, s, old)?),
+            ("swc2", [r, m]) => format!("__psxw_sw({}, psx_gte_mfc2({}u));", mem(m, s, old)?, c2(r)?),
+            ("mtc2", [x, r]) => format!("psx_gte_mtc2({}u, {});", c2(r)?, cpu(x, s, old)?),
+            ("ctc2", [x, r]) => format!("psx_gte_ctc2({}u, {});", c2(r)?, cpu(x, s, old)?),
+            ("mfc2", [d, r]) => format!("{} = psx_gte_mfc2({}u);", cpu(d, s, None)?, c2(r)?),
+            ("cfc2", [d, r]) => format!("{} = psx_gte_cfc2({}u);", cpu(d, s, None)?, c2(r)?),
+            ("lw", [d, m]) => format!("{} = __psxw_lw({});", cpu(d, s, None)?, mem(m, s, old)?),
+            ("lh", [d, m]) => format!("{} = (unsigned int)(int)(short)__psxw_lhu({});", cpu(d, s, None)?, mem(m, s, old)?),
+            ("lhu", [d, m]) => format!("{} = __psxw_lhu({});", cpu(d, s, None)?, mem(m, s, old)?),
+            ("lb", [d, m]) => format!("{} = (unsigned int)(int)(signed char)__psxw_lbu({});", cpu(d, s, None)?, mem(m, s, old)?),
+            ("lbu", [d, m]) => format!("{} = __psxw_lbu({});", cpu(d, s, None)?, mem(m, s, old)?),
+            ("sw", [x, m]) => format!("__psxw_sw({}, {});", mem(m, s, old)?, cpu(x, s, old)?),
+            ("sh", [x, m]) => format!("__psxw_sh({}, {});", mem(m, s, old)?, cpu(x, s, old)?),
+            ("sb", [x, m]) => format!("__psxw_sb({}, {});", mem(m, s, old)?, cpu(x, s, old)?),
+            ("sll" | "srl" | "sra", [d, x, n]) => {
                 let n: u32 = n.trim().parse().ok().filter(|&n| n < 32)?;
-                let (d, s) = (cpu(d, &mut scratch)?, cpu(s, &mut scratch)?);
+                let (d, x) = (cpu(d, s, None)?, cpu(x, s, old)?);
                 match op {
-                    "sll" => format!("{d} = {s} << {n};"),
-                    "srl" => format!("{d} = {s} >> {n};"),
-                    _ => format!("{d} = (unsigned int)((int){s} >> {n});"),
+                    "sll" => format!("{d} = {x} << {n};"),
+                    "srl" => format!("{d} = {x} >> {n};"),
+                    _ => format!("{d} = (unsigned int)((int){x} >> {n});"),
                 }
             }
             ("addu" | "subu" | "and" | "or", [d, x, y]) => {
@@ -345,11 +363,11 @@ pub fn lower(template: &str, rest: &str) -> Option<String> {
                     "and" => "&",
                     _ => "|",
                 };
-                format!("{} = {} {sym} {};", cpu(d, &mut scratch)?, cpu(x, &mut scratch)?, cpu(y, &mut scratch)?)
+                format!("{} = {} {sym} {};", cpu(d, s, None)?, cpu(x, s, old)?, cpu(y, s, old)?)
             }
-            ("addi" | "addiu", [d, s, n]) => {
+            ("addi" | "addiu", [d, x, n]) => {
                 let n: i32 = n.trim().parse().ok()?;
-                format!("{} = {} + (unsigned int){n};", cpu(d, &mut scratch)?, cpu(s, &mut scratch)?)
+                format!("{} = {} + (unsigned int){n};", cpu(d, s, None)?, cpu(x, s, old)?)
             }
             ("cop2", [n]) => {
                 gte = true;
@@ -370,8 +388,23 @@ pub fn lower(template: &str, rest: &str) -> Option<String> {
             }
             _ => return None,
         };
-        body.push(line);
+        if let Some((_, t)) = old.filter(|(_, t)| line.contains(t.as_str())) {
+            saves.insert(t.clone());
+        }
+        let save = match (op, a.first()) {
+            ("lw" | "lh" | "lhu" | "lb" | "lbu" | "mfc2" | "cfc2", Some(d)) => Some((format!("__ld{j}"), cpu(d, s, None)?)),
+            _ => None,
+        };
+        delayed = save.clone().map(|(t, d)| (d, t));
+        body.push((save, line));
     }
+    let body: Vec<String> = body
+        .into_iter()
+        .map(|(save, line)| match save.filter(|(t, _)| saves.contains(t)) {
+            Some((t, d)) => format!("{t} = {d}; {line}"),
+            None => line,
+        })
+        .collect();
     // Only templates that touch the GTE are this rule's.
     if !gte && !body.iter().any(|l| l.contains("psx_gte_")) {
         return None;
@@ -384,8 +417,8 @@ pub fn lower(template: &str, rest: &str) -> Option<String> {
             out.push_str(&format!("unsigned int __op{k} = (unsigned int)({}); ", o.expr));
         }
     }
-    if !scratch.is_empty() {
-        let regs: Vec<String> = scratch.iter().map(|n| format!("__r{n} = 0")).collect();
+    if !scratch.is_empty() || !saves.is_empty() {
+        let regs: Vec<String> = scratch.iter().map(|n| format!("__r{n} = 0")).chain(saves.iter().map(|t| format!("{t} = 0"))).collect();
         out.push_str(&format!("unsigned int {}; ", regs.join(", ")));
     }
     for l in &body {
@@ -472,6 +505,11 @@ mod tests {
         // An output operand.
         let c = lower("mfc2 %0, $7", ": \"=r\"( z ) :").unwrap();
         assert!(c.ends_with("__op0 = psx_gte_mfc2(7u); (z) = __op0; } while (0)"), "{c}");
+        // Without the nop, the store is in cfc2's load delay: it stores the
+        // register's old value.
+        let c = lower("cfc2\t$12, $31;sw\t$12, 0( %0 )", ": : \"r\"( p ) : \"$12\", \"memory\"").unwrap();
+        assert!(c.contains("unsigned int __r12 = 0, __ld0 = 0;"), "{c}");
+        assert!(c.contains("__ld0 = __r12; __r12 = psx_gte_cfc2(31u); __psxw_sw((__op0 + (unsigned int)0), __ld0);"), "{c}");
     }
 
     #[test]
