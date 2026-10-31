@@ -93,13 +93,15 @@ async function importDisc(files) {
       });
       open.push({ f, w });
     }
+    for (const { f, w } of open) {
+      say(`copying ${f.name} into OPFS…`);
+      await f.stream().pipeTo(w);
+    }
   } catch (e) {
+    // Also release the not-yet-used writers if a copy fails. Completed
+    // copies cannot be rolled back; this is cleanup, not a transaction.
     for (const { w } of open) await w.abort().catch(() => {});
     throw e;
-  }
-  for (const { f, w } of open) {
-    say(`copying ${f.name} into OPFS…`);
-    await f.stream().pipeTo(w);
   }
   // The new image is in place: only now drop the files it no longer names
   // and remember it, so a refused import leaves the old disc imported.

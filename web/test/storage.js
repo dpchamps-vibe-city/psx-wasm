@@ -181,7 +181,30 @@ async function main() {
       (await discText(root, "test-b", "test.cue")) === cues["test-b"] &&
       localStorage.getItem("psxw.cue.test-b") === "test.cue",
   );
-  worker.terminate();
+  // Fail the first copy after preflight has opened every writer. The unused
+  // bin writer must be released too, or the next game cannot open its disc.
+  const win = reimported.contentWindow;
+  const stream = win.File.prototype.stream;
+  try {
+    win.File.prototype.stream = function () {
+      return new win.ReadableStream({ start(c) { c.error(new Error("injected disc read failure")); } });
+    };
+    const selected = new win.DataTransfer();
+    selected.items.add(new win.File([replacedCue], "test.cue"));
+    selected.items.add(new win.File([replacedBin], "track01.bin"));
+    const input = win.document.getElementById("disc");
+    input.files = selected.files;
+    input.dispatchEvent(new win.Event("change"));
+    check("a failed disc copy reports its error", await eventually(() => /injected disc read failure/.test(status(reimported))), status(reimported));
+    // Disc.open's SyncAccessHandle is exclusive even where createWritable
+    // allows more than one writer; use the same access the game needs.
+    const reopened = await ask({ type: "lock", dir: "disc-test-a", cue: "test.cue" });
+    check("a failed copy releases unused writers", !reopened.error && same(reopened.sector, replacedBin.subarray(0, 2352)), reopened.error || "");
+    if (!reopened.error) await ask({ type: "close" });
+  } finally {
+    win.File.prototype.stream = stream;
+    worker.terminate();
+  }
 
   const pass = checks.every((c) => c.pass);
   return { browser, pass, checks };
