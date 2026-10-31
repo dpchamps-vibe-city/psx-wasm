@@ -1,6 +1,6 @@
 # Spec fidelity
 
-**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress; phase 6 done on its branch but for the human's runs; phase 7's steps 2 and 3 built, adapters' straight-line time partly, baselines the human's.
+**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress; phase 6 done on its branch but for the human's runs; phase 7's steps 2 and 3 built, the adapters' time all but libgpu's, libcd's, libetc's dispatcher's and libpress's straight-line code, baselines the human's.
 **Depends on:** [unified adapter layer, phase 1](unified-adaptor-layer/phase1.md)
 (done): the adapters this plan corrects.
 **Replaces:** `plans/shortcuts.md` (the 2026-10-30 audit, commits
@@ -651,8 +651,9 @@ anything else.
    the C function), `psxw_link::cost` (regions paired by nesting and
    order, a spend per straight-line segment). btn: 2,460 of 2,541 C
    functions pair. The check's distribution is in Findings and D71.
-   Adapters spend their originals' instructions (`38bf58e`), but not all
-   yet: Findings, "Adapters' straight-line time".
+   Adapters spend their originals' instructions (`38bf58e`; the pad and
+   card handlers `368670a`, `0b2c55d`), but not all yet: Findings,
+   "Adapters' straight-line time".
 5. [ ] **Re-record baselines once:** replays, golden frames, `ramdiff`
    baselines, each after showing the new timing is closer to the oracle's
    (`psxw oracle play`, `psxw oracle ramdiff`). The human's; commands
@@ -667,13 +668,15 @@ anything else.
 
 Status (2026-10-31): merged to main at `9f00d2b`; 1 and 2 pass. `psxw difftest btn`: 2,620 pass, 3 excluded, the known
 `AlignPadActuators` mismatch and `Ovl11ProbeActorBounds` trap, as
-before. Conformance: chips irq, gpu, cd and spu pass in both games, mdec
-in bof4; sio0 (both) and memcard (btn) fail on time: their interrupt
-handlers' adapters don't yet spend their originals' straight-line
-instructions (Findings, "Adapters' straight-line time"). Both games boot
-to their main loops and run 1,200 frames without a trap (`psxw run
-<game> --check boot --check no-trap`). Step 5 and 3 wait for the human,
-and, before them, those handlers' time.
+before. The pad and card handlers' time is done (`368670a`, `0b2c55d`;
+Findings, "Adapters' straight-line time"): conformance passes for chips
+irq, gpu, cd, sio0, memcard and spu in btn, and irq, gpu, cd, mdec, sio0
+and spu in bof4, sio0 and memcard now observing the budget at every
+look. Both games boot to their main loops and run 1,200 frames without
+a trap (`psxw run <game> --check boot --check no-trap`, before the
+handlers' time). Left before step 5: the straight-line code of libgpu's,
+libcd's, libetc's dispatcher's and libpress's adapters (Findings). Step
+5 and exit criterion 3 are the human's.
 
 Step 5, the human's (each game; btn's replay `title-to-gameplay`,
 bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
@@ -841,28 +844,47 @@ locals, or static translation.
   loop header (where a safepoint can fall), a guest call.
   - Done, and their chips pass: libapi's counter functions (irq);
     libgpu's timeout check (26 instructions, gpu); every libspu adapter
-    and libsnd's `_SsInit` (spu, `38bf58e`, `69ebfa8`).
-  - Left: libpad's interrupt (`_padIntPad` and its callees) for chip
-    sio0, libmcx's elements and `_mcxDsrEntry` for chip memcard, and the
-    straight-line code of libgpu's, libcd's, libetc's dispatcher's and
-    libpress's adapters, which no case sees yet but games run natively.
-  - What the handlers need, beyond the blocks: (1) each element's
-    verifier spends on every interrupt the kernel walks the chain for,
-    not only when it says yes (`mcxresi` +0h and +40h, 10 to 16
-    instructions; libpad's `_padIsVsync` likewise); (2) a quantum passes
-    inside the handler only at a loop header there, so the handler's
-    tail after its last wait spends without one
-    (`libpad::spend_in_exception` takes them wherever the budget runs
-    out); (3) a wait ends at the pass whose poll sees what it waits for,
-    and the poll is read at the time after its whole block: libmcx's
-    root counter 2 wait can poll the counter itself through `guest_now`
-    pass by pass; libpad's waits are on its own wire model, so its
-    `Spin` must count every instruction between the handler's start and
-    each poll (2 cycles each), not only the waits'. Each is the same
-    mechanical work as libspu's, checked by `sio0.interrupt-time`,
-    `memcard.session` and the chips' other cases. Until it is done,
-    replays with those chips native run a little fast against their
-    originals.
+    and libsnd's `_SsInit` (spu, `38bf58e`, `69ebfa8`); every libpad
+    adapter and its interrupt (sio0, `368670a`); libmcx's `McxStartCom`,
+    elements and `_mcxDsrEntry` (memcard, `0b2c55d`).
+  - Left: the straight-line code of libgpu's, libcd's, libetc's
+    dispatcher's and libpress's adapters, which no case sees yet but
+    games run natively.
+  - How the handlers do it (2026-10-31, `368670a`, `0b2c55d`): a
+    transliteration of the original's control flow, block by block
+    (`sdk_psyq::irq_path`, offsets from `psxw sdk disasm`, checked
+    against the lifted C's `PSXW_SPEND`s), each block spent before what
+    it does. (1) Each element's verifier spends on every walk of the
+    chains (`_padIsVsync` 13, 18 or 24; `mcxresi` +0h and +40h 10, 16 or
+    15). (2) A quantum passes only at a loop header
+    (`sdk_psyq::irq_header`: once the budget is at or below 0, the clock
+    moves a quantum and the budget gets its quantum, nothing delivered);
+    `libpad::spend_in_exception` is gone, libapi's pad element takes its
+    quanta at its countdown's header too. (3) Root counter 2 is read
+    through the shared device at `guest_now`, as the original reads it
+    (counter, mode, target, in its order), so each poll sees the cycle
+    after its block; libpad's wire answers at the device's times (the
+    byte's 8 × 88h cycles, /ACK 40h after it for 32 cycles, IRQ7 latched
+    until acknowledged), from the guest cycle each byte goes out; so
+    does libmcx's, whose /ACK event is now timed from the guest's cycle
+    too. libpad's `_padFuncCurrLimit` (with the game's `bzero`: libapi's
+    A0h vector, 3, or libc2's loop), `_padFuncGetTxd` and the actuator
+    gates are computed, as their paths take time.
+  - What else they needed: the call adapters too. With only the
+    handlers exact, the budget's phase still drifted by the calls'
+    instructions (`PadGetState`'s 30-odd a call, a few a frame), so where
+    a quantum fell inside the interrupt still differed. Every libpad call
+    and `McxStartCom` now spends its path and libapi's stubs
+    (`EnterCriticalSection`'s 4, a vector's 3); `McxStartCom` enters its
+    critical section, as the original does, so a quantum at its chain
+    walk's header delivers nothing. Calls whose original makes no runtime
+    call return quietly (`Machine::quiet`). Chips sio0 and memcard now
+    observe the budget at each look and place: the two sides agree at
+    every one (btn's `sio0.sequence` 95, `memcard.session` 114).
+  - Not reproduced, as before: what a pad in config mode or a multitap
+    would take (the info states' requests and replies, `_padFuncIntGun`,
+    `_mcxFastDsrEnt`'s bulk path beyond its blocks), which these games'
+    devices never answer.
 - **A BIOS call panicked** (2026-10-31): `77ee6fd` kept the machine
   borrowed through `driver::run` in the runtime's `bios` import, so
   every BIOS call from guest code trapped ("RefCell already borrowed"),
