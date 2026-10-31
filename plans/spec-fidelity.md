@@ -638,7 +638,11 @@ locals, or static translation.
   decision, or give the lifter the register-pointer table and make every
   access through it volatile in every build. Until then, SDK code that
   reaches registers through pointers in data is plain memory to clang;
-  it matters only when a chip runs on its device.
+  it matters only when a chip runs on its device. Decided (2026-10-31,
+  under the /goal): the second — the lifter takes `psxw sdk scan`'s reach
+  (`psxw_inputs::boundary::Reach`, per function), and every access but
+  the stack's in a function it names is volatile, in every build. Built
+  after phase 4's lifter changes merge.
 - **TR12 left two callers on the old default:** psxw-modkit now takes
   plain `char` from the game's reference flags (`psxw_cc::plain_char_unsigned`,
   in the mod SDK's `flags.json`). psxw-difftest's compiler still uses
