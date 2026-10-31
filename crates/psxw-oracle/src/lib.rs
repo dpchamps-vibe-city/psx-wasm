@@ -9,6 +9,7 @@
 //! (gitignored); reports go under `out/oracle/`.
 
 pub mod batch;
+pub mod bios;
 pub mod cdc;
 pub mod commands;
 pub mod exact;

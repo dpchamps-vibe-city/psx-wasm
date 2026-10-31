@@ -122,7 +122,7 @@ pub fn install(store: &Store) -> Result<Vec<VectorId>> {
 
 // ---- psx-bios, driven like the runner drives the target's BIOS ------------
 
-struct NullHost;
+pub(crate) struct NullHost;
 
 impl Host for NullHost {
     fn log(&mut self, _level: u32, _msg: &str) {}
@@ -145,9 +145,9 @@ impl Host for NullHost {
     fn report(&mut self, _json: &str) {}
 }
 
-struct SimRegs {
-    sp: u32,
-    gp: u32,
+pub(crate) struct SimRegs {
+    pub(crate) sp: u32,
+    pub(crate) gp: u32,
 }
 
 impl Regs for SimRegs {
@@ -165,7 +165,7 @@ impl Regs for SimRegs {
     }
 }
 
-struct NoSdk;
+pub(crate) struct NoSdk;
 
 impl Sdk for NoSdk {
     fn on_event(_m: &mut Machine<Self>, _kind: u32, _data: u32) {}
@@ -177,8 +177,8 @@ impl Sdk for NoSdk {
 
 /// The runner's main thread: its sp and gp at a call (any values; results
 /// are differences).
-const MAIN_SP: u32 = 0x801F_FE00;
-const MAIN_GP: u32 = 0x8001_C230;
+pub(crate) const MAIN_SP: u32 = 0x801F_FE00;
+pub(crate) const MAIN_GP: u32 = 0x8001_C230;
 /// How far below its entry sp the thread body's ChangeThread is.
 const BODY_FRAME: u32 = 0x40;
 

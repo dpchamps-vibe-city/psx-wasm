@@ -39,6 +39,7 @@ pub(crate) fn devices(ws: &Workspace) -> Vec<Box<dyn DeviceUnderTest>> {
         Box::new(psxw_oracle::mdec::Device),
         Box::new(psxw_oracle::cdc::Device),
         Box::new(psxw_oracle::threads::Device),
+        Box::new(psxw_oracle::bios::Device),
     ]
 }
 
