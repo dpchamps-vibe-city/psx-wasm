@@ -1049,20 +1049,24 @@ impl<S: Sdk> Machine<S> {
         0
     }
 
-    /// A(64h) `dev_cd_chdir(fcb, path)`: the current directory, upper-cased;
-    /// 1 when it is on the native disc, or 0.
+    /// A(64h) `dev_cd_chdir(fcb, path)`: replace the current directory,
+    /// upper-cased, even on failure. The directory need not exist: the
+    /// result is the disc metadata read, not a directory lookup (psx-spx;
+    /// OpenBIOS `dev_cd_chdir` / `cdromReadPathTable`). Native lookups read
+    /// the disc afresh rather than retaining the BIOS's path-table cache.
     pub fn dev_cd_chdir(&mut self, path: u32) -> u32 {
         let raw = String::from_utf8_lossy(&self.mem.cstr(path, 128)).into_owned();
-        let p = raw.replace('/', "\\");
-        let absolute = p.starts_with('\\');
-        let p = p.trim_matches('\\');
-        let p = if absolute { p.to_string() } else { self.cd_join(p) };
-        let p = p.trim_matches('\\').to_ascii_uppercase();
-        if self.cd_entries(&p).is_none() {
+        self.kernel.files.cd_cwd = raw.replace('/', "\\").trim_matches('\\').to_ascii_uppercase();
+        let mut raw = [0u8; cd::RAW];
+        if !self.host.disc_read(16, &mut raw) {
             return 0;
         }
-        self.kernel.files.cd_cwd = p;
-        1
+        let pvd = cd::user_data(&raw);
+        if &pvd[1..6] != b"CD001" {
+            return 0;
+        }
+        let table = u32::from_le_bytes(pvd[140..144].try_into().unwrap());
+        self.host.disc_read(table, &mut raw) as u32
     }
 
     /// B(55h) `_get_error(fd)`: the FCB's error, or -1 for a handle not in
@@ -1422,6 +1426,7 @@ mod tests {
         let mut pvd = vec![0u8; cd::USER];
         pvd[0] = 1;
         pvd[1..6].copy_from_slice(b"CD001");
+        pvd[140..144].copy_from_slice(&17u32.to_le_bytes());
         pvd[156..190].copy_from_slice(&iso_record("\0", 18, 2048, true)[..34]);
         sectors[16] = iso_sector(16, &pvd);
         let mut root = Vec::new();
@@ -1458,10 +1463,22 @@ mod tests {
         let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 2);
 
-        m.mem.write(0x8005_0000, b"cdrom:DATA\0");
+        // chdir replaces the cwd, even with a nonexistent name. It does
+        // not check that directory, and a second relative name is not
+        // appended to the first one.
+        m.mem.write(0x8005_0000, b"cdrom:missing\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x40, [0x8005_0000, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 1);
+        assert_eq!(m.kernel.files.cd_cwd, "MISSING");
+        m.mem.write(0x8001_0000, b"cdrom:A.BIN;1\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), u32::MAX, "lookup uses the nonexistent cwd");
+        assert_eq!(m.kernel.files.errno, E_NOT_FOUND);
+        m.mem.write(0x8005_0000, b"cdrom:data\0");
         let v = crate::bios::call(&mut m, 0xB0, 0x40, [0x8005_0000, 0, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 1);
         assert_eq!(m.kernel.files.cd_cwd, "DATA");
+        assert_eq!(m.kernel.files.errno, E_NOT_FOUND, "chdir leaves errno alone");
         m.mem.write(0x8001_0000, b"cdrom:B.BIN;1\0");
         let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 2, "relative to DATA");
@@ -1485,6 +1502,44 @@ mod tests {
         assert_eq!(ret(&mut m, v, &returns), 0x8004_0000);
         assert_eq!(m.mem.cstr(0x8004_0000, 32), b"A.BIN;1", "an absolute pattern ignores the cwd");
         assert_eq!(m.mem.r32(0x8004_0020), 19);
+        m.mem.write(0x8005_0000, b"cdrom:\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x40, [0x8005_0000, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 1);
+        assert!(m.kernel.files.cd_cwd.is_empty(), "empty chdir replaces the cwd with root");
+        let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), u32::MAX, "B.BIN is not in root");
+        m.mem.write(0x8001_0000, b"cdrom:A.BIN;1\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 2, "relative open after clearing cwd");
+    }
+
+    /// chdir stores its name before either metadata read. Failures return
+    /// zero without a directory lookup or an errno write; the FCB is freed.
+    #[test]
+    fn cdrom_chdir_keeps_name_when_metadata_read_fails() {
+        for failure in 0..3 {
+            let mut sectors = vec![[0u8; cd::RAW]; if failure == 0 { 0 } else { 17 }];
+            if failure != 0 {
+                let mut pvd = vec![0u8; cd::USER];
+                pvd[0] = 1;
+                pvd[1..6].copy_from_slice(if failure == 1 { b"WRONG" } else { b"CD001" });
+                pvd[140..144].copy_from_slice(&17u32.to_le_bytes());
+                sectors[16] = iso_sector(16, &pvd);
+            }
+            let mut m = crate::testing::machine_with_disc(sectors);
+            m.kernel.files.cd_cwd = "OLD".into();
+            m.kernel.files.errno = 0x1234;
+            m.mem.write(0x8001_0000, b"cdrom:new\0");
+            let v = crate::bios::call(&mut m, 0xB0, 0x40, [0x8001_0000, 0, 0, 0]);
+            assert_eq!(ret(&mut m, v, &|_, _| panic!("no guest callback")), 0, "failure {failure}");
+            assert_eq!(m.kernel.files.cd_cwd, "NEW");
+            assert_eq!(m.kernel.files.errno, 0x1234);
+            assert_eq!(m.mem.r32(fcb_at(2) + fcb::FLAGS), 0);
+            m.mem.write(0x8001_0000, b"direct\0");
+            let v = crate::bios::call(&mut m, 0xA0, 0x64, [fcb_at(2), 0x8001_0000, 0, 0]);
+            assert_eq!(ret(&mut m, v, &|_, _| panic!("no guest callback")), 0);
+            assert_eq!(m.kernel.files.cd_cwd, "DIRECT", "direct device entry uses the same contract");
+        }
     }
 
     /// `gets` uses the installed console's file callbacks for both read

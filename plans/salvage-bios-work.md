@@ -136,20 +136,26 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 | Card, console and CD | Partial; continue independently verifiable software contracts using existing backends. Do not invent missing reference behaviour. |
 | Other executable, exception and thread gaps | Still open; do not assume deferring longjmp implements these or authorises a runtime redesign. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | Code at `99fa333` passes local tests, fresh builds, four replays and memcard conformance. Earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | CD-directory follow-up passes BIOS 51/runtime 8/SDK 42 tests and wasm32 check. Release/game/replay/memcard artifacts remain at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | Checklist and `99fa333` build/replay/memcard gates complete; both handoffs reviewed, dispositions below | Owns plan and integration, not worker files |
+| Parent | `salvage/bios`, writer | CD-directory software follow-up implemented and locally checked; `99fa333` build/replay/memcard checkpoint retained | Owns plan and integration, not worker files |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
 Workflow `1610e372-e898-4cf0-946a-0dc7f60bd941` completed both lanes. No active
-children, subdelegation or control-flow work. Source/gate claims remain
-checkpoint-specific; worker completion alone is not parent acceptance.
+children from that workflow, subdelegation or control-flow work. Source/gate
+claims remain checkpoint-specific; worker completion alone is not parent acceptance.
+
+A subsequent independent worker, run `7ccc8568-6c02-46fe-8c24-162d54aef56d`,
+is implementing focused two-bundle/locked-disc browser validation in
+`../psx-wasm-salvage-lanes/browser-disc-validation` (base `aea8c94`). It owns
+only that worktree's web tests/necessary packaging, not runtime or plan changes;
+no acceptance or browser-pass claim yet.
 
 ## Work order
 
@@ -1104,6 +1110,35 @@ using the native software/scheduler seams; merely changing late error priority
 would be a hybrid contract. No CD code or tests were changed on this evidence,
 and no new architecture approval request is being made. These services remain
 partial, independently of the user-deferred non-local-return bug.
+
+### CD-directory software follow-up
+
+Parent corrected A(64h) `dev_cd_chdir`, also reached through B(40h) `cd`, using
+psx-spx's file-function contract and pinned OpenBIOS
+[`filesystem.c`](https://github.com/pcsx-redux/nugget/blob/4dc70d2931121a0fde858a0354192b6df4fa22e8/openbios/cdrom/filesystem.c).
+The old native implementation incorrectly required the directory to exist and
+appended a relative new name to the old current directory. The call now replaces
+the upper-cased current directory before reading metadata, accepts nonexistent
+directories, and returns the result of reading the PVD signature and its first
+little-endian path-table sector through the existing host disc. A failed read
+still keeps the new directory; an empty name resets it to root. The existing
+native slash normalization remains. No hardware-driver, timing, scheduler or ABI
+change was introduced.
+
+The existing device-table integration test now checks nonexistent-directory
+acceptance followed by failed relative open, replacement by another relative
+name, root reset and unchanged errno. One grouped failure test covers absent
+PVD, invalid signature and absent path-table sector through both B40 and A64;
+the name persists and the generic temporary FCB is released. **BIOS 51, runtime
+8 and SDK 42 tests plus wasm32 runtime check pass**, logged in the session
+scratchpad as `cd-chdir-integrated-tests.log`; the complete code diff was reviewed.
+
+A64/B40 remain `Partial`: native lookups reread directory data rather than
+retaining Sony's path-table/disc-identity cache. Other CD filesystem quirks and
+the separately documented event-wait/retry contract are unchanged. This does
+not resolve the rejected wait proposal. Release/game/replay/conformance outputs
+remain at `99fa333` until a later integrated refresh; no new full CI, browser or
+oracle pass is claimed.
 
 ## Progress log
 
