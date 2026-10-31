@@ -204,25 +204,41 @@ call_indirect $dispatch ((fp & 0x003F_FFFC) >> 2)
   address is taken get synthetic addresses above RAM, in window offsets
   `0x200000`–`0x3FFFFF`.
 
-### 3. Overlays: the bytes in RAM decide
+### 3. Overlays: what the disc wrote decides
 
 Each overlay's functions are compiled into `game.wasm` alongside the EXE.
-An address that more than one overlay defines gets a dispatch stub:
+Which container's code runs at an address is decided by what the disc
+wrote there (D69):
 
-1. Read the first word or two of guest RAM at that address.
-2. Compare them against each candidate overlay's original code at that
-   address.
-3. Call the candidate that matches. If none matches, trap with a diagnostic
-   ("no translation for resident code at 0x800BBC74").
+1. Each container's code where overlays load (all of an overlay's text,
+   and the part of the EXE's that overlays share) is a *residency unit*,
+   identified by a 64-bit FNV-1a hash of its original words, computed at
+   build time from the containers' original files.
+2. The guest keeps a flag per unit: resident, not resident, or unknown
+   (all unknown at boot). Every disc write into RAM (CD DMA, the BIOS's
+   file reads, through `Machine::loaded`) reaches the guest's
+   `psxmod_loaded` before any of its code runs again, and makes the units
+   it overlaps unknown.
+3. An unknown unit is settled when code needs it: its RAM is hashed and
+   compared with the original's.
+4. An address several containers define gets a dispatch stub that calls
+   the first candidate whose unit is resident. A function only one
+   container defines where overlays load checks its own unit when entered.
+   Either way, a call with nothing built for it resident traps, naming the
+   container that is ("call to 0x800BBC74, but none of the code built for
+   it is resident: ovl_17 is").
 
-The 690 EXE→overlay imports, and every table entry for an overlay address,
-point at these stubs.
+So every call into an overlay region is checked: the 690 EXE→overlay
+imports, table entries (function pointers), calls inside an overlay, and
+calls where the EXE and an overlay overlap. A check is a global read; the
+hash runs once per load.
 
-Residency is decided by RAM contents, the same way the hardware decides
-which code runs. It doesn't matter how the bytes arrived: CD DMA, a game
-`memcpy`, or decompression. No per-game loader hook is needed. Calls inside
-an overlay are direct and unchecked. Caching the check against a
-region-write epoch is a later optimization.
+The words at the address can't decide: two overlays can start the same
+way (a common prologue) and differ after. Code the CPU copies into an
+overlay region (decompressed or moved) is noticed only the first time its
+unit is settled, and a unit is resident as a whole: a game that overwrites
+part of an overlay and still calls the rest traps where the console would
+run it.
 
 ### 4. Every function gets exactly one implementation
 
@@ -1363,6 +1379,9 @@ indirect ABI `(a0..a3) -> i64`. (design §2)
 **D7. Overlays dispatch on resident bytes.** A stub compares code words in
 RAM against each candidate overlay. *Why:* it's how hardware decides, and
 needs no per-game loader hook. (design §3)
+
+*Later:* revised by D69: residency comes from the disc's writes, and every
+call into an overlay region is checked.
 
 ### Implementations
 
@@ -2658,15 +2677,37 @@ under the /goal that implements plans/spec-fidelity.md, whose decisions
 table proposes it.
 
 **D69. Overlay residency comes from what was loaded** (spec fidelity,
-phase 5; planned, the body changes with the code). The runtime keeps a
-residency table from the disc's writes into RAM (the BIOS's file reads,
-DMA3, `Machine::loaded`); every call into an overlay region dispatches on
-it, and a call whose target isn't resident traps naming what is. Revises
-D7, whose stub compares two code words and takes the first candidate by
-name: two overlays with the same prologue in one slot dispatch wrongly,
-and single-definer, intra-overlay and main/overlay-overlap calls go
-unchecked. Decided without the human's input under the /goal that
-implements plans/spec-fidelity.md, whose decisions table proposes it.
+phase 5). Each container's code where overlays load (all of an overlay's
+text; the part of the executable's that overlays share) is a residency
+unit, identified by a build-time 64-bit FNV-1a hash of its original words
+(`psxw_link::game::residency`). The guest keeps a flag per unit, unknown at
+boot. Every disc write into RAM (DMA3, the BIOS's file reads; anything that
+pushes `Machine::loaded`) reaches the guest's `psxmod_loaded` before any
+guest code runs again (`driver::deliver_loaded`) and marks the units it
+covers unknown; an unknown unit's RAM is hashed again when code next needs
+it. An address several containers define dispatches through a stub to the
+first candidate whose unit is resident; a function only one container
+defines there checks its own unit when entered. So every call into an
+overlay region is checked (single definers, calls inside an overlay, where
+the executable and an overlay overlap, function pointers), and one whose
+target isn't resident traps (`psx.not_resident`) naming the container that
+is. The hash rather than the disc file and offset a write came from: it
+needs nothing beyond the splat configs' originals and works however the
+game reads the disc; the check is a global read and the hash runs once per
+load. Cost: btn's game.wasm +2.8% bytes (2,012,484 → 2,068,944) and +2.8%
+instructions (723,592 → 743,935, `llvm-objdump -d`); bof4's +2.5% bytes
+(9,960,497 → 10,208,630) and +3.0% instructions (3,834,478 → 3,949,022).
+*Limits:* code the CPU copies into an overlay region is noticed only the
+first time its unit is settled; a unit is resident as a whole, so a game
+that overwrites part of an overlay and still calls the rest traps where the
+console would run it; functions the translator expands into their callers
+run unchecked. Mods' overlay data patches still apply once the overlay's
+first two code words are there. Revises D7, whose stub compared two code
+words and took the first candidate by name: two overlays with the same
+prologue in one slot dispatched wrongly, and single-definer, intra-overlay
+and main/overlay-overlap calls went unchecked. Decided without the human's
+input under the /goal that implements plans/spec-fidelity.md, whose
+decisions table proposes it.
 
 **D70. The memory map is the console's** (spec fidelity, phase 6;
 planned, the body changes with the code). RAM is mirrored four times in

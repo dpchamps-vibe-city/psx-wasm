@@ -525,7 +525,7 @@ census` for both games (the `.i` files change again).
 ## Phase 5: overlay residency
 
 1. [x] **Record the decision** (D7). Done: D69.
-2. [ ] **TR4. Dispatch on what's loaded.** Today a stub compares two code
+2. [x] **TR4. Dispatch on what's loaded.** Today a stub compares two code
    words, first candidate by name wins, and single-definer, intra-overlay
    and main/overlay-overlap calls aren't checked
    (`psxw-link/src/game.rs:117, 838-868`; `psxw-build/src/game.rs:337-340,
@@ -535,6 +535,16 @@ census` for both games (the `.i` files change again).
    overlay region dispatches on it; a call whose target isn't resident
    traps naming what is. Test: two overlays with identical prologues in
    one slot.
+   Done `dcc2505`, `c135310` (agent): design in D69 and §3. Residency
+   units (each container's code where overlays load) hashed at build
+   time; a guest flag per unit, made unknown by each disc write
+   (`psxmod_loaded`, now delivered before any guest code runs again) and
+   settled by hashing RAM when code needs it. Shared addresses dispatch
+   through a stub; a function only one container has there checks its own
+   unit on entry; `psx.not_resident` names what is resident (ABI 13). The
+   lifter needed no change: the link decides from its `psxw_f_`/`psxw_d_`
+   names. Test: `psxw-link/tests/overlay_residency.rs`. Cost: btn
+   game.wasm +2.8% bytes, +2.8% instructions; bof4 +2.5%, +3.0% (D69).
 
 ### Exit criteria
 
@@ -542,6 +552,9 @@ census` for both games (the `.i` files change again).
 2. `psxw build btn` and `psxw build bof4` succeed.
 3. **Human:** `psxw ci btn` (M2's overlay dispatch gate) and
    `psxw ci bof4`.
+
+Status (2026-10-31): 1 passes and 2 holds at `c135310`; 3 waits for the
+human.
 
 ## Phase 6: the memory map
 
@@ -718,6 +731,27 @@ locals, or static translation.
     Measure the cost; fall back to a call the link lowers if clang's wasm
     asm can't name the global. TR9's charge (a pass per word, including
     clang's zero-fills of locals) moves to the same units.
+
+- **Overlay residency's limits** (2026-10-31, TR4). A unit is a
+  container's whole text where overlays load: a game that overwrites part
+  of an overlay and still calls the rest traps where the console would run
+  it (the boot check's `overlay-mismatch` flags the case where the first
+  words survive; neither game has shown it). Code the CPU copies into an
+  overlay region (decompressed, moved) is noticed only the first time its
+  unit is settled. Both games' overlays sit uncompressed and sector-aligned
+  on their discs (bof4's inside its EMI files), the layout of a game that
+  reads them straight into place, and RAM dumps under `out/` (btn frames
+  4900–5000; bof4 frames 24768–25168 and an FMV, ours and Beetle's) show
+  every resident overlay's whole text intact. Functions the translator
+  expands into their callers run unchecked. The mods' overlay data patches
+  (static and script) still decide an overlay is there from its first two
+  code words: that only times a patch, but could move to the residency
+  flags. Checking at each call site instead of at function entry, with a
+  stub per overlay function for pointers, cost btn +6% and bof4 +10%
+  (Asyncify instrumented the extra stubs). Settling every unknown candidate
+  before a stub dispatches (so it never rehashes while another candidate
+  is known resident) cost bof4 another 0.8% and was left out: a stub
+  settles candidates in name order up to the resident one.
 
 - **Phase 4's limits** (2026-10-31). D33: a value a function passes on
   without setting it is no evidence for its callee; calls through
