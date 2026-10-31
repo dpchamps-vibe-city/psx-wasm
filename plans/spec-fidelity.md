@@ -125,17 +125,19 @@ BIOS:
   build's coverage check trusts. `psx-bios/src/bios.rs:104`. Fix: count
   only calls that can succeed.
   Done `d8592ec`: `implemented()` excludes `longjmp` and `Exec` (`bios::unsupported` gives the reason); the build lists such calls' sites and records the reason in `bios-calls.json` instead of failing (bof4 makes `Exec`). `SystemError` stops as the console does and `ReturnFromException` is lowered by the lift, so both stay implemented.
-- [ ] **B7. BIOS `printf` zero-pads negatives as `000-5`** and ignores
+- [x] **B7. BIOS `printf` zero-pads negatives as `000-5`** and ignores
   `+`, space and `#`. `psx-bios/src/bios.rs:597-607`. Fix: sign before
   padding; the flags.
+  Done `2a735e9`: psx-spx A(3Fh)'s conversions and prefixes (`*`, `.*`, `h`, `D`/`U`/`O`, `%n`) with C's meaning.
 - [x] **B8. Stale doc on `card_queue`.** `psx-bios/src/card.rs:162`: it
   always returns true.
   Done `decdde9`: `card_queue` now refuses while the port's last operation runs (OpenBIOS: flags bit 0), so the doc holds.
-- [ ] **B9. The vblank counter event ignores I_MASK.**
+- [x] **B9. The vblank counter event ignores I_MASK.**
   `psx-bios/src/machine.rs:392`; counters 0–2 are gated
   (`machine.rs:410`), and libapi's `StartRCnt(RCntCNT3)` sets bit 0
   expecting it. Fix: gate on bit 0 (phase 3 task 5 later replaces both
   with the kernel's handler).
+  Done `2673b46`.
 
 Devices (out of scope otherwise):
 - [x] **B10. `GetlocP` loses a minute.** `psx-devices/src/cdc.rs:389-397`:
@@ -165,9 +167,10 @@ Devices (out of scope otherwise):
   *Blocked (2026-10-30):* the oracle can't settle it. Beetle has no FIFO (each DATA write goes to SPU RAM; its header calls the FIFO "more trouble than it's worth"), and psx-spx says only "max 32 halfwords". Needs a hardware test (M10's rig); left as is.
 
 Renderer, SDK, translator, runtime:
-- [ ] **B16. 15-bit colour is shifted, not expanded.**
+- [x] ~~**B16. 15-bit colour is shifted, not expanded.**
   `psx-render-gl/src/shaders.rs:341-344` (white shows as F8F8F8). Fix:
-  `(c << 3) | (c >> 2)`.
+  `(c << 3) | (c >> 2)`.~~
+  *Wrong (2026-10-30):* the shift is the oracle's. Beetle zero-pads each 5-bit channel (`<< 3`, its `gpu.c` says "NOT bit-replication"), and psx-spx doesn't specify the DAC's mapping; expanding would break the golden frames.
 - [ ] **B17. libgpu's timeout counts every vblank** when libetc's adapters
   aren't running. `sdk-psyq/src/libgpu.rs:324-328`. Fix: read `Vcount` as
   the original does (`VSync(-1)`).
@@ -231,9 +234,10 @@ Renderer, SDK, translator, runtime:
 - [ ] **SDK16. `_spu_t(3)` writes the DMA fields directly.**
   `sdk-psyq/src/libspu.rs:660-663`. Fix: MADR, BCR and CHCR4 through the
   register path.
-- [ ] **REN1. A failed output texture or framebuffer is swallowed.**
+- [x] **REN1. A failed output texture or framebuffer is swallowed.**
   `psx-render-gl/src/lib.rs:620-621`. Fix: fail loudly, as the crate does
   elsewhere.
+  Done `f664edd`: `present_frame` returns the error through `execute`.
 - [x] **TR1. Lifted I/O accesses are plain memory to clang.**
   `psxw-lift/src/psxw_rt.h:23-33`, `emit.rs:416-437`; the I/O hooks come
   after clang (`psxw-link/src/rewrite.rs:195-230`). Clang may drop,
