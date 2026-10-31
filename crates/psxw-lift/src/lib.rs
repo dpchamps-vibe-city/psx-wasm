@@ -631,6 +631,32 @@ mod tests {
         translate_all(&mut program, &originals, &["test".into()])
     }
 
+    /// Accesses at a constant device address are volatile and fenced, so
+    /// clang keeps both of two equal stores and keeps RAM accesses on their
+    /// side; RAM stays plain memory.
+    #[test]
+    fn device_accesses_are_volatile() {
+        let words = [
+            0x3C08_1F80, // lui t0, 0x1F80
+            0x2409_0001, // addiu t1, zero, 1
+            0x3C0A_8001, // lui t2, 0x8001
+            0xAD09_1810, // sw t1, 0x1810(t0)
+            0xAD09_1810, // sw t1, 0x1810(t0)
+            0xAD49_0100, // sw t1, 0x100(t2)
+            0x8D0B_1814, // lw t3, 0x1814(t0)
+            0,           // nop
+            0xAD4B_0104, // sw t3, 0x104(t2)
+            0x03E0_0008, // jr ra
+            0,           // nop
+        ];
+        let out = lift_words(&words, &[(BASE, 4 * words.len() as u32)]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let c = &out.ok[0].c;
+        assert_eq!(c.matches("PSXW_FENCE(); PSXW_SWV(r8 + 0x1810u, r9); PSXW_FENCE();").count(), 2, "{c}");
+        assert!(c.contains("PSXW_FENCE(); r11 = (uint32_t)PSXW_LWV(r8 + 0x1814u); PSXW_FENCE();"), "{c}");
+        assert!(c.contains("PSXW_SW(r10 + 0x100u, r9);") && c.contains("PSXW_SW(r10 + 0x104u, r11);"), "{c}");
+    }
+
     /// A callee inlined for the registers it reads ends in a tail jump to
     /// another function: that function returns to the inlined call's return
     /// site, not out of the caller.

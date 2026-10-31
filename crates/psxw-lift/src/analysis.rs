@@ -55,6 +55,11 @@ pub struct Facts {
     /// still happen on hardware, and from an I/O register a read pops a
     /// FIFO, so they are emitted as volatile reads clang keeps.
     pub dead_loads: BTreeSet<Node>,
+    /// Loads and stores at a constant address that isn't RAM or the
+    /// scratchpad: device registers and the other bus regions. Each is
+    /// emitted volatile, between compiler barriers, so clang keeps it,
+    /// doesn't merge it, and keeps it in order with every other access.
+    pub device: BTreeSet<Node>,
 }
 
 pub fn analyze(g: &Graph, in_code: &dyn Fn(u32) -> bool) -> Facts {
@@ -132,6 +137,17 @@ fn sites(g: &Graph, f: &mut Facts) {
 
 fn is_io(addr: u32) -> bool {
     (0x1F80_1000..0x1F80_3000).contains(&(addr & 0x1FFF_FFFF))
+}
+
+/// Main RAM (its 8 MiB of mirrors) through KUSEG, KSEG0 or KSEG1, or the
+/// scratchpad through KUSEG or KSEG0 (psx-spx "Memory Map"): plain memory,
+/// where an access does nothing but read or write its bytes.
+fn is_memory(addr: u32) -> bool {
+    let p = addr & 0x1FFF_FFFF;
+    let kuseg = addr < 0x2000_0000;
+    let ram = p < 0x0080_0000 && (kuseg || (0x8000_0000..0xC000_0000).contains(&addr));
+    let scratchpad = (0x1F80_0000..0x1F80_0400).contains(&p) && (kuseg || (0x8000_0000..0xA000_0000).contains(&addr));
+    ram || scratchpad
 }
 
 /// The BIOS kernel's RAM, but for the tables the runtime's BIOS keeps in
@@ -226,6 +242,9 @@ fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, f: &mut Facts) {
         if i.op.is_load() || i.op.is_store() {
             if let Some(base) = st[i.rs as usize] {
                 let a = base.wrapping_add(i.simm as u32);
+                if !is_memory(a) {
+                    f.device.insert(*n);
+                }
                 if is_io(a) {
                     f.io.push((n.pc(), a));
                 } else if is_kernel(a) {
@@ -398,5 +417,16 @@ mod tests {
         assert!(super::is_kernel(0x0000_0150));
         assert!(super::is_kernel(0xA000_DF80));
         assert!(!super::is_kernel(0));
+    }
+
+    #[test]
+    fn memory_regions() {
+        assert!(super::is_memory(0x8001_0000) && super::is_memory(0xA07F_FFFC) && super::is_memory(0x0000_0100));
+        assert!(super::is_memory(0x1F80_03FC) && super::is_memory(0x9F80_0000));
+        // The scratchpad isn't in KSEG1; I/O, expansion, unmapped space
+        // and KSEG2's cache control aren't memory.
+        assert!(!super::is_memory(0xBF80_0000));
+        assert!(!super::is_memory(0x1F80_1810) && !super::is_memory(0xBF80_1070) && !super::is_memory(0x1F00_0084));
+        assert!(!super::is_memory(0x0080_0000) && !super::is_memory(0xFFFE_0130) && !super::is_memory(0x2000_0000));
     }
 }

@@ -31,6 +31,14 @@ typedef struct { uint32_t v; } __attribute__((packed, aligned(1))) psxw_u32;
 #define PSXW_SB(a, x) (((psxw_u8 *)(uint32_t)(a))->v = (uint8_t)(x))
 #define PSXW_SH(a, x) (((psxw_u16 *)(uint32_t)(a))->v = (uint16_t)(x))
 #define PSXW_SW(a, x) (((psxw_u32 *)(uint32_t)(a))->v = (uint32_t)(x))
+/* An access at an address that isn't RAM (a device register) is volatile,
+ * between two fences: clang keeps it, doesn't merge it, and keeps it in
+ * order with every other access (a DMA reads what was stored before it
+ * starts). */
+#define PSXW_SBV(a, x) (((volatile psxw_u8 *)(uint32_t)(a))->v = (uint8_t)(x))
+#define PSXW_SHV(a, x) (((volatile psxw_u16 *)(uint32_t)(a))->v = (uint16_t)(x))
+#define PSXW_SWV(a, x) (((volatile psxw_u32 *)(uint32_t)(a))->v = (uint32_t)(x))
+#define PSXW_FENCE() __asm__ __volatile__("" ::: "memory")
 
 /* Lowered by the linker to the shared guest-register globals. */
 uint32_t psxw_sp_get(void);

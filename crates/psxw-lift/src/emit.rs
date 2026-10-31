@@ -6,7 +6,8 @@
 //! load whose next instruction reads the loaded register is emitted with
 //! that instruction inlined after it, reading the old value: the R3000 load
 //! delay. Loop heads carry a compiler memory barrier, so every iteration
-//! performs its loads as the original does.
+//! performs its loads as the original does. An access at a constant
+//! address that isn't RAM (a device register) is volatile and fenced.
 
 use crate::analysis::Facts;
 use crate::decode::{Insn, Op, disasm};
@@ -158,6 +159,14 @@ impl<'a> Emitter<'a> {
         self.body.push('\n');
     }
 
+    /// Node `n`'s statement. An access at a device address is volatile and
+    /// fenced; a load nothing reads is volatile.
+    fn stmt(&self, n: Node, insn: &Insn, ov: &Ov) -> String {
+        let device = self.facts.device.contains(&n);
+        let s = stmt(insn, n.pc(), ov, device || self.facts.dead_loads.contains(&n));
+        if device { format!("PSXW_FENCE(); {s} PSXW_FENCE();") } else { s }
+    }
+
     /// Emit a `Normal` node (with its delay slot, if a branch). Returns the
     /// node control falls through to, if any.
     fn normal(&mut self, n: Node, ov: Ov, label: bool) -> Option<Node> {
@@ -183,7 +192,7 @@ impl<'a> Emitter<'a> {
             self.line(&format!("{tmp} = {read};"));
             ov_next = Some((r, tmp));
         }
-        let s = stmt(&insn, pc, &ov, self.facts.dead_loads.contains(&n));
+        let s = self.stmt(n, &insn, &ov);
         self.line(&format!("{s} /* {pc:08X}: {} */", disasm(&insn, pc)));
         match self.g.nodes[&n].transfer.clone() {
             Transfer::Seq(next) => {
@@ -238,7 +247,7 @@ impl<'a> Emitter<'a> {
             Op::Jalr if head.rd != 0 => self.line(&format!("r{} = 0x{:08X}u;", head.rd, b + 8)),
             _ => {}
         }
-        let s = stmt(&slot.insn, b + 4, &None, self.facts.dead_loads.contains(&Node::Slot(b)));
+        let s = self.stmt(Node::Slot(b), &slot.insn, &None);
         self.line(&format!("{s} /* {:08X}: {} (delay slot) */", b + 4, disasm(&slot.insn, b + 4)));
         let c = c_expr.unwrap_or_default();
         match slot.transfer {
@@ -386,15 +395,17 @@ fn write(r: u8, expr: String, pure: bool) -> String {
     }
 }
 
-/// The C statement for a non-control instruction. `keep`: a load whose
-/// result is dead, emitted as a volatile read so it still happens.
-pub fn stmt(i: &Insn, pc: u32, ov: &Ov, keep: bool) -> String {
+/// The C statement for a non-control instruction. `vol`: a memory access
+/// that must happen as written (a load whose result is dead, or an access
+/// at a device address), emitted volatile.
+pub fn stmt(i: &Insn, pc: u32, ov: &Ov, vol: bool) -> String {
     let s = reg(i.rs, ov);
     let t = reg(i.rt, ov);
     let imm = format!("0x{:X}u", i.simm as u32);
     let uimm = format!("0x{:X}u", i.uimm);
     let addr = if i.simm == 0 { s.clone() } else { format!("{s} + {imm}") };
     let w = |r: u8, e: String| write(r, e, true);
+    let v = if vol { "V" } else { "" };
     match i.op {
         Op::Sll if i.word == 0 => ";".into(),
         Op::Sll => w(i.rd, format!("{t} << {}", i.sa)),
@@ -437,15 +448,15 @@ pub fn stmt(i: &Insn, pc: u32, ov: &Ov, keep: bool) -> String {
         Op::Mtc2 => format!("psx_gte_mtc2({}, {t});", i.rd),
         Op::Ctc2 => format!("psx_gte_ctc2({}, {t});", i.rd),
         Op::Cop2 => format!("psx_gte_exec(0x{:07X}u);", i.word & 0x01FF_FFFF),
-        Op::Lb | Op::Lbu | Op::Lh | Op::Lhu | Op::Lw if keep => {
-            let v = match i.op {
+        Op::Lb | Op::Lbu | Op::Lh | Op::Lhu | Op::Lw if vol => {
+            let e = match i.op {
                 Op::Lb => format!("(uint32_t)(int32_t)(int8_t)PSXW_LBV({addr})"),
                 Op::Lbu => format!("(uint32_t)PSXW_LBV({addr})"),
                 Op::Lh => format!("(uint32_t)(int32_t)(int16_t)PSXW_LHV({addr})"),
                 Op::Lhu => format!("(uint32_t)PSXW_LHV({addr})"),
                 _ => format!("(uint32_t)PSXW_LWV({addr})"),
             };
-            write(i.rt, v, false)
+            write(i.rt, e, false)
         }
         Op::Lb => w(i.rt, format!("(uint32_t)(int32_t)(int8_t)PSXW_LB({addr})")),
         Op::Lbu => w(i.rt, format!("(uint32_t)PSXW_LB({addr})")),
@@ -454,13 +465,13 @@ pub fn stmt(i: &Insn, pc: u32, ov: &Ov, keep: bool) -> String {
         Op::Lw => w(i.rt, format!("PSXW_LW({addr})")),
         Op::Lwl => w(i.rt, format!("psxw_lwl({addr}, {t})")),
         Op::Lwr => w(i.rt, format!("psxw_lwr({addr}, {t})")),
-        Op::Sb => format!("PSXW_SB({addr}, {t});"),
-        Op::Sh => format!("PSXW_SH({addr}, {t});"),
-        Op::Sw => format!("PSXW_SW({addr}, {t});"),
+        Op::Sb => format!("PSXW_SB{v}({addr}, {t});"),
+        Op::Sh => format!("PSXW_SH{v}({addr}, {t});"),
+        Op::Sw => format!("PSXW_SW{v}({addr}, {t});"),
         Op::Swl => format!("psxw_swl({addr}, {t});"),
         Op::Swr => format!("psxw_swr({addr}, {t});"),
-        Op::Lwc2 => format!("psx_gte_mtc2({}, PSXW_LW({addr}));", i.rt),
-        Op::Swc2 => format!("PSXW_SW({addr}, psx_gte_mfc2({}));", i.rt),
+        Op::Lwc2 => format!("psx_gte_mtc2({}, PSXW_LW{v}({addr}));", i.rt),
+        Op::Swc2 => format!("PSXW_SW{v}({addr}, psx_gte_mfc2({}));", i.rt),
         Op::Syscall => write(2, format!("psxw_syscall({}, {}, {}, {})", reg(4, ov), reg(5, ov), reg(6, ov), reg(7, ov)), false),
         Op::Break => format!("__psxw_break(0x{:X});", (i.word >> 6) & 0xF_FFFF),
         Op::Invalid
