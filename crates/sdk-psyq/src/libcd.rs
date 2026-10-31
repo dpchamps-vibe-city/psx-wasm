@@ -43,9 +43,7 @@
 //! does when `CheckCallback()` says so. Past 0x3C0000 passes a wait gives
 //! up as the original does ("CD timeout", `CD_flush`, -1).
 //!
-//! **Not reproduced:** the debug printouts (`CD_debug`), and the memory
-//! controller's delay registers the original sets around transfers (they
-//! have no effect here).
+//! **Not reproduced:** the debug printouts (`CD_debug`).
 
 use crate::libetc::{LOOP_BUDGET, quantum};
 use crate::{Adapter, M, Psyq, Result, reg, ret, set_reg};
@@ -149,6 +147,10 @@ mod bs {
 const TIMEOUT_PASSES: u64 = 0x3C_0000;
 
 const DPCR: u32 = psx_devices::dma::DPCR;
+/// The memory controller's CD-ROM and common delays, which the drive layer
+/// sets around a sector transfer and `CD_flush` leaves at 1325h.
+const CDROM_DELAY: u32 = 0x1F80_1018;
+const COM_DELAY: u32 = 0x1F80_1020;
 const DICR: u32 = psx_devices::dma::DICR;
 /// DMA channel 3: the CD controller's data FIFO.
 const CH: u32 = 3;
@@ -589,6 +591,9 @@ fn flush(m: &mut M, b: Bios1) -> u32 {
     b.set_intr(m, 2, 0);
     b.set_intr(m, 1, 0);
     b.set_intr(m, 0, 2);
+    if let Err(e) = set_reg(m, COM_DELAY, 4, 0x1325) {
+        m.log(&format!("CD_flush: {e}"));
+    }
     0x1325
 }
 
@@ -715,23 +720,30 @@ fn cd_datasync(m: &mut M, a: [u32; 4]) -> Result {
 /// `chcr`, through the DMA controller's registers (shared with the other
 /// chips: completion flags DICR and raises IRQ3 when enabled, as on the
 /// device).
-fn getsector(m: &mut M, madr: u32, words: u32, chcr: u32) -> Result {
+/// The memory controller's delays as each one sets them: the CD-ROM's and
+/// the common delay before the transfer, and the common delay after it.
+fn getsector(m: &mut M, madr: u32, words: u32, chcr: u32, delays: (u32, u32, Option<u32>)) -> Result {
     cdc(m, |c, _| c.request(true))?;
+    set_reg(m, CDROM_DELAY, 4, delays.0)?;
+    set_reg(m, COM_DELAY, 4, delays.1)?;
     let dpcr = reg(m, DPCR, 4)?;
     set_reg(m, DPCR, 4, dpcr | 0x8000)?;
     set_reg(m, MADR3, 4, madr)?;
     set_reg(m, BCR3, 4, words | 0x1_0000)?;
     set_reg(m, CHCR3, 4, chcr)?;
     m.cdc_sync();
+    if let Some(d) = delays.2 {
+        set_reg(m, COM_DELAY, 4, d)?;
+    }
     ret(0)
 }
 
 fn cd_getsector(m: &mut M, a: [u32; 4]) -> Result {
-    getsector(m, a[0], a[1], 0x1100_0000)
+    getsector(m, a[0], a[1], 0x1100_0000, (0x2_0943, 0x1323, Some(0x1325)))
 }
 
 fn cd_getsector2(m: &mut M, a: [u32; 4]) -> Result {
-    getsector(m, a[0], a[1], 0x1140_0100)
+    getsector(m, a[0], a[1], 0x1140_0100, (0x2102_0843, 0x1325, None))
 }
 
 // --- The streaming ring (c_011, c_003) -------------------------------------
