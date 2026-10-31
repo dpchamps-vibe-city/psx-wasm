@@ -521,6 +521,13 @@ plain `char` from the reference flags (`23b0976`). The two left,
 which the original takes an address error (see Findings, "difftest's
 last two mismatches"). 3 holds. 4 waits for the human, after `psxw
 census` for both games (the `.i` files change again).
+Since phase 6 those two pass and two others failed, `AlignPadActuators`
+and `Ovl11ProbeActorBounds`, on seeds that are undefined behaviour in C.
+Both are gone (`506894a`, `3d02757`): difftest compares only seeds
+inside a function's domain, which the original alone decides (D34), and
+their failing seeds are outside it. `psxw difftest btn` @ c77a66f:
+2,615 pass, 7 outside, 3 excluded; outside: fault 14,692,
+stack-dependent 30 (Findings, "difftest's domain").
 
 ## Phase 5: overlay residency
 
@@ -762,6 +769,13 @@ locals, or static translation.
   (`-ftrivial-auto-var-init=zero`, D27).
 
 ## Progress log
+
+- **2026-10-31:** difftest's domain (agent, `506894a`, `3d02757`): the
+  original decides which seeds are compared; one where it faults or its
+  result moves with its stack is replaced and counted (D34). btn: the
+  `AlignPadActuators` mismatch and `Ovl11ProbeActorBounds` trap are
+  gone; 2,615 pass, 7 outside (every seed faults), 3 excluded (Findings,
+  "difftest's domain"). Tests pass.
 
 - **2026-10-31:** phase 7, the adapters' straight-line time (agent and
   two sub-agents, `a1e5cea`..`d02f4c5`): libetc's, libcd's and libgpu's
@@ -1198,7 +1212,39 @@ locals, or static translation.
   random pointer before an early return: the original takes the bus
   error, clang sinks the loads past the return (C may; nothing in C
   faults). Both are the harness's inputs, not translation bugs; left as
-  reported, not excluded.
+  reported, not excluded. Settled by "difftest's domain" (below): both
+  kinds of seed are outside the functions' domains; both pass.
+- **difftest's domain** (2026-10-31, `506894a`, `3d02757`, D34). A
+  verdict that depends on undefined behaviour tests nothing, so each
+  seed runs the original first and is outside its function's domain when
+  the original faults (a bus error, any trap; `both_fault` counted these
+  as agreement and is gone), or when the original run again with its
+  stack 1008h lower (sp, stack arguments, stack area) differs from the
+  first run by `compare`, both stack areas excluded. Outside seeds are
+  counted by kind and replaced, up to 4× the seeds. btn @ c77a66f, 64
+  seeds: before, 2,620 pass, 3 excluded, 1 mismatch
+  (`AlignPadActuators`), 1 trap (`Ovl11ProbeActorBounds`); after, 2,615
+  pass, 7 outside, 3 excluded, nothing fails. `AlignPadActuators` has
+  64 seeds, 30 rejected stack-dependent (its random `portIndex` reads a
+  byte relative to `&ports`, which the moved stack changes) and 42 fault;
+  `Ovl11ProbeActorBounds` 64, 13 fault. The 14,692 faults fall in the
+  same 316 functions that had bus errors on both sides before
+  (315 `both_fault` plus `Ovl11ProbeActorBounds`); none is any other
+  trap. They are high because a function that faults often draws up to
+  256 seeds. 7 functions fault on every seed and are now `outside`,
+  where before they passed with all 64 seeds `both_fault`, compared on
+  nothing: `GetTextRowY`, `Ovl11BuildMapGrid`,
+  `Ovl11AdvanceSeasonalGridGrowth`, `Ovl11LoadTextureCellRecord`,
+  `Ovl11SnapshotStatusPages`, `Ovl11BuildAreaGrid`,
+  `Ovl11BuildMode6SurfaceGrid`. They read through globals the original
+  images leave unset (`GetTextRowY` takes no argument and reads
+  `gTextScriptCursor[gTextScriptIndex - 1]`, both BSS: a NULL `u16 *` at
+  index -1, FFFF_FFFEh in KSEG2), so no seed reaches their domain. 13 more pass short of 64, fewest
+  `Ovl23InitDecisionRecords` (1), `AppendU16String` (4),
+  `Ovl17RollRecordDecisionResults` (8); the summary lists them. Limit:
+  moving the stack catches frame-relative accesses whose target moves
+  with it, not reads of the function's own saved registers or stack
+  arguments, which move too; none seen.
 
 - **libapi's pad.o installs its own vblank element** (2026-10-30, BIOS1).
   `InitPAD` and `PAD_init` call a local helper that queues a priority-1
