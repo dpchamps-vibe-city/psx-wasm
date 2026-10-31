@@ -96,6 +96,7 @@ fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 fn init_pad(m: &mut M, a: [u32; 4]) -> Result {
     bios(m, 0xB0, 0x5B, [0; 4])?;
     bios(m, 0xB0, 0x12, a)?;
+    set_init_pad_flag(m)?;
     ret(1)
 }
 
@@ -108,11 +109,23 @@ fn start_pad(m: &mut M, _a: [u32; 4]) -> Result {
 }
 
 /// `PAD_init(type, button_dest, …)`: `ChangeClearPAD(0)`, then the BIOS's
-/// `PAD_init2` (B0:15h) with the same arguments; 1.
+/// `PAD_init2` (B0:15h) with the same arguments; pad.o's flag set; 1.
 fn pad_init(m: &mut M, a: [u32; 4]) -> Result {
     bios(m, 0xB0, 0x5B, [0; 4])?;
     bios(m, 0xB0, 0x15, a)?;
+    set_init_pad_flag(m)?;
     ret(1)
+}
+
+/// pad.o's flag, which `ReadInitPadFlag` reads (libcard's `InitCARD`
+/// keeps the pads in the BIOS's handler only when it is set): `PAD_init`
+/// and `InitPAD` set it at the end, through the `lui`/`sw` pair at the same
+/// place in both.
+fn set_init_pad_flag(m: &mut M) -> std::result::Result<(), String> {
+    let at = m.sdk.at;
+    let flag = crate::libspu::pair(m, at + 0x6C, at + 0x70).ok_or_else(|| format!("libapi/pad at {at:#010x}: no init flag where PsyQ 4.7's object has it"))?;
+    m.mem.w32(flag, 1);
+    Ok(())
 }
 
 /// libapi's `firstfile` calls the BIOS's `firstfile2` (B0h:42h) and
@@ -147,9 +160,15 @@ mod tests {
     #[test]
     fn pads_through_the_bios() {
         let mut m = machine(vec![], Default::default());
+        // InitPAD's `lui at, %hi(flag)` / `sw v0, %lo(flag)(at)`.
+        let (at, flag) = (0x8004_2C30, 0x8005_E0E4);
+        m.sdk.at = at;
+        m.mem.w32(at + 0x6C, 0x3C01_0000 | (flag + 0x8000) >> 16);
+        m.mem.w32(at + 0x70, 0xAC22_0000 | (flag & 0xFFFF));
         m.mem.write(0x8001_0000, &[0x5A; 0x44]);
         assert_eq!(call(&mut m, init_pad, [0x8001_0000, 0x22, 0x8001_0022, 0x22]), 1);
         assert_eq!(m.mem.bytes(0x8001_0000, 0x44), [0; 0x44]);
+        assert_eq!(m.mem.r32(flag), 1);
         assert_eq!(call(&mut m, start_pad, [0; 4]), 1);
         assert!(m.kernel.pad_started);
     }
