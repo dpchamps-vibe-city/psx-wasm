@@ -87,8 +87,9 @@ pub const RUNTIME_BASE: u32 = 0x0200_0000;
 pub mod kernel {
     use core::ops::Range;
     /// The table of tables: a (pointer, size) pair per table from 0x100.
-    /// These three entries are filled: the exception control blocks, the
-    /// process control block, and the thread control blocks.
+    /// These four entries are filled: the exception control blocks, the
+    /// process control block, the thread control blocks and the event
+    /// control blocks.
     pub const EXCB_ENTRY: u32 = 0x100;
     pub const PCB_ENTRY: u32 = 0x108;
     pub const TCB_ENTRY: u32 = 0x110;
@@ -112,9 +113,16 @@ pub mod kernel {
     /// unused word. Just below the PCB.
     pub const EXCB: u32 = 0xDFE0;
     pub const EXCB_SIZE: u32 = 0x20;
+    /// The event control blocks (D68; SYSTEM.CNF `EVENT=`, at most
+    /// [`MAX_EVENTS`]), after the TCBs: per event its class, status, spec,
+    /// mode and handler (psx-spx "BIOS Control Blocks").
+    pub const EVCB_ENTRY: u32 = 0x120;
+    pub const EVCBS: u32 = TCBS + MAX_TCBS * TCB_SIZE;
+    pub const EVCB_SIZE: u32 = 0x1C;
+    pub const MAX_EVENTS: u32 = 64;
     /// Kernel RAM a game may read and write at constant addresses: the
     /// lift's kernel rule accepts these and still fails on the rest.
-    pub const RAM_BACKED: [Range<u32>; 2] = [EXCB_ENTRY..TCB_ENTRY + 8, EXCB..TCBS + MAX_TCBS * TCB_SIZE];
+    pub const RAM_BACKED: [Range<u32>; 2] = [EXCB_ENTRY..EVCB_ENTRY + 8, EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE];
 
     /// Whether physical address `addr` lies in [`RAM_BACKED`].
     pub fn ram_backed(addr: u32) -> bool {

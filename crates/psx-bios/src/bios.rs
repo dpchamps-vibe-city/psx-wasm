@@ -277,26 +277,22 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.deliver_event(a[0], a[1]);
             r(1)
         }
-        (0xB0, 0x08) => r(m.kernel.open_event(a[0], a[1], a[2], a[3])),
+        (0xB0, 0x08) => r(m.open_event(a[0], a[1], a[2], a[3])),
         (0xB0, 0x09) => {
-            if let Some(e) = m.kernel.ev(a[0]) {
-                e.status = kernel::EV_UNUSED;
-            }
+            m.set_ev_status(a[0], kernel::EV_UNUSED);
             r(1)
         }
         (0xB0, 0x0A) => {
             let h = a[0];
-            match m.kernel.ev(h).map(|e| e.status) {
+            match m.ev(h).map(|e| e.status) {
                 Some(kernel::EV_READY) => {
-                    m.kernel.ev(h).unwrap().status = kernel::EV_ENABLED;
+                    m.set_ev_status(h, kernel::EV_ENABLED);
                     r(1)
                 }
                 Some(kernel::EV_ENABLED) => Ok(Flow::Block {
                     until: Wait::Event(h),
                     then: Box::new(move |m: &mut Machine<S>| {
-                        if let Some(e) = m.kernel.ev(h) {
-                            e.status = kernel::EV_ENABLED;
-                        }
+                        m.set_ev_status(h, kernel::EV_ENABLED);
                         Flow::ret(1)
                     }),
                 }),
@@ -304,17 +300,17 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             }
         }
         (0xB0, 0x0B) => {
-            let ready = m.kernel.ev(a[0]).is_some_and(|e| e.status == kernel::EV_READY);
+            let ready = m.ev(a[0]).is_some_and(|e| e.status == kernel::EV_READY);
             if ready {
-                m.kernel.ev(a[0]).unwrap().status = kernel::EV_ENABLED;
+                m.set_ev_status(a[0], kernel::EV_ENABLED);
             }
             r(ready as u32)
         }
         // EnableEvent, DisableEvent: a closed slot stays closed; enabling
         // a ready event makes it busy again (OpenBIOS `events.c`).
         (0xB0, 0x0C) | (0xB0, 0x0D) => {
-            if let Some(e) = m.kernel.ev(a[0]).filter(|e| e.status != kernel::EV_UNUSED) {
-                e.status = if func == 0x0C { kernel::EV_ENABLED } else { kernel::EV_DISABLED };
+            if m.ev(a[0]).is_some_and(|e| e.status != kernel::EV_UNUSED) {
+                m.set_ev_status(a[0], if func == 0x0C { kernel::EV_ENABLED } else { kernel::EV_DISABLED });
             }
             r(1)
         }

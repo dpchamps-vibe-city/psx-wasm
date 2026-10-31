@@ -3,6 +3,8 @@
 //! handler queues (psx-spx "Kernel (BIOS)").
 
 use crate::machine::Host;
+use crate::{Machine, Sdk};
+use psxw_abi::kernel as k;
 use psx_devices::mem::Mem;
 use std::collections::BTreeMap;
 
@@ -40,7 +42,6 @@ pub struct File {
 
 #[derive(Debug, Clone, Default)]
 pub struct Kernel {
-    pub events: Vec<EvCb>,
     /// `InitPAD` buffers: (address, size) per port.
     pub pad_bufs: Option<[(u32, u32); 2]>,
     /// The pad and card handler is in the chain (`StartPAD2`/`StartCARD2`;
@@ -70,55 +71,6 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    fn ensure(&mut self) {
-        if self.events.is_empty() {
-            self.events = vec![EvCb::default(); EVENTS];
-        }
-    }
-
-    fn index(h: u32) -> Option<usize> {
-        (h & 0xFFFF_0000 == EV_HANDLE).then_some((h & 0xFFFF) as usize)
-    }
-
-    pub fn open_event(&mut self, class: u32, spec: u32, mode: u32, func: u32) -> u32 {
-        self.ensure();
-        match self.events.iter().position(|e| e.status == EV_UNUSED) {
-            Some(i) => {
-                self.events[i] = EvCb { class, spec, mode, func, status: EV_DISABLED };
-                EV_HANDLE | i as u32
-            }
-            None => u32::MAX,
-        }
-    }
-
-    pub fn ev(&mut self, h: u32) -> Option<&mut EvCb> {
-        self.ensure();
-        Self::index(h).and_then(|i| self.events.get_mut(i))
-    }
-
-    pub fn event_ready(&self, h: u32) -> bool {
-        Self::index(h).and_then(|i| self.events.get(i)).is_some_and(|e| e.status == EV_READY)
-    }
-
-    /// DeliverEvent: interrupt-mode handlers to call; other enabled events
-    /// become ready.
-    pub fn deliver(&mut self, class: u32, spec: u32) -> Vec<u32> {
-        let mut calls = Vec::new();
-        for e in &mut self.events {
-            if e.status != EV_ENABLED || e.class != class || e.spec != spec {
-                continue;
-            }
-            if e.mode == EV_MODE_INTR {
-                if e.func != 0 {
-                    calls.push(e.func);
-                }
-            } else {
-                e.status = EV_READY;
-            }
-        }
-        calls
-    }
-
     /// `InitPAD2`: zero-fill the buffers and remember them; `PAD_dr` is no
     /// longer called by the handler.
     pub fn init_pad(&mut self, mem: &mut dyn Mem, bufs: [(u32, u32); 2]) {
@@ -193,5 +145,90 @@ impl Kernel {
         if self.pad_dest != 0 {
             self.pad_dr(mem);
         }
+    }
+}
+
+/// The event control blocks, in kernel RAM through the table of tables
+/// (D68), as OpenBIOS's `events.c` keeps them.
+impl<S: Sdk> Machine<S> {
+    /// `n` blocks (SYSTEM.CNF `EVENT=`), all free.
+    pub fn lay_out_events(&mut self, n: u32) {
+        let n = n.clamp(1, k::MAX_EVENTS);
+        self.mem.w32(k::EVCB_ENTRY, 0xA000_0000 | k::EVCBS);
+        self.mem.w32(k::EVCB_ENTRY + 4, n * k::EVCB_SIZE);
+        self.mem.write(k::EVCBS, &vec![0; (n * k::EVCB_SIZE) as usize]);
+    }
+
+    /// Handle `h`'s block; before the boot laid them out, the default
+    /// count's.
+    fn evcb(&mut self, h: u32) -> Option<u32> {
+        if self.mem.r32(k::EVCB_ENTRY) == 0 {
+            self.lay_out_events(EVENTS as u32);
+        }
+        self.evcb_at(h)
+    }
+
+    fn evcb_at(&self, h: u32) -> Option<u32> {
+        let (base, size) = (self.mem.r32(k::EVCB_ENTRY), self.mem.r32(k::EVCB_ENTRY + 4));
+        let i = h & 0xFFFF;
+        (base != 0 && h & 0xFFFF_0000 == EV_HANDLE && i < size / k::EVCB_SIZE).then_some(base + i * k::EVCB_SIZE)
+    }
+
+    fn read_ev(&self, a: u32) -> EvCb {
+        let r = |o: u32| self.mem.r32(a + o);
+        EvCb { class: r(0), status: r(4), spec: r(8), mode: r(0xC), func: r(0x10) }
+    }
+
+    /// Event `h`'s block, if `h` names one.
+    pub fn ev(&mut self, h: u32) -> Option<EvCb> {
+        self.evcb(h).map(|a| self.read_ev(a))
+    }
+
+    pub fn set_ev_status(&mut self, h: u32, status: u32) {
+        if let Some(a) = self.evcb(h) {
+            self.mem.w32(a + 4, status);
+        }
+    }
+
+    /// `OpenEvent`: the first free block, disabled; its handle, or -1.
+    pub fn open_event(&mut self, class: u32, spec: u32, mode: u32, func: u32) -> u32 {
+        self.evcb(EV_HANDLE);
+        let n = self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE;
+        for i in 0..n {
+            let a = self.evcb_at(EV_HANDLE | i).expect("in range");
+            if self.mem.r32(a + 4) == EV_UNUSED {
+                for (o, v) in [(0, class), (4, EV_DISABLED), (8, spec), (0xC, mode), (0x10, func)] {
+                    self.mem.w32(a + o, v);
+                }
+                return EV_HANDLE | i;
+            }
+        }
+        u32::MAX
+    }
+
+    pub fn event_ready(&self, h: u32) -> bool {
+        self.evcb_at(h).is_some_and(|a| self.mem.r32(a + 4) == EV_READY)
+    }
+
+    /// DeliverEvent: interrupt-mode handlers to call; other enabled events
+    /// become ready.
+    pub(crate) fn event_calls(&mut self, class: u32, spec: u32) -> Vec<u32> {
+        let mut calls = Vec::new();
+        let n = self.evcb(EV_HANDLE).map_or(0, |_| self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE);
+        for i in 0..n {
+            let a = self.evcb_at(EV_HANDLE | i).expect("in range");
+            let e = self.read_ev(a);
+            if e.status != EV_ENABLED || e.class != class || e.spec != spec {
+                continue;
+            }
+            if e.mode == EV_MODE_INTR {
+                if e.func != 0 {
+                    calls.push(e.func);
+                }
+            } else {
+                self.mem.w32(a + 4, EV_READY);
+            }
+        }
+        calls
     }
 }

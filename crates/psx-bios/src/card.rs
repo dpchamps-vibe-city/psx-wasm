@@ -512,15 +512,15 @@ mod tests {
         [super::SPEC_DONE, super::SPEC_NO_CARD, super::SPEC_NEW, super::SPEC_ERROR]
             .into_iter()
             .map(|spec| {
-                let h = m.kernel.open_event(class, spec, 0x2000, 0);
-                m.kernel.ev(h).unwrap().status = crate::kernel::EV_ENABLED;
+                let h = m.open_event(class, spec, 0x2000, 0);
+                m.set_ev_status(h, crate::kernel::EV_ENABLED);
                 (spec, h)
             })
             .collect()
     }
 
     fn ready(m: &crate::Machine<crate::testing::NoSdk>, evs: &[(u32, u32)]) -> Vec<u32> {
-        evs.iter().filter(|(_, h)| m.kernel.event_ready(*h)).map(|(s, _)| *s).collect()
+        evs.iter().filter(|(_, h)| m.event_ready(*h)).map(|(s, _)| *s).collect()
     }
 
     /// libmcrd's MemCardGetDirentry waits for a low-level event after a
