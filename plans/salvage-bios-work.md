@@ -211,7 +211,7 @@ Five are documented no-ops, and A(52h)'s meaning needs verification.
 | [ ] | C(09h) | `SysInitKernelVariables` (reference notes its post-boot corruption; verify the callable behaviour) |
 | [x] | C(0Eh), C(0Fh), C(10h), C(11h), C(14h) | Five retail zero-return entries |
 | [ ] | C(15h) | `_cdevinput` |
-| [ ] | C(16h) | `_cdevscan` |
+| [x] | C(16h) | `_cdevscan`: live FCB/device scan; built-in host input still absent (`Partial`) |
 | [ ] | C(17h) | `_circgetc` |
 | [ ] | C(18h) | `_circputc` |
 | [ ] | C(19h) | `_ioabort` |
@@ -247,13 +247,16 @@ handoff's missing-call list.
   async file frames become visible at completion, with busy/error state and
   read/write-specific event order. Generic close releases its FCB even on error;
   native cleanup cancels old queued work to protect descriptor reuse. Explicit
-  A(A7h..AAh/AEh) callbacks remain partial, notably Info/Load/write-test effects
-  and unspecified returns. No serial exchanges or instruction timing added.
+  A(A7h..AAh/AEh) callbacks remain partial. A8/A9/AA now end pending Info/Load
+  high-level notifications without consuming the driver's scheduled completion;
+  write-test effects, AE's body and unspecified returns remain unresolved.
+  No serial exchanges or instruction timing added.
 - [ ] **Console input/control.** `gets` now edits and echoes a bounded line
   through guest file/device callbacks, including quoted characters and deferred
-  termination. Built-in blocking TTY reads still error; host input, circular
-  helpers and low-level TTY control remain unfinished. Reuse file/device dispatch;
-  a no-op poll or fabricated availability is not host-input integration.
+  termination. C16 now scans live flagged FCBs through guest device ioctls,
+  including before read/write device lookup. Built-in blocking TTY reads still
+  error; host input, circular helpers and low-level TTY control remain unfinished.
+  A working guest-device scan is not built-in host-input integration.
 - [x] **Direct SYS(03h).** The TCB-address syscall now uses the same pending
   switch, SP/GP bookkeeping and Asyncify stacks as B(10h). Build scope includes
   syscall sites; the syscall import stops rewind without repeating the switch.
@@ -935,12 +938,64 @@ call paths, and correct frame cleanup/return. No interpreter, simulated CPU
 register file or scheduler replacement. This is a proposed direction, not an
 approved implementation; a concrete design must be reviewed before code.
 
-Independent read-only workflow `93e1e227-2f2c-49d5-8c86-7e755960d251` checks the
-bounded public/OpenBIOS contracts of C(15h/17h/18h) and A(A7h..AAh/AEh) in
-parallel. It has no implementation authority. The first launch was rejected
-before starting children because the parallel shorthand disallowed per-child
-output paths; the single retry uses the documented scripted workflow. No files
-were changed by the failed launch.
+## Console/card contract follow-up
+
+Read-only workflow `93e1e227-2f2c-49d5-8c86-7e755960d251` completed both bounded
+contract scouts; parent read both reports in full and checked the relevant
+pinned OpenBIOS bodies. No children remain active. Reports are
+`salvage/console-circular-contract.md` and `salvage/card-callback-contract.md`
+under that workflow's session artifacts. The first launch was rejected before
+starting children because the parallel shorthand disallowed per-child output
+paths; one documented scripted-workflow retry succeeded. Neither scout edited
+source or had implementation authority.
+
+Parent implementation in `psx-bios/src/{files,bios,lib,card}.rs`:
+
+- **C16 `_cdevscan`:** OpenBIOS `fileio/misc.c` walks all 16 FCBs, tests flag
+  1000h, then calls `psxioctl(fd,6602h,0)`. Native implementation uses existing
+  `ioctl`/`Flow`/`seq`; reads each flag after preceding callbacks, ignores ioctl
+  failure results while preserving errno, and neither snapshots nor invents
+  input. `fileio/stdio.c` also scans before read/write: invalid fd fails first,
+  then device/transfer fields are read only after scans return. The old no-scan
+  path's immediate errors remain errors. Callback-continuation errors retain
+  the existing file-flow diagnostic policy. C16's void/unspecified v0 uses zero;
+  this is not an input-availability result. Coverage is `Partial` because the
+  built-in host-input path is still missing. Contrary to the scout's no-op
+  suggestion, guest-provided scan drivers are useful without a built-in host ABI.
+- **C15/C17/C18 remain blocked:** the pinned OpenBIOS table points them at
+  `unimplementedThunk`; the circular-buffer header and DTL-H2000 TTY consumer
+  do not establish retail full/empty/flags/wrap/error semantics. No guessed ring
+  buffer. C19/A(B2h) still require the unapproved non-local-return work above.
+- **A8/A9/AA, pending Info/Load:** `card/backupunit.c` error callbacks clear
+  `g_buOperation` and emit high 8000h/100h/2000h only for an active operation;
+  they do not change low-driver status or emit its event. Existing queued native
+  Info/Load operations now clear only their high-notification flag. The correct
+  last-completed slot is used, repeat/idle/low-only callbacks do nothing, and
+  the existing scheduler still completes the low operation. Load gains the
+  same high flag as Info. File cancellation policy and A7 are unchanged.
+- **Narrow acceptance, not the whole card proposal:** the scout also proposed
+  extending this to write-test and AE; those bodies/effects are not established
+  sufficiently, so parent did not extend them. No inferred failed-write image
+  policy or new per-slot state framework. The existing callback v0 remains
+  explicitly unspecified. All five callbacks remain `Partial`; native Load's
+  existing simplified directory behavior is not claimed retail-complete.
+
+Reference pin for all three bodies:
+`pcsx-redux/nugget@4dc70d2931121a0fde858a0354192b6df4fa22e8/openbios/`.
+One grouped guest-device integration test covers direct C16, live flag changes,
+last descriptor, negative ioctl, both read/write device paths and post-scan
+field lookup. One grouped card test covers A8/A9/AA × Info/Load, both slots,
+A7 non-advancement, repeat/idle/low-only guards, unchanged busy status and no
+second high completion. The first scan gate found an obsolete assertion that
+C16 must error; replaced with the still-missing C15/C17/C18 assertions, not a
+weakened scan test. Final **BIOS 50 / runtime 8 / SDK 42 tests pass**, plus the
+wasm32 runtime check. Log: `console-card-callback-integrated-tests.log` in the
+session scratchpad. Formatter-only changes were removed before integration.
+No runtime ABI, scheduler, register driver or host API change.
+
+Release/game/conformance/replay artifacts remain at **d06c81b**, predating this
+follow-up; their earlier passing results above are not a fresh game gate for
+these source changes. No full CI rerun or new oracle/browser claim.
 
 ## Progress log
 

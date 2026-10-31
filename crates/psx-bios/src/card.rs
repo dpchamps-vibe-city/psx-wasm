@@ -66,7 +66,7 @@ enum Op {
     Write { frame: u32, data: Vec<u8>, high: bool },
     /// `high`: `_card_info` (A-table), which also delivers F4000001h.
     Info { high: bool },
-    Load,
+    Load { high: bool },
     /// One frame of an asynchronous file read or write, moved when the
     /// operation completes. `buf` is where that frame goes or comes from;
     /// `id` identifies the file open that requested it.
@@ -241,7 +241,7 @@ impl<S: Sdk> Machine<S> {
     }
 
     pub fn card_load(&mut self, port: u32) -> u32 {
-        self.card_queue(slot_of(port), port, Op::Load) as u32
+        self.card_queue(slot_of(port), port, Op::Load { high: true }) as u32
     }
 
     /// `card_write_test(port)`: rewrite frame 3Fh as it is, ignoring the
@@ -329,8 +329,8 @@ impl<S: Sdk> Machine<S> {
 
     /// An asynchronous file operation failed: cancel its remaining steps,
     /// keep the partial offset, and report the driver's and higher-level
-    /// events. `low` is false for the bufs callbacks, whose driver low
-    /// event already happened and must not be repeated.
+    /// events. `low` is false for the bufs callbacks: the low event is
+    /// owned by the driver, not emitted by the callback.
     fn card_file_fail(&mut self, slot: usize, fd: u32, id: u64, errno: u32, spec: u32, low: bool) {
         self.card_file_cancel(slot, fd, id);
         self.kernel.cards.status[slot] = if spec == SPEC_NO_CARD { FAIL_TIMEOUT } else { FAIL_GENERAL };
@@ -422,7 +422,7 @@ impl<S: Sdk> Machine<S> {
             }
             _ => {}
         }
-        let high = matches!(op, Op::Info { high: true } | Op::Load | Op::Write { high: true, .. });
+        let high = matches!(op, Op::Info { high: true } | Op::Load { high: true } | Op::Write { high: true, .. });
         let ignore = std::mem::take(&mut self.kernel.cards.ignore_new[slot]);
         let Some(card) = self.kernel.cards.slots[slot].as_mut() else {
             self.kernel.cards.status[slot] = FAIL_TIMEOUT;
@@ -449,7 +449,7 @@ impl<S: Sdk> Machine<S> {
                 self.mem.write(dst, &data);
             }
             Op::Write { frame, data, .. } => card.write_frame(frame, &data),
-            Op::Info { .. } | Op::Load | Op::FileFrame { .. } | Op::FileDone { .. } => {}
+            Op::Info { .. } | Op::Load { .. } | Op::FileFrame { .. } | Op::FileDone { .. } => {}
         }
         self.kernel.cards.status[slot] = READY;
         self.card_event(SPEC_DONE, high);
@@ -483,22 +483,40 @@ impl<S: Sdk> Machine<S> {
 
     /// A(A7h..AAh, AEh) `bufs_cb_*`: the BIOS's completion callbacks.
     /// Native completion already performed A7's state advancement; A7 must
-    /// not consume or replay a scheduled stage here. A8/A9/AA/AE cancel
-    /// the active file operation with the spec psx-spx assigns them. Their
-    /// effects on pending Info/Load/write_test operations remain partial.
+    /// not consume or replay a scheduled stage here. A8/A9/AA end a pending
+    /// Info/Load high-level operation, leaving driver status and the low-level
+    /// completion alone (OpenBIOS buLowLevelOpError1/2/3). File cancellation
+    /// retains the native policy below. AE's body and write_test effects
+    /// remain unverified. v0 is unspecified; keep the existing status return.
     pub fn card_bufs_cb(&mut self, which: u32) -> u32 {
         let slot = self.kernel.cards.last.unwrap_or(0);
         if which == 0 {
             return self.kernel.cards.status[slot];
         }
-        let Some((fd, id)) = self.card_file_active(slot) else { return self.kernel.cards.status[slot] };
         let spec = match which {
             1 | 4 => SPEC_ERROR,
             2 => SPEC_NO_CARD,
             3 => SPEC_NEW,
             _ => return self.kernel.cards.status[slot],
         };
-        self.card_file_fail(slot, fd, id, E_GENERAL, spec, false);
+        if let Some((fd, id)) = self.card_file_active(slot) {
+            self.card_file_fail(slot, fd, id, E_GENERAL, spec, false);
+        } else if which <= 3 {
+            // Clearing only the high-level operation mirrors buFinishAndTrigger:
+            // the in-flight driver operation still owns its eventual low event.
+            let ended = self.kernel.cards.pending.iter_mut().any(|(s, _, op)| {
+                if *s != slot {
+                    return false;
+                }
+                match op {
+                    Op::Info { high } | Op::Load { high } => std::mem::take(high),
+                    _ => false,
+                }
+            });
+            if ended {
+                self.deliver_event(EV_HIGH, spec);
+            }
+        }
         self.kernel.cards.status[slot]
     }
 
@@ -1071,6 +1089,55 @@ mod tests {
         let high = card_events(&mut m, super::EV_HIGH);
         m.card_bufs_cb(0);
         assert_eq!(ready(&m, &high), Vec::<u32>::new());
+    }
+
+    /// Error callbacks end only the last device's high-level Info/Load
+    /// notification, not the driver's pending operation or another slot's work.
+    #[test]
+    fn card_error_callbacks_end_info_and_load_without_draining() {
+        for (func, spec) in [(0xA8, super::SPEC_ERROR), (0xA9, super::SPEC_NO_CARD), (0xAA, super::SPEC_NEW)] {
+            for request in [0xAB, 0xAC] {
+                let mut m = machine();
+                m.cards_ready();
+                m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+                m.kernel.cards.slots[1] = m.kernel.cards.slots[0].clone();
+                assert_eq!(m.card_info_subfunc(0x10), 1);
+                m.card_vblank();
+                assert_eq!(m.card_chan(), 0x10);
+                let (error, done, low) = (0x8003_0000, 0x8003_0004, 0x8003_0008);
+                for (class, spec, addr) in [(super::EV_HIGH, spec, error), (super::EV_HIGH, super::SPEC_DONE, done), (super::EV_LOW, super::SPEC_DONE, low)] {
+                    let h = m.open_event(class, spec, 0x1000, addr);
+                    m.set_ev_status(h, crate::kernel::EV_ENABLED);
+                }
+                assert_eq!(m.card_info(0x00), 1, "other slot queues first");
+                assert_eq!(ret(bios::dispatch(&mut m, 0xA0, request, [0x10, 0, 0, 0])), 1);
+                ret(bios::dispatch(&mut m, 0xA0, 0xA7, [0; 4]));
+                assert!(m.calls.is_empty(), "A7 never advances the pending native operation");
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert_eq!(m.calls.pop_front(), Some(GuestCall { addr: error, args: [0; 4] }));
+                assert!(m.calls.is_empty(), "the callback emits high only");
+                assert_eq!(m.kernel.cards.status, [super::BUSY_INFO; 2], "callbacks do not change driver flags");
+                assert_eq!(m.kernel.cards.pending.len(), 2, "neither low-level operation was consumed");
+                assert_eq!(m.card_info(0x10), 0, "the low-level driver remains busy");
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert!(m.calls.is_empty(), "the high-level operation ended once");
+                m.card_vblank();
+                assert_eq!(m.calls.iter().map(|c| c.addr).collect::<Vec<_>>(), [done, low], "other slot retains its high completion");
+                m.calls.clear();
+                m.card_vblank();
+                assert_eq!(m.calls.pop_front(), Some(GuestCall { addr: low, args: [0; 4] }));
+                assert!(m.calls.is_empty(), "no second high event at completion");
+                assert_eq!(m.kernel.cards.status, [super::READY; 2]);
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert!(m.calls.is_empty(), "idle callbacks do not deliver high events");
+                assert_eq!(m.card_info_subfunc(0x10), 1);
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert!(m.calls.is_empty(), "B4D has no high-level operation to end");
+                m.card_vblank();
+                assert_eq!(m.calls.pop_front(), Some(GuestCall { addr: low, args: [0; 4] }));
+                assert!(m.calls.is_empty());
+            }
+        }
     }
 
     /// A7 is dispatched as the low-level completion callback. Native

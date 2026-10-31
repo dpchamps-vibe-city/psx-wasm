@@ -562,6 +562,8 @@ mod tests {
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x17, [0x8001_0100, 0x8001_0200, 0, 0])) as i32, -1);
         ret(bios::call(&mut m, 0xA0, 0x2B, [0x8001_0300, 0x5A, 3, 0]));
         assert_eq!(m.mem.bytes(0x8001_0300, 4), vec![0x5A, 0x5A, 0x5A, 0]);
-        assert!(bios::call(&mut m, 0xC0, 0x16, [0; 4]).is_err(), "_cdevscan is not implemented");
+        for func in [0x15, 0x17, 0x18] {
+            assert!(bios::call(&mut m, 0xC0, func, [0; 4]).is_err(), "circular helper C({func:02X}h) remains unimplemented");
+        }
     }
 }

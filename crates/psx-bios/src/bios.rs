@@ -211,6 +211,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xC0, 0x0D) => "SetIrqAutoAck",
         (0xC0, 0x12) => "InstallDevices",
         (0xC0, 0x13) => "FlushStdInOutPut",
+        (0xC0, 0x16) => "_cdevscan",
         (0xC0, 0x1B) => "KernelRedirect",
         (0xC0, 0x1A) => "set_card_find_mode",
         (0xC0, 0x1D) => "get_card_find_mode",
@@ -289,7 +290,8 @@ pub fn support(table: u32, func: u32) -> Support {
         | (0xA0, 0xB4)
         | (0xB0, 0x0E..=0x10)
         | (0xB0, 0x32 | 0x34..=0x36 | 0x3A | 0x3C | 0x3E | 0x40 | 0x42 | 0x43)
-        | (0xB0, 0x4D..=0x4F | 0x5C | 0x5D) => Support::Partial,
+        | (0xB0, 0x4D..=0x4F | 0x5C | 0x5D)
+        | (0xC0, 0x16) => Support::Partial,
         _ => Support::Working,
     }
 }
@@ -909,6 +911,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel_redirect(a[0])
         }
         (0xC0, 0x13) => m.reopen_stdio(),
+        (0xC0, 0x16) => m.cdevscan(),
         (0xC0, 0x1B) => m.kernel_redirect(a[0]),
         _ => Err(format!("{label}: not implemented")),
     }
@@ -1155,6 +1158,7 @@ mod tests {
         assert_eq!(support(0xA0, 0x42), Support::Partial, "loader works over the incomplete file backends");
         assert_eq!(support(0xB0, 0x3E), Support::Partial);
         assert_eq!(support(0xC0, 0x09), Support::Unsupported);
+        assert_eq!(support(0xC0, 0x16), Support::Partial, "guest scan callbacks work; built-in host input remains absent");
         // Documented fatal and no-op behaviour.
         assert_eq!(support(0xA0, 0x0B), Support::Fatal);
         assert_eq!(support(0xA0, 0x32), Support::Fatal);

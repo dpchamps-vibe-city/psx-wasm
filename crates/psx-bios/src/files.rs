@@ -87,6 +87,9 @@ pub const E_FULL: u32 = 0x1C;
 
 /// `ioctl`'s non-blocking command (OpenBIOS `PSXFIOCNBLOCK`).
 const FIOCNBLOCK: u32 = 0x6601;
+/// OpenBIOS `PSXF_SCAN2` and `PSXFIOCSCAN` (not the older 0x100 scan bit).
+const SCAN: u32 = 0x1000;
+const FIOCSCAN: u32 = 0x6602;
 
 /// The devices' names in kernel RAM, after the DCBs.
 const NAMES: u32 = k::DCBS + k::DEVICES * k::DCB_SIZE;
@@ -346,6 +349,16 @@ impl<S: Sdk> Machine<S> {
     /// (counted in blocks on a block device).
     pub fn transfer(&mut self, fd: u32, buf: u32, len: u32, write: bool) -> Result<Flow<S>, String> {
         let Some(f) = self.open_fcb(fd) else { return Ok(self.fail(E_BAD_FD, u32::MAX)) };
+        // OpenBIOS psxread/psxwrite validate the fd, then scan before
+        // reading its device/transfer fields. A scan callback may edit them.
+        let flow = self.cdevscan()?;
+        match flow {
+            Flow::Return(_) => self.transfer_after_scan(f, buf, len, write),
+            flow => Ok(seq(self, flow, move |m, _| m.transfer_after_scan(f, buf, len, write).unwrap_or_else(|e| panic!("read/write after _cdevscan: {e}")))),
+        }
+    }
+
+    fn transfer_after_scan(&mut self, f: u32, buf: u32, len: u32, write: bool) -> Result<Flow<S>, String> {
         let d = self.mem.r32(f + fcb::DCB);
         let after = move |m: &mut Self, v: u32| {
             if (v as i32) < 0 {
@@ -408,6 +421,29 @@ impl<S: Sdk> Machine<S> {
             }
             Flow::ret(1)
         })
+    }
+
+    /// C(16h) `_cdevscan()`: scan flagged FCBs through their device's
+    /// ioctl, in descriptor order (OpenBIOS fileio/misc.c). Flags are read
+    /// live after each callback. This void service has no specified v0;
+    /// returning zero here does not indicate available host input.
+    pub fn cdevscan(&mut self) -> Result<Flow<S>, String> {
+        self.cdevscan_from(0)
+    }
+
+    fn cdevscan_from(&mut self, first: u32) -> Result<Flow<S>, String> {
+        for fd in first..k::FILES {
+            if self.mem.r32(fcb_at(fd) + fcb::FLAGS) & SCAN == 0 {
+                continue;
+            }
+            match self.ioctl(fd, FIOCSCAN, 0)? {
+                Flow::Return(_) => {}
+                flow => {
+                    return Ok(seq(self, flow, move |m, _| m.cdevscan_from(fd + 1).unwrap_or_else(|e| panic!("_cdevscan: {e}"))));
+                }
+            }
+        }
+        Ok(Flow::ret(0))
     }
 
     /// A(07h)/B(39h) `isatty(fd)`: bit 1 of the file's DCB flags.
@@ -1260,6 +1296,101 @@ mod tests {
         let v = crate::bios::call(&mut m, 0xB0, 0x49, [0; 4]);
         assert_eq!(ret(&mut m, v, &returns), 0);
         assert!(String::from_utf8_lossy(&written.borrow()).contains("tty"));
+    }
+
+    /// Scanning uses live FCB flags and guest ioctls; read/write defer
+    /// their device lookup and transfer fields until all scans return.
+    #[test]
+    fn cdevscan_visits_live_files_before_transfers() {
+        use std::cell::RefCell;
+
+        let mut m = machine();
+        let tty = m.find_device(b"tty").unwrap();
+        let scan = 0x8003_0000;
+        m.mem.w32(tty + dcb::IOCTL, scan);
+        for (fd, flags) in [(0, READ | 0x100), (2, READ | SCAN), (3, READ | SCAN), (4, READ), (15, SCAN)] {
+            m.mem.w32(fcb_at(fd) + fcb::FLAGS, flags);
+            m.mem.w32(fcb_at(fd) + fcb::DCB, tty);
+        }
+        let seen = RefCell::new(Vec::new());
+        let v = crate::bios::dispatch(&mut m, 0xC0, 0x16, [0; 4]);
+        ret(&mut m, v, &|m, call| {
+            assert_eq!(call.addr, scan);
+            let fd = m.mem.r32(call.args[0] + fcb::FD);
+            assert_eq!(call.args, [fcb_at(fd), FIOCSCAN, 0, 0]);
+            seen.borrow_mut().push(fd);
+            if fd == 2 {
+                m.mem.w32(fcb_at(3) + fcb::FLAGS, 0);
+                m.mem.w32(fcb_at(4) + fcb::FLAGS, READ | SCAN);
+            }
+            if fd == 4 {
+                m.mem.w32(fcb_at(fd) + fcb::ERRNO, E_GENERAL);
+                u32::MAX
+            } else {
+                0
+            }
+        });
+        assert_eq!(*seen.borrow(), [2, 4, 15], "skip cleared/unflagged files, see newly flagged files, continue after ioctl failure");
+        assert_eq!(m.kernel.files.errno, E_GENERAL);
+
+        // Keep one scanner and redirect the transfer's device during it.
+        for fd in [3, 4, 15] {
+            m.mem.w32(fcb_at(fd) + fcb::FLAGS, 0);
+        }
+        let device = 0x8002_0000;
+        let action = 0x8003_0100;
+        for off in [dcb::IN_OUT, dcb::READ, dcb::WRITE] {
+            m.mem.w32(device + off, action + off);
+        }
+        for fs in [false, true] {
+            for write in [false, true] {
+                let fd = u32::from(write);
+                let f = fcb_at(fd);
+                m.mem.w32(f + fcb::FLAGS, if write { WRITE } else { READ });
+                m.mem.w32(f + fcb::DCB, tty);
+                m.mem.w32(f + fcb::DEVICE_FLAGS, CHAR);
+                m.mem.w32(f + fcb::BUFFER, 0x1234);
+                m.mem.w32(f + fcb::COUNT, 0x5678);
+                m.mem.w32(f + fcb::OFFSET, 9);
+                seen.borrow_mut().clear();
+                let buf = 0x8004_0000;
+                let v = crate::bios::dispatch(&mut m, 0xB0, if write { 0x35 } else { 0x34 }, [fd, buf, 7, 0]);
+                assert_eq!(
+                    ret(&mut m, v, &|m, call| {
+                        seen.borrow_mut().push(call.addr);
+                        if call.addr == scan {
+                            assert_eq!(call.args, [fcb_at(2), FIOCSCAN, 0, 0]);
+                            assert_eq!(m.mem.r32(f + fcb::BUFFER), 0x1234);
+                            assert_eq!(m.mem.r32(f + fcb::COUNT), 0x5678);
+                            m.mem.w32(f + fcb::DCB, device);
+                            m.mem.w32(f + fcb::DEVICE_FLAGS, if fs { FS } else { CHAR });
+                            return 0;
+                        }
+                        let off = if fs {
+                            if write {
+                                dcb::WRITE
+                            } else {
+                                dcb::READ
+                            }
+                        } else {
+                            dcb::IN_OUT
+                        };
+                        assert_eq!(call.addr, action + off);
+                        assert_eq!(call.args, if fs { [f, buf, 7, 0] } else { [f, if write { 2 } else { 1 }, 0, 0] });
+                        if !fs {
+                            assert_eq!(m.mem.r32(f + fcb::BUFFER), buf);
+                            assert_eq!(m.mem.r32(f + fcb::COUNT), 7);
+                        }
+                        3
+                    }),
+                    3
+                );
+                assert_eq!(seen.borrow().len(), 2);
+                assert_eq!(m.mem.r32(f + fcb::OFFSET), if fs { 9 } else { 12 });
+            }
+        }
+        let v = m.transfer(k::FILES, 0, 1, false);
+        assert_eq!(ret(&mut m, v, &|_, _| panic!("invalid fd must fail before scanning")), u32::MAX);
     }
 
     fn iso_sector(lba: u32, data: &[u8]) -> [u8; cd::RAW] {
