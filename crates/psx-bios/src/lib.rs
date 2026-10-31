@@ -123,11 +123,15 @@ mod tests {
         m.run_until(2000);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
-        // Interrupt-mode events queue their handler.
+        // Interrupt-mode events queue their handler; RCntCNT3 once vblank
+        // is unmasked (StartRCnt(RCntCNT3)).
         let h2 = ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0003, 0x0002, 0x1000, 0x8001_2340]));
         ret(bios::call(&mut m, 0xB0, 0x0C, [h2, 0, 0, 0]));
         m.run_until(m.clock.video.vblank_at(1));
         assert_eq!(m.vblanks, 1);
+        assert!(m.calls.is_empty(), "vblank masked");
+        m.io_write(0x1F80_1074, 4, 1 << 6 | 1).unwrap();
+        m.run_until(m.clock.video.vblank_at(2));
         assert_eq!(m.calls.pop_front().map(|c| c.addr), Some(0x8001_2340));
     }
 
