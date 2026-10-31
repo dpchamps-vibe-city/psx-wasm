@@ -226,7 +226,7 @@ async function opfsMods() {
   return out;
 }
 
-async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
+async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, options }) {
   const canvas = new OffscreenCanvas(options.width || 640, options.height || 480);
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
@@ -246,7 +246,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   postMessage({ type: "status", text: `renderer: ${renderer.info()}` });
 
   const root = await navigator.storage.getDirectory();
-  const discDir = await root.getDirectoryHandle("disc").catch((e) => {
+  const discDir = await root.getDirectoryHandle(discName).catch((e) => {
     if (e.name !== "NotFoundError") throw e;
     throw new Error("no disc in this browser's storage for this address: import it");
   });

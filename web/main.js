@@ -64,21 +64,34 @@ function pollInput() {
 /** The .bin files a .cue sheet names. */
 const cueFiles = (text) => [...text.matchAll(/^\s*FILE\s+"?([^"]+?)"?\s+\S+\s*$/gm)].map((m) => m[1]);
 
+/**
+ * Where this bundle's disc lives: its own OPFS directory and remembered
+ * .cue, so bundles served from one origin don't boot each other's discs.
+ */
+const discStore = gameInfo().then((g) => {
+  const id = g.id || "game";
+  return { dir: `disc-${id}`, key: `psxw.cue.${id}` };
+});
+
 async function importDisc(files) {
   const cueFile = files.find((f) => f.name.toLowerCase().endsWith(".cue"));
   if (!cueFile) throw new Error("no .cue among the files");
   const missing = cueFiles(await cueFile.text()).filter((n) => !files.some((f) => f.name === n));
   if (missing.length) throw new Error(`${cueFile.name} names ${missing.join(", ")}: pick them along with the .cue`);
-  localStorage.removeItem("psxw.cue");
+  const store = await discStore;
+  localStorage.removeItem(store.key);
   const root = await navigator.storage.getDirectory();
-  await root.removeEntry("disc", { recursive: true }).catch(() => {});
-  const dir = await root.getDirectoryHandle("disc", { create: true });
+  await root.removeEntry(store.dir, { recursive: true }).catch(() => {});
+  const dir = await root.getDirectoryHandle(store.dir, { create: true });
   for (const f of files) {
     say(`copying ${f.name} into OPFS…`);
-    const w = await (await dir.getFileHandle(f.name, { create: true })).createWritable();
+    const w = await (await dir.getFileHandle(f.name, { create: true })).createWritable().catch((e) => {
+      if (e.name !== "NoModificationAllowedError") throw e;
+      throw new Error(`${f.name} is open in a running game (this tab or another): close that tab or reload this one, then import again`);
+    });
     await f.stream().pipeTo(w);
   }
-  localStorage.setItem("psxw.cue", cueFile.name);
+  localStorage.setItem(store.key, cueFile.name);
   return cueFile.name;
 }
 
@@ -361,16 +374,18 @@ async function start(cue, audioRing) {
       }
     }
   };
-  worker.postMessage({ type: "start", cue, padBuffer, audioRing, modBuffer, options });
+  worker.postMessage({ type: "start", cue, discDir: (await discStore).dir, padBuffer, audioRing, modBuffer, options });
 }
 
 const discInput = document.getElementById("disc");
 const startButton = document.getElementById("start");
-let cue = params.get("cue") || localStorage.getItem("psxw.cue");
-if (cue && !params.has("discurl")) {
+let cue = params.get("cue");
+discStore.then((store) => {
+  cue ||= localStorage.getItem(store.key);
+  if (!cue || params.has("discurl")) return;
   // localStorage can outlive OPFS (storage cleared or evicted).
   navigator.storage.getDirectory()
-    .then((root) => root.getDirectoryHandle("disc"))
+    .then((root) => root.getDirectoryHandle(store.dir))
     .then((dir) => dir.getFileHandle(cue))
     .then(() => {
       startButton.disabled = false;
@@ -378,7 +393,7 @@ if (cue && !params.has("discurl")) {
       if (params.has("autostart")) startButton.click();
     })
     .catch(() => say(`disc ${cue} is no longer in this browser's storage: import it again`));
-}
+});
 discInput.addEventListener("change", async () => {
   try {
     cue = await importDisc([...discInput.files]);
