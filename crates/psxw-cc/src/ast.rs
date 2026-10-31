@@ -248,6 +248,21 @@ pub struct Object {
 
 #[cfg(test)]
 mod tests {
+    /// Every loop body starts with a barrier, a body that isn't a block
+    /// becoming one; a label only a later `goto` reaches is a loop head.
+    #[test]
+    fn loop_barriers() {
+        let src = "int g;\nvoid f(int n) {\n  while (g == 0) ;\n  for (; n; n--) { g++; }\n  do g--; while (g);\nback:\n  if (g) goto back;\n  goto out;\nout:\n  ;\n}\n";
+        let text = crate::edit::apply(src, super::loop_barriers(&super::parse(src)));
+        let b = super::BARRIER;
+        assert_eq!(text.matches(b).count(), 4, "{text}");
+        assert!(text.contains(&format!("while (g == 0) {{ {b} ; }}")), "{text}");
+        assert!(text.contains(&format!("{{ {b} g++; }}")), "{text}");
+        assert!(text.contains(&format!("do {{ {b} g--; }} while (g);")), "{text}");
+        assert!(text.contains(&format!("back:\n  {b} if (g)")), "{text}");
+        assert_eq!(text.lines().count(), src.lines().count());
+    }
+
     #[test]
     fn nested_definitions() {
         let src = "int outer(int a) {\n  auto int bound(int) __asm__(\"Elsewhere\");\n  auto void inner(int r) __asm__(\"Original\");\n  int plain(int x) { return x; }\n  void inner(int r) { }\n  return plain(a) + bound(a);\n}\n";
@@ -305,6 +320,61 @@ pub fn harness_variant(text: &str) -> String {
         at = i;
     }
     out.push_str(&text[at..]);
+    out
+}
+
+/// A compiler memory barrier, as lifted loop heads have (psxw-lift's emit).
+pub const BARRIER: &str = "__asm__ __volatile__(\"\" ::: \"memory\");";
+
+/// Edits putting [`BARRIER`] at the top of every loop body in the TU's
+/// functions (`for`, `while`, `do`, and a label a later `goto` jumps back
+/// to), on the body's own line. Interrupt handlers and callbacks run at
+/// safepoints the linker adds to loops after clang, so clang must not keep
+/// a load in a register across iterations: the original reads memory each
+/// pass. A body that isn't a block becomes one.
+pub fn loop_barriers(ast: &Ast) -> Vec<crate::edit::Edit> {
+    use crate::edit::Edit;
+    fn walk(ast: &Ast, n: Node, labels: &mut Vec<(String, usize, usize)>, gotos: &mut Vec<(String, usize)>, out: &mut Vec<Edit>) {
+        match n.kind() {
+            "for_statement" | "while_statement" | "do_statement" => {
+                if let Some(body) = n.child_by_field_name("body") {
+                    if body.kind() == "compound_statement" {
+                        out.push(Edit::insert(body.start_byte() + 1, format!(" {BARRIER}")));
+                    } else {
+                        out.push(Edit::insert(body.start_byte(), format!("{{ {BARRIER} ")));
+                        out.push(Edit::insert(body.end_byte(), " }"));
+                    }
+                }
+            }
+            "labeled_statement" => {
+                if let (Some(l), Some(s)) = (n.child_by_field_name("label"), n.named_child(1)) {
+                    labels.push((ast.text(l).to_string(), n.start_byte(), s.start_byte()));
+                }
+            }
+            "goto_statement" => {
+                if let Some(l) = n.child_by_field_name("label") {
+                    gotos.push((ast.text(l).to_string(), n.start_byte()));
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = n.walk();
+        for c in n.named_children(&mut cursor) {
+            walk(ast, c, labels, gotos, out);
+        }
+    }
+    let mut out = Vec::new();
+    let root = ast.tree.root_node();
+    let mut cursor = root.walk();
+    for f in root.named_children(&mut cursor).filter(|n| n.kind() == "function_definition") {
+        let (mut labels, mut gotos) = (Vec::new(), Vec::new());
+        walk(ast, f, &mut labels, &mut gotos, &mut out);
+        for (name, at, stmt) in labels {
+            if gotos.iter().any(|(g, from)| *g == name && *from > at) {
+                out.push(Edit::insert(stmt, format!("{BARRIER} ")));
+            }
+        }
+    }
     out
 }
 

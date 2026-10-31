@@ -128,6 +128,8 @@ pub fn compile(
     if !out.errors.is_empty() {
         return Ok(out);
     }
+    // Loops read memory each pass, as lifted loops do.
+    text = edit::apply(&text, ast::loop_barriers(&ast::parse(&text)));
 
     let i_path = work.join(format!("{stem}.i"));
     let obj = work.join(format!("{stem}.o"));
