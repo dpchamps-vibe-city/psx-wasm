@@ -97,9 +97,9 @@ fn bcd(v: u32) -> u8 {
     (((v / 10) << 4) | (v % 10)) as u8
 }
 
-/// OpenBIOS calls A(A1h) and then returns -1; psx-spx documents -1.
-/// The default SystemError is fatal, but a guest table patch may return.
-/// Do not replace that callable boundary with an unconditional Rust panic.
+/// Call A(A1h), returning -1 if a guest table patch returns. A read error
+/// can instead sequence another attempt after this flow (OpenBIOS helpers.c).
+/// The default SystemError is fatal; retain the callable boundary.
 fn system_error<S: Sdk>(m: &Machine<S>, code: u32) -> Flow<S> {
     Flow::Call {
         call: GuestCall {
@@ -505,17 +505,28 @@ impl<S: Sdk> Machine<S> {
 
     /// A(A5h) `CdReadSector(count, sector, dst)` (OpenBIOS
     /// `cdromBlockReading`): SeekL to `sector`, then ReadN at double speed;
-    /// `count`, or -1 if SystemError returns. Waits through every sector and the pause.
+    /// `count`, or -1 on failure if SystemError returns. A read ERR retries
+    /// after that call, up to ten attempts. Waits through every sector and the pause.
     pub fn cd_block_read(&mut self, count: u32, sector: u32, dst: u32) -> Result<Flow<S>, String> {
-        let s = sector.wrapping_add(cd::PREGAP);
-        let msf = [bcd(s / 4500), bcd(s % 4500 / 75), bcd(s % 75)];
+        Ok(self.cd_block_read_attempt(count, sector.wrapping_add(cd::PREGAP), dst, 10))
+    }
+
+    fn cd_block_read_attempt(&mut self, count: u32, sector: u32, dst: u32, left: u32) -> Flow<S> {
+        if left == 0 {
+            return system_error(self, 0x0C);
+        }
+        let msf = [bcd(sector / 4500), bcd(sector % 4500 / 75), bcd(sector % 75)];
+        // Retail computes MSF inside the retry loop and loses the minutes
+        // from `sector`. OpenBIOS helpers.c documents but fixes that bug.
+        let sector = sector % 4500;
         if self.cd_seek_l(msf) == 0 {
-            return Ok(system_error(self, 0x0B));
+            return system_error(self, 0x0B);
         }
         let done = self.kernel.cd.done.clone();
         let wait = cd_wait(self, done.clone());
-        Ok(crate::machine::seq(self, wait, move |m, result| {
+        crate::machine::seq(self, wait, move |m, result| {
             if result as u32 != DNE {
+                m.cd_take(ERR, &done);
                 return system_error(m, 0x0C);
             }
             m.cd_take(DNE, &done);
@@ -533,9 +544,15 @@ impl<S: Sdk> Machine<S> {
                     m.cd_take(END, &done);
                     system_error(m, 0x17)
                 }
-                _ => system_error(m, 0x16),
+                _ => {
+                    m.cd_take(ERR, &done);
+                    let error = system_error(m, 0x16);
+                    crate::machine::seq(m, error, move |m, _| {
+                        m.cd_block_read_attempt(count, sector, dst, left - 1)
+                    })
+                }
             })
-        }))
+        })
     }
 
     /// A(A6h) `CdGetStatus()` (OpenBIOS `cdromBlockGetStatus`): the drive's
@@ -552,7 +569,10 @@ impl<S: Sdk> Machine<S> {
                     m.cd_take(DNE, &done);
                     Flow::ret((result >> 32) as u32)
                 }
-                _ => system_error(m, 0x20),
+                _ => {
+                    m.cd_take(ERR, &done);
+                    system_error(m, 0x20)
+                }
             }
         }))
     }
@@ -897,7 +917,7 @@ mod tests {
         assert!(m.kernel.files.cd_cwd.is_empty());
     }
 
-    /// Failures call the patchable SystemError and return -1 if it returns.
+    /// Terminal failures call the patchable SystemError and return -1 if it returns.
     /// A completion callback may start another operation before a waiter resumes.
     #[test]
     fn blocking_results_survive_callbacks_and_errors_can_return() {
@@ -968,6 +988,91 @@ mod tests {
         assert_eq!((call.addr, call.args), (error, [0x44, 0x1F, 0, 0]));
         let f = then(&mut m, 0);
         assert_eq!(run(&mut m, f), u32::MAX as u64);
+
+        // Unlike a read ERR, seek/status errors are terminal even when the
+        // patched error handler returns. Both consume ERR before calling it.
+        for (func, code) in [(0xA5, 0x0C), (0xA6, 0x20)] {
+            m.cd_init();
+            let flow = bios::call(&mut m, 0xA0, func, [1, 40, 0x8002_0000, 0]).unwrap();
+            let Flow::Block { until: Wait::Cycle(at), then } = flow else {
+                panic!("operation must wait");
+            };
+            assert_eq!(ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])), 1);
+            ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
+            m.step(at);
+            let Flow::Call { call, then } = then(&mut m) else {
+                panic!("SystemError");
+            };
+            assert_eq!((call.addr, call.args), (error, [0x44, code, 0, 0]));
+            assert!(!m.event_ready(m.kernel.cd.events[4]));
+            let flow = then(&mut m, 123);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert!(m.kernel.cd.op.is_none(), "seek/status errors do not retry");
+        }
+    }
+
+    /// Returning from a read error retries, but not before SystemError returns.
+    /// The ten-attempt limit, retail's lost-minute bug, original buffer/count,
+    /// and live error-table lookup survive the continuation boundary.
+    #[test]
+    fn blocking_read_retries_after_returning_system_error() {
+        for failures in [1, 10] {
+            let mut sectors = vec![[0u8; cd::RAW]; 4504];
+            sectors[4502] = sector(4502, b"first");
+            sectors[2] = sector(2, b"retry");
+            sectors[3] = sector(3, b"tail");
+            let mut m = machine_with_disc(sectors);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let error_entry = crate::tables::entry(0xA0, 0xA1).unwrap();
+            let error = 0x8001_1000;
+            let dst = 0x8002_0000;
+            m.mem.w32(error_entry, error);
+            m.mem.write(dst + 0x800, b"keep");
+            let mut flow = bios::call(&mut m, 0xA0, 0xA5, [2, 4502, dst, 0]).unwrap();
+            for attempt in 0..failures {
+                let Flow::Block { until: Wait::Cycle(at), then } = flow else {
+                    panic!("seek must wait on attempt {attempt}");
+                };
+                assert_eq!(m.cd_drive().head, if attempt == 0 { 4502 } else { 2 });
+                m.step(at);
+                let flow_read = then(&mut m);
+                let Flow::Block { until: Wait::Cycle(at), then } = flow_read else {
+                    panic!("read must wait on attempt {attempt}");
+                };
+                // Complete one frame, then reset the pending read through A95.
+                // This uses native cancellation, not a fabricated controller INT5.
+                m.step(at);
+                assert_eq!(m.mem.bytes(dst, 5), if attempt == 0 { b"first" } else { b"retry" });
+                assert_eq!(m.mem.bytes(dst + 0x800, 4), b"keep");
+                assert_eq!(ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])), 1);
+                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
+                let flow_error = then(&mut m);
+                let Flow::Call { call, then } = flow_error else {
+                    panic!("read error must call SystemError");
+                };
+                assert_eq!((call.addr, call.args), (error + attempt * 4, [0x44, 0x16, 0, 0]));
+                assert!(!m.event_ready(m.kernel.cd.events[4]), "ERR consumed before callback");
+                assert!(m.kernel.cd.op.is_none(), "retry waits for the guest handler");
+                // A returning patch may edit the table for the next error.
+                m.mem.w32(error_entry, error + (attempt + 1) * 4);
+                flow = then(&mut m, 123);
+            }
+            if failures == 10 {
+                let Flow::Call { call, then } = flow else {
+                    panic!("exhaustion must call SystemError once more");
+                };
+                assert_eq!((call.addr, call.args), (error + 40, [0x44, 0x0C, 0, 0]));
+                assert!(m.kernel.cd.op.is_none(), "no eleventh attempt");
+                let flow = then(&mut m, 456);
+                assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            } else {
+                assert_eq!(run(&mut m, flow), 2, "original sector count");
+                assert_eq!(m.mem.bytes(dst, 5), b"retry", "retry starts at original buffer");
+                assert_eq!(m.mem.bytes(dst + 0x800, 4), b"tail");
+                assert_eq!(m.cd_drive().head, 4, "retail retry loses the first minute");
+            }
+        }
     }
 
     /// A partial `_96_init` leaves no event open, and `_96_remove` does not

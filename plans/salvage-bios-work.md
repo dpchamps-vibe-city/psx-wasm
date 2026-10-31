@@ -133,17 +133,17 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 |---|---|
 | Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
-| Card, console and CD | Partial; BIOS CD opens now preserve ISO versions and accept `?` filename matching, with focused tests passing. Continue independently verifiable software contracts using existing backends; do not invent missing reference behaviour. |
+| Card, console and CD | Partial; CD reads now retry after a returning SystemError patch, bounded to ten attempts. CD opens preserve ISO versions and accept `?` filename matching. Continue independently verifiable software contracts using existing backends; event-driven CD waits remain unfinished. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | Native source `03c4627` (CD-open correction, including A40) passes focused tests, wasm32 check, builds and four replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates pass at `9624526`. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | CD retry follow-up passes BIOS 52/runtime 8/SDK 42 tests and wasm32 check. Latest builds/four replays remain at `03c4627` (before retry changes). Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates pass at `9624526`. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD-open/A40 source `03c4627` passes focused tests, wasm32 check, both builds and four replays. Browser gates remain at the separately recorded checkpoints. CD chain-control scout reviewed; unused flags and unhandled chain entries rejected. | Owns plan, integration and final acceptance |
+| Parent | `salvage/bios`, writer | CD read retry correction passes focused tests and wasm32 check; latest builds/four replays remain at `03c4627`. Browser gates keep their recorded checkpoints. CD chain-control flag-only proposal rejected; event-wait work remains open. | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -711,11 +711,12 @@ seek still yields to the existing scheduler rather than recursing in its wait.
 
 **Error-reference distinction:** psx-spx documents A(A5h/A6h) returning -1;
 OpenBIOS at `4dc70d2931121a0fde858a0354192b6df4fa22e8`, `cdrom/helpers.c`,
-`cdrom/cdrom.c` and `common/syscalls/syscalls.h`, calls A(A1h) SystemError first,
-then returns -1. The old unconditional Rust panic has been replaced by a call
-through that guest-patchable table entry, followed by -1 if it returns. The
-existing default SystemError still stops execution. This preserves both the
-error call and a returning patch, not an unconditional nonfatal error policy.
+`cdrom/cdrom.c` and `common/syscalls/syscalls.h`, calls A(A1h) SystemError first.
+Terminal failures then return -1; a read ERR instead retries if the patch returns
+(the initial integration missed this distinction, corrected below). The old
+unconditional Rust panic has been replaced by the guest-patchable table call.
+The existing default SystemError still stops execution; this is not an
+unconditional nonfatal error policy.
 
 Integrated tests: BIOS 36, devices 63, runtime 8 and SDK 36 plus wasm32 runtime
 check pass. They use handcrafted sectors, include core/native handover, no-bus
@@ -737,8 +738,8 @@ Reports/logs are retained in the session scratchpad as `cd-*`; this is not a
 full fresh CI/browser/oracle gate, and earlier ABI-17 CI failures remain open.
 
 **Still unfinished:** A(90h..93h), A(9Eh), A(A2h/A3h) callable handler services;
-controller INT5 production/error retries (A94 currently exposes the zero initial
-bytes, not complete error coverage); retail filesystem quirks/path-table state;
+controller INT5 production (A94 currently exposes the zero initial bytes, not
+complete error coverage); retail filesystem quirks/path-table state;
 and exact blocking behaviour under guest-disabled/replaced driver events. The
 current native wait retains an operation result rather than reproducing the
 retail TestEvent polling loop. These remain real coverage gaps, not waived
@@ -1373,6 +1374,39 @@ contradicts the quoted IO-then-DMA body. The reported A93 dispatch-table anomaly
 must not be silently copied. No chain state, flags, ABI, runtime or exception
 machinery was added from this scout, and no new architecture was approved.
 No active children or pending worker changes remain.
+
+### CD read retry follow-up
+
+Parent corrected the returning-error continuation in `cdrom.rs`, using the
+existing `Flow::Call`/`machine::seq` machinery only. Pinned OpenBIOS
+[`helpers.c`](https://raw.githubusercontent.com/pcsx-redux/nugget/4dc70d2931121a0fde858a0354192b6df4fa22e8/openbios/cdrom/helpers.c)
+shows that read ERR calls A(A1h) with `(44h,16h)` and retries if that patch
+returns, up to ten seek/read attempts. Exhaustion calls `(44h,0Ch)` and returns
+-1 if it returns. Seek errors, rejected commands and END remain terminal.
+The original destination/count survive the callback, and each later error
+looks up the current A1 table entry. Selected ERR is consumed before the error
+callback when it belongs to that operation, as for existing DNE/END handling.
+
+The reference explicitly documents that retail computes MSF inside the retry
+loop and mutates `sector %= 4500`, losing its minute on retries; OpenBIOS moves
+that computation outside the loop to fix it. The native retry keeps the reported
+retail behavior rather than silently copying that OpenBIOS divergence. This is
+software argument handling, not command/instruction timing.
+
+One grouped integration test exercises a partial two-sector transfer interrupted
+through A95, software-delivered ERR, a returning error patch, successful retry,
+and ten-attempt exhaustion. It checks the buffer/count, lost-minute behavior,
+ERR consumption, no retry before the callback returns, live table replacement
+and no eleventh attempt. The existing error test now also covers terminal
+seek/status errors. Tests use disposable handcrafted sectors, not user discs.
+
+**Gate:** BIOS 52/runtime 8/SDK 42 tests and wasm32 runtime check pass
+(`cd-retry-integrated-tests.log` in session scratch). A5/A6 remain `Partial`:
+waits still use per-operation results, not early/live TestEvent polling;
+command-busy retry loops and native INT5 production are not implemented. No
+Wait variant, event-generation state, IRQ/CD driver, ABI or runtime redesign.
+Latest release/runtime/game builds and four replays remain at `03c4627`, before
+this correction; no unnecessary full-CI/browser/empty-oracle rerun.
 
 ## Progress log
 

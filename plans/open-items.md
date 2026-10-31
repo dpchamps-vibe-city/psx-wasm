@@ -36,13 +36,16 @@ retain their provenance; the active recovery status is recorded separately.
   non-main SetConf. Recent card Info/Load callback and guest-device console-scan
   fixes do not complete these whole families. BIOS CD opens now honor explicit
   ISO versions, default to `;1`, and support `?` filename matching without star
-  expansion; shared disc lookup and CdGetLbn are unchanged. A52/C09 contracts
-  remain unresolved.
+  expansion; shared disc lookup and CdGetLbn are unchanged. CD read errors now
+  retry after a returning SystemError patch, bounded to ten attempts; live-event
+  waiting, busy-command retries and INT5 production remain unfinished. A52/C09
+  contracts remain unresolved.
 - **Resources/policy:** legally usable font data/mapping and GetSystemInfo's
   BIOS date/version identity remain undecided; no fabricated values or pointers.
-- **Validation:** CD-open/A40 source `03c4627` passes BIOS 51 / runtime 8 /
-  SDK 42 tests, wasm32 runtime check, release/runtime/both game builds and all
-  four unchanged replays. Latest memcard conformance remains at `99fa333`. Non-empty oracle
+- **Validation:** CD retry follow-up passes BIOS 52 / runtime 8 / SDK 42 tests
+  and wasm32 runtime check. Latest release/runtime/both game builds and all
+  four unchanged replays remain at `03c4627`, before the retry correction.
+  Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
   remain open. Two-bundle browser disc isolation, locked-import refusal,
   unlocked replacement and copy-error writer cleanup now pass 25 checks each
