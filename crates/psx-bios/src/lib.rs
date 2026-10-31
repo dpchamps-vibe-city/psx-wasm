@@ -343,6 +343,11 @@ mod tests {
         let a = [0x8001_0000, (-5i32) as u32, 7, 7];
         assert_eq!(bios::printf(&mut m, a), "-0005|+7| 7|0xa|010|8   |003");
         assert_eq!(m.mem.r32(0x8001_0200), 28);
+        // Each conversion finishes before the next: %s sees %n's write.
+        m.mem.write(0x8001_0000, b"%n%s\0");
+        m.mem.write(0x8001_0200, b"old\0");
+        assert_eq!(bios::printf(&mut m, [0x8001_0000, 0x8001_0200, 0x8001_0200, 0]), "");
+        assert_eq!(m.mem.r32(0x8001_0200), 0);
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x1B, [0x8001_0100, 0, 0, 0])), 3);
         m.mem.write(0x8001_0200, b"vam\0");
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x17, [0x8001_0100, 0x8001_0200, 0, 0])) as i32, -1);

@@ -677,7 +677,7 @@ pub extern "C" fn mod_log(fmt: u32, va: u32) {
     with(|rt| {
         let mut m = rt.m.borrow_mut();
         let mut k = 0;
-        let text = psx_bios::bios::format(&m, fmt, &mut Vec::new(), &mut || {
+        let text = psx_bios::bios::format(&mut m, fmt, &mut |m| {
             let v = m.mem.r32(va.wrapping_add(4 * k));
             k += 1;
             v

@@ -774,24 +774,19 @@ impl cd::Disc for HostDisc<'_> {
 /// precision. Arguments come from a1..a3, then the guest stack.
 pub fn printf<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> String {
     let mut k = 1;
-    let mut counts = Vec::new();
-    let text = format(m, a[0], &mut counts, &mut || {
+    format(m, a[0], &mut |m| {
         let v = m.arg(&a, k);
         k += 1;
         v
-    });
-    for (addr, n, half) in counts {
-        if half { m.mem.w16(addr, n as u16) } else { m.mem.w32(addr, n) }
-    }
-    text
+    })
 }
 
 /// [`printf`]'s formatting of the string at guest address `fmt`, each
 /// argument word from `next`: psx-spx's conversions (`c s d i D u U o O p
 /// x X n`) and prefixes (`+`, space, `-`, `#`, `0`, a width or `*`, a
-/// precision or `.*`, `h`, `l`, `L`), with C's meaning. `%n`'s writes
-/// (address, length, 16-bit) go to `counts`.
-pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool)>, next: &mut dyn FnMut() -> u32) -> String {
+/// precision or `.*`, `h`, `l`, `L`), with C's meaning. `%n` writes at
+/// its conversion, before later conversions or stack arguments are read.
+pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machine<S>) -> u32) -> String {
     let fmt = m.mem.cstr(fmt, 1024);
     let mut out = String::new();
     let mut i = 0;
@@ -818,7 +813,7 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
         let mut left = flags.contains('-');
         let width = if fmt.get(i) == Some(&b'*') {
             i += 1;
-            let w = next() as i32;
+            let w = next(m) as i32;
             left |= w < 0;
             w.unsigned_abs() as usize
         } else {
@@ -829,7 +824,7 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
             i += 1;
             prec = Some(if fmt.get(i) == Some(&b'*') {
                 i += 1;
-                (next() as i32).max(0) as usize
+                (next(m) as i32).max(0) as usize
             } else {
                 digits(&fmt, &mut i)
             });
@@ -844,7 +839,7 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
         // h: the argument sign-extended from 16 bits, for every conversion
         // (psx-spx: unsigned ones too).
         let mut arg = || {
-            let v = next();
+            let v = next(m);
             if half { v as i16 as i32 as u32 } else { v }
         };
         let (sign, prefix, mut body) = match conv {
@@ -874,11 +869,12 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
             }
             b'c' => ("", "", ((arg() as u8) as char).to_string()),
             b's' => {
-                let s = m.mem.cstr(next(), prec.unwrap_or(1024));
+                let s = m.mem.cstr(next(m), prec.unwrap_or(1024));
                 ("", "", String::from_utf8_lossy(&s).into_owned())
             }
             b'n' => {
-                counts.push((next(), out.len() as u32, half));
+                let addr = next(m);
+                if half { m.mem.w16(addr, out.len() as u16) } else { m.mem.w32(addr, out.len() as u32) }
                 continue;
             }
             b'%' => ("", "", "%".into()),
