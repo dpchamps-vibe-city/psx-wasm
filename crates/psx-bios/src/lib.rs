@@ -144,6 +144,15 @@ mod tests {
     }
 
     #[test]
+    fn reset_entry_int_drops_the_hook() {
+        let mut m = machine();
+        ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));
+        assert_eq!(m.kernel.custom_exit, 0x8001_0000);
+        ret(bios::call(&mut m, 0xB0, 0x18, [0; 4]));
+        assert_eq!(m.kernel.custom_exit, 0);
+    }
+
+    #[test]
     fn strings_and_printf() {
         let mut m = machine();
         m.mem.write(0x8001_0000, b"%s=%04x %d%%\0");

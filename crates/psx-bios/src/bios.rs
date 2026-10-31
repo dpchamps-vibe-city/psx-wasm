@@ -336,7 +336,11 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(2)
         }
         (0xB0, 0x17) => Err(format!("{label}: called outside an exception handler")),
-        (0xB0, 0x18) => r(0),
+        (0xB0, 0x18) => {
+            // ResetEntryInt: back to the default exit (ReturnFromException).
+            m.kernel.custom_exit = 0;
+            r(0)
+        }
         (0xB0, 0x19) => {
             m.kernel.custom_exit = a[0];
             r(0)
