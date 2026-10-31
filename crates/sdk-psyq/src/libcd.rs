@@ -136,6 +136,7 @@ struct Site {
 const SYNC: Site = Site { name: 0x5CC, puts: 0x634 };
 const READY: Site = Site { name: 0x84C, puts: 0x8B4 };
 const CW: Site = Site { name: 0xC90, puts: 0xD10 };
+const DATASYNC: Site = Site { name: 0x1380, puts: 0x13E0 };
 
 /// `bios_1`'s `.bss`: the result buffers the callbacks get.
 mod bs {
@@ -695,11 +696,16 @@ fn cd_init_rest(m: &mut M, b: Bios1) -> Result {
 }
 
 /// `CD_datasync(mode)`: 0 once DMA3 is idle; with `mode`, 1 while it is
-/// busy. Transfers end at once here, so it never waits.
+/// busy, without waiting; mode 0 waits, as libcd's other waits do (its
+/// timeout, message and `CD_flush`, -1).
 fn cd_datasync(m: &mut M, a: [u32; 4]) -> Result {
-    bios1(m, at::CD_DATASYNC)?;
-    let busy = reg(m, CHCR3, 4)? & CHCR_BUSY != 0;
-    ret((busy && a[0] != 0) as u32)
+    let b = bios1(m, at::CD_DATASYNC)?;
+    let busy = |m: &mut M| reg(m, CHCR3, 4).is_ok_and(|c| c & CHCR_BUSY != 0);
+    if a[0] != 0 {
+        return ret(busy(m) as u32);
+    }
+    let idle: Done = |m, _| (!reg(m, CHCR3, 4).is_ok_and(|c| c & CHCR_BUSY != 0)).then_some(0);
+    Ok(wait(m, b, DATASYNC, false, idle, Box::new(|_, v| value(v))))
 }
 
 // --- bios_2, bios_3 ---------------------------------------------------------
