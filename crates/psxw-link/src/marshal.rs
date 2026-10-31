@@ -162,6 +162,29 @@ pub fn push_word(f: &mut Function, window: u32, w: Word) {
     }
 }
 
+/// Extend the word on the stack as a parameter of `kind` is: clang's
+/// callee takes an 8- or 16-bit integer `signext`/`zeroext` and uses the
+/// word as it comes, whatever the o32 caller left in the upper bits.
+fn extend(f: &mut Function, kind: Option<&Kind>) {
+    match kind {
+        Some(Kind::I8 { signed: true }) => {
+            f.instruction(&I::I32Extend8S);
+        }
+        Some(Kind::I16 { signed: true }) => {
+            f.instruction(&I::I32Extend16S);
+        }
+        Some(Kind::I8 { signed: false }) => {
+            f.instruction(&I::I32Const(0xFF));
+            f.instruction(&I::I32And);
+        }
+        Some(Kind::I16 { signed: false }) => {
+            f.instruction(&I::I32Const(0xFFFF));
+            f.instruction(&I::I32And);
+        }
+        _ => {}
+    }
+}
+
 /// Convert an o32 result (i64 on the stack) to a C result type.
 pub fn from_o32_result(f: &mut Function, results: &[wasmparser::ValType]) {
     match results.first() {
@@ -353,7 +376,10 @@ pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u
                 word(&mut f, pos(&|w| *w == Word::F32(i)).unwrap_or(0));
                 f.instruction(&I::F32ReinterpretI32);
             }
-            _ => word(&mut f, pos(&|w| *w == Word::Param(i)).unwrap_or(0)),
+            _ => {
+                word(&mut f, pos(&|w| *w == Word::Param(i)).unwrap_or(0));
+                extend(&mut f, kinds.get(i as usize));
+            }
         }
     }
     f.instruction(&I::Call(callee));
@@ -509,7 +535,10 @@ pub fn o32_to_c_with(sig: &FuncType, proto: Option<&Proto>, callee: u32, shape: 
                 word(&mut f, pos(&|w| *w == Word::F32(j)).unwrap_or(0));
                 f.instruction(&I::F32ReinterpretI32);
             }
-            _ => word(&mut f, pos(&|w| *w == Word::Param(j)).unwrap_or(0)),
+            _ => {
+                word(&mut f, pos(&|w| *w == Word::Param(j)).unwrap_or(0));
+                extend(&mut f, kinds.get(i));
+            }
         }
     }
     f.instruction(&I::Call(callee));
@@ -601,5 +630,27 @@ mod tests {
         assert_eq!(fixed, 1);
         assert_eq!(w.len() as u32, 1 + VARIADIC_WORDS);
         assert_eq!(w[1], Word::Mem(1, 0));
+    }
+
+    /// An o32 caller's words reach 8- and 16-bit parameters extended as
+    /// their C types are.
+    #[test]
+    fn narrow_parameters_are_extended() {
+        use wasmparser::{BinaryReader, FunctionBody, Operator as O, ValType::I32};
+        let narrow = [Kind::I8 { signed: true }, Kind::I8 { signed: false }, Kind::I16 { signed: true }, Kind::I16 { signed: false }];
+        let sig = FuncType { params: vec![I32; 4], results: vec![] };
+        let proto = Proto { name: "f".into(), defined: true, ret: Kind::Void, params: narrow.to_vec(), variadic: false };
+        let bytes = o32_to_c(&sig, Some(&proto), 0, 0, 0).into_raw_body();
+        let body = FunctionBody::new(BinaryReader::new(&bytes, 0));
+        let ops: Vec<O> = body.get_operators_reader().unwrap().into_iter().collect::<Result<_, _>>().unwrap();
+        // What follows each parameter's word.
+        let after = |k: u32| {
+            let at = ops.iter().position(|o| *o == O::LocalGet { local_index: k }).expect("parameter read");
+            &ops[at + 1..at + 3]
+        };
+        assert_eq!(after(0)[0], O::I32Extend8S);
+        assert_eq!(after(1), [O::I32Const { value: 0xFF }, O::I32And]);
+        assert_eq!(after(2)[0], O::I32Extend16S);
+        assert_eq!(after(3), [O::I32Const { value: 0xFFFF }, O::I32And]);
     }
 }
