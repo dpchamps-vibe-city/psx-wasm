@@ -37,15 +37,28 @@
 //! (`CdDataCallback`, the ring's frame callback) arrives as on the device.
 //! XA audio is the controller's (its decoder, into the SPU's CD input).
 //!
-//! **Waits spin,** as the original's loops do: each pass its instructions
-//! from the guest's budget (D71), a safepoint each time it runs out,
-//! interrupts taken there (D59's rule for adapters that replace a loop).
-//! Inside a callback, where no interrupt is taken, a wait polls the
-//! controller and calls the callbacks itself, as the original does when
-//! `CheckCallback()` says so. Past 0x3C0000 passes a wait gives up as the
-//! original does ("CD timeout", `CD_flush`, -1).
+//! **Time** (D71): every adapter spends its original's blocks on the path
+//! it takes (offsets in its object, `psxw sdk disasm`), each before what
+//! time can see, and the `VSync(-1)` and `CheckCallback()` the waits call
+//! as libetc's adapters spend them. A loop header of the original's,
+//! where the budget has run out, takes a safepoint ([`header`]): the
+//! waits', the result copies', `CD_flush`'s, the ring's; the interrupt
+//! handler and `getintr` run in the exception, a quantum passing at their
+//! headers ([`crate::irq_header`]). Waits on what the models answer at once
+//! (DMA3 idle, the FIFO holding the sector, the flags read twice) take
+//! one pass.
 //!
-//! **Not reproduced:** the debug printouts (`CD_debug`).
+//! **Waits spin,** as the original's loops do: each pass its instructions
+//! from the guest's budget, a safepoint each time it runs out, interrupts
+//! taken there (D59's rule for adapters that replace a loop). Inside a
+//! callback, where no interrupt is taken, a wait polls the controller and
+//! calls the callbacks itself, as the original does when `CheckCallback()`
+//! says so. Past 0x3C0000 passes a wait gives up as the original does
+//! ("CD timeout", `CD_flush`, -1).
+//!
+//! **Not reproduced:** the debug printouts (`CD_debug`); the waits' other
+//! time-out, 960 vblanks after the call (`VSync(-1)`), which comes a
+//! little before the passes' in NTSC.
 
 use crate::libetc::quantum;
 use crate::{Adapter, M, Psyq, Result, reg, ret, set_reg};
@@ -123,24 +136,45 @@ mod d {
     pub const INTR_NAMES: u32 = 0xAC;
 }
 
-/// A wait's "CD timeout" in `bios_1`'s text: its name's `lui`/`addiu`
-/// (`CD_sync`, …) and the `jal` of `puts("CD timeout: ")`, whose format's
-/// `lui` comes before it and `addiu` in its delay slot; the `printf` of
-/// the details follows, laid out the same, 4Ch on.
+/// One of `bios_1`'s wait loops, laid out alike from its header (D71):
+/// `VSync(-1)`'s `jal` at `head`, the time-out checks to `count`, then the
+/// time-out's blocks ("CD timeout: " through `puts`, whose `jal` is at
+/// `count` + 8, the details through `printf`, `CD_flush`), the branch out
+/// (`count` + 70h), and in the waits that poll the controller in a
+/// callback, `CheckCallback()`'s `jal` (`count` + 78h) and that poll (its
+/// loop's header at `count` + A0h, out at `count` + 118h), then the wait's
+/// own look.
 #[derive(Debug, Clone, Copy)]
 struct Site {
+    /// The `lui`/`addiu` of its name, for the time-out's message.
     name: u32,
-    puts: u32,
-    /// The loop's instructions a pass, not timing out and not in a
-    /// callback (D71): `CD_sync` +5E4h..+7B0h, `CD_ready` +864h..+A78h,
-    /// `CD_cw` +CC0h..+E3Ch, `CD_datasync` +1398h..+1474h.
+    head: u32,
+    count: u32,
+    poll: bool,
+    /// The loop's own instructions a pass, not timing out and not in a
+    /// callback: `CD_sync` +5E4h..+7B0h, `CD_ready` +864h..+A78h, `CD_cw`
+    /// +CC0h..+E3Ch, `CD_datasync` +1398h..+1474h.
     pass: u32,
+    /// What it returns when it looks once and nothing came.
+    not_yet: u32,
+    /// Its epilogue.
+    ret: (u32, u32),
 }
 
-const SYNC: Site = Site { name: 0x5CC, puts: 0x634, pass: 35 };
-const READY: Site = Site { name: 0x84C, puts: 0x8B4, pass: 38 };
-const CW: Site = Site { name: 0xC90, puts: 0xD10, pass: 30 };
-const DATASYNC: Site = Site { name: 0x1380, puts: 0x13E0, pass: 30 };
+const SYNC: Site = Site { name: 0x5CC, head: 0x5E4, count: 0x62C, poll: true, pass: 35, not_yet: 0, ret: (0x7B4, 0x7E0) };
+const READY: Site = Site { name: 0x84C, head: 0x864, count: 0x8AC, poll: true, pass: 38, not_yet: 0, ret: (0xA7C, 0xAA8) };
+const CW: Site = Site { name: 0xC90, head: 0xCC0, count: 0xD08, poll: true, pass: 30, not_yet: 0, ret: (0xE90, 0xEB4) };
+const DATASYNC: Site = Site { name: 0x1380, head: 0x1398, count: 0x13D8, poll: false, pass: 30, not_yet: 1, ret: (0x1478, 0x1494) };
+
+/// What the waits' calls of libetc's `VSync(-1)` and `CheckCallback()`
+/// spend: their originals' paths (`vsync.o` +0h..+5Ch, +60h..+6Ch,
+/// +164h..+174h; `intr.o` +154h..+160h), as libetc's adapters spend them.
+const VCOUNT: u64 = 33;
+const CHECK: u64 = 4;
+/// What a wait's look in a callback adds when the controller presents
+/// nothing: the poll's blocks around its loop, a pass of the loop and
+/// `getintr`'s look (+0h..+48h, +54Ch..+560h).
+const POLLED: u64 = 6 + 2 + 25 + 3 + 4;
 
 /// `bios_1`'s `.bss`: the result buffers the callbacks get.
 mod bs {
@@ -253,14 +287,6 @@ fn bios1(m: &mut M, off: u32) -> std::result::Result<Bios1, String> {
     Ok(b)
 }
 
-/// Copy a result buffer to `to` (8 bytes), if there is one.
-fn copy8(m: &mut M, from: u32, to: u32) {
-    if to != 0 {
-        let v = m.mem.bytes(from, 8);
-        m.mem.write(to, &v);
-    }
-}
-
 /// A call into the controller's core at the current time, the controller
 /// brought up to now around it (its due work, its line, its wakeup).
 fn cdc<R>(m: &mut M, f: impl FnOnce(&mut Cdc, u64) -> R) -> std::result::Result<R, String> {
@@ -272,6 +298,17 @@ fn cdc<R>(m: &mut M, f: impl FnOnce(&mut Cdc, u64) -> R) -> std::result::Result<
     Ok(r)
 }
 
+/// The interrupt the controller presents: 1-5, or 0.
+fn pending(m: &mut M) -> u8 {
+    cdc(m, |c, _| c.pending() & 7).unwrap_or(0)
+}
+
+fn logged(m: &mut M, what: &str, r: std::result::Result<(), String>) {
+    if let Err(e) = r {
+        m.log(&format!("{what}: {e}"));
+    }
+}
+
 type Then = Box<dyn FnOnce(&mut M, u32) -> Flow<Psyq>>;
 type Next = Box<dyn FnOnce(&mut M) -> Flow<Psyq>>;
 
@@ -279,82 +316,220 @@ fn call(addr: u32, args: [u32; 4], then: impl FnOnce(&mut M, u64) -> Flow<Psyq> 
     Flow::Call { call: GuestCall { addr, args }, then: Box::new(then) }
 }
 
+// --- Time (D71) --------------------------------------------------------------
+
+/// One of the original's loop headers: where the guest's budget has run
+/// out, a safepoint as the link's check there takes it (a quantum's budget
+/// added, a quantum passing, what fell due delivered outside a callback);
+/// then `k`.
+fn header(m: &mut M, k: Next) -> Flow<Psyq> {
+    match m.regs.budget() {
+        Some(b) if b <= 0 => {
+            m.regs.set_budget(b + psx_bios::BUDGET as i32);
+            let until = m.clock.now + quantum(m);
+            m.run_until(until);
+            Flow::Block { until: Wait::Cycle(until), then: k }
+        }
+        _ => k(m),
+    }
+}
+
+/// `n` passes of one of the original's loops whose blocks are `body`, each
+/// from its header ([`header`]); then `k`.
+fn passes(m: &mut M, n: u32, body: (u32, u32), k: Next) -> Flow<Psyq> {
+    for i in 0..n {
+        if m.regs.budget().is_some_and(|b| b <= 0) {
+            return header(
+                m,
+                Box::new(move |m| {
+                    crate::path(m, &[body]);
+                    passes(m, n - i - 1, body, k)
+                }),
+            );
+        }
+        crate::path(m, &[body]);
+    }
+    k(m)
+}
+
+/// Copy a result buffer to `to` (8 bytes), if there is one, as the
+/// original's byte loop does: `pre`, then 8 passes from its header at `at`
+/// ([`passes`]); then `k`.
+fn copy_result(m: &mut M, from: u32, to: u32, pre: (u32, u32), at: u32, k: Next) -> Flow<Psyq> {
+    if to == 0 {
+        return k(m);
+    }
+    let v = m.mem.bytes(from, 8);
+    m.mem.write(to, &v);
+    crate::path(m, &[pre]);
+    passes(m, 8, (at, at + 0x14), k)
+}
+
 // --- The interrupt ---------------------------------------------------------
 
-/// `bios_1`'s interrupt routine: the interrupt the controller presents, its
-/// response, acknowledged; the drive status from it; the interrupt states
-/// and result buffers. What to call: bit 1 the sync callback, bit 2 the
-/// ready callback (0: nothing presented).
+/// `bios_1`'s interrupt routine (+0h): the interrupt the controller
+/// presents, its response, acknowledged; the drive status from it; the
+/// interrupt states and result buffers. What to call: bit 1 the sync
+/// callback, bit 2 the ready callback (0: nothing presented). It runs in
+/// the exception, its blocks spent there, a quantum passing at its loops'
+/// headers once the budget has run out ([`crate::irq_header`]): the flags
+/// read again (+64h), the response's bytes (+7Ch), the rest of the buffer
+/// zeroed (+D4h), and each copy of the buffer.
 fn getintr(m: &mut M, b: Bios1) -> std::result::Result<u32, String> {
     let intr = cdc(m, |c, _| c.pending())? & 7;
+    crate::path(m, &[(0x0, 0x48)]);
     if intr == 0 {
+        crate::path(m, &[(0x54C, 0x560)]);
         return Ok(0);
     }
-    let resp = cdc(m, |c, _| {
-        let r = c.take_response(8);
+    // The flags again until two reads agree, as the controller's do at once.
+    crate::path(m, &[(0x4C, 0x50)]);
+    crate::irq_header(m);
+    crate::path(m, &[(0x64, 0x74), (0x78, 0x78)]);
+    let resp = cdc(m, |c, _| c.take_response(8))?;
+    let n = resp.len();
+    for _ in 0..n {
+        crate::irq_header(m);
+        crate::path(m, &[(0x7C, 0x98), (0x9C, 0xBC)]);
+    }
+    if n < 8 {
+        crate::irq_header(m);
+        crate::path(m, &[(0x7C, 0x98)]);
+    }
+    crate::path(m, &[(0xC0, 0xC8)]);
+    if n < 8 {
+        crate::path(m, &[(0xCC, 0xD0)]);
+        for _ in n..8 {
+            crate::irq_header(m);
+            crate::path(m, &[(0xD4, 0xE4)]);
+        }
+    }
+    crate::path(m, &[(0xE8, 0x124)]);
+    cdc(m, |c, _| {
         c.acknowledge();
         c.set_enable(7);
-        r
     })?;
     let mut buf = [0u8; 8];
-    buf[..resp.len()].copy_from_slice(&resp);
+    buf[..n].copy_from_slice(&resp);
     let com = m.mem.r8(b.data + d::COM);
+    if intr == 3 {
+        crate::path(m, &[(0x128, 0x14C)]);
+    }
     let mut stat = 0;
     if intr != 3 || b.table(m, d::ACK_STATUS, com) != 0 {
-        if b.word(m, d::STATUS) & 0x10 == 0 && buf[0] & 0x10 != 0 {
-            let n = b.word(m, d::NOPEN);
-            m.mem.w32(b.data + d::NOPEN, n.wrapping_add(1));
+        crate::path(m, &[(0x150, 0x164)]);
+        if b.word(m, d::STATUS) & 0x10 == 0 {
+            crate::path(m, &[(0x168, 0x178)]);
+            if buf[0] & 0x10 != 0 {
+                crate::path(m, &[(0x17C, 0x190)]);
+                let n = b.word(m, d::NOPEN);
+                m.mem.w32(b.data + d::NOPEN, n.wrapping_add(1));
+            }
         }
+        crate::path(m, &[(0x194, 0x1B0)]);
         stat = buf[0] & 0x1D;
         m.mem.w32(b.data + d::STATUS, buf[0] as u32);
         m.mem.w32(b.data + d::STATUS1, buf[1] as u32);
     }
-    let put = |m: &mut M, at: u32| m.mem.write(b.bss + at, &buf);
-    Ok(match intr {
+    crate::path(m, &[(0x1B4, 0x1C0)]);
+    if intr == 5 {
+        crate::path(m, &[(0x1C4, 0x1D8)]);
+    }
+    crate::path(m, &[(0x234, 0x248)]);
+    if !(1..=5).contains(&intr) {
+        crate::path(m, &[(0x530, 0x538), (0x53C, 0x548), (0x54C, 0x560)]);
+        m.log(&format!("CDROM: unknown intr ({intr})"));
+        return Ok(0);
+    }
+    crate::path(m, &[(0x24C, 0x260)]);
+    // The buffer into a result buffer: 8 passes from the copy's header.
+    let put = |m: &mut M, to: u32, at: u32| {
+        m.mem.write(b.bss + to, &buf);
+        for _ in 0..8 {
+            crate::irq_header(m);
+            crate::path(m, &[(at, at + 0x14)]);
+        }
+    };
+    let f = match intr {
         3 => {
-            let (s, r) = if stat != 0 {
+            crate::path(m, &[(0x264, 0x268)]);
+            let (s, f) = if stat != 0 {
+                crate::path(m, &[(0x26C, 0x284), (0x288, 0x28C)]);
+                put(m, bs::SYNC, 0x290);
+                crate::path(m, &[(0x2A8, 0x2AC)]);
                 (5, 2)
-            } else if b.table(m, d::SECOND, com) != 0 {
-                (3, 1)
             } else {
-                (2, 2)
+                crate::path(m, &[(0x2B0, 0x2D4)]);
+                if b.table(m, d::SECOND, com) != 0 {
+                    crate::path(m, &[(0x2D8, 0x2F0), (0x2F4, 0x2F8)]);
+                    put(m, bs::SYNC, 0x2FC);
+                    crate::path(m, &[(0x314, 0x318)]);
+                    (3, 1)
+                } else {
+                    crate::path(m, &[(0x31C, 0x338), (0x33C, 0x340)]);
+                    put(m, bs::SYNC, 0x344);
+                    crate::path(m, &[(0x35C, 0x360)]);
+                    (2, 2)
+                }
             };
             b.set_intr(m, 0, s);
-            put(m, bs::SYNC);
-            r
+            f
         }
         2 => {
+            crate::path(m, &[(0x364, 0x368)]);
+            if stat != 0 {
+                crate::path(m, &[(0x36C, 0x36C)]);
+            }
             b.set_intr(m, 0, if stat != 0 { 5 } else { 2 });
-            put(m, bs::SYNC);
+            crate::path(m, &[(0x370, 0x384), (0x388, 0x38C)]);
+            put(m, bs::SYNC, 0x390);
+            crate::path(m, &[(0x3A8, 0x3AC)]);
             2
         }
         1 => {
             // A lone status byte with an error bit is no error.
-            let err = stat != 0 && resp.len() != 1;
+            crate::path(m, &[(0x3B0, 0x3B4)]);
+            if stat != 0 {
+                crate::path(m, &[(0x3B8, 0x3BC)]);
+                if n == 1 {
+                    crate::path(m, &[(0x3C0, 0x3C0)]);
+                }
+            }
+            let err = stat != 0 && n != 1;
+            crate::path(m, &[(0x3C4, 0x3C8)]);
+            if err {
+                crate::path(m, &[(0x3CC, 0x3CC)]);
+            }
             b.set_intr(m, 1, if err { 5 } else { 1 });
-            put(m, bs::READY);
+            crate::path(m, &[(0x3D0, 0x3E8), (0x3EC, 0x3F0)]);
+            put(m, bs::READY, 0x3F4);
+            crate::path(m, &[(0x40C, 0x42C)]);
             cdc(m, |c, _| c.request(false))?;
             4
         }
         4 => {
             b.set_intr(m, 2, 4);
             b.set_intr(m, 1, 4);
-            put(m, bs::DATA);
-            put(m, bs::READY);
+            crate::path(m, &[(0x430, 0x458), (0x45C, 0x45C)]);
+            put(m, bs::DATA, 0x460);
+            crate::path(m, &[(0x478, 0x484), (0x488, 0x48C)]);
+            put(m, bs::READY, 0x490);
+            crate::path(m, &[(0x4A8, 0x4AC)]);
             4
         }
-        5 => {
+        _ => {
             b.set_intr(m, 1, 5);
             b.set_intr(m, 0, 5);
-            put(m, bs::SYNC);
-            put(m, bs::READY);
+            crate::path(m, &[(0x4B0, 0x4D8), (0x4DC, 0x4DC)]);
+            put(m, bs::SYNC, 0x4E0);
+            crate::path(m, &[(0x4F8, 0x504), (0x508, 0x50C)]);
+            put(m, bs::READY, 0x510);
+            crate::path(m, &[(0x528, 0x52C)]);
             6
         }
-        other => {
-            m.log(&format!("CDROM: unknown intr ({other})"));
-            0
-        }
-    })
+    };
+    crate::path(m, &[(0x550, 0x560)]);
+    Ok(f)
 }
 
 /// The callbacks for `getintr`'s answer `f`: the ready one, then the sync
@@ -369,238 +544,409 @@ fn callbacks(m: &M, b: Bios1, f: u32) -> (Option<GuestCall>, Option<GuestCall>) 
     (ready, sync)
 }
 
-/// `bios_1`'s interrupt handler, bound by its place: while the controller
-/// presents an interrupt, its callbacks (a data-ready one, with a sync one
-/// after it when both are due, or the sync one).
+/// `bios_1`'s interrupt handler (+14A4h), bound by its place: while the
+/// controller presents an interrupt, its callbacks (a data-ready one, with
+/// a sync one after it when both are due, or the sync one).
 fn handler(m: &mut M, _a: [u32; 4]) -> Result {
     let b = bios1(m, at::HANDLER)?;
-    Ok(handler_pass(m, b))
+    crate::path(m, &[(0x14A4, 0x14D4)]);
+    Ok(drain(
+        m,
+        b,
+        0x14D8,
+        Box::new(|m| {
+            crate::path(m, &[(0x1550, 0x1578)]);
+            Flow::ret(0)
+        }),
+    ))
 }
 
-fn handler_pass(m: &mut M, b: Bios1) -> Flow<Psyq> {
-    loop {
-        let f = getintr(m, b).unwrap_or_else(|e| {
-            m.log(&format!("libcd interrupt: {e}"));
-            0
-        });
-        if f == 0 {
-            return Flow::ret(0);
-        }
-        match callbacks(m, b, f) {
-            (Some(r), _) => {
-                return call(r.addr, r.args, move |m, _| match callbacks(m, b, 2) {
-                    (_, Some(s)) if f & 2 != 0 => call(s.addr, s.args, move |m, _| handler_pass(m, b)),
-                    _ => handler_pass(m, b),
-                });
-            }
-            (None, Some(s)) => return call(s.addr, s.args, move |m, _| handler_pass(m, b)),
-            (None, None) => {}
-        }
-    }
-}
-
-/// The same from inside a wait in a callback (`CheckCallback()`): every
-/// interrupt presented now, with its callbacks, then `then`.
-fn poll(m: &mut M, b: Bios1, then: Next) -> Flow<Psyq> {
+/// The loop that takes what the controller presents and calls its
+/// callbacks, from its header at `at`: the handler's (+14D8h), and a
+/// wait's in a callback (`CheckCallback()`), laid out alike. It runs in
+/// the exception: a quantum passes at its header once the budget has run
+/// out ([`crate::irq_header`]). Then `then`.
+fn drain(m: &mut M, b: Bios1, at: u32, then: Next) -> Flow<Psyq> {
+    crate::irq_header(m);
+    crate::path(m, &[(at, at + 4)]);
     let f = getintr(m, b).unwrap_or_else(|e| {
-        m.log(&format!("libcd: {e}"));
+        m.log(&format!("libcd interrupt: {e}"));
         0
     });
+    crate::path(m, &[(at + 8, at + 0x10)]);
     if f == 0 {
         return then(m);
     }
-    let (ready, _) = callbacks(m, b, f);
-    let sync_then = move |m: &mut M| -> Flow<Psyq> {
-        match callbacks(m, b, f & 2).1 {
-            Some(c) => Flow::Call { call: c, then: Box::new(move |m, _| poll(m, b, then)) },
-            None => poll(m, b, then),
+    crate::path(m, &[(at + 0x14, at + 0x18)]);
+    // The sync callback when it is due and set, then the loop again.
+    let sync = move |m: &mut M| -> Flow<Psyq> {
+        crate::path(m, &[(at + 0x44, at + 0x48)]);
+        if f & 2 == 0 {
+            return drain(m, b, at, then);
+        }
+        crate::path(m, &[(at + 0x4C, at + 0x5C)]);
+        match callbacks(m, b, 2).1 {
+            Some(c) => {
+                crate::path(m, &[(at + 0x60, at + 0x6C)]);
+                call(c.addr, c.args, move |m, _| {
+                    crate::path(m, &[(at + 0x70, at + 0x74)]);
+                    drain(m, b, at, then)
+                })
+            }
+            None => drain(m, b, at, then),
         }
     };
-    match ready {
-        Some(c) => Flow::Call { call: c, then: Box::new(move |m, _| sync_then(m)) },
-        None => sync_then(m),
+    if f & 4 == 0 {
+        return sync(m);
+    }
+    crate::path(m, &[(at + 0x1C, at + 0x2C)]);
+    match callbacks(m, b, 4).0 {
+        Some(c) => {
+            crate::path(m, &[(at + 0x30, at + 0x3C)]);
+            call(c.addr, c.args, move |m, _| {
+                crate::path(m, &[(at + 0x40, at + 0x40)]);
+                sync(m)
+            })
+        }
+        None => {
+            crate::path(m, &[(at + 0x40, at + 0x40)]);
+            sync(m)
+        }
     }
 }
 
 // --- Waits ------------------------------------------------------------------
 
+/// A wait's look, past its loop's common blocks, spending its own: the
+/// result when it holds, else `None`, the blocks back to the header spent.
 type Done = fn(&mut M, Bios1) -> Option<u32>;
 
 /// One of the drive layer's wait loops (`CD_sync`, `CD_ready`, `CD_cw`,
 /// `CD_datasync`): until `done` gives the result, or with `once` after one
-/// look (0). Each pass spends the loop's instructions; the passes until
-/// the guest's budget runs out see the same, then a safepoint takes the
-/// interrupts (inside a callback the controller is polled instead). After
-/// [`TIMEOUT_PASSES`]: "CD timeout", `CD_flush`, -1.
+/// look (`site.not_yet`). Each pass spends the loop's blocks and the
+/// `VSync(-1)` and `CheckCallback()` it calls (D71); the passes until the
+/// guest's budget runs out see the same, then its header takes a
+/// safepoint, where the interrupts are taken (inside a callback the
+/// controller is polled instead, [`drain`]). After [`TIMEOUT_PASSES`]: "CD
+/// timeout", `CD_flush`, -1. `then` gets the result, and spends the rest of
+/// the function when `done` gave it.
 fn wait(m: &mut M, b: Bios1, site: Site, once: bool, done: Done, then: Then) -> Flow<Psyq> {
     pass(m, b, site, once, TIMEOUT_PASSES + 1, done, then)
 }
 
-/// "CD timeout: " through the game's `puts`, then "%s:(%s) Sync=%s,
-/// Ready=%s\n" through its `printf`: the wait's name, the command's, the
-/// two interrupt states'. Then `k`.
-fn timeout_message(m: &mut M, b: Bios1, site: Site, k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
-    let (t, p) = (b.text, b.text + site.puts);
+/// The time-out (`site.count` + 4h on): "CD timeout: " through the game's
+/// `puts`, then "%s:(%s) Sync=%s, Ready=%s\n" through its `printf` (the
+/// wait's name, the command's, the two interrupt states'), `CD_flush`, and
+/// -1.
+fn timeout(m: &mut M, b: Bios1, site: Site, then: Then) -> Flow<Psyq> {
+    let (t, c) = (b.text, site.count);
+    let p = t + c + 8;
     let name = hi_lo(m, t + site.name, t + site.name + 4).unwrap_or(0);
     let names = |m: &M, table: u32, i: u8| m.mem.r32(b.data + table + 4 * i as u32);
     let com = m.mem.r8(b.data + d::COM);
     let args = [name, names(m, d::COM_NAMES, com), names(m, d::INTR_NAMES, b.intr(m, 0)), names(m, d::INTR_NAMES, b.intr(m, 1))];
-    crate::say(m, (p - 4, p + 4, p), &[], move |m| crate::say(m, (p + 0x48, p + 0x50, p + 0x4C), &args, k))
+    crate::path(m, &[(c + 4, c + 0xC)]);
+    crate::say(m, (p - 4, p + 4, p), &[], move |m| {
+        crate::path(m, &[(c + 0x10, c + 0x58)]);
+        crate::say(m, (p + 0x48, p + 0x50, p + 0x4C), &args, move |m| {
+            crate::path(m, &[(c + 0x5C, c + 0x60)]);
+            flush(
+                m,
+                b,
+                at::CD_FLUSH,
+                Box::new(move |m| {
+                    crate::path(m, &[(0xFC4, 0x1010), (c + 0x64, c + 0x68), (c + 0x70, c + 0x74), site.ret]);
+                    then(m, u32::MAX)
+                }),
+            )
+        })
+    })
 }
 
-/// A pass of the wait, `left` before its timeout.
+/// A pass of the wait from its header, `left` before its time-out.
 fn pass(m: &mut M, b: Bios1, site: Site, once: bool, left: u64, done: Done, then: Then) -> Flow<Psyq> {
-    if left == 0 {
-        return timeout_message(m, b, site, move |m| {
-            flush(m, b);
-            then(m, u32::MAX)
-        });
-    }
-    let rest: Next = Box::new(move |m: &mut M| {
-        crate::take(m, site.pass as u64);
-        if let Some(v) = done(m, b) {
+    header(
+        m,
+        Box::new(move |m| {
+            let (h, c) = (site.head, site.count);
+            crate::path(m, &[(h, h + 4)]);
+            crate::take(m, VCOUNT);
+            crate::path(m, &[(h + 8, h + 0x1C), (h + 0x20, c)]);
+            if left == 0 {
+                return timeout(m, b, site, then);
+            }
+            crate::path(m, &[(c + 0x6C, c + 0x74)]);
+            let look: Next = Box::new(move |m| {
+                if let Some(v) = done(m, b) {
+                    return then(m, v);
+                }
+                if once {
+                    crate::path(m, &[site.ret]);
+                    return then(m, site.not_yet);
+                }
+                let left = left - 1;
+                if m.regs.budget().is_none() {
+                    // No guest budget (tests): a quantum a pass.
+                    let until = m.clock.now + quantum(m);
+                    m.run_until(until);
+                    return Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, site, once, left, done, then)) };
+                }
+                // The passes that follow see the same while every header in
+                // them finds budget left; the one after runs for itself.
+                let mut per = site.pass as u64 + VCOUNT;
+                if site.poll {
+                    per += CHECK + if m.in_irq { POLLED } else { 0 };
+                }
+                let more = (crate::budget(m).max(0) as u64 / (per * crate::UNIT as u64)).saturating_sub(1).min(left);
+                crate::take(m, more * per);
+                pass(m, b, site, once, left - more, done, then)
+            });
+            if !site.poll {
+                return look(m);
+            }
+            crate::path(m, &[(c + 0x78, c + 0x7C)]);
+            crate::take(m, CHECK);
+            crate::path(m, &[(c + 0x80, c + 0x84)]);
+            // In a callback (libetc's dispatcher, or any exception) no
+            // interrupt is taken: the loop polls the controller itself.
+            if !m.in_irq {
+                return look(m);
+            }
+            crate::path(m, &[(c + 0x88, c + 0x9C)]);
+            header(
+                m,
+                Box::new(move |m| {
+                    drain(
+                        m,
+                        b,
+                        c + 0xA0,
+                        Box::new(move |m| {
+                            crate::path(m, &[(c + 0x118, c + 0x124)]);
+                            look(m)
+                        }),
+                    )
+                }),
+            )
+        }),
+    )
+}
+
+/// `CD_sync(mode, result)` (+564h): the command's completion (2) or error
+/// (5), its result copied, the state back to complete. Without waiting:
+/// 0 if neither.
+fn sync(m: &mut M, b: Bios1, once: bool, result: u32, then: Then) -> Flow<Psyq> {
+    crate::path(m, &[(0x564, 0x59C)]);
+    crate::take(m, VCOUNT);
+    crate::path(m, &[(0x5A0, 0x5E0)]);
+    let done: Done = |m, b| {
+        crate::path(m, &[(0x754, 0x764)]);
+        let s = b.intr(m, 0);
+        if s == 2 {
+            return Some(2);
+        }
+        crate::path(m, &[(0x768, 0x76C)]);
+        if s == 5 {
+            return Some(5);
+        }
+        crate::path(m, &[(0x7AC, 0x7B0)]);
+        None
+    };
+    let then: Then = Box::new(move |m, v| {
+        if v != 2 && v != 5 {
             return then(m, v);
         }
-        if once {
-            return then(m, 0);
-        }
-        let more = crate::room(m, site.pass).min(left - 1);
-        crate::take(m, more * site.pass as u64);
-        let left = left - 1 - more;
-        if left == 0 {
-            return pass(m, b, site, once, 0, done, then);
-        }
-        // The next pass's loop header takes a safepoint.
-        if let Some(v) = m.regs.budget() {
-            m.regs.set_budget(v + psx_bios::BUDGET as i32);
-        }
-        let until = m.clock.now + quantum(m);
-        m.run_until(until);
-        Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, site, once, left, done, then)) }
-    });
-    // In a callback (libetc's dispatcher, or any exception) no interrupt
-    // is taken: the loop polls the controller itself.
-    if m.in_irq { poll(m, b, rest) } else { rest(m) }
-}
-
-/// `CD_sync(mode, result)`: the command's completion (2) or error (5), its
-/// result copied, the state back to complete. Without waiting: 0 if
-/// neither.
-fn sync(m: &mut M, b: Bios1, once: bool, result: u32, then: Then) -> Flow<Psyq> {
-    let done: Done = |m, b| {
-        let s = b.intr(m, 0);
-        (s == 2 || s == 5).then_some(s as u32)
-    };
-    wait(
-        m,
-        b,
-        SYNC,
-        once,
-        done,
-        Box::new(move |m, v| {
-            if v == 2 || v == 5 {
-                b.set_intr(m, 0, 2);
-                copy8(m, b.bss + bs::SYNC, result);
-            }
+        b.set_intr(m, 0, 2);
+        crate::path(m, &[(0x770, 0x784)]);
+        let out: Next = Box::new(move |m| {
+            crate::path(m, &[(0x7A4, 0x7A8), SYNC.ret]);
             then(m, v)
-        }),
-    )
-}
-
-/// `CD_ready(mode, result)`: a data-end interrupt (4), else data ready (1)
-/// or error (5), taken with its result. Without waiting: 0 if none.
-fn ready(m: &mut M, b: Bios1, once: bool, result: u32, then: Then) -> Flow<Psyq> {
-    let done: Done = |m, b| {
-        let (end, data) = (b.intr(m, 2), b.intr(m, 1));
-        if end != 0 {
-            Some(0x200 | end as u32)
-        } else if data != 0 {
-            Some(0x100 | data as u32)
-        } else {
-            None
-        }
-    };
-    wait(
-        m,
-        b,
-        READY,
-        once,
-        done,
-        Box::new(move |m, v| {
-            if v == 0 || v == u32::MAX {
-                return then(m, v);
-            }
-            let (slot, from) = if v >> 8 == 2 { (2, bs::DATA) } else { (1, bs::READY) };
-            b.set_intr(m, slot, 0);
-            copy8(m, b.bss + from, result);
-            then(m, v & 0xFF)
-        }),
-    )
-}
-
-/// `CD_cw(com, param, result, async)`: after the last command completes,
-/// the command to the controller (Setloc and Setmode remembered); unless
-/// `async`, its first answer, its result copied: 0, or -1 on an error
-/// answer; -2 without a parameter it needs.
-fn cw(m: &mut M, b: Bios1, com: u8, param: u32, result: u32, nowait: bool, then: Then) -> Flow<Psyq> {
-    let n = b.table(m, d::NPARAMS, com);
-    if n != 0 && param == 0 {
-        return then(m, (-2i32) as u32);
-    }
-    let issue = move |m: &mut M, _| {
-        if com == com::SETLOC {
-            let pos = m.mem.bytes(param, 4);
-            m.mem.write(b.data + d::POS, &pos);
-        }
-        if com == com::SETMODE {
-            let mode = m.mem.r8(param);
-            m.mem.w8(b.data + d::MODE, mode);
-        }
-        b.set_intr(m, 0, 0);
-        if b.table(m, d::READY_RESET, com) != 0 {
-            b.set_intr(m, 1, 0);
-        }
-        let params = if n > 0 { m.mem.bytes(param, n.min(16) as usize) } else { Vec::new() };
-        m.mem.w8(b.data + d::COM, com);
-        if let Err(e) = cdc(m, |c, now| c.issue(com, &params, now)) {
-            m.log(&format!("CD_cw: {e}"));
-        }
-        if nowait {
-            return then(m, 0);
-        }
-        let answered: Done = |m, b| (b.intr(m, 0) != 0).then_some(0);
-        let answer: Then = Box::new(move |m, v| {
-            if v == u32::MAX {
-                return then(m, v);
-            }
-            copy8(m, b.bss + bs::SYNC, result);
-            then(m, if b.intr(m, 0) == 5 { u32::MAX } else { 0 })
         });
-        if b.intr(m, 0) != 0 { answer(m, 0) } else { wait(m, b, CW, false, answered, answer) }
+        copy_result(m, b.bss + bs::SYNC, result, (0x788, 0x788), 0x78C, out)
+    });
+    wait(m, b, SYNC, once, done, then)
+}
+
+/// `CD_ready(mode, result)` (+7E4h): a data-end interrupt (4), else data
+/// ready (1) or error (5), taken with its result. Without waiting: 0 if
+/// none.
+fn ready(m: &mut M, b: Bios1, once: bool, result: u32, then: Then) -> Flow<Psyq> {
+    crate::path(m, &[(0x7E4, 0x81C)]);
+    crate::take(m, VCOUNT);
+    crate::path(m, &[(0x820, 0x860)]);
+    let done: Done = |m, b| {
+        crate::path(m, &[(0x9D4, 0x9E4)]);
+        let end = b.intr(m, 2);
+        if end != 0 {
+            return Some(0x200 | end as u32);
+        }
+        crate::path(m, &[(0xA24, 0xA34)]);
+        let data = b.intr(m, 1);
+        if data != 0 {
+            return Some(0x100 | data as u32);
+        }
+        crate::path(m, &[(0xA74, 0xA78)]);
+        None
+    };
+    let then: Then = Box::new(move |m, v| {
+        if v == 0 || v == u32::MAX {
+            return then(m, v);
+        }
+        let out = move |m: &mut M, tail: (u32, u32)| {
+            crate::path(m, &[tail, READY.ret]);
+            then(m, v & 0xFF)
+        };
+        if v >> 8 == 2 {
+            b.set_intr(m, 2, 0);
+            crate::path(m, &[(0x9E8, 0x9F8)]);
+            if result == 0 {
+                return out(m, (0xA6C, 0xA70));
+            }
+            return copy_result(m, b.bss + bs::DATA, result, (0x9FC, 0xA00), 0xA04, Box::new(move |m| out(m, (0xA1C, 0xA20))));
+        }
+        b.set_intr(m, 1, 0);
+        crate::path(m, &[(0xA38, 0xA4C)]);
+        copy_result(m, b.bss + bs::READY, result, (0xA50, 0xA50), 0xA54, Box::new(move |m| out(m, (0xA6C, 0xA70))))
+    });
+    wait(m, b, READY, once, done, then)
+}
+
+/// `CD_cw(com, param, result, async)` (+AACh): after the last command
+/// completes (`CD_sync`), the command to the controller (Setloc and Setmode
+/// remembered); unless `async`, its first answer, its result copied: 0, or
+/// -1 on an error answer; -2 without a parameter it needs.
+fn cw(m: &mut M, b: Bios1, com: u8, param: u32, result: u32, nowait: bool, then: Then) -> Flow<Psyq> {
+    crate::path(m, &[(0xAAC, 0xAEC), (0xB10, 0xB2C)]);
+    let n = b.table(m, d::NPARAMS, com);
+    if n != 0 {
+        crate::path(m, &[(0xB30, 0xB34)]);
+        if param == 0 {
+            crate::path(m, &[(0xB38, 0xB48), CW.ret]);
+            return then(m, (-2i32) as u32);
+        }
+    }
+    crate::path(m, &[(0xB6C, 0xB70)]);
+    let issue = move |m: &mut M, _| {
+        crate::path(m, &[(0xB74, 0xB80)]);
+        if com != com::SETLOC {
+            return command(m, b, com, param, result, nowait, n, then);
+        }
+        let pos = m.mem.bytes(param, 4);
+        m.mem.write(b.data + d::POS, &pos);
+        crate::path(m, &[(0xB84, 0xB88)]);
+        let rest: Next = Box::new(move |m| {
+            crate::path(m, &[(0xBAC, 0xBB0)]);
+            command(m, b, com, param, result, nowait, n, then)
+        });
+        passes(m, 4, (0xB8C, 0xBA8), rest)
     };
     sync(m, b, false, 0, Box::new(issue))
 }
 
-/// `CD_flush`: acknowledge everything pending, the states back to idle,
-/// the data FIFO emptied. Its result is a register value left in v0.
-fn flush(m: &mut M, b: Bios1) -> u32 {
-    let r = cdc(m, |c, _| {
-        while c.pending() & 7 != 0 {
-            c.acknowledge();
-            c.set_enable(7);
-        }
-        c.request(false);
-    });
-    if let Err(e) = r {
-        m.log(&format!("CD_flush: {e}"));
+/// `CD_cw` past Setloc's position (+BB4h): Setmode's mode kept, the
+/// states, the `n` parameters and the command to the controller; unless
+/// `nowait`, its first answer.
+#[allow(clippy::too_many_arguments)]
+fn command(m: &mut M, b: Bios1, com: u8, param: u32, result: u32, nowait: bool, n: u32, then: Then) -> Flow<Psyq> {
+    crate::path(m, &[(0xBB4, 0xBB8)]);
+    if com == com::SETMODE {
+        crate::path(m, &[(0xBBC, 0xBC4)]);
+        let mode = m.mem.r8(param);
+        m.mem.w8(b.data + d::MODE, mode);
     }
+    crate::path(m, &[(0xBC8, 0xBEC)]);
+    b.set_intr(m, 0, 0);
+    if b.table(m, d::READY_RESET, com) != 0 {
+        crate::path(m, &[(0xBF0, 0xBF0)]);
+        b.set_intr(m, 1, 0);
+    }
+    crate::path(m, &[(0xBF4, 0xC18)]);
+    let n = if (n as i32) > 0 { n.min(16) } else { 0 };
+    let params = m.mem.bytes(param, n as usize);
+    let send: Next = Box::new(move |m| {
+        crate::path(m, &[(0xC4C, 0xC64)]);
+        m.mem.w8(b.data + d::COM, com);
+        let r = cdc(m, |c, now| c.issue(com, &params, now));
+        logged(m, "CD_cw", r);
+        if nowait {
+            crate::path(m, &[CW.ret]);
+            return then(m, 0);
+        }
+        let answer: Then = Box::new(move |m, v| {
+            if v == u32::MAX {
+                return then(m, v);
+            }
+            crate::path(m, &[(0xE40, 0xE4C)]);
+            let out: Next = Box::new(move |m| {
+                crate::path(m, &[(0xE6C, 0xE84)]);
+                let err = b.intr(m, 0) == 5;
+                if err {
+                    crate::path(m, &[(0xE88, 0xE8C)]);
+                }
+                crate::path(m, &[CW.ret]);
+                then(m, if err { u32::MAX } else { 0 })
+            });
+            copy_result(m, b.bss + bs::SYNC, result, (0xE50, 0xE50), 0xE54, out)
+        });
+        crate::path(m, &[(0xC68, 0xC6C)]);
+        crate::take(m, VCOUNT);
+        crate::path(m, &[(0xC70, 0xCA4)]);
+        if b.intr(m, 0) != 0 {
+            return answer(m, 0);
+        }
+        crate::path(m, &[(0xCA8, 0xCBC)]);
+        let answered: Done = |m, b| {
+            crate::path(m, &[(0xE30, 0xE3C)]);
+            (b.intr(m, 0) != 0).then_some(0)
+        };
+        wait(m, b, CW, false, answered, answer)
+    });
+    if n == 0 {
+        return send(m);
+    }
+    crate::path(m, &[(0xC1C, 0xC20)]);
+    passes(m, n, (0xC24, 0xC48), send)
+}
+
+/// `CD_flush`'s loop, or `CD_init`'s copy of it, from `at` (+F40h,
+/// +11C0h): what the controller presents acknowledged, a pass each from
+/// the loop's header (+34h); the states back to idle, the data FIFO
+/// emptied, the common delay at 1325h. Then `k`, which spends the rest.
+fn flush(m: &mut M, b: Bios1, at: u32, k: Next) -> Flow<Psyq> {
+    crate::path(m, &[(at, at + 0x2C)]);
+    if pending(m) == 0 {
+        return flushed(m, b, k);
+    }
+    crate::path(m, &[(at + 0x30, at + 0x30)]);
+    flush_pass(m, b, at, k)
+}
+
+fn flush_pass(m: &mut M, b: Bios1, at: u32, k: Next) -> Flow<Psyq> {
+    header(
+        m,
+        Box::new(move |m| {
+            crate::path(m, &[(at + 0x34, at + 0x80)]);
+            let r = cdc(m, |c, _| {
+                c.acknowledge();
+                c.set_enable(7);
+            });
+            logged(m, "CD_flush", r);
+            if pending(m) != 0 {
+                return flush_pass(m, b, at, k);
+            }
+            flushed(m, b, k)
+        }),
+    )
+}
+
+fn flushed(m: &mut M, b: Bios1, k: Next) -> Flow<Psyq> {
+    let r = cdc(m, |c, _| c.request(false));
+    logged(m, "CD_flush", r);
     b.set_intr(m, 2, 0);
     b.set_intr(m, 1, 0);
     b.set_intr(m, 0, 2);
-    if let Err(e) = set_reg(m, COM_DELAY, 4, 0x1325) {
-        m.log(&format!("CD_flush: {e}"));
-    }
-    0x1325
+    let r = set_reg(m, COM_DELAY, 4, 0x1325);
+    logged(m, "CD_flush", r);
+    k(m)
 }
 
 fn value(v: u32) -> Flow<Psyq> {
@@ -624,14 +970,24 @@ fn cd_ready(m: &mut M, a: [u32; 4]) -> Result {
     Ok(ready(m, b, a[0] != 0, a[1], Box::new(|_, v| value(v))))
 }
 
+/// `CD_flush`: its result is a register value left in v0.
 fn cd_flush(m: &mut M, _a: [u32; 4]) -> Result {
     let b = bios1(m, at::CD_FLUSH)?;
-    ret(flush(m, b))
+    Ok(flush(
+        m,
+        b,
+        at::CD_FLUSH,
+        Box::new(|m| {
+            crate::path(m, &[(0xFC4, 0x1010)]);
+            value(0x1325)
+        }),
+    ))
 }
 
 /// `CD_vol(vol)`: the CD-to-SPU volume matrix, applied.
 fn cd_vol(m: &mut M, a: [u32; 4]) -> Result {
     bios1(m, at::CD_VOL)?;
+    crate::path(m, &[(0xEB8, 0xF3C)]);
     let v = m.mem.bytes(a[0], 4);
     cdc(m, |c, _| c.set_volume([v[0], v[1], v[2], v[3]]))?;
     ret(0)
@@ -643,10 +999,18 @@ fn cd_vol(m: &mut M, a: [u32; 4]) -> Result {
 /// interrupt controller's are for chip irq) until chip spu has adapters.
 fn cd_initvol(m: &mut M, _a: [u32; 4]) -> Result {
     bios1(m, at::CD_INITVOL)?;
-    if reg(m, SPU + 0x1B8, 2)? == 0 && reg(m, SPU + 0x1BA, 2)? == 0 {
-        set_reg(m, SPU + 0x180, 2, 0x3FFF)?;
-        set_reg(m, SPU + 0x182, 2, 0x3FFF)?;
+    crate::path(m, &[(0x1014, 0x102C)]);
+    if reg(m, SPU + 0x1B8, 2)? != 0 {
+        crate::path(m, &[(0x1050, 0x1050)]);
+    } else {
+        crate::path(m, &[(0x1030, 0x103C)]);
+        if reg(m, SPU + 0x1BA, 2)? == 0 {
+            crate::path(m, &[(0x1040, 0x104C), (0x1050, 0x1050)]);
+            set_reg(m, SPU + 0x180, 2, 0x3FFF)?;
+            set_reg(m, SPU + 0x182, 2, 0x3FFF)?;
+        }
     }
+    crate::path(m, &[(0x1054, 0x1100)]);
     set_reg(m, SPU + 0x1B0, 2, 0x3FFF)?;
     set_reg(m, SPU + 0x1B2, 2, 0x3FFF)?;
     set_reg(m, SPU + 0x1AA, 2, 0xC001)?;
@@ -656,21 +1020,28 @@ fn cd_initvol(m: &mut M, _a: [u32; 4]) -> Result {
 
 /// The callback slots and status cleared, then `ResetCallback()` and
 /// `InterruptCallback(2, handler)` as guest calls (the `jal`s at `reset`
-/// and `intr` in bios_1's text), so the handler goes in whichever way
-/// libetc runs.
+/// and `intr` in bios_1's text, the blocks between them spent), so the
+/// handler goes in whichever way libetc runs.
 fn install(m: &mut M, b: Bios1, reset: u32, intr: u32, then: impl FnOnce(&mut M, u64) -> Flow<Psyq> + 'static) -> Result {
     for o in [d::CBREADY, d::CBSYNC, d::STATUS1, d::STATUS] {
         m.mem.w32(b.data + o, 0);
     }
-    let (reset, intr) = (jal(m, b.text + reset)?, jal(m, b.text + intr)?);
+    let (reset_f, intr_f) = (jal(m, b.text + reset)?, jal(m, b.text + intr)?);
     let handler = b.text + at::HANDLER;
-    Ok(call(reset, [0; 4], move |_, _| call(intr, [2, handler, 0, 0], then)))
+    Ok(call(reset_f, [0; 4], move |m, _| {
+        crate::path(m, &[(reset + 8, intr + 4)]);
+        call(intr_f, [2, handler, 0, 0], then)
+    }))
 }
 
 /// `CD_initintr`: the handler installed; `InterruptCallback`'s result.
 fn cd_initintr(m: &mut M, _a: [u32; 4]) -> Result {
     let b = bios1(m, at::CD_INITINTR)?;
-    install(m, b, 0x1128, 0x1138, |_, v| Flow::Return(v & 0xFFFF_FFFF))
+    crate::path(m, &[(0x1104, 0x112C)]);
+    install(m, b, 0x1128, 0x1138, |m, v| {
+        crate::path(m, &[(0x1140, 0x114C)]);
+        Flow::Return(v & 0xFFFF_FFFF)
+    })
 }
 
 /// `CD_init`: no command, mode 0, the handler installed, whatever the
@@ -681,76 +1052,152 @@ fn cd_init(m: &mut M, _a: [u32; 4]) -> Result {
     // "CD_init:" through the game's `puts`, then "addr=%08x\n" through its
     // `printf`.
     let t = b.text;
+    crate::path(m, &[(0x1150, 0x1164)]);
     Ok(crate::say(m, (t + 0x1154, t + 0x1158, t + 0x1160), &[], move |m| {
+        crate::path(m, &[(0x1168, 0x1178)]);
         crate::say(m, (t + 0x1168, t + 0x116C, t + 0x1174), &[b.data + d::INIT_ADDR], move |m| cd_init_rest(m, b).unwrap_or_else(|e| panic!("CD_init: {e}")))
     }))
 }
 
 fn cd_init_rest(m: &mut M, b: Bios1) -> Result {
+    crate::path(m, &[(0x117C, 0x11AC)]);
     m.mem.w8(b.data + d::COM, 0);
     m.mem.w8(b.data + d::MODE, 0);
     let fail = (-1i32) as u32;
+    let out = |m: &mut M, v: u32| {
+        crate::path(m, &[(0x1320, 0x132C)]);
+        value(v)
+    };
     let demute: Then = Box::new(move |m, v| {
+        crate::path(m, &[(0x12F4, 0x12F8)]);
         if v != 0 {
-            return value(fail);
+            crate::path(m, &[(0x131C, 0x131C)]);
+            return out(m, fail);
         }
-        sync(m, b, false, 0, Box::new(move |_, v| value(if v == 2 { 0 } else { fail })))
+        crate::path(m, &[(0x12FC, 0x1300)]);
+        sync(
+            m,
+            b,
+            false,
+            0,
+            Box::new(move |m, v| {
+                crate::path(m, &[(0x1304, 0x1310)]);
+                if v != 2 {
+                    return out(m, fail);
+                }
+                crate::path(m, &[(0x1314, 0x1318)]);
+                out(m, 0)
+            }),
+        )
     });
-    let init: Then = Box::new(move |m, v| if v != 0 { value(fail) } else { cw(m, b, com::DEMUTE, 0, 0, false, demute) });
+    let init: Then = Box::new(move |m, v| {
+        crate::path(m, &[(0x12D8, 0x12DC)]);
+        if v != 0 {
+            return out(m, fail);
+        }
+        crate::path(m, &[(0x12E0, 0x12F0)]);
+        cw(m, b, com::DEMUTE, 0, 0, false, demute)
+    });
     let after_nop: Then = Box::new(move |m, _| {
-        let start = move |m: &mut M| cw(m, b, com::INIT, 0, 0, false, init);
-        if b.word(m, d::STATUS) & 0x10 != 0 { cw(m, b, com::NOP, 0, 0, false, Box::new(move |m, _| start(m))) } else { start(m) }
+        crate::path(m, &[(0x129C, 0x12B0)]);
+        let start = move |m: &mut M| {
+            crate::path(m, &[(0x12C4, 0x12D4)]);
+            cw(m, b, com::INIT, 0, 0, false, init)
+        };
+        if b.word(m, d::STATUS) & 0x10 != 0 {
+            crate::path(m, &[(0x12B4, 0x12C0)]);
+            cw(m, b, com::NOP, 0, 0, false, Box::new(move |m, _| start(m)))
+        } else {
+            start(m)
+        }
     });
     install(m, b, 0x11A8, 0x11B8, move |m, _| {
-        flush(m, b);
-        cw(m, b, com::NOP, 0, 0, false, after_nop)
+        flush(
+            m,
+            b,
+            0x11C0,
+            Box::new(move |m| {
+                crate::path(m, &[(0x1244, 0x1298)]);
+                cw(m, b, com::NOP, 0, 0, false, after_nop)
+            }),
+        )
     })
 }
 
 /// `CD_datasync(mode)`: 0 once DMA3 is idle; with `mode`, 1 while it is
-/// busy, without waiting; mode 0 waits, as libcd's other waits do (its
+/// busy, after one look; mode 0 waits, as libcd's other waits do (its
 /// timeout, message and `CD_flush`, -1).
 fn cd_datasync(m: &mut M, a: [u32; 4]) -> Result {
     let b = bios1(m, at::CD_DATASYNC)?;
-    let busy = |m: &mut M| reg(m, CHCR3, 4).is_ok_and(|c| c & CHCR_BUSY != 0);
-    if a[0] != 0 {
-        return ret(busy(m) as u32);
-    }
-    let idle: Done = |m, _| (!reg(m, CHCR3, 4).is_ok_and(|c| c & CHCR_BUSY != 0)).then_some(0);
-    Ok(wait(m, b, DATASYNC, false, idle, Box::new(|_, v| value(v))))
+    crate::path(m, &[(0x1330, 0x1354)]);
+    crate::take(m, VCOUNT);
+    crate::path(m, &[(0x1358, 0x1394)]);
+    let idle: Done = |m, _| {
+        crate::path(m, &[(0x1450, 0x146C)]);
+        if !reg(m, CHCR3, 4).is_ok_and(|c| c & CHCR_BUSY != 0) {
+            return Some(0);
+        }
+        crate::path(m, &[(0x1470, 0x1474)]);
+        None
+    };
+    let then: Then = Box::new(|m, v| {
+        if v == 0 {
+            crate::path(m, &[DATASYNC.ret]);
+        }
+        value(v)
+    });
+    Ok(wait(m, b, DATASYNC, a[0] != 0, idle, then))
 }
 
 // --- bios_2, bios_3 ---------------------------------------------------------
 
-/// DMA3 from the controller's data FIFO: the sector buffer into the FIFO,
-/// channel 3 enabled, then the transfer of `words` words to `madr` with
-/// `chcr`, through the DMA controller's registers (shared with the other
-/// chips: completion flags DICR and raises IRQ3 when enabled, as on the
-/// device).
-/// The memory controller's delays as each one sets them: the CD-ROM's and
-/// the common delay before the transfer, and the common delay after it.
-fn getsector(m: &mut M, madr: u32, words: u32, chcr: u32, delays: (u32, u32, Option<u32>)) -> Result {
+/// DMA3 from the controller's data FIFO, as the drive layer sets it up: the
+/// sector buffer into the FIFO, the memory controller's CD-ROM and common
+/// delays, channel 3 enabled, its address and `words` words, through the
+/// DMA controller's registers (shared with the other chips: completion
+/// flags DICR and raises IRQ3 when enabled, as on the device); then
+/// [`transfer`].
+fn getsector(m: &mut M, madr: u32, words: u32, delays: (u32, u32)) -> std::result::Result<(), String> {
     cdc(m, |c, _| c.request(true))?;
     set_reg(m, CDROM_DELAY, 4, delays.0)?;
     set_reg(m, COM_DELAY, 4, delays.1)?;
     let dpcr = reg(m, DPCR, 4)?;
     set_reg(m, DPCR, 4, dpcr | 0x8000)?;
     set_reg(m, MADR3, 4, madr)?;
-    set_reg(m, BCR3, 4, words | 0x1_0000)?;
-    set_reg(m, CHCR3, 4, chcr)?;
-    m.cdc_sync();
-    if let Some(d) = delays.2 {
-        set_reg(m, COM_DELAY, 4, d)?;
-    }
-    ret(0)
+    set_reg(m, BCR3, 4, words | 0x1_0000)
 }
 
+/// The transfer started with `chcr`, and the common delay after it.
+fn transfer(m: &mut M, chcr: u32, after: Option<u32>) -> std::result::Result<(), String> {
+    set_reg(m, CHCR3, 4, chcr)?;
+    m.cdc_sync();
+    if let Some(d) = after {
+        set_reg(m, COM_DELAY, 4, d)?;
+    }
+    Ok(())
+}
+
+/// `CD_getsector(madr, words)`: its wait for the FIFO (+8Ch) a loop's
+/// header, the FIFO holding the sector; the transfer done at once.
 fn cd_getsector(m: &mut M, a: [u32; 4]) -> Result {
-    getsector(m, a[0], a[1], 0x1100_0000, (0x2_0943, 0x1323, Some(0x1325)))
+    getsector(m, a[0], a[1], (0x2_0943, 0x1323))?;
+    crate::path(m, &[(0x0, 0x88)]);
+    Ok(header(
+        m,
+        Box::new(|m| {
+            crate::path(m, &[(0x8C, 0x9C), (0xA0, 0xCC), (0xE8, 0xFC)]);
+            let r = transfer(m, 0x1100_0000, Some(0x1325));
+            logged(m, "CD_getsector", r);
+            value(0)
+        }),
+    ))
 }
 
 fn cd_getsector2(m: &mut M, a: [u32; 4]) -> Result {
-    getsector(m, a[0], a[1], 0x1140_0100, (0x2102_0843, 0x1325, None))
+    getsector(m, a[0], a[1], (0x2102_0843, 0x1325))?;
+    crate::path(m, &[(0x0, 0x9C), (0xB4, 0xE8)]);
+    transfer(m, 0x1140_0100, None)?;
+    ret(0)
 }
 
 // --- The streaming ring (c_011, c_003) -------------------------------------
@@ -822,19 +1269,28 @@ impl Ring {
         m.mem.w32(self.data + 0x48, code);
     }
 
-    /// Streaming from memory (`StSetEmulate`): the next sector.
-    fn emu_step(self, m: &mut M) {
+    /// Streaming from memory (`StSetEmulate`): the next sector, the
+    /// original's count `step` when it is.
+    fn emu_step(self, m: &mut M, step: (u32, u32)) {
         if m.mem.r32(self.emu_addr) != 0 {
+            crate::path(m, &[step]);
             let i = m.mem.r32(self.emu_idx);
             m.mem.w32(self.emu_idx, i.wrapping_add(1));
         }
     }
 }
 
-/// `StCdInterrupt`'s DMA helper: channel 3's interrupt enabled for a
+/// `StCdInterrupt`'s epilogue.
+const END: (u32, u32) = (0x90C, 0x918);
+
+/// `c_011`'s DMA helper (+948h): channel 3's interrupt enabled for a
 /// frame's last sector and disabled otherwise (a byte store to DICR, as
-/// the original makes it), the channel enabled, then the transfer.
+/// the original makes it), the channel enabled, then the transfer. Its
+/// blocks with DMA3 idle and the FIFO holding the sector, which its waits
+/// find at once.
 fn ring_dma(m: &mut M, madr: u32, words: u32, chcr: u32, irq: bool) -> std::result::Result<(), String> {
+    let enables = if irq { (0x9CC, 0x9E4) } else { (0xA08, 0xA1C) };
+    crate::path(m, &[(0x948, 0x998), (0x9C0, 0x9C8), enables, (0xA20, 0xAA0), (0xAB8, 0xAEC)]);
     let enables = reg(m, DICR + 2, 1)?;
     set_reg(m, DICR + 2, 1, if irq { enables | 1 << CH } else { enables & !(1 << CH) })?;
     let dpcr = reg(m, DPCR, 4)?;
@@ -846,9 +1302,21 @@ fn ring_dma(m: &mut M, madr: u32, words: u32, chcr: u32, irq: bool) -> std::resu
     Ok(())
 }
 
-fn copy_words(m: &mut M, to: u32, from: u32, n: u32) {
+/// `c_011`'s word copy (+91Ch) of `n` words from `from` to `to`: its
+/// blocks, a pass a word from its loop's header; then `k`.
+fn ring_copy(m: &mut M, to: u32, from: u32, n: u32, k: Next) -> Flow<Psyq> {
     let v = m.mem.bytes(from, 4 * n as usize);
     m.mem.write(to, &v);
+    crate::path(m, &[(0x91C, 0x920)]);
+    passes(
+        m,
+        n,
+        (0x924, 0x93C),
+        Box::new(move |m| {
+            crate::path(m, &[(0x940, 0x944)]);
+            k(m)
+        }),
+    )
 }
 
 /// `StCdInterrupt()`: the data-ready interrupt's work for the streaming
@@ -861,224 +1329,405 @@ fn copy_words(m: &mut M, to: u32, from: u32, n: u32) {
 /// frame's last sector enables DMA3's interrupt, whose callback
 /// (`data_ready_callback`) hands the frame on. The guest calls it makes are
 /// the original's (`CdReady`, `init_ring_status`, `StFunc2`), from a frame
-/// below the caller's stack that holds `CdReady`'s result.
+/// below the caller's stack that holds `CdReady`'s result. Its blocks on
+/// that path (D71), its loops' headers taking safepoints.
 fn st_cd_interrupt(m: &mut M, _a: [u32; 4]) -> Result {
     let s = Ring::find(m, m.sdk.at)?;
+    crate::path(m, &[(0x0, 0x14)]);
     if m.mem.r32(s.final_sector) == 1 {
+        crate::path(m, &[END]);
         return ret(0);
     }
+    crate::path(m, &[(0x18, 0x28)]);
     if m.mem.r32(s.rgb24) != 0 {
+        crate::path(m, &[(0x2C, 0x48)]);
         // 24-bit movies skip sectors while the GPU's DMA (the last frame)
         // runs.
         let gpu = m.mem.r32(s.data + 0x20);
         if reg(m, gpu, 4)? & CHCR_BUSY != 0 {
+            crate::path(m, &[(0x4C, 0x5C)]);
             m.mem.w32(s.intr_flag, 1);
-            s.emu_step(m);
+            s.emu_step(m, (0x60, 0x74));
+            crate::path(m, &[(0x78, 0x80), END]);
             s.status(m, 1);
             return ret(0);
         }
     }
+    crate::path(m, &[(0x84, 0x88)]);
     let frame = m.regs.sp().wrapping_sub(64);
     m.regs.set_sp(frame);
-    Ok(call(s.cd_ready, [1, frame + 48, 0, 0], move |m, v| match ring_sector(m, s, frame, v as u32) {
-        Ok(f) => f(m),
-        Err(e) => {
-            m.log(&format!("StCdInterrupt: {e}"));
-            leave(m, frame)
-        }
-    }))
+    Ok(call(s.cd_ready, [1, frame + 48, 0, 0], move |m, v| ring_sector(m, s, frame, v as u32)))
 }
 
-/// The end of `StCdInterrupt`: its stack frame popped.
+/// The end of `StCdInterrupt` (+90Ch), with its status `code` if it sets
+/// one: its stack frame popped.
+fn done(m: &mut M, s: Ring, frame: u32, code: Option<u32>) -> Flow<Psyq> {
+    if let Some(c) = code {
+        s.status(m, c);
+    }
+    crate::path(m, &[END]);
+    leave(m, frame)
+}
+
 fn leave(m: &mut M, frame: u32) -> Flow<Psyq> {
     m.regs.set_sp(frame.wrapping_add(64));
     Flow::ret(0)
 }
 
-/// `StCdInterrupt` after `CdReady`: what remains, as a flow to run.
-fn ring_sector(m: &mut M, s: Ring, frame: u32, ready: u32) -> std::result::Result<Next, String> {
-    let done = move |code: Option<u32>| -> Next {
-        Box::new(move |m: &mut M| {
-            if let Some(c) = code {
-                s.status(m, c);
-            }
-            leave(m, frame)
-        })
-    };
+/// `StCdInterrupt` after `CdReady` (+8Ch): the entry, the request, and
+/// the sector's header bytes.
+fn ring_sector(m: &mut M, s: Ring, frame: u32, ready: u32) -> Flow<Psyq> {
+    crate::path(m, &[(0x8C, 0x94)]);
     if ready == 5 {
-        return Ok(done(None));
+        return done(m, s, frame, None);
     }
+    crate::path(m, &[(0x98, 0xB8)]);
     if m.mem.r8(frame + 48) & 4 != 0 {
-        return Ok(done(Some(3)));
+        crate::path(m, &[(0xBC, 0xC4)]);
+        return done(m, s, frame, Some(3));
     }
+    crate::path(m, &[(0xC8, 0xF4)]);
     let e = m.mem.r32(s.addr).wrapping_add(m.mem.r32(s.idx1).wrapping_mul(32));
     m.mem.w32(s.entry, e);
     if m.mem.r16(e) != 0 {
         // The ring is full.
-        s.emu_step(m);
-        return Ok(done(Some(4)));
+        crate::path(m, &[(0xF8, 0x108)]);
+        s.emu_step(m, (0x10C, 0x124));
+        crate::path(m, &[(0x128, 0x130)]);
+        return done(m, s, frame, Some(4));
     }
-    cdc(m, |c, _| {
+    crate::path(m, &[(0x134, 0x1A4)]);
+    let r = cdc(m, |c, _| {
         c.request(false);
         c.request(true);
-    })?;
-    let hdr = frame + 40;
-    if m.mem.r32(s.mode) == 0 {
-        let h = cdc(m, |c, _| {
-            let h = c.read_data(4);
-            c.read_data(8);
-            h
-        })?;
-        m.mem.write(hdr, &h);
+    });
+    logged(m, "StCdInterrupt", r);
+    let next: Next = Box::new(move |m| ring_header(m, s, frame));
+    if m.mem.r32(s.mode) != 0 {
+        return next(m);
     }
+    // The header's 4 bytes kept and 8 more read, a byte a pass.
+    let h = cdc(m, |c, _| {
+        let h = c.read_data(4);
+        c.read_data(8);
+        h
+    })
+    .unwrap_or_default();
+    m.mem.write(frame + 40, &h);
+    crate::path(m, &[(0x1A8, 0x1A8)]);
+    passes(
+        m,
+        4,
+        (0x1AC, 0x1CC),
+        Box::new(move |m| {
+            crate::path(m, &[(0x1D0, 0x1DC)]);
+            passes(m, 8, (0x1E0, 0x1F0), next)
+        }),
+    )
+}
+
+/// +1F4h: the frame header into the entry, from memory or by DMA3, then
+/// the header's bytes after it.
+fn ring_header(m: &mut M, s: Ring, frame: u32) -> Flow<Psyq> {
+    crate::path(m, &[(0x1F4, 0x204)]);
+    let e = m.mem.r32(s.entry);
     let emu = m.mem.r32(s.emu_addr);
     if emu != 0 {
         let from = emu.wrapping_add(m.mem.r32(s.emu_idx).wrapping_mul(2048));
-        copy_words(m, e, from, 8);
-    } else {
-        ring_dma(m, e, 8, 0x1100_0000, false)?;
+        crate::path(m, &[(0x208, 0x228)]);
+        return ring_copy(
+            m,
+            e,
+            from,
+            8,
+            Box::new(move |m| {
+                crate::path(m, &[(0x22C, 0x230)]);
+                ring_frame(m, s, frame)
+            }),
+        );
     }
-    let h = m.mem.bytes(hdr, 4);
-    m.mem.write(e + 0x1C, &h);
-    let start = m.mem.r32(s.start_frame);
-    if m.mem.r32(s.start_flag) == 1 && start != 0 {
-        if start != m.mem.r16(e + 8) as u32 {
-            m.mem.w16(e, 0);
-            s.emu_step(m);
-            return Ok(done(None));
-        }
-        m.mem.w32(s.start_flag, 0);
-    }
+    crate::path(m, &[(0x234, 0x254)]);
+    let r = ring_dma(m, e, 8, 0x1100_0000, false);
+    logged(m, "StCdInterrupt", r);
+    ring_frame(m, s, frame)
+}
+
+/// +258h: DMA3 idle (the header's transfer is done at once), the header's
+/// bytes in the entry; the start frame, the sector's kind and channel, and
+/// its place in the frame.
+fn ring_frame(m: &mut M, s: Ring, frame: u32) -> Flow<Psyq> {
+    crate::path(m, &[(0x258, 0x274), (0x290, 0x2E0)]);
     let e = m.mem.r32(s.entry);
-    if m.mem.r16(e) != 0x160 || (m.mem.r16(e + 2) >> 10 & 0x1F) as u32 != m.mem.r32(s.cchannel) {
-        if m.mem.r32(s.emu_addr) != 0 {
-            m.mem.w32(s.emu_idx, 0);
+    let h = m.mem.bytes(frame + 40, 4);
+    m.mem.write(e + 0x1C, &h);
+    if m.mem.r32(s.start_flag) == 1 {
+        crate::path(m, &[(0x2E4, 0x2F4)]);
+        let start = m.mem.r32(s.start_frame);
+        if start != 0 {
+            crate::path(m, &[(0x2F8, 0x310)]);
+            if start != m.mem.r16(e + 8) as u32 {
+                crate::path(m, &[(0x314, 0x328)]);
+                m.mem.w16(e, 0);
+                s.emu_step(m, (0x32C, 0x344));
+                return done(m, s, frame, None);
+            }
+            crate::path(m, &[(0x348, 0x34C)]);
+            m.mem.w32(s.start_flag, 0);
         }
-        m.mem.w16(e, 0);
-        return Ok(done(Some(5)));
     }
+    crate::path(m, &[(0x350, 0x368)]);
+    let e = m.mem.r32(s.entry);
+    let other = m.mem.r16(e) != 0x160 || {
+        crate::path(m, &[(0x36C, 0x384)]);
+        (m.mem.r16(e + 2) >> 10 & 0x1F) as u32 != m.mem.r32(s.cchannel)
+    };
+    if other {
+        crate::path(m, &[(0x388, 0x398)]);
+        if m.mem.r32(s.emu_addr) != 0 {
+            crate::path(m, &[(0x39C, 0x3A4)]);
+            m.mem.w32(s.emu_idx, 0);
+        } else {
+            crate::path(m, &[(0x3A8, 0x3A8)]);
+        }
+        crate::path(m, &[(0x3AC, 0x3C4)]);
+        m.mem.w16(e, 0);
+        return done(m, s, frame, Some(5));
+    }
+    crate::path(m, &[(0x3C8, 0x3DC)]);
     let offset = m.mem.r16(s.sector_offset) as i16 as i32 as u32;
     let frame_no = m.mem.r32(s.frame_no);
-    // Starting over: the ring entries from StRingIdx2 cleared.
-    let restart = move |m: &mut M, then: Next| -> Flow<Psyq> {
-        let (i1, i2) = (m.mem.r32(s.idx1), m.mem.r32(s.idx2));
-        m.mem.w32(s.frame_no, 0);
-        m.mem.w16(s.sector_offset, 0);
-        call(s.init_ring_status, [i2, i1.wrapping_sub(i2), 0, 0], move |m, _| {
-            let i2 = m.mem.r32(s.idx2);
-            m.mem.w32(s.idx1, i2);
-            let e = m.mem.r32(s.entry);
-            m.mem.w16(e, 0);
-            then(m)
-        })
+    let out_of_sequence = offset != m.mem.r16(e + 4) as u32 || {
+        crate::path(m, &[(0x3E0, 0x3F0)]);
+        frame_no != 0 && {
+            crate::path(m, &[(0x3F4, 0x400)]);
+            frame_no != m.mem.r16(e + 8) as u32
+        }
     };
-    let step_and = move |code: u32| -> Next {
-        Box::new(move |m: &mut M| {
-            s.emu_step(m);
-            done(Some(code))(m)
-        })
-    };
-    if offset != m.mem.r16(e + 4) as u32 || (frame_no != 0 && frame_no != m.mem.r16(e + 8) as u32) {
-        // Out of sequence.
-        return Ok(Box::new(move |m: &mut M| restart(m, step_and(6))));
+    if out_of_sequence {
+        crate::path(m, &[(0x404, 0x428)]);
+        return restart(
+            m,
+            s,
+            Box::new(move |m| {
+                crate::path(m, &[(0x42C, 0x458)]);
+                s.emu_step(m, (0x45C, 0x474));
+                crate::path(m, &[(0x478, 0x480)]);
+                done(m, s, frame, Some(6))
+            }),
+        );
     }
-    let func2 = move |m: &mut M, then: Next| -> Flow<Psyq> {
-        let f = m.mem.r32(s.func2);
-        if f != 0 { call(f, [0; 4], move |m, _| then(m)) } else { then(m) }
-    };
-    if m.mem.r16(e + 4) == 0 {
-        // A frame's first sector.
-        m.mem.w16(s.sector_offset, 0);
-        let no = m.mem.r16(e + 8) as u32;
-        m.mem.w32(s.frame_no, no);
-        let end = m.mem.r32(s.end_frame);
-        if end != 0 && no >= end {
-            // Past the last frame: the stream ends.
-            return Ok(Box::new(move |m: &mut M| {
-                restart(
+    crate::path(m, &[(0x484, 0x49C)]);
+    if m.mem.r16(e + 4) != 0 {
+        return ring_data(m, s, frame);
+    }
+    // A frame's first sector.
+    crate::path(m, &[(0x4A0, 0x4C4)]);
+    m.mem.w16(s.sector_offset, 0);
+    let no = m.mem.r16(e + 8) as u32;
+    m.mem.w32(s.frame_no, no);
+    let end = m.mem.r32(s.end_frame);
+    if end != 0 && {
+        crate::path(m, &[(0x4C8, 0x4CC)]);
+        no >= end
+    } {
+        // Past the last frame: the stream ends.
+        crate::path(m, &[(0x4D0, 0x4F4)]);
+        return restart(
+            m,
+            s,
+            Box::new(move |m| {
+                crate::path(m, &[(0x4F8, 0x528)]);
+                m.mem.w32(s.start_flag, 1);
+                func2(
                     m,
-                    Box::new(move |m: &mut M| {
-                        m.mem.w32(s.start_flag, 1);
-                        func2(m, step_and(7))
+                    s,
+                    (0x52C, 0x530),
+                    Box::new(move |m| {
+                        crate::path(m, &[(0x534, 0x544)]);
+                        s.emu_step(m, (0x548, 0x560));
+                        crate::path(m, &[(0x564, 0x56C)]);
+                        done(m, s, frame, Some(7))
                     }),
                 )
-            }));
-        }
-        let room = m.mem.r32(s.size).wrapping_sub(m.mem.r32(s.idx1)).wrapping_sub(1);
-        if room < m.mem.r16(e + 6) as u32 {
-            // The frame doesn't fit before the ring's end.
-            if m.mem.r32(s.end_frame) == 0 {
-                m.mem.w16(e, 1);
-                m.mem.w32(s.start_flag, 1);
-                return Ok(Box::new(move |m: &mut M| func2(m, step_and(8))));
-            }
-            let ring = m.mem.r32(s.addr);
-            if m.mem.r16(ring) != 0 {
-                m.mem.w16(e, 0);
-                s.emu_step(m);
-                return Ok(done(Some(9)));
-            }
-            // Wrap: the entry moves to the ring's start.
-            m.mem.w16(e, 1);
-            m.mem.w32(s.idx1, 0);
-            copy_words(m, ring, e, 8);
-            m.mem.w32(s.entry, ring);
-        }
+            }),
+        );
+    }
+    crate::path(m, &[(0x570, 0x59C)]);
+    let first: Next = Box::new(move |m| {
+        crate::path(m, &[(0x6BC, 0x6CC)]);
         let i1 = m.mem.r32(s.idx1);
         m.mem.w32(s.idx2, i1);
+        ring_data(m, s, frame)
+    });
+    let room = m.mem.r32(s.size).wrapping_sub(m.mem.r32(s.idx1)).wrapping_sub(1);
+    if room >= m.mem.r16(e + 6) as u32 {
+        return first(m);
     }
+    // The frame doesn't fit before the ring's end.
+    crate::path(m, &[(0x5A0, 0x5B0)]);
+    if m.mem.r32(s.end_frame) == 0 {
+        crate::path(m, &[(0x5B4, 0x5CC)]);
+        m.mem.w16(e, 1);
+        m.mem.w32(s.start_flag, 1);
+        return func2(
+            m,
+            s,
+            (0x5D0, 0x5D4),
+            Box::new(move |m| {
+                crate::path(m, &[(0x5D8, 0x5E8)]);
+                s.emu_step(m, (0x5EC, 0x604));
+                crate::path(m, &[(0x608, 0x610)]);
+                done(m, s, frame, Some(8))
+            }),
+        );
+    }
+    crate::path(m, &[(0x614, 0x62C)]);
+    let ring = m.mem.r32(s.addr);
+    if m.mem.r16(ring) != 0 {
+        crate::path(m, &[(0x630, 0x644)]);
+        m.mem.w16(e, 0);
+        s.emu_step(m, (0x648, 0x660));
+        crate::path(m, &[(0x664, 0x66C)]);
+        return done(m, s, frame, Some(9));
+    }
+    // Wrap: the entry moves to the ring's start, a word a pass.
+    crate::path(m, &[(0x670, 0x68C)]);
+    m.mem.w16(e, 1);
+    m.mem.w32(s.idx1, 0);
+    let v = m.mem.bytes(e, 32);
+    m.mem.write(ring, &v);
+    m.mem.w32(s.entry, ring);
+    passes(
+        m,
+        8,
+        (0x690, 0x6A8),
+        Box::new(move |m| {
+            crate::path(m, &[(0x6AC, 0x6B8)]);
+            first(m)
+        }),
+    )
+}
+
+/// The ring's start over: `init_ring_status(StRingIdx2, StRingIdx1 -
+/// StRingIdx2)` (its entries from StRingIdx2 cleared), the frame and
+/// sector counts 0 before it, StRingIdx1 back to StRingIdx2 and the entry
+/// cleared after; then `then`, which spends the blocks after the call.
+fn restart(m: &mut M, s: Ring, then: Next) -> Flow<Psyq> {
+    let (i1, i2) = (m.mem.r32(s.idx1), m.mem.r32(s.idx2));
+    m.mem.w32(s.frame_no, 0);
+    m.mem.w16(s.sector_offset, 0);
+    call(s.init_ring_status, [i2, i1.wrapping_sub(i2), 0, 0], move |m, _| {
+        let i2 = m.mem.r32(s.idx2);
+        m.mem.w32(s.idx1, i2);
+        let e = m.mem.r32(s.entry);
+        m.mem.w16(e, 0);
+        then(m)
+    })
+}
+
+/// `StFunc2()` when it is set, its `jalr` the blocks `jalr`; then `k`.
+fn func2(m: &mut M, s: Ring, jalr: (u32, u32), k: Next) -> Flow<Psyq> {
+    let f = m.mem.r32(s.func2);
+    if f == 0 {
+        return k(m);
+    }
+    crate::path(m, &[jalr]);
+    call(f, [0; 4], move |m, _| k(m))
+}
+
+/// +6D0h: the sector's 2016 data bytes into the entry's slot, from memory
+/// or by DMA3, its interrupt on for a frame's last sector.
+fn ring_data(m: &mut M, s: Ring, frame: u32) -> Flow<Psyq> {
+    crate::path(m, &[(0x6D0, 0x730)]);
     s.status(m, 10);
     let so = m.mem.r16(s.sector_offset);
     m.mem.w16(s.sector_offset, so.wrapping_add(1));
     let base = m.mem.r32(s.addr).wrapping_add(m.mem.r32(s.size).wrapping_mul(32)).wrapping_add(m.mem.r32(s.idx1).wrapping_mul(2016));
     m.mem.w32(s.base, base);
-    let chcr = if m.mem.r32(s.rgb24) != 0 { 0x1100_0000 } else { 0x1140_0100 };
+    let rgb24 = m.mem.r32(s.rgb24) != 0;
+    crate::path(m, &[if rgb24 { (0x734, 0x758) } else { (0x75C, 0x774) }, (0x778, 0x794)]);
+    let chcr = if rgb24 { 0x1100_0000 } else { 0x1140_0100 };
     let e = m.mem.r32(s.entry);
     let last = m.mem.r16(e + 6) as i32 - 1 == m.mem.r16(e + 4) as i32;
     if last {
         m.mem.w32(s.final_sector, 1);
     }
+    crate::path(m, &[if last { (0x798, 0x7AC) } else { (0x838, 0x848) }]);
     let emu = m.mem.r32(s.emu_addr);
     if emu != 0 {
         let i = m.mem.r32(s.emu_idx);
-        copy_words(m, base, emu.wrapping_add(i.wrapping_mul(2048)).wrapping_add(32), 504);
-        m.mem.w32(s.emu_idx, i.wrapping_add(1));
-    } else {
-        ring_dma(m, base, 504, chcr, last)?;
+        let from = emu.wrapping_add(i.wrapping_mul(2048)).wrapping_add(32);
+        crate::path(m, &[if last { (0x7B0, 0x7D0) } else { (0x84C, 0x86C) }]);
+        return ring_copy(
+            m,
+            base,
+            from,
+            504,
+            Box::new(move |m| {
+                crate::path(m, &[if last { (0x7D4, 0x7EC) } else { (0x870, 0x888) }]);
+                m.mem.w32(s.emu_idx, i.wrapping_add(1));
+                ring_end(m, s, frame, last)
+            }),
+        );
     }
+    crate::path(m, &[if last { (0x7F0, 0x810) } else { (0x88C, 0x8AC) }]);
+    let r = ring_dma(m, base, 504, chcr, last);
+    logged(m, "StCdInterrupt", r);
+    ring_end(m, s, frame, last)
+}
+
+/// +814h, +8B0h: after a frame's last sector the counters start over; the
+/// entry's status, the next entry; from memory, the frame handed on here,
+/// where no DMA interrupt comes.
+fn ring_end(m: &mut M, s: Ring, frame: u32, last: bool) -> Flow<Psyq> {
     if last {
+        crate::path(m, &[(0x814, 0x834)]);
         m.mem.w16(s.sector_offset, 0);
         m.mem.w32(s.frame_no, 0);
         let ch = m.mem.r32(s.stchannel);
         m.mem.w32(s.cchannel, ch);
     }
+    crate::path(m, &[(0x8B0, 0x8EC)]);
     let e = m.mem.r32(s.entry);
     m.mem.w16(e, 3);
     let i1 = m.mem.r32(s.idx1);
     m.mem.w32(s.idx1, i1.wrapping_add(1));
-    if m.mem.r32(s.emu_addr) != 0 && m.mem.r32(s.final_sector) != 0 {
-        // From memory no DMA interrupt comes: the frame is handed on here.
-        return Ok(Box::new(move |_: &mut M| call(s.data_ready_callback, [0; 4], move |m, _| leave(m, frame))));
+    if m.mem.r32(s.emu_addr) != 0 {
+        crate::path(m, &[(0x8F0, 0x900)]);
+        if m.mem.r32(s.final_sector) != 0 {
+            crate::path(m, &[(0x904, 0x908)]);
+            return call(s.data_ready_callback, [0; 4], move |m, _| done(m, s, frame, None));
+        }
     }
-    Ok(done(None))
+    done(m, s, frame, None)
 }
 
 /// `StUnSetRing()`: in a critical section, the data and ready callbacks
 /// off (libds's when it is active, else libcd's), and the data FIFO
-/// emptied. The calls are the original's; `ExitCriticalSection`'s result.
+/// emptied. The calls are the original's, its blocks around them;
+/// `ExitCriticalSection`'s result.
 fn st_unset_ring(m: &mut M, _a: [u32; 4]) -> Result {
     let t = m.sdk.at;
     let ds_active = hi_lo(m, t + 0x10, t + 0x14)?;
     let enter = jal(m, t + 0x08)?;
-    let (data, ready) = if m.mem.r32(ds_active) == 1 { (jal(m, t + 0x24)?, jal(m, t + 0x2C)?) } else { (jal(m, t + 0x3C)?, jal(m, t + 0x44)?) };
+    let ((data, ready), ds) = if m.mem.r32(ds_active) == 1 { ((jal(m, t + 0x24)?, jal(m, t + 0x2C)?), true) } else { ((jal(m, t + 0x3C)?, jal(m, t + 0x44)?), false) };
     let exit = jal(m, t + 0x68)?;
-    Ok(call(enter, [0; 4], move |_, _| {
-        call(data, [0; 4], move |_, _| {
+    crate::path(m, &[(0x0, 0xC)]);
+    Ok(call(enter, [0; 4], move |m, _| {
+        crate::path(m, &[(0x10, 0x20), if ds { (0x24, 0x28) } else { (0x3C, 0x40) }]);
+        call(data, [0; 4], move |m, _| {
+            crate::path(m, &[if ds { (0x2C, 0x30) } else { (0x44, 0x48) }]);
             call(ready, [0; 4], move |m, _| {
-                if let Err(e) = cdc(m, |c, _| c.request(false)) {
-                    m.log(&format!("StUnSetRing: {e}"));
+                if ds {
+                    crate::path(m, &[(0x34, 0x38)]);
                 }
-                call(exit, [0; 4], |_, v| Flow::Return(v & 0xFFFF_FFFF))
+                crate::path(m, &[(0x4C, 0x6C)]);
+                let r = cdc(m, |c, _| c.request(false));
+                logged(m, "StUnSetRing", r);
+                call(exit, [0; 4], |m, v| {
+                    crate::path(m, &[(0x70, 0x7C)]);
+                    Flow::Return(v & 0xFFFF_FFFF)
+                })
             })
         })
     }))
