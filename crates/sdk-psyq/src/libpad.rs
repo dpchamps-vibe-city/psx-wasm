@@ -766,6 +766,7 @@ fn pad_init_direct(m: &mut M, a: [u32; 4]) -> Result {
 fn pad_start_com(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::ELEMENT, data::VSYNC_PARAM)?;
     m.mem.w32(l.data + data::INT_EXEC, 0);
+    psx_bios::bios::syscall(m, [1, 0, 0, 0])?;
     let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])?;
     Ok(psx_bios::machine::seq(m, flow, move |m, _| {
         let flow = psx_bios::bios::dispatch(m, 0xC0, 0x02, [PRIORITY, l.element(), 0, 0])
@@ -795,6 +796,7 @@ fn pad_start_com(m: &mut M, _a: [u32; 4]) -> Result {
 /// [`pad_start_com`]'s are.
 fn pad_stop_com(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::ELEMENT, data::VSYNC_PARAM)?;
+    psx_bios::bios::syscall(m, [1, 0, 0, 0])?;
     let flow = psx_bios::bios::dispatch(m, 0xC0, 0x0A, [3, 1, 0, 0])?;
     Ok(psx_bios::machine::seq(m, flow, move |m, _| {
         let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])
@@ -1110,7 +1112,7 @@ mod tests {
     fn start_dequeue(m: &mut M) {
         note(m, 0x03);
         assert_eq!(args(), [PRIORITY, ELEMENT, 0, 0]);
-        assert!(m.crit, "the caller's critical section is still held");
+        assert!(m.crit, "PadStartCom entered its critical section");
         assert_eq!(m.mem.r32(DATA + data::INT_EXEC), 0, "_padIntExec cleared before the call");
         assert_eq!(m.mem.r8(RECORDS + rec::STATE), 7, "the ports are not forgotten yet");
     }
@@ -1172,7 +1174,7 @@ mod tests {
         patch(&mut m, 0x03, START_DEQUEUE);
         patch(&mut m, 0x02, START_ENQUEUE);
         patch(&mut m, 0x0A, START_CHANGE_CLEAR);
-        psx_bios::bios::syscall(&mut m, [1, 0, 0, 0]).unwrap();
+        assert!(!m.crit, "the adapter, not the caller, must enter critical");
         assert_eq!(run(&mut m, "PadStartCom", [0; 4]), 1);
         assert_eq!(notes(&m), [0x03, 0x02, 0x0A], "the original's order");
         assert!(!m.crit, "the critical section is left after the last call");
@@ -1188,7 +1190,7 @@ mod tests {
         crate::testing::double(STOP_DEQUEUE, stop_dequeue);
         patch(&mut m, 0x0A, STOP_CHANGE_CLEAR);
         patch(&mut m, 0x03, STOP_DEQUEUE);
-        psx_bios::bios::syscall(&mut m, [1, 0, 0, 0]).unwrap();
+        assert!(!m.crit, "PadStopCom must enter critical too");
         assert_eq!(run(&mut m, "PadStopCom", [0; 4]), 0);
         assert_eq!(notes(&m), [0x0A, 0x03]);
         assert!(!m.crit, "ExitCriticalSection's 0, after the dequeue");

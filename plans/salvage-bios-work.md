@@ -773,15 +773,30 @@ patches, while existing clock/IRQ behavior and original object addresses remain.
 The combined SDK 39/runtime 8 tests and wasm32 runtime check pass. These are
 source gates, not a fresh game/replay or original-SDK conformance result.
 
-Resume `aca5bd30-9fcd-4232-a592-8ed276a12afc` owns only libpad's five analogous
-PadStartCom/PadStopCom calls in the same isolated SDK worktree. Libmc's synchronous
-BIOS bypasses (including its void IRQ-step path) and libgpu's direct GPU_cw call
-remain partial; no global helper or IRQ/runtime redesign is authorized.
+Resume `aca5bd30-9fcd-4232-a592-8ed276a12afc` completed libpad's five analogous
+PadStartCom/PadStopCom calls as `2a18cb5`, reviewed and integrated as `02f2a66`.
+Parent verified `pdmaiini.o` and restored the missing EnterCriticalSection calls
+before the patched BIOS work (the matching exits already existed), and changed
+the regression to start outside critical rather than hide that omission. SDK 40/
+runtime 8 tests and wasm32 runtime check pass. Libmc's synchronous BIOS bypasses
+(including its void IRQ-step path) and libgpu's direct GPU_cw call remain partial;
+no global helper or IRQ/runtime redesign is authorized.
+
+Workspace tests passed at `6deb05b` (card/libapi/libetc batch): BIOS 47, runtime 8,
+SDK 39, linker integration 7, and other crates. Optional compiler-env tests and
+two Docker oracle cases still skip for missing prerequisites; threaded Docker
+DWARF stays ignored. The release CLI also rebuilt there; game/runtime wasm
+artifacts still require the next combined build/replay gate.
 Read-only DeepSeek run `008e4a9a-fd2e-4f8a-9117-34759266ba0f` investigates only
 A(52h)/C(09h) evidence at parent `55d2c2e`, with a four-reference bound and no
-implementation authority. Console research was steered a second time after a
-completed 200-revision grep; it must implement available evidence-backed software
-or report unresolved circular-buffer/host-input/ioabort behavior, not invent it.
+implementation authority. Console research continued broad searches after two
+steers. Parent interrupted `f8f7657d` on its third watchdog notice, verified no
+tracked changes at `e2fb21b`, an empty report and the stopped search processes.
+The original four-lane workflow is complete with that child marked failed/paused,
+not a successful console implementation. One same-channel retry `5f2da315-0130-
+4b17-a89f-c9decd7845db` now owns only gets using the supplied pinned stdio body;
+circular-buffer services, missing host input and general ioabort remain blocked.
+No alternate runner or tool/config workaround was used.
 
 ## Progress log
 
