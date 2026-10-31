@@ -311,7 +311,8 @@ pub fn verify_snapshot(ws: &Workspace, game: &str, snap: &psxw_modkit::snapshot:
     let src = build::snapshot(ws, game)?;
     let map = psxw_inputs::AddressMap::load(&src, &manifest)?;
     let work = ws.out_dir().join("modkit").join(game).join("verify");
-    let clang = psxw_cc::Clang::new(ws.clang()?, src.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    let mut clang = psxw_cc::Clang::new(ws.clang()?, src.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    clang.reference(&manifest.reference.cc1flags);
     psxw_modkit::cfront::verify(snap, &clang, &reference, &src, &manifest, &map, &work.join("probe"))
 }
 

@@ -237,7 +237,7 @@ impl ModsWorkspace {
         let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}: run psxw mod sdk", p.display()))?;
         let f: SdkFlags = serde_json::from_str(&text)?;
         let sdk = self.sdk_dir();
-        Ok(Flags { clang: f.clang.into(), prelude: sdk.join(&f.prelude), includes: f.includes.iter().map(|i| sdk.join(i)).collect(), defines: f.defines })
+        Ok(Flags { clang: f.clang.into(), prelude: sdk.join(&f.prelude), includes: f.includes.iter().map(|i| sdk.join(i)).collect(), defines: f.defines, unsigned_char: f.unsigned_char })
     }
 
     /// Write each mod's `mod.h` and the workspace's
@@ -250,7 +250,8 @@ impl ModsWorkspace {
             let inc = self.include_dir(m.id());
             crate::build::write_if_changed(&inc.join("mod.h"), &genfiles::mod_h(plan, mods, mi, &prelude))?;
             crate::build::write_if_changed(&inc.join("psxmod.h"), genfiles::PSXMOD_H)?;
-            let clang = psxw_cc::Clang::new(flags.clang.clone(), m.dir.clone(), [flags.includes.clone(), vec![inc.clone()]].concat(), flags.defines.clone(), &self.state.join("scan"))?;
+            let mut clang = psxw_cc::Clang::new(flags.clang.clone(), m.dir.clone(), [flags.includes.clone(), vec![inc.clone()]].concat(), flags.defines.clone(), &self.state.join("scan"))?;
+            clang.unsigned_char = flags.unsigned_char;
             let defines = |src: &Path| -> Vec<String> {
                 let rel = src.strip_prefix(&m.dir).map(Path::to_path_buf).unwrap_or_else(|_| src.to_path_buf());
                 crate::compile::static_defines(&clang, m, &rel).unwrap_or_default()
@@ -293,6 +294,14 @@ pub struct SdkFlags {
     pub defines: Vec<String>,
     /// The game's prelude headers, which `mod.h` includes first.
     pub prelude_headers: Vec<String>,
+    /// Plain `char` as the game's reference compiler has it (SDKs made
+    /// before this field: unsigned).
+    #[serde(default = "unsigned")]
+    pub unsigned_char: bool,
+}
+
+fn unsigned() -> bool {
+    true
 }
 
 impl SdkFlags {
@@ -554,6 +563,7 @@ pub fn sdk_into(ws: &ModsWorkspace, psx: &Workspace) -> Result<SymbolTable> {
         includes,
         defines: manifest.c.defines.clone(),
         prelude_headers: manifest.probe.prelude.clone(),
+        unsigned_char: psxw_cc::plain_char_unsigned(&manifest.reference.cc1flags),
     };
     std::fs::write(sdk.join("flags.json"), serde_json::to_string_pretty(&flags)?)?;
     std::fs::write(sdk.join("symbols.json"), serde_json::to_string(&table)?)?;

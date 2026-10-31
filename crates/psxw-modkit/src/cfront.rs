@@ -40,12 +40,10 @@ fn w(s: &str) -> TypeExpr {
 
 /// A primitive C type's width (GCC's MIPS and clang's wasm32 agree on
 /// these; the probe checks every layout built from them).
-fn primitive(text: &str) -> Option<TypeExpr> {
+fn primitive(text: &str, unsigned_char: bool) -> Option<TypeExpr> {
     let t: Vec<&str> = text.split_whitespace().filter(|t| *t != "int" || text.split_whitespace().count() == 1).collect();
     let t = t.join(" ");
-    // psx-wasm's C is compiled as the reference compiler's: plain `char`
-    // unsigned (`-funsigned-char`).
-    let unsigned_char = psxw_cc::UB_CONTAINMENT_FLAGS.contains(&"-funsigned-char");
+    // Plain `char` as the reference compiler has it (`Clang::reference`).
     Some(w(match t.as_str() {
         "char" if unsigned_char => "u8",
         "char" | "signed char" => "s8",
@@ -115,6 +113,8 @@ struct Tu {
 struct Reader<'a> {
     ast: &'a Ast,
     tu: Tu,
+    /// Plain `char`'s signedness, as the game's C is compiled.
+    unsigned_char: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -175,7 +175,7 @@ impl<'a> Reader<'a> {
     /// defines; `via` is how C reaches it when no name does.
     fn specifier(&mut self, n: Node, anon: Option<String>, via: Option<(String, String)>) -> TypeExpr {
         match n.kind() {
-            "primitive_type" | "sized_type_specifier" => primitive(self.text(n)).unwrap_or_else(|| w("s32")),
+            "primitive_type" | "sized_type_specifier" => primitive(self.text(n), self.unsigned_char).unwrap_or_else(|| w("s32")),
             "type_identifier" => {
                 let name = self.text(n);
                 self.tu.typedefs.get(name).cloned().unwrap_or(TypeExpr::Named { named: name.to_string() })
@@ -457,7 +457,7 @@ fn header(clang: &psxw_cc::Clang, reference: Option<&Reference>, headers: &Heade
     let map = LineMap::new(&text);
     let tree = ast::parse(&text);
     let mine = |offset: usize| map.presumed(map.line_of(offset)).is_some_and(|(f, _)| headers.marks(f, h));
-    let mut r = Reader { ast: &tree, tu: Tu::default() };
+    let mut r = Reader { ast: &tree, tu: Tu::default(), unsigned_char: clang.unsigned_char };
     r.read();
     let tu = r.tu;
 
@@ -763,7 +763,7 @@ mod tests {
 
     fn read(src: &str) -> Tu {
         let ast = ast::parse(src);
-        let mut r = Reader { ast: &ast, tu: Tu::default() };
+        let mut r = Reader { ast: &ast, tu: Tu::default(), unsigned_char: true };
         r.read();
         r.tu
     }

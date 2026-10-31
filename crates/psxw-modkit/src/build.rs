@@ -43,7 +43,7 @@ pub fn flags(ws: &Workspace, game: &str, map: &psxw_inputs::AddressMap, work: &P
     if !headers.rooted_in(&headers.contexts(map)).is_empty() {
         includes.push(snap.clone());
     }
-    Ok(Flags { clang: ws.clang()?, prelude, includes, defines: manifest.c.defines.clone() })
+    Ok(Flags { clang: ws.clang()?, prelude, includes, defines: manifest.c.defines.clone(), unsigned_char: psxw_cc::plain_char_unsigned(&manifest.reference.cc1flags) })
 }
 
 /// The header index at the pinned commit, cached under `out/modkit/`.
@@ -59,7 +59,8 @@ pub fn header_index(ws: &Workspace, prep: &Prepared) -> Result<HeaderIndex> {
     let snap = snapshot(ws, game)?;
     let manifest = &prep.inputs.manifest;
     let work = dir.join("headers");
-    let clang = psxw_cc::Clang::new(ws.clang()?, snap.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    let mut clang = psxw_cc::Clang::new(ws.clang()?, snap.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    clang.reference(&manifest.reference.cc1flags);
     let idx = headers::index(&clang, &snap, manifest, &prep.inputs.map, &work)?;
     std::fs::create_dir_all(&dir)?;
     std::fs::write(&path, serde_json::to_string(&idx)?)?;
@@ -83,7 +84,8 @@ pub fn snapshots(ws: &Workspace, game: &str) -> Result<(crate::snapshot::Snapsho
     let snap = snapshot(ws, game)?;
     let manifest = &prep.inputs.manifest;
     let work = dir.join("cfront");
-    let clang = psxw_cc::Clang::new(ws.clang()?, snap.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    let mut clang = psxw_cc::Clang::new(ws.clang()?, snap.clone(), manifest.c.include.clone(), manifest.c.defines.clone(), &work)?;
+    clang.reference(&manifest.reference.cc1flags);
     let pin = ws.game_pin(manifest)?;
     let checkout = ws.checkout(pin);
     let tool = |p: &Path| if p.components().count() > 1 { checkout.join(p) } else { p.to_path_buf() };

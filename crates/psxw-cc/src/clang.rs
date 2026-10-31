@@ -35,6 +35,21 @@ const DOWNGRADED: &[&str] = &[
     "return-mismatch",
 ];
 
+/// Whether the reference compiler's plain `char` is unsigned: signed, as
+/// GCC's MIPS default has it, unless the last `-f[no-]{un,}signed-char` of
+/// its cc1 flags says unsigned.
+pub fn plain_char_unsigned(cc1flags: &[String]) -> bool {
+    cc1flags
+        .iter()
+        .rev()
+        .find_map(|f| match f.as_str() {
+            "-funsigned-char" | "-fno-signed-char" => Some(true),
+            "-fsigned-char" | "-fno-unsigned-char" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 impl Clang {
     pub fn new(path: PathBuf, cwd: PathBuf, includes: Vec<PathBuf>, defines: Vec<String>, work: &Path) -> Result<Self> {
         std::fs::create_dir_all(work)?;
@@ -48,15 +63,7 @@ impl Clang {
     /// unless the last `-f[no-]{un,}signed-char` says unsigned.
     pub fn reference(&mut self, cc1flags: &[String]) {
         self.soft_float = cc1flags.iter().any(|f| f == "-msoft-float");
-        self.unsigned_char = cc1flags
-            .iter()
-            .rev()
-            .find_map(|f| match f.as_str() {
-                "-funsigned-char" | "-fno-signed-char" => Some(true),
-                "-fsigned-char" | "-fno-unsigned-char" => Some(false),
-                _ => None,
-            })
-            .unwrap_or(false);
+        self.unsigned_char = plain_char_unsigned(cc1flags);
     }
 
     /// [`crate::UB_CONTAINMENT_FLAGS`], with plain `char` as configured.
