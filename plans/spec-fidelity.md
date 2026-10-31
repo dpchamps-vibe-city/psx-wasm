@@ -117,12 +117,14 @@ BIOS:
   the original `pad.o`; make both agree (BIOS1 then routes `PAD_init`
   through B0:15h).
   Done `9ed5377`: B0:15h is `PAD_init2(type, button_dest)` (psx-spx, OpenBIOS `initPadHighLevel`): types 20000000h/20000001h only, the kernel's own buffers, `PAD_dr` (B0:16h) storing at `button_dest` each vblank; libapi's `PAD_init` passes its arguments through. `InitPAD2` zero-fills; the handler stores up to 22h bytes whatever the size.
-- [ ] **B5. `open` on `cdrom:` hands out descriptor 16 when all are
+- [x] **B5. `open` on `cdrom:` hands out descriptor 16 when all are
   taken.** `psx-bios/src/bios.rs:362`. Fix: fail as the card path does.
-- [ ] **B6. `bios::implemented()` counts calls that always error**
+  Done `227f8e4`: as OpenBIOS's `psxopen`, a free descriptor first (EMFILE 18h), then ENODEV for an unknown device, ENOENT for a missing CD file.
+- [x] **B6. `bios::implemented()` counts calls that always error**
   (`longjmp`, `Exec`, `ReturnFromException`, `SystemError`), which the
   build's coverage check trusts. `psx-bios/src/bios.rs:104`. Fix: count
   only calls that can succeed.
+  Done `d8592ec`: `implemented()` excludes `longjmp` and `Exec` (`bios::unsupported` gives the reason); the build lists such calls' sites and records the reason in `bios-calls.json` instead of failing (bof4 makes `Exec`). `SystemError` stops as the console does and `ReturnFromException` is lowered by the lift, so both stay implemented.
 - [ ] **B7. BIOS `printf` zero-pads negatives as `000-5`** and ignores
   `+`, space and `#`. `psx-bios/src/bios.rs:597-607`. Fix: sign before
   padding; the flags.
@@ -172,18 +174,22 @@ Renderer, SDK, translator, runtime:
 - [ ] **B18. libmcx's last-byte wait is ~20 cycles, not a byte's ~1,000.**
   `sdk-psyq/src/libmc.rs:498-505`; probably a D66 regression. Fix: a
   byte's time at the port's baud rate.
-- [ ] **B19. A tail transfer out of an inlined callee exits the whole
+- [x] **B19. A tail transfer out of an inlined callee exits the whole
   caller.** `psxw-lift/src/graph.rs:231-237, 260-264`; `emit.rs:198-201,
   255-258, 306-314`. Fix: return to the inlined call's return site.
-- [ ] **B20. `bltzal`/`bgezal` with rs = ra test the new link value.**
+  Done `0cf92f5` (agent): the target is called, then the inlined `jr ra`'s r31 dispatch. Blocks entered at computed offsets get the same dispatch, so an r31 that's neither a return site nor 0 now reaches `psxw_bad_jump` where it returned silently.
+- [x] **B20. `bltzal`/`bgezal` with rs = ra test the new link value.**
   `psxw-lift/src/emit.rs:213-234`. Fix: capture the condition before
   writing r31.
-- [ ] **B21. `psxw_lift::bios_calls()` recognises only `addiu t1`.**
+  Done `76e5b25` (agent).
+- [x] **B21. `psxw_lift::bios_calls()` recognises only `addiu t1`.**
   `psxw-lift/src/lib.rs:524-528`; an `ori t1` ChangeThread trampoline
   misses the Asyncify scope (`psxw-build/src/game.rs:527`). Fix: use
   `t1_after_slot` (`lib.rs:51`).
-- [ ] **B22. GTE operands parse shifts tighter than `+`.**
+  Done `5dd692b` (agent).
+- [x] **B22. GTE operands parse shifts tighter than `+`.**
   `psxw-cc/src/gte.rs:236-259`. Fix: C's precedence.
+  Done `e172c80` (agent).
 - [ ] **B23. The EXE header's stack beats `SYSTEM.CNF`'s `STACK=`.**
   `psx-runtime/src/boot.rs:68`. Fix: check psx-spx's `LoadExec` first; if
   it writes `STACK` into the header, `STACK` wins.
@@ -205,10 +211,11 @@ Renderer, SDK, translator, runtime:
   `sdk-psyq/src/libetc.rs:215-217`. Fix: pass what the original leaves
   (I_STAT; DICR's address).
   Done `9b210b6`: a0 = the I_STAT the dispatcher read (handlers, VSync callbacks), DICR's address (DMA callbacks).
-- [ ] **SDK9. Messages go to the host log, not the game's `printf`.**
+- [x] **SDK9. Messages go to the host log, not the game's `printf`.**
   `sdk-psyq/src/libgpu.rs:343, 869`; `libetc.rs:250, 578`;
   `libcd.rs:427, 638`. Fix: print through the game's `printf`, as
   libpress and libspu do.
+  Done `9717931`: each message calls the `printf`/`puts` and format the original's code names, with its arguments (past the fourth on the stack, `crate::guest_call`): ResetGraph's, libgpu's timeout, libetc's unexpected-interrupt, intr-timeout and VSync-timeout messages, libcd's CD timeout and `CD_init`.
 - [ ] **SDK12. `DecDCTPutEnv` and transfers skip DMA bookkeeping.**
   `sdk-psyq/src/libpress.rs:42-46`. Fix: MADR/BCR after a transfer,
   DPCR's DMA1 enable, the table copy's passes.
@@ -227,24 +234,29 @@ Renderer, SDK, translator, runtime:
 - [ ] **REN1. A failed output texture or framebuffer is swallowed.**
   `psx-render-gl/src/lib.rs:620-621`. Fix: fail loudly, as the crate does
   elsewhere.
-- [ ] **TR1. Lifted I/O accesses are plain memory to clang.**
+- [x] **TR1. Lifted I/O accesses are plain memory to clang.**
   `psxw-lift/src/psxw_rt.h:23-33`, `emit.rs:416-437`; the I/O hooks come
   after clang (`psxw-link/src/rewrite.rs:195-230`). Clang may drop,
   merge or reorder register accesses. Fix: volatile for every access the
   lifter can't prove is plain RAM (constant I/O addresses, and every access
   in device-tier SDK objects).
-- [ ] **TR10. o32→C wrappers don't extend narrow parameters.**
+  Partly done `ec4826f` (agent): loads and stores at constant device addresses (1F80_1000–1F80_2FFF in every mirror, expansion regions, unmapped space, FFFE_0130) are volatile and fenced on both sides; unaligned ones are fenced only. *Not done:* accesses in device-tier SDK objects through register pointers in data. Lifting runs once per game, before `psxw-build` decides which chips run on their devices, and that decision uses the lift; the register-pointer table is loaded only in `psxw-build`. Doing it needs those functions re-emitted after the chip decision, or the table passed to the lifter: a design decision (see Findings).
+- [x] **TR10. o32→C wrappers don't extend narrow parameters.**
   `psxw-link/src/marshal.rs:356, 512`. Fix: sign- or zero-extend from
   the known kinds.
-- [ ] **TR11. `return;` in a non-void function isn't lifted.**
+  Done `ad58149` (agent): `i32.extend8_s`/`extend16_s` from the prototype's kind.
+- [x] **TR11. `return;` in a non-void function isn't lifted.**
   `psxw-cc/src/compile.rs:141-145`, `clang.rs:31`. Fix: match both of
   clang's return-type diagnostics and lift as for falling off the end
   (D35).
-- [ ] **TR12. `-funsigned-char` is hard-wired.** `psxw-cc/src/lib.rs:81`.
+  Done `8020910` (agent).
+- [x] **TR12. `-funsigned-char` is hard-wired.** `psxw-cc/src/lib.rs:81`.
   Fix: from the reference cc1 flags, as soft-float is
   (`psxw-census/src/lib.rs:58`).
-- [ ] **TR14. Soft-float detection works from a partial list.**
+  Done `744fac0` (agent): signed unless the reference flags' last `-f[no-]{un,}signed-char` says unsigned; both games' say unsigned, so nothing changes for them. psxw-modkit (its compilers, `cfront.rs`'s char check) and psxw-difftest's compiler still default to unsigned and need `Clang::reference` too (see Findings).
+- [x] **TR14. Soft-float detection works from a partial list.**
   `psxw-cc/src/compile.rs:381-392`. Fix: every wasm float operation.
+  Done `07c30dd` (agent).
 
 ### Exit criteria
 
@@ -507,3 +519,15 @@ locals, or static translation.
 - **OpenBIOS is the reference where psx-spx is silent, and sometimes the
   plan's fix was wrong** (B2, B3): check OpenBIOS's source (pcsx-redux's
   `src/mips/openbios`, the oracle's `8a86b7e`) before each BIOS fix.
+- **TR1's second half needs a decision** (2026-10-30): which SDK objects run
+  on their devices is decided in `psxw-build` after the lift, from the
+  lift's results, so the lifter can't mark their register accesses
+  volatile. Options: re-emit device-tier functions after the chip
+  decision, or give the lifter the register-pointer table and make every
+  access through it volatile in every build. Until then, SDK code that
+  reaches registers through pointers in data is plain memory to clang;
+  it matters only when a chip runs on its device.
+- **TR12 leaves two callers on the old default:** psxw-modkit and
+  psxw-difftest compile with `Clang::new` (unsigned `char`, and
+  `-funsigned-char` stays in the shared UB-containment list). A game whose
+  reference flags leave `char` signed needs both on `Clang::reference`.
