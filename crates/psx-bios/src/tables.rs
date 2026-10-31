@@ -14,12 +14,10 @@
 use psxw_abi::kernel as k;
 
 /// The stand-ins: BIOS ROM space (psx-spx "Kernel Part 1"), clear of the
-/// kernel's element functions ([`crate::kernel::KERNEL_ELEMENTS`]'). The
-/// dispatch table masks an address to its low 22 bits, so a guest call
-/// through one lands in kernel RAM, where nothing is translated, and
-/// reaches the runtime's `untranslated` (which has no arguments to pass
-/// on).
-pub const STAND_INS: u32 = 0xBFC0_A000;
+/// kernel's element functions ([`crate::kernel::KERNEL_ELEMENTS`]'). A
+/// guest call through one reaches its thunk (psxw-abi `BIOS_THUNKS`),
+/// which calls the runtime's `bios` with the stand-in's address.
+pub const STAND_INS: u32 = psxw_abi::BIOS_STAND_INS.start;
 
 /// (table, offset of its stand-ins, entries).
 const TABLES: [(u32, u32, u32); 3] = [(0xA0, 0x000, k::A0_LEN), (0xB0, 0x300, k::B0_LEN), (0xC0, 0x700, k::C0_LEN)];
@@ -157,8 +155,8 @@ mod tests {
         }
         assert_eq!(stand_in_fn(STAND_INS - 4), None);
         assert_eq!(stand_in_fn(STAND_INS + 0x900), None);
-        // Masked into the dispatch table, kernel RAM.
-        assert!(psxw_abi::table_index(stand_in(0xB0, 0xFF)) < psxw_abi::table_index(0x8001_0000));
+        // psxw-abi's range, whose thunks the link puts in the dispatch table.
+        assert_eq!(stand_in(0xC0, 0x7F) + 4, psxw_abi::BIOS_STAND_INS.end);
     }
 
     #[test]

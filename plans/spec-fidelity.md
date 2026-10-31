@@ -375,7 +375,7 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    `GetB0Table`/`GetC0Table` return them; the vectors and kernel variables
    where psx-spx and OpenBIOS put them. A game calling through a table, or
    patching an entry, then works.
-   Done `4ec0ec4` (agent): each entry is a stand-in in ROM space (BFC0A000h + table base + 4·function); the runtime's `bios` export reads the entry, a stand-in runs the Rust BIOS, anything else is called as guest code. Vectors, dispatchers, the garbage area, the exception vector (retail opcodes), RAM-size variables and the BOOT argument laid out; `GetB0Table`/`GetC0Table` return 874h/674h (psx-spx; OpenBIOS returns its own). The layout is in D68. *Left:* a guest calling a stand-in through a function pointer reaches `untranslated(addr)`, which carries no arguments, and traps (needs the linker ABI change, below); the Rust BIOS's own internal calls bypass the tables. SDK adapters' BIOS calls go through them since `782a6c3`; a patched entry fails there, naming it, since adapters call the BIOS synchronously.
+   Done `4ec0ec4` (agent): each entry is a stand-in in ROM space (BFC0A000h + table base + 4·function); the runtime's `bios` export reads the entry, a stand-in runs the Rust BIOS, anything else is called as guest code. Vectors, dispatchers, the garbage area, the exception vector (retail opcodes), RAM-size variables and the BOOT argument laid out; `GetB0Table`/`GetC0Table` return 874h/674h (psx-spx; OpenBIOS returns its own). The layout is in D68. A guest calling a stand-in through a function pointer reaches its thunk since `THUNK` (ABI 15; see Findings); the Rust BIOS's own internal calls bypass the tables. SDK adapters' BIOS calls go through them since `782a6c3`; a patched entry fails there, naming it, since adapters call the BIOS synchronously.
 3. [x] **BIOS8. Event control blocks in kernel RAM**, through the table
    of tables, sized by `SYSTEM.CNF` `EVENT=` (`psx-bios/src/kernel.rs`).
    Done `5e52ad2`: after the TCBs (`psxw_abi::kernel::EVCBS`), through
@@ -735,11 +735,15 @@ locals, or static translation.
   DeliverEvent and SystemError (the runtime's `brk`); syscall 3 doesn't
   switch threads; the boot's disc work (CdlInit, path table, executable)
   is still the runtime's through the host.
-- **`untranslated` carries no arguments** (phase 3 task 2): a guest
-  calling a stand-in or a kernel element's function through a pointer
-  traps. The fix is a linker ABI change (`untranslated` takes a0–a3 and
-  routes stand-ins to `bios::call`); it waits for phases 5 and 6, which
-  change the link's dispatch.
+- **A stand-in called through a pointer** (phase 3 task 2; done
+  2026-10-31, `THUNK`). Phase 6's `map_code` gave ROM space no code, and
+  `untranslated` carries no arguments. Instead of widening `untranslated`,
+  each stand-in has a dispatch-table slot at the top of `SYNTHETIC_CODE`
+  (`BIOS_THUNKS`) whose thunk calls `psx.bios` with the stand-in's
+  address; the runtime runs that function, not the table's entry, so a
+  game's patch can chain to the entry it saved. 576 thunks, about 24 KB
+  per game. A kernel element's function called through a pointer still
+  traps (no code in ROM).
 
 - **Phase 7, step 3's design: decompiled C's counts** (2026-10-31, under
   the /goal; recorded before building, as step 3 asks).

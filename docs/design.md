@@ -2678,10 +2678,13 @@ driver over the CD controller's registers, with the drive's timing; the
 boot leaves it installed (`_96_init`) and libetc's `ResetCallback` takes
 it out (`_96_remove`) before libcd drives the controller. Extends D57 and
 D65 (the thread and exception tables already in RAM); revises D43's card
-driver (the BIOS's cards were its own images, reached directly). Not
-covered: a guest calling a stand-in through a function pointer reaches
-the runtime's `untranslated`, which has no arguments to pass on (a
-linker ABI change).
+driver (the BIOS's cards were its own images, reached directly). A guest
+calling a stand-in through a function pointer (a game that saved an entry
+before patching it) reaches the stand-in's thunk: the link puts one per
+stand-in in the dispatch table (psxw-abi `BIOS_THUNKS`), which calls
+`psx.bios` with the stand-in's address, and the runtime runs that
+function rather than the table's entry. Not covered: the kernel elements'
+functions, called through a pointer, have no code.
 
 *Why:* the HLE BIOS kept this state in the runtime, which only works while
 no game reads or patches the kernel's tables, and its handlers ran on

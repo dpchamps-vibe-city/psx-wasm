@@ -253,6 +253,9 @@ enum Synth {
     /// Runtime adapter `id` in place of the function at guest address
     /// `addr` (D61: the adapter reads its object's relocated operands there).
     AdapterThunk { id: u32, addr: u32 },
+    /// A BIOS stand-in's slot (psxw-abi `BIOS_THUNKS`): `psx.bios` with the
+    /// stand-in's address.
+    BiosThunk(u32),
     /// A call to an address several containers define: whichever one's
     /// code there is resident (D69), else a trap naming what is.
     OverlayStub(u32),
@@ -1021,6 +1024,17 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let proto = ctx.inputs[input].protos.get(&guest_name);
             let callee = ctx.guest[&(input, func)];
             (o32(), marshal::o32_to_c(&sig, proto, callee, sp, win), format!("o32:{guest_name}"))
+        }
+        Synth::BiosThunk(stand_in) => {
+            let mut f = Function::new([]);
+            f.instruction(&I::I32Const(stand_in as i32));
+            f.instruction(&I::I32Const(0));
+            for l in 0..4 {
+                f.instruction(&I::LocalGet(l));
+            }
+            f.instruction(&I::Call(ctx.import(psx::BIOS)));
+            f.instruction(&I::End);
+            (o32(), f, format!("bios@{stand_in:08X}"))
         }
         Synth::AdapterThunk { id, addr } => {
             let mut f = Function::new([]);
@@ -1952,7 +1966,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             let index = f + inp.obj.num_imported_funcs();
             let Some(sym) = inp.obj.func_symbol(index) else { continue };
             if ctx.mod_of[i].is_some() {
-                ensure!(next < psxw_abi::SYNTHETIC_CODE.end, "mods define more functions than synthetic addresses");
+                ensure!(next < psxw_abi::BIOS_THUNKS.start, "mods define more functions than synthetic addresses");
                 ctx.synthetic.insert((i, f), next);
                 next += 4;
                 continue;
@@ -2033,6 +2047,10 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     for (&(i, f), &addr) in &ctx.synthetic.clone() {
         let e = ctx.synth(Synth::ModWrap { input: i, func: f, hook: None });
         elements.insert(table_index(addr), e);
+    }
+    // The BIOS's stand-ins, for calls through pointers to them.
+    for (stand_in, slot) in psxw_abi::BIOS_STAND_INS.zip(psxw_abi::BIOS_THUNKS).step_by(4) {
+        elements.insert(table_index(slot), ctx.synth(Synth::BiosThunk(stand_in)));
     }
     let mod_init = ctx.synth(Synth::ModInit);
     let mod_loaded = ctx.synth(Synth::ModLoaded);

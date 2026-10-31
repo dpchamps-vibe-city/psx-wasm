@@ -59,7 +59,10 @@ pub mod replay;
 ///   but RAM's through `psx.map_code`; psx-wasm's own data and synthetic
 ///   code move to [`OWN_BASE`]; hosts reach guest bytes through
 ///   [`exports::GUEST_PTR`].
-pub const ABI_VERSION: u32 = 14;
+/// - 15: a function pointer to a BIOS stand-in ([`BIOS_STAND_INS`]) reaches
+///   its thunk in [`BIOS_THUNKS`], which calls `psx.bios` with the
+///   stand-in's address.
+pub const ABI_VERSION: u32 = 15;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -227,6 +230,16 @@ pub mod phys {
 /// (mod functions whose address is taken or stored in game data).
 pub const SYNTHETIC_CODE: core::ops::Range<u32> = own(0x0020_0000)..own(0x0040_0000);
 
+/// The BIOS's stand-ins (D68): a BIOS ROM address per A0h, B0h and C0h
+/// function, which kernel RAM's tables hold (psx-bios `tables`). A game
+/// that saves an entry and calls it through a pointer calls one.
+pub const BIOS_STAND_INS: core::ops::Range<u32> = 0xBFC0_A000..0xBFC0_A900;
+
+/// The stand-ins' dispatch-table slots, at the top of [`SYNTHETIC_CODE`]:
+/// a thunk each, which calls `psx.bios` with its stand-in's address.
+pub const BIOS_THUNKS: core::ops::Range<u32> =
+    SYNTHETIC_CODE.end - (BIOS_STAND_INS.end - BIOS_STAND_INS.start)..SYNTHETIC_CODE.end;
+
 /// Dispatch table index for a function's address: RAM's first copy or
 /// [`SYNTHETIC_CODE`] (any guest function pointer: [`map::code_index`]).
 /// Unmapped entries trap with the address.
@@ -368,6 +381,9 @@ pub mod map {
         if super::SYNTHETIC_CODE.contains(&fp) {
             return Some(super::table_index(fp));
         }
+        if super::BIOS_STAND_INS.contains(&fp) && fp & 3 == 0 {
+            return Some(super::table_index(super::BIOS_THUNKS.start + (fp - super::BIOS_STAND_INS.start)));
+        }
         match place(fp)? {
             Place { region: Region::Ram, offset, .. } => Some(offset >> 2),
             _ => None,
@@ -423,6 +439,9 @@ pub mod map {
             assert_eq!(code_index(super::super::SYNTHETIC_CODE.start), Some(0x8_0000));
             assert_eq!(code_index(0x1F80_0000), None);
             assert_eq!(code_index(0x0080_0000), None);
+            // A BIOS stand-in reaches its thunk; the rest of ROM has no code.
+            assert_eq!(code_index(0xBFC0_A004), Some(super::super::table_index(super::super::BIOS_THUNKS.start + 4)));
+            assert_eq!(code_index(0xBFC0_0000), None);
         }
     }
 }
@@ -446,7 +465,10 @@ pub mod psx {
     /// `(addr) -> i64`: control reached a guest address with no
     /// implementation; traps with the address.
     pub const UNTRANSLATED: &str = "untranslated";
-    /// `(table, fn, a0, a1, a2, a3) -> i64`: BIOS vector call.
+    /// `(table, fn, a0, a1, a2, a3) -> i64`: BIOS vector call (A0h, B0h,
+    /// C0h: through the table in kernel RAM), or, with `table` a stand-in's
+    /// address ([`super::BIOS_STAND_INS`]), that stand-in's function: a
+    /// call through a pointer to it.
     pub const BIOS: &str = "bios";
     /// `(a0, a1, a2, a3) -> i32`: `syscall`.
     pub const SYSCALL: &str = "syscall";
