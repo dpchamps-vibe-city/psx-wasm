@@ -834,8 +834,8 @@ has no state assertions and is not save/persistence certification. BTN GPU
 warnings at frames 64/65/83 remain unchanged and unclassified. Original versus
 adaptor conformance passes for libpad (125 steps) and libetc (60 steps).
 
-These artifacts remain at `37e37ed`; the later gets source is only locally gated.
-No fresh full CI, browser or non-empty BIOS oracle result is claimed. ABI-17 CI
+At this checkpoint artifacts were at `37e37ed`; the later gets source was only
+locally gated. No fresh full CI, browser or non-empty BIOS oracle result was claimed. ABI-17 CI
 failures/prerequisite gaps remain recorded above. New SDK continuation work is
 isolated in `5941fc75-3407-47dd-887d-3b601c2ea103`, same SDK lane: ONLY libmc's
 start_com and finish (three direct BIOS calls). That lane has completed as
@@ -845,8 +845,8 @@ including Exit's existing pending-IRQ queue behavior, without changing finish's
 IRQ context. The test now starts outside critical. Parent also routed libgpu's
 ResetGraph GPU_cw through patched dispatch, preserving its original argument and
 existing error handling; GPU reset/GEnv writes wait for that call to return.
-SDK 41/runtime 8 and wasm32 runtime check pass. These later changes are locally
-gated; release/game/replay/conformance artifacts are still at `37e37ed`.
+SDK 41/runtime 8 and wasm32 runtime check pass. These changes were initially
+locally gated; the later combined `d06c81b` gate below refreshes the artifacts.
 
 The four remaining libmcx IRQ-path BIOS bypasses are now converted by the
 parent. Read-only scout `a122da85-3103-4a9a-9839-7e88fdaf259a` identified the
@@ -871,8 +871,41 @@ slot/card tests now traverse the queued handler/DSR path; one grouped test
 checks reserved/retry/timeout order, patched services without native duplicate
 execution, reentry, retry cancellation and RFE skipping. The existing memcard
 conformance cases exercise this handler on every transfer and now name it in
-their coverage. Fresh builds, memcard conformance and replay gates are pending;
-previous `37e37ed` artifacts are not evidence for this change.
+their coverage. The conversion is committed as `d06c81b`.
+
+### SDK Flow integration gate at `d06c81b` (ABI 18)
+
+Release CLI/runtime and both game builds pass with all six chip groups native.
+BTN is 2,568,958 bytes; BOF4 is 10,182,849 bytes. BTN's static mcxresi+80h handler
+is actually bound as an adapter in `tiers.json` and the build adapter list;
+BOF4 does not link libmcx. Coverage totals and unsupported entries are unchanged
+from the prior gate; no ABI or supported-service inflation is claimed.
+
+Conformance passes: memcard native versus device (9 case runs: start and command
+at four seeds each, plus a full session) and libgpu original versus adaptor
+(134 steps). Normal `game.wasm` remains native; comparison artifacts are separate.
+All four unchanged replays pass again: BTN title 6000 frames/all three expected
+states and card-load 3000, BOF4 title-to-field 26000/all five expected states and
+the supplied crash replay 694. Boot text matches, EDC errors are zero; BTN's
+64/65/83 warnings remain unchanged and unclassified. Card-load and the supplied
+crash replay have no state assertions; these are not persistence certification.
+Only disposable run storage was used; previous disposable files were preserved
+in the session scratchpad. Source tests/build/conform/replay evidence is in
+`mcx-irq-integrated-tests.log` and `mcx-flow-*` scratch reports.
+
+Independent read-only review `e9e68d0c-bafa-4e72-8dea-50b9a9ba34bf` is complete;
+parent read its full report and accepted the conversion with no introduced
+correctness defect found. Its required real-binding gate is satisfied by the
+fresh build reports and memcard conformance above. Parent rejected its claimed
+inherited retry-exhaustion status mismatch: mcxresi's branch delay slot at CCh
+loads 11h before the status store, matching the adapter (not retry count 3).
+The focused RFE test uses a test double in patched dequeue; no new real-wasm
+MCX/DSR RFE test is claimed. Existing nested-RFE machinery tests cover the unwind
+mechanism, and no transport or timing change was requested or made.
+No new full CI, browser or non-empty oracle result is claimed. The documented
+ABI-17 CI failures and missing prerequisites are unresolved. General non-local
+return, executable/exception context, fonts/identity policy and other partial
+BIOS services remain open; this is not full-BIOS completion.
 
 ## Progress log
 
