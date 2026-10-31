@@ -382,15 +382,6 @@ How each tier is produced:
   - a jump through a register holding the entry `ra`: `r31` starts at 0,
     standing for the caller's return address, so a jump to 0 returns.
 
-  A `jr ra` is a wasm return, and a tail callee returns to the caller too,
-  so either is right only while `ra` is the caller's return address. The
-  lift tracks `ra` through the frame and fails where it isn't (`la ra, L;
-  j f`, a saved `ra` written over, a longjmp's `lw ra` from its buffer).
-  A `jr ra` that some paths reach with `ra` restored and others without
-  (one that leaves early on a switched stack) dispatches on `ra` as an
-  inlined callee's does: it returns when `ra` is the caller's, and traps
-  otherwise.
-
   A load whose result nothing reads is kept, as a volatile read: from an
   I/O register it pops a FIFO. An access at a constant address that isn't
   RAM or the scratchpad is volatile and fenced, so clang neither drops,

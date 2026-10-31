@@ -56,9 +56,6 @@ pub struct Emitter<'a> {
     chain: &'a BTreeSet<String>,
     /// This function is one of them: its entry v0 is `psxw_chain_get()`.
     reads_chain: bool,
-    /// `jr ra` (branch pc) where ra may not be the caller's return address
-    /// on every path: it dispatches on ra as an inlined `jr ra` does.
-    guarded: BTreeSet<u32>,
     preds: BTreeMap<Node, Vec<Node>>,
     /// Each basic block's first node and its instructions ([`Graph::blocks`]).
     blocks: BTreeMap<Node, u32>,
@@ -87,7 +84,6 @@ impl<'a> Emitter<'a> {
             x: Exceptions::default(),
             chain: &NO_CHAIN,
             reads_chain: false,
-            guarded: BTreeSet::new(),
             preds,
             blocks: g.blocks(),
             skip: BTreeSet::new(),
@@ -105,11 +101,6 @@ impl<'a> Emitter<'a> {
     pub fn chain(mut self, chain: &'a BTreeSet<String>, reads: bool) -> Self {
         self.chain = chain;
         self.reads_chain = reads;
-        self
-    }
-
-    pub fn guarded(mut self, returns: BTreeSet<u32>) -> Self {
-        self.guarded = returns;
         self
     }
 
@@ -305,11 +296,6 @@ impl<'a> Emitter<'a> {
                     "if ({c}) {{ uint64_t v_ = {call}; r2 = (uint32_t)v_; r3 = (uint32_t)(v_ >> 32); }} /* {b:08X}: {dis} */"
                 ));
                 self.fall(b, &next)
-            }
-            Transfer::Return if self.guarded.contains(&b) => {
-                let back = self.back(b);
-                self.line(&back);
-                None
             }
             Transfer::Return => {
                 self.line("return ((uint64_t)r3 << 32) | r2;");
