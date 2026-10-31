@@ -37,7 +37,7 @@ manifest, without changes to the toolchain's code.
 | CD-ROM | **Native, per chip** (D59, D62). libcd's drive layer (`CD_init`, `CD_cw`, `CD_sync`, `CD_ready`, `CD_getsector`…) and the streaming ring's interrupt are adapters (btn and bof4) over the CD controller's core (`psx-devices::cdc`: the user's disc image, ISO9660, the drive's timing, XA into the SPU's CD input), driven without its register protocol; libcd's public layer, libds and the rest of streaming are original code over them, their state where the original keeps it. As the fallback, libcd runs as original code over the same controller's registers (D58). |
 | MDEC | **Native, per chip** (D59, D64). libpress's adapters (bof4, the game that links it) give the MDEC's decode core (`psx-devices::mdec`) the run-length codes `DecDCTin` names and put its pixels into `DecDCTout`'s buffer, without its register protocol. DMA0 and DMA1 complete on the shared DMA controller, so their callbacks come through libetc's DMA handler, at the guest's next safepoint as on the device. As the fallback, libpress is original code over the MDEC's registers, DMA0 in and DMA1 out (D58). |
 | Pad | **Native** (D59, D60). libpad's adapters run its direct-connection engine (btn and bof4): at each vblank interrupt, one exchange per port with a digital-pad model fed by the host's buttons, the detection steps and the buffers as libpad's own state machine makes them, and the time its busy-waits take. As the fallback, libpad is original code over SIO0 (`psx-devices::sio`, D40). |
-| Memory card | **Native, per chip** (D59, D65), for libmcx, the PocketStation library (btn): its adapters run its card-port driver without SIO0's registers, a slot's card being the BIOS's image answering as a standard card does (`psx-devices::memcard`), libmcx's state where libmcx keeps it. As the fallback, libmcx is original code over SIO0, whose cards are the same images. The cards themselves are the BIOS's (D43). |
+| Memory card | **Native, per chip** (D59, D65), for libmcx, the PocketStation library (btn): its adapters run its card-port driver without SIO0's registers, a slot's card answering as a standard card does (`psx-devices::memcard`), libmcx's state where libmcx keeps it. As the fallback, libmcx is original code over SIO0. The cards are SIO0's, in its slots (D68): the BIOS's driver, libmcx's adapters and SIO0's device reach them through the card's protocol. |
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
 | BIOS/kernel | A Rust implementation of the A0/B0/C0 services the SDK calls, including threads (D57) and the memory card functions (D43). |
 
@@ -1658,6 +1658,12 @@ would reimplement it; the original runs unchanged over `psx-bios::card`.
 - **The card image is raw 128 KiB** (`.mcr`) in host storage.
 - **Slot 1 always has a card** (formatted if no image exists). Slot 2 has
   one only if its image exists, matching the oracle's default.
+- **The cards are SIO0's** (revised by D68, spec fidelity BIOS6): the
+  images sit in the port's slots, and the BIOS's driver moves each sector
+  through the card's protocol (`memcard::Responder`), one operation per
+  vblank in the kernel's pad and card handler once `StartCARD2` ran. The
+  `bu` file functions read the directory from the image and move their
+  frames through the protocol.
 - **libcard's functions that patch Sony BIOS code in kernel RAM are
   adapters with nothing to patch** (`_patch_card`, `_patch_card2`,
   `_patch_card_info`, `_copy_memcard_patch`, `_ExitCard`). Its wrappers
@@ -2443,7 +2449,8 @@ and nothing after it (McxErrInvalid), an empty slot nothing (McxErrNoCard).
   adapter calls where `_mcxStepSio` does), `McxSync` and `McxStopCom`
   stay original. The six old libmcx adapters answered at once, and
   `McxSync`'s command number and zeroed out-parameters were wrong.
-- **The card is the BIOS's image on both paths** (D43's cards):
+- **The card is the port's on both paths** (D43's cards, in SIO0's slots
+  since D68):
   `psx_devices::memcard::Responder`, a standard card as Beetle's is (81h
   and its FLAG, `R` and `W` frame transfers, every other command refused),
   clocked bit by bit by SIO0's device for libmcx on its device, a byte at

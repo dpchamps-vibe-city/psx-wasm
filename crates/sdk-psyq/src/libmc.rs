@@ -267,7 +267,7 @@ fn send(m: &mut M, b: u8) {
         return;
     };
     w.rx = w.card.next().unwrap_or(0xFF);
-    if w.card.byte(m.kernel.cards.slots[slot].as_mut(), b).is_some() {
+    if w.card.byte(psx_bios::card::slot_card(&mut m.io, slot), b).is_some() {
         let at = now + byte_time(w) + psx_devices::sio::CARD_ACK_DELAY as u64;
         let g = w.generation;
         m.clock.schedule(at, Event::Sdk(EV_ACK, g));

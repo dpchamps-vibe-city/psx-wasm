@@ -187,8 +187,7 @@ impl<S: Sdk> Machine<S> {
             self.spu_run();
         }
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
-        let cards = &mut self.kernel.cards.slots;
-        io.sio0.update(sio, &mut io.irq, cards);
+        io.sio0.update(sio, &mut io.irq);
         let v = if SPU.contains(&addr) {
             let off = addr - SPU.start;
             let half = |o: u32| io.spu.spu.read(o) as u32;
@@ -202,7 +201,7 @@ impl<S: Sdk> Machine<S> {
             // Wider reads (the data FIFO's halfwords) take bytes in turn.
             (0..size.min(4)).fold(0, |v, i| v | (io.cdc.read(addr) as u32) << (8 * i))
         } else if Sio0::handles(addr) {
-            io.sio0.read(addr, sio, &mut io.irq, cards)
+            io.sio0.read(addr, sio, &mut io.irq)
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
             let now = if n == 2 { sio } else { now };
@@ -265,8 +264,7 @@ impl<S: Sdk> Machine<S> {
         }
         self.sio0_cards(addr, v);
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
-        let cards = &mut self.kernel.cards.slots;
-        io.sio0.update(sio, &mut io.irq, cards);
+        io.sio0.update(sio, &mut io.irq);
         let v = v & mask(size);
         if SPU.contains(&addr) {
             let off = addr - SPU.start;
@@ -305,7 +303,7 @@ impl<S: Sdk> Machine<S> {
             io.cdc.write(addr, v as u8, now);
             self.cdc_sync();
         } else if Sio0::handles(addr) {
-            io.sio0.write(addr, size, v, sio, &mut io.irq, cards);
+            io.sio0.write(addr, size, v, sio, &mut io.irq);
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
             let now = if n == 2 { sio } else { now };

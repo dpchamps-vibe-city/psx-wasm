@@ -398,7 +398,7 @@ impl<S: Sdk> Machine<S> {
                 // chains when the interrupt is taken.
                 self.raise_irq(psx_devices::irq::VBLANK);
                 self.gpu_vblank();
-                self.card_vblank();
+                self.save_cards();
                 self.audio_vblank();
                 self.host.vblank(self.vblanks);
                 self.host.wait_vblank(self.vblanks);

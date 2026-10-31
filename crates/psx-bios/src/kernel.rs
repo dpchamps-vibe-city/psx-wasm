@@ -340,6 +340,9 @@ impl<S: Sdk> Machine<S> {
                 if self.kernel.clear_pad != 0 {
                     ack(self, vblank);
                 }
+                if self.kernel.card_started {
+                    self.card_step();
+                }
                 false
             }
             _ => false,
