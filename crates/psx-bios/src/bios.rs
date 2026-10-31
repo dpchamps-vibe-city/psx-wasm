@@ -337,28 +337,29 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xB0, 0x32) => {
+            // OpenBIOS `psxopen`: a free descriptor first, then the device.
             let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
+            let Some(fd) = (0..16).find(|f| !m.kernel.files.contains_key(f) && !m.kernel.cards.files.contains_key(f)) else {
+                m.kernel.cards.errno = crate::card::E_NO_FDS;
+                return r(u32::MAX);
+            };
             if crate::card::parse_path(&path).is_some() {
-                let fd = (0..16).find(|f| !m.kernel.files.contains_key(f) && !m.kernel.cards.files.contains_key(f));
-                return match fd {
-                    Some(fd) => r(m.card_open(&path, a[1], fd)),
-                    None => {
-                        m.kernel.cards.errno = crate::card::E_NO_FDS;
-                        r(u32::MAX)
-                    }
-                };
+                return r(m.card_open(&path, a[1], fd));
             }
             if !path.to_ascii_lowercase().starts_with("cdrom:") {
+                m.kernel.cards.errno = crate::card::E_NO_DEVICE;
                 return r(u32::MAX);
             }
             let mut disc = HostDisc(&mut *m.host);
             match cd::find(&mut disc, &path) {
                 Some(e) if !e.dir => {
-                    let fd = (0..16).find(|f| !m.kernel.files.contains_key(f) && !m.kernel.cards.files.contains_key(f)).unwrap_or(16);
                     m.kernel.files.insert(fd, File { lba: e.lba, size: e.size, pos: 0 });
                     r(fd)
                 }
-                _ => r(u32::MAX),
+                _ => {
+                    m.kernel.cards.errno = crate::card::E_NOT_FOUND;
+                    r(u32::MAX)
+                }
             }
         }
         (0xB0, 0x33) => {

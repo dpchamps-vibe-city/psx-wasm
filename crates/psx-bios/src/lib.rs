@@ -193,6 +193,17 @@ mod tests {
     }
 
     #[test]
+    fn open_fails_without_a_descriptor() {
+        let mut m = machine();
+        for fd in 0..16 {
+            m.kernel.files.insert(fd, kernel::File { lba: 0, size: 0, pos: 0 });
+        }
+        m.mem.write(0x8001_0000, b"cdrom:\\A.BIN;1\0");
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, 1, 0, 0])), u32::MAX);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x54, [0; 4])), card::E_NO_FDS);
+    }
+
+    #[test]
     fn reset_entry_int_drops_the_hook() {
         let mut m = machine();
         ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));
