@@ -149,6 +149,9 @@ pub struct Pad {
     pub ports: [Port; 2],
     /// `PadInitDirect` has run: the engine has its records.
     pub direct: bool,
+    /// `PadStartCom` has put the element in the kernel's chain;
+    /// `PadStopCom` takes it out.
+    pub com: bool,
     /// Each port's receive buffer, from the ID on. `PadInitDirect`
     /// leaves them, as the original's live outside the records.
     pub rx: [[u8; RX]; 2],
@@ -162,7 +165,7 @@ pub struct Pad {
 
 impl Default for Pad {
     fn default() -> Self {
-        Pad { ports: Default::default(), direct: false, rx: [[0; RX]; 2], pending: [false; 2], latched: [None; 2] }
+        Pad { ports: Default::default(), direct: false, com: false, rx: [[0; RX]; 2], pending: [false; 2], latched: [None; 2] }
     }
 }
 
@@ -174,15 +177,10 @@ fn index(port: u32) -> usize {
 
 // --- The vblank engine -----------------------------------------------------
 
-/// Whether libpad's element is in the kernel's chain.
-fn installed(m: &M) -> bool {
-    m.kernel.int_handlers.get(&PRIORITY).is_some_and(|c| c.contains(&ELEMENT))
-}
-
 /// At each vblank, before the interrupt: the pads latch their buttons,
 /// as SIO0's do (`psx_bios::io`), once there are records to poll for.
 pub fn on_vblank(m: &mut M) {
-    if !m.sdk.pad.direct || !installed(m) {
+    if !m.sdk.pad.direct || !m.sdk.pad.com {
         return;
     }
     for p in 0..2 {
@@ -591,7 +589,8 @@ fn pad_start_com(m: &mut M, _a: [u32; 4]) -> Result {
     let mask = reg(m, I_MASK, 4)?;
     set_reg(m, I_MASK, 4, mask | 1)?;
     bios(m, 0xC0, 0x0A, [3, 0, 0, 0])?;
-    m.crit = false;
+    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
+    m.sdk.pad.com = true;
     for p in &mut m.sdk.pad.ports {
         clear_info(p);
     }
@@ -604,7 +603,8 @@ fn pad_start_com(m: &mut M, _a: [u32; 4]) -> Result {
 fn pad_stop_com(m: &mut M, _a: [u32; 4]) -> Result {
     bios(m, 0xC0, 0x0A, [3, 1, 0, 0])?;
     bios(m, 0xC0, 0x03, [PRIORITY, ELEMENT, 0, 0])?;
-    m.crit = false;
+    m.sdk.pad.com = false;
+    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
     ret(0)
 }
 
@@ -748,7 +748,7 @@ mod tests {
         let mut m = started();
         vblanks(&mut m, 3);
         assert_eq!(call(&mut m, pad_stop_com, [0; 4]), 0);
-        assert!(!installed(&m));
+        assert!(!m.sdk.pad.com);
         m.mem.write(B0, &[9; 4]);
         vblanks(&mut m, 2);
         assert_eq!(buf(&m, B0), [9; 4], "nothing polls");
