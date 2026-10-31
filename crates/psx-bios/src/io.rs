@@ -863,12 +863,13 @@ mod tests {
         m.enq_int_rp(2, 0x8000_1000);
         m.raise_irq(psx_devices::irq::VBLANK);
         assert_eq!(m.io_read(0x1F80_1070, 4).unwrap(), 1);
-        // The kernel's root counter and vblank elements (priority 1), the
-        // element (2), the kernel's IRQ events (3).
+        // The kernel's syscall element (priority 0), its root counter and
+        // vblank elements (1), the element (2), the kernel's IRQ events
+        // (3).
         let steps: Vec<IrqStep> = m.irq_calls.drain(..).collect();
         let chain = IrqStep::Chain(GuestCall { addr: 0x8000_2000, args: [0; 4] }, Some(0x8000_3000));
         use IrqStep::Kernel;
-        assert_eq!(steps, [Kernel(3), Kernel(2), Kernel(1), Kernel(0), chain, Kernel(4), IrqStep::Exit]);
+        assert_eq!(steps, [Kernel(6), Kernel(3), Kernel(2), Kernel(1), Kernel(0), chain, Kernel(4), IrqStep::Exit]);
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
         // The SPU: main volume left reads back; the CD controller's status

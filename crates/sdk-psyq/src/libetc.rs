@@ -445,8 +445,9 @@ fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     set_reg(m, DICR, 4, 0)?;
     set_line(m, l, 3, l.dma_handler)?;
     m.mem.w32(l.driver + driver::DMA, l.dma_setter);
-    // _96_remove (the BIOS's CD handlers; this BIOS has none), then
-    // ExitCriticalSection.
+    // _96_remove (the BIOS's CD-ROM driver out, which leaves a critical
+    // section entered), then ExitCriticalSection.
+    bios(m, 0xA0, 0x72, [0; 4])?;
     psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
     ret(l.context)
 }

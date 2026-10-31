@@ -25,20 +25,22 @@
 //!   BIOS paces it.
 //! - A card is "new" from insertion until a sector write; while it is,
 //!   I/O fails with 2000h unless `_new_card` was called first.
-//! - File functions on `buXY:` read the directory from the card's image,
-//!   and move their frames through the protocol, after the
-//!   check the BIOS makes first (`card_check`: a synchronous
-//!   read of frame 0, whose event is delivered during the call). Reads
-//!   and writes are in 128-byte frames. A file opened with mode bit 15 is
-//!   asynchronous: `read`/`write` return 0 once the request is accepted
-//!   (libmcrd retries until they do), and it completes one frame per
-//!   vblank, delivering event class `fd` and F4000001h with spec 04h at
-//!   the end.
+//! - The `bu` device's functions (A(65h..6Eh), reached through its DCB,
+//!   `crate::files`) read the directory from the card's image, and move
+//!   their frames through the protocol, after the check the BIOS makes
+//!   first (`card_check`: a synchronous read of frame 0, whose event is
+//!   delivered during the call). The FCB holds the port, the file's first
+//!   block (its LBA) and size. Reads and writes are in 128-byte frames. A
+//!   file opened with mode bit 15 is asynchronous: `read`/`write` return 0
+//!   once the request is accepted (libmcrd retries until they do), and it
+//!   completes one frame per vblank, delivering event class `fd` and
+//!   F4000001h with spec 04h at the end.
 //! - Changed images are written back to host storage at vblank.
 
+use crate::files::{ASYNC, CREATE, E_ALIGN, E_EXISTS, E_FULL, E_GENERAL, E_NOT_FOUND, fcb};
 use crate::machine::{Machine, Sdk};
-use psx_devices::memcard::{self, Card, Responder};
-use std::collections::{BTreeMap, VecDeque};
+use psx_devices::memcard::{self, Card, FileInfo, Responder};
+use std::collections::VecDeque;
 
 pub const EV_LOW: u32 = 0xF000_0011;
 pub const EV_HIGH: u32 = 0xF400_0001;
@@ -55,16 +57,6 @@ pub const BUSY_INFO: u32 = 0x08;
 pub const FAIL_TIMEOUT: u32 = 0x11;
 pub const FAIL_GENERAL: u32 = 0x21;
 
-/// File error numbers (`_get_errno`).
-pub const E_NOT_FOUND: u32 = 0x02;
-pub const E_BAD_FD: u32 = 0x09;
-pub const E_GENERAL: u32 = 0x10;
-pub const E_EXISTS: u32 = 0x11;
-pub const E_NO_DEVICE: u32 = 0x13;
-pub const E_ALIGN: u32 = 0x16;
-pub const E_NO_FDS: u32 = 0x18;
-pub const E_FULL: u32 = 0x1C;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Op {
     Read { frame: u32, dst: u32 },
@@ -78,15 +70,6 @@ enum Op {
     FileDone { fd: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CardFile {
-    pub slot: usize,
-    pub name: String,
-    pub size: u32,
-    pub pos: u32,
-    pub asynchronous: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Cards {
     loaded: bool,
@@ -95,26 +78,10 @@ pub struct Cards {
     ignore_new: [bool; 2],
     pub status: [u32; 2],
     pending: VecDeque<(usize, Op)>,
-    pub files: BTreeMap<u32, CardFile>,
-    pub errno: u32,
     pub auto_format: bool,
     pub find_mode: u32,
     /// firstfile/nextfile: (slot, pattern, next directory index).
     search: Option<(usize, String, usize)>,
-}
-
-/// `buXY:NAME` → (slot, name).
-pub fn parse_path(path: &str) -> Option<(usize, String)> {
-    let lower = path.to_ascii_lowercase();
-    let rest = lower.strip_prefix("bu")?;
-    let (dev, _) = rest.split_once(':')?;
-    let slot = match dev.as_bytes().first()? {
-        b'0' => 0,
-        b'1' => 1,
-        _ => return None,
-    };
-    let name = &path[path.find(':')? + 1..];
-    Some((slot, name.to_string()))
 }
 
 /// Port (00h, 10h, …) → slot.
@@ -387,49 +354,68 @@ impl<S: Sdk> Machine<S> {
         self.kernel.cards.status[slot]
     }
 
-    fn card_fail(&mut self, errno: u32) -> u32 {
-        self.kernel.cards.errno = errno;
+    /// The FCB's error, and -1.
+    fn bu_fail(&mut self, f: u32, errno: u32) -> u32 {
+        self.mem.w32(f + fcb::ERRNO, errno);
         u32::MAX
     }
 
-    /// `open("buXY:NAME", mode)`.
-    pub fn card_open(&mut self, path: &str, mode: u32, fd: u32) -> u32 {
+    /// The FCB's slot (its port, 00h or 10h), and the name at `name`.
+    fn bu_args(&mut self, f: u32, name: u32) -> (usize, String) {
+        let slot = slot_of(self.mem.r32(f + fcb::DEVICE_ID));
+        (slot, String::from_utf8_lossy(&self.mem.cstr(name, 64)).into_owned())
+    }
+
+    /// The file whose first block the FCB holds.
+    fn bu_file(&mut self, f: u32) -> Option<(usize, FileInfo)> {
+        let slot = slot_of(self.mem.r32(f + fcb::DEVICE_ID));
+        let first = self.mem.r32(f + fcb::LBA) as usize;
+        let card = slot_card(&mut self.io, slot)?;
+        card.files().into_iter().find(|i| !i.deleted && i.blocks.first() == Some(&first)).map(|i| (slot, i))
+    }
+
+    /// A(65h) `dev_card_open(fcb, name, mode)`: an existing file, or (mode
+    /// bit 9) a new one of mode's bits 16-31 blocks; 0, or -1.
+    pub fn dev_bu_open(&mut self, f: u32, name: u32, mode: u32) -> u32 {
         self.cards_ready();
-        let Some((slot, name)) = parse_path(path) else { return self.card_fail(E_NO_DEVICE) };
+        let (slot, name) = self.bu_args(f, name);
         // An asynchronous open skips the check.
-        if mode & 0x8000 == 0 && !self.card_check(slot) {
-            return self.card_fail(E_GENERAL);
+        if mode & ASYNC == 0 && !self.card_check(slot) {
+            return self.bu_fail(f, E_GENERAL);
         }
-        let Some(card) = slot_card(&mut self.io, slot) else { return self.card_fail(E_GENERAL) };
-        let file = if mode & 0x200 != 0 {
+        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
+        let file = if mode & CREATE != 0 {
             let blocks = (mode >> 16) as usize;
             if card.find(&name).is_some() {
-                return self.card_fail(E_EXISTS);
+                return self.bu_fail(f, E_EXISTS);
             }
             match card.create(&name, blocks.max(1)) {
-                Some(f) => f,
-                None => return self.card_fail(E_FULL),
+                Some(i) => i,
+                None => return self.bu_fail(f, E_FULL),
             }
         } else {
             match card.find(&name) {
-                Some(f) => f,
-                None => return self.card_fail(E_NOT_FOUND),
+                Some(i) => i,
+                None => return self.bu_fail(f, E_NOT_FOUND),
             }
         };
-        self.kernel.cards.files.insert(fd, CardFile { slot, name: file.name, size: file.size, pos: 0, asynchronous: mode & 0x8000 != 0 });
-        fd
+        for (o, v) in [(fcb::LBA, file.blocks[0] as u32), (fcb::LENGTH, file.size), (fcb::ERRNO, 0)] {
+            self.mem.w32(f + o, v);
+        }
+        0
     }
 
-    /// `read`/`write` on a card file; `to_card` writes.
-    pub fn card_io(&mut self, fd: u32, buf: u32, len: u32, to_card: bool) -> u32 {
-        let Some(f) = self.kernel.cards.files.get(&fd).cloned() else { return self.card_fail(E_BAD_FD) };
-        if len % memcard::FRAME as u32 != 0 || f.pos % memcard::FRAME as u32 != 0 || f.pos >= f.size {
-            return self.card_fail(E_ALIGN);
+    /// A(66h) `dev_card_read`, A(67h) `dev_card_write` (`to_card`): whole
+    /// frames from a frame boundary inside the file.
+    pub fn dev_bu_io(&mut self, f: u32, buf: u32, len: u32, to_card: bool) -> u32 {
+        let (pos, size) = (self.mem.r32(f + fcb::OFFSET), self.mem.r32(f + fcb::LENGTH));
+        if len % memcard::FRAME as u32 != 0 || pos % memcard::FRAME as u32 != 0 || pos >= size {
+            return self.bu_fail(f, E_ALIGN);
         }
-        let n = len.min(f.size - f.pos);
-        let Some(card) = slot_card(&mut self.io, f.slot) else { return self.card_fail(E_GENERAL) };
-        let Some(info) = card.find(&f.name) else { return self.card_fail(E_NOT_FOUND) };
-        let frames: Vec<u32> = (0..n).step_by(memcard::FRAME).map_while(|o| card.file_frame(&info, f.pos + o)).collect();
+        let n = len.min(size - pos);
+        let Some((slot, info)) = self.bu_file(f) else { return self.bu_fail(f, E_GENERAL) };
+        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
+        let frames: Vec<u32> = (0..n).step_by(memcard::FRAME).map_while(|o| card.file_frame(&info, pos + o)).collect();
         let mut off = 0;
         // Each frame through the port, the card accepted by the open's
         // check.
@@ -437,9 +423,9 @@ impl<S: Sdk> Machine<S> {
             let x = if to_card {
                 let mut data = vec![0u8; memcard::FRAME];
                 self.mem.read(buf + off, &mut data);
-                self.xfer_write(f.slot, frame, &data, true)
+                self.xfer_write(slot, frame, &data, true)
             } else {
-                let x = self.xfer_read(f.slot, frame, true);
+                let x = self.xfer_read(slot, frame, true);
                 if let Xfer::Done(data) = &x {
                     self.mem.write(buf + off, data);
                 }
@@ -450,16 +436,16 @@ impl<S: Sdk> Machine<S> {
             }
             off += memcard::FRAME as u32;
         }
-        let Some(f) = self.kernel.cards.files.get_mut(&fd) else { return off };
-        f.pos += off;
+        self.mem.w32(f + fcb::OFFSET, pos + off);
+        self.mem.w32(f + fcb::ERRNO, 0);
         let frames = off / memcard::FRAME as u32;
-        if !f.asynchronous {
+        if self.mem.r32(f + fcb::FLAGS) & ASYNC == 0 {
             for _ in 0..frames {
                 self.card_event(SPEC_DONE, false);
             }
             return off;
         }
-        let slot = f.slot;
+        let fd = self.mem.r32(f + fcb::FD);
         for _ in 1..frames.max(1) {
             self.kernel.cards.pending.push_back((slot, Op::FileFrame));
         }
@@ -467,11 +453,12 @@ impl<S: Sdk> Machine<S> {
         0
     }
 
-    /// `firstfile("buXY:PATTERN", direntry)` and `nextfile(direntry)`.
-    pub fn card_find(&mut self, pattern: Option<&str>, dir: u32) -> u32 {
+    /// A(69h) `dev_card_firstfile(fcb, pattern, direntry)` and A(6Ah)
+    /// `dev_card_nextfile(fcb, direntry)` (`pattern` 0).
+    pub fn dev_bu_find(&mut self, f: u32, pattern: u32, dir: u32) -> u32 {
         self.cards_ready();
-        if let Some(p) = pattern {
-            let Some((slot, name)) = parse_path(p) else { return 0 };
+        if pattern != 0 {
+            let (slot, name) = self.bu_args(f, pattern);
             self.kernel.cards.search = Some((slot, name, 0));
             if !self.card_check(slot) {
                 return 0;
@@ -481,67 +468,62 @@ impl<S: Sdk> Machine<S> {
         let deleted = self.kernel.cards.find_mode == 1;
         let Some(card) = slot_card(&mut self.io, slot) else { return 0 };
         let files = card.files();
-        let hit = files.iter().enumerate().skip(from).find(|(_, f)| f.deleted == deleted && memcard::name_matches(&pat, &f.name));
-        let Some((i, f)) = hit else {
+        let hit = files.iter().enumerate().skip(from).find(|(_, i)| i.deleted == deleted && memcard::name_matches(&pat, &i.name));
+        let Some((i, file)) = hit else {
             self.kernel.cards.search = Some((slot, pat, files.len()));
             return 0;
         };
         let mut e = vec![0u8; 0x28];
-        let n = f.name.as_bytes();
+        let n = file.name.as_bytes();
         e[..n.len().min(0x13)].copy_from_slice(&n[..n.len().min(0x13)]);
-        e[0x14..0x18].copy_from_slice(&(if f.deleted { 0xA0u32 } else { 0x50 }).to_le_bytes());
-        e[0x18..0x1C].copy_from_slice(&f.size.to_le_bytes());
-        e[0x20..0x24].copy_from_slice(&((f.blocks[0] * 64) as u32).to_le_bytes());
+        e[0x14..0x18].copy_from_slice(&(if file.deleted { 0xA0u32 } else { 0x50 }).to_le_bytes());
+        e[0x18..0x1C].copy_from_slice(&file.size.to_le_bytes());
+        e[0x20..0x24].copy_from_slice(&((file.blocks[0] * 64) as u32).to_le_bytes());
         self.mem.write(dir, &e);
         self.kernel.cards.search = Some((slot, pat, i + 1));
         dir
     }
 
-    /// erase, undelete, rename, format on `bu`; 1 ok, 0 failed.
-    pub fn card_erase(&mut self, path: &str, undelete: bool) -> u32 {
+    /// A(6Bh) `dev_card_erase`, A(6Ch) `dev_card_undelete` (fcb, name): 0,
+    /// or -1.
+    pub fn dev_bu_erase(&mut self, f: u32, name: u32, undelete: bool) -> u32 {
         self.cards_ready();
-        let Some((slot, name)) = parse_path(path) else { return 0 };
+        let (slot, name) = self.bu_args(f, name);
         if !self.card_check(slot) {
-            self.kernel.cards.errno = E_GENERAL;
-            return 0;
+            return self.bu_fail(f, E_GENERAL);
         }
-        let Some(card) = slot_card(&mut self.io, slot) else { return 0 };
+        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
         let ok = if undelete { card.undelete(&name) } else { card.delete(&name) };
-        if !ok {
-            self.kernel.cards.errno = E_NOT_FOUND;
-        }
-        ok as u32
+        if ok { 0 } else { self.bu_fail(f, E_NOT_FOUND) }
     }
 
-    pub fn card_rename(&mut self, from: &str, to: &str) -> u32 {
+    /// A(6Eh) `dev_card_rename(fcb1, name1, fcb2, name2)`: 0, or -1.
+    pub fn dev_bu_rename(&mut self, f: u32, from: u32, to: u32) -> u32 {
         self.cards_ready();
-        let (Some((slot, a)), Some((slot2, b))) = (parse_path(from), parse_path(to)) else { return 0 };
-        if slot != slot2 {
-            self.kernel.cards.errno = 0x12;
-            return 0;
-        }
+        let (slot, a) = self.bu_args(f, from);
+        let (_, b) = self.bu_args(f, to);
         if !self.card_check(slot) {
-            self.kernel.cards.errno = E_GENERAL;
-            return 0;
+            return self.bu_fail(f, E_GENERAL);
         }
-        let Some(card) = slot_card(&mut self.io, slot) else { return 0 };
-        card.rename(&a, &b) as u32
+        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
+        if card.rename(&a, &b) { 0 } else { self.bu_fail(f, E_NOT_FOUND) }
     }
 
-    pub fn card_format(&mut self, path: &str) -> u32 {
+    /// A(6Dh) `dev_card_format(fcb)`: 0, or -1 without a card. Its writes
+    /// accept a new card.
+    pub fn dev_bu_format(&mut self, f: u32) -> u32 {
         self.cards_ready();
-        let Some((slot, _)) = parse_path(path) else { return 0 };
-        // Its writes accept a new card.
+        let slot = slot_of(self.mem.r32(f + fcb::DEVICE_ID));
         match slot_card(&mut self.io, slot) {
             Some(c) => {
                 c.format();
                 c.new_card = false;
                 self.card_event(SPEC_DONE, false);
-                1
+                0
             }
             None => {
                 self.card_event(SPEC_NO_CARD, false);
-                0
+                self.bu_fail(f, E_GENERAL)
             }
         }
     }
@@ -549,6 +531,7 @@ impl<S: Sdk> Machine<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::testing::machine;
 
     #[test]
@@ -582,25 +565,33 @@ mod tests {
         assert_eq!(m.kernel.cards.status[1], super::FAIL_TIMEOUT);
     }
 
+    /// Through the device table: create, write, reopen, read, find,
+    /// erase.
     #[test]
     fn files_on_bu00() {
         let mut m = machine();
         m.io = Some(Default::default());
-        let name = "bu00:BASLUS-01115TEST";
-        assert_eq!(m.card_open(name, 0x200 | 2 << 16 | 3, 3), 3);
+        let call = |m: &mut crate::Machine<crate::testing::NoSdk>, f: u32, a: [u32; 4]| match crate::bios::call(m, 0xB0, f, a).unwrap() {
+            crate::Flow::Return(v) => v as u32,
+            _ => panic!("blocked"),
+        };
+        let name = 0x8001_0100;
+        m.mem.write(name, b"bu00:BASLUS-01115TEST\0");
+        assert_eq!(call(&mut m, 0x32, [name, 0x200 | 2 << 16 | 3, 0, 0]), 2);
         m.mem.write(0x8001_0000, &[7; 256]);
-        assert_eq!(m.card_io(3, 0x8001_0000, 256, true), 256);
-        m.kernel.cards.files.remove(&3);
-        assert_eq!(m.card_open(name, 1, 4), 4);
-        assert_eq!(m.card_io(4, 0x8002_0000, 128, false), 128);
+        assert_eq!(call(&mut m, 0x35, [2, 0x8001_0000, 256, 0]), 256);
+        assert_eq!(call(&mut m, 0x36, [2, 0, 0, 0]), 2);
+        assert_eq!(call(&mut m, 0x32, [name, 1, 0, 0]), 2);
+        assert_eq!(call(&mut m, 0x34, [2, 0x8002_0000, 128, 0]), 128);
         assert_eq!(m.mem.r8(0x8002_007F), 7);
-        assert_eq!(m.card_find(Some("bu00:BASLUS*"), 0x8003_0000), 0x8003_0000);
+        m.mem.write(0x8001_0200, b"bu00:BASLUS*\0");
+        assert_eq!(call(&mut m, 0x42, [0x8001_0200, 0x8003_0000, 0, 0]), 0x8003_0000);
         assert_eq!(m.mem.r32(0x8003_0018), 0x4000);
-        assert_eq!(m.card_find(None, 0x8003_0000), 0);
-        assert_eq!(m.card_open(name, 0x200 | 1 << 16, 5), u32::MAX, "exists");
-        assert_eq!(m.kernel.cards.errno, super::E_EXISTS);
-        assert_eq!(m.card_erase(name, false), 1);
-        assert_eq!(m.card_open(name, 1, 5), u32::MAX);
+        assert_eq!(call(&mut m, 0x43, [0x8003_0000, 0, 0, 0]), 0);
+        assert_eq!(call(&mut m, 0x32, [name, 0x200 | 1 << 16, 0, 0]), u32::MAX, "exists");
+        assert_eq!(call(&mut m, 0x54, [0; 4]), E_EXISTS);
+        assert_eq!(call(&mut m, 0x45, [name, 0, 0, 0]), 1);
+        assert_eq!(call(&mut m, 0x32, [name, 1, 0, 0]), u32::MAX);
         assert!(m.io.as_ref().unwrap().sio0.slots[0].as_ref().unwrap().valid());
     }
 
@@ -629,9 +620,17 @@ mod tests {
         let mut m = machine();
         m.io = Some(Default::default());
         let low = card_events(&mut m, super::EV_LOW);
+        let f = crate::files::fcb_at(2);
+        let at = |m: &mut crate::Machine<crate::testing::NoSdk>, port: u32, name: &[u8]| {
+            m.mem.w32(f + fcb::DEVICE_ID, port);
+            m.mem.write(0x8001_0000, name);
+            m.mem.w8(0x8001_0000 + name.len() as u32, 0);
+            0x8001_0000
+        };
         // A new card: the read fails (2000h), the BIOS accepts it, and
         // the reread completes (04h).
-        assert_eq!(m.card_find(Some("bu00:BASLUS*"), 0x8003_0000), 0);
+        let p = at(&mut m, 0, b"BASLUS*");
+        assert_eq!(m.dev_bu_find(f, p, 0x8003_0000), 0);
         assert_eq!(ready(&m, &low), [super::SPEC_DONE, super::SPEC_NEW]);
         assert!(!m.io.as_ref().unwrap().sio0.slots[0].as_ref().unwrap().new_card);
         let mut m = machine();
@@ -639,17 +638,21 @@ mod tests {
         let low = card_events(&mut m, super::EV_LOW);
         m.cards_ready();
         m.io.as_mut().unwrap().sio0.slots[0].as_mut().unwrap().new_card = false;
-        assert_eq!(m.card_find(Some("bu00:*"), 0x8003_0000), 0);
+        let p = at(&mut m, 0, b"*");
+        assert_eq!(m.dev_bu_find(f, p, 0x8003_0000), 0);
         assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
         // Slot 2 is empty.
         let low = card_events(&mut m, super::EV_LOW);
-        assert_eq!(m.card_find(Some("bu10:*"), 0x8003_0000), 0);
+        let p = at(&mut m, 0x10, b"*");
+        assert_eq!(m.dev_bu_find(f, p, 0x8003_0000), 0);
         assert_eq!(ready(&m, &low), [super::SPEC_NO_CARD]);
-        assert_eq!(m.card_open("bu10:X", 1, 3), u32::MAX);
+        let p = at(&mut m, 0x10, b"X");
+        assert_eq!(m.dev_bu_open(f, p, 1), u32::MAX);
         // An asynchronous open doesn't check; sector I/O is low-level only.
         let low = card_events(&mut m, super::EV_LOW);
         let high = card_events(&mut m, super::EV_HIGH);
-        assert_eq!(m.card_open("bu00:X", 0x8001, 3), u32::MAX);
+        let p = at(&mut m, 0, b"X");
+        assert_eq!(m.dev_bu_open(f, p, 0x8001), u32::MAX);
         assert_eq!(ready(&m, &low), []);
         m.card_read(0x00, 0x40, 0x8001_0000);
         m.card_step();

@@ -3,10 +3,10 @@
 //! anything else is an error naming the table and number, so a gap fails
 //! loudly instead of returning garbage.
 
-use crate::kernel::{self, File};
+use crate::kernel;
 use crate::libc;
-use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait};
-use crate::tables;
+use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait, seq};
+use crate::{files, tables};
 use psx_devices::{cd, dma};
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
@@ -371,11 +371,86 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xA0, 0x3F) => {
+            // Through putchar, to the console (psx-spx).
             let text = printf(m, a);
-            m.host.log(2, text.trim_end_matches('\n'));
-            r(text.len() as u32)
+            let n = text.len() as u32;
+            let flow = m.putchars(text.into_bytes())?;
+            Ok(seq(m, flow, move |_, _| Flow::ret(n)))
         }
-        (0xA0, 0x44) | (0xA0, 0x56) | (0xA0, 0x9F) => r(0),
+        (0xA0, 0x44) | (0xA0, 0x9F) => r(0),
+        // "return 0" (psx-spx), and the dummy device functions.
+        (0xA0, 0x57..=0x5A) | (0xA0, 0x73..=0x77) | (0xA0, 0x79..=0x7B) | (0xA0, 0x7D) | (0xA0, 0x7F) | (0xA0, 0x80) | (0xA0, 0x82..=0x8F) | (0xA0, 0xB0) | (0xA0, 0xB1) | (0xA0, 0xB3) => r(0),
+        // --- A0h: the CD-ROM driver and its device (crate::cdrom) -------
+        (0xA0, 0x54) => m.cd_init(),
+        (0xA0, 0x56) => {
+            m.cd_remove();
+            r(0)
+        }
+        (0xA0, 0x5F) => m.dev_cd_open(a[0], a[1]),
+        (0xA0, 0x60) => m.dev_cd_read(a[0], a[1], a[2]),
+        (0xA0, 0x61) => r(0),
+        (0xA0, 0x62) => m.dev_cd_firstfile(a[0], a[1], a[2]),
+        (0xA0, 0x63) => m.dev_cd_nextfile(a[0], a[1]),
+        (0xA0, 0x64) => m.dev_cd_chdir(a[1]),
+        (0xA0, 0x78) => {
+            let msf = [mem.r8(a[0]), mem.r8(a[0] + 1), mem.r8(a[0] + 2)];
+            r(m.cd_seek_l(msf))
+        }
+        (0xA0, 0x7C) => r(m.cd_get_status(a[0])),
+        (0xA0, 0x7E) => r(m.cd_read(a[0], a[1], a[2])),
+        (0xA0, 0x81) => r(m.cd_set_mode(a[0])),
+        (0xA0, 0x90) => r(m.cd_io_verifier()),
+        (0xA0, 0x91) => r(m.cd_dma_verifier()),
+        (0xA0, 0x92) | (0xA0, 0x93) => {
+            // The handler returns from the exception when it acknowledges:
+            // the guest handler that called it returns into the
+            // exception's end, its own code after the call run first.
+            if m.cd_handler(func == 0x93) {
+                if !m.in_irq {
+                    return Err(format!("{label}: returns from an exception outside one"));
+                }
+                m.rfe = true;
+            }
+            r(0)
+        }
+        (0xA0, 0x94) => {
+            m.cd_int5_error(a[0], a[1]);
+            r(0)
+        }
+        (0xA0, 0x95) => m.cd_init(),
+        (0xA0, 0x9E) => {
+            let i = (a[0] != 0) as usize;
+            r(std::mem::replace(&mut m.kernel.cd.auto_ack[i], a[1]))
+        }
+        (0xA0, 0xA2) => {
+            m.cd_enqueue();
+            r(0)
+        }
+        (0xA0, 0xA3) => {
+            m.cd_dequeue();
+            r(0)
+        }
+        (0xA0, 0xA4) => m.cd_get_lbn(a[0]),
+        (0xA0, 0xA5) => m.cd_block_read(a[0], a[1], a[2], |_, n| Flow::ret(n)),
+        (0xA0, 0xA6) => m.cd_block_status(|_, s| Flow::ret(s)),
+        // --- A0h: the devices' functions, the device table ---------------
+        (0xA0, 0x5B) => r(0),
+        (0xA0, 0x5C) => r(m.tty_open(a[0])),
+        (0xA0, 0x5D) => m.tty_in_out(a[0], a[1]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x5E) => r(0),
+        (0xA0, 0x65) => r(m.dev_bu_open(a[0], a[1], a[2])),
+        (0xA0, 0x66) | (0xA0, 0x67) => r(m.dev_bu_io(a[0], a[1], a[2], func == 0x67)),
+        (0xA0, 0x68) => r(0),
+        (0xA0, 0x69) => r(m.dev_bu_find(a[0], a[1], a[2])),
+        (0xA0, 0x6A) => r(m.dev_bu_find(a[0], 0, a[1])),
+        (0xA0, 0x6B) | (0xA0, 0x6C) => r(m.dev_bu_erase(a[0], a[1], func == 0x6C)),
+        (0xA0, 0x6D) => r(m.dev_bu_format(a[0])),
+        (0xA0, 0x6E) => r(m.dev_bu_rename(a[0], a[1], a[3])),
+        (0xA0, 0x6F) => {
+            mem.w32(a[0] + files::fcb::ERRNO, 0);
+            r(0)
+        }
+        (0xA0, 0x96..=0x99) => r(m.add_device(func)),
         (0xA0, 0x45) => {
             m.install_vectors();
             r(0)
@@ -478,110 +553,40 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.undeliver_event(a[0], a[1]);
             r(1)
         }
-        (0xB0, 0x32) => {
-            // OpenBIOS `psxopen`: a free descriptor first, then the device.
-            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            let Some(fd) = (0..16).find(|f| !m.kernel.files.contains_key(f) && !m.kernel.cards.files.contains_key(f)) else {
-                m.kernel.cards.errno = crate::card::E_NO_FDS;
-                return r(u32::MAX);
-            };
-            if crate::card::parse_path(&path).is_some() {
-                return r(m.card_open(&path, a[1], fd));
-            }
-            if !path.to_ascii_lowercase().starts_with("cdrom:") {
-                m.kernel.cards.errno = crate::card::E_NO_DEVICE;
-                return r(u32::MAX);
-            }
-            let mut disc = HostDisc(&mut *m.host);
-            match cd::find(&mut disc, &path) {
-                Some(e) if !e.dir => {
-                    m.kernel.files.insert(fd, File { lba: e.lba, size: e.size, pos: 0 });
-                    r(fd)
-                }
-                _ => {
-                    m.kernel.cards.errno = crate::card::E_NOT_FOUND;
-                    r(u32::MAX)
-                }
-            }
-        }
-        (0xB0, 0x33) => {
-            if let Some(f) = m.kernel.cards.files.get_mut(&a[0]) {
-                f.pos = match a[2] {
-                    0 => a[1],
-                    1 => f.pos.wrapping_add(a[1]),
-                    _ => return r(u32::MAX),
-                };
-                return r(f.pos);
-            }
-            let Some(f) = m.kernel.files.get_mut(&a[0]) else { return r(u32::MAX) };
-            f.pos = match a[2] {
-                0 => a[1],
-                1 => f.pos.wrapping_add(a[1]),
-                _ => return r(u32::MAX),
-            };
-            r(f.pos)
-        }
-        (0xB0, 0x34) => {
-            if m.kernel.cards.files.contains_key(&a[0]) {
-                return r(m.card_io(a[0], a[1], a[2], false));
-            }
-            let Some(f) = m.kernel.files.get(&a[0]).copied() else { return r(u32::MAX) };
-            let n = a[2].min(f.size.saturating_sub(f.pos));
-            let disc = HostDisc(&mut *m.host);
-            let mut got = Vec::with_capacity(n as usize);
-            let mut raw = [0u8; cd::RAW];
-            let mut s = f.pos / cd::USER as u32;
-            while (got.len() as u32) < n {
-                if !disc.0.disc_read(f.lba + s, &mut raw) {
-                    return r(u32::MAX);
-                }
-                let user = cd::user_data(&raw);
-                let start = if s == f.pos / cd::USER as u32 { (f.pos % cd::USER as u32) as usize } else { 0 };
-                let take = ((n as usize) - got.len()).min(cd::USER - start);
-                got.extend_from_slice(&user[start..start + take]);
-                s += 1;
-            }
-            m.mem.write(a[1], &got);
-            m.loaded.push((a[1], got.len() as u32));
-            m.kernel.files.get_mut(&a[0]).unwrap().pos += n;
-            r(n)
-        }
-        (0xB0, 0x35) => {
-            if m.kernel.cards.files.contains_key(&a[0]) {
-                return r(m.card_io(a[0], a[1], a[2], true));
-            }
-            r(u32::MAX)
-        }
-        (0xB0, 0x36) => {
-            let known = m.kernel.files.remove(&a[0]).is_some() | m.kernel.cards.files.remove(&a[0]).is_some();
-            r(if known { a[0] } else { u32::MAX })
-        }
-        (0xB0, 0x41) => {
-            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            r(m.card_format(&path))
-        }
+        // --- B0h: the file functions over the device table (crate::files)
+        (0xB0, 0x32) => m.open(a[0], a[1]),
+        (0xB0, 0x33) => r(m.lseek(a[0], a[1], a[2])),
+        (0xB0, 0x34) | (0xB0, 0x35) => m.transfer(a[0], a[1], a[2], func == 0x35),
+        (0xB0, 0x36) => m.close(a[0]),
+        (0xB0, 0x37) => m.ioctl(a[0], a[1], a[2]),
+        (0xB0, 0x38) => Err(format!("{label}: the game exited ({:#x})", a[0])),
+        (0xB0, 0x39) => r(m.isatty(a[0])),
+        (0xB0, 0x3A) => m.getc(a[0]),
+        (0xB0, 0x3B) => m.putc(a[0], a[1]),
+        (0xB0, 0x3C) => m.getchar(),
+        (0xB0, 0x3D) => m.putchars(vec![a[0] as u8]),
+        (0xB0, 0x3E) => Err(format!("{label}: gets reads the console, which has no input")),
         (0xB0, 0x3F) => {
-            let s = String::from_utf8_lossy(&mem.cstr(a[0], 1024)).into_owned();
-            m.host.log(2, &s);
+            // puts: "<NULL>" for a null pointer (psx-spx).
+            let s = if a[0] == 0 { b"<NULL>".to_vec() } else { mem.cstr(a[0], MAX_LEN as usize) };
+            m.putchars(s)
+        }
+        (0xB0, 0x40) => m.cd(a[0]),
+        (0xB0, 0x41) => m.erase(a[0], files::dcb::FORMAT),
+        (0xB0, 0x42) => m.firstfile(a[0], a[1]),
+        (0xB0, 0x43) => m.nextfile(a[0]),
+        (0xB0, 0x44) => m.rename(a[0], a[1]),
+        (0xB0, 0x45) => m.erase(a[0], files::dcb::ERASE),
+        (0xB0, 0x46) => m.erase(a[0], files::dcb::UNDELETE),
+        (0xB0, 0x47) => m.add_drv(a[0]),
+        (0xB0, 0x48) => m.del_drv(a[0]),
+        (0xB0, 0x49) => {
+            m.print_devices();
             r(0)
         }
-        (0xB0, 0x42) => {
-            let pat = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            if crate::card::parse_path(&pat).is_some() {
-                return r(m.card_find(Some(&pat), a[1]));
-            }
-            r(0)
-        }
-        (0xB0, 0x43) => r(m.card_find(None, a[0])),
-        (0xB0, 0x44) => {
-            let from = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            let to = String::from_utf8_lossy(&mem.cstr(a[1], 128)).into_owned();
-            r(m.card_rename(&from, &to))
-        }
-        (0xB0, 0x45) | (0xB0, 0x46) => {
-            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            r(m.card_erase(&path, func == 0x46))
-        }
+        (0xB0, 0x54) => r(m.kernel.files.errno),
+        (0xB0, 0x55) => r(m.get_error(a[0])),
+        (0xB0, 0x59) => m.test_device(a[0]),
         (0xB0, 0x4A) => r(m.card_init(a[0])),
         // StartCARD2, StopCARD2: the pad and card handler in or out of the
         // chain.
@@ -597,8 +602,6 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.card_new(0x10);
             r(1)
         }
-        (0xB0, 0x54) => r(m.kernel.cards.errno),
-        (0xB0, 0x55) => r(if m.kernel.cards.files.contains_key(&a[0]) { m.kernel.cards.errno } else { u32::MAX }),
         (0xB0, 0x5C) => {
             m.cards_ready();
             r(m.kernel.cards.status[(a[0] & 1) as usize])
@@ -624,6 +627,26 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xC0, 0x1D) => r(m.kernel.cards.find_mode),
+        (0xC0, 0x00) => {
+            m.enqueue_rcnt_irqs(a[0]);
+            r(0)
+        }
+        (0xC0, 0x01) => {
+            m.enqueue_syscall_handler(a[0]);
+            r(0)
+        }
+        (0xC0, 0x0C) => {
+            m.init_def_int(a[0]);
+            r(0)
+        }
+        (0xC0, 0x12) => {
+            // InstallDevices(ttyflag): the control blocks, the console as
+            // KernelRedirect mounts it, cdrom and bu.
+            m.lay_out_files();
+            m.kernel_redirect(a[0])
+        }
+        (0xC0, 0x13) => m.reopen_stdio(),
+        (0xC0, 0x1B) => m.kernel_redirect(a[0]),
         (0xC0, 0x07) => {
             m.install_exception_handlers();
             r(0)

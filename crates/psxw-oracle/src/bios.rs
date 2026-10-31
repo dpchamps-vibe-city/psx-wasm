@@ -42,6 +42,10 @@ pub fn run(b: &BiosCall) -> Result<Vec<u8>> {
     );
     // The devices the runtime's BIOS reaches (the GPU and timer functions).
     m.io = Some(Default::default());
+    // As the runner's boot leaves the BIOS (its SYSTEM.CNF: EVENT=10):
+    // the CD-ROM driver installed (`_96_init`'s events and handlers).
+    m.lay_out_events(0x10);
+    m.cd_install();
     for (addr, bytes) in &b.setup {
         m.mem.write(*addr, bytes);
     }

@@ -8,6 +8,8 @@
 
 pub mod bios;
 pub mod card;
+pub mod cdrom;
+pub mod files;
 pub mod io;
 pub mod kernel;
 pub mod libc;
@@ -27,6 +29,8 @@ pub mod testing {
     #[derive(Default)]
     pub struct TestHost {
         pub logs: Vec<String>,
+        /// Raw sectors from LBA 0.
+        pub disc: Vec<[u8; 2352]>,
     }
 
     impl Host for TestHost {
@@ -34,11 +38,16 @@ pub mod testing {
             self.logs.push(msg.to_string());
         }
         fn wait_vblank(&mut self, _frame: u64) {}
-        fn disc_read(&mut self, _lba: u32, _out: &mut [u8; 2352]) -> bool {
-            false
+        fn disc_read(&mut self, lba: u32, out: &mut [u8; 2352]) -> bool {
+            self.disc.get(lba as usize).map(|s| *out = *s).is_some()
         }
         fn has_disc(&mut self) -> bool {
-            false
+            !self.disc.is_empty()
+        }
+        fn disc_info(&mut self) -> Option<psxw_abi::DiscInfo> {
+            let mut i = psxw_abi::DiscInfo { tracks: 1, sectors: self.disc.len() as u32, ..Default::default() };
+            i.track_data[0] = 1;
+            self.has_disc().then_some(i)
         }
         fn pad_state(&mut self, _port: u32) -> Vec<u8> {
             vec![0xFF, 0xFF]
@@ -83,9 +92,13 @@ pub mod testing {
     }
 
     pub fn machine() -> Machine<NoSdk> {
+        machine_with_disc(Vec::new())
+    }
+
+    pub fn machine_with_disc(disc: Vec<[u8; 2352]>) -> Machine<NoSdk> {
         Machine::new(
             Box::new(VecMem::default()),
-            Box::new(TestHost::default()),
+            Box::new(TestHost { disc, ..Default::default() }),
             Box::new(TestRegs { sp: 0x801F_F000, gp: 0 }),
             BootOptions::default(),
             NoSdk,
@@ -248,11 +261,11 @@ mod tests {
     fn open_fails_without_a_descriptor() {
         let mut m = machine();
         for fd in 0..16 {
-            m.kernel.files.insert(fd, kernel::File { lba: 0, size: 0, pos: 0 });
+            m.mem.w32(files::fcb_at(fd), 1);
         }
         m.mem.write(0x8001_0000, b"cdrom:\\A.BIN;1\0");
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, 1, 0, 0])), u32::MAX);
-        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x54, [0; 4])), card::E_NO_FDS);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x54, [0; 4])), files::E_NO_FDS);
     }
 
     /// A call goes through the table in kernel RAM: a stand-in runs the
@@ -307,6 +320,6 @@ mod tests {
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x17, [0x8001_0100, 0x8001_0200, 0, 0])) as i32, -1);
         ret(bios::call(&mut m, 0xA0, 0x2B, [0x8001_0300, 0x5A, 3, 0]));
         assert_eq!(m.mem.bytes(0x8001_0300, 4), vec![0x5A, 0x5A, 0x5A, 0]);
-        assert!(bios::call(&mut m, 0xA0, 0x05, [0; 4]).is_err(), "ioctl is not implemented");
+        assert!(bios::call(&mut m, 0xC0, 0x16, [0; 4]).is_err(), "_cdevscan is not implemented");
     }
 }

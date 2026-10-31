@@ -1,13 +1,12 @@
 //! Kernel state behind the BIOS functions: event control blocks, the pad
-//! buffers the kernel fills at vblank, open files, the heap, interrupt
-//! handler queues (psx-spx "Kernel (BIOS)").
+//! buffers the kernel fills at vblank, the heap, interrupt handler queues
+//! (psx-spx "Kernel (BIOS)").
 
 use crate::{Machine, Sdk};
 #[allow(unused_imports)]
 use crate::IrqStep;
 use psxw_abi::kernel as k;
 use psx_devices::mem::Mem;
-use std::collections::BTreeMap;
 
 pub const EV_UNUSED: u32 = 0x0000;
 pub const EV_DISABLED: u32 = 0x1000;
@@ -36,13 +35,6 @@ pub struct EvCb {
     pub status: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct File {
-    pub lba: u32,
-    pub size: u32,
-    pub pos: u32,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Kernel {
     /// `InitPAD` buffers: (address, size) per port.
@@ -64,7 +56,10 @@ pub struct Kernel {
     pub kheap: (u32, u32),
     /// Where `strtok`'s next fragment starts (0: none).
     pub strtok: u32,
-    pub files: BTreeMap<u32, File>,
+    /// The file functions' state outside the control blocks.
+    pub files: crate::files::Files,
+    /// The CD-ROM driver.
+    pub cd: crate::cdrom::Driver,
     /// Whether the kernel's handlers acknowledge what they handle: root
     /// counters 0-2 and vblank (`ChangeClearRCnt`), the pad handler's vblank
     /// (`ChangeClearPad`), the IRQ events' lines (`SetIrqAutoAck`).
@@ -256,15 +251,20 @@ impl<S: Sdk> Machine<S> {
 
 /// The kernel's own `SysEnqIntRP` elements, in its data (D68): root
 /// counters 0-2 and vblank (0-3, priority 1) and the IRQ events (priority
-/// 3), as OpenBIOS's `handlers/irq.c` enqueues them at boot, and the pad and
+/// 3), as OpenBIOS's `handlers/irq.c` enqueues them at boot, the pad and
 /// card handler (priority 2, `sio0/driver.c`), which `StartPAD2` and
-/// `StartCARD2` enqueue. Their verifiers and handlers are kernel code here,
-/// at addresses in the BIOS ROM's range ([`KERNEL_CODE`]), run as
-/// [`IrqStep::Kernel`] steps in their places.
+/// `StartCARD2` enqueue, the syscall handler (priority 0; syscalls here
+/// are calls, so it never acts) and the CD-ROM driver's (priority 0,
+/// `_96_init`'s). Their verifiers and handlers are kernel code here, at
+/// addresses in the BIOS ROM's range ([`KERNEL_CODE`], the CD-ROM's the
+/// A(90h..93h) stand-ins), run as [`IrqStep::Kernel`] steps in their places.
 pub const KERNEL_ELEMENTS: u32 = 0x8000_7100;
 pub const IRQ_ELEMENT: u32 = 4;
 pub const SIO0_ELEMENT: u32 = 5;
-const ELEMENTS: u32 = 6;
+pub const SYSCALL_ELEMENT: u32 = 6;
+pub const CD_IO_ELEMENT: u32 = 7;
+pub const CD_DMA_ELEMENT: u32 = 8;
+const ELEMENTS: u32 = 9;
 const KERNEL_CODE: u32 = 0xBFC0_8000;
 
 pub fn kernel_element(i: u32) -> u32 {
@@ -288,22 +288,46 @@ const IRQ_EVENTS: [(u32, u32); 11] = [
 ];
 
 impl<S: Sdk> Machine<S> {
-    /// The elements, the IRQ events at priority 3 and the root counters at
-    /// 1, acknowledging what they handle (`enqueueIrqHandler(3)`,
+    /// The elements, the syscall handler at priority 0, the IRQ events at 3
+    /// and the root counters at 1, acknowledging what they handle
+    /// (`enqueueSyscallHandler(0)`, `enqueueIrqHandler(3)`,
     /// `enqueueRCntIrqs(1)`).
     pub fn lay_out_kernel_handlers(&mut self) {
         for i in 0..ELEMENTS {
             let e = kernel_element(i);
-            for (o, v) in [(0, 0), (4, KERNEL_CODE + 8 * i + 4), (8, KERNEL_CODE + 8 * i), (12, 0)] {
+            let (handler, verifier) = match i {
+                CD_IO_ELEMENT => (crate::tables::stand_in(0xA0, 0x92), crate::tables::stand_in(0xA0, 0x90)),
+                CD_DMA_ELEMENT => (crate::tables::stand_in(0xA0, 0x93), crate::tables::stand_in(0xA0, 0x91)),
+                _ => (KERNEL_CODE + 8 * i + 4, KERNEL_CODE + 8 * i),
+            };
+            for (o, v) in [(0, 0), (4, handler), (8, verifier), (12, 0)] {
                 self.mem.w32(e + o, v);
             }
         }
-        self.kernel.irq_auto_ack = [0; 11];
-        self.enq_int_rp(3, kernel_element(IRQ_ELEMENT));
+        self.enqueue_syscall_handler(0);
+        self.init_def_int(3);
+        self.enqueue_rcnt_irqs(1);
+    }
+
+    /// C(00h) `EnqueueTimerAndVblankIrqs(priority)`: the root counter and
+    /// vblank elements, acknowledging what they handle.
+    pub fn enqueue_rcnt_irqs(&mut self, prio: u32) {
         for i in 0..4 {
             self.kernel.clear_rcnt[i] = 1;
-            self.enq_int_rp(1, kernel_element(i as u32));
+            self.enq_int_rp(prio, kernel_element(i as u32));
         }
+    }
+
+    /// C(01h) `EnqueueSyscallHandler(priority)`.
+    pub fn enqueue_syscall_handler(&mut self, prio: u32) {
+        self.enq_int_rp(prio, kernel_element(SYSCALL_ELEMENT));
+    }
+
+    /// C(0Ch) `InitDefInt(priority)`: the IRQ events' element, none of them
+    /// acknowledged.
+    pub fn init_def_int(&mut self, prio: u32) {
+        self.kernel.irq_auto_ack = [0; 11];
+        self.enq_int_rp(prio, kernel_element(IRQ_ELEMENT));
     }
 
     /// The kernel element `h` is, if it is one.
@@ -344,6 +368,8 @@ impl<S: Sdk> Machine<S> {
                 }
                 false
             }
+            CD_IO_ELEMENT => self.cd_io_verifier() != 0 && self.cd_handler(false),
+            CD_DMA_ELEMENT => self.cd_dma_verifier() != 0 && self.cd_handler(true),
             SIO0_ELEMENT => {
                 let vblank = psx_devices::irq::VBLANK;
                 if !taken(self, vblank) {

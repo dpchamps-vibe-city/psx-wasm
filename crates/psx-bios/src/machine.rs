@@ -158,6 +158,28 @@ impl<S> Flow<S> {
     }
 }
 
+/// `flow`, then `f` with its result: at once when it returns, else once
+/// its wait or guest call is over.
+pub fn seq<S: Sdk>(m: &mut Machine<S>, flow: Flow<S>, f: impl FnOnce(&mut Machine<S>, u64) -> Flow<S> + 'static) -> Flow<S> {
+    match flow {
+        Flow::Return(v) => f(m, v),
+        Flow::Block { until, then } => Flow::Block {
+            until,
+            then: Box::new(move |m| {
+                let next = then(m);
+                seq(m, next, f)
+            }),
+        },
+        Flow::Call { call, then } => Flow::Call {
+            call,
+            then: Box::new(move |m, v| {
+                let next = then(m, v);
+                seq(m, next, f)
+            }),
+        },
+    }
+}
+
 /// Conditions a blocked call waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
@@ -169,10 +191,12 @@ pub enum Wait {
     Sdk(u32),
     /// A BIOS event becomes ready.
     Event(u32),
+    /// One of these BIOS events becomes ready (0: none).
+    Events([u32; 3]),
 }
 
 /// SDK adapter state plugs into the machine through this trait.
-pub trait Sdk: Sized {
+pub trait Sdk: Sized + 'static {
     /// Handle an `Event::Sdk` the adapters scheduled.
     fn on_event(m: &mut Machine<Self>, kind: u32, data: u32);
     /// Whether `Wait::Sdk(cond)` holds.
@@ -298,10 +322,11 @@ impl<S: Sdk> Machine<S> {
         };
         let first = m.clock.video.vblank_at(1);
         m.clock.schedule(first, Event::Vblank);
-        // The kernel's call tables and vectors, its exception control
-        // blocks and its own handlers in their chains are there before a
-        // game runs.
+        // The kernel's call tables and vectors, its file and device control
+        // blocks with stdio open, its exception control blocks and its own
+        // handlers in their chains are there before a game runs.
         m.lay_out_tables();
+        m.lay_out_files();
         m.lay_out_excb();
         m.lay_out_kernel_handlers();
         m
@@ -334,6 +359,7 @@ impl<S: Sdk> Machine<S> {
             Wait::Cycle(t) => self.clock.now >= t,
             Wait::Sdk(c) => S::ready(self, c),
             Wait::Event(h) => self.event_ready(h),
+            Wait::Events(hs) => hs.iter().any(|&h| self.event_ready(h)),
         }
     }
 

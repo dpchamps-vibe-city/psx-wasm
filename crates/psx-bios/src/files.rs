@@ -1,0 +1,762 @@
+//! The file functions over `AddDrv`'s device table (psx-spx "BIOS File
+//! Functions", "BIOS Control Blocks", "BIOS TTY Console"; OpenBIOS
+//! `fileio/`): the file control blocks (FCBs) and device control blocks
+//! (DCBs) live in kernel RAM through the table of tables at 140h and 150h
+//! (D68), and every file function reaches its device through the DCB's
+//! function pointers. The built-in devices' pointers are stand-ins for the
+//! A0h device functions psx-spx names (`cdrom`: A(5Fh..64h), `bu`:
+//! A(65h..6Eh), `tty`: A(5Bh..5Eh)), which run here; a guest driver's
+//! (`AddDrv`), or a pointer a game patched, is called as guest code.
+//!
+//! psx-spx and OpenBIOS differ here and there; psx-spx decides: a device
+//! name's trailing hex digits are its port ("bu10"), `firstfile`/`nextfile`
+//! leave the error number alone, `nextfile` returns the entry, `cd`,
+//! `undelete` and `testdevice` work, LF goes out as CR LF. The console is
+//! the host's log: what `tty` writes, line by line.
+
+use crate::bios::MAX_LEN;
+use crate::machine::{Flow, GuestCall, Machine, Sdk, seq};
+use crate::tables;
+use psxw_abi::kernel as k;
+
+/// FCB fields (psx-spx).
+pub mod fcb {
+    pub const FLAGS: u32 = 0x00;
+    pub const DEVICE_ID: u32 = 0x04;
+    pub const BUFFER: u32 = 0x08;
+    pub const COUNT: u32 = 0x0C;
+    pub const OFFSET: u32 = 0x10;
+    pub const DEVICE_FLAGS: u32 = 0x14;
+    pub const ERRNO: u32 = 0x18;
+    pub const DCB: u32 = 0x1C;
+    pub const LENGTH: u32 = 0x20;
+    pub const LBA: u32 = 0x24;
+    pub const FD: u32 = 0x28;
+}
+
+/// DCB fields (psx-spx): the names, the flags and block size, then the
+/// device's functions.
+pub mod dcb {
+    pub const NAME: u32 = 0x00;
+    pub const FLAGS: u32 = 0x04;
+    pub const BLOCK: u32 = 0x08;
+    pub const DESC: u32 = 0x0C;
+    pub const INIT: u32 = 0x10;
+    pub const OPEN: u32 = 0x14;
+    pub const IN_OUT: u32 = 0x18;
+    pub const CLOSE: u32 = 0x1C;
+    pub const IOCTL: u32 = 0x20;
+    pub const READ: u32 = 0x24;
+    pub const WRITE: u32 = 0x28;
+    pub const ERASE: u32 = 0x2C;
+    pub const UNDELETE: u32 = 0x30;
+    pub const FIRSTFILE: u32 = 0x34;
+    pub const NEXTFILE: u32 = 0x38;
+    pub const FORMAT: u32 = 0x3C;
+    pub const CHDIR: u32 = 0x40;
+    pub const RENAME: u32 = 0x44;
+    pub const REMOVE: u32 = 0x48;
+    pub const CHECK: u32 = 0x4C;
+}
+
+/// Device flags: a character device, a console, a block device, a file
+/// system (whose own read and write the BIOS calls).
+pub const CHAR: u32 = 0x01;
+pub const CONS: u32 = 0x02;
+pub const BLOCK: u32 = 0x04;
+pub const FS: u32 = 0x10;
+
+/// Open modes (psx-spx `open`).
+pub const READ: u32 = 0x0001;
+pub const WRITE: u32 = 0x0002;
+pub const NBLOCK: u32 = 0x0004;
+pub const CREATE: u32 = 0x0200;
+pub const ASYNC: u32 = 0x8000;
+
+/// File error numbers (`_get_errno`, psx-spx).
+pub const E_NOT_FOUND: u32 = 0x02;
+pub const E_BAD_PORT: u32 = 0x06;
+pub const E_BAD_FD: u32 = 0x09;
+pub const E_GENERAL: u32 = 0x10;
+pub const E_EXISTS: u32 = 0x11;
+pub const E_CROSS_DEVICE: u32 = 0x12;
+pub const E_NO_DEVICE: u32 = 0x13;
+pub const E_ALIGN: u32 = 0x16;
+pub const E_NO_FDS: u32 = 0x18;
+pub const E_FULL: u32 = 0x1C;
+
+/// `ioctl`'s non-blocking command (OpenBIOS `PSXFIOCNBLOCK`).
+const FIOCNBLOCK: u32 = 0x6601;
+
+/// The devices' names in kernel RAM, after the DCBs.
+const NAMES: u32 = k::DCBS + k::DEVICES * k::DCB_SIZE;
+const NAME_LIST: [&[u8]; 6] = [b"cdrom", b"CD-ROM", b"bu", b"MEMORY CARD", b"tty", b"CONSOLE"];
+
+/// The kernel's file state outside the control blocks.
+#[derive(Debug, Clone, Default)]
+pub struct Files {
+    /// The last error (`_get_errno`).
+    pub errno: u32,
+    /// `firstfile`'s search FCB: taken free on the first call and kept,
+    /// though never marked used (psx-spx's bug).
+    pub first: u32,
+    /// The console's column, for TAB (`putchar`).
+    pub column: u32,
+    /// What the console has been sent since its last line.
+    pub line: Vec<u8>,
+}
+
+/// FCB `fd`'s address (KSEG1, as the table of tables points).
+pub fn fcb_at(fd: u32) -> u32 {
+    0xA000_0000 | (k::FCBS + fd * k::FCB_SIZE)
+}
+
+fn name_at(i: usize) -> u32 {
+    let off: usize = NAME_LIST[..i].iter().map(|n| (n.len() + 4) & !3).sum();
+    0xA000_0000 | (NAMES + off as u32)
+}
+
+/// A built-in device: its names, flags, block size and functions (A0h
+/// numbers; the rest the A(57h) "return 0").
+struct Builtin {
+    name: usize,
+    flags: u32,
+    block: u32,
+    funcs: &'static [(u32, u32)],
+}
+
+const DUMMY: u32 = 0x57;
+
+const CDROM: Builtin = Builtin {
+    name: 0,
+    flags: FS | BLOCK,
+    block: 0x800,
+    funcs: &[(dcb::OPEN, 0x5F), (dcb::READ, 0x60), (dcb::CLOSE, 0x61), (dcb::FIRSTFILE, 0x62), (dcb::NEXTFILE, 0x63), (dcb::CHDIR, 0x64), (dcb::REMOVE, 0x56)],
+};
+
+const CARD: Builtin = Builtin {
+    name: 2,
+    flags: FS | BLOCK,
+    block: 0x80,
+    funcs: &[
+        (dcb::OPEN, 0x65),
+        (dcb::READ, 0x66),
+        (dcb::WRITE, 0x67),
+        (dcb::CLOSE, 0x68),
+        (dcb::FIRSTFILE, 0x69),
+        (dcb::NEXTFILE, 0x6A),
+        (dcb::ERASE, 0x6B),
+        (dcb::UNDELETE, 0x6C),
+        (dcb::FORMAT, 0x6D),
+        (dcb::RENAME, 0x6E),
+    ],
+};
+
+/// The DUART console (`AddDuartTtyDevice`) and the dummy one
+/// (`add_nullcon_driver`, which the retail boot installs); both write to
+/// the host's log here.
+const DUART: Builtin =
+    Builtin { name: 4, flags: CHAR | CONS, block: 1, funcs: &[(dcb::INIT, 0x5B), (dcb::OPEN, 0x5C), (dcb::IN_OUT, 0x5D), (dcb::IOCTL, 0x5E)] };
+const NULLCON: Builtin = Builtin { name: 4, flags: CHAR, block: 1, funcs: &[(dcb::IN_OUT, 0x5D)] };
+
+/// A file name split at its device (psx-spx "Device Names"): the name up to
+/// `:`, less its trailing hex digits, which are the port; where the rest
+/// starts.
+pub fn split(path: &[u8]) -> (Vec<u8>, u32, u32) {
+    let lead = path.iter().take_while(|&&c| c == b' ').count();
+    let p = &path[lead..];
+    let Some(colon) = p.iter().position(|&c| c == b':') else { return (p.to_vec(), 0, (lead + p.len()) as u32) };
+    let dev = &p[..colon];
+    let digits = dev.iter().rev().take_while(|c| c.is_ascii_hexdigit()).count();
+    let (name, port) = dev.split_at(dev.len() - digits);
+    let port = port.iter().fold(0u32, |v, &c| v.wrapping_shl(4) | (c as char).to_digit(16).unwrap_or(0));
+    (name.to_vec(), port, (lead + colon + 1) as u32)
+}
+
+impl<S: Sdk> Machine<S> {
+    /// C(12h) `InstallDevices(ttyflag)` without its console's reopening:
+    /// the FCBs and DCBs through the table of tables, all free; the names;
+    /// the console, `cdrom` and `bu`; `fd` 0 and 1 the console's, as the
+    /// boot leaves them.
+    pub fn lay_out_files(&mut self) {
+        self.mem.w32(k::FCB_ENTRY, fcb_at(0));
+        self.mem.w32(k::FCB_ENTRY + 4, k::FILES * k::FCB_SIZE);
+        self.mem.w32(k::DCB_ENTRY, 0xA000_0000 | k::DCBS);
+        self.mem.w32(k::DCB_ENTRY + 4, k::DEVICES * k::DCB_SIZE);
+        self.mem.write(k::FCBS, &vec![0; ((k::FILES * k::FCB_SIZE) + k::DEVICES * k::DCB_SIZE) as usize]);
+        for fd in 0..k::FILES {
+            self.mem.w32(fcb_at(fd) + fcb::FD, fd);
+        }
+        for (i, n) in NAME_LIST.iter().enumerate() {
+            let mut b = n.to_vec();
+            b.push(0);
+            self.mem.write(name_at(i), &b);
+        }
+        self.kernel.files = Files::default();
+        for d in [NULLCON, CDROM, CARD] {
+            self.add_builtin(&d);
+        }
+        // stdin and stdout (OpenBIOS `reopenStdio`; the dummy console's
+        // open does nothing).
+        let tty = self.find_device(b"tty").expect("the console was added");
+        for (fd, mode) in [(0, READ), (1, WRITE)] {
+            let f = fcb_at(fd);
+            for (o, v) in [(fcb::FLAGS, mode), (fcb::DCB, tty), (fcb::DEVICE_FLAGS, NULLCON.flags)] {
+                self.mem.w32(f + o, v);
+            }
+        }
+    }
+
+    /// A built-in device into the first free DCB (its `init` does nothing
+    /// for these); whether there was one.
+    fn add_builtin(&mut self, d: &Builtin) -> bool {
+        let Some(at) = self.free_dcb() else { return false };
+        let mut w = [tables::stand_in(0xA0, DUMMY); 20];
+        w[0] = name_at(d.name);
+        w[1] = d.flags;
+        w[2] = d.block;
+        w[3] = name_at(d.name + 1);
+        for &(o, f) in d.funcs {
+            w[(o / 4) as usize] = tables::stand_in(0xA0, f);
+        }
+        for (i, v) in w.into_iter().enumerate() {
+            self.mem.w32(at + 4 * i as u32, v);
+        }
+        true
+    }
+
+    fn free_dcb(&self) -> Option<u32> {
+        (0..k::DEVICES).map(|i| 0xA000_0000 | (k::DCBS + i * k::DCB_SIZE)).find(|&d| self.mem.r32(d + dcb::NAME) == 0)
+    }
+
+    /// The DCB named `name` (case-sensitive).
+    pub fn find_device(&self, name: &[u8]) -> Option<u32> {
+        (0..k::DEVICES)
+            .map(|i| 0xA000_0000 | (k::DCBS + i * k::DCB_SIZE))
+            .find(|&d| self.mem.r32(d + dcb::NAME) != 0 && self.mem.cstr(self.mem.r32(d + dcb::NAME), 32) == name)
+    }
+
+    /// The first free FCB (flags 0).
+    fn free_fcb(&self) -> Option<u32> {
+        (0..k::FILES).map(fcb_at).find(|&f| self.mem.r32(f + fcb::FLAGS) == 0)
+    }
+
+    /// FCB `fd`, if `fd` names one in use.
+    fn open_fcb(&self, fd: u32) -> Option<u32> {
+        (fd < k::FILES).then(|| fcb_at(fd)).filter(|&f| self.mem.r32(f + fcb::FLAGS) != 0)
+    }
+
+    fn fail(&mut self, errno: u32, v: u32) -> Flow<S> {
+        self.kernel.files.errno = errno;
+        Flow::ret(v)
+    }
+
+    /// The device `path` names, its port and where the rest of the name
+    /// starts; none for an unknown device, which OpenBIOS reports on the
+    /// console.
+    fn device_of(&mut self, path: u32) -> Option<(u32, u32, u32)> {
+        let p = self.mem.cstr(path, 128);
+        let (name, port, rest) = split(&p);
+        let found = self.find_device(&name);
+        if found.is_none() {
+            let text = format!("{} is not known device\n", String::from_utf8_lossy(&name));
+            self.console(text.as_bytes());
+        }
+        found.map(|d| (d, port, path + rest))
+    }
+
+    /// Device function `off` of `dcb` with `args`, then `then` with its v0:
+    /// a stand-in runs here, a guest driver's function is called.
+    fn device(&mut self, dcb: u32, off: u32, args: [u32; 4], then: impl FnOnce(&mut Self, u32) -> Flow<S> + 'static) -> Result<Flow<S>, String> {
+        let f = self.mem.r32(dcb + off);
+        let flow = match tables::stand_in_fn(f) {
+            Some((t, n)) => crate::bios::call(self, t, n, args)?,
+            None => Flow::Call { call: GuestCall { addr: f, args }, then: Box::new(|_, v| Flow::Return(v)) },
+        };
+        Ok(seq(self, flow, move |m, v| then(m, v as u32)))
+    }
+
+    /// A(00h)/B(32h) `open(path, mode)`: a free FCB, then the device
+    /// (OpenBIOS `psxopen`); `fd`, or -1.
+    pub fn open(&mut self, path: u32, mode: u32) -> Result<Flow<S>, String> {
+        let Some(f) = self.free_fcb() else { return Ok(self.fail(E_NO_FDS, u32::MAX)) };
+        let Some((d, port, rest)) = self.device_of(path) else { return Ok(self.fail(E_NO_DEVICE, u32::MAX)) };
+        let flags = self.mem.r32(d + dcb::FLAGS);
+        for (o, v) in [(fcb::FLAGS, mode), (fcb::DEVICE_ID, port), (fcb::DCB, d), (fcb::DEVICE_FLAGS, flags)] {
+            self.mem.w32(f + o, v);
+        }
+        self.device(d, dcb::OPEN, [f, rest, mode, 0], move |m, v| {
+            if v != 0 {
+                m.kernel.files.errno = m.mem.r32(f + fcb::ERRNO);
+                m.mem.w32(f + fcb::FLAGS, 0);
+                return Flow::ret(u32::MAX);
+            }
+            m.mem.w32(f + fcb::OFFSET, 0);
+            Flow::ret(m.mem.r32(f + fcb::FD))
+        })
+    }
+
+    /// A(01h)/B(33h) `lseek(fd, offset, seektype)`: from the start or the
+    /// position; psx-spx's bug: from the end leaves it.
+    pub fn lseek(&mut self, fd: u32, off: u32, whence: u32) -> u32 {
+        let Some(f) = self.open_fcb(fd) else {
+            self.kernel.files.errno = E_BAD_FD;
+            return u32::MAX;
+        };
+        let pos = self.mem.r32(f + fcb::OFFSET);
+        let pos = match whence {
+            0 => off,
+            1 => pos.wrapping_add(off),
+            2 => pos,
+            _ => {
+                self.mem.w32(f + fcb::ERRNO, E_ALIGN);
+                self.kernel.files.errno = E_ALIGN;
+                return u32::MAX;
+            }
+        };
+        self.mem.w32(f + fcb::OFFSET, pos);
+        pos
+    }
+
+    /// A(02h)/B(34h) `read` and A(03h)/B(35h) `write`: a file system's own
+    /// function, or the device's in_out on the FCB's transfer fields
+    /// (counted in blocks on a block device).
+    pub fn transfer(&mut self, fd: u32, buf: u32, len: u32, write: bool) -> Result<Flow<S>, String> {
+        let Some(f) = self.open_fcb(fd) else { return Ok(self.fail(E_BAD_FD, u32::MAX)) };
+        let d = self.mem.r32(f + fcb::DCB);
+        let after = move |m: &mut Self, v: u32| {
+            if (v as i32) < 0 {
+                m.kernel.files.errno = m.mem.r32(f + fcb::ERRNO);
+            }
+            Flow::ret(v)
+        };
+        if self.mem.r32(f + fcb::DEVICE_FLAGS) & FS != 0 {
+            return self.device(d, if write { dcb::WRITE } else { dcb::READ }, [f, buf, len, 0], after);
+        }
+        self.mem.w32(f + fcb::BUFFER, buf);
+        self.mem.w32(f + fcb::COUNT, len);
+        if self.mem.r32(d + dcb::FLAGS) & BLOCK != 0 {
+            let block = self.mem.r32(d + dcb::BLOCK).max(1);
+            if self.mem.r32(f + fcb::OFFSET) % block != 0 {
+                self.console(b"offset not on block boundary\n");
+                return Ok(Flow::ret(u32::MAX));
+            }
+            self.mem.w32(f + fcb::COUNT, len / block);
+        }
+        self.device(d, dcb::IN_OUT, [f, if write { 2 } else { 1 }, 0, 0], move |m, v| {
+            if (v as i32) > 0 {
+                let pos = m.mem.r32(f + fcb::OFFSET);
+                m.mem.w32(f + fcb::OFFSET, pos.wrapping_add(v));
+            }
+            after(m, v)
+        })
+    }
+
+    /// A(04h)/B(36h) `close(fd)`: `fd`, or -1.
+    pub fn close(&mut self, fd: u32) -> Result<Flow<S>, String> {
+        let Some(f) = self.open_fcb(fd) else { return Ok(self.fail(E_BAD_FD, u32::MAX)) };
+        let d = self.mem.r32(f + fcb::DCB);
+        self.device(d, dcb::CLOSE, [f, 0, 0, 0], move |m, v| {
+            m.mem.w32(f + fcb::FLAGS, 0);
+            if v != 0 {
+                m.kernel.files.errno = m.mem.r32(f + fcb::ERRNO);
+                return Flow::ret(u32::MAX);
+            }
+            Flow::ret(fd)
+        })
+    }
+
+    /// A(05h)/B(37h) `ioctl(fd, cmd, arg)`: 1, or 0 when the device fails.
+    pub fn ioctl(&mut self, fd: u32, cmd: u32, arg: u32) -> Result<Flow<S>, String> {
+        let Some(f) = self.open_fcb(fd) else { return Ok(self.fail(E_BAD_FD, u32::MAX)) };
+        if cmd == FIOCNBLOCK {
+            let flags = self.mem.r32(f + fcb::FLAGS);
+            self.mem.w32(f + fcb::FLAGS, if arg == 0 { flags & !NBLOCK } else { flags | NBLOCK });
+            return Ok(Flow::ret(1));
+        }
+        let d = self.mem.r32(f + fcb::DCB);
+        self.device(d, dcb::IOCTL, [f, cmd, arg, 0], move |m, v| {
+            if (v as i32) < 0 {
+                m.kernel.files.errno = m.mem.r32(f + fcb::ERRNO);
+                return Flow::ret(0);
+            }
+            Flow::ret(1)
+        })
+    }
+
+    /// A(07h)/B(39h) `isatty(fd)`: bit 1 of the file's DCB flags.
+    pub fn isatty(&self, fd: u32) -> u32 {
+        let d = if fd < k::FILES { self.mem.r32(fcb_at(fd) + fcb::DCB) } else { 0 };
+        if d == 0 { 0 } else { (self.mem.r32(d + dcb::FLAGS) >> 1) & 1 }
+    }
+
+    /// A(08h)/B(3Ah) `getc(fd)`: the byte sign-extended, or -1.
+    pub fn getc(&mut self, fd: u32) -> Result<Flow<S>, String> {
+        let tmp = self.scratch_byte();
+        let flow = self.transfer(fd, tmp, 1, false)?;
+        Ok(seq(self, flow, move |m, v| Flow::ret(if (v as i32) < 1 { u32::MAX } else { m.mem.r8(tmp) as i8 as i32 as u32 })))
+    }
+
+    /// A(09h)/B(3Bh) `putc(char, fd)`: what `write` returns.
+    pub fn putc(&mut self, c: u32, fd: u32) -> Result<Flow<S>, String> {
+        let tmp = self.scratch_byte();
+        self.mem.w8(tmp, c as u8);
+        self.transfer(fd, tmp, 1, true)
+    }
+
+    /// The kernel's one-byte buffer for `getc`, `putc` and the console.
+    fn scratch_byte(&self) -> u32 {
+        0xA000_0000 | (NAMES + 0x40)
+    }
+
+    /// A(3Bh)/B(3Ch) `getchar()`: `read(0, tmp, 1)`, ANDed with 7Fh.
+    pub fn getchar(&mut self) -> Result<Flow<S>, String> {
+        let tmp = self.scratch_byte();
+        let flow = self.transfer(0, tmp, 1, false)?;
+        Ok(seq(self, flow, move |m, _| Flow::ret(m.mem.r8(tmp) as u32 & 0x7F)))
+    }
+
+    /// A(3Ch)/B(3Dh) `putchar(char)`, and the characters of `puts` and
+    /// `printf`: TAB to the next multiple of 8, LF as CR LF, each through
+    /// `write(1, tmp, 1)`.
+    pub fn putchars(&mut self, text: Vec<u8>) -> Result<Flow<S>, String> {
+        let mut out = Vec::new();
+        for c in text {
+            match c {
+                b'\t' => loop {
+                    out.push(b' ');
+                    self.kernel.files.column += 1;
+                    if self.kernel.files.column % 8 == 0 {
+                        break;
+                    }
+                },
+                b'\n' => {
+                    out.extend([b'\r', b'\n']);
+                    self.kernel.files.column = 0;
+                }
+                c => {
+                    out.push(c);
+                    self.kernel.files.column += 1;
+                }
+            }
+        }
+        Ok(self.write_each(out, 0))
+    }
+
+    /// `out[i..]` a byte at a time to `fd` 1, without nesting while the
+    /// writes return at once.
+    fn write_each(&mut self, out: Vec<u8>, mut i: usize) -> Flow<S> {
+        while i < out.len() {
+            let tmp = self.scratch_byte();
+            self.mem.w8(tmp, out[i]);
+            i += 1;
+            match self.transfer(1, tmp, 1, true) {
+                Ok(Flow::Return(_)) => {}
+                Ok(flow) => return seq(self, flow, move |m, _| m.write_each(out, i)),
+                Err(e) => panic!("putchar: {e}"),
+            }
+        }
+        Flow::ret(0)
+    }
+
+    /// What the BIOS reports on its console (OpenBIOS's messages).
+    fn console(&mut self, text: &[u8]) {
+        if let Ok(Flow::Return(_)) = self.putchars(text.to_vec()) {}
+    }
+
+    /// The console's output: the host's log, a line at a time.
+    pub fn tty_out(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            match b {
+                b'\r' => {}
+                b'\n' => {
+                    let line = std::mem::take(&mut self.kernel.files.line);
+                    self.host.log(2, &String::from_utf8_lossy(&line));
+                }
+                b => self.kernel.files.line.push(b),
+            }
+        }
+    }
+
+    /// A(5Dh) `dev_tty_in_out(fcb, cmd)`: writes the FCB's bytes to the
+    /// console (opened for writing); there is no input, so a read returns
+    /// nothing when it mustn't wait and fails otherwise.
+    pub fn tty_in_out(&mut self, f: u32, cmd: u32) -> Result<u32, String> {
+        let (buf, count) = (self.mem.r32(f + fcb::BUFFER), self.mem.r32(f + fcb::COUNT));
+        match cmd {
+            2 if self.mem.r32(f + fcb::FLAGS) & WRITE != 0 => {
+                let bytes = self.mem.bytes(buf, count.min(MAX_LEN) as usize);
+                self.tty_out(&bytes);
+                self.mem.w32(f + fcb::BUFFER, buf.wrapping_add(count));
+                self.mem.w32(f + fcb::COUNT, 0);
+                Ok(count)
+            }
+            1 if self.mem.r32(f + fcb::FLAGS) & NBLOCK != 0 => Ok(0),
+            1 => Err("a read from the console waits for input, and the console has none".into()),
+            _ => Err("tty: bad function (the BIOS's ioabort)".into()),
+        }
+    }
+
+    /// A(5Ch) `dev_tty_open(fcb, name, mode)`: ports 0 and 1 (psx-spx: 06h
+    /// for tty2 and up).
+    pub fn tty_open(&mut self, f: u32) -> u32 {
+        if self.mem.r32(f + fcb::DEVICE_ID) < 2 {
+            return 0;
+        }
+        self.mem.w32(f + fcb::ERRNO, E_BAD_PORT);
+        u32::MAX
+    }
+
+    /// A function on a name, with a free FCB borrowed for it (`erase`,
+    /// `undelete`, `format`, `cd`, `testdevice`; OpenBIOS `psxerase`): the
+    /// device's function `off` with (fcb, rest of the name), then
+    /// `done(device's v0) -> (failed, v0)`.
+    fn on_name(&mut self, path: u32, off: u32, fail: u32, done: fn(u32) -> (bool, u32)) -> Result<Flow<S>, String> {
+        let Some(f) = self.free_fcb() else { return Ok(self.fail(E_NO_FDS, fail)) };
+        let Some((d, port, rest)) = self.device_of(path) else { return Ok(self.fail(E_NO_DEVICE, fail)) };
+        self.mem.w32(f + fcb::DEVICE_ID, port);
+        self.mem.w32(f + fcb::DCB, d);
+        let args = if off == dcb::FORMAT { [f, 0, 0, 0] } else { [f, rest, 0, 0] };
+        self.device(d, off, args, move |m, v| {
+            m.mem.w32(f + fcb::FLAGS, 0);
+            let (failed, v) = done(v);
+            if failed {
+                m.kernel.files.errno = m.mem.r32(f + fcb::ERRNO);
+            }
+            Flow::ret(v)
+        })
+    }
+
+    /// B(45h) `erase`, B(46h) `undelete`, B(41h) `format`: 1, or 0 when the
+    /// device fails (returns nonzero).
+    pub fn erase(&mut self, path: u32, off: u32) -> Result<Flow<S>, String> {
+        self.on_name(path, off, 0, |v| (v != 0, (v == 0) as u32))
+    }
+
+    /// B(40h) `cd(path)`: the device's `chdir`, 1 okay or 0 failed.
+    pub fn cd(&mut self, path: u32) -> Result<Flow<S>, String> {
+        self.on_name(path, dcb::CHDIR, 0, |v| (false, v))
+    }
+
+    /// B(59h) `testdevice(name)`: the device's own check.
+    pub fn test_device(&mut self, path: u32) -> Result<Flow<S>, String> {
+        self.on_name(path, dcb::CHECK, 0, |v| (false, v))
+    }
+
+    /// B(44h) `rename(old, new)`: on one device, with two FCBs; 1 or 0.
+    pub fn rename(&mut self, old: u32, new: u32) -> Result<Flow<S>, String> {
+        let Some(f1) = self.free_fcb() else { return Ok(self.fail(E_NO_FDS, 0)) };
+        // The second is the first again: psx-spx's bug, rename "does
+        // accidently use only 1 handle".
+        let f2 = f1;
+        let Some((d1, p1, r1)) = self.device_of(old) else { return Ok(self.fail(E_NO_DEVICE, 0)) };
+        let Some((d2, p2, r2)) = self.device_of(new) else { return Ok(self.fail(E_NO_DEVICE, 0)) };
+        if p1 != p2 || d1 != d2 {
+            return Ok(self.fail(E_CROSS_DEVICE, 0));
+        }
+        self.mem.w32(f1 + fcb::DEVICE_ID, p1);
+        self.mem.w32(f1 + fcb::DCB, d1);
+        self.device(d1, dcb::RENAME, [f1, r1, f2, r2], move |m, v| {
+            m.mem.w32(f1 + fcb::FLAGS, 0);
+            if v != 0 {
+                m.kernel.files.errno = m.mem.r32(f1 + fcb::ERRNO);
+                return Flow::ret(0);
+            }
+            Flow::ret(1)
+        })
+    }
+
+    /// B(42h) `firstfile2(path, direntry)`: the search FCB, then the
+    /// device's `firstfile`; the entry, or 0. The error number is left
+    /// alone (psx-spx).
+    pub fn firstfile(&mut self, path: u32, dir: u32) -> Result<Flow<S>, String> {
+        if self.kernel.files.first == 0 {
+            let Some(f) = self.free_fcb() else { return Ok(Flow::ret(0)) };
+            self.kernel.files.first = f;
+        }
+        let f = self.kernel.files.first;
+        let Some((d, port, rest)) = self.device_of(path) else {
+            self.mem.w32(f + fcb::FLAGS, 0);
+            return Ok(Flow::ret(0));
+        };
+        self.mem.w32(f + fcb::DEVICE_ID, port);
+        self.mem.w32(f + fcb::DCB, d);
+        self.device(d, dcb::FIRSTFILE, [f, rest, dir, 0], |_, v| Flow::ret(v))
+    }
+
+    /// B(43h) `nextfile(direntry)`: the search FCB's device's `nextfile`.
+    pub fn nextfile(&mut self, dir: u32) -> Result<Flow<S>, String> {
+        let f = self.kernel.files.first;
+        let d = if f == 0 { 0 } else { self.mem.r32(f + fcb::DCB) };
+        if d == 0 {
+            return Ok(Flow::ret(0));
+        }
+        self.device(d, dcb::NEXTFILE, [f, dir, 0, 0], |_, v| Flow::ret(v))
+    }
+
+    /// B(55h) `_get_error(fd)`: the FCB's error, or -1 for a handle not in
+    /// use.
+    pub fn get_error(&self, fd: u32) -> u32 {
+        self.open_fcb(fd).map_or(u32::MAX, |f| self.mem.r32(f + fcb::ERRNO))
+    }
+
+    /// B(47h) `AddDrv(device_info)`: the DCB copied into the first free one,
+    /// then its `init`; 1, or 0 with none free.
+    pub fn add_drv(&mut self, info: u32) -> Result<Flow<S>, String> {
+        let Some(d) = self.free_dcb() else { return Ok(Flow::ret(0)) };
+        let b = self.mem.bytes(info, k::DCB_SIZE as usize);
+        self.mem.write(d, &b);
+        self.device(d, dcb::INIT, [0; 4], |_, _| Flow::ret(1))
+    }
+
+    /// A(96h..99h): a built-in device, as `AddDrv` adds it.
+    pub fn add_device(&mut self, func: u32) -> u32 {
+        let d = match func {
+            0x96 => CDROM,
+            0x97 => CARD,
+            0x98 => DUART,
+            _ => NULLCON,
+        };
+        self.add_builtin(&d) as u32
+    }
+
+    /// B(48h) `DelDrv(name)`: the device's `remove`, then its DCB free; 1,
+    /// or 0 for an unknown device.
+    pub fn del_drv(&mut self, name: u32) -> Result<Flow<S>, String> {
+        let n = self.mem.cstr(name, 32);
+        let Some(d) = self.find_device(&n) else { return Ok(Flow::ret(0)) };
+        self.device(d, dcb::REMOVE, [0; 4], move |m, _| {
+            m.mem.w32(d + dcb::NAME, 0);
+            Flow::ret(1)
+        })
+    }
+
+    /// B(49h) `PrintInstalledDevices()`.
+    pub fn print_devices(&mut self) {
+        for i in 0..k::DEVICES {
+            let d = 0xA000_0000 | (k::DCBS + i * k::DCB_SIZE);
+            let name = self.mem.r32(d + dcb::NAME);
+            if name != 0 {
+                let line = format!(
+                    "\t{}:\t{}\n",
+                    String::from_utf8_lossy(&self.mem.cstr(name, 32)),
+                    String::from_utf8_lossy(&self.mem.cstr(self.mem.r32(d + dcb::DESC), 32))
+                );
+                self.console(line.as_bytes());
+            }
+        }
+    }
+
+    /// C(1Bh) `KernelRedirect(ttyflag)`: the console out, the dummy one (0)
+    /// or the DUART's (1) in, `fd` 0 and 1 reopened on it; nothing for other
+    /// values (psx-spx).
+    pub fn kernel_redirect(&mut self, tty: u32) -> Result<Flow<S>, String> {
+        if let Some(d) = self.find_device(b"tty") {
+            self.mem.w32(d + dcb::NAME, 0);
+        }
+        if tty > 1 {
+            return Ok(Flow::ret(0));
+        }
+        self.add_builtin(if tty == 0 { &NULLCON } else { &DUART });
+        self.reopen_stdio()
+    }
+
+    /// C(13h) `FlushStdInOutPut()`: `fd` 0 and 1 closed and reopened on
+    /// "tty00:" (OpenBIOS `reopenStdio`).
+    pub fn reopen_stdio(&mut self) -> Result<Flow<S>, String> {
+        let name = self.scratch_byte() + 4;
+        self.mem.write(name, b"tty00:\0");
+        let c0 = self.close(0)?;
+        Ok(seq(self, c0, move |m, _| {
+            let c1 = m.close(1).unwrap_or_else(|e| panic!("FlushStdInOutPut: {e}"));
+            seq(m, c1, move |m, _| {
+                let o = m.open(name, READ).unwrap_or_else(|e| panic!("FlushStdInOutPut: {e}"));
+                seq(m, o, move |m, v| {
+                    if v != 0 {
+                        return Flow::ret(0);
+                    }
+                    let o = m.open(name, WRITE).unwrap_or_else(|e| panic!("FlushStdInOutPut: {e}"));
+                    seq(m, o, |_, _| Flow::ret(0))
+                })
+            })
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{NoSdk, machine};
+
+    fn ret(m: &mut Machine<NoSdk>, f: Result<Flow<NoSdk>, String>) -> u32 {
+        match f.unwrap() {
+            Flow::Return(v) => v as u32,
+            Flow::Call { call, then } => {
+                // A guest driver's function returns 0 here.
+                m.kernel.files.line.extend(format!("<{:08x}>", call.addr).bytes());
+                let next = then(m, 0);
+                ret(m, Ok(next))
+            }
+            Flow::Block { .. } => panic!("blocked"),
+        }
+    }
+
+    #[test]
+    fn names_split_at_the_port() {
+        assert_eq!(split(b"bu10:FILE"), (b"bu".to_vec(), 0x10, 5));
+        assert_eq!(split(b" cdrom:\\A;1"), (b"cdrom".to_vec(), 0, 7));
+        assert_eq!(split(b"usb:x"), (b"us".to_vec(), 0xB, 4));
+        assert_eq!(split(b"tty"), (b"tty".to_vec(), 0, 3));
+    }
+
+    /// The control blocks through the table of tables; stdio on the
+    /// console from the start; an unknown device fails; a guest driver's
+    /// functions are called (AddDrv, open, DelDrv).
+    #[test]
+    fn devices_and_files() {
+        let mut m = machine();
+        assert_eq!(m.mem.r32(k::FCB_ENTRY), 0xA000_7300);
+        assert_eq!(m.mem.r32(k::DCB_ENTRY + 4), 0x320);
+        let s = 0x8001_0000;
+        m.mem.write(s, b"nodev:x\0");
+        let v = m.open(s, READ);
+        assert_eq!(ret(&mut m, v), u32::MAX);
+        assert_eq!(m.kernel.files.errno, E_NO_DEVICE);
+        assert_eq!(m.isatty(1), 0, "the dummy console");
+        let v = m.close(5);
+        assert_eq!(ret(&mut m, v), u32::MAX);
+        // A driver "sim" whose functions are guest code.
+        let info = 0x8002_0000;
+        m.mem.write(s + 0x10, b"sim\0");
+        m.mem.w32(info, s + 0x10);
+        m.mem.w32(info + dcb::FLAGS, FS);
+        for o in (dcb::INIT..=dcb::CHECK).step_by(4) {
+            m.mem.w32(info + o, 0x8003_0000 + o);
+        }
+        let v = m.add_drv(info);
+        assert_eq!(ret(&mut m, v), 1);
+        m.mem.write(s, b"sim:FILE\0");
+        let v = m.open(s, READ);
+        assert_eq!(ret(&mut m, v), 2, "fd 0 and 1 are stdio");
+        let v = m.transfer(2, 0x8004_0000, 16, false);
+        ret(&mut m, v);
+        m.mem.write(s, b"sim\0");
+        let v = m.del_drv(s);
+        assert_eq!(ret(&mut m, v), 1);
+        assert_eq!(String::from_utf8_lossy(&m.kernel.files.line), "<80030010><80030014><80030024><80030048>");
+        assert!(m.find_device(b"sim").is_none());
+    }
+
+    #[test]
+    fn the_console_is_the_log() {
+        let mut m = machine();
+        m.mem.write(0x8001_0000, b"a\tb\n\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x3F, [0x8001_0000, 0, 0, 0]);
+        ret(&mut m, v);
+        assert!(m.kernel.files.line.is_empty());
+        let v = crate::bios::call(&mut m, 0xB0, 0x3D, [b'x' as u32, 0, 0, 0]);
+        ret(&mut m, v);
+        assert_eq!(m.kernel.files.line, b"x");
+        assert_eq!(m.mem.r32(fcb_at(1) + fcb::OFFSET), 12, "a TAB to column 8, LF as CR LF, then x");
+    }
+}

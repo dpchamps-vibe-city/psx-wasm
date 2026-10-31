@@ -89,5 +89,9 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
     m.lay_out_threads(tcbs);
     // The CD controller, for SDK code that drives the drive (D58).
     m.cdc_insert();
+    // The BIOS's CD-ROM driver as its boot leaves it (`_96_init`: its
+    // handlers, events and interrupts), with the path table the boot read.
+    m.cd_install();
+    m.cd_boot();
     Ok(Boot { exe, pc0, gp0, t_addr, t_size, b_addr, b_size, sp, events, text_hash: fnv(body) })
 }
