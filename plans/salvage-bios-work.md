@@ -265,10 +265,10 @@ handoff's missing-call list.
   reject patched BIOS-table targets; non-CD built-in kernel-handler addresses
   lack callable implementations. Fix meaningful native call/exception paths
   through the existing driver, guest calls and lowering.
-- [ ] **Coverage reporting.** `bios::implemented()` currently mistakes some
-  named stubs/failures for completed functions. Make build reporting distinguish
-  working support, partial support, unsupported calls and documented fatal/no-op
-  behaviour. Keep this simple; no new coverage framework.
+- [x] **Coverage reporting.** Build reports distinguish working, partial,
+  unsupported, documented fatal/no-op and dynamic unknown calls. The old
+  `implemented` field remains a compatibility gate, not a completeness claim.
+  Alias names resolve consistently; classifications must follow later changes.
 
 For control-flow changes that require a substantial compiler/runtime redesign,
 record the concrete missing capability and ask the user before implementing it.
@@ -670,6 +670,16 @@ hazards, incomplete callback state transitions/error fields, and an extra read
 completion vblank. Corrective run `15ef11e6-62fc-4b78-9fc6-442d57c0e63c` resumes
 the same isolated worker with these findings, two disposable-card lifecycle
 coverage, and public-reference verification of helper/channel semantics.
+Its corrective `ffe6e60` is also **not integrated**. Parent read the full combined
+patch and pinned references: B(58h) returns the requested device ID, not the last
+slot index; generic close clears flags even on failure; the write-info stage
+must not be consumed by the preceding frame's callback. Read completion orders
+high then fd then low, while write-info orders fd then high then low in OpenBIOS
+(the earlier parent brief incorrectly requested fd before high for reads).
+Run `cf4f986e-fce2-4feb-a403-99d0b460f196` resumes the same worker with those exact
+corrections, mid-operation error/new-card checks and auto-format event ordering.
+Native close cancellation must protect a reused descriptor without changing the
+generic close contract; callback coverage remains partial until accepted.
 
 After the user flagged unnecessary serialization, workflow
 `810c2b90-9237-4898-bca6-953b1a8efeff` adds four parallel DeepSeek lanes alongside
@@ -685,6 +695,21 @@ that correction (no Qwen active; only Qwen has the one-at-a-time limit):
 Parent retains difficult runtime/control-flow work, source acceptance and
 integration. No child may subdelegate, write input snapshots or real cards, or
 expand architecture unilaterally.
+
+Coverage worker `66b62cd` is integrated as `e005f10` with parent corrections:
+`bios-calls.json` retains name/implemented and adds support; the summary no
+longer claims all calls work. The existing build rejection policy is preserved.
+Parent classified absent font data as unsupported, inherited CD/file/thread
+limitations as partial, fixed alias names and tested a real saved-entry lookup.
+Documented COP1-fatal conversions are named without fabricating conversions.
+Integrated BIOS 38/build 1 tests pass. No new game artifacts were built; current
+release CLI and game outputs remain at source `e2fb21b` until the next batch gate.
+
+Load worker found the default kernel heap cannot hold its 0x800-byte header
+sector. Parent authorized one reserved kernel data buffer at 8040h..8840h,
+clear of existing data, native callable slots and kernel tables, using the
+existing RAM-backed-data approach. No SP manipulation, heap expansion, runtime
+interface or ABI-version change; static-buffer limitations must be reported.
 
 ## Progress log
 

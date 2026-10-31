@@ -15,6 +15,7 @@ use psxw_abi::kernel as k;
 pub(crate) const MAX_LEN: u32 = 0x0020_0000;
 
 pub fn name(table: u32, func: u32) -> &'static str {
+    let (table, func) = tables::canonical(table, func);
     match (table, func) {
         (0xA0, 0x0A) => "todigit",
         (0xA0, 0x0B) => "atof",
@@ -263,29 +264,22 @@ pub fn support(table: u32, func: u32) -> Support {
         // No cache or dummy device to affect; retail returns zero.
         (0xA0, 0x44) | (0xA0, 0x57) | (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => Support::Noop,
         // Recognised, but the required capability is not available here.
-        (0xA0, 0x14) | (0xA0, 0x43) | (0xA0, 0x52) | (0xB0, 0x3E) | (0xC0, 0x09) => {
-            Support::Unsupported
-        }
-        // Native service present, with a recorded limitation on the
-        // documented behaviour.
+        (0xA0, 0x14) | (0xA0, 0x43) | (0xA0, 0x52) | (0xB0, 0x3E) | (0xB0, 0x51) | (0xC0, 0x09) => Support::Unsupported,
+        // Native services with recorded gaps: continuation/thread contexts,
+        // host console input, card completion, CD errors/event waits and
+        // filesystem details, or configuration/identity restrictions. Public
+        // wrappers inherit these gaps; a working happy path is not completeness.
         (0xA0, 0x13)
-        | (0xA0, 0x5D)
-        | (0xA0, 0x5E)
-        | (0xA0, 0x66)
-        | (0xA0, 0x67)
-        | (0xA0, 0x94)
-        | (0xA0, 0x95)
-        | (0xA0, 0x9C)
-        | (0xA0, 0xAB)
-        | (0xA0, 0xAC)
-        | (0xA0, 0xAD)
-        | (0xA0, 0xAF)
+        | (0xA0, 0x5D..=0x5F)
+        | (0xA0, 0x60 | 0x62..=0x67)
+        | (0xA0, 0x78 | 0x7C | 0x7E | 0x81)
+        | (0xA0, 0x94 | 0x95 | 0x9C)
+        | (0xA0, 0xA4..=0xA6)
+        | (0xA0, 0xAB..=0xAF)
         | (0xA0, 0xB4)
-        | (0xB0, 0x4E)
-        | (0xB0, 0x4F)
-        | (0xB0, 0x51)
-        | (0xB0, 0x5C)
-        | (0xB0, 0x5D) => Support::Partial,
+        | (0xB0, 0x0E..=0x10)
+        | (0xB0, 0x32 | 0x34 | 0x35 | 0x3A | 0x3C | 0x40 | 0x42 | 0x43)
+        | (0xB0, 0x4E | 0x4F | 0x5C | 0x5D) => Support::Partial,
         _ => Support::Working,
     }
 }
@@ -1118,13 +1112,19 @@ mod tests {
         assert_eq!(support(0xA0, 0x1B), Support::Working);
         assert_eq!(support(0xA0, 0x00), support(0xB0, 0x32));
         assert_eq!(support(0xC0, 0x80 + 0x57), support(0xB0, 0x57));
-        // A returned native stand-in still names the same service.
-        assert_eq!(support(0xA0, 0x70), support(0xA0, 0x55));
+        assert_eq!(name(0xA0, 0x00), "open");
+        assert_eq!(name(0xA0, 0x70), "_bu_init");
+        // A saved native entry resolves to the same underlying service.
+        let (table, func) = tables::stand_in_fn(tables::stand_in(0xA0, 0x70)).unwrap();
+        assert_eq!(support(table, func), support(0xA0, 0x55));
         // Native service with a recorded limitation.
         assert_eq!(support(0xA0, 0x9C), Support::Partial);
         assert_eq!(support(0xA0, 0xB4), Support::Partial);
-        assert_eq!(support(0xB0, 0x51), Support::Partial);
+        assert_eq!(support(0xB0, 0x51), Support::Unsupported, "no glyph resource exists");
         assert_eq!(support(0xB0, 0x5D), Support::Partial);
+        assert_eq!(support(0xB0, 0x10), Support::Partial, "callback thread switches are unsupported");
+        assert_eq!(support(0xA0, 0xA5), Support::Partial, "CD error/event behaviour remains incomplete");
+        assert_eq!(support(0xA0, 0x02), Support::Partial, "read inherits device limitations");
         // Recognised but no required capability.
         assert_eq!(support(0xA0, 0x14), Support::Unsupported);
         assert_eq!(support(0xA0, 0x43), Support::Unsupported);
