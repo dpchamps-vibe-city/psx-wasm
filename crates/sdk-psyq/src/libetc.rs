@@ -739,12 +739,12 @@ pub(crate) mod fixture {
     pub const LAST: u32 = 0x8005_64A8;
 
     /// A `lui`/`addiu` pair at `pc` that makes `addr`.
-    fn pair_at(m: &mut M, pc: u32, addr: u32) {
+    pub(crate) fn pair_at(m: &mut M, pc: u32, addr: u32) {
         m.mem.w32(pc, 0x3C02_0000 | addr.wrapping_add(0x8000) >> 16);
         m.mem.w32(pc + 4, 0x2442_0000 | (addr & 0xFFFF));
     }
 
-    fn jal_to(m: &mut M, pc: u32, target: u32) {
+    pub(crate) fn jal_to(m: &mut M, pc: u32, target: u32) {
         m.mem.w32(pc, 0x0C00_0000 | (target >> 2) & 0x03FF_FFFF);
     }
 
