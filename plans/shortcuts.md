@@ -70,8 +70,9 @@ Highest impact:
 - TR2, registers outside o32 arrive as 0;
 - DEV1, CD-DA plays nothing;
 - DEV19 and SDK1, digital pad only;
-- SDK2 and SDK4, SDK state kept outside guest RAM, justified only by what
-  the current target games read.
+- SDK4 and SDK2, SDK state kept outside guest RAM with no build check for
+  other readers; libetc's justification rests partly on what the current
+  target games read.
 
 ## BIOS
 
@@ -407,9 +408,11 @@ Highest impact:
 - [ ] **SDK2. Port records and buffers live in the runtime.**
   `sdk-psyq/src/libpad.rs:48-52, 146-161`. Unadapted code reading
   libpad's records in guest RAM sees stale values, and the build's chip
-  decision (`psxw-build/src/game.rs:983-1037`) doesn't detect it.
-  Ref: design §5, justified only by what the current target games read.
-  Impact: med. Checked: audit.
+  decision (`psxw-build/src/game.rs:975-1037`) follows calls into code
+  that touches hardware or kernel RAM, not reads of SDK globals.
+  Ref: design §5 table; the module doc (`libpad.rs:48-50`): "only
+  libpad's own code reads them" (`psxw sdk scan`, an SDK-level check).
+  Impact: med. Checked: yes.
 - [ ] **SDK3. `PadSetAct` returns 0 and sends nothing.**
   `sdk-psyq/src/libpad.rs:650-656`. Spec: returns the port record and sends
   the actuator levels. Ref: module doc. Impact: low. Checked: audit.
@@ -419,9 +422,11 @@ Highest impact:
 - [ ] **SDK4. `Vcount`, `Hcount`, the handler, callback and DMA tables
   live in the runtime.** `sdk-psyq/src/libetc.rs:4-7, 125-158, 303,
   528-530`. Code reading them in guest RAM sees zeros; the build doesn't
-  detect it. Ref: design §5 ("no code but libetc's own reads them in
-  either game"); open-items "Other difference classes ramdiff shows".
-  Impact: med. Checked: audit.
+  detect it (same check as SDK2). Ref: design §5 table; the module doc
+  (`libetc.rs:4-7`): "no code but libetc's own reads them in either game
+  (`psxw sdk scan`; the games' symbol files)", partly a per-game argument;
+  open-items "Other difference classes ramdiff shows". Impact: med.
+  Checked: yes.
 - [ ] **SDK5. `VSync`'s wait doesn't spend or restart the guest's
   budget.** `sdk-psyq/src/libetc.rs:556-563, 572-585`. Ref: D66.
   Impact: low-med. Checked: audit.
