@@ -1,6 +1,6 @@
 # Spec fidelity
 
-**Status:** phase 1 done but for the human's runs; phases 2 and 4 in progress.
+**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress.
 **Depends on:** [unified adapter layer, phase 1](unified-adaptor-layer/phase1.md)
 (done): the adapters this plan corrects.
 **Replaces:** `plans/shortcuts.md` (the 2026-10-30 audit, commits
@@ -352,6 +352,16 @@ calls (TR1, B19).
    as before.
 4. **Human:** `psxw conform <game> --modes` and `psxw ci` for both games.
 
+**Status (2026-10-31): done but for the human's runs.** 1: passes. 2:
+chip irq, sio0, cd and gpu pass in both games, mdec in bof4
+(`out/sf-p2-conform-*.log`). 3: both games build with every chip native.
+4: **waiting on the human:** `./target/release/psxw conform btn --modes`,
+`./target/release/psxw conform bof4 --modes`, `./target/release/psxw ci
+btn`, `./target/release/psxw ci bof4`, and both games' replays (tasks 3, 5,
+6 asked for them). What moved: libetc's and libpad's state and addresses
+(D67), the waits' timing (SDK3–5: whether bof4's native and device runs
+now agree is D66's open note), DMA0/DMA1 through the controller (SDK11).
+
 ## Phase 3: the BIOS
 
 The BIOS implemented properly. Phase 1 fixed its bugs.
@@ -368,10 +378,12 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    of tables, sized by `SYSTEM.CNF` `EVENT=` (`psx-bios/src/kernel.rs`).
    Done `5e52ad2`: after the TCBs (`psxw_abi::kernel::EVCBS`), through
    the table of tables' 120h entry, psx-spx's layout; every access is RAM.
-4. [ ] **BIOS7. Interrupt chains in RAM.** `SysEnqIntRP`/`SysDeqIntRP`
+4. [x] **BIOS7. Interrupt chains in RAM.** `SysEnqIntRP`/`SysDeqIntRP`
    link elements into the exception control blocks; the handler walks RAM
    only (`psx-bios/src/io.rs:684-767`); `Sdk::chain_element` keeps
    working for adapter-owned elements.
+   Done `6155844`: `SysEnqIntRP` prepends in RAM, `SysDeqIntRP` unlinks and
+   returns the element; the handler walks RAM only.
 5. [ ] **BIOS4. The kernel's own interrupt handlers are chain elements**
    (`EnqueueTimerAndVblankIrqs`): root counter and vblank events, pad
    buffer filling and card pacing run when the interrupt is taken, in
