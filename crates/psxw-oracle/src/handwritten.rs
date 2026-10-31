@@ -274,7 +274,8 @@ fn bios() -> Vec<Handwritten> {
         call("bios_gpu_sync", 0x4E, [0, 0, 0, 0], vec![], vec![]),
         // Files and devices (phase 3 task 9): what fails without touching a
         // device, so the runner's BIOS keeps no state from it. fd 5 is
-        // unused, "nodev" no device.
+        // unused, "nodev" no device. (GetB0Table and GetC0Table have no
+        // vectors: OpenBIOS stops unless the caller is a patch it knows.)
         file("bios_open_no_device", 0x32, [s, 1, 0, 0], b"nodev:x\0"),
         call("bios_open_no_device_a0", 0x00, [s, 1, 0, 0], text(b"nodev:x\0"), vec![]),
         file("bios_lseek_unused", 0x33, [5, 0, 0, 0], b""),
@@ -331,10 +332,6 @@ fn bios_disputed() -> Vec<Handwritten> {
         // nothing).
         call("bios_gpu_cwp", 0x4A, [s, 1, 0, 0], vec![(s, vec![0; 4])], vec![]),
         call("bios_gpu_abort_dma", 0x4C, [0, 0, 0, 0], vec![], vec![]),
-        // The tables at 874h and 674h (OpenBIOS: wherever its .data puts
-        // them).
-        bios_call("bios_get_b0_table", 0xB0, 0x57, [0; 4], vec![], vec![]),
-        bios_call("bios_get_c0_table", 0xB0, 0x56, [0; 4], vec![], vec![]),
     ]
 }
 

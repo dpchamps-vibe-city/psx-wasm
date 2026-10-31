@@ -296,8 +296,30 @@ mod tests {
         let mut m = machine();
         ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));
         assert_eq!(m.kernel.custom_exit, 0x8001_0000);
-        ret(bios::call(&mut m, 0xB0, 0x18, [0; 4]));
+        // The default structure: ReturnFromException, the exception
+        // stack, zeros; hooking it is the default.
+        let d = ret(bios::call(&mut m, 0xB0, 0x18, [0; 4]));
         assert_eq!(m.kernel.custom_exit, 0);
+        assert_eq!((m.mem.r32(d), m.mem.r32(d + 4), m.mem.r32(d + 8)), (tables::stand_in(0xB0, 0x17), 0x8000_6FFC, 0));
+        ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));
+        ret(bios::call(&mut m, 0xB0, 0x19, [d, 0, 0, 0]));
+        assert_eq!(m.kernel.custom_exit, 0);
+    }
+
+    /// syscall 4 and up deliver F0000010h/4000h; SystemError and the
+    /// entries that jump to 0 stop.
+    #[test]
+    fn syscalls_and_system_errors() {
+        let mut m = machine();
+        let h = ret(bios::call(&mut m, 0xB0, 0x08, [0xF000_0010, 0x4000, 0x2000, 0]));
+        ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
+        assert_eq!(bios::syscall(&mut m, [7, 0, 0, 0]), Ok(0));
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
+        for (t, f) in [(0xA0, 0x40), (0xB0, 0x1A), (0xC0, 0x0B), (0xB0, 0x11), (0xC0, 0x1E), (0xB0, 0x38)] {
+            assert!(bios::call(&mut m, t, f, [0; 4]).is_err(), "{t:X}:{f:X}");
+            assert!(bios::implemented(t, f), "{t:X}:{f:X} stops as the console does");
+        }
+        assert!(!bios::implemented(0xA0, 0xA0), "_boot");
     }
 
     #[test]

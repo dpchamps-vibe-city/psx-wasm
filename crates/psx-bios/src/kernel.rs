@@ -267,6 +267,12 @@ pub const CD_DMA_ELEMENT: u32 = 8;
 const ELEMENTS: u32 = 9;
 const KERNEL_CODE: u32 = 0xBFC0_8000;
 
+/// The default exception exit `ResetEntryInt` applies (psx-spx), a
+/// `setjmp` buffer: ReturnFromException, the exception stack's top less 4
+/// (its 1000h bytes below the kernel's data), zeros.
+pub const DEFAULT_EXIT: u32 = 0xA000_7940;
+const EXCEPTION_STACK: u32 = 0x8000_7000;
+
 pub fn kernel_element(i: u32) -> u32 {
     KERNEL_ELEMENTS + 16 * i
 }
@@ -307,6 +313,15 @@ impl<S: Sdk> Machine<S> {
         self.enqueue_syscall_handler(0);
         self.init_def_int(3);
         self.enqueue_rcnt_irqs(1);
+        self.lay_out_default_exit();
+    }
+
+    /// [`DEFAULT_EXIT`], laid out; its address.
+    pub fn lay_out_default_exit(&mut self) -> u32 {
+        self.mem.write(DEFAULT_EXIT, &[0; 0x30]);
+        self.mem.w32(DEFAULT_EXIT, crate::tables::stand_in(0xB0, 0x17));
+        self.mem.w32(DEFAULT_EXIT + 4, EXCEPTION_STACK - 4);
+        DEFAULT_EXIT
     }
 
     /// C(00h) `EnqueueTimerAndVblankIrqs(priority)`: the root counter and

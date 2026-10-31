@@ -81,7 +81,53 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x55) => "_bu_init",
         (0xA0, 0x56) => "_96_remove",
         (0xA0, 0x9F) => "SetMemSize",
-        (0xA0, 0xA1) => "SystemError",
+        (0xA0, 0x3A) => "_exit",
+        (0xA0, 0x40) => "SystemErrorUnresolvedException",
+        (0xA0, 0x4F) | (0xA0, 0x50) | (0xA0, 0x53) | (0xA0, 0x9A) | (0xA0, 0x9B) | (0xA0, 0xA1) => "SystemError",
+        (0xA0, 0x57..=0x5A) | (0xA0, 0x73..=0x77) | (0xA0, 0x79..=0x7B) | (0xA0, 0x7D) | (0xA0, 0x7F) | (0xA0, 0x80) | (0xA0, 0x82..=0x8F) | (0xA0, 0xB0) | (0xA0, 0xB1) | (0xA0, 0xB3) => "return 0",
+        (0xA0, 0x5B) => "dev_tty_init",
+        (0xA0, 0x5C) => "dev_tty_open",
+        (0xA0, 0x5D) => "dev_tty_in_out",
+        (0xA0, 0x5E) => "dev_tty_ioctl",
+        (0xA0, 0x5F) => "dev_cd_open",
+        (0xA0, 0x60) => "dev_cd_read",
+        (0xA0, 0x61) => "dev_cd_close",
+        (0xA0, 0x62) => "dev_cd_firstfile",
+        (0xA0, 0x63) => "dev_cd_nextfile",
+        (0xA0, 0x64) => "dev_cd_chdir",
+        (0xA0, 0x65) => "dev_card_open",
+        (0xA0, 0x66) => "dev_card_read",
+        (0xA0, 0x67) => "dev_card_write",
+        (0xA0, 0x68) => "dev_card_close",
+        (0xA0, 0x69) => "dev_card_firstfile",
+        (0xA0, 0x6A) => "dev_card_nextfile",
+        (0xA0, 0x6B) => "dev_card_erase",
+        (0xA0, 0x6C) => "dev_card_undelete",
+        (0xA0, 0x6D) => "dev_card_format",
+        (0xA0, 0x6E) => "dev_card_rename",
+        (0xA0, 0x6F) => "card_clear_error",
+        (0xA0, 0x78) => "CdAsyncSeekL",
+        (0xA0, 0x7C) => "CdAsyncGetStatus",
+        (0xA0, 0x7E) => "CdAsyncReadSector",
+        (0xA0, 0x81) => "CdAsyncSetMode",
+        (0xA0, 0x90) => "CdromIoIrqFunc1",
+        (0xA0, 0x91) => "CdromDmaIrqFunc1",
+        (0xA0, 0x92) => "CdromIoIrqFunc2",
+        (0xA0, 0x93) => "CdromDmaIrqFunc2",
+        (0xA0, 0x94) => "CdromGetInt5errCode",
+        (0xA0, 0x95) => "CdInitSubFunc",
+        (0xA0, 0x96) => "AddCDROMDevice",
+        (0xA0, 0x97) => "AddMemCardDevice",
+        (0xA0, 0x98) => "AddDuartTtyDevice",
+        (0xA0, 0x99) => "add_nullcon_driver",
+        (0xA0, 0x9E) => "SetCdromIrqAutoAbort",
+        (0xA0, 0xA0) => "_boot",
+        (0xA0, 0xA2) => "EnqueueCdIntr",
+        (0xA0, 0xA3) => "DequeueCdIntr",
+        (0xA0, 0xA4) => "CdGetLbn",
+        (0xA0, 0xA5) => "CdReadSector",
+        (0xA0, 0xA6) => "CdGetStatus",
+        (0xA0, 0xB5..=0xBF) => "jump_to_00000000h",
         (0xA0, 0xAB) => "_card_info",
         (0xA0, 0xAC) => "_card_load",
         (0xA0, 0xAD) => "_card_auto",
@@ -117,6 +163,21 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x34) => "read",
         (0xB0, 0x35) => "write",
         (0xB0, 0x36) => "close",
+        (0xB0, 0x37) => "ioctl",
+        (0xB0, 0x38) => "exit",
+        (0xB0, 0x39) => "isatty",
+        (0xB0, 0x3A) => "getc",
+        (0xB0, 0x3B) => "putc",
+        (0xB0, 0x3C) => "getchar",
+        (0xB0, 0x3D) => "putchar",
+        (0xB0, 0x3E) => "gets",
+        (0xB0, 0x40) => "cd",
+        (0xB0, 0x47) => "AddDrv",
+        (0xB0, 0x48) => "DelDrv",
+        (0xB0, 0x49) => "PrintInstalledDevices",
+        (0xB0, 0x59) => "testdevice",
+        (0xB0, 0x1A..=0x1F) | (0xB0, 0x21..=0x23) | (0xB0, 0x2A) | (0xB0, 0x2B) | (0xB0, 0x52) | (0xB0, 0x5A) => "SystemError",
+        (0xB0, 0x11) | (0xB0, 0x24..=0x29) | (0xB0, 0x2C..=0x31) | (0xB0, 0x5E..=0xFF) => "jump_to_00000000h",
         (0xB0, 0x3F) => "puts",
         (0xB0, 0x41) => "format",
         (0xB0, 0x42) => "firstfile",
@@ -138,9 +199,18 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x5B) => "ChangeClearPad",
         (0xB0, 0x5C) => "_card_status",
         (0xB0, 0x5D) => "_card_wait",
+        (0xC0, 0x00) => "EnqueueTimerAndVblankIrqs",
+        (0xC0, 0x01) => "EnqueueSyscallHandler",
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
+        (0xC0, 0x06) => "ExceptionHandler",
         (0xC0, 0x07) => "InstallExceptionHandlers",
+        (0xC0, 0x0B) => "SystemError",
+        (0xC0, 0x0C) => "InitDefInt",
+        (0xC0, 0x12) => "InstallDevices",
+        (0xC0, 0x13) => "FlushStdInOutPut",
+        (0xC0, 0x1B) => "KernelRedirect",
+        (0xC0, 0x1E..=0x7F) => "jump_to_00000000h",
         (0xC0, 0x0A) => "ChangeClearRCnt",
         (0xC0, 0x0D) => "SetIrqAutoAck",
         (0xC0, 0x1A) => "set_card_find_mode",
@@ -165,6 +235,8 @@ pub fn unsupported(table: u32, func: u32) -> Option<&'static str> {
         (0xA0, 0x43) | (0xA0, 0x51) => Some("loading and running another executable is not supported: only what was translated at build time runs"),
         // psx-spx: they use the absent COP1, so the console locks up.
         (0xA0, 0x0B) | (0xA0, 0x32) => Some("it uses COP1, which the console doesn't have (the call locks up on hardware)"),
+        (0xA0, 0xA0) => Some("rebooting runs the BIOS's boot again, and only what was translated at build time runs"),
+        (0xC0, 0x06) => Some("the exception handler is entered by exceptions, which the runtime takes at safepoints (D45), not called"),
         _ => None,
     }
 }
@@ -226,7 +298,19 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             // longjmp traps.
             r(0)
         }
-        (0xA0, 0x0B) | (0xA0, 0x14) | (0xA0, 0x32) | (0xA0, 0x43) | (0xA0, 0x51) => Err(format!("{label}: {}", unsupported(table, func).unwrap_or_default())),
+        (0xA0, 0x0B) | (0xA0, 0x14) | (0xA0, 0x32) | (0xA0, 0x43) | (0xA0, 0x51) | (0xA0, 0xA0) | (0xC0, 0x06) => {
+            Err(format!("{label}: {}", unsupported(table, func).unwrap_or_default()))
+        }
+        // The console stops: SystemError's (psx-spx), the functions whose
+        // entries jump to 0, the game exiting.
+        (0xA0, 0x40) => Err(format!("{label}: an unresolved exception: the console stops")),
+        (0xA0, 0x4F) | (0xA0, 0x50) | (0xA0, 0x53) | (0xA0, 0x9A) | (0xA0, 0x9B) | (0xB0, 0x1A..=0x1F) | (0xB0, 0x21..=0x23) | (0xB0, 0x2A) | (0xB0, 0x2B) | (0xB0, 0x52) | (0xB0, 0x5A) | (0xC0, 0x0B) => {
+            Err(format!("{label}: SystemError: the console stops"))
+        }
+        (0xA0, 0xB5..=0xBF) | (0xB0, 0x11) | (0xB0, 0x24..=0x29) | (0xB0, 0x2C..=0x31) | (0xB0, 0x5E..=0xFF) | (0xC0, 0x1E..=0x7F) => {
+            Err(format!("{label}: its entry jumps to 00000000h"))
+        }
+        (0xA0, 0x3A) => Err(format!("{label}: the game exited ({:#x}): the console stops", a[0])),
         (0xA0, 0x15) | (0xA0, 0x16) => {
             // strcat, strncat (at most maxlen characters, none for a
             // negative maxlen); 0 for a null pointer.
@@ -541,12 +625,14 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x16) => r(m.kernel.pad_dr(&mut *m.mem)),
         (0xB0, 0x17) => Err(format!("{label}: called outside an exception handler")),
         (0xB0, 0x18) => {
-            // ResetEntryInt: back to the default exit (ReturnFromException).
+            // ResetEntryInt: back to the default exit (ReturnFromException);
+            // the default structure's address (psx-spx).
             m.kernel.custom_exit = 0;
-            r(0)
+            r(m.lay_out_default_exit())
         }
         (0xB0, 0x19) => {
-            m.kernel.custom_exit = a[0];
+            // HookEntryInt: the default structure is the default exit.
+            m.kernel.custom_exit = if a[0] == kernel::DEFAULT_EXIT { 0 } else { a[0] };
             r(0)
         }
         (0xB0, 0x20) => {
@@ -559,7 +645,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x34) | (0xB0, 0x35) => m.transfer(a[0], a[1], a[2], func == 0x35),
         (0xB0, 0x36) => m.close(a[0]),
         (0xB0, 0x37) => m.ioctl(a[0], a[1], a[2]),
-        (0xB0, 0x38) => Err(format!("{label}: the game exited ({:#x})", a[0])),
+        (0xB0, 0x38) => Err(format!("{label}: the game exited ({:#x}): the console stops", a[0])),
         (0xB0, 0x39) => r(m.isatty(a[0])),
         (0xB0, 0x3A) => m.getc(a[0]),
         (0xB0, 0x3B) => m.putc(a[0], a[1]),
@@ -694,7 +780,12 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
         // ChangeThreadSubFunction.
         3 => Ok(1),
         0 => Ok(0),
-        n => Err(format!("syscall {n} not implemented")),
+        // The others deliver the exception event (psx-spx); v0 is the
+        // caller's on the console, 0 here.
+        _ => {
+            m.deliver_event(0xF000_0010, 0x4000);
+            Ok(0)
+        }
     }
 }
 
