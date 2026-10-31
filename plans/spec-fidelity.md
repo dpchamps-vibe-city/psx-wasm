@@ -317,7 +317,7 @@ calls (TR1, B19).
    the original over the state now in RAM. Retire the stand-ins that
    become unused.
    Done `b92f582` (libetc: the context, intr_vb's and intr_dma's own
-   handlers) and the commit after `dbda488` (libgpu's pump: an adapter
+   handlers) and `b1f07f4` (libgpu's pump: an adapter
    bound by its place in `sys.o`, `libgpu/sys:0x23a8`, which psxw-build now
    supports for static functions). libcd's interrupt handler is still a
    stand-in (`libcd::HANDLER`); the same binding would retire it (Findings).
