@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(m.io.as_ref().unwrap().gp0_words, 1);
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x48, [0x0300_0001, 0, 0, 0])), 0, "SendGP1Command");
         assert!(m.io.as_ref().unwrap().gpu.display().off);
-        let status = m.io.as_ref().unwrap().gpu.status();
+        let status = m.io.as_ref().unwrap().gpu.status(m.clock.now, m.clock.video);
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4D, [0, 0, 0, 0])), status, "GetGPUStatus");
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4E, [0, 0, 0, 0])), 0, "gpu_sync");
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4C, [0, 0, 0, 0])), 0x1F80_1814, "gpu_abort_dma");

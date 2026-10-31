@@ -254,7 +254,7 @@ fn gp1(m: &mut M, v: u32) {
 }
 
 fn gpustat(m: &M) -> u32 {
-    m.io.as_ref().map_or(0, |io| io.gpu.status())
+    m.io.as_ref().map_or(0, |io| io.gpu.status(m.clock.now, m.clock.video))
 }
 
 fn gpuread(m: &mut M) -> u32 {

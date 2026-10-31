@@ -226,7 +226,7 @@ impl<S: Sdk> Machine<S> {
         } else if addr & !3 == GP0 {
             io.gpu.read() >> (8 * (addr & 3))
         } else if addr & !3 == GP1 {
-            io.gpu.status() >> (8 * (addr & 3))
+            io.gpu.status(now, video) >> (8 * (addr & 3))
         } else {
             return Err(format!("read of unmodelled I/O register {addr:#010x} ({size} bytes)"));
         };
@@ -366,10 +366,11 @@ impl<S: Sdk> Machine<S> {
         Ok(())
     }
 
-    /// GPUSTAT from the GPU core (`GetGPUStatus`, A0h:4Dh), as far as the
-    /// front end knows it (no field timing).
+    /// GPUSTAT from the GPU core (`GetGPUStatus`, A0h:4Dh) at the clock's
+    /// cycle and video standard.
     pub fn gpu_status(&mut self) -> Result<u32, String> {
-        Ok(self.io.as_mut().ok_or_else(no_gpu)?.gpu.status())
+        let (now, video) = (self.clock.now, self.clock.video);
+        Ok(self.io.as_mut().ok_or_else(no_gpu)?.gpu.status(now, video))
     }
 
     /// GPU DMA channel 2 for the BIOS's `gpu_send_dma` and
