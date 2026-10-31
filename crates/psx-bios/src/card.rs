@@ -84,6 +84,8 @@ pub struct CardFile {
 pub struct Cards {
     pub slots: [Option<Card>; 2],
     loaded: bool,
+    /// `InitCARD2` ran before (its return value).
+    initialized: bool,
     ignore_new: [bool; 2],
     pub status: [u32; 2],
     pending: VecDeque<(usize, Op)>,
@@ -213,6 +215,15 @@ impl<S: Sdk> Machine<S> {
         let queued = self.card_queue(slot, Op::Write { frame: 0x3F, data, high: true });
         self.kernel.cards.ignore_new[slot] |= queued;
         queued as u32
+    }
+
+    /// `InitCARD2(pad_enable)`: both ports ready, the pads read with the
+    /// cards or not; whether it ran before (OpenBIOS `initCard`).
+    pub fn card_init(&mut self, pad_enable: u32) -> u32 {
+        self.cards_ready();
+        self.kernel.cards.status = [READY; 2];
+        self.kernel.pad_enable = pad_enable != 0;
+        std::mem::replace(&mut self.kernel.cards.initialized, true) as u32
     }
 
     pub fn card_new(&mut self, port: u32) {

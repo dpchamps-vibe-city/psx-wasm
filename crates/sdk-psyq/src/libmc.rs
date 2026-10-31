@@ -1,9 +1,10 @@
 //! libcard's BIOS wrappers, and libmcx (chip memcard, D59, D65).
 //!
-//! **libcard** is BIOS internals: its `_patch_card` patches Sony BIOS code
-//! in kernel RAM, so its wrappers are adapters that find the cards ready
-//! (`psx-bios::card`, D43). libmcrd runs as guest code over the BIOS card
-//! functions.
+//! **libcard**'s wrappers (`InitCARD`, `StartCARD`, `StopCARD`) run as
+//! the original code into the BIOS's card functions (`psx-bios::card`,
+//! D43); the functions they call to patch Sony BIOS code in kernel RAM are
+//! adapters with nothing to patch. libmcrd runs as guest code over the
+//! BIOS card functions.
 //!
 //! **libmcx** talks to a PocketStation in a memory card slot over SIO0
 //! itself. A command function (`McxGetApl`, `McxCardType`, …) reserves a
@@ -56,14 +57,14 @@ use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
 use psx_bios::{Event, Flow, GuestCall, IrqStep};
 use psx_devices::memcard::Responder;
 
+/// libcard's functions that patch the Sony BIOS's card driver in kernel
+/// RAM: the HLE BIOS has no such code, so there is nothing to patch.
 pub const ADAPTERS: &[(&str, Adapter)] = &[
-    ("InitCARD", cards),
-    ("InitCARD2", cards),
-    ("StartCARD", cards),
-    ("StartCARD2", cards),
-    ("StopCARD", zero),
-    ("StopCARD2", zero),
-    ("_bu_init", cards),
+    ("_patch_card", zero),
+    ("_patch_card2", zero),
+    ("_patch_card_info", zero),
+    ("_copy_memcard_patch", zero),
+    ("_ExitCard", zero),
 ];
 
 /// Chip memcard's adapters (libmcx).
@@ -625,13 +626,6 @@ fn card_handler(m: &mut M, l: Lib) -> std::result::Result<(), String> {
 }
 
 // --- libcard ------------------------------------------------------------------------
-
-/// The BIOS wrappers (`InitCARD` → B(4Ah), …): the cards are ready
-/// (`psx-bios::card`), whatever `_patch_card` would patch in a Sony BIOS.
-fn cards(m: &mut M, _a: [u32; 4]) -> Result {
-    m.cards_ready();
-    ret(0)
-}
 
 fn zero(_m: &mut M, _a: [u32; 4]) -> Result {
     ret(0)

@@ -174,6 +174,25 @@ mod tests {
     }
 
     #[test]
+    fn init_card_selects_the_pads() {
+        let mut m = machine();
+        let buf = 0x8001_0000;
+        let filled = |m: &mut Machine<testing::NoSdk>| {
+            m.mem.w8(buf, 0x5A);
+            m.kernel.pad_vblank(&mut *m.mem, &mut *m.host);
+            m.mem.r8(buf) == 0
+        };
+        ret(bios::call(&mut m, 0xB0, 0x12, [buf, 0x22, buf + 0x22, 0x22]));
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x4A, [0; 4])), 0);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x4B, [0; 4])), 1);
+        assert!(!filled(&mut m), "InitCARD2(0) leaves the pads out");
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x4A, [1, 0, 0, 0])), 1, "initialised before");
+        assert!(filled(&mut m));
+        ret(bios::call(&mut m, 0xB0, 0x4C, [0; 4]));
+        assert!(!filled(&mut m), "StopCARD2 stops the pads too");
+    }
+
+    #[test]
     fn reset_entry_int_drops_the_hook() {
         let mut m = machine();
         ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));

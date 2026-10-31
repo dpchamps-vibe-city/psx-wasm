@@ -13,7 +13,7 @@
 //! libspu where it touches the SPU and libsnd's `_SsInit` (chip spu),
 //! libapi's `pad.o`/`patch.o`/`first.o`, libcd's drive layer and the
 //! streaming ring's interrupt (chip cd), libmcx's port driver (chip
-//! memcard), and libcard's thin BIOS wrappers.
+//! memcard), and libcard's BIOS patches.
 //!
 //! A chip whose adapters don't cover a game runs its libraries as the
 //! game's own code over register-level devices ([`DEVICE_LIBRARIES`],

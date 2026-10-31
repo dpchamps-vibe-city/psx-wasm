@@ -439,8 +439,12 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
             r(m.card_erase(&path, func == 0x46))
         }
-        (0xB0, 0x4A) | (0xB0, 0x4B) | (0xB0, 0x4C) => {
+        (0xB0, 0x4A) => r(m.card_init(a[0])),
+        // StartCARD2, StopCARD2: the pad and card handler in or out of the
+        // chain.
+        (0xB0, 0x4B) | (0xB0, 0x4C) => {
             m.cards_ready();
+            m.kernel.pad_started = func == 0x4B;
             r(1)
         }
         (0xB0, 0x4E) => r(m.card_write(a[0], a[1], a[2])),
