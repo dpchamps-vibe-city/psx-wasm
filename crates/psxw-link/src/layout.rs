@@ -5,7 +5,11 @@
 //! - anonymous read-only data without relocations (string literals,
 //!   constant tables) is placed on identical bytes in the container's
 //!   original read-only data, so pointers to it equal the original's;
-//! - everything else anonymous goes to the AUX region, 8-byte aligned;
+//! - other anonymous read-only data (clang's switch tables, pointer
+//!   tables) goes to the AUX region, 8-byte aligned;
+//! - writable data the address map doesn't name fails the link: the
+//!   original keeps it at an address of its own, which translated code
+//!   reaches too;
 //! - mods' data (plans/M11) goes to the mod area, below its stack: a mod's
 //!   names never resolve to game addresses, and its references resolve
 //!   inside the mod first.
@@ -127,6 +131,7 @@ impl Layout {
         mod_of: &[Option<usize>],
     ) -> Result<Self> {
         let mut l = Layout { next: AUX_BASE, next_mod: MOD_BASE, mod_of: mod_of.to_vec(), ..Default::default() };
+        let mut unnamed = Vec::new();
         for (i, (container, obj)) in inputs.iter().enumerate() {
             for (si, s) in obj.symbols.iter().enumerate() {
                 if s.kind != SymbolKind::Data || !s.defined {
@@ -158,6 +163,13 @@ impl Layout {
                         continue;
                     }
                 }
+                // The original keeps writable data at its own address, where
+                // translated code and the BIOS reach it too; AUX would be a
+                // second copy.
+                if !seg.is_rodata() {
+                    unnamed.push(format!("{container} {}", s.name));
+                    continue;
+                }
                 let addr = l.next.div_ceil(align.max(8)) * align.max(8);
                 l.next = addr + def.size.max(1);
                 if l.next > AUX_END {
@@ -166,6 +178,12 @@ impl Layout {
                 l.defined.insert((i, si as u32), Placed { addr, how: How::Aux });
                 l.aux.push((i, si as u32, addr));
             }
+        }
+        if !unnamed.is_empty() {
+            bail!(
+                "writable data the address map doesn't name, so its original address is unknown (name it in the decomp's symbols):\n  {}",
+                unnamed.join("\n  ")
+            );
         }
         Ok(l)
     }
