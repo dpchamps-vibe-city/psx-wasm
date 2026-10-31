@@ -136,12 +136,10 @@ pub fn compile(
         let (ok, diags) = clang.compile_i(&text, &i_path, &obj)?;
         let map = LineMap::new(&text);
         let errors: Vec<&Diag> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
-        // A non-void function that can fall off its end returns whatever
-        // the original left in v0; C has no such value, so it's lifted.
-        let falls_off: Vec<&Diag> = diags
-            .iter()
-            .filter(|d| d.severity == Severity::Warning && d.message.contains("does not return a value"))
-            .collect();
+        // A non-void function that can fall off its end, or `return;`,
+        // returns whatever the original left in v0; C has no such value, so
+        // it's lifted.
+        let falls_off: Vec<&Diag> = diags.iter().filter(|d| d.severity == Severity::Warning && no_value(&d.message)).collect();
         if ok && errors.is_empty() && !falls_off.is_empty() {
             let ast = ast::parse(&text);
             let fns = ast.functions();
@@ -263,6 +261,13 @@ fn lift(text: &str, ast: &Ast, f: &ast::FnDef, reason: &str, out: &mut Compiled)
     Edit::replace(f.range.clone(), replacement)
 }
 
+/// Clang's two diagnostics for a non-void function that returns no value:
+/// it can fall off its end (`-Wreturn-type`), or it has a `return;`
+/// (`-Wreturn-mismatch`).
+fn no_value(message: &str) -> bool {
+    message.contains("does not return a value") || message.contains("should return a value")
+}
+
 fn lift_reason(message: &str) -> String {
     if message.contains("function definition is not allowed here") || message.contains("illegal storage class on function") {
         "nested-function".into()
@@ -343,7 +348,7 @@ fn assigns(body: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::assigns;
+    use super::*;
 
     #[test]
     fn detects_assignment() {
@@ -353,6 +358,31 @@ mod tests {
         assert!(assigns("{ f(&x); }", "x"));
         assert!(!assigns("{ y = x; if (x == 2) {} }", "x"));
         assert!(!assigns("{ xx = 1; }", "x"));
+    }
+
+    /// Compile `c` with the pinned clang; the names of the functions lifted
+    /// and why. `None` when the toolchain isn't fetched.
+    fn lifted(c: &str, soft_float: bool) -> Option<Vec<(String, String)>> {
+        let path = psxw_inputs::Workspace::discover().ok()?.clang().ok()?;
+        let dir = std::env::temp_dir().join(format!("psxw-compile-test-{}-{soft_float}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.c"), c).unwrap();
+        let mut clang = Clang::new(path, dir.clone(), vec![], vec![], &dir).unwrap();
+        clang.soft_float = soft_float;
+        let out = compile(&clang, &dir.join("t.c"), &dir, "t", &[], None).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(out.ok, "{:?}", out.errors);
+        Some(out.lifted.into_iter().map(|l| (l.name, l.reason)).collect())
+    }
+
+    /// A non-void function that returns no value, by falling off its end
+    /// or by `return;`, leaves v0 as it is: both are lifted (D35).
+    #[test]
+    fn lifts_functions_returning_no_value() {
+        let c = "int falls(int x) { if (x) return 1; }\nint bare(int x) { if (x) return; return 2; }\nint fine(int x) { return x; }\n";
+        let Some(mut got) = lifted(c, false) else { return eprintln!("skipped: run `psxw toolchain fetch`") };
+        got.sort();
+        assert_eq!(got, [("bare".into(), "return-type".into()), ("falls".into(), "return-type".into())]);
     }
 }
 
