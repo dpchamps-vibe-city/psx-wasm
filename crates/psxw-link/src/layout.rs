@@ -188,6 +188,16 @@ impl Layout {
         Ok(l)
     }
 
+    /// Room for `len` bytes of the linker's own read-only data in AUX.
+    pub fn aux_bytes(&mut self, len: u32) -> Result<u32> {
+        let addr = self.next.div_ceil(8) * 8;
+        self.next = addr + len;
+        if self.next > AUX_END {
+            bail!("AUX region exhausted placing {len} bytes of the linker's");
+        }
+        Ok(addr)
+    }
+
     /// Address of data symbol `si` of input `i`: its placement, or for an
     /// undefined symbol, the address map's (then any input defining it).
     pub fn data_addr(

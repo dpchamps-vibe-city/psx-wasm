@@ -234,7 +234,7 @@ pub struct Prepared {
     unvalidated: BTreeSet<String>,
     hardware: Vec<Unbound>,
     void_used: BTreeSet<(String, u32)>,
-    overlays: BTreeMap<u32, Vec<(String, [u32; 2])>>,
+    overlay_addresses: usize,
     spec: GameSpec,
     /// Functions that switch threads (wasm names), seeding Asyncify.
     switches: BTreeSet<String>,
@@ -555,24 +555,15 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     }
 
     // Addresses several containers define (overlay slots).
-    let mut by_addr: BTreeMap<u32, Vec<String>> = BTreeMap::new();
-    for (c, a) in tiers.keys() {
-        by_addr.entry(*a).or_default().push(c.clone());
+    let mut by_addr: BTreeMap<u32, usize> = BTreeMap::new();
+    for (_, a) in tiers.keys() {
+        *by_addr.entry(*a).or_default() += 1;
     }
-    let mut overlays = BTreeMap::new();
-    for (a, cs) in by_addr.into_iter().filter(|(_, cs)| cs.len() > 1) {
-        let mut cands = Vec::new();
-        for c in cs {
-            let w0 = inputs.originals.word(&c, a).context("overlay code")?;
-            let w1 = inputs.originals.word(&c, a + 4).unwrap_or(0);
-            cands.push((c, [w0, w1]));
-        }
-        overlays.insert(a, cands);
-    }
+    let overlay_addresses = by_addr.values().filter(|&&n| n > 1).count();
 
     let spec = GameSpec {
         tiers: tiers.clone(),
-        overlays: overlays.clone(),
+        resident: psxw_link::game::residency(&inputs.map, &inputs.originals)?,
         budget: opts.budget,
         debug_io: opts.debug_io || !opts.original.is_empty(),
         device_funcs: tiers
@@ -623,7 +614,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         unvalidated,
         hardware,
         void_used,
-        overlays,
+        overlay_addresses,
         spec,
         switches,
     })
@@ -657,7 +648,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         unvalidated,
         hardware,
         void_used,
-        overlays,
+        overlay_addresses,
         mut spec,
         switches,
         ..
@@ -796,7 +787,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         tiers: counts,
         by_container,
         adapters: bound.into_iter().collect(),
-        overlay_addresses: overlays.len(),
+        overlay_addresses,
         aux_symbols: linked.aux.len(),
         matched_rodata: linked.matched,
         debug_io: opts.debug_io || !opts.original.is_empty(),

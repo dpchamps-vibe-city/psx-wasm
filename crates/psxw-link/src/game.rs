@@ -6,8 +6,9 @@
 //!   translation.
 //! - Function pointers are MIPS addresses; the dispatch table maps each
 //!   address to its entry. Where overlays share an address, the entry is a
-//!   stub that compares the code resident in RAM with each candidate's
-//!   original words (D7).
+//!   stub that calls whichever container's code there is resident, as the
+//!   disc's writes decide; code only one container has where overlays load
+//!   checks the same when entered (D69).
 //! - C calls C directly when the signatures agree; every other edge goes
 //!   through o32 adapters.
 //! - Every loop header spends the safepoint budget.
@@ -21,7 +22,9 @@ use crate::rewrite::{self, Lowered, Resolver};
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_abi::{TABLE_LEN, WINDOW_MASK, guest, psx, table_index};
 use psxw_inputs::AddressMap;
+use psxw_inputs::originals::Originals;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use wasm_encoder::{
     BlockType, Catch, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction as I,
@@ -45,9 +48,9 @@ pub enum Tier {
 pub struct GameSpec {
     /// Every guest function: (container, address) → tier.
     pub tiers: BTreeMap<(String, u32), Tier>,
-    /// Addresses more than one container defines: each candidate's first
-    /// two original code words.
-    pub overlays: BTreeMap<u32, Vec<(String, [u32; 2])>>,
+    /// Overlay residency (D69): each container's code where overlays load
+    /// ([`residency`]).
+    pub resident: Vec<Residency>,
     /// Loop iterations between safepoints.
     pub budget: u32,
     /// Trap on guest accesses to the I/O window.
@@ -77,6 +80,73 @@ pub struct GameSpec {
     /// with Asyncify, which exports the control functions; otherwise the
     /// link exports stubs.
     pub threads: bool,
+}
+
+/// One container's code where overlays load (D69): the guest decides it
+/// is resident when RAM there hashes as its original did, checked again
+/// after each disc write into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Residency {
+    pub container: String,
+    /// Word-aligned guest address ranges.
+    pub text: Vec<Range<u32>>,
+    /// [`text_hash`] of the original bytes there, range by range.
+    pub hash: u64,
+}
+
+/// A residency global's states besides 0, not resident.
+const RESIDENT: i32 = 1;
+/// The disc wrote into the code since it was last checked (and at boot).
+const UNKNOWN: i32 = 2;
+
+pub const HASH_START: u64 = 0xCBF2_9CE4_8422_2325;
+const HASH_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+/// FNV-1a over little-endian words, continuing from `h`: what the guest
+/// computes over RAM.
+pub fn text_hash(mut h: u64, bytes: &[u8]) -> u64 {
+    for w in bytes.chunks(4) {
+        let mut b = [0u8; 4];
+        b[..w.len()].copy_from_slice(w);
+        h = (h ^ u32::from_le_bytes(b) as u64).wrapping_mul(HASH_PRIME);
+    }
+    h
+}
+
+/// Every container's code where overlays load: all of an overlay's text,
+/// and the part of the executable's that overlays share, with the hash of
+/// its original bytes.
+pub fn residency(map: &AddressMap, originals: &Originals) -> Result<Vec<Residency>> {
+    let words = |r: &Range<u32>| (r.start & !3)..((r.end + 3) & !3);
+    let region: Vec<Range<u32>> = map.containers.iter().filter(|c| !c.is_main).flat_map(|c| c.text.iter().map(words)).collect();
+    let mut out = Vec::new();
+    for c in &map.containers {
+        let mut text: Vec<Range<u32>> = c
+            .text
+            .iter()
+            .map(words)
+            .flat_map(|t| region.iter().map(move |r| t.start.max(r.start)..t.end.min(r.end)))
+            .filter(|r| r.start < r.end)
+            .collect();
+        text.sort_by_key(|r| r.start);
+        text.dedup_by(|b, a| {
+            let joined = b.start <= a.end;
+            if joined {
+                a.end = a.end.max(b.end);
+            }
+            joined
+        });
+        if text.is_empty() {
+            continue;
+        }
+        let mut hash = HASH_START;
+        for a in text.iter().flat_map(|r| r.clone().step_by(4)) {
+            let w = originals.read(&c.id, a, 4).with_context(|| format!("overlay residency: no original code of {} at {a:#010x}", c.id))?;
+            hash = text_hash(hash, w);
+        }
+        out.push(Residency { container: c.id.clone(), text, hash });
+    }
+    Ok(out)
 }
 
 /// A moddable base's tables, by index.
@@ -147,6 +217,7 @@ pub(crate) fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::PROBE, vec![i], vec![]),
         (psx::RETURN_FROM_EXCEPTION, vec![], vec![]),
         (psx::MOD_LOG, vec![i, i], vec![]),
+        (psx::NOT_RESIDENT, vec![i, i], vec![]),
     ]
 }
 
@@ -180,8 +251,27 @@ enum Synth {
     /// Runtime adapter `id` in place of the function at guest address
     /// `addr` (D61: the adapter reads its object's relocated operands there).
     AdapterThunk { id: u32, addr: u32 },
-    /// Dispatch on the code resident at an address shared by overlays.
+    /// A call to an address several containers define: whichever one's
+    /// code there is resident (D69), else a trap naming what is.
     OverlayStub(u32),
+    /// `() -> ()`: hash residency unit `k`'s code in RAM and record whether
+    /// it is the original's.
+    Refresh(u32),
+    /// `(addr) -> ()`: return if unit `k`'s code is resident, else trap
+    /// for a call to `addr`.
+    Ensure(u32),
+    /// `(addr) -> !`: the trap for a call to `addr` with nothing built for
+    /// it resident, naming what is.
+    Missing,
+    /// `(h: i64, start, end) -> i64`: [`text_hash`] over window offsets
+    /// `start..end`.
+    HashRange,
+    /// `(addr) -> i32`: the guest address of the name of the container
+    /// resident at `addr`, or 0.
+    ResidentAt,
+    /// `(addr, len) -> ()`: the disc wrote there; the residency units it
+    /// covered are checked again before their code next runs.
+    DiscWrite,
     /// C `call_indirect` with a signature (the MIPS address trails).
     ICall(FuncType),
     /// `psxw_call_indirect(addr, a0..a3)` and `guest_invoke`.
@@ -225,7 +315,8 @@ enum Synth {
     Transparent { input: usize, name: String, sig: FuncType, next: u32, id: i32 },
     /// `guest.psxmod_init`: data patches to the executable.
     ModInit,
-    /// `guest.psxmod_loaded(addr, len)`: data patches to overlays.
+    /// `guest.psxmod_loaded(addr, len)`: what the disc wrote, for overlay
+    /// residency and data patches to overlays.
     ModLoaded,
     /// A moddable base's C-typed slot entry: the hook in slot `slot`, else
     /// the function `callee`.
@@ -304,6 +395,16 @@ struct Ctx<'a> {
     caller_of: HashMap<(usize, u32), (String, u32)>,
     /// A moddable base's hook-count globals (init, loaded).
     moddable: Option<(u32, u32)>,
+    /// Containers defining a function at each address.
+    cands: BTreeMap<u32, Vec<String>>,
+    /// Where overlays load: every residency unit's code.
+    region: Vec<Range<u32>>,
+    /// The first residency global, one per unit of `spec.resident`.
+    res: u32,
+    /// Each container's residency unit.
+    units: HashMap<String, u32>,
+    /// Each unit's container name, NUL-terminated, at these AUX addresses.
+    names: Vec<u32>,
 }
 
 impl Ctx<'_> {
@@ -332,9 +433,10 @@ impl Ctx<'_> {
     }
 
     /// The o32 entry of the function at (container, addr): its hook chain
-    /// when it has one.
+    /// when it has one; where overlays share the address, the residency
+    /// stub.
     fn entry(&mut self, container: &str, addr: u32) -> Option<u32> {
-        if self.spec.overlays.contains_key(&addr) && container != self.spec.main {
+        if self.dispatched(addr) {
             return Some(self.synth(Synth::OverlayStub(addr)));
         }
         if let Some(h) = self.heads.get(&(container.to_string(), addr, None)) {
@@ -360,12 +462,9 @@ impl Ctx<'_> {
             .or_else(|| self.heads.get(&(container.to_string(), addr, None)))
     }
 
-    /// [`Ctx::entry`] for a call from `caller`, whose `from`-scoped hooks
-    /// apply.
+    /// The function's o32 entry for a call from `caller`, whose
+    /// `from`-scoped hooks apply; no residency dispatch.
     fn entry_from(&mut self, container: &str, addr: u32, caller: Option<&(String, u32)>) -> Option<u32> {
-        if self.spec.overlays.contains_key(&addr) && container != self.spec.main {
-            return Some(self.synth(Synth::OverlayStub(addr)));
-        }
         match self.head(container, addr, caller) {
             Some(h) => Some(h.o32),
             None => self.entry_raw(container, addr),
@@ -418,13 +517,49 @@ impl Ctx<'_> {
         o.types[o.funcs[func as usize].ty as usize].clone()
     }
 
-    /// The entry for a call into an overlay slot from outside it.
+    /// The entry for a call to `addr` from code that names no container
+    /// for it.
     fn dynamic_entry(&mut self, addr: u32) -> Option<u32> {
-        if self.spec.overlays.contains_key(&addr) {
-            return Some(self.synth(Synth::OverlayStub(addr)));
-        }
-        let c = self.spec.tiers.keys().find(|(_, a)| *a == addr).map(|(c, _)| c.clone())?;
+        let c = self.cands.get(&addr)?.first()?.clone();
         self.entry(&c, addr)
+    }
+
+    /// Whether code at `addr` is only there while its container is
+    /// resident (D69): it lies where overlays load, or an overlay defines a
+    /// function there, and some container defines one.
+    fn checked(&self, addr: u32) -> bool {
+        let Some(cs) = self.cands.get(&addr) else { return false };
+        self.region.iter().any(|r| r.contains(&addr)) || cs.iter().any(|c| *c != self.spec.main)
+    }
+
+    /// Whether calls to `addr` go through the residency stub: several
+    /// containers define a function there. (One that only one container
+    /// defines checks its own residency when entered.)
+    fn dispatched(&self, addr: u32) -> bool {
+        self.checked(addr) && self.cands[&addr].len() > 1
+    }
+
+    /// `container`'s residency unit.
+    fn unit(&self, container: &str) -> Option<u32> {
+        self.units.get(container).copied()
+    }
+
+    /// The entry check of `container`'s function at `addr`, when it is the
+    /// only one there and checked: trap unless the container's code is
+    /// resident.
+    fn self_check(&mut self, container: &str, addr: u32) -> Vec<I<'static>> {
+        let only = self.checked(addr) && !self.dispatched(addr) && self.spec.tiers.contains_key(&(container.to_string(), addr));
+        let Some(k) = self.unit(container).filter(|_| only) else { return Vec::new() };
+        let ensure = self.synth(Synth::Ensure(k));
+        vec![
+            I::GlobalGet(self.res + k),
+            I::I32Const(RESIDENT),
+            I::I32Ne,
+            I::If(BlockType::Empty),
+            I::I32Const(addr as i32),
+            I::Call(ensure),
+            I::End,
+        ]
     }
 
     /// Container whose code holds `addr`, as seen from `from`.
@@ -496,6 +631,11 @@ impl Resolver for R<'_, '_> {
         }
         let caller = self.ctx.caller_of.get(&(self.input, self.func)).cloned();
         if let Some((c, addr)) = parse_generated(&name, &self.ctx.spec.main) {
+            // Where overlays share the address, whichever container's code
+            // is resident runs (D69).
+            if self.ctx.dispatched(addr) {
+                return Ok(Lowered::Call(self.ctx.synth(Synth::OverlayStub(addr))));
+            }
             let e = match c {
                 Some(c) => self.ctx.entry_from(&c, addr, caller.as_ref()),
                 None => self.ctx.dynamic_entry(addr),
@@ -554,15 +694,16 @@ impl Resolver for R<'_, '_> {
             match ctx.spec.tiers.get(&(c.to_string(), addr))? {
                 Tier::C { input, func } => {
                     let o = &ctx.inputs[*input].obj;
-                    (o.types[o.funcs[*func as usize].ty as usize] == *sig && !ctx.spec.overlays.contains_key(&addr))
+                    (o.types[o.funcs[*func as usize].ty as usize] == *sig && !ctx.dispatched(addr))
                         .then(|| ctx.guest[&(*input, *func)])
                 }
                 _ => None,
             }
         };
         // A hooked function: its chain's C entry when the signatures agree,
-        // else its o32 entry. (An overlay slot's goes through the stub.)
-        if let Some(c) = home.as_ref().filter(|c| !self.ctx.spec.overlays.contains_key(&addr) || **c == self.ctx.spec.main) {
+        // else its o32 entry. (Where overlays share the address, the stub
+        // calls whichever container's code is resident, D69.)
+        if let Some(c) = home.as_ref().filter(|_| !self.ctx.dispatched(addr)) {
             if let Some(h) = self.ctx.head(c, addr, caller.as_ref()).cloned() {
                 if let Some((ci, csig)) = &h.c {
                     match mismatch(self.ctx, c) {
@@ -661,7 +802,8 @@ impl Resolver for R<'_, '_> {
         if self.ctx.mod_of[self.input].is_some() {
             return Ok(out);
         }
-        // A watched function: by its guest name (C) or its translation's.
+        // The function's address: by its guest name (C) or its
+        // translation's.
         let addr = func_symbol.and_then(|n| match n.strip_prefix("psxw_t_") {
             Some(rest) => u32::from_str_radix(rest.rsplit('_').next()?, 16).ok(),
             None => match classify_name(n) {
@@ -670,6 +812,10 @@ impl Resolver for R<'_, '_> {
             },
         });
         if let Some(a) = addr {
+            // Where overlays load, it runs only while its container's code
+            // is resident (D69).
+            out.extend(self.ctx.self_check(&inp.container, a));
+            // A watched function.
             if self.ctx.spec.probes.iter().any(|(c, pa)| *c == inp.container && *pa == a) {
                 out.push(I::I32Const(a as i32));
                 out.push(I::Call(self.ctx.import(psx::PROBE)));
@@ -833,6 +979,16 @@ fn dispatch(f: &mut Function, a: u32, args: [u32; 4], untranslated: u32, o32_ty:
     f.instruction(&I::CallIndirect { type_index: o32_ty, table_index: 0 });
 }
 
+/// Check residency unit `k`'s code again if the disc wrote into it.
+fn refresh_unknown(ctx: &mut Ctx, f: &mut Function, k: u32) {
+    f.instruction(&I::GlobalGet(ctx.res + k));
+    f.instruction(&I::I32Const(UNKNOWN));
+    f.instruction(&I::I32Eq);
+    f.instruction(&I::If(BlockType::Empty));
+    f.instruction(&I::Call(ctx.synth(Synth::Refresh(k))));
+    f.instruction(&I::End);
+}
+
 fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
     let sp = ctx.sp;
     let window = ctx.spec.window_base;
@@ -862,6 +1018,11 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
         }
         Synth::AdapterThunk { id, addr } => {
             let mut f = Function::new([]);
+            if let Some(c) = ctx.cands.get(&addr).and_then(|cs| cs.first()).cloned() {
+                for i in ctx.self_check(&c, addr) {
+                    f.instruction(&i);
+                }
+            }
             f.instruction(&I::I32Const(id as i32));
             f.instruction(&I::I32Const(addr as i32));
             for l in 0..4 {
@@ -872,40 +1033,157 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             (o32(), f, format!("adapter#{id}@{addr:08X}"))
         }
         Synth::OverlayStub(addr) => {
-            let cands = ctx.spec.overlays.get(&addr).cloned().unwrap_or_default();
-            let mut entries = Vec::new();
-            for (c, words) in &cands {
+            // Each container defining a function here, in name order, its
+            // code checked again if the disc wrote into it since; one with
+            // no code where overlays load is always there, so it goes last.
+            let mut cands = ctx.cands.get(&addr).cloned().unwrap_or_default();
+            cands.sort_by_key(|c| ctx.unit(c).is_none());
+            let mut f = Function::new([]);
+            for c in &cands {
                 let e = match ctx.heads.get(&(c.clone(), addr, None)) {
                     Some(h) => h.o32,
                     None => ctx.entry_raw(c, addr).context("overlay candidate without a tier")?,
                 };
-                entries.push((*words, e));
-            }
-            let mut f = Function::new([]);
-            let word = |f: &mut Function, off: u32| {
-                f.instruction(&I::I32Const(((addr + off) & WINDOW_MASK) as i32));
-                f.instruction(&I::I32Load(MemArg { offset: window as u64, align: 2, memory_index: 0 }));
-            };
-            for (w, e) in entries {
-                word(&mut f, 0);
-                f.instruction(&I::I32Const(w[0] as i32));
-                f.instruction(&I::I32Eq);
-                word(&mut f, 4);
-                f.instruction(&I::I32Const(w[1] as i32));
-                f.instruction(&I::I32Eq);
-                f.instruction(&I::I32And);
-                f.instruction(&I::If(BlockType::Empty));
+                let unit = ctx.unit(c);
+                if let Some(k) = unit {
+                    refresh_unknown(ctx, &mut f, k);
+                    f.instruction(&I::GlobalGet(ctx.res + k));
+                    f.instruction(&I::If(BlockType::Empty));
+                }
                 for l in 0..4 {
                     f.instruction(&I::LocalGet(l));
                 }
                 f.instruction(&I::Call(e));
                 f.instruction(&I::Return);
-                f.instruction(&I::End);
+                if unit.is_some() {
+                    f.instruction(&I::End);
+                }
             }
             f.instruction(&I::I32Const(addr as i32));
-            f.instruction(&I::Call(ctx.import(psx::UNTRANSLATED)));
+            f.instruction(&I::Call(ctx.synth(Synth::Missing)));
+            f.instruction(&I::Unreachable);
             f.instruction(&I::End);
             (o32(), f, format!("overlay:{addr:08X}"))
+        }
+        Synth::Ensure(k) => {
+            let mut f = Function::new([]);
+            refresh_unknown(ctx, &mut f, k);
+            f.instruction(&I::GlobalGet(ctx.res + k));
+            f.instruction(&I::If(BlockType::Empty));
+            f.instruction(&I::Return);
+            f.instruction(&I::End);
+            f.instruction(&I::LocalGet(0));
+            f.instruction(&I::Call(ctx.synth(Synth::Missing)));
+            f.instruction(&I::End);
+            let name = format!("ensure:{}", ctx.spec.resident[k as usize].container);
+            (FuncType { params: vec![V::I32], results: vec![] }, f, name)
+        }
+        Synth::Missing => {
+            let mut f = Function::new([]);
+            f.instruction(&I::LocalGet(0));
+            f.instruction(&I::LocalGet(0));
+            f.instruction(&I::Call(ctx.synth(Synth::ResidentAt)));
+            f.instruction(&I::Call(ctx.import(psx::NOT_RESIDENT)));
+            f.instruction(&I::Unreachable);
+            f.instruction(&I::End);
+            (FuncType { params: vec![V::I32], results: vec![] }, f, "not_resident".into())
+        }
+        Synth::Refresh(k) => {
+            let u = ctx.spec.resident[k as usize].clone();
+            let hash = ctx.synth(Synth::HashRange);
+            let mut f = Function::new([]);
+            f.instruction(&I::I64Const(HASH_START as i64));
+            for r in &u.text {
+                f.instruction(&I::I32Const((r.start & WINDOW_MASK) as i32));
+                f.instruction(&I::I32Const((r.start & WINDOW_MASK) as i32 + (r.end - r.start) as i32));
+                f.instruction(&I::Call(hash));
+            }
+            f.instruction(&I::I64Const(u.hash as i64));
+            f.instruction(&I::I64Eq);
+            f.instruction(&I::GlobalSet(ctx.res + k));
+            f.instruction(&I::End);
+            (FuncType { params: vec![], results: vec![] }, f, format!("resident:{}", u.container))
+        }
+        Synth::HashRange => {
+            let (h, at, end) = (0, 1, 2);
+            let mut f = Function::new([]);
+            f.instruction(&I::Block(BlockType::Empty));
+            f.instruction(&I::Loop(BlockType::Empty));
+            f.instruction(&I::LocalGet(at));
+            f.instruction(&I::LocalGet(end));
+            f.instruction(&I::I32GeU);
+            f.instruction(&I::BrIf(1));
+            f.instruction(&I::LocalGet(h));
+            f.instruction(&I::LocalGet(at));
+            f.instruction(&I::I32Load(MemArg { offset: window as u64, align: 2, memory_index: 0 }));
+            f.instruction(&I::I64ExtendI32U);
+            f.instruction(&I::I64Xor);
+            f.instruction(&I::I64Const(HASH_PRIME as i64));
+            f.instruction(&I::I64Mul);
+            f.instruction(&I::LocalSet(h));
+            f.instruction(&I::LocalGet(at));
+            f.instruction(&I::I32Const(4));
+            f.instruction(&I::I32Add);
+            f.instruction(&I::LocalSet(at));
+            f.instruction(&I::Br(0));
+            f.instruction(&I::End);
+            f.instruction(&I::End);
+            f.instruction(&I::LocalGet(h));
+            f.instruction(&I::End);
+            (FuncType { params: vec![V::I64, V::I32, V::I32], results: vec![V::I64] }, f, "resident_hash".into())
+        }
+        Synth::ResidentAt => {
+            let mut f = Function::new([]);
+            for k in 0..ctx.spec.resident.len() as u32 {
+                for r in ctx.spec.resident[k as usize].text.clone() {
+                    f.instruction(&I::LocalGet(0));
+                    f.instruction(&I::I32Const(r.start as i32));
+                    f.instruction(&I::I32Sub);
+                    f.instruction(&I::I32Const((r.end - r.start) as i32));
+                    f.instruction(&I::I32LtU);
+                    f.instruction(&I::If(BlockType::Empty));
+                    refresh_unknown(ctx, &mut f, k);
+                    f.instruction(&I::GlobalGet(ctx.res + k));
+                    f.instruction(&I::If(BlockType::Empty));
+                    f.instruction(&I::I32Const(ctx.names[k as usize] as i32));
+                    f.instruction(&I::Return);
+                    f.instruction(&I::End);
+                    f.instruction(&I::End);
+                }
+            }
+            f.instruction(&I::I32Const(0));
+            f.instruction(&I::End);
+            (FuncType { params: vec![V::I32], results: vec![V::I32] }, f, "resident_at".into())
+        }
+        Synth::DiscWrite => {
+            // a < end && phys < a + len, in physical RAM.
+            let (phys, end) = (2, 3);
+            let mut f = Function::new([(2, ValType::I32)]);
+            f.instruction(&I::LocalGet(0));
+            f.instruction(&I::I32Const(0x1F_FFFF));
+            f.instruction(&I::I32And);
+            f.instruction(&I::LocalTee(phys));
+            f.instruction(&I::LocalGet(1));
+            f.instruction(&I::I32Add);
+            f.instruction(&I::LocalSet(end));
+            for (k, u) in ctx.spec.resident.iter().enumerate() {
+                for r in &u.text {
+                    let a = (r.start & 0x1F_FFFF) as i32;
+                    f.instruction(&I::I32Const(a));
+                    f.instruction(&I::LocalGet(end));
+                    f.instruction(&I::I32LtU);
+                    f.instruction(&I::LocalGet(phys));
+                    f.instruction(&I::I32Const(a + (r.end - r.start) as i32));
+                    f.instruction(&I::I32LtU);
+                    f.instruction(&I::I32And);
+                    f.instruction(&I::If(BlockType::Empty));
+                    f.instruction(&I::I32Const(UNKNOWN));
+                    f.instruction(&I::GlobalSet(ctx.res + k as u32));
+                    f.instruction(&I::End);
+                }
+            }
+            f.instruction(&I::End);
+            (FuncType { params: vec![V::I32; 2], results: vec![] }, f, "disc_write".into())
         }
         Synth::ICall(sig) => {
             let (kinds, _) = marshal::param_kinds(&sig, None);
@@ -1268,7 +1546,7 @@ pub(crate) fn store_byte(f: &mut Function, window: u32, addr: u32, b: u8) {
 fn mod_init(ctx: &mut Ctx) -> Result<Function> {
     if let Some((n, _)) = ctx.moddable {
         let t = ctx.intern(&FuncType { params: vec![], results: vec![] });
-        return Ok(call_registered(n, tables::ON_INIT, t, 0));
+        return Ok(call_registered(n, tables::ON_INIT, t, 0, None));
     }
     let mut f = Function::new([]);
     for d in ctx.spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_none()) {
@@ -1280,12 +1558,18 @@ fn mod_init(ctx: &mut Ctx) -> Result<Function> {
     Ok(f)
 }
 
-/// A moddable base's `psxmod_init`/`psxmod_loaded`: call each mod's,
-/// registered in `table` (type `ty`, `params` i32 parameters passed on),
-/// in load order; global `n` counts them.
-fn call_registered(n: u32, table: u32, ty: u32, params: u32) -> Function {
+/// A moddable base's `psxmod_init`/`psxmod_loaded`: call `first` if any,
+/// then each mod's, registered in `table` (type `ty`, `params` i32
+/// parameters passed on), in load order; global `n` counts them.
+fn call_registered(n: u32, table: u32, ty: u32, params: u32, first: Option<u32>) -> Function {
     let i = params;
     let mut f = Function::new([(1, ValType::I32)]);
+    if let Some(g) = first {
+        for p in 0..params {
+            f.instruction(&I::LocalGet(p));
+        }
+        f.instruction(&I::Call(g));
+    }
     f.instruction(&I::Block(BlockType::Empty));
     f.instruction(&I::Loop(BlockType::Empty));
     f.instruction(&I::LocalGet(i));
@@ -1320,16 +1604,21 @@ fn overlay_patches<'a>(ctx: &Ctx<'a>) -> Vec<(&'a crate::mods::DataPatch, u32)> 
         .collect()
 }
 
-/// `psxmod_loaded(addr, len)`: a disc write over an overlay patch's bytes
-/// marks it pending; a pending patch is applied once its overlay's first
-/// code words are resident (the write that brings them may come before or
-/// after the patch's, in another sector).
+/// `psxmod_loaded(addr, len)`: the disc wrote there. The overlay code it
+/// covered is checked again before it next runs (D69). A disc write over
+/// an overlay patch's bytes marks it pending; a pending patch is applied
+/// once its overlay's first code words are resident (the write that brings
+/// them may come before or after the patch's, in another sector).
 fn mod_loaded(ctx: &mut Ctx) -> Result<Function> {
+    let disc = ctx.synth(Synth::DiscWrite);
     if let Some((_, n)) = ctx.moddable {
         let t = ctx.intern(&FuncType { params: vec![V::I32; 2], results: vec![] });
-        return Ok(call_registered(n, tables::ON_LOADED, t, 2));
+        return Ok(call_registered(n, tables::ON_LOADED, t, 2, Some(disc)));
     }
     let mut f = Function::new([(2, ValType::I32)]);
+    f.instruction(&I::LocalGet(0));
+    f.instruction(&I::LocalGet(1));
+    f.instruction(&I::Call(disc));
     let (phys, end) = (2, 3);
     let patches = overlay_patches(ctx);
     if !patches.is_empty() {
@@ -1543,7 +1832,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             *mod_of.get_mut(i).context("mod input out of range")? = Some(m);
         }
     }
-    let layout = Layout::place_mods(&view, map, rodata, &mod_of)?;
+    let mut layout = Layout::place_mods(&view, map, rodata, &mod_of)?;
     let spec_own;
     let spec = if spec.mods.is_some() && mods.is_none() {
         spec_own = GameSpec { mods: None, ..spec.clone() };
@@ -1551,6 +1840,30 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     } else {
         spec
     };
+    // Overlay residency (D69): a global per unit after the others, and the
+    // units' names for the trap, in AUX.
+    let n_patches = spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_some()).count() as u32;
+    let res = 4 + if spec.mods.is_some() { 3 + n_patches } else { 0 } + if spec.slots.is_some() { 2 } else { 0 };
+    let mut names_blob = Vec::new();
+    let mut name_at = Vec::new();
+    for u in &spec.resident {
+        name_at.push(names_blob.len() as u32);
+        names_blob.extend(u.container.bytes().chain([0]));
+    }
+    let names_at = if names_blob.is_empty() { 0 } else { layout.aux_bytes(names_blob.len() as u32)? };
+    let mut cands: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for (c, a) in spec.tiers.keys() {
+        cands.entry(*a).or_default().push(c.clone());
+    }
+    let mut region: Vec<Range<u32>> = spec.resident.iter().flat_map(|u| u.text.iter().cloned()).collect();
+    region.sort_by_key(|r| r.start);
+    region.dedup_by(|b, a| {
+        let joined = b.start <= a.end;
+        if joined {
+            a.end = a.end.max(b.end);
+        }
+        joined
+    });
     let mut ctx = Ctx {
         map,
         inputs,
@@ -1581,6 +1894,11 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         bindings: HashMap::new(),
         caller_of: HashMap::new(),
         moddable: None,
+        cands,
+        region,
+        res,
+        units: spec.resident.iter().enumerate().map(|(k, u)| (u.container.clone(), k as u32)).collect(),
+        names: name_at.iter().map(|o| names_at + o).collect(),
         o32_ty: 0,
         device: spec
             .device_funcs
@@ -1697,11 +2015,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     // Table entries for every function with an address, and the exports.
     let mut elements: BTreeMap<u32, u32> = BTreeMap::new();
     for (c, addr) in spec.tiers.keys().cloned().collect::<Vec<_>>() {
-        let e = if spec.overlays.contains_key(&addr) {
-            ctx.synth(Synth::OverlayStub(addr))
-        } else {
-            ctx.entry(&c, addr).context("entry")?
-        };
+        let e = ctx.entry(&c, addr).context("entry")?;
         elements.insert(table_index(addr), e);
     }
     // Mod functions, at their synthetic addresses.
@@ -1800,6 +2114,8 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         // How many mods' init and loaded functions are registered.
         inits.extend([0, 0]);
     }
+    ensure!(inits.len() as u32 == ctx.res, "residency globals misplaced");
+    inits.extend(spec.resident.iter().map(|_| UNKNOWN));
     for init in inits {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));
     }
@@ -1877,6 +2193,9 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         let bytes = ctx.layout.bytes_of(&ctx.view, map, i, si, &fa)?;
         data.active(0, &ConstExpr::i32_const((spec.window_base + (addr & WINDOW_MASK)) as i32), bytes);
         aux.push((inputs[i].label.clone(), inputs[i].obj.symbols[si as usize].name.clone(), addr));
+    }
+    if !names_blob.is_empty() {
+        data.active(0, &ConstExpr::i32_const((spec.window_base + (names_at & WINDOW_MASK)) as i32), names_blob);
     }
     module.section(&data);
     let mut fnames = NameMap::new();

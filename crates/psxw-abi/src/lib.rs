@@ -51,7 +51,10 @@ pub mod replay;
 ///   BIOS keeps the kernel's thread tables in guest RAM ([`kernel`]).
 /// - 12: an adapter call carries the replaced function's guest address
 ///   ([`psx::ADAPTER`], D61).
-pub const ABI_VERSION: u32 = 12;
+/// - 13: overlay residency (D69): `guest.psxmod_loaded` hears of every
+///   disc write into RAM, mods or not, and a call into an overlay region
+///   with nothing resident to run traps through [`psx::NOT_RESIDENT`].
+pub const ABI_VERSION: u32 = 13;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -272,6 +275,11 @@ pub mod psx {
     /// adapter finds its object's data through the relocated operands of
     /// the original code there (D61).
     pub const ADAPTER: &str = "adapter";
+    /// `(addr, name) -> !`: a call into an overlay region found none of
+    /// the code built for `addr` resident (D69); `name` is the guest
+    /// address of the NUL-terminated name of the container resident
+    /// there, or 0.
+    pub const NOT_RESIDENT: &str = "not_resident";
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
     pub const ADAPTER_PREFIX: &str = "adapter.";
@@ -297,9 +305,10 @@ pub mod guest {
     /// without mods.
     pub const MOD_INIT: &str = "psxmod_init";
     /// `(addr, len) -> ()`: the disc just wrote `len` bytes at guest
-    /// address `addr`; the mods' data patches to an overlay whose code is
-    /// now resident and whose patched bytes that range covered are applied
-    /// (M11). Empty without mods.
+    /// address `addr`. The overlays' code there is checked again before
+    /// it next runs (D69), and the mods' data patches to an overlay whose
+    /// code is now resident and whose patched bytes that range covered are
+    /// applied (M11).
     pub const MOD_LOADED: &str = "psxmod_loaded";
     /// `() -> i32`: the window's wasm address ([`super::WINDOW_BASE`] or
     /// [`super::DEBUG_WINDOW_BASE`]). Hosts read it from the module's

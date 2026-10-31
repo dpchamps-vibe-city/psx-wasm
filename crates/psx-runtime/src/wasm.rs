@@ -467,6 +467,22 @@ pub extern "C" fn untranslated(addr: u32) -> u64 {
     }
 }
 
+/// A call into an overlay region found none of the code built for `addr`
+/// resident (D69); `name` points at the name of the container that is.
+#[unsafe(export_name = "not_resident")]
+pub extern "C" fn not_resident(addr: u32, name: u32) {
+    let mut buf = [0u8; 64];
+    if name != 0 {
+        Window.read(name, &mut buf);
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let what = match len {
+        0 => "nothing".to_string(),
+        _ => String::from_utf8_lossy(&buf[..len]).into_owned(),
+    };
+    fatal(13, &format!("call to {addr:#010x}, but none of the code built for it is resident: {what} is"))
+}
+
 #[unsafe(export_name = "bios")]
 pub extern "C" fn bios(table: u32, func: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
     // A resumed thread's stack has been rewound to its ChangeThread, which

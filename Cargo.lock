@@ -995,6 +995,7 @@ dependencies = [
  "serde_json",
  "wasm-encoder 0.262.0",
  "wasmparser 0.262.0",
+ "wasmtime",
 ]
 
 [[package]]
