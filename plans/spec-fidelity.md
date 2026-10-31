@@ -295,7 +295,8 @@ calls (TR1, B19).
 
 ## Phase 2: SDK state and waits
 
-1. [ ] **Record the decision** (table above, phase 2).
+1. [x] **Record the decision** (table above, phase 2). D67, `c3aa557`;
+   decided without the human under the /goal (the plan proposes it).
 2. [ ] **SDK2. libetc's state into its own data.** `Vcount`, `Hcount`,
    the handler, callback and DMA tables, the dispatcher's flags:
    `sdk-psyq/src/libetc.rs:4-7, 125-158, 303, 528-530`. Find them through
