@@ -171,12 +171,14 @@ Renderer, SDK, translator, runtime:
   `psx-render-gl/src/shaders.rs:341-344` (white shows as F8F8F8). Fix:
   `(c << 3) | (c >> 2)`.~~
   *Wrong (2026-10-30):* the shift is the oracle's. Beetle zero-pads each 5-bit channel (`<< 3`, its `gpu.c` says "NOT bit-replication"), and psx-spx doesn't specify the DAC's mapping; expanding would break the golden frames.
-- [ ] **B17. libgpu's timeout counts every vblank** when libetc's adapters
+- [x] **B17. libgpu's timeout counts every vblank** when libetc's adapters
   aren't running. `sdk-psyq/src/libgpu.rs:324-328`. Fix: read `Vcount` as
   the original does (`VSync(-1)`).
-- [ ] **B18. libmcx's last-byte wait is ~20 cycles, not a byte's ~1,000.**
+  Done `c061fcd`: libetc's `Vcount` where `VSync(-1)` reads it (found through libgpu's `jal VSync`) when libetc's adapters aren't running.
+- [x] **B18. libmcx's last-byte wait is ~20 cycles, not a byte's ~1,000.**
   `sdk-psyq/src/libmc.rs:498-505`; probably a D66 regression. Fix: a
   byte's time at the port's baud rate.
+  Done `0e36770`: eight bits at JOY_BAUD (~1,088 cycles at 88h).
 - [x] **B19. A tail transfer out of an inlined callee exits the whole
   caller.** `psxw-lift/src/graph.rs:231-237, 260-264`; `emit.rs:198-201,
   255-258, 306-314`. Fix: return to the inlined call's return site.
@@ -193,9 +195,10 @@ Renderer, SDK, translator, runtime:
 - [x] **B22. GTE operands parse shifts tighter than `+`.**
   `psxw-cc/src/gte.rs:236-259`. Fix: C's precedence.
   Done `e172c80` (agent).
-- [ ] **B23. The EXE header's stack beats `SYSTEM.CNF`'s `STACK=`.**
+- [x] **B23. The EXE header's stack beats `SYSTEM.CNF`'s `STACK=`.**
   `psx-runtime/src/boot.rs:68`. Fix: check psx-spx's `LoadExec` first; if
   it writes `STACK` into the header, `STACK` wins.
+  Done `22dae52`: OpenBIOS's boot writes `STACK` into the header with size 0 before `Exec`, and `Exec` leaves sp alone when the base is 0, so the header's stack is never used at boot; no `STACK` gives 801FFF00h.
 
 ### Small shortcuts
 
@@ -219,21 +222,26 @@ Renderer, SDK, translator, runtime:
   `libcd.rs:427, 638`. Fix: print through the game's `printf`, as
   libpress and libspu do.
   Done `9717931`: each message calls the `printf`/`puts` and format the original's code names, with its arguments (past the fourth on the stack, `crate::guest_call`): ResetGraph's, libgpu's timeout, libetc's unexpected-interrupt, intr-timeout and VSync-timeout messages, libcd's CD timeout and `CD_init`.
-- [ ] **SDK12. `DecDCTPutEnv` and transfers skip DMA bookkeeping.**
+- [x] **SDK12. `DecDCTPutEnv` and transfers skip DMA bookkeeping.**
   `sdk-psyq/src/libpress.rs:42-46`. Fix: MADR/BCR after a transfer,
   DPCR's DMA1 enable, the table copy's passes.
-- [ ] **SDK13. `CD_datasync(0)` never waits.**
+  Done `708e754`: BCR0, MADR1/BCR1 as libpress writes them (psyq-decomp's `func_00000428`/`func_000004B8`), each transfer's end as the controller leaves it, `DecDCTPutEnv`'s 32 copy passes spent. DPCR's DMA0/DMA1 enables were already set before each transfer, as the original does.
+- [x] **SDK13. `CD_datasync(0)` never waits.**
   `sdk-psyq/src/libcd.rs:659-665`. Fix: wait while DMA3 is busy, with the
   original's timeout.
-- [ ] **SDK14. `CD_init` doesn't set the memory controller's delay
+  Done `2a23737`.
+- [x] **SDK14. `CD_init` doesn't set the memory controller's delay
   registers.** `sdk-psyq/src/libcd.rs:46-48`. Fix: write them as the
   original does.
-- [ ] **SDK15. `SetRCnt`, `GetRCnt`, `ResetRCnt` call the timer model.**
+  Done `ba72e08`: `CD_flush` leaves COM_DELAY 1325h; `CD_getsector` 20943h/1323h then 1325h; `CD_getsector2` 21020843h/1325h.
+- [x] **SDK15. `SetRCnt`, `GetRCnt`, `ResetRCnt` call the timer model.**
   `sdk-psyq/src/libapi.rs:61-63, 70, 89-90`. Fix: the counter registers
   through `set_reg`, as `StartRCnt` does.
-- [ ] **SDK16. `_spu_t(3)` writes the DMA fields directly.**
+  Done `d7bf03e`.
+- [x] **SDK16. `_spu_t(3)` writes the DMA fields directly.**
   `sdk-psyq/src/libspu.rs:660-663`. Fix: MADR, BCR and CHCR4 through the
   register path.
+  Done `7a80d62`: the end state through the registers. The start bit itself can't go through them: the controller would run the transfer into the device SPU, not the native one.
 - [x] **REN1. A failed output texture or framebuffer is swallowed.**
   `psx-render-gl/src/lib.rs:620-621`. Fix: fail loudly, as the crate does
   elsewhere.
