@@ -180,13 +180,13 @@ const TIMEOUT_ITERATIONS: u32 = 0xF0000;
 const TIMEOUT_VBLANKS: u32 = 0xF0;
 
 /// The waits' iterations (PsyQ 4.7 `sys.o`), the original's instructions
-/// each (D71), the timeout check's 25 (`sys:0x28b4`, not timing out)
+/// each (D71), the timeout check's 26 (`sys:0x28b4`, not timing out)
 /// among them: a full queue's (`sys:0x212c..0x2160`), `DrawSync(0)`'s
 /// first loop (`sys:0x2764..0x279c`) and its second's, the `*2`
 /// functions' alike (`sys:0x27a0..0x27cc`, DMA2 busy).
-const QUEUE_FULL_PASS: u32 = 14 + 25;
-const SYNC_QUEUE_PASS: u32 = 15 + 25;
-const IDLE_PASS: u32 = 12 + 25;
+const QUEUE_FULL_PASS: u32 = 14 + 26;
+const SYNC_QUEUE_PASS: u32 = 15 + 26;
+const IDLE_PASS: u32 = 12 + 26;
 
 /// Where `libgpu/sys` is in this game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1334,9 +1334,9 @@ mod tests {
         assert_eq!(run(&mut m, at::DRAW_SYNC, draw_sync, [1, 0, 0, 0]), 1, "busy");
         let before = m.clock.now;
         assert_eq!(run(&mut m, at::DRAW_SYNC, draw_sync, [0; 4]), u32::MAX);
-        // 0xF0001 iterations of 37 instructions, 2 cycles each.
+        // 0xF0001 iterations of 38 instructions, 2 cycles each.
         let quanta = (m.clock.now - before) / 20_000;
-        assert!((3626..=3628).contains(&quanta), "{quanta} quanta");
+        assert!((3722..=3737).contains(&quanta), "{quanta} quanta");
         assert_eq!(m.mem.r32(DATA + data::COUNT), TIMEOUT_ITERATIONS + 2);
         assert_ne!(m.io.as_ref().unwrap().dma.dpcr & 0x800, 0, "the timeout enables DMA2");
         assert_eq!(run(&mut m, at::DRAW_SYNC, draw_sync, [1, 0, 0, 0]), 0);

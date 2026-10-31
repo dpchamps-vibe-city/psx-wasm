@@ -81,6 +81,15 @@ pub(crate) fn take(m: &mut M, n: u64) {
     }
 }
 
+/// The original's instructions in these ranges of its code (the offsets
+/// of each range's first and last instruction): the blocks on the path an
+/// adapter's original runs, spent from the guest's budget as they start
+/// (D71). An adapter spends a block before what the block does that time
+/// can see (a root counter 2 or SIO0 access, a loop header, a guest call).
+pub(crate) fn path(m: &mut M, ranges: &[(u32, u32)]) {
+    take(m, ranges.iter().map(|&(a, b)| ((b - a) / 4 + 1) as u64).sum());
+}
+
 /// Passes of a loop of `per` instructions an iteration until the budget
 /// runs out: the next pass's loop header takes a safepoint.
 pub(crate) fn room(m: &M, per: u32) -> u64 {

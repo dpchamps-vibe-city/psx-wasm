@@ -10,7 +10,7 @@
 //! I_MASK (its table: counters 0-2, then RCntCNT3, vblank), which the
 //! kernel's root counter handler and libetc's dispatcher both go by.
 
-use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
+use crate::{path, Adapter, M, Result, bios, reg, ret, set_reg};
 
 /// The root-counter adapters (`counter.o`): chip irq (D59).
 pub const COUNTERS: &[&str] = &["SetRCnt", "GetRCnt", "StartRCnt", "StopRCnt", "ResetRCnt"];
@@ -48,35 +48,60 @@ fn rcnt(n: usize, reg: u32) -> u32 {
 }
 
 pub(crate) fn set_rcnt(m: &mut M, a: [u32; 4]) -> Result {
-    let Some(n) = counter(a[0]) else { return ret(0) };
+    // Its time is `counter.o`'s blocks on its path (D71): root counter 2
+    // sees the cycle each access is made at (D66).
+    let Some(n) = counter(a[0]) else {
+        path(m, &[(0x0, 0xC), (0x10, 0x14), (0x94, 0x98)]);
+        return ret(0);
+    };
     let mode_in = a[2];
     let mut mode: u16 = 0x48;
-    if n < 2 {
-        if mode_in & 0x10 != 0 {
-            mode = 0x49;
-        }
-        if mode_in & 1 == 0 {
-            mode |= 0x100;
-        }
-    } else if mode_in & 1 == 0 {
-        mode = 0x248;
-    }
-    if mode_in & 0x1000 != 0 {
-        mode |= 0x10;
-    }
+    path(m, &[(0x0, 0xC), (0x18, 0x38)]);
     // As counter.o writes them: the mode cleared, the target, the mode.
     set_reg(m, rcnt(n, 4), 2, 0)?;
     set_reg(m, rcnt(n, 8), 2, a[1] & 0xFFFF)?;
+    if n < 2 {
+        path(m, &[(0x3C, 0x40)]);
+        if mode_in & 0x10 != 0 {
+            mode = 0x49;
+            path(m, &[(0x44, 0x44)]);
+        }
+        path(m, &[(0x48, 0x4C)]);
+        if mode_in & 1 == 0 {
+            mode |= 0x100;
+            path(m, &[(0x50, 0x54)]);
+        }
+    } else {
+        path(m, &[(0x58, 0x60), (0x64, 0x6C)]);
+        if mode_in & 1 == 0 {
+            mode = 0x248;
+            path(m, &[(0x70, 0x70)]);
+        }
+    }
+    path(m, &[(0x74, 0x78)]);
+    if mode_in & 0x1000 != 0 {
+        mode |= 0x10;
+        path(m, &[(0x7C, 0x7C)]);
+    }
+    path(m, &[(0x80, 0x90)]);
     set_reg(m, rcnt(n, 4), 2, mode as u32)?;
+    path(m, &[(0x94, 0x98)]);
     ret(1)
 }
 
 fn get_rcnt(m: &mut M, a: [u32; 4]) -> Result {
-    let Some(n) = counter(a[0]) else { return ret(0) };
-    ret(reg(m, rcnt(n, 0), 2)? & 0xFFFF)
+    let Some(n) = counter(a[0]) else {
+        path(m, &[(0x9C, 0xA8), (0xC8, 0xC8), (0xCC, 0xD0)]);
+        return ret(0);
+    };
+    path(m, &[(0x9C, 0xA8), (0xAC, 0xC4)]);
+    let v = reg(m, rcnt(n, 0), 2)? & 0xFFFF;
+    path(m, &[(0xCC, 0xD0)]);
+    ret(v)
 }
 
 fn start_rcnt(m: &mut M, a: [u32; 4]) -> Result {
+    path(m, &[(0xD4, 0x100)]);
     let n = (a[0] & 0xFFFF) as usize;
     let mask = reg(m, psx_devices::irq::I_MASK, 4)?;
     set_reg(m, psx_devices::irq::I_MASK, 4, mask | RCNT_IRQ.get(n).copied().unwrap_or(0))?;
@@ -84,6 +109,7 @@ fn start_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 }
 
 fn stop_rcnt(m: &mut M, a: [u32; 4]) -> Result {
+    path(m, &[(0x104, 0x134)]);
     let n = (a[0] & 0xFFFF) as usize;
     let mask = reg(m, psx_devices::irq::I_MASK, 4)?;
     set_reg(m, psx_devices::irq::I_MASK, 4, mask & !RCNT_IRQ.get(n).copied().unwrap_or(0))?;
@@ -91,8 +117,13 @@ fn stop_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 }
 
 fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
-    let Some(n) = counter(a[0]) else { return ret(0) };
+    let Some(n) = counter(a[0]) else {
+        path(m, &[(0x138, 0x144), (0x160, 0x160), (0x164, 0x168)]);
+        return ret(0);
+    };
+    path(m, &[(0x138, 0x144), (0x148, 0x15C)]);
     set_reg(m, rcnt(n, 0), 2, 0)?;
+    path(m, &[(0x164, 0x168)]);
     ret(1)
 }
 

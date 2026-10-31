@@ -59,7 +59,7 @@
 //! iterations at once. Values left in `v0` by `void` functions are the
 //! original's where the code makes them plain.
 
-use crate::{Adapter, M, Psyq, Result, reg, set_reg};
+use crate::{Adapter, M, Psyq, Result, path, reg, set_reg};
 use psx_bios::{Flow, GuestCall};
 use psx_spu::Spu;
 use psx_spu::mixer::{Mask, Volume};
@@ -148,11 +148,9 @@ const CHCR4: u32 = 0x1F80_10C8;
 const SPU_DELAY: u32 = 0x1F80_1014;
 /// libspu's wait loops give up after this many polls.
 const TIMEOUT: u32 = 3840;
-/// Loop passes the translated original spends, where clang's code makes
-/// them other than one per iteration (measured against the original over
-/// the devices, `psxw conform --chip spu`): `_spu_init` parks two voices
-/// a pass.
-const PARK_PASSES: u32 = 12;
+/// The status polls' loops: the original's instructions a pass (D71;
+/// `spu.o` +88h..+90h and +B0h..+CCh, the same at +348h and +3DCh).
+const WAIT_PASS: u32 = 11;
 /// `SpuSetReverbModeParam` copies a mode's 68 bytes of parameters a word a
 /// pass.
 const COPY_PASSES: u32 = 17;
@@ -302,6 +300,23 @@ pub(crate) fn each(m: &mut M, from: u32, n: u32, per: u32, body: Rc<dyn Fn(&mut 
     k(m)
 }
 
+/// A loop entered at its test (`test`, its header), `n` passes of the test
+/// and the body, then the test that leaves: the original's instructions
+/// (D71), a safepoint at the header where the budget has run out.
+fn tested(m: &mut M, n: u32, test: (u32, u32), body: (u32, u32), k: K) -> F {
+    header(
+        m,
+        Box::new(move |m| {
+            path(m, &[test]);
+            if n == 0 {
+                return k(m);
+            }
+            path(m, &[body]);
+            tested(m, n - 1, test, body, k)
+        }),
+    )
+}
+
 /// The SPU core, up to now.
 fn sp<R>(m: &mut M, f: impl FnOnce(&mut Spu) -> R) -> R {
     match m.with_spu(f) {
@@ -316,18 +331,28 @@ fn sp_r<R>(m: &mut M, f: impl FnOnce(&mut Spu) -> std::result::Result<R, String>
 }
 
 /// libspu's poll of a status bit: done at once when `cond` holds (the core
-/// changes no status bit while time passes); else its 3,840 polls, then
-/// `printf("SPU:T/O [%s]\n", what)`.
+/// changes no status bit while time passes); else its 3,840 polls of
+/// [`WAIT_PASS`] instructions, then `printf("SPU:T/O [%s]\n", what)`. The
+/// caller spends the blocks the original branches to when it holds at
+/// once.
 fn wait(m: &mut M, o: SpuO, cond: impl FnOnce(&Spu) -> bool, what: u32, k: K) -> F {
     if sp(m, |s| cond(&*s)) {
         return k(m);
     }
-    spend(m, TIMEOUT, Box::new(move |m| call(m, o.printf, [o.rdata, o.rdata + what, 0, 0], move |m, _| k(m))))
+    spend(m, TIMEOUT * WAIT_PASS, Box::new(move |m| call(m, o.printf, [o.rdata, o.rdata + what, 0, 0], move |m, _| k(m))))
 }
 
-/// `_spu_Fw1ts()` `n` times: libspu's delay loop, the original's code.
+/// `_spu_Fw1ts()` `n` times: libspu's delay loop, the original's code;
+/// each call after the first preceded by its two instructions (`jal` and
+/// delay slot), the original's calls in a row.
 fn delay(m: &mut M, o: SpuO, n: u32, k: K) -> F {
-    call(m, o.fw1ts(), [0; 4], move |m, _| if n == 1 { k(m) } else { delay(m, o, n - 1, k) })
+    call(m, o.fw1ts(), [0; 4], move |m, _| {
+        if n == 1 {
+            return k(m);
+        }
+        crate::take(m, 2);
+        delay(m, o, n - 1, k)
+    })
 }
 
 // --- Registers by index -------------------------------------------------
@@ -425,6 +450,8 @@ fn get_index(s: &Spu, idx: u32) -> std::result::Result<u16, String> {
 fn spu_init(m: &mut M, a: [u32; 4]) -> Result {
     let o = spu_o(m, at::INIT)?;
     let hot = a[0] != 0;
+    // Its time is `spu.o`'s blocks on its path (D71).
+    path(m, &[(0x0, 0x58)]);
     let dpcr = reg(m, DPCR, 4)?;
     set_reg(m, DPCR, 4, dpcr | 0xB_0000)?;
     m.mem.w32(o.data + d::TRANS_MODE, 0);
@@ -440,21 +467,35 @@ fn spu_init(m: &mut M, a: [u32; 4]) -> Result {
         o,
         1,
         Box::new(move |m| {
+            path(m, &[(0x5C, 0x80)]);
             sp(m, |s| {
                 s.set_common_volume(Volume::Main, 0, 0);
                 s.set_common_volume(Volume::Main, 1, 0);
             });
-            wait(m, o, |s| s.status() & 0x7FF == 0, msg::RESET, Box::new(move |m| init_modes(m, o, hot)))
+            wait(
+                m,
+                o,
+                |s| s.status() & 0x7FF == 0,
+                msg::RESET,
+                Box::new(move |m| {
+                    path(m, &[(0xD0, 0xD0)]);
+                    init_modes(m, o, hot)
+                }),
+            )
         }),
     ))
 }
 
 fn init_modes(m: &mut M, o: SpuO, hot: bool) -> F {
+    path(m, &[(0xD4, 0x134)]);
     let rq = o.rq;
-    // The register queue's ten halfwords: a loop the translation unrolls.
-    for i in 0..10 {
-        m.mem.w16(rq + 2 * i, 0);
-    }
+    // The register queue's ten halfwords.
+    let clear = Rc::new(move |m: &mut M, i: u32| m.mem.w16(rq + 2 * i, 0));
+    each(m, 0, 10, 5, clear, Box::new(move |m| init_regs(m, o, hot)))
+}
+
+fn init_regs(m: &mut M, o: SpuO, hot: bool) -> F {
+    path(m, &[(0x14C, 0x150)]);
     let dd = o.data;
     for (off, v) in [(d::MEM_MODE, 2), (d::MEM_PLUS, 3), (d::MEM_UNIT, 8), (d::MEM_UNITM, 7)] {
         m.mem.w32(dd + off, v);
@@ -471,6 +512,7 @@ fn init_modes(m: &mut M, o: SpuO, hot: bool) -> F {
     if hot {
         return init_done(m, o);
     }
+    path(m, &[(0x154, 0x194)]);
     m.mem.w16(dd + d::TSA, 0x200);
     sp(m, |s| {
         s.set_mask_bits(Mask::PitchMod, 0);
@@ -486,34 +528,44 @@ fn init_modes(m: &mut M, o: SpuO, hot: bool) -> F {
         dd + d::BLOCK,
         16,
         Box::new(move |m| {
-            // Two voices a pass: the translation unrolls the loop once.
-            let park = Rc::new(|m: &mut M, pass: u32| {
+            path(m, &[(0x198, 0x1AC)]);
+            // Every voice parked on the silent block.
+            let park = Rc::new(|m: &mut M, v: u32| {
                 sp(m, |s| {
-                    for v in [2 * pass as usize, 2 * pass as usize + 1] {
-                        s.set_voice_volume(v, 0, 0);
-                        s.set_voice_volume(v, 1, 0);
-                        s.set_voice_pitch(v, 0x3FFF);
-                        s.set_voice_start(v, 0x200);
-                        s.set_voice_adsr1(v, 0);
-                        s.set_voice_adsr2(v, 0);
-                    }
+                    let v = v as usize;
+                    s.set_voice_volume(v, 0, 0);
+                    s.set_voice_volume(v, 1, 0);
+                    s.set_voice_pitch(v, 0x3FFF);
+                    s.set_voice_start(v, 0x200);
+                    s.set_voice_adsr1(v, 0);
+                    s.set_voice_adsr2(v, 0);
                 })
             });
             each(
                 m,
                 0,
-                PARK_PASSES,
-                1,
+                24,
+                10,
                 park,
                 Box::new(move |m| {
+                    path(m, &[(0x1D8, 0x1F0)]);
                     sp(m, |s| s.set_mask_bits(Mask::KeyOn, 0xFF_FFFF));
                     delay(
                         m,
                         o,
                         4,
                         Box::new(move |m| {
+                            path(m, &[(0x20C, 0x220)]);
                             sp(m, |s| s.set_mask_bits(Mask::KeyOff, 0xFF_FFFF));
-                            delay(m, o, 4, Box::new(move |m| init_done(m, o)))
+                            delay(
+                                m,
+                                o,
+                                4,
+                                Box::new(move |m| {
+                                    path(m, &[(0x23C, 0x23C)]);
+                                    init_done(m, o)
+                                }),
+                            )
                         }),
                     )
                 }),
@@ -523,6 +575,7 @@ fn init_modes(m: &mut M, o: SpuO, hot: bool) -> F {
 }
 
 fn init_done(m: &mut M, o: SpuO) -> F {
+    path(m, &[(0x240, 0x27C)]);
     m.mem.w32(o.data + d::IN_TRANSFER, 1);
     sp(m, |s| s.set_control(0xC000));
     m.mem.w32(o.data + d::TRANSFER_CB, 0);
@@ -534,49 +587,80 @@ fn init_done(m: &mut M, o: SpuO) -> F {
 /// the FIFO, 64 at a time, each sent with transfer mode 1; then the mode
 /// cleared and the status back to what it was.
 fn manual_write(m: &mut M, o: SpuO, src: u32, size: u32, k: K) -> F {
+    path(m, &[(0x280, 0x2BC)]);
     let tsa = m.mem.r16(o.data + d::TSA);
     let before = sp(m, |s| {
         let st = s.status() & 0x7FF;
         s.set_transfer_start(tsa);
         st
     });
-    delay(m, o, 1, Box::new(move |m| manual_chunk(m, o, src, size, before, k)))
-}
-
-fn manual_chunk(m: &mut M, o: SpuO, src: u32, left: u32, before: u16, k: K) -> F {
-    if left == 0 {
-        sp(m, |s| s.set_control(s.control() & !0x30));
-        return wait(m, o, move |s| s.status() & 0x7FF == before, msg::DMAF, k);
-    }
-    let n = left.min(64);
-    // The outer loop's header, then a pass per halfword.
-    spend(
+    delay(
         m,
+        o,
         1,
         Box::new(move |m| {
+            path(m, &[(0x2C0, 0x2C4)]);
+            manual_chunk(m, o, src, size, before, k)
+        }),
+    )
+}
+
+/// A chunk of [`manual_write`], from its loop's header.
+fn manual_chunk(m: &mut M, o: SpuO, src: u32, left: u32, before: u16, k: K) -> F {
+    if left == 0 {
+        path(m, &[(0x3A8, 0x3D4)]);
+        sp(m, |s| s.set_control(s.control() & !0x30));
+        let end = move |m: &mut M| {
+            path(m, &[(0x424, 0x43C)]);
+            k(m)
+        };
+        return wait(m, o, move |s| s.status() & 0x7FF == before, msg::DMAF, Box::new(end));
+    }
+    let n = left.min(64);
+    header(
+        m,
+        Box::new(move |m| {
+            path(m, &[(0x2C8, 0x2CC)]);
+            if left < 65 {
+                path(m, &[(0x2D0, 0x2D0)]);
+            }
+            path(m, &[(0x2D4, 0x2D8), (0x2DC, 0x2E0)]);
             let halves = n.div_ceil(2);
             each(
                 m,
                 0,
                 halves,
-                1,
+                7,
                 Rc::new(move |m, i| {
                     let h = m.mem.r16(src + 2 * i);
                     sp(m, |s| s.push_transfer(h));
                 }),
                 Box::new(move |m| {
+                    path(m, &[(0x300, 0x320)]);
                     sp(m, |s| s.set_control((s.control() & !0x30) | 0x10));
                     delay(
                         m,
                         o,
                         1,
                         Box::new(move |m| {
+                            path(m, &[(0x324, 0x340)]);
                             wait(
                                 m,
                                 o,
                                 |s| s.status() & 0x400 == 0,
                                 msg::WRDY,
-                                Box::new(move |m| delay(m, o, 2, Box::new(move |m| manual_chunk(m, o, src + 2 * halves, left - n, before, k)))),
+                                Box::new(move |m| {
+                                    path(m, &[(0x390, 0x394)]);
+                                    delay(
+                                        m,
+                                        o,
+                                        2,
+                                        Box::new(move |m| {
+                                            path(m, &[(0x3A0, 0x3A4)]);
+                                            manual_chunk(m, o, src + 2 * halves, left - n, before, k)
+                                        }),
+                                    )
+                                }),
                             )
                         }),
                     )
@@ -591,6 +675,29 @@ fn manual_chunk(m: &mut M, o: SpuO, src: u32, left: u32, before: u16, k: K) -> F
 /// starts DMA4 on `addr`, `size` bytes, in 16-word blocks.
 fn spu_t(m: &mut M, o: SpuO, mode: u32, addr: u32, size: u32) -> std::result::Result<(), String> {
     let dd = o.data;
+    // Its time is `spu.o`'s blocks on its path (D71); its waits on the SPU
+    // hold at once.
+    const ENTRY: (u32, u32) = (0x5A4, 0x5CC);
+    const EXIT: (u32, u32) = (0x814, 0x820);
+    match mode {
+        2 => path(m, &[ENTRY, (0x5D0, 0x5D8), (0x5EC, 0x5F0), (0x604, 0x62C), EXIT]),
+        1 => path(m, &[ENTRY, (0x630, 0x650), (0x674, 0x698), EXIT]),
+        0 => path(m, &[ENTRY, (0x5D0, 0x5D8), (0x5DC, 0x5E0), (0x69C, 0x6BC), (0x6E0, 0x700), EXIT]),
+        3 if m.mem.r32(dd + d::DMA_READ) == 1 => path(
+            m,
+            &[ENTRY, (0x5D0, 0x5D8), (0x5EC, 0x5F0), (0x5F4, 0x5F8), (0x704, 0x714), (0x718, 0x718), (0x71C, 0x738), (0x75C, 0x76C)],
+        ),
+        3 => path(m, &[ENTRY, (0x5D0, 0x5D8), (0x5EC, 0x5F0), (0x5F4, 0x5F8), (0x704, 0x714), (0x71C, 0x738), (0x75C, 0x76C)]),
+        _ => path(m, &[ENTRY, (0x5D0, 0x5D8), (0x5EC, 0x5F0), (0x5F4, 0x5F8), (0x5FC, 0x600), EXIT]),
+    }
+    if mode == 3 {
+        // The DMA delay register's helper, then the transfer's set-up.
+        if m.mem.r32(dd + d::DMA_READ) == 1 {
+            path(m, &[(0x770, 0x774), (0xAB0, 0xAD4), (0x778, 0x77C), (0x78C, 0x7F4), (0x7F8, 0x7FC), (0x800, 0x810), EXIT]);
+        } else {
+            path(m, &[(0x780, 0x784), (0xA88, 0xAAC), (0x788, 0x788), (0x78C, 0x7F4), (0x800, 0x810), EXIT]);
+        }
+    }
     match mode {
         2 => {
             let tsa = addr >> (m.mem.r32(dd + d::MEM_PLUS) & 31);
@@ -661,14 +768,26 @@ fn dma4(m: &mut M, addr: u32, words: u32, read: bool) -> std::result::Result<(),
 fn spu_fw(m: &mut M, a: [u32; 4]) -> Result {
     let o = spu_o(m, at::FW)?;
     let (addr, size) = (a[0], a[1]);
+    // Its time is `spu.o`'s blocks on its path, the callees' among them
+    // (D71).
+    path(m, &[(0x824, 0x844)]);
     if m.mem.r32(o.data + d::TRANS_MODE) != 0 {
-        return Ok(manual_write(m, o, addr, size, Box::new(move |m| back(m, size))));
+        path(m, &[(0x884, 0x88C)]);
+        let end = move |m: &mut M| {
+            path(m, &[(0x890, 0x890), (0x894, 0x8A4)]);
+            back(m, size)
+        };
+        return Ok(manual_write(m, o, addr, size, Box::new(end)));
     }
     let plus = m.mem.r32(o.data + d::MEM_PLUS) & 31;
     let tsa = (m.mem.r16(o.data + d::TSA) as u32) << plus;
+    path(m, &[(0x848, 0x860)]);
     spu_t(m, o, 2, tsa, 0)?;
+    path(m, &[(0x864, 0x868)]);
     spu_t(m, o, 1, 0, 0)?;
+    path(m, &[(0x86C, 0x878)]);
     spu_t(m, o, 3, addr, size)?;
+    path(m, &[(0x87C, 0x880), (0x894, 0x8A4)]);
     Ok(back(m, size))
 }
 
@@ -678,12 +797,33 @@ fn spu_fw(m: &mut M, a: [u32; 4]) -> Result {
 /// transfer event (`DeliverEvent(HwSPU, EvSpCOMP)`).
 fn spu_fidma(m: &mut M, _a: [u32; 4]) -> Result {
     let o = spu_o(m, at::FIDMA)?;
+    // Its time is `spu.o`'s blocks on its path (D71).
+    path(m, &[(0x440, 0x450)]);
     let then = move |m: &mut M| -> F {
+        path(m, &[(0x45C, 0x488)]);
         sp(m, |s| s.set_control(s.control() & !0x30));
+        path(m, &[(0x4B0, 0x4C0)]);
         let cb = m.mem.r32(o.data + d::TRANSFER_CB);
-        if cb != 0 { call(m, cb, [0xF000_0000, 0, 0, 0], back) } else { call(m, o.deliver_event, [0xF000_0009, 0x20, 0, 0], back) }
+        if cb != 0 {
+            path(m, &[(0x4C4, 0x4D4)]);
+            call(m, cb, [0xF000_0000, 0, 0, 0], |m, v| {
+                path(m, &[(0x4D8, 0x4DC), (0x4EC, 0x4F8)]);
+                back(m, v)
+            })
+        } else {
+            path(m, &[(0x4E0, 0x4E8)]);
+            call(m, o.deliver_event, [0xF000_0009, 0x20, 0, 0], |m, v| {
+                path(m, &[(0x4EC, 0x4F8)]);
+                back(m, v)
+            })
+        }
     };
-    Ok(if m.mem.r32(o.data + d::DMA_READ) == 0 { delay(m, o, 1, Box::new(then)) } else { then(m) })
+    Ok(if m.mem.r32(o.data + d::DMA_READ) == 0 {
+        path(m, &[(0x454, 0x458)]);
+        delay(m, o, 1, Box::new(then))
+    } else {
+        then(m)
+    })
 }
 
 /// `_spu_FsetRXX(idx, value, as_address)`: register `idx` set to `value`,
@@ -692,7 +832,9 @@ fn spu_fidma(m: &mut M, _a: [u32; 4]) -> Result {
 fn spu_fsetrxx(m: &mut M, a: [u32; 4]) -> Result {
     let o = spu_o(m, at::FSETRXX)?;
     let (idx, value) = (a[0], a[1]);
-    let v = if a[2] == 0 { value } else { value >> (m.mem.r32(o.data + d::MEM_PLUS) & 31) };
+    let raw = a[2] == 0;
+    path(m, &[(0x90C, 0x910), if raw { (0x914, 0x928) } else { (0x92C, 0x944) }, (0x948, 0x94C)]);
+    let v = if raw { value } else { value >> (m.mem.r32(o.data + d::MEM_PLUS) & 31) };
     sp_r(m, |s| set_index(s, idx, v as u16))?;
     let rxx = m.mem.r32(o.data + d::RXX);
     Ok(back(m, rxx.wrapping_add(idx.wrapping_mul(2))))
@@ -709,20 +851,32 @@ fn spu_fsetrxxa(m: &mut M, a: [u32; 4]) -> Result {
 
 fn fsetrxxa(m: &mut M, o: SpuO, idx: u32, mut addr: u32) -> std::result::Result<u32, String> {
     let dd = o.data;
+    // Its time is `spu.o`'s blocks on its path (D71).
+    path(m, &[(0x950, 0x960)]);
     if m.mem.r32(dd + d::MEM_MODE) != 0 {
         let unit = m.mem.r32(dd + d::MEM_UNIT);
         if unit == 0 {
             return Err("_spu_FsetRXXa: division by a zero memory unit".into());
         }
+        path(m, &[(0x964, 0x978), (0x980, 0x988)]);
         if addr % unit != 0 {
             addr = addr.wrapping_add(unit) & !m.mem.r32(dd + d::MEM_UNITM);
+            path(m, &[(0x98C, 0x99C)]);
         }
     }
+    path(m, &[(0x9A0, 0x9B8)]);
     let units = addr >> (m.mem.r32(dd + d::MEM_PLUS) & 31);
     match idx as i32 {
-        -2 => Ok(addr),
-        -1 => Ok(units & 0xFFFF),
+        -2 => {
+            path(m, &[(0x9D0, 0x9D4), (0x9EC, 0x9F0)]);
+            Ok(addr)
+        }
+        -1 => {
+            path(m, &[(0x9BC, 0x9C4), (0x9C8, 0x9CC), (0x9EC, 0x9F0)]);
+            Ok(units & 0xFFFF)
+        }
         _ => {
+            path(m, &[(0x9BC, 0x9C4), (0x9D8, 0x9E8), (0x9EC, 0x9F0)]);
             sp_r(m, |s| set_index(s, idx, units as u16))?;
             Ok(addr)
         }
@@ -909,6 +1063,7 @@ fn get_all_keys_status(m: &mut M, a: [u32; 4]) -> Result {
 
 /// `SpuGetVoiceEnvelope(voice, *envx)`.
 fn get_voice_envelope(m: &mut M, a: [u32; 4]) -> Result {
+    path(m, &[(0x0, 0x18)]);
     let e = sp_r(m, |s| get_index(s, a[0].wrapping_mul(8).wrapping_add(6)))?;
     m.mem.w16(a[1], e);
     Ok(back(m, e as u32))
@@ -919,6 +1074,8 @@ fn get_voice_envelope(m: &mut M, a: [u32; 4]) -> Result {
 fn get_voice_volume(m: &mut M, a: [u32; 4]) -> Result {
     let base = a[0].wrapping_mul(8);
     let (l, r) = sp_r(m, |s| Ok((get_index(s, base)?, get_index(s, base + 1)?)))?;
+    let side = |v: u16, level, sweep| if v < 0x4000 { level } else { sweep };
+    path(m, &[(0x0, 0x24), side(l, (0x34, 0x34), (0x28, 0x30)), (0x38, 0x44), side(r, (0x54, 0x54), (0x48, 0x50)), (0x58, 0x5C)]);
     let shown = |v: u16| if v < 0x4000 { v as u32 } else { (v as u32).wrapping_sub(0x8000) };
     m.mem.w16(a[1], shown(l) as u16);
     m.mem.w16(a[2], shown(r) as u16);
@@ -933,12 +1090,23 @@ fn set_voice_volume(m: &mut M, a: [u32; 4]) -> Result {
         set_index(s, base, (a[1] & 0x7FFF) as u16)?;
         set_index(s, base + 1, (a[2] & 0x7FFF) as u16)
     })?;
-    Ok(spend(m, 2, Box::new(|m| back(m, 0))))
+    // Then its delay loop: two passes, its test (the loop's header) first.
+    path(m, &[(0x0, 0x30)]);
+    Ok(tested(m, 2, (0x60, 0x70), (0x34, 0x5C), Box::new(|m| {
+        path(m, &[(0x74, 0x78)]);
+        back(m, 0)
+    })))
 }
 
 /// `SpuSetNoiseClock(n)`: the noise clock (0-63) in SPUCNT bits 8-13.
 fn set_noise_clock(m: &mut M, a: [u32; 4]) -> Result {
     let n = (a[0] as i32).clamp(0, 63) as u32;
+    match a[0] as i32 {
+        i32::MIN..0 => path(m, &[(0x0, 0x8)]),
+        0..64 => path(m, &[(0x0, 0x8), (0xC, 0x18)]),
+        _ => path(m, &[(0x0, 0x8), (0xC, 0x18), (0x1C, 0x1C)]),
+    }
+    path(m, &[(0x20, 0x44)]);
     sp(m, |s| s.set_control((s.control() & 0xC0FF) | (n as u16) << 8));
     Ok(back(m, n))
 }
@@ -954,6 +1122,26 @@ fn set_any_voice(m: &mut M, a: [u32; 4]) -> Result {
     let rqmask = c.pair(m, (0xD8, 0xDC), "_spu_RQmask")?;
     let (op, bits, lo, hi) = (a[0], a[1], a[2], a[3]);
     let queue = m.mem.r32(env) & 1 != 0;
+    // Its time is `s_sav.o`'s blocks on its path (D71).
+    path(m, &[(0x0, 0x20)]);
+    if !queue {
+        path(m, &[(0x24, 0x28)]);
+    }
+    path(m, &[(0x2C, 0x54)]);
+    let tail = |q: (u32, u32), r: (u32, u32), join: (u32, u32)| [if queue { q } else { r }, join, (0x2AC, 0x2B8)];
+    match op as i32 {
+        1 => path(m, &[(0x84, 0x98)]),
+        0 => path(m, &[(0x58, 0x60), (0x64, 0x68), (0x140, 0x154)]),
+        8 => path(m, &[(0x58, 0x60), (0x74, 0x78), (0x214, 0x228)]),
+        o if o < 2 => path(m, &[(0x58, 0x60), (0x64, 0x68), (0x6C, 0x70), (0x2B4, 0x2B8)]),
+        _ => path(m, &[(0x58, 0x60), (0x74, 0x78), (0x7C, 0x80), (0x2B4, 0x2B8)]),
+    }
+    match op {
+        1 => path(m, &tail((0x9C, 0xF4), (0xF8, 0x12C), (0x130, 0x13C))),
+        0 => path(m, &tail((0x158, 0x1B8), (0x1BC, 0x1FC), (0x200, 0x210))),
+        8 => path(m, &tail((0x22C, 0x274), (0x278, 0x2A0), (0x2A4, 0x2A8))),
+        _ => {}
+    }
     let q = |i: u32| rqb.wrapping_add(i.wrapping_mul(2));
     let (cur_lo, cur_hi) =
         if queue { (m.mem.r16(q(lo)) as u32, m.mem.r16(q(hi)) as u32) } else { sp_r(m, |s| Ok((get_index(s, lo)? as u32, get_index(s, hi)? as u32)))? };
@@ -982,6 +1170,7 @@ fn set_any_voice(m: &mut M, a: [u32; 4]) -> Result {
 
 /// `_SpuGetAnyVoice(lo, hi)`: the voice mask in registers `lo` and `hi`.
 fn get_any_voice(m: &mut M, a: [u32; 4]) -> Result {
+    path(m, &[(0x0, 0x2C)]);
     let (lo, hi) = sp_r(m, |s| Ok((get_index(s, a[0])? as u32, get_index(s, a[1])? as u32)))?;
     Ok(back(m, lo | (hi & 0xFF) << 16))
 }
@@ -1282,6 +1471,40 @@ fn set_common_attr(m: &mut M, a: [u32; 4]) -> Result {
     let has = |b: u32| all || mask & b != 0;
     let r16 = |m: &M, o: u32| m.mem.r16(p + o);
     let r32 = |m: &M, o: u32| m.mem.r32(p + o);
+    // Its time is `s_sca.o`'s instructions on its path (D71): no loop and
+    // no call, so all at once.
+    let mut n = 6 + 2;
+    for (side, (vol, mode_bit)) in [(1u32, 4u32), (2, 8)].into_iter().enumerate() {
+        // R's test of `all`; the side's bit (L's block takes the next
+        // test's first instruction).
+        n += if side == 1 { 2 } else { 0 } + if all { 0 } else { 3 - side as u64 };
+        if !has(vol) {
+            continue;
+        }
+        let at = if all || mask & mode_bit != 0 {
+            n += if all { 0 } else { 2 };
+            let mode = r16(m, 8 + 2 * side as u32) as i16 as i32;
+            n += if (mode as u32) < 8 { 11 } else { 5 };
+            (1..8).contains(&mode)
+        } else {
+            n += 2;
+            false
+        };
+        // The case (or the direct path), the sweep test, the store.
+        n += 2 + 2 + 4;
+        if at {
+            let level = r16(m, 4 + 2 * side as u32) as i16;
+            n += 5 + match level {
+                128.. => 1,
+                i16::MIN..0 => 3,
+                _ => 4,
+            };
+        }
+    }
+    for (bit, cost) in [(0x40, 5), (0x80, 5), (0x400, 5), (0x800, 5), (0x100, 11), (0x200, 11), (0x1000, 11), (0x2000, 11)] {
+        n += 2 + if all { 0 } else { 2 } + if has(bit) { cost } else { 0 };
+    }
+    crate::take(m, n);
     let mut v0 = 0u32;
     for (side, (vol, mode_bit)) in [(1u32, 4u32), (2, 8)].into_iter().enumerate() {
         if has(vol) {
