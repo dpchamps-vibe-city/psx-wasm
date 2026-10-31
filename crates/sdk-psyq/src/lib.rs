@@ -81,13 +81,47 @@ pub(crate) fn take(m: &mut M, n: u64) {
     }
 }
 
+/// The instructions a call through libapi's stubs spends before the
+/// BIOS's code, which spends none (D71): a syscall's (`EnterCriticalSection`,
+/// `a36`), and a vector's (`SysEnqIntRP`, `l02`: `jr` to A0h, B0h or C0h).
+pub(crate) const SYSCALL_STUB: u64 = 4;
+pub(crate) const VECTOR_STUB: u64 = 3;
+
 /// The original's instructions in these ranges of its code (the offsets
 /// of each range's first and last instruction): the blocks on the path an
 /// adapter's original runs, spent from the guest's budget as they start
 /// (D71). An adapter spends a block before what the block does that time
 /// can see (a root counter 2 or SIO0 access, a loop header, a guest call).
 pub(crate) fn path(m: &mut M, ranges: &[(u32, u32)]) {
-    take(m, ranges.iter().map(|&(a, b)| ((b - a) / 4 + 1) as u64).sum());
+    take(m, count(ranges));
+}
+
+fn count(ranges: &[(u32, u32)]) -> u64 {
+    ranges.iter().map(|&(a, b)| ((b - a) / 4 + 1) as u64).sum()
+}
+
+/// [`path`] in an interrupt handler an adapter runs, where a register
+/// read sees the time after the blocks spent so far (`Machine::guest_now`,
+/// D66). Without a guest budget (tests) the time passes on the clock.
+pub(crate) fn irq_path(m: &mut M, ranges: &[(u32, u32)]) {
+    let n = count(ranges);
+    if m.regs.budget().is_some() {
+        return take(m, n);
+    }
+    let t = m.clock.now + n * psxw_abi::guest::CYCLES_PER_INSTRUCTION as u64;
+    m.clock.advance_to(t);
+}
+
+/// One of the original's loop headers in an interrupt handler: where the
+/// budget has run out, a quantum passes there, delivering nothing
+/// (interrupts are off), as at the original's safepoint (D60, D71).
+/// Nowhere else in the handler does one.
+pub(crate) fn irq_header(m: &mut M) {
+    if let Some(b) = m.regs.budget().filter(|&b| b <= 0) {
+        m.regs.set_budget(b + psx_bios::BUDGET as i32);
+        let t = m.clock.now + m.quantum();
+        m.clock.advance_to(t);
+    }
 }
 
 /// Passes of a loop of `per` instructions an iteration until the budget

@@ -189,10 +189,16 @@ fn element_verifier(m: &mut M, _a: [u32; 4]) -> Result {
 
 /// The element's handler: SIO0's control register cleared, then a
 /// countdown from 10: the original's 98 instructions (D71; `pad:0x1e4`,
-/// 18 around ten passes of the loop's 8).
+/// 18 around ten passes of the loop's 8, a quantum only at its header).
 fn element_handler(m: &mut M, _a: [u32; 4]) -> Result {
+    crate::irq_path(m, &[(0x1E4, 0x218)]);
     set_reg(m, 0x1F80_104A, 2, 0)?;
-    crate::libpad::spend_in_exception(m, 98);
+    crate::irq_path(m, &[(0x21C, 0x21C)]);
+    for _ in 0..10 {
+        crate::irq_header(m);
+        crate::irq_path(m, &[(0x220, 0x23C)]);
+    }
+    crate::irq_path(m, &[(0x240, 0x248)]);
     ret(0)
 }
 

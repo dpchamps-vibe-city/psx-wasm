@@ -316,7 +316,26 @@ fn sio_rw(m: &mut M, b: u8) -> std::result::Result<u8, String> {
 /// (nothing delivered) each time it runs out (D60).
 fn spin(m: &mut M, t: u64, per: u32) {
     let cycles = per as u64 * psxw_abi::guest::CYCLES_PER_INSTRUCTION as u64;
-    crate::libpad::spend_in_exception(m, t.div_ceil(cycles) * per as u64);
+    spend_in_exception(m, t.div_ceil(cycles) * per as u64);
+}
+
+/// The budget spent in the exception, a quantum each time it runs out:
+/// libmcx's wait, until its handlers spend their originals' blocks.
+fn spend_in_exception(m: &mut M, n: u64) {
+    let Some(left) = m.regs.budget() else {
+        let t = m.clock.now + n * m.quantum() / (psx_bios::BUDGET / crate::UNIT) as u64;
+        m.clock.advance_to(t);
+        return;
+    };
+    let mut left = left as i64 - n as i64 * crate::UNIT;
+    let mut quanta = 0;
+    while left <= 0 {
+        left += psx_bios::BUDGET;
+        quanta += 1;
+    }
+    let t = m.clock.now + quanta * m.quantum();
+    m.clock.advance_to(t);
+    m.regs.set_budget(left as i32);
 }
 
 /// JOY_CTRL 40h, then mode 0Dh, baud 88h and control 0: the port reset.
