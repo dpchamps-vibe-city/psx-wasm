@@ -119,6 +119,27 @@ pub fn call(h: &mut dyn Harness, name: &str, args: &[u32]) -> Result<u32, String
     Ok(v)
 }
 
+/// Record the guest's budget left: the original's instructions so far, the
+/// interrupts' among them (D71).
+pub fn budget(h: &mut dyn Harness, what: &str) {
+    let b = h.budget();
+    h.observe(&format!("{what}: budget"), b.to_string());
+}
+
+/// [`call`], and the budget after it.
+pub fn timed(h: &mut dyn Harness, name: &str, args: &[u32]) -> Result<u32, String> {
+    let v = call(h, name, args)?;
+    budget(h, name);
+    Ok(v)
+}
+
+/// Let `n` vblanks pass, and record the budget.
+pub fn vblanks(h: &mut dyn Harness, n: u32) -> Result<(), String> {
+    h.vblanks(n)?;
+    budget(h, &format!("{n} vblanks"));
+    Ok(())
+}
+
 /// Record `len` bytes at `addr`, in hex.
 pub fn observe_ram(h: &mut dyn Harness, what: &str, addr: u32, len: usize) {
     let b = h.read(addr, len);

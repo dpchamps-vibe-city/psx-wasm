@@ -18,7 +18,7 @@
 //! - Fake function pointers go only where nothing calls them: lines and
 //!   channels that raise nothing in the case.
 
-use super::{Case, Harness, Rng};
+use super::{Case, Harness, Rng, budget, timed as call, vblanks};
 
 const RCNT: u32 = 0xF200_0000;
 /// SetRCnt modes: interrupt at target, system clock (counter 2: not /8).
@@ -102,26 +102,6 @@ pub fn cases() -> Vec<Case> {
             run: sequence,
         },
     ]
-}
-
-/// The guest's budget left: the original's instructions so far (D71).
-fn budget(h: &mut dyn Harness, what: &str) {
-    let b = h.budget();
-    h.observe(&format!("{what}: budget"), b.to_string());
-}
-
-/// Call `name`, and record its result and the budget.
-fn call(h: &mut dyn Harness, name: &str, args: &[u32]) -> Result<u32, String> {
-    let v = super::call(h, name, args)?;
-    budget(h, name);
-    Ok(v)
-}
-
-/// Let `n` vblanks pass, and record the budget.
-fn vblanks(h: &mut dyn Harness, n: u32) -> Result<(), String> {
-    h.vblanks(n)?;
-    budget(h, &format!("{n} vblanks"));
-    Ok(())
 }
 
 /// A call whose result is libetc's context pointer (or 0).
