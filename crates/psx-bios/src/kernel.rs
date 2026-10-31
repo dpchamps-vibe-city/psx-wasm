@@ -60,8 +60,6 @@ pub struct Kernel {
     pub clear_rcnt: [u32; 4],
     pub clear_pad: u32,
     pub custom_exit: u32,
-    /// `SysEnqIntRP` queues: priority → handler structs.
-    pub int_handlers: BTreeMap<u32, Vec<u32>>,
     /// Memory cards and their files.
     pub cards: crate::card::Cards,
     /// Threads; their TCBs are in guest RAM.

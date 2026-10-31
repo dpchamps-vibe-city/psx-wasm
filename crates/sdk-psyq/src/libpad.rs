@@ -1019,13 +1019,13 @@ mod tests {
         let mut m = started();
         vblanks(&mut m, 3);
         assert_eq!(run(&mut m, "PadStopCom", [0; 4]), 0);
-        assert!(!m.kernel.int_handlers[&2].contains(&ELEMENT));
+        assert!(!m.chain(2).contains(&ELEMENT));
         m.mem.write(B0, &[9; 4]);
         vblanks(&mut m, 2);
         assert_eq!(buf(&m, B0), [9; 4], "nothing polls");
         run(&mut m, "PadStartCom", [0; 4]);
         assert_eq!(m.mem.r8(RECORDS + rec::STATE), 0, "forgotten");
-        assert_eq!(m.kernel.int_handlers[&2], vec![ELEMENT], "libpad's own element");
+        assert_eq!(m.chain(2), vec![ELEMENT], "libpad's own element");
         // Detection again: a poll, its reply a vblank later.
         vblanks(&mut m, 1);
         assert_eq!(buf(&m, B0), [9; 4]);
