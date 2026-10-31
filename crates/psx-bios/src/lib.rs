@@ -142,6 +142,11 @@ mod tests {
         m.io_write(0x1F80_1074, 4, 1 << 6).unwrap();
         m.run_until(2000);
         take(&mut m);
+        assert_eq!(m.ev(h).unwrap().status, kernel::EV_READY);
+        // UnDeliverEvent makes it busy again; DeliverEvent ready.
+        ret(bios::call(&mut m, 0xB0, 0x20, [0xF200_0002, 0x0002, 0, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
+        ret(bios::call(&mut m, 0xB0, 0x07, [0xF200_0002, 0x0002, 0, 0]));
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
         assert_eq!(m.io.as_ref().unwrap().irq.stat & 1 << 6, 0, "acknowledged");
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);

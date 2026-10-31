@@ -15,7 +15,10 @@ pub const EV_DISABLED: u32 = 0x1000;
 pub const EV_ENABLED: u32 = 0x2000;
 pub const EV_READY: u32 = 0x4000;
 /// Event mode: call the handler from the interrupt.
-pub const EV_MODE_INTR: u32 = 0x1000;pub const EV_HANDLE: u32 = 0xF100_0000;
+pub const EV_MODE_INTR: u32 = 0x1000;
+/// Event mode: no handler, the event becomes ready.
+pub const EV_MODE_NOINTR: u32 = 0x2000;
+pub const EV_HANDLE: u32 = 0xF100_0000;
 /// Default number of event control blocks (SYSTEM.CNF `EVENT=`).
 pub const EVENTS: usize = 16;
 /// `PAD_init2`'s own buffers (B0:15h), in the kernel's data: psx-spx has
@@ -240,6 +243,19 @@ impl<S: Sdk> Machine<S> {
             }
         }
         calls
+    }
+
+    /// UnDeliverEvent: ready events of mode 2000h with this class and spec
+    /// are busy again (psx-spx).
+    pub(crate) fn undeliver_event(&mut self, class: u32, spec: u32) {
+        let n = self.evcb(EV_HANDLE).map_or(0, |_| self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE);
+        for i in 0..n {
+            let a = self.evcb_at(EV_HANDLE | i).expect("in range");
+            let e = self.read_ev(a);
+            if e.status == EV_READY && e.mode == EV_MODE_NOINTR && e.class == class && e.spec == spec {
+                self.mem.w32(a + 4, EV_ENABLED);
+            }
+        }
     }
 }
 

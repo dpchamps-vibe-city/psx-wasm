@@ -222,6 +222,7 @@ fn bios_call(name: &'static str, table: u32, func: u32, args: [u32; 4], setup: V
 fn bios() -> Vec<Handwritten> {
     let s = wire::SCRATCH_BASE;
     let call = |name, func, args, setup, captures| bios_call(name, 0xA0, func, args, setup, captures);
+    let timer = |name, func, args| bios_call(name, 0xB0, func, args, vec![], vec![]);
     let text = |t: &[u8]| vec![(s, t.to_vec()), (s + 0x20, vec![0xEE; 4])];
     vec![
         call("bios_strlen", 0x1B, [s, 0, 0, 0], vec![(s, b"psx-wasm device oracle\0".to_vec())], vec![]),
@@ -260,6 +261,13 @@ fn bios() -> Vec<Handwritten> {
         call("bios_bzero", 0x28, [s + 4, 8, 0, 0], vec![(s, vec![0x11; 16])], vec![(s, 16)]),
         call("bios_memmove_down", 0x2C, [s, s + 4, 8, 0], vec![(s, (0u8..16).collect())], vec![(s, 16)]),
         call("bios_memchr", 0x2E, [s, b'd' as u32, 6, 0], text(b"abcdef\0"), vec![]),
+        // Root counters: the runner captures no registers, so results.
+        timer("bios_init_timer", 0x02, [1, 0x100, 0, 0]),
+        timer("bios_init_timer_vblank", 0x02, [3, 0, 0, 0]),
+        timer("bios_get_timer_vblank", 0x03, [3, 0, 0, 0]),
+        timer("bios_enable_timer_irq", 0x04, [0, 0, 0, 0]),
+        timer("bios_disable_timer_irq", 0x05, [0, 0, 0, 0]),
+        timer("bios_restart_timer_vblank", 0x06, [3, 0, 0, 0]),
     ]
 }
 
