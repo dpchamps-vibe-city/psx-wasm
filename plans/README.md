@@ -11,7 +11,7 @@ where the last one stopped.
 | [`conventions.md`](conventions.md) | Repo layout, commands, file formats, data hygiene, commit rules |
 | [`unified-adaptor-layer/`](unified-adaptor-layer/) | **The active plan:** native adapters per chip, with graceful degradation to the device models. A README for shared context, then phase 1 (btn and bof4) and phase 2 (the rest of PsyQ 4.7). |
 | [`open-items.md`](open-items.md) | Every unfinished task, blocked item, human-needed input and erratum, in one place |
-| [`shortcuts.md`](shortcuts.md) | Every place the runtime, BIOS, devices, adapters or translator silently deviates from the hardware or the original code, as tasks to fix to the spec |
+| [`shortcuts.md`](shortcuts.md) | Every corner cut in the runtime, BIOS, devices, adapters and translator, as tasks to redo the spec's way |
 | [`completed/`](completed/) | Everything implemented: milestones M0–M13 (M9 never started) and the btn bug follow-ups, kept as history |
 
 ## What psx-wasm is, in one screen
