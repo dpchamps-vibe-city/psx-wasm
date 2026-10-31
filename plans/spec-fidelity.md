@@ -384,12 +384,17 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    working for adapter-owned elements.
    Done `6155844`: `SysEnqIntRP` prepends in RAM, `SysDeqIntRP` unlinks and
    returns the element; the handler walks RAM only.
-5. [ ] **BIOS4. The kernel's own interrupt handlers are chain elements**
+5. [x] **BIOS4. The kernel's own interrupt handlers are chain elements**
    (`EnqueueTimerAndVblankIrqs`): root counter and vblank events, pad
    buffer filling and card pacing run when the interrupt is taken, in
    priority order, not on the device event
    (`psx-bios/src/machine.rs:385-414`). They honour `ChangeClearRCnt`,
    `ChangeClearPad` and `SetIrqAutoAck`. **Run:** both games' replays.
+   Done `053035d`: elements in kernel RAM run as `IrqStep::Kernel` steps:
+   root counters and vblank (priority 1, acknowledge and RFE per
+   `ChangeClearRCnt`), IRQ class events (3, `SetIrqAutoAck`), the pad and
+   card handler (2, `StartPAD2`/`StartCARD2`, `ChangeClearPad`). Pending
+   interrupts are taken at ExitCriticalSection and I_MASK writes.
 6. [ ] **BIOS5. The pad driver drives SIO0** for `InitPAD`/`StartPAD`
    buffers (`psx-bios/src/kernel.rs:110-126`), through the shared port
    model.
