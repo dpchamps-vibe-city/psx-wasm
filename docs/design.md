@@ -489,7 +489,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 registers from its table); natively it is an adapter (D63) that calls the original `_SsVmInit` and writes libsnd's globals where libsnd keeps them; the rest of libsnd reaches the SPU through libspu's adapters. On the device those writes reach the SPU (D47). |
 | libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), their state in the runtime, the games' buffers in guest RAM; `PadStartCom` installs a `SysEnqIntRP` element the kernel runs as an adapter step. On the device: original code over SIO0 (D40), a port of the oracle's. |
 | libmcrd | `guest`, over the HLE BIOS card functions (D43). |
-| libcard | `adapter`. Its `_patch_card` patches Sony BIOS code in kernel RAM (D43). |
+| libcard | `adapter`. The functions that patch Sony BIOS code in kernel RAM (`_patch_card` and its kin) are adapters with nothing to patch; the wrappers run as original code into the BIOS (D43). |
 | libmcx | `adapter-or-device`, chip memcard (D65): the PocketStation library, which drives the card slots on SIO0 itself. Native (btn): adapters for `McxStartCom` (vblank in I_STAT/I_MASK, its element appended to the kernel's priority-2 chain through the table of tables) and `_mcxDsrEntry` (each byte of a transfer, the card answering as a standard card does), with the vblank handler and both elements' verifiers run as adapter steps in their places; libmcx's state stays where libmcx keeps it (D61's way), so the command functions, `McxSync` and `McxStopCom` are guest code over it. On the device: original code over SIO0, its cards the BIOS's images, its element in the kernel's RAM chain. |
 | libgs | `guest`. It only writes packets into RAM; libgpu's `DrawOTag` is the device step. |
 | libgte | `guest`, with COP2 through `psx-gte`. |
@@ -1656,8 +1656,12 @@ would reimplement it; the original runs unchanged over `psx-bios::card`.
 - **The card image is raw 128 KiB** (`.mcr`) in host storage.
 - **Slot 1 always has a card** (formatted if no image exists). Slot 2 has
   one only if its image exists, matching the oracle's default.
-- **libcard's thin BIOS wrappers keep adapters**: their `_patch_card`
-  patches Sony BIOS code in kernel RAM.
+- **libcard's functions that patch Sony BIOS code in kernel RAM are
+  adapters with nothing to patch** (`_patch_card`, `_patch_card2`,
+  `_patch_card_info`, `_copy_memcard_patch`, `_ExitCard`). Its wrappers
+  (`InitCARD`, `StartCARD`, `StopCARD`) run as the original code into the
+  BIOS's `InitCARD2`, `StartCARD2` and `StopCARD2` (2026-10-30: they were
+  adapters that only readied the cards, spec-fidelity BIOS2).
 
 **D44. Browser tests: Debian-snapshot browsers, results POSTed by the
 page** (M5). Two deviations from the plan's Playwright image and

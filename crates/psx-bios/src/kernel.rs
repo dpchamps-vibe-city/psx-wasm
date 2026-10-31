@@ -44,7 +44,13 @@ pub struct File {
 pub struct Kernel {
     /// `InitPAD` buffers: (address, size) per port.
     pub pad_bufs: Option<[(u32, u32); 2]>,
+    /// The pad and card handler is in the chain (`StartPAD2`/`StartCARD2`;
+    /// `StopPAD2` and `StopCARD2` take it out for both).
     pub pad_started: bool,
+    /// psx-spx's `pad_enable_flag`: set by `InitPAD2`, and by
+    /// `InitCARD2(pad_enable)`, which selects whether the pads are read
+    /// with the cards.
+    pub pad_enable: bool,
     /// `PAD_init2`'s `button_dest`: where `PAD_dr` stores its result; the
     /// handler calls it at each vblank when nonzero.
     pub pad_dest: u32,
@@ -74,6 +80,7 @@ impl Kernel {
         }
         self.pad_bufs = Some(bufs);
         self.pad_dest = 0;
+        self.pad_enable = true;
     }
 
     /// `PAD_init2(type, button_dest)`: only types 20000000h and 20000001h;
@@ -123,7 +130,7 @@ impl Kernel {
     /// nothing is connected), at most 22h bytes whatever the buffer's
     /// size; then `PAD_dr` when `PAD_init2` named a destination.
     pub fn pad_vblank(&mut self, mem: &mut dyn Mem, host: &mut dyn Host) {
-        let (Some(bufs), true) = (self.pad_bufs, self.pad_started) else { return };
+        let (Some(bufs), true) = (self.pad_bufs, self.pad_started && self.pad_enable) else { return };
         for (port, (addr, _)) in bufs.iter().enumerate() {
             let state = host.pad_state(port as u32);
             if state.is_empty() {
