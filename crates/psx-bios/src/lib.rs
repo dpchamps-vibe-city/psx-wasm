@@ -144,6 +144,19 @@ mod tests {
     }
 
     #[test]
+    fn closed_events_stay_closed() {
+        let mut m = machine();
+        let h = ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0]));
+        ret(bios::call(&mut m, 0xB0, 0x09, [h, 0, 0, 0]));
+        ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
+        assert_eq!(m.kernel.ev(h).unwrap().status, kernel::EV_UNUSED);
+        ret(bios::call(&mut m, 0xB0, 0x0D, [h, 0, 0, 0]));
+        assert_eq!(m.kernel.ev(h).unwrap().status, kernel::EV_UNUSED);
+        // The slot is free for the next OpenEvent.
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0])), h);
+    }
+
+    #[test]
     fn reset_entry_int_drops_the_hook() {
         let mut m = machine();
         ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));
