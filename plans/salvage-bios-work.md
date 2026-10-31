@@ -192,7 +192,7 @@ Five are documented no-ops, and A(52h)'s meaning needs verification.
 |---|---|---|
 | [x] | A(41h) | `LoadTest` |
 | [x] | A(42h) | `Load` |
-| [ ] | A(52h) | Resolve reference conflict: summary says `GetSysSp`, another section says `SystemError`; then implement the verified behaviour |
+| [ ] | A(52h) | PsyQ binds `GetSysSp` to this slot, but its returned pointer/body remain unverified and psx-spx conflicts; do not guess a stack address |
 | [ ] | A(9Ch) | `SetConf`: main-thread reset implemented; live non-main reset still blocked |
 | [x] | A(9Dh) | `GetConf` |
 | [ ] | A(A7h) | `bufs_cb_0` |
@@ -249,10 +249,11 @@ handoff's missing-call list.
   native cleanup cancels old queued work to protect descriptor reuse. Explicit
   A(A7h..AAh/AEh) callbacks remain partial, notably Info/Load/write-test effects
   and unspecified returns. No serial exchanges or instruction timing added.
-- [ ] **Console input/control.** `gets` always errors; built-in blocking TTY
-  reads error; low-level TTY `ioctl` is a zero-return stub. `getc`/`getchar` and
-  output wrappers already exist. Complete the missing software and host-input
-  integration, reusing file/device dispatch.
+- [ ] **Console input/control.** `gets` now edits and echoes a bounded line
+  through guest file/device callbacks, including quoted characters and deferred
+  termination. Built-in blocking TTY reads still error; host input, circular
+  helpers and low-level TTY control remain unfinished. Reuse file/device dispatch;
+  a no-op poll or fabricated availability is not host-input integration.
 - [x] **Direct SYS(03h).** The TCB-address syscall now uses the same pending
   switch, SP/GP bookkeeping and Asyncify stacks as B(10h). Build scope includes
   syscall sites; the syscall import stops rewind without repeating the switch.
@@ -797,6 +798,47 @@ not a successful console implementation. One same-channel retry `5f2da315-0130-
 4b17-a89f-c9decd7845db` now owns only gets using the supplied pinned stdio body;
 circular-buffer services, missing host input and general ioabort remain blocked.
 No alternate runner or tool/config workaround was used.
+
+The gets-only retry completed as `26264cc`, reviewed and integrated as `cec5896`.
+Its iterative immediate-return path and existing Flow continuations preserve
+editing, quoting, the 125-byte limit and read/echo order over guest devices.
+Parent fixed the final NUL write to occur AFTER the newline echo returns, as in
+pinned stdio.c, with a callback-time assertion, and classified gets as partial
+rather than unsupported. BIOS 48/runtime 8 and wasm32 runtime check pass. The
+built-in host-input error remains; C(15h..19h)/A(B2h) are not implemented.
+
+The kernel-entry scout's report is reviewed, but its proposed A(52h) answer is
+NOT accepted: a PsyQ GetSysSp tail-jump proves the SDK binding, not the retail
+body, side effects or whether the return is stack-top/top-minus-four/live SP.
+No guessed 80006FFCh return or fatal classification was added. C(09h)'s documented
+post-boot problem is its FIRST OPCODE being overwritten by the A0 table's last
+word, not a known callable operation that corrupts data. Literal clearing of
+7460h..891Fh would destroy unrelated native file data while not resetting Rust
+kernel state; no clear/reset implementation is justified. Both stay unfinished.
+
+### Card/SDK integration gate at `37e37ed` (ABI 18)
+
+Fresh release CLI, runtime wasm and both game builds pass, all six chip groups
+native. BTN is 2,544,749 bytes; BOF4 is 10,157,727 bytes. The new build report
+actually prints BTN 42 working/12 partial/1 unsupported/1 fatal/1 no-op calls,
+and BOF4 36 working/16 partial/1 unsupported/1 no-op; unsupported entries are
+B(51h) font access and A(43h) Exec respectively, not build failures under the
+preserved named-entry gate.
+
+Fresh disposable storage and unchanged replays: BTN title-to-gameplay (6000
+frames, all three expected states), card-load (3000 frames), BOF4 title-to-field
+(26000 frames, all five expected states), and supplied name-select crash (694
+frames) all pass no-trap. Boot text matches and EDC errors are zero. Card-load
+has no state assertions and is not save/persistence certification. BTN GPU
+warnings at frames 64/65/83 remain unchanged and unclassified. Original versus
+adaptor conformance passes for libpad (125 steps) and libetc (60 steps).
+
+These artifacts remain at `37e37ed`; the later gets source is only locally gated.
+No fresh full CI, browser or non-empty BIOS oracle result is claimed. ABI-17 CI
+failures/prerequisite gaps remain recorded above. New SDK continuation work is
+isolated in `5941fc75-3407-47dd-887d-3b601c2ea103`, same SDK lane: ONLY libmc's
+start_com and finish (three direct BIOS calls). Its void IRQ-step path remains
+parent-owned; no new driver/runtime framework is authorized.
 
 ## Progress log
 

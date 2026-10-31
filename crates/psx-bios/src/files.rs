@@ -470,12 +470,11 @@ impl<S: Sdk> Machine<S> {
             let was_quoted = quoted;
             quoted = false;
             if !was_quoted && (c == b'\n' || c == b'\r') {
-                self.mem.w8(ptr, 0);
                 let echo = self.putchars(vec![b'\n'])?;
-                return Ok(match echo {
-                    Flow::Return(_) => Flow::ret(s),
-                    flow => seq(self, flow, move |_, _| Flow::ret(s)),
-                });
+                return Ok(seq(self, echo, move |m, _| {
+                    m.mem.w8(ptr, 0);
+                    Flow::ret(s)
+                }));
             }
             let (next, echo) = self.gets_echo(s, ptr, end, c, was_quoted)?;
             match echo {
@@ -490,12 +489,11 @@ impl<S: Sdk> Machine<S> {
             return self.gets_loop(s, ptr, end, true);
         }
         if !quoted && (c == b'\n' || c == b'\r') {
-            self.mem.w8(ptr, 0);
             let echo = self.putchars(vec![b'\n'])?;
-            return Ok(match echo {
-                Flow::Return(_) => Flow::ret(s),
-                flow => seq(self, flow, move |_, _| Flow::ret(s)),
-            });
+            return Ok(seq(self, echo, move |m, _| {
+                m.mem.w8(ptr, 0);
+                Flow::ret(s)
+            }));
         }
         let (next, echo) = self.gets_echo(s, ptr, end, c, quoted)?;
         match echo {
@@ -1363,7 +1361,7 @@ mod tests {
     /// OpenBIOS `psxgets`.
     #[test]
     fn gets_reads_and_echoes_through_a_guest_tty() {
-        use std::cell::RefCell;
+        use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
         use std::rc::Rc;
 
@@ -1394,7 +1392,8 @@ mod tests {
 
         let input = Rc::new(RefCell::new(VecDeque::new()));
         let events = Rc::new(RefCell::new(Vec::new()));
-        let (queue, seen) = (input.clone(), events.clone());
+        let terminator = Rc::new(Cell::new(0u32));
+        let (queue, seen, tail) = (input.clone(), events.clone(), terminator.clone());
         let returns = move |m: &mut Machine<NoSdk>, call: GuestCall| {
             if call.addr != func + dcb::IN_OUT {
                 return 0;
@@ -1411,6 +1410,9 @@ mod tests {
                     None => u32::MAX,
                 },
                 2 => {
+                    if queue.borrow().is_empty() {
+                        assert_eq!(m.mem.r8(tail.get()), 0xCC, "the terminator is written only after the final echo returns");
+                    }
                     let (at, n) = (m.mem.r32(f + fcb::BUFFER), m.mem.r32(f + fcb::COUNT));
                     let bytes = m.mem.bytes(at, n as usize);
                     seen.borrow_mut().extend(bytes.into_iter().map(|c| (2, c)));
@@ -1422,6 +1424,8 @@ mod tests {
 
         input.borrow_mut().extend(b"\x7fab\x08c\t\x16\nQ\r");
         let line = 0x8004_0000;
+        terminator.set(line + 5);
+        m.mem.w8(line + 5, 0xCC);
         let v = m.gets(line);
         assert_eq!(ret(&mut m, v, &returns), line);
         assert_eq!(m.mem.bytes(line, 6), b"ac \nQ\0");
@@ -1456,6 +1460,8 @@ mod tests {
         input.borrow_mut().extend(std::iter::repeat(b'x').take(125));
         input.borrow_mut().extend(b"y\r");
         let full = 0x8005_0000;
+        terminator.set(full + 125);
+        m.mem.w8(full + 125, 0xCC);
         let v = m.gets(full);
         assert_eq!(ret(&mut m, v, &returns), full);
         assert_eq!(m.mem.bytes(full, 125), vec![b'x'; 125]);

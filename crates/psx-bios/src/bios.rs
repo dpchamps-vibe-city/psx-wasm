@@ -273,7 +273,7 @@ pub fn support(table: u32, func: u32) -> Support {
         // No cache or dummy device to affect; retail returns zero.
         (0xA0, 0x44) | (0xA0, 0x57) | (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => Support::Noop,
         // Recognised, but the required capability is not available here.
-        (0xA0, 0x14) | (0xA0, 0x43) | (0xA0, 0x52) | (0xB0, 0x3E) | (0xB0, 0x51) | (0xC0, 0x09) => Support::Unsupported,
+        (0xA0, 0x14) | (0xA0, 0x43) | (0xA0, 0x52) | (0xB0, 0x51) | (0xC0, 0x09) => Support::Unsupported,
         // Native services with recorded gaps: continuation/thread contexts,
         // host console input, card completion, CD errors/event waits and
         // filesystem details, or configuration/identity restrictions. Public
@@ -288,7 +288,7 @@ pub fn support(table: u32, func: u32) -> Support {
         | (0xA0, 0xAE | 0xAF)
         | (0xA0, 0xB4)
         | (0xB0, 0x0E..=0x10)
-        | (0xB0, 0x32 | 0x34..=0x36 | 0x3A | 0x3C | 0x40 | 0x42 | 0x43)
+        | (0xB0, 0x32 | 0x34..=0x36 | 0x3A | 0x3C | 0x3E | 0x40 | 0x42 | 0x43)
         | (0xB0, 0x4D..=0x4F | 0x5C | 0x5D) => Support::Partial,
         _ => Support::Working,
     }
@@ -1153,7 +1153,7 @@ mod tests {
         assert_eq!(support(0xA0, 0x14), Support::Unsupported);
         assert_eq!(support(0xA0, 0x43), Support::Unsupported);
         assert_eq!(support(0xA0, 0x42), Support::Partial, "loader works over the incomplete file backends");
-        assert_eq!(support(0xB0, 0x3E), Support::Unsupported);
+        assert_eq!(support(0xB0, 0x3E), Support::Partial);
         assert_eq!(support(0xC0, 0x09), Support::Unsupported);
         // Documented fatal and no-op behaviour.
         assert_eq!(support(0xA0, 0x0B), Support::Fatal);
