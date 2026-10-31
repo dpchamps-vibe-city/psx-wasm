@@ -303,7 +303,9 @@ handoff's missing-call list.
   native cleanup cancels old queued work to protect descriptor reuse. Explicit
   A(A7h..AAh/AEh) callbacks remain partial. A8/A9/AA now end pending Info/Load
   high-level notifications without consuming the driver's scheduled completion;
-  write-test effects, AE's body and unspecified returns remain unresolved.
+  write-test notifications/effects, AE's body and unspecified returns remain
+  unresolved. OpenBIOS does not implement AF; absence of its body is not evidence
+  for either high-level notifications or their removal.
   No serial exchanges or instruction timing added.
 - [ ] **Console input/control.** `gets` now edits and echoes a bounded line
   through guest file/device callbacks, including quoted characters and deferred
@@ -1375,7 +1377,7 @@ must not be silently copied. No chain state, flags, ABI, runtime or exception
 machinery was added from this scout, and no new architecture was approved.
 No active children or pending worker changes remain.
 
-### CD read retry follow-up
+### CD read retry follow-up (`c42c64c`)
 
 Parent corrected the returning-error continuation in `cdrom.rs`, using the
 existing `Flow::Call`/`machine::seq` machinery only. Pinned OpenBIOS
@@ -1407,6 +1409,23 @@ command-busy retry loops and native INT5 production are not implemented. No
 Wait variant, event-generation state, IRQ/CD driver, ABI or runtime redesign.
 Latest release/runtime/game builds and four replays remain at `03c4627`, before
 this correction; no unnecessary full-CI/browser/empty-oracle rerun.
+
+### Card write-test contract scout disposition
+
+Read-only DeepSeek scout `ce3b09e8-84df-43f2-9bfe-f7f50cfc95f5` completed
+`salvage/card-write-test-contract.md`. Parent read its complete report and
+independently checked pinned OpenBIOS
+[`handlers.c`](https://raw.githubusercontent.com/pcsx-redux/nugget/4dc70d2931121a0fde858a0354192b6df4fa22e8/openbios/kernel/handlers.c):
+A(AFh), like AE, is unimplemented. psx-spx documents the dummy frame-3Fh write
+and new-card flag clearing, but not its high-level notification contract.
+
+Parent **rejected** the scout's proposed `high: true` to `false` change and
+low-only test: an absent reference body proves neither behavior. A8/A9/AA's
+write-test effects cannot be inferred from the known Info/Load operations.
+The card source comments now distinguish the retained, unverified native policy
+from the verified OpenBIOS event split; no behavior or coverage classification
+changed. AF and the callbacks remain `Partial`, with no extra test/build needed
+for these comment-only corrections. No active children or pending worker edits.
 
 ## Progress log
 

@@ -8,9 +8,10 @@
 //! - Every card access the BIOS makes delivers the low-level driver's
 //!   completion event (F0000011h): 04h done, 100h no card, 2000h new
 //!   card, 8000h error. The higher-level event (F4000001h, same specs)
-//!   comes only from the A-table functions (`_card_info`, `_card_load`,
-//!   `card_write_test`) and asynchronous file I/O, as in OpenBIOS
-//!   (`sio0/driver.c`, `card/backupunit.c`). libmcrd waits on exactly
+//!   comes from `_card_info`, `_card_load` and asynchronous file I/O,
+//!   as in OpenBIOS (`sio0/driver.c`, `card/backupunit.c`). The existing
+//!   `card_write_test` high notification remains unverified: OpenBIOS
+//!   leaves A(AFh) unimplemented. libmcrd waits on exactly
 //!   this split: on F0000011h after `_card_read`/`_card_write` and after
 //!   a `firstfile` that finds nothing, on F4000001h after `_card_info`,
 //!   `_card_load` and file reads and writes.
@@ -62,7 +63,7 @@ pub const E_FULL: u32 = 0x1C;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Op {
     Read { frame: u32, dst: u32 },
-    /// `high`: `card_write_test` (A-table), which also delivers F4000001h.
+    /// `high`: the existing `card_write_test` notification policy; unverified.
     Write { frame: u32, data: Vec<u8>, high: bool },
     /// `high`: `_card_info` (A-table), which also delivers F4000001h.
     Info { high: bool },
