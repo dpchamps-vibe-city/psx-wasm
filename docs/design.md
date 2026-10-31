@@ -775,8 +775,13 @@ a call into guest code.
   registry, critical sections, the heap, the file API on top of the CD,
   the memory card functions (D43), exception hooks, and `setjmp` support
   (guest `setjmp`/`longjmp` use wasm exception handling, D45). The pure
-  parts (heap, the string table) could come from OpenBIOS's C, compiled as
-  guest code.
+  parts now run in Rust over guest memory. The guest-visible A0/B0/C0
+  tables hold native stand-in pointers, or guest patches. Saved native
+  pointers call linker-generated o32 thunks independently of later table
+  edits; B(17h)'s thunk uses the existing exception-exit tag. ABI 17 retains
+  the baseline window/masked dispatch: stand-ins occupy low-kernel slots
+  A000h..A900h, and the linker rejects game-code collisions. It does not
+  introduce a console-wide address mapper or execute BIOS machine code.
 - **clock.** The virtual timeline: vblank (NTSC 59.94 Hz, PAL 50 Hz), a
   queue of pending device events, and the safepoint quantum. It delivers
   events in a fixed order by calling guest callbacks.

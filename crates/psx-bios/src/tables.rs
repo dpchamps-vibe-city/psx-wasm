@@ -6,7 +6,7 @@
 use psxw_abi::kernel as k;
 
 /// Synthetic callable addresses, clear of the kernel's IRQ functions.
-pub const STAND_INS: u32 = 0xBFC0_A000;
+pub const STAND_INS: u32 = psxw_abi::BIOS_STAND_INS.start;
 const TABLES: [(u32, u32, u32); 3] = [(0xA0, 0x000, k::A0_LEN), (0xB0, 0x300, k::B0_LEN), (0xC0, 0x700, k::C0_LEN)];
 
 /// Numbers psx-spx gives the same function, and C(80h..)'s B0h aliases.

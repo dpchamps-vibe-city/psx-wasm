@@ -164,6 +164,96 @@ void func_80011000(int a, char *p) { func_80012200(a, 0, 8); func_80012200(p, 0,
     assert_eq!(calls, [(callout::CALL, 0x8001_2200, 5), (callout::CALL, 0x8001_2200, 0x8001_5000)]);
 }
 
+/// Saved native BIOS entries remain callable after a table patch. Exercise
+/// C's dynamic/constant pointers, a lifted direct call, and the o32 return.
+#[test]
+fn game_bios_saved_entry_thunks() {
+    use psxw_abi::{WINDOW_BASE, guest, kernel};
+    use psxw_link::game::{GameSpec, Tier};
+    let src = r#"
+typedef unsigned long long (*fp)(unsigned, unsigned, unsigned, unsigned);
+unsigned long long func_80011100(unsigned a, unsigned b, unsigned c, unsigned d) { return 42; }
+unsigned long long func_80011000(unsigned a, unsigned b, unsigned c, unsigned d) {
+    fp saved = *(fp volatile *)0x200;
+    *(fp volatile *)0x200 = func_80011100;
+    return saved(a, b, c, d);
+}
+unsigned long long func_80011200(unsigned a, unsigned b, unsigned c, unsigned d) {
+    return ((fp)0xBFC0A000)(a, b, c, d);
+}
+extern unsigned long long psxw_f_BFC0A000(unsigned, unsigned, unsigned, unsigned);
+unsigned long long func_80011300(unsigned a, unsigned b, unsigned c, unsigned d) {
+    return psxw_f_BFC0A000(a, b, c, d);
+}
+unsigned long long func_80011400(unsigned a, unsigned b, unsigned c, unsigned d) {
+    ((fp)0xBFC0A35C)(a, b, c, d);
+    return 77; /* ReturnFromException must never return here. */
+}
+"#;
+    let Some((map, input)) = compile("psxw-link-bios-thunks", src) else {
+        return;
+    };
+    let tiers = (0..input.obj.funcs.len() as u32)
+        .filter_map(|f| {
+            let name = &input.obj.func_symbol(f + input.obj.num_imported_funcs())?.name;
+            let addr = u32::from_str_radix(name.strip_prefix("func_")?, 16).ok()?;
+            Some((("t".into(), addr), Tier::C { input: 0, func: f }))
+        })
+        .collect();
+    let mut spec = GameSpec {
+        tiers,
+        overlays: BTreeMap::new(),
+        budget: 1000,
+        debug_io: false,
+        device_funcs: Default::default(),
+        main: "t".into(),
+        min_pages: psxw_abi::window_pages(WINDOW_BASE),
+        window_base: WINDOW_BASE,
+        debug_info: false,
+        probes: vec![],
+        mods: None,
+        slots: None,
+        threads: false,
+    };
+    let inputs = [input];
+    let linked = psxw_link::game::link(&map, None, &spec, &inputs).unwrap();
+    let mut config = wasmtime::Config::new();
+    config.wasm_exceptions(true);
+    let engine = wasmtime::Engine::new(&config).unwrap();
+    let module = wasmtime::Module::new(&engine, &linked.wasm).unwrap();
+    let mut store = wasmtime::Store::new(&engine, 0u32);
+    let mut linker = wasmtime::Linker::new(&engine);
+    const RESULT: u64 = 0xFEDC_BA98_7654_3210;
+    linker
+        .func_wrap("psx", "bios", |mut caller: wasmtime::Caller<'_, u32>, t: u32, f: u32, a: u32, b: u32, c: u32, d: u32| {
+            assert_eq!((t, f), (psxw_abi::BIOS_STAND_INS.start, 0));
+            assert_eq!([a, b, c, d], [11, 22, 33, 44]);
+            *caller.data_mut() += 1;
+            RESULT
+        })
+        .unwrap();
+    linker.func_wrap("psx", "return_from_exception", |mut c: wasmtime::Caller<'_, u32>| *c.data_mut() += 100).unwrap();
+    linker.define_unknown_imports_as_traps(&module).unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    instance.get_typed_func::<u32, ()>(&mut store, "guest_sp_set").unwrap().call(&mut store, STACK_TOP).unwrap();
+    let memory = instance.get_memory(&mut store, guest::MEMORY).unwrap();
+    memory.write(&mut store, (WINDOW_BASE + kernel::A0_TABLE) as usize, &psxw_abi::BIOS_STAND_INS.start.to_le_bytes()).unwrap();
+    let invoke = instance.get_typed_func::<(u32, u32, u32, u32, u32), u64>(&mut store, guest::INVOKE).unwrap();
+    for addr in [0x8001_1000, 0x8001_1200, 0x8001_1300, psxw_abi::BIOS_STAND_INS.start] {
+        assert_eq!(invoke.call(&mut store, (addr, 11, 22, 33, 44)).unwrap(), RESULT);
+    }
+    assert_eq!(*store.data(), 4);
+    // The second call through the table reaches the patch, not the saved native entry.
+    assert_eq!(invoke.call(&mut store, (0x8001_1000, 11, 22, 33, 44)).unwrap(), 42);
+    assert_eq!(*store.data(), 4);
+    let irq = instance.get_typed_func::<(u32, u32, u32, u32, u32), u64>(&mut store, guest::INVOKE_IRQ).unwrap();
+    assert_eq!(irq.call(&mut store, (0x8001_1400, 0, 0, 0, 0)).unwrap(), 0);
+    assert_eq!(*store.data(), 104);
+    spec.tiers.insert(("t".into(), 0x8000_A000), spec.tiers[&("t".into(), 0x8001_1000)]);
+    let err = psxw_link::game::link(&map, None, &spec, &inputs).unwrap_err();
+    assert!(err.to_string().contains("collides with BIOS stand-in"), "{err:#}");
+}
+
 /// A writable static the address map doesn't name has an original address
 /// the link can't know: it fails naming it, rather than placing a second
 /// copy in AUX.

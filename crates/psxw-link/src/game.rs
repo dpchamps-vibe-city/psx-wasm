@@ -180,6 +180,8 @@ enum Synth {
     /// Runtime adapter `id` in place of the function at guest address
     /// `addr` (D61: the adapter reads its object's relocated operands there).
     AdapterThunk { id: u32, addr: u32 },
+    /// A saved BIOS table entry, calling the original native function.
+    BiosThunk(u32),
     /// Dispatch on the code resident at an address shared by overlays.
     OverlayStub(u32),
     /// C `call_indirect` with a signature (the MIPS address trails).
@@ -346,6 +348,9 @@ impl Ctx<'_> {
 
     /// The function's own o32 entry, without hooks or overlay dispatch.
     fn entry_raw(&mut self, container: &str, addr: u32) -> Option<u32> {
+        if psxw_abi::BIOS_STAND_INS.contains(&addr) && addr & 3 == 0 {
+            return Some(self.synth(Synth::BiosThunk(addr)));
+        }
         let tier = *self.spec.tiers.get(&(container.to_string(), addr))?;
         Some(match tier {
             Tier::Lift { input, func } => self.guest[&(input, func)],
@@ -421,6 +426,9 @@ impl Ctx<'_> {
 
     /// The entry for a call into an overlay slot from outside it.
     fn dynamic_entry(&mut self, addr: u32) -> Option<u32> {
+        if psxw_abi::BIOS_STAND_INS.contains(&addr) && addr & 3 == 0 {
+            return Some(self.synth(Synth::BiosThunk(addr)));
+        }
         if self.spec.overlays.contains_key(&addr) {
             return Some(self.synth(Synth::OverlayStub(addr)));
         }
@@ -828,6 +836,22 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let proto = ctx.inputs[input].protos.get(&guest_name);
             let callee = ctx.guest[&(input, func)];
             (o32(), marshal::o32_to_c(&sig, proto, callee, sp, window), format!("o32:{guest_name}"))
+        }
+        Synth::BiosThunk(addr) => {
+            let mut f = Function::new([]);
+            if addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+                f.instruction(&I::Call(ctx.import(psx::RETURN_FROM_EXCEPTION)));
+                f.instruction(&I::Throw(RFE_TAG));
+            } else {
+                f.instruction(&I::I32Const(addr as i32));
+                f.instruction(&I::I32Const(0));
+                for l in 0..4 {
+                    f.instruction(&I::LocalGet(l));
+                }
+                f.instruction(&I::Call(ctx.import(psx::BIOS)));
+            }
+            f.instruction(&I::End);
+            (o32(), f, format!("bios@{addr:08X}"))
         }
         Synth::AdapterThunk { id, addr } => {
             let mut f = Function::new([]);
@@ -1681,6 +1705,16 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     for (&(i, f), &addr) in &ctx.synthetic.clone() {
         let e = ctx.synth(Synth::ModWrap { input: i, func: f, hook: None });
         elements.insert(table_index(addr), e);
+    }
+    // Preserve the baseline masked dispatch. These ROM-shaped pointers
+    // use otherwise reserved low-kernel slots, not a new address mapper.
+    for addr in psxw_abi::BIOS_STAND_INS.step_by(4) {
+        ensure!(
+            !elements.contains_key(&table_index(addr)),
+            "game code collides with BIOS stand-in {addr:#010x} at dispatch slot {:#x}",
+            table_index(addr)
+        );
+        elements.insert(table_index(addr), ctx.synth(Synth::BiosThunk(addr)));
     }
     let mod_init = ctx.synth(Synth::ModInit);
     let mod_loaded = ctx.synth(Synth::ModLoaded);

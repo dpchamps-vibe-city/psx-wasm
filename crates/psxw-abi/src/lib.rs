@@ -51,7 +51,10 @@ pub mod replay;
 ///   BIOS keeps the kernel's thread tables in guest RAM ([`kernel`]).
 /// - 12: an adapter call carries the replaced function's guest address
 ///   ([`psx::ADAPTER`], D61).
-pub const ABI_VERSION: u32 = 12;
+/// - 17: native BIOS call tables and callable saved-entry stand-ins. Keeps
+///   the baseline address window and masked dispatch table; 13–16 belong
+///   to the archived, incompatible map/residency experiments.
+pub const ABI_VERSION: u32 = 17;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -174,6 +177,15 @@ pub mod phys {
 /// (mod functions whose address is taken or stored in game data).
 pub const SYNTHETIC_CODE: core::ops::Range<u32> = 0x8020_0000..0x8040_0000;
 
+/// Native BIOS entry pointers stored in the guest's A0/B0/C0 tables.
+/// Each aligned address names an o32 thunk calling `psx.bios` directly,
+/// independently of later edits to the tables. With the baseline masked
+/// dispatch these occupy slots for low kernel RAM A000h..A900h; the linker
+/// rejects game-code collisions rather than silently replacing an entry.
+pub const BIOS_STAND_INS: core::ops::Range<u32> = 0xBFC0_A000..0xBFC0_A900;
+/// B(17h)'s thunk uses the existing exception-exit tag, not a normal return.
+pub const BIOS_RETURN_FROM_EXCEPTION: u32 = BIOS_STAND_INS.start + 0x300 + 4 * 0x17;
+
 /// Dispatch table index for a guest function pointer. The table spans
 /// RAM plus the synthetic range; unmapped entries trap with the address.
 #[inline]
@@ -207,7 +219,9 @@ pub mod psx {
     /// `(addr) -> i64`: control reached a guest address with no
     /// implementation; traps with the address.
     pub const UNTRANSLATED: &str = "untranslated";
-    /// `(table, fn, a0, a1, a2, a3) -> i64`: BIOS vector call.
+    /// `(table, fn, a0, a1, a2, a3) -> i64`: BIOS vector call through the
+    /// guest's table, or a direct native call when `table` is an address
+    /// in [`super::BIOS_STAND_INS`] (`fn` is then ignored).
     pub const BIOS: &str = "bios";
     /// `(a0, a1, a2, a3) -> i32`: `syscall`.
     pub const SYSCALL: &str = "syscall";
