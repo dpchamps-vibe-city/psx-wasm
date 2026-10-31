@@ -35,10 +35,13 @@ retain their provenance; the active recovery status is recorded separately.
   fixes do not complete these whole families. A52/C09 contracts remain unresolved.
 - **Resources/policy:** legally usable font data/mapping and GetSystemInfo's
   BIOS date/version identity remain undecided; no fabricated values or pointers.
-- **Validation:** source `99fa333` passes focused BIOS/runtime/SDK tests, both
-  game builds, all four unchanged replays and memcard conformance. Non-empty
-  oracle validation, unresolved full-CI failures, two-bundle browser disc
-  isolation/locked-disc coverage and save/persistence certification remain open.
+- **Validation:** CD-directory/search source `bbdeb39` passes focused
+  BIOS/runtime/SDK tests, wasm32 check, both game builds and all four unchanged
+  replays. Latest memcard conformance remains at `99fa333`. Non-empty oracle
+  validation, unresolved full-CI failures and save/persistence certification
+  remain open. Two-bundle browser disc isolation/locked-disc validation is in
+  an isolated worker retry after a disk-space build failure; no browser pass
+  or acceptance is claimed yet.
 
 See the active plan for exact service inventories, accepted source changes and
 next actions. Deferral or an unsupported diagnostic does not complete a service.

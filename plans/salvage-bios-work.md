@@ -136,14 +136,14 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 | Card, console and CD | Partial; continue independently verifiable software contracts using existing backends. Do not invent missing reference behaviour. |
 | Other executable, exception and thread gaps | Still open; do not assume deferring longjmp implements these or authorises a runtime redesign. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | CD-directory/search follow-ups pass BIOS 51/runtime 8/SDK 42 tests and wasm32 check. Release/game/replay/memcard artifacts remain at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | CD-directory/search source `bbdeb39` passes BIOS 51/runtime 8/SDK 42 tests, wasm32 check, fresh builds and four replays. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD-directory software follow-up implemented and locally checked; `99fa333` build/replay/memcard checkpoint retained | Owns plan and integration, not worker files |
+| Parent | `salvage/bios`, writer | CD-directory/search fixes implemented; `bbdeb39` build/four-replay gate passes; browser partial diff not accepted | Owns plan and integration, not worker files |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -151,11 +151,21 @@ Workflow `1610e372-e898-4cf0-946a-0dc7f60bd941` completed both lanes. No active
 children from that workflow, subdelegation or control-flow work. Source/gate
 claims remain checkpoint-specific; worker completion alone is not parent acceptance.
 
-A subsequent independent worker, run `7ccc8568-6c02-46fe-8c24-162d54aef56d`,
-is implementing focused two-bundle/locked-disc browser validation in
-`../psx-wasm-salvage-lanes/browser-disc-validation` (base `aea8c94`). It owns
-only that worktree's web tests/necessary packaging, not runtime or plan changes;
-no acceptance or browser-pass claim yet.
+The subsequent browser worker `7ccc8568-6c02-46fe-8c24-162d54aef56d` stopped
+with four uncommitted files after its CLI build reported **No space left on
+device**; the tool registry then returned `Async run not found`. Parent reported
+the failure, verified no child/build was active and preserved the partial diff
+as `browser-disc-interrupted.diff` in session scratch. No browser gate ran.
+
+One same-tool retry, `828341b3-aa23-4b55-a23d-a3dcfe76bf23`, now owns
+`../psx-wasm-salvage-lanes/browser-disc-validation` (base `aea8c94`). Filesystem
+space is available again. Parent rejected the partial lock test's same-content
+reimport as insufficient proof and its sequential-write production fix as able
+to overwrite the cue before encountering a locked bin. The retry must use
+different replacement content, preserve old cue/bin/key on refusal, and verify
+successful import after unlocking. Scope remains the focused browser test,
+packaging and a minimal demonstrated import fix; no runtime/plan writes,
+subdelegation or new storage architecture. No acceptance/browser pass yet.
 
 ## Work order
 
@@ -345,7 +355,7 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
 
 - [x] Run workspace tests and build both games from the recovery branch's own
   toolchain/artifacts. Latest workspace run: `6deb05b`; subsequent batches have
-  focused tests. Latest release/runtime/game builds: `99fa333`, ABI 18. Census
+  focused tests. Latest release/runtime/game builds: `bbdeb39`, ABI 18. Census
   and optional-test qualifications are recorded with their actual checkpoints.
 - [x] Run focused integration tests for changed families, including guest devices,
   card completion, patched BIOS calls and real wasm kernel/thread lowering.
@@ -1153,6 +1163,30 @@ matching/mismatching/omitted versions. BIOS 51/runtime 8/SDK 42 plus wasm32 chec
 pass (`cd-search-integrated-tests.log`). A62/A63 and B42/B43 remain `Partial`;
 this does not implement Sony's directory cache, disk-change quirks or arbitrary
 invalid/overlong filename behavior.
+
+### Fresh CD-filesystem integration gate (`bbdeb39`, ABI 18)
+
+Release CLI/runtime and both game builds pass. All six chip groups remain
+native. BTN is 2,572,791 bytes (86 adapters); BOF4 is 10,186,726 bytes (91).
+Coverage totals are unchanged: BTN 42 working/12 partial/1 unsupported/1 fatal/
+1 no-op; BOF4 36 working/16 partial/1 unsupported/1 no-op. Asyncify remains
+1296/7158 and 3009/18393, with one exception handler excluded in each.
+
+All four unchanged replays pass with explicit frame limits and `--check no-trap`:
+BTN title-to-gameplay 6000 (all three expectations), card-load 3000 (no state
+assertions), BOF4 title-to-field 26000 (all five expectations), and the supplied
+name-select crash replay 694 (no state assertions). Boot text matches and EDC
+errors are zero in all four. BTN's frame-64 timeout and frame-65/83 resets remain
+unchanged and unclassified. Fresh disposable run storage was used; previous
+run storage is preserved in session scratch, not user saves.
+
+Logs/reports are session scratch `cd-files-release.log`, `cd-files-build-*.log`
+and `cd-files-replay-*.{log,json}`. Older scratch logs from the preceding session
+checkpoint are no longer present there; their committed plan records remain
+historical evidence. No unnecessary memcard/SDK conformance, workspace or full
+CI rerun was performed for these two CD filesystem changes. Latest memcard
+conformance remains at `99fa333`, GPU at `d06c81b`, libpad/libetc at `37e37ed`.
+Browser, non-empty oracle and save/reload-persistence gaps remain open.
 
 ## Progress log
 
