@@ -591,10 +591,11 @@ locals, or static translation.
   access through it volatile in every build. Until then, SDK code that
   reaches registers through pointers in data is plain memory to clang;
   it matters only when a chip runs on its device.
-- **TR12 leaves two callers on the old default:** psxw-modkit and
-  psxw-difftest compile with `Clang::new` (unsigned `char`, and
-  `-funsigned-char` stays in the shared UB-containment list). A game whose
-  reference flags leave `char` signed needs both on `Clang::reference`.
+- **TR12 left two callers on the old default:** psxw-modkit now takes
+  plain `char` from the game's reference flags (`psxw_cc::plain_char_unsigned`,
+  in the mod SDK's `flags.json`). psxw-difftest's compiler still uses
+  `Clang::new`'s unsigned default; a game whose reference flags leave
+  `char` signed needs it on `Clang::reference` too (phase 4's crate).
 - **Phase 2's libetc layout** (2026-10-30, from btn's PsyQ 4.7 objects;
   offsets in each object's `.text`). `intr.o` (`ResetCallback` at +0):
   the `lui`/`lw` at +0/+4 loads the driver-table pointer (`.data`+10E0h);
