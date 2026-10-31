@@ -326,7 +326,7 @@ fn unpassed(program: &Program, ok: &[Translation], takes: &BTreeMap<(String, u32
         .filter(|(_, t)| t.func.sources.iter().any(|s| matches!(s, Source::CodePointer | Source::DataPointer)))
         .map(|(i, _)| i)
         .collect();
-    for t in ok {
+    for (j, t) in ok.iter().enumerate() {
         taken.extend(t.facts.code_consts.iter().filter_map(|&a| callee(&t.func.container, a)));
         for &(pc, target, set) in &t.facts.call_sites {
             let Some(i) = callee(&t.func.container, target) else { continue };
@@ -336,7 +336,8 @@ fn unpassed(program: &Program, ok: &[Translation], takes: &BTreeMap<(String, u32
             let passed = unsupplied(&ok[i], !defined(t)) & set;
             if passed != 0 {
                 let how = if defined(t) { "its C can't set them" } else { "the call isn't expanded" };
-                fail(i, ok[i].func.addr, format!("reads {} on entry, which {} sets before calling it at 0x{pc:08X}; {how}", reg_list(passed), name(t)));
+                let regs = reg_list(passed);
+                fail(i, ok[i].func.addr, format!("reads {regs} on entry, which {} sets before calling it at 0x{pc:08X}; {how}", name(t)));
             }
         }
         if defined(t) {
@@ -350,7 +351,8 @@ fn unpassed(program: &Program, ok: &[Translation], takes: &BTreeMap<(String, u32
                 None => regs & !S_REGS,
             };
             if left != 0 {
-                fail(index[&(t.func.container.as_str(), t.func.addr)], pc, format!("reads {} after the call at 0x{pc:08X}, which leaves them as the callee did; the call isn't expanded", reg_list(left)));
+                let regs = reg_list(left);
+                fail(j, pc, format!("reads {regs} after the call at 0x{pc:08X}, which leaves them as the callee did; the call isn't expanded"));
             }
         }
     }
@@ -359,7 +361,8 @@ fn unpassed(program: &Program, ok: &[Translation], takes: &BTreeMap<(String, u32
         let key = (t.func.container.clone(), t.func.addr);
         let passed = takes.get(&key).copied().unwrap_or(0) & unsupplied(t, false);
         if passed != 0 && !t.func.sources.contains(&Source::ComputedEntry) {
-            fail(i, t.func.addr, format!("reads {} on entry, which its callers pass, and its address is taken: a call through a pointer passes only a0-a3", reg_list(passed)));
+            let regs = reg_list(passed);
+            fail(i, t.func.addr, format!("reads {regs} on entry, which its callers pass, and its address is taken: a call through a pointer passes only a0-a3"));
         }
     }
     out
@@ -384,12 +387,14 @@ fn foreign_returns(program: &Program, ok: &[Translation]) -> BTreeMap<usize, Lif
             _ => true,
         };
         if let Some((pc, callee, holds)) = t.foreign_returns.iter().find(|(_, c, _)| c.is_none_or(reads_ra)) {
+            let jr_ra = t.graph.nodes.get(&Node::Normal(*pc)).is_some_and(|d| d.insn.op == decode::Op::Jr && d.insn.rs == 31);
             let what = match callee {
-                None if t.graph.nodes.get(&Node::Normal(*pc)).is_some_and(|d| d.insn.op == decode::Op::Jr && d.insn.rs == 31) => "jr ra".to_string(),
+                None if jr_ra => "jr ra".to_string(),
                 None => "a tail jump".to_string(),
                 Some(a) => format!("a tail jump to 0x{a:08X}, which returns through ra,"),
             };
-            out.insert(i, LiftError { pc: *pc, message: format!("{what} where {holds}, not the caller's return address: the translation returns to the caller") });
+            let message = format!("{what} where {holds}, not the caller's return address: the translation returns to the caller");
+            out.insert(i, LiftError { pc: *pc, message });
         }
     }
     out
