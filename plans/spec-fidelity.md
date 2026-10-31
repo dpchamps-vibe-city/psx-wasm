@@ -627,7 +627,7 @@ anything else.
    vectorising or loop-to-`memory.fill` rewriting
    (`psxw-cc/src/lib.rs:48`, `clang.rs:79, 95`), so pass counts track the
    source's loops.
-   Done `TR5S1`: `CODEGEN_FLAGS` adds `-fno-unroll-loops -fno-vectorize
+   Done `75b892e`: `CODEGEN_FLAGS` adds `-fno-unroll-loops -fno-vectorize
    -fno-slp-vectorize -mllvm -disable-loop-idiom-all` (every C → wasm
    compile: lifted, decompiled, mods, difftest). game.wasm: btn
    2,914,801 → 2,753,059 bytes (−5.5%), bof4 16,571,334 → 15,918,085
