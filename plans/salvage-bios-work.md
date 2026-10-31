@@ -557,6 +557,31 @@ required architecture change rather than invent it. Parent retains IRQ enqueue,
 exception/non-local/thread control flow and integration. No subdelegation.
 The separate ABI-17 foundation CI remains active and pinned to its own source.
 
+Native-CD's initial `0aac185` is **not accepted or integrated**. Parent review
+found that a blocking multi-sector read wakes after its first sector, normal
+completion is confused with the early-end event, and changes to `Drive.status`
+do not update the controller's actual shared status or pending jobs. The worker
+is resumed as `b498c913-ceb9-47d3-8fe5-22dc437e8163` for bounded corrections,
+including event reuse/allocation cleanup and existing core error semantics.
+No register driver or native-core/SDK ownership rewrite is authorised.
+
+Kernel/configuration's initial `aa9cb54` is also **not accepted or integrated**.
+Parent review found that SetConf re-enqueues into uncleared exception chains,
+while C(08h) refuses its documented default region and GetConf adds an
+unsupported null-destination restriction. GetSystemInfo's absent metadata and
+A(52h)'s conflicting reference remain unresolved, not verified implementations.
+The worker is resumed as `cfc570f4-246e-4858-b3dc-61243686e641` for these bounded
+corrections. No runtime/thread redesign is authorised.
+
+A further DeepSeek worker, `cde8d5ed-e38b-4833-bcb0-989b9570b1b3`, starts at
+`22a4c87` in `../psx-wasm-salvage-lanes/card-completion`, branch
+`salvage/card-completion`. It owns card waits, asynchronous file visibility,
+busy/completion ordering, opt-in auto-format/reset and the listed card helpers.
+It must use existing card images/scheduling, test only handcrafted disposable
+in-memory cards, and ask before SDK scope or architectural expansion. No input
+snapshots, real saves, game outputs, full CI or oracle captures in this lane.
+Parent retains source review, integration and control-flow architecture.
+
 ## Progress log
 
 - 2026-10-31: callable kernel functions and callback ordering integrated as
