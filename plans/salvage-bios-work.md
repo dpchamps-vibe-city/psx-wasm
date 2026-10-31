@@ -133,17 +133,17 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 |---|---|
 | Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
-| Card, console and CD | Partial; CD reads now retry after a returning SystemError patch, bounded to ten attempts. CD opens preserve ISO versions and accept `?` filename matching. Continue independently verifiable software contracts using existing backends; event-driven CD waits remain unfinished. |
+| Card, console and CD | Partial; CD blocking calls now wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts; busy-command acceptance/internal dispatch remain incomplete. CD opens preserve ISO versions and accept `?` filename matching. Continue independently verifiable software contracts using existing backends. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | CD retry follow-up passes BIOS 52/runtime 8/SDK 42 tests and wasm32 check. Latest builds/four replays remain at `03c4627` (before retry changes). Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates pass at `9624526`. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | CD live-wait batch passes BIOS 53/runtime 9/SDK 42 tests, wasm32 check, fresh native builds and four unchanged replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates remain at `9624526`, before this native batch. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD read retry correction passes focused tests and wasm32 check; latest builds/four replays remain at `03c4627`. Browser gates keep their recorded checkpoints. CD chain-control flag-only proposal rejected; event-wait work remains open. | Owns plan, integration and final acceptance |
+| Parent | `salvage/bios`, writer | CD live-event waits and returning read-error retries implemented; focused tests, wasm32 check, fresh builds/four replays pass. Browser gates keep their recorded checkpoints. CD internal services and busy-command acceptance remain partial; flag-only chain-control proposal rejected. | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -1114,9 +1114,10 @@ was accepted. A progress steer arrived after the documentation lane had already
 completed; it changed no work, and fresh validation facts were integrated here.
 
 CD review confirms the pinned OpenBIOS wait priority: seek/status test DNE before
-ERR; reads test DNE, ERR, then END. Current per-operation completion Cells do not
-fully reproduce that guest-event contract. **The scout's proposed completion-only
-selector is not accepted:** falling back to the Cell when no event is ready
+ERR; reads test DNE, ERR, then END. At that checkpoint, per-operation completion
+Cells did not fully reproduce that guest-event contract (the later live-wait
+batch below replaces that selection, retaining captured status/cancellation).
+**The scout's proposed completion-only selector is not accepted:** falling back to the Cell when no event is ready
 would still ignore disabled/consumed events, and it would not return when an
 early guest event becomes ready. Its proposed read-ERR test also assumes that
 SystemError(44h,16h) returns -1 immediately; the reference instead continues its
@@ -1404,7 +1405,8 @@ seek/status errors. Tests use disposable handcrafted sectors, not user discs.
 
 **Gate:** BIOS 52/runtime 8/SDK 42 tests and wasm32 runtime check pass
 (`cd-retry-integrated-tests.log` in session scratch). A5/A6 remain `Partial`:
-waits still use per-operation results, not early/live TestEvent polling;
+at this retry checkpoint, waits still used per-operation results rather than
+live TestEvent polling (superseded by the live-wait batch below);
 command-busy retry loops and native INT5 production are not implemented. No
 Wait variant, event-generation state, IRQ/CD driver, ABI or runtime redesign.
 Latest release/runtime/game builds and four replays remain at `03c4627`, before
@@ -1426,6 +1428,103 @@ The card source comments now distinguish the retained, unverified native policy
 from the verified OpenBIOS event split; no behavior or coverage classification
 changed. AF and the callbacks remain `Partial`, with no extra test/build needed
 for these comment-only corrections. No active children or pending worker edits.
+
+### CD live-event waits (ABI 18)
+
+Parent replaced completion-Cell/Cycle selection in `cdrom.rs` with the live
+TestEvent contract from pinned OpenBIOS `helpers.c` and `cdrom.c`
+(`4dc70d2931121a0fde858a0354192b6df4fa22e8`, both read in full). Seek/status
+poll DNE then ERR; read polls DNE, ERR, END. Only the winning flag is consumed.
+Disabled, closed or already-consumed flags no longer release a wait just because
+the native operation finished. Handles remain live if the guest reuses a slot.
+Software events can wake before the CD deadline without advancing virtual time.
+
+This uses a CD-specific condition in the existing `Wait` enum/driver, retaining
+the per-operation `Rc<Cell>` for captured status and native reset cancellation.
+`Wait` is now borrowed by `holds` rather than copied; other wait predicates and
+scheduler stepping are unchanged. No event generations, register driver, clock
+costs, runtime import/export or ABI version change. Cancellation remains an
+explicit native error policy, not an INT5 producer, and cannot consume a newer
+operation's notification. Normal TestEvent polling intentionally can: if a
+callback clears DNE by starting another operation, the old waiter must wait for
+a live flag and consume it, while retaining its own completed status byte.
+The old reentry test's contrary event-consumption expectation was corrected.
+
+An unready flag may wait indefinitely, as the reference polling loop does.
+Absence of pending native CD work does not exclude a later guest DeliverEvent;
+no new timeout/error policy is imposed. A premature software DNE before status
+writes its local byte has native zero, not a claim to reproduce an uninitialized
+retail byte. Command-acceptance loops and patched internal BIOS calls remain
+unfinished. In particular, an early software read ERR followed by a returning
+SystemError patch attempts SeekL while the original read is still busy: current
+native acceptance rejects it with 0Bh and leaves that read active. The test
+records this partial behavior; it does not silently cancel the read to make the
+retry succeed. A5/A6 and the CD family remain `Partial`.
+
+One grouped BIOS integration test covers disabled/consumed/reused events, early
+software wakes and priority, winner-only consumption, reset cancellation and the
+returning early-ERR/busy continuation. Existing reentry/retry tests are retained
+and strengthened. One runtime driver test exercises both callback-delivered ERR
+and callback reset, no deadline/clock advance, correct context and error ordering.
+Its guest is a test double, not a newly compiled wasm guest patch.
+
+Read-only DeepSeek review `6ba8ab1e-2063-45a3-84c2-7b5878d3a3a5` was read in full.
+Parent accepted its core correctness review and added the two continuation/cancel
+assertions above. Its proposed two-second no-pending-operation timeout was
+rejected: that would change valid event-wait behavior, not merely diagnose it.
+Its claim that cancellation coverage leaves interrupts disabled was also wrong
+for A95, which exits critical. No other review-driven architecture was added.
+The review completed despite an ENOSPC error writing its optional context mirror;
+it made no source edits, ran no tests and needed no alternate launch channel.
+
+Validation (all logs read, replay JSON stop/boot/report fields inspected):
+
+- `cargo test -p psx-bios -p psx-runtime -p sdk-psyq --offline`: **53 / 9 / 42 pass**;
+  `cargo check -p psx-runtime --target wasm32-unknown-unknown --offline`: pass.
+  After review, the two strengthened tests passed again; production behavior was
+  unchanged. Logs `cd-live-wait-{focused,integrated}-tests.log` in session scratch.
+- Release CLI built successfully. The first BTN build exited 101 with an empty
+  log while `/tmp` was full. One retry with `TMPDIR` in this worktree's ignored
+  `out/tmp-cd-live-wait` succeeded for both games; no other sessions' files deleted.
+  Native runtime and both game modules include the retry and live-wait changes.
+  BTN **2,582,381 bytes / 86 adapters**; BOF4 **10,196,316 / 91**. All six chip
+  groups native. Asyncify counts unchanged (1296/7158, 3009/18393, one exception
+  handler excluded). Coverage stays BTN 42 working/12 partial/1 unsupported
+  (B51)/1 fatal/1 noop; BOF4 36 working/16 partial/1 unsupported (A43)/1 noop.
+- Four unchanged replays, explicit frames and `--check no-trap`, pass: BTN title
+  6000 (all three expectations), card-load 3000 (no assertions), BOF4 title 26000
+  (all five expectations), supplied crash 694 (no assertions). All boot text
+  matches; EDC errors and guest I/O empty; final critical/in_irq false; no held
+  waits or queued calls. Sector totals 1419/697/12695/680. BTN's frame-64 GPU
+  timeout and resets at 65/83 remain unchanged and unclassified.
+- Fresh disposable run storage; prior own cards preserved under
+  `out/tmp-cd-live-wait/{btn,bof4}-previous-disposable-storage`. Build/replay logs,
+  four replay JSON and `review-focused-tests.log` are in that same ignored
+  directory because the session scratch filesystem was full. No user saves or
+  inputs changed. No game save/reload certification, fresh browser/conformance,
+  full-workspace/full-CI or non-empty oracle claim; prior gate epochs stand.
+
+### Executable contract scout disposition
+
+Read-only DeepSeek scout `7149ce1e-78db-4ae2-9e35-853c4f43832c` completed without
+edits/tests. Parent read its full report and the pinned OpenBIOS
+`kernel/psxexec.s` and `kernel/psxexe.c` bodies. Exec saves caller S0/RA/SP/S8/GP
+into header offsets 38h/34h/28h/2Ch/30h, clears BSS, optionally changes SP/FP,
+loads GP, calls PC with the two arguments, reloads those saved values from the
+live header and returns 1. Existing Flow calls and SP/GP globals provide useful
+seams, but saved RA/FP/S0 visibility and executable identity/admission remain
+unresolved. No Exec/LoadExec code, classification or runtime ABI changed.
+
+The report's proposed `Regs::code_known`/new guest import is **not an accepted
+design**: table membership alone would not establish identity of newly loaded
+bytes, and the scout did not establish that a new preflight query is necessary.
+Its claim that LoadExec requires a clean thread/heap/event restart is not in
+the quoted body, which loads and calls the boot executable without that reset.
+The LoadTest/loadExe reference discrepancy and broken boot-path fallback are
+not settled by declaring one interpretation the only functional one. A future
+implementation still needs an evidence-based contract and real runtime/return
+validation, not only a manually resumed Flow test. These open items are not
+implicitly deferred with longjmp, nor is there a new approval request now.
 
 ## Progress log
 

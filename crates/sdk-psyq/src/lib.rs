@@ -350,7 +350,7 @@ pub mod testing {
                 Flow::Return(v) => return v as u32,
                 Flow::Block { until, then } => {
                     let mut guard = 0;
-                    while !m.holds(until) {
+                    while !m.holds(&until) {
                         let limit = m.clock.now + psx_devices::clock::CPU_HZ;
                         m.step(limit);
                         drain(m);

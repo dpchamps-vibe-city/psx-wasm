@@ -746,7 +746,7 @@ mod tests {
                 Flow::Return(v) => return v as u32,
                 Flow::Block { until, then } => {
                     let mut steps = 0;
-                    while !m.holds(until) {
+                    while !m.holds(&until) {
                         let next = m.clock.next_time().expect("a vblank");
                         m.step(next);
                         steps += 1;

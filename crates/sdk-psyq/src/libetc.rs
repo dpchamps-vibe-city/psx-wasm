@@ -961,7 +961,7 @@ mod tests {
             Flow::ret(123)
         });
         let Flow::Block { until, then } = flow else { panic!("timeout must still wait") };
-        while !m.holds(until) {
+        while !m.holds(&until) {
             let next = m.clock.next_time().unwrap();
             m.step(next);
         }

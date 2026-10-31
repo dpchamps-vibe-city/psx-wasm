@@ -112,7 +112,7 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
                 loop {
                     drain(rt, inv);
                     let mut m = rt.borrow_mut();
-                    if m.holds(until) {
+                    if m.holds(&until) {
                         break;
                     }
                     // With interrupts disabled nothing can satisfy an event
@@ -224,6 +224,60 @@ mod tests {
         m.mem.w32(at + 4, handler);
         m.mem.w32(at + 8, verifier);
         m.enq_int_rp(prio, at);
+    }
+
+    /// A queued guest callback delivers ERR or cancels CdGetStatus. The
+    /// ordinary driver must resume immediately, before the native CD deadline.
+    #[test]
+    fn cd_event_wait_wakes_from_a_guest_callback_without_advancing_time() {
+        use psx_bios::{bios, cdrom};
+        const DELIVER: u32 = 0x8001_1000;
+        const ERROR: u32 = 0x8001_2000;
+        struct CdGuest<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            seen: Vec<u32>,
+            cancel: bool,
+        }
+        impl Invoke for CdGuest<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                self.seen.push(call.addr);
+                if call.addr == DELIVER {
+                    assert!(self.rt.borrow().in_irq);
+                    let flow = if self.cancel {
+                        bios::dispatch(&mut self.rt.borrow_mut(), 0xA0, 0x95, [0; 4]).unwrap()
+                    } else {
+                        bios::dispatch(&mut self.rt.borrow_mut(), 0xB0, 0x07,
+                            [cdrom::EV_CD, cdrom::ERR, 0, 0]).unwrap()
+                    };
+                    run(self.rt, self, flow)
+                } else {
+                    assert_eq!(call.addr, ERROR);
+                    assert_eq!(call.args, [0x44, 0x20, 0, 0]);
+                    let m = self.rt.borrow();
+                    assert!(!m.in_irq);
+                    assert!(!m.event_ready(m.kernel.cd.events[4]), "ERR consumed before SystemError");
+                    123
+                }
+            }
+        }
+        for cancel in [false, true] {
+            let rt = machine();
+            let (flow, now, due) = {
+                let mut m = rt.borrow_mut();
+                m.cd_init();
+                m.mem.w32(psx_bios::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+                let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+                m.calls.push_back(GuestCall { addr: DELIVER, args: [0; 4] });
+                (flow, m.clock.now, m.cd_due())
+            };
+            assert!(due > now);
+            let mut guest = CdGuest { rt: &rt, seen: vec![], cancel };
+            assert_eq!(run(&rt, &mut guest, flow), u32::MAX as u64);
+            assert_eq!(guest.seen, [DELIVER, ERROR]);
+            assert_eq!(rt.borrow().clock.now, now);
+            assert_eq!(rt.borrow().clock.pending(|e| *e == psx_bios::Event::Cd),
+                if cancel { None } else { Some(due) });
+        }
     }
 
     /// The ABI 10 host: `vblank` at every delivered vblank, `wait_vblank`

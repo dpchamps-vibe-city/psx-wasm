@@ -32,21 +32,29 @@ retain their provenance; the active recovery status is recorded separately.
   count-only. Do not replace existing Asyncify threading or infer approval for
   a runtime redesign from the recovery work.
 - **Partial software services:** card helpers A7..AA/AE, built-in console input
-  and circular helpers, CD internal calls/event waits/filesystem details, and
+  and circular helpers, CD internal calls/busy-command acceptance/filesystem details, and
   non-main SetConf. Recent card Info/Load callback and guest-device console-scan
   fixes do not complete these whole families. AF write-test notifications remain
   unverified: OpenBIOS's missing body does not justify adding or removing them.
   BIOS CD opens now honor explicit
   ISO versions, default to `;1`, and support `?` filename matching without star
   expansion; shared disc lookup and CdGetLbn are unchanged. CD read errors now
-  retry after a returning SystemError patch, bounded to ten attempts; live-event
-  waiting, busy-command retries and INT5 production remain unfinished. A52/C09
-  contracts remain unresolved.
+  retry after a returning SystemError patch, bounded to ten attempts. Blocking
+  calls now use live ordered event flags, including early software wakes and
+  disabled/consumed/reused slots, while preserving captured status and native
+  cancellation. Busy-command retries, patched internal dispatch and INT5
+  production remain unfinished. An early read ERR can still encounter busy
+  SeekL after the patch returns; no silent native-read cancellation is added.
+  A52/C09 contracts remain unresolved.
 - **Resources/policy:** legally usable font data/mapping and GetSystemInfo's
   BIOS date/version identity remain undecided; no fabricated values or pointers.
-- **Validation:** CD retry source `c42c64c` passes BIOS 52 / runtime 8 / SDK 42 tests
-  and wasm32 runtime check. Latest release/runtime/both game builds and all
-  four unchanged replays remain at `03c4627`, before the retry correction.
+- **Validation:** the CD live-wait batch passes BIOS 53 / runtime 9 / SDK 42 tests
+  and wasm32 runtime check, plus fresh release/runtime/both game builds and all
+  four unchanged replays. Independent review accepted with focused test additions;
+  no new timeout imposed on legitimately unready event flags. The first game
+  build failed while `/tmp` was full; retry using this worktree's ignored
+  `out/tmp-cd-live-wait` passed. Logs, replay JSON and prior disposable run cards
+  are preserved there; inputs and user saves were untouched.
   Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
   remain open. Two-bundle browser disc isolation, locked-import refusal,

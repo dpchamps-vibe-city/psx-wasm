@@ -122,15 +122,25 @@ fn sector_bytes(raw: &[u8; cd::RAW], mode: u8) -> &[u8] {
     }
 }
 
-/// Wait for this operation, not one started by its completion callback.
-/// Low word: completion spec; high word: captured status.
-fn cd_wait<S: Sdk>(m: &mut Machine<S>, done: Rc<Cell<Option<u64>>>) -> Flow<S> {
-    match done.get() {
-        Some(result) => Flow::Return(result),
-        None => Flow::Block {
-            until: Wait::Cycle(m.cd_due().max(m.clock.now + 1)),
-            then: Box::new(move |m| cd_wait(m, done)),
-        },
+/// Poll and consume the live TestEvent flags, not the operation's result.
+/// Keep its captured status across callback re-entry. A premature software DNE
+/// has no captured status yet (native zero, not retail's uninitialized byte).
+/// Cancellation remains a separate native failure, not an invented INT5 event.
+/// Like TestEvent polling, an unready/closed flag can wait indefinitely: no
+/// pending drive operation does not exclude a later guest DeliverEvent.
+fn cd_wait<S: Sdk>(m: &mut Machine<S>, done: Rc<Cell<Option<u64>>>, read: bool) -> Flow<S> {
+    if done.get() == Some(ERR as u64) {
+        m.cd_take(ERR, &done);
+        return Flow::ret(ERR);
+    }
+    if let Some((h, spec)) = m.cd_wait_event(read) {
+        m.set_ev_status(h, kernel::EV_ENABLED);
+        let status = done.get().unwrap_or(0) & 0xFFFF_FFFF_0000_0000;
+        return Flow::Return(status | spec as u64);
+    }
+    Flow::Block {
+        until: Wait::Cd { done: done.clone(), read },
+        then: Box::new(move |m| cd_wait(m, done, read)),
     }
 }
 
@@ -341,8 +351,21 @@ impl<S: Sdk> Machine<S> {
         self.deliver_event(EV_CD, spec);
     }
 
-    /// A blocking call consumes the event it waited for, as the retail
-    /// driver's event wait does; only _96_init's own events are touched.
+    /// TestEvent order from helpers.c/cdrom.c. Handles are live, even if a
+    /// callback closed/reused a slot; TestEvent tests its status, not ownership.
+    fn cd_wait_event(&self, read: bool) -> Option<(u32, u32)> {
+        let events = self.kernel.cd.events;
+        [(events[1], DNE), (events[4], ERR), (events[3], END)]
+            .into_iter().take(if read { 3 } else { 2 })
+            .find(|&(h, _)| self.event_ready(h))
+    }
+
+    pub(crate) fn cd_wait_ready(&self, done: &Rc<Cell<Option<u64>>>, read: bool) -> bool {
+        done.get() == Some(ERR as u64) || self.cd_wait_event(read).is_some()
+    }
+
+    /// Cancellation can also leave an ERR flag to consume, but must not take
+    /// a newer operation's notification. Normal waits use live TestEvent above.
     fn cd_take(&mut self, spec: u32, done: &Rc<Cell<Option<u64>>>) {
         // A callback may already have completed a different operation.
         if !Rc::ptr_eq(done, &self.kernel.cd.done) {
@@ -522,30 +545,19 @@ impl<S: Sdk> Machine<S> {
         if self.cd_seek_l(msf) == 0 {
             return system_error(self, 0x0B);
         }
-        let done = self.kernel.cd.done.clone();
-        let wait = cd_wait(self, done.clone());
+        let wait = cd_wait(self, self.kernel.cd.done.clone(), false);
         crate::machine::seq(self, wait, move |m, result| {
             if result as u32 != DNE {
-                m.cd_take(ERR, &done);
                 return system_error(m, 0x0C);
             }
-            m.cd_take(DNE, &done);
             if m.cd_read(count, dst, 0x80) == 0 {
                 return system_error(m, 0x0C);
             }
-            let done = m.kernel.cd.done.clone();
-            let wait = cd_wait(m, done.clone());
+            let wait = cd_wait(m, m.kernel.cd.done.clone(), true);
             crate::machine::seq(m, wait, move |m, result| match result as u32 {
-                DNE => {
-                    m.cd_take(DNE, &done);
-                    Flow::ret(count)
-                }
-                END => {
-                    m.cd_take(END, &done);
-                    system_error(m, 0x17)
-                }
+                DNE => Flow::ret(count),
+                END => system_error(m, 0x17),
                 _ => {
-                    m.cd_take(ERR, &done);
                     let error = system_error(m, 0x16);
                     crate::machine::seq(m, error, move |m, _| {
                         m.cd_block_read_attempt(count, sector, dst, left - 1)
@@ -561,18 +573,11 @@ impl<S: Sdk> Machine<S> {
         if self.cd_get_status_at(None) == 0 {
             return Ok(system_error(self, 0x1F));
         }
-        let done = self.kernel.cd.done.clone();
-        let wait = cd_wait(self, done.clone());
+        let wait = cd_wait(self, self.kernel.cd.done.clone(), false);
         Ok(crate::machine::seq(self, wait, move |m, result| {
             match result as u32 {
-                DNE => {
-                    m.cd_take(DNE, &done);
-                    Flow::ret((result >> 32) as u32)
-                }
-                _ => {
-                    m.cd_take(ERR, &done);
-                    system_error(m, 0x20)
-                }
+                DNE => Flow::ret((result >> 32) as u32),
+                _ => system_error(m, 0x20),
             }
         }))
     }
@@ -603,7 +608,7 @@ mod tests {
                 Flow::Return(v) => return v,
                 Flow::Call { .. } => panic!("no guest in this test"),
                 Flow::Block { until, then } => {
-                    while !m.holds(until) {
+                    while !m.holds(&until) {
                         let limit = m.clock.next_time().unwrap_or(m.clock.now + 1000);
                         m.step(limit.max(m.clock.now));
                     }
@@ -917,6 +922,119 @@ mod tests {
         assert!(m.kernel.files.cd_cwd.is_empty());
     }
 
+    /// Actual BIOS event operations control blocking calls: disabled/consumed
+    /// flags do not wake, reused handles are live, and software events can wake
+    /// before the drive finishes. No instruction-cost polling or clock advance.
+    #[test]
+    fn blocking_cd_waits_use_live_event_flags() {
+        for change in 0..3 {
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            let dne = m.kernel.cd.events[1];
+            let flow = bios::call(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+            let Flow::Block { until, then } = flow else { panic!("status must wait") };
+            match change {
+                0 => { ret(bios::call(&mut m, 0xB0, 0x0D, [dne, 0, 0, 0])); }
+                2 => { ret(bios::call(&mut m, 0xB0, 0x09, [dne, 0, 0, 0])); }
+                _ => {}
+            }
+            m.step(m.cd_due());
+            assert!(m.kernel.cd.op.is_none());
+            if change == 1 {
+                assert!(m.holds(&until));
+                assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [dne, 0, 0, 0])), 1);
+            }
+            assert!(!m.holds(&until), "completion is not a fallback for TestEvent");
+            let class = if change == 2 { 0x1234 } else { EV_CD };
+            if change == 2 {
+                assert_eq!(ret(bios::call(&mut m, 0xB0, 0x08,
+                    [class, DNE, kernel::EV_MODE_NOINTR, 0])), dne);
+            }
+            ret(bios::call(&mut m, 0xB0, 0x0C, [dne, 0, 0, 0]));
+            assert!(!m.holds(&until), "enable does not deliver an event");
+            let now = m.clock.now;
+            ret(bios::call(&mut m, 0xB0, 0x07, [class, DNE, 0, 0]));
+            assert!(m.holds(&until));
+            let flow = then(&mut m);
+            assert_eq!(run(&mut m, flow), 2);
+            assert!(!m.event_ready(dne));
+            assert_eq!(m.clock.now, now);
+        }
+
+        // Seek/status poll DNE, ERR, but not END. Native reset cancellation
+        // still wakes without fabricating a software or controller event.
+        for func in [0xA5, 0xA6] {
+            for cancel in [false, true] {
+                let mut m = machine_with_disc(vec![]);
+                m.cd_init();
+                let error = 0x8001_1000;
+                m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+                let flow = bios::call(&mut m, 0xA0, func, [1, 4000, 0x8002_0000, 0]).unwrap();
+                let Flow::Block { until, then } = flow else { panic!("must wait") };
+                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, END, 0, 0]));
+                assert!(!m.holds(&until));
+                let now = m.clock.now;
+                assert!(m.cd_due() > now);
+                if cancel {
+                    ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+                    assert!(!m.event_ready(m.kernel.cd.events[4]));
+                } else {
+                    ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
+                }
+                assert!(m.holds(&until));
+                let Flow::Call { call, then } = then(&mut m) else { panic!("SystemError") };
+                assert_eq!((call.addr, call.args), (error, [0x44, if func == 0xA5 { 0x0C } else { 0x20 }, 0, 0]));
+                assert!(!m.event_ready(m.kernel.cd.events[4]));
+                assert!(m.event_ready(m.kernel.cd.events[3]), "END was not polled");
+                let flow = then(&mut m, 123);
+                assert_eq!(run(&mut m, flow), u32::MAX as u64);
+                assert_eq!(m.clock.now, now, "early wake needs no CD completion");
+                assert_eq!(m.kernel.cd.op.is_none(), cancel, "software ERR does not cancel native work");
+            }
+        }
+
+        // A read polls DNE before ERR before END, consuming only the winner.
+        for winner in [DNE, ERR, END] {
+            let mut m = machine_with_disc(vec![]);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let error = 0x8001_1000;
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+            let flow = bios::call(&mut m, 0xA0, 0xA5, [2, 0, 0x8002_0000, 0]).unwrap();
+            let Flow::Block { then, .. } = flow else { panic!("seek") };
+            m.step(m.cd_due());
+            let Flow::Block { until, then } = then(&mut m) else { panic!("read") };
+            let specs: &[u32] = match winner { DNE => &[END, ERR, DNE], ERR => &[END, ERR], _ => &[END] };
+            let now = m.clock.now;
+            for &spec in specs {
+                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, spec, 0, 0]));
+            }
+            assert!(m.holds(&until));
+            let flow = then(&mut m);
+            if winner == DNE {
+                assert_eq!(run(&mut m, flow), 2);
+            } else {
+                let Flow::Call { call, then } = flow else { panic!("SystemError") };
+                assert_eq!((call.addr, call.args), (error, [0x44, if winner == ERR { 0x16 } else { 0x17 }, 0, 0]));
+                if winner == ERR {
+                    // Busy command acceptance remains partial: the returning
+                    // patch retries SeekL, which rejects the still-active read.
+                    // Do not silently cancel that read to make a retry succeed.
+                    let Flow::Call { call, then } = then(&mut m, 123) else { panic!("busy SeekL") };
+                    assert_eq!((call.addr, call.args), (error, [0x44, 0x0B, 0, 0]));
+                    let flow = then(&mut m, 456);
+                    assert_eq!(run(&mut m, flow), u32::MAX as u64);
+                }
+            }
+            for &spec in specs {
+                let h = m.kernel.cd.events[SPECS.iter().position(|&s| s == spec).unwrap()];
+                assert_eq!(m.event_ready(h), spec != winner);
+            }
+            assert!(m.kernel.cd.op.is_some(), "software delivery does not finish the drive");
+            assert_eq!(m.clock.now, now);
+        }
+    }
+
     /// Terminal failures call the patchable SystemError and return -1 if it returns.
     /// A completion callback may start another operation before a waiter resumes.
     #[test]
@@ -932,7 +1050,7 @@ mod tests {
         loop {
             match f {
                 Flow::Block { until, then } => {
-                    while !m.holds(until) {
+                    while !m.holds(&until) {
                         let at = m.clock.next_time().unwrap();
                         m.step(at);
                     }
@@ -955,7 +1073,7 @@ mod tests {
         let Flow::Block { until, then } = f else {
             panic!("status should wait")
         };
-        while !m.holds(until) {
+        while !m.holds(&until) {
             let at = m.clock.next_time().unwrap();
             m.step(at);
         }
@@ -967,9 +1085,14 @@ mod tests {
             ret(bios::call(&mut m, 0xA0, 0x7C, [0x8002_1000, 0, 0, 0])),
             1
         );
+        let Flow::Block { until, then } = then(&mut m) else {
+            panic!("the callback cleared DNE: the old result must not release the wait");
+        };
+        assert!(!m.holds(&until));
         m.drive.status = 0xEE;
         let at = m.cd_due();
         wait(&mut m, at);
+        assert!(m.holds(&until));
         assert_eq!(m.kernel.cd.last_status, 0xEE);
         let f = then(&mut m);
         assert_eq!(
@@ -978,8 +1101,8 @@ mod tests {
             "the completed status, not the callback's operation"
         );
         assert!(
-            m.event_ready(m.kernel.cd.events[1]),
-            "the new operation's event is not consumed"
+            !m.event_ready(m.kernel.cd.events[1]),
+            "TestEvent consumes the live flag, even from the callback's operation"
         );
         m.cd_remove();
         let Flow::Call { call, then } = m.cd_block_status().unwrap() else {
@@ -994,12 +1117,12 @@ mod tests {
         for (func, code) in [(0xA5, 0x0C), (0xA6, 0x20)] {
             m.cd_init();
             let flow = bios::call(&mut m, 0xA0, func, [1, 40, 0x8002_0000, 0]).unwrap();
-            let Flow::Block { until: Wait::Cycle(at), then } = flow else {
+            let Flow::Block { until, then } = flow else {
                 panic!("operation must wait");
             };
             assert_eq!(ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])), 1);
             ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
-            m.step(at);
+            assert!(m.holds(&until));
             let Flow::Call { call, then } = then(&mut m) else {
                 panic!("SystemError");
             };
@@ -1031,22 +1154,25 @@ mod tests {
             m.mem.write(dst + 0x800, b"keep");
             let mut flow = bios::call(&mut m, 0xA0, 0xA5, [2, 4502, dst, 0]).unwrap();
             for attempt in 0..failures {
-                let Flow::Block { until: Wait::Cycle(at), then } = flow else {
+                let Flow::Block { until, then } = flow else {
                     panic!("seek must wait on attempt {attempt}");
                 };
                 assert_eq!(m.cd_drive().head, if attempt == 0 { 4502 } else { 2 });
-                m.step(at);
+                m.step(m.cd_due());
+                assert!(m.holds(&until));
                 let flow_read = then(&mut m);
-                let Flow::Block { until: Wait::Cycle(at), then } = flow_read else {
+                let Flow::Block { until, then } = flow_read else {
                     panic!("read must wait on attempt {attempt}");
                 };
                 // Complete one frame, then reset the pending read through A95.
                 // This uses native cancellation, not a fabricated controller INT5.
-                m.step(at);
+                m.step(m.cd_due());
+                assert!(!m.holds(&until), "one of two sectors is not completion");
                 assert_eq!(m.mem.bytes(dst, 5), if attempt == 0 { b"first" } else { b"retry" });
                 assert_eq!(m.mem.bytes(dst + 0x800, 4), b"keep");
                 assert_eq!(ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])), 1);
                 ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
+                assert!(m.holds(&until));
                 let flow_error = then(&mut m);
                 let Flow::Call { call, then } = flow_error else {
                     panic!("read error must call SystemError");

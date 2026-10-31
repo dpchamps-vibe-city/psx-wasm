@@ -13,7 +13,7 @@ use psx_devices::clock::{Clock, Video};
 use psx_devices::mem::Mem;
 use psx_devices::timers::Timer;
 use psxw_abi::BootOptions;
-use std::collections::{BTreeMap, VecDeque};
+use std::{cell::Cell, collections::{BTreeMap, VecDeque}, rc::Rc};
 
 /// What the runtime needs from its host.
 pub trait Host {
@@ -180,7 +180,7 @@ pub fn seq<S: Sdk>(m: &mut Machine<S>, flow: Flow<S>, f: impl FnOnce(&mut Machin
 }
 
 /// Conditions a blocked call waits for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wait {
     /// `vblanks >= n`.
     Vblanks(u64),
@@ -190,6 +190,9 @@ pub enum Wait {
     Sdk(u32),
     /// A BIOS event becomes ready.
     Event(u32),
+    /// A blocking CD call's live events, or cancellation of its own native
+    /// operation. Normal completion alone does not satisfy the wait.
+    Cd { done: Rc<Cell<Option<u64>>>, read: bool },
 }
 
 /// SDK adapter state plugs into the machine through this trait.
@@ -347,12 +350,13 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// Whether a wait condition holds.
-    pub fn holds(&self, w: Wait) -> bool {
+    pub fn holds(&self, w: &Wait) -> bool {
         match w {
-            Wait::Vblanks(n) => self.vblanks >= n,
-            Wait::Cycle(t) => self.clock.now >= t,
-            Wait::Sdk(c) => S::ready(self, c),
-            Wait::Event(h) => self.event_ready(h),
+            Wait::Vblanks(n) => self.vblanks >= *n,
+            Wait::Cycle(t) => self.clock.now >= *t,
+            Wait::Sdk(c) => S::ready(self, *c),
+            Wait::Event(h) => self.event_ready(*h),
+            Wait::Cd { done, read } => self.cd_wait_ready(done, *read),
         }
     }
 
