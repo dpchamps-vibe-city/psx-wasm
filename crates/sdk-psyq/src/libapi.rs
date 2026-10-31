@@ -24,8 +24,11 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("InitPAD", init_pad),
     ("StartPAD", start_pad),
     ("PAD_init", pad_init),
-    ("EnablePAD", nop),
-    ("DisablePAD", nop),
+    ("EnablePAD", enable_pad),
+    ("DisablePAD", disable_pad),
+    // pad.o's own vblank element's verifier and handler (static).
+    ("libapi/pad:0x24c", element_verifier),
+    ("libapi/pad:0x1e4", element_handler),
     ("_patch_pad", nop),
     ("firstfile", firstfile),
 ];
@@ -98,23 +101,74 @@ fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 /// handler, has nothing to patch.
 fn init_pad(m: &mut M, a: [u32; 4]) -> Result {
     bios(m, 0xB0, 0x5B, [0; 4])?;
+    queue_element(m)?;
     bios(m, 0xB0, 0x12, a)?;
     set_init_pad_flag(m)?;
     ret(1)
 }
 
-/// `StartPAD`: `StartPAD2` (B0:13h), `ChangeClearPAD(0)`; 1. `EnablePAD`
-/// jumps into the patched BIOS.
+/// `StartPAD`: `StartPAD2` (B0:13h), `ChangeClearPAD(0)`, `EnablePAD`; 1.
 fn start_pad(m: &mut M, _a: [u32; 4]) -> Result {
     bios(m, 0xB0, 0x13, [0; 4])?;
     bios(m, 0xB0, 0x5B, [0; 4])?;
+    m.kernel.pad_enable = true;
     ret(1)
+}
+
+/// `EnablePAD`, `DisablePAD`: the BIOS's pad handler reads the pads, or
+/// not. `_patch_pad` points them at the Sony BIOS's `SetPadEnableFlag` and
+/// `ClearPadEnableFlag` (psx-spx, "patch_pad_error_handling_and_get_pad_
+/// enable_functions"): psx-spx's `pad_enable_flag`.
+fn enable_pad(m: &mut M, _a: [u32; 4]) -> Result {
+    m.kernel.pad_enable = true;
+    ret(1)
+}
+
+fn disable_pad(m: &mut M, _a: [u32; 4]) -> Result {
+    m.kernel.pad_enable = false;
+    ret(1)
+}
+
+/// pad.o's own element, which `InitPAD` and `PAD_init` queue at priority
+/// 1 (its helper, the `jal` at +4Ch in both): its handler and verifier
+/// written in, then out of the chain and back in, in a critical section,
+/// as the helper does. Its fields, from the helper's code.
+fn queue_element(m: &mut M) -> std::result::Result<(), String> {
+    let at = m.sdk.at;
+    let err = || format!("libapi/pad at {at:#010x}: no element helper where PsyQ 4.7's object has it");
+    let h = crate::libspu::jal(m, at + 0x4C).ok_or_else(err)?;
+    let p = |m: &M, o: u32| crate::libspu::pair(m, h + o, h + o + 4).ok_or_else(err);
+    let element = p(m, 0x14)?.wrapping_sub(4);
+    let (handler, verifier) = (p(m, 0x20)?, p(m, 0x2C)?);
+    psx_bios::bios::syscall(m, [1, 0, 0, 0])?;
+    for (o, v) in [(4, handler), (8, verifier), (0, 0), (12, 0)] {
+        m.mem.w32(element + o, v);
+    }
+    bios(m, 0xC0, 0x03, [1, element, 0, 0])?;
+    bios(m, 0xC0, 0x02, [1, element, 0, 0])?;
+    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
+    Ok(())
+}
+
+/// The element's verifier: vblank unmasked and pending.
+fn element_verifier(m: &mut M, _a: [u32; 4]) -> Result {
+    let taken = reg(m, psx_devices::irq::I_MASK, 4)? & reg(m, psx_devices::irq::I_STAT, 4)? & 1;
+    ret(taken)
+}
+
+/// The element's handler: SIO0's control register cleared, then a
+/// countdown of 11 passes.
+fn element_handler(m: &mut M, _a: [u32; 4]) -> Result {
+    set_reg(m, 0x1F80_104A, 2, 0)?;
+    crate::libpad::spend_in_exception(m, 11);
+    ret(0)
 }
 
 /// `PAD_init(type, button_dest, …)`: `ChangeClearPAD(0)`, then the BIOS's
 /// `PAD_init2` (B0:15h) with the same arguments; pad.o's flag set; 1.
 fn pad_init(m: &mut M, a: [u32; 4]) -> Result {
     bios(m, 0xB0, 0x5B, [0; 4])?;
+    queue_element(m)?;
     bios(m, 0xB0, 0x15, a)?;
     set_init_pad_flag(m)?;
     ret(1)
@@ -168,11 +222,26 @@ mod tests {
         m.sdk.at = at;
         m.mem.w32(at + 0x6C, 0x3C01_0000 | (flag + 0x8000) >> 16);
         m.mem.w32(at + 0x70, 0xAC22_0000 | (flag & 0xFFFF));
+        // Its `jal` to pad.o's element helper, whose pairs name the
+        // element (+4) and its handler and verifier.
+        let (h, element, handler, verifier) = (0x8004_2CF0, 0x800B_79E8, 0x8004_2D68, 0x8004_2DD0);
+        m.mem.w32(at + 0x4C, 0x0C00_0000 | (h & 0x0FFF_FFFF) >> 2);
+        for (o, v) in [(0x14, element + 4), (0x20, handler), (0x2C, verifier)] {
+            m.mem.w32(h + o, 0x3C02_0000 | (v + 0x8000) >> 16);
+            m.mem.w32(h + o + 4, 0x2442_0000 | (v & 0xFFFF));
+        }
         m.mem.write(0x8001_0000, &[0x5A; 0x44]);
         assert_eq!(call(&mut m, init_pad, [0x8001_0000, 0x22, 0x8001_0022, 0x22]), 1);
         assert_eq!(m.mem.bytes(0x8001_0000, 0x44), [0; 0x44]);
         assert_eq!(m.mem.r32(flag), 1);
+        // Ahead of the kernel's timer elements.
+        assert_eq!(m.chain(1)[0], element);
+        assert_eq!((m.mem.r32(element + 4), m.mem.r32(element + 8)), (handler, verifier));
         assert_eq!(call(&mut m, start_pad, [0; 4]), 1);
         assert!(m.sio0_started());
+        call(&mut m, disable_pad, [0; 4]);
+        assert!(!m.kernel.pad_enable);
+        call(&mut m, enable_pad, [0; 4]);
+        assert!(m.kernel.pad_enable);
     }
 }

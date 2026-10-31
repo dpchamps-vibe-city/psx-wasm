@@ -402,7 +402,8 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    SIO0's model (01h, 42h, ID, 5Ah, the halfwords; status FFh on no
    acknowledge), as OpenBIOS's `readPad`. Not modelled: the handler's own
    CPU time in the exception (libpad's adapters spend it, D60). libapi's
-   priority-1 element and `EnablePAD`/`DisablePAD` (Findings) stay open.
+   priority-1 element and `EnablePAD`/`DisablePAD` (Findings) settled
+   after it: see the Findings entry.
 7. [x] **BIOS6, SDK10. The card driver drives SIO0, and the cards are the
    port's.** `psx-bios/src/card.rs`: transfers paced as the BIOS paces
    them; `_card_*` and the `bu` device over it. The card images move to
@@ -619,7 +620,14 @@ locals, or static translation.
   (phase 3, BIOS5). Likewise `EnablePAD`/`DisablePAD` jump into code
   `_patch_pad` finds in the Sony BIOS (B0:5Bh's address + 884h/894h,
   probably psx-spx's `pad_enable_flag`); the adapters are nops. Settle
-  both in BIOS5.
+  both in BIOS5. Settled (2026-10-31): `InitPAD`/`PAD_init` queue the
+  element as the helper does (found through the `jal` at +4Ch and the
+  helper's pairs), its handler and verifier adapters bound by place
+  (`libapi/pad:0x1e4`, `:0x24c`); `EnablePAD`/`DisablePAD` set and clear
+  the BIOS's pad-enable flag. The helper writes `next` = 0 before its
+  `SysDeqIntRP`, so a second `InitPAD` cuts the elements queued after it
+  off chain 1 (the kernel's timer elements here) — the original does the
+  same, so it is kept.
 - **OpenBIOS is the reference where psx-spx is silent, and sometimes the
   plan's fix was wrong** (B2, B3): check OpenBIOS's source (pcsx-redux's
   `src/mips/openbios`, the oracle's `8a86b7e`) before each BIOS fix.
