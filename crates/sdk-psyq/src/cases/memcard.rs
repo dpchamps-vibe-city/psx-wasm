@@ -90,10 +90,14 @@ fn port_arg(rng: &mut Rng) -> u32 {
     }
 }
 
-/// Where the guest resumes in the frame, and the interrupt mask.
+/// Where the guest resumes in the frame, the guest's budget left (the
+/// original's instructions so far, the interrupts' among them, D71), and
+/// the interrupt mask.
 fn place(h: &mut dyn Harness, what: &str) -> Result<(), String> {
     let v = h.call("GetRCnt", &[0xF200_0001])?;
     h.observe(&format!("{what}: hblank"), format!("{}", v % LINES_PER_FRAME));
+    let b = h.budget();
+    h.observe(&format!("{what}: budget"), b.to_string());
     call(h, "GetIntrMask", &[])?;
     Ok(())
 }
