@@ -6,7 +6,7 @@
 use crate::kernel::{self, File};
 use crate::libc;
 use crate::machine::{Flow, Machine, Sdk, Wait};
-use psx_devices::cd;
+use psx_devices::{cd, dma};
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
 /// wild argument can't spin for minutes.
@@ -63,7 +63,15 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x3F) => "printf",
         (0xA0, 0x43) => "Exec",
         (0xA0, 0x44) => "FlushCache",
+        (0xA0, 0x46) => "GPU_dw",
+        (0xA0, 0x47) => "gpu_send_dma",
+        (0xA0, 0x48) => "SendGP1Command",
         (0xA0, 0x49) => "GPU_cw",
+        (0xA0, 0x4A) => "GPU_cwp",
+        (0xA0, 0x4B) => "send_gpu_linked_list",
+        (0xA0, 0x4C) => "gpu_abort_dma",
+        (0xA0, 0x4D) => "GetGPUStatus",
+        (0xA0, 0x4E) => "gpu_sync",
         (0xA0, 0x55) | (0xA0, 0x70) => "_bu_init",
         (0xA0, 0x72) => "_96_remove",
         (0xA0, 0x9F) => "SetMemSize",
@@ -346,12 +354,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.cards_ready();
             r(0)
         }
-        (0xA0, 0x49) => {
-            // GPU_cw: a GP0 word (after gpu_sync, which returns 0 here:
-            // the GPU front end takes words at once).
-            m.gp0(a[0]);
-            r(0)
-        }
+        (0xA0, 0x46..=0x4E) => gpu(m, func, a).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xA0, 0xA1) => Err(format!("{label}: SystemError({:#x}, {:#x})", a[0], a[1])),
         (0xA0, 0xAB) => r(m.card_info(a[0])),
         (0xA0, 0xAC) => r(m.card_load(a[0])),
@@ -670,6 +673,122 @@ fn timer<S: Sdk>(m: &mut Machine<S>, func: u32, a: [u32; 4]) -> Result<u32, Stri
         }
         _ => Ok(0),
     }
+}
+
+const GP0: u32 = 0x1F80_1810;
+const GP1: u32 = 0x1F80_1814;
+/// DMA channel 2's registers.
+const D2_MADR: u32 = dma::BASE + 0x10 * dma::GPU as u32;
+const D2_BCR: u32 = D2_MADR + 4;
+const D2_CHCR: u32 = D2_MADR + 8;
+
+/// The A0h GPU functions (psx-spx "BIOS GPU Functions") through the GPU's
+/// and the DMA controller's registers.
+fn gpu<S: Sdk>(m: &mut Machine<S>, func: u32, a: [u32; 4]) -> Result<u32, String> {
+    let gp0 = |m: &mut Machine<S>, w: u32| m.reg_write(GP0, 4, w);
+    // GPU_dw and gpu_send_dma: an image's header, and its arguments left
+    // in the caller's argument words (psx-spx).
+    let image = |m: &mut Machine<S>| -> Result<(), String> {
+        for w in [0xA000_0000, a[1] << 16 | a[0] & 0xFFFF, a[3] << 16 | a[2] & 0xFFFF] {
+            gp0(m, w)?;
+        }
+        let sp = m.regs.sp();
+        for (k, v) in [a[1], a[2], a[3]].into_iter().enumerate() {
+            m.mem.w32(sp + 4 * (k as u32 + 1), v);
+        }
+        Ok(())
+    };
+    let dma_on = |m: &mut Machine<S>| -> Result<(), String> {
+        let dpcr = m.reg_read(dma::DPCR, 4)?;
+        m.reg_write(dma::DPCR, 4, dpcr | 0x800)
+    };
+    match func {
+        0x46 => {
+            // GPU_dw: by software once GPUSTAT bit 26 is set; w*h/2 words.
+            if m.reg_read(GP1, 4)? & 1 << 26 == 0 {
+                return Err("GPUSTAT bit 26 stays clear (a GP0 command is half sent): the BIOS waits forever".into());
+            }
+            let src = m.arg(&a, 4);
+            image(m)?;
+            let n = len(a[2].wrapping_mul(a[3]) / 2);
+            for i in 0..n {
+                let w = m.mem.r32(src.wrapping_add(4 * i));
+                gp0(m, w)?;
+            }
+            let end = src.wrapping_add(4 * n);
+            let sp = m.regs.sp();
+            m.mem.w32(sp + 0x10, end);
+            Ok(end)
+        }
+        0x47 => {
+            // gpu_send_dma: w*h/32 blocks of 16 words by DMA.
+            let src = m.arg(&a, 4);
+            gpu_sync(m)?;
+            image(m)?;
+            m.reg_write(GP1, 4, 0x0400_0002)?;
+            dma_on(m)?;
+            m.reg_write(D2_MADR, 4, src)?;
+            m.reg_write(D2_BCR, 4, (a[2].wrapping_mul(a[3]) / 32) << 16 | 0x10)?;
+            m.reg_write(D2_CHCR, 4, 0x0100_0201)?;
+            Ok(GP0)
+        }
+        0x48 => m.reg_write(GP1, 4, a[0]).map(|_| 0),
+        0x49 => {
+            let v = gpu_sync(m)?;
+            gp0(m, a[0])?;
+            Ok(v)
+        }
+        0x4A => {
+            gpu_sync(m)?;
+            for i in 0..len(a[1]) {
+                let w = m.mem.r32(a[0].wrapping_add(4 * i));
+                gp0(m, w)?;
+            }
+            Ok(0)
+        }
+        0x4B => {
+            // send_gpu_linked_list: DICR cleared as well (psx-spx). Its
+            // TTY messages are left out: psx-spx doesn't give them.
+            gpu_sync(m)?;
+            m.reg_write(GP1, 4, 0x0400_0002)?;
+            m.reg_write(dma::DICR, 4, 0)?;
+            dma_on(m)?;
+            m.reg_write(D2_MADR, 4, a[0])?;
+            m.reg_write(D2_BCR, 4, 0)?;
+            m.reg_write(D2_CHCR, 4, 0x0100_0401)?;
+            Ok(0)
+        }
+        0x4C => {
+            // gpu_abort_dma: the channel stopped; GP1(04h), (02h), (01h).
+            m.reg_write(D2_CHCR, 4, 0x401)?;
+            for c in [0x0400_0000, 0x0200_0000, 0x0100_0000] {
+                m.reg_write(GP1, 4, c)?;
+            }
+            Ok(GP1)
+        }
+        0x4D => m.reg_read(GP1, 4),
+        _ => gpu_sync(m),
+    }
+}
+
+/// `gpu_sync` (A0h:4Eh): with GPU DMA off, wait for GPUSTAT bit 28; with
+/// it on, for the channel to finish and bit 28, then DMA off (GP1(04h)).
+/// The front end takes words at once and DMA ends at once, so each wait
+/// holds already or never ends: then the BIOS's timeout (-1), or an error
+/// for the one wait without a timeout.
+fn gpu_sync<S: Sdk>(m: &mut Machine<S>) -> Result<u32, String> {
+    let ready = |m: &mut Machine<S>| m.reg_read(GP1, 4).map(|s| s & 1 << 28 != 0);
+    if m.reg_read(GP1, 4)? & 0x6000_0000 == 0 {
+        return Ok(if ready(m)? { 0 } else { u32::MAX });
+    }
+    if m.reg_read(D2_CHCR, 4)? & dma::CHCR_BUSY != 0 {
+        return Ok(u32::MAX);
+    }
+    if !ready(m)? {
+        return Err("GPUSTAT bit 28 stays clear (a polygon or line is half sent): gpu_sync waits forever".into());
+    }
+    m.reg_write(GP1, 4, 0x0400_0000)?;
+    Ok(0)
 }
 
 /// Raw sectors through the host.

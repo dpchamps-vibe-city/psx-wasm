@@ -268,6 +268,9 @@ fn bios() -> Vec<Handwritten> {
         timer("bios_enable_timer_irq", 0x04, [0, 0, 0, 0]),
         timer("bios_disable_timer_irq", 0x05, [0, 0, 0, 0]),
         timer("bios_restart_timer_vblank", 0x06, [3, 0, 0, 0]),
+        // The GPU, idle: a NOP word, and the sync.
+        call("bios_gpu_cw", 0x49, [0, 0, 0, 0], vec![], vec![]),
+        call("bios_gpu_sync", 0x4E, [0, 0, 0, 0], vec![], vec![]),
     ]
 }
 
@@ -303,6 +306,10 @@ fn bios_disputed() -> Vec<Handwritten> {
         call("bios_memmove_bug", 0x2C, [s + 16, s, 8, 0], vec![(s, (0u8..32).collect())], vec![(s + 16, 12)]),
         // memset of nothing returns 0.
         call("bios_memset_empty", 0x2B, [s, 0x5A, 0, 0], vec![(s, vec![0x11; 4])], vec![(s, 4)]),
+        // GPU_cwp returns 0 and gpu_abort_dma GP1's address (OpenBIOS:
+        // nothing).
+        call("bios_gpu_cwp", 0x4A, [s, 1, 0, 0], vec![(s, vec![0; 4])], vec![]),
+        call("bios_gpu_abort_dma", 0x4C, [0, 0, 0, 0], vec![], vec![]),
     ]
 }
 

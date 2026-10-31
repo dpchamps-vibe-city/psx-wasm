@@ -40,7 +40,7 @@ pub fn run(b: &BiosCall) -> Result<Vec<u8>> {
         psxw_abi::BootOptions::default(),
         NoSdk,
     );
-    // The devices the runtime's BIOS reaches (the timer functions).
+    // The devices the runtime's BIOS reaches (the GPU and timer functions).
     m.io = Some(Default::default());
     for (addr, bytes) in &b.setup {
         m.mem.write(*addr, bytes);
