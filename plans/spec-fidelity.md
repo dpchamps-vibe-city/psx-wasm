@@ -398,12 +398,18 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
 6. [ ] **BIOS5. The pad driver drives SIO0** for `InitPAD`/`StartPAD`
    buffers (`psx-bios/src/kernel.rs:110-126`), through the shared port
    model.
-7. [ ] **BIOS6, SDK10. The card driver drives SIO0, and the cards are the
+7. [x] **BIOS6, SDK10. The card driver drives SIO0, and the cards are the
    port's.** `psx-bios/src/card.rs`: transfers paced as the BIOS paces
    them; `_card_*` and the `bu` device over it. The card images move to
    the port; libmcx's wire (`sdk-psyq/src/libmc.rs:158-173, 269`) reaches
    them through the card device's interface, not `m.kernel.cards`.
    Revise D43. **Run:** both games' save and load.
+   Done `5cec580`: the images are SIO0's slots (`Sio0::slots`); the driver
+   moves sectors through `memcard::Responder` (FLAG, confirmed sector,
+   checksum, end byte decide the outcome), one operation per vblank in the
+   pad and card handler after `StartCARD2`; libmcx's wire reaches the
+   port's card. D43 revised. The `bu` directory is still read from the
+   image (the device table's work, task 8).
 8. [ ] **BIOS9. Files over the CD controller and a device table.** `open`,
    `read`, `lseek`, `close`, `firstfile`/`nextfile` go through `AddDrv`'s
    device table (`cdrom`, `bu`, `tty`); `cdrom` reads through the CD
@@ -412,11 +418,14 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    `BIOS_CALL` vectors (`psxw-oracle/src/handwritten.rs`, `bios()`). The
    harness's psx-wasm side is `psxw_oracle::bios::Device` (`7e748f0`): a
    vector's call on a bare psx-bios machine, v0 and the captures:
-   - the C library, including `malloc`/`free`/`calloc`/`realloc` over
-     `InitHeap`, number conversion, `qsort`;
-   - events (`UnDeliverEvent`), timers, kernel memory;
+   - [x] the C library, including `malloc`/`free`/`calloc`/`realloc` over
+     `InitHeap`, number conversion, `qsort` (`fe99091`, agent; Sony's
+     documented bugs reproduced, 13 `disputed-bios` vectors where OpenBIOS
+     differs);
+   - [x] events (`UnDeliverEvent`), timers, kernel memory (`d89a101`,
+     `b9db230`);
    - files and devices (after task 8);
-   - the A0h GPU functions over the GPU;
+   - [x] the A0h GPU functions over the GPU (`12c6040`);
    - the A0h CD functions over the CD controller;
    - `syscall` 4 and up (the exception event), `SystemError`, exception
      hooks.
@@ -654,3 +663,18 @@ locals, or static translation.
   at +228h (23h per port). `_padRestPeriod` is a common reached from
   `_padIntPad`'s pair at +ACh. Not written yet: `_padTotalCurr`, the
   actuator gates, `_padSioChan`/`_padSioState`.
+- **BIOS calls vs OpenBIOS** (task 9, agent): psx-bios follows psx-spx's
+  Sony behaviour where OpenBIOS differs: `todigit` past hex, `strtol`'s
+  `0b`/`0o`, `atoi`'s octal, `strpbrk`/`strspn`/`strcspn`/`strtok`/`strstr`/
+  `memcmp`/`memmove`'s documented bugs, `memset(…, 0)`'s 0, `GPU_cwp` and
+  `gpu_abort_dma`'s results: 13 `disputed-bios` vectors kept out of the
+  verdicts. Where psx-spx is silent the choices are recorded in the
+  commits (heap search, `free(0)`, `realloc` failure). The runner can't pass
+  a fifth argument, read registers or capture outside the scratch area,
+  so callbacks, 5-argument calls, heaps, kernel memory and events are unit
+  tests; extending the runner's op would make them vectors. The kernel
+  heap (`alloc_kernel_memory`) is what follows the event blocks (630h
+  bytes with 16 events): Sony allocates the control blocks from it, which
+  task 2's layout should settle. `atof`/`strtod` (COP1, lock up) are left
+  for task 10. `GPU_cw` now syncs first, which libgpu's `ResetGraph`
+  reaches: a human run should confirm it.
