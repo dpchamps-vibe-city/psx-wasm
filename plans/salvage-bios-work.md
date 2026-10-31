@@ -193,23 +193,23 @@ Five are documented no-ops, and A(52h)'s meaning needs verification.
 | [ ] | A(41h) | `LoadTest` |
 | [ ] | A(42h) | `Load` |
 | [ ] | A(52h) | Resolve reference conflict: summary says `GetSysSp`, another section says `SystemError`; then implement the verified behaviour |
-| [ ] | A(9Ch) | `SetConf` |
-| [ ] | A(9Dh) | `GetConf` |
+| [ ] | A(9Ch) | `SetConf`: main-thread reset implemented; live non-main reset still blocked |
+| [x] | A(9Dh) | `GetConf` |
 | [ ] | A(A7h) | `bufs_cb_0` |
 | [ ] | A(A8h) | `bufs_cb_1` |
 | [ ] | A(A9h) | `bufs_cb_2` |
 | [ ] | A(AAh) | `bufs_cb_3` |
 | [ ] | A(AEh) | `bufs_cb_4` |
 | [ ] | A(B2h) | `ioabort_raw` |
-| [ ] | A(B4h) | `GetSystemInfo` |
+| [ ] | A(B4h) | `GetSystemInfo`: size/flags implemented; date/version identity unresolved |
 | [ ] | B(4Dh) | `_card_info_subfunc` |
 | [ ] | B(53h) | `Krom2Offset` |
 | [ ] | B(58h) | `_card_chan` |
-| [ ] | C(04h) | `get_free_EvCB_slot` |
-| [ ] | C(05h) | `get_free_TCB_slot` |
-| [ ] | C(08h) | `SysInitMemory` |
+| [x] | C(04h) | `get_free_EvCB_slot` |
+| [x] | C(05h) | `get_free_TCB_slot` |
+| [x] | C(08h) | `SysInitMemory` |
 | [ ] | C(09h) | `SysInitKernelVariables` (reference notes its post-boot corruption; verify the callable behaviour) |
-| [ ] | C(0Eh), C(0Fh), C(10h), C(11h), C(14h) | Five retail zero-return entries, currently errors |
+| [x] | C(0Eh), C(0Fh), C(10h), C(11h), C(14h) | Five retail zero-return entries |
 | [ ] | C(15h) | `_cdevinput` |
 | [ ] | C(16h) | `_cdevscan` |
 | [ ] | C(17h) | `_circgetc` |
@@ -237,9 +237,9 @@ handoff's missing-call list.
   and accessible glyph data together with B(53h). Establish a legally usable
   resource source with the user; do not commit a BIOS dump or extracted font,
   invent a valid pointer to missing data, or call this complete without glyphs.
-- [ ] **`SetMem`, A(9Fh).** Currently a no-op, including the guest-visible
-  RAM-size variable. Implement its native-relevant state; this is not permission
-  to restore the console-wide bus map.
+- [x] **`SetMem`, A(9Fh).** Updates the guest-visible RAM-size variable for
+  retail's 2/8 MB choices, also reported by GetSystemInfo(5). No host memory
+  resizing or console-wide bus map.
 - [ ] **Card auto-format, A(ADh).** The flag is written but never read. Implement
   the documented opt-in behaviour and its initialisation/reset, with tests using
   disposable card images. Never test destructive formatting on user saves.
@@ -565,13 +565,16 @@ is resumed as `b498c913-ceb9-47d3-8fe5-22dc437e8163` for bounded corrections,
 including event reuse/allocation cleanup and existing core error semantics.
 No register driver or native-core/SDK ownership rewrite is authorised.
 
-Kernel/configuration's initial `aa9cb54` is also **not accepted or integrated**.
-Parent review found that SetConf re-enqueues into uncleared exception chains,
-while C(08h) refuses its documented default region and GetConf adds an
-unsupported null-destination restriction. GetSystemInfo's absent metadata and
-A(52h)'s conflicting reference remain unresolved, not verified implementations.
-The worker is resumed as `cfc570f4-246e-4858-b3dc-61243686e641` for these bounded
-corrections. No runtime/thread redesign is authorised.
+Kernel/configuration's `aa9cb54` plus corrective `fd9e662` have now been
+source-reviewed together and integrated. SetConf clears chains before reinstalling
+native defaults, including on repeated calls, and uses the parent's timer/IRQ
+reset helpers. GetConf performs all three guest writes (address zero included);
+C(08h) accepts its documented default range and intentionally invalidates old
+allocations. SetMem, free-slot helpers and the five C0 zero-return entries work.
+SetConf from a non-main thread, C(09h), GetSystemInfo identity indices 0/2 and
+A(52h)'s reference conflict remain explicitly unfinished. Integrated BIOS 32,
+runtime 8 and SDK 36 tests plus wasm32 runtime check pass. No runtime/thread
+redesign, ABI change, game rebuild or fresh oracle comparison in this batch.
 
 A further DeepSeek worker, `cde8d5ed-e38b-4833-bcb0-989b9570b1b3`, starts at
 `22a4c87` in `../psx-wasm-salvage-lanes/card-completion`, branch

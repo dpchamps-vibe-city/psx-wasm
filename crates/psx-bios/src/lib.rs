@@ -104,6 +104,7 @@ pub mod testing {
 mod tests {
     use super::testing::machine;
     use super::*;
+    use crate::threads;
 
     fn ret(f: Result<Flow<testing::NoSdk>, String>) -> u32 {
         match f.unwrap() {
@@ -430,6 +431,108 @@ mod tests {
             assert_eq!(bios::syscall(&mut m, [n, 0, 0, 0]), Ok(0));
             assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
         }
+    }
+
+    /// The kernel/configuration family: RAM size and system information,
+    /// the configuration the boot and `SetConf` leave, its free slots, the
+    /// kernel memory region, and the entries that stay explicitly blocked.
+    #[test]
+    fn kernel_configuration_lifecycle() {
+        use psxw_abi::kernel as k;
+        let mut m = machine();
+        // SetMem: only retail's 2 and 8 MB change the guest-visible size.
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x9F, [8, 0, 0, 0])), 0);
+        assert_eq!(m.mem.r32(k::RAM_SIZE), 8);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0xB4, [5, 0, 0, 0])), 8192);
+        ret(bios::call(&mut m, 0xA0, 0x9F, [3, 0, 0, 0]));
+        assert_eq!(m.mem.r32(k::RAM_SIZE), 8, "an unsupported size is ignored");
+        ret(bios::call(&mut m, 0xA0, 0x9F, [2, 0, 0, 0]));
+        // GetSystemInfo: kernel/console facts; identity metadata is not
+        // invented. The function stays partial while 0 and 2 are unsupported.
+        for (index, value) in [(1, 3), (3, 0), (4, 0), (5, 2048), (6, 0), (7, 1024), (8, 0), (9, 512), (10, 0), (11, 0), (12, 1), (13, 1), (14, 1), (15, 0)] {
+            assert_eq!(ret(bios::call(&mut m, 0xA0, 0xB4, [index, 0, 0, 0])), value, "GetSystemInfo({index:#x})");
+        }
+        for index in [0, 2] {
+            assert!(bios::call(&mut m, 0xA0, 0xB4, [index, 0, 0, 0]).is_err(), "GetSystemInfo({index:#x}) needs identity");
+        }
+        // Retail's zero-return entries.
+        for f in [0x0E, 0x0F, 0x10, 0x11, 0x14] {
+            assert_eq!(ret(bios::call(&mut m, 0xC0, f, [0; 4])), 0);
+            assert!(bios::implemented(0xC0, f));
+        }
+        // GetConf reports the boot's counts and initial stack top.
+        m.regs.set_sp(0x801F_EE00);
+        m.lay_out_threads(4);
+        let (events, tcbs, stack) = (0x8001_0000, 0x8001_0004, 0x8001_0008);
+        ret(bios::call(&mut m, 0xA0, 0x9D, [events, tcbs, stack, 0]));
+        assert_eq!((m.mem.r32(events), m.mem.r32(tcbs), m.mem.r32(stack)), (kernel::EVENTS as u32, 4, 0x801F_EE00));
+        ret(bios::call(&mut m, 0xA0, 0x9D, [0, tcbs, stack, 0]));
+        assert_eq!(m.mem.r32(0), kernel::EVENTS as u32, "guest address zero is mapped");
+        // C(04h)/C(05h) name the first free block; Open/Close update them.
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x04, [0; 4])), 0);
+        let ev = ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x04, [0; 4])), 1);
+        ret(bios::call(&mut m, 0xB0, 0x09, [ev, 0, 0, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x04, [0; 4])), 0);
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x05, [0; 4])), 1, "TCB 0 is the main thread");
+        let th = ret(bios::call(&mut m, 0xB0, 0x0E, [0x8001_0000, 0x801F_E000, 0, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x05, [0; 4])), 2);
+        ret(bios::call(&mut m, 0xB0, 0x0F, [th, 0, 0, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x05, [0; 4])), 1);
+        // SetConf resets the blocks, chains and kernel memory, keeping the
+        // main thread and reporting the new configuration.
+        let stale = ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0]));
+        for prio in 0..4 {
+            m.enq_int_rp(prio, 0x8002_0000 + 4 * prio);
+        }
+        let default_chains = |m: &Machine<testing::NoSdk>| {
+            let roots: Vec<u32> = (0..4).rev().map(kernel::kernel_element).collect();
+            (m.chain(0), m.chain(1), m.chain(2), m.chain(3), roots)
+        };
+        let check_chains = |m: &Machine<testing::NoSdk>| {
+            let (p0, p1, p2, p3, roots) = default_chains(m);
+            assert!(p0.is_empty(), "priority 0 keeps no guest handler");
+            assert_eq!(p1, roots, "priority 1 is the native root counters");
+            assert!(p2.is_empty(), "priority 2 keeps no guest handler");
+            assert_eq!(p3, vec![kernel::kernel_element(kernel::IRQ_ELEMENT)]);
+            // Exact links: no trailing guest element and no self-cycle.
+            for (i, &e) in roots.iter().enumerate() {
+                let next = roots.get(i + 1).copied().unwrap_or(0);
+                assert_eq!(m.mem.r32(e), next, "root-counter element {i} link");
+            }
+            assert_eq!(m.mem.r32(kernel::kernel_element(kernel::IRQ_ELEMENT)), 0);
+        };
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x9C, [8, 2, 0x801F_EC00, 0])), 0);
+        check_chains(&m);
+        assert_eq!(m.ev(stale).unwrap().status, kernel::EV_UNUSED, "old events are gone");
+        // Repeating SetConf must not append or self-link the native chains.
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x9C, [8, 2, 0x801F_EC00, 0])), 0);
+        check_chains(&m);
+        ret(bios::call(&mut m, 0xA0, 0x9D, [events, tcbs, stack, 0]));
+        assert_eq!((m.mem.r32(events), m.mem.r32(tcbs), m.mem.r32(stack)), (8, 2, 0x801F_EC00));
+        assert_eq!(m.kernel.kheap, (0, 0));
+        assert_eq!(m.regs.sp(), 0x801F_EE00, "SetConf changes the configured top, not the running SP");
+        assert_eq!(m.mem.r32(threads::tcb(0) + k::TCB_STATUS), k::TCB_USED);
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x05, [0; 4])), 1);
+        let heap_start = 0xA000_0000 | (k::EVCBS + 8 * k::EVCB_SIZE);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x00, [0x10, 0, 0, 0])), heap_start + 4);
+        // A live non-main thread cannot be reset by the native runtime.
+        ret(bios::call(&mut m, 0xB0, 0x0E, [0x8001_0000, 0x801F_E000, 0, 0]));
+        m.enter_thread(1);
+        assert!(bios::call(&mut m, 0xA0, 0x9C, [4, 3, 0, 0]).is_err());
+        ret(bios::call(&mut m, 0xA0, 0x9D, [events, tcbs, stack, 0]));
+        assert_eq!((m.mem.r32(events), m.mem.r32(tcbs)), (8, 2), "a refused reset changes nothing");
+        m.enter_thread(0);
+        // SysInitMemory reinitialises the allocator in the requested region,
+        // including retail's default kernel range.
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x08, [0xA000_2000, 0x1000, 0, 0])), 0);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x00, [0x10, 0, 0, 0])), 0xA000_2004);
+        assert_eq!(ret(bios::call(&mut m, 0xC0, 0x08, [0xA000_E000, 0x2000, 0, 0])), 0);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x00, [0x10, 0, 0, 0])), 0xA000_E004);
+        assert!(bios::call(&mut m, 0xC0, 0x08, [0, 0x1000, 0, 0]).is_err());
+        // Disputed/undocumented entries are explicit errors, not no-ops.
+        assert!(bios::call(&mut m, 0xC0, 0x09, [0; 4]).is_err(), "SysInitKernelVariables stays blocked");
+        assert!(bios::call(&mut m, 0xA0, 0x52, [0; 4]).is_err(), "A(52h) conflict stays unresolved");
     }
 
     #[test]

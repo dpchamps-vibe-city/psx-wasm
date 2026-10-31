@@ -788,6 +788,11 @@ a call into guest code.
   handlers use the existing RFE thunk/tag, without a new return-code protocol.
   The IRQ entry restores guest-call depth after nested RFE unwinding. None of
   this introduces a console-wide address mapper or executes BIOS machine code.
+  Kernel configuration uses those same RAM tables and allocator: SetConf resets
+  the main thread's configuration and reinstalls native chains; GetConf, SetMem,
+  SysInitMemory and free-slot queries expose the resulting state. Resetting from
+  a live non-main thread remains unsupported. GetSystemInfo date/version identity,
+  the disputed A(52h), and post-boot C(09h) remain unresolved.
 - **clock.** The virtual timeline: vblank (NTSC 59.94 Hz, PAL 50 Hz), a
   queue of pending device events, and the safepoint quantum. It delivers
   events in a fixed order by calling guest callbacks.

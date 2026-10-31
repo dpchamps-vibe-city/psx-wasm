@@ -69,6 +69,9 @@ pub struct Kernel {
     pub threads: crate::threads::Threads,
     /// The C library's random generator (A0h:2Fh/30h).
     pub rand: u32,
+    /// The initial stack top `GetConf` reports (A0h:9Dh): the guest's sp
+    /// when the thread tables were laid out, or `SetConf`'s argument.
+    pub stack_top: u32,
 }
 
 impl Kernel {
@@ -157,6 +160,21 @@ impl<S: Sdk> Machine<S> {
         self.mem.w32(k::EVCB_ENTRY, 0xA000_0000 | k::EVCBS);
         self.mem.w32(k::EVCB_ENTRY + 4, n * k::EVCB_SIZE);
         self.mem.write(k::EVCBS, &vec![0; (n * k::EVCB_SIZE) as usize]);
+    }
+
+    /// How many event blocks the kernel has (lay them out first if the
+    /// boot has not).
+    pub fn event_count(&mut self) -> u32 {
+        self.evcb(EV_HANDLE);
+        self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE
+    }
+
+    /// C(04h) `get_free_EvCB_slot`: the first free block's index, or -1.
+    pub fn free_event_slot(&mut self) -> u32 {
+        let n = self.event_count();
+        (0..n)
+            .find(|&i| self.mem.r32(self.evcb_at(EV_HANDLE | i).expect("in range") + 4) == EV_UNUSED)
+            .unwrap_or(u32::MAX)
     }
 
     /// Handle `h`'s block; before the boot laid them out, the default

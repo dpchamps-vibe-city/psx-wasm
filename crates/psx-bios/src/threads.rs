@@ -53,6 +53,7 @@ impl<S: Sdk> Machine<S> {
     /// running main thread, the rest are free.
     pub fn lay_out_threads(&mut self, n: u32) {
         let n = n.clamp(1, k::MAX_TCBS);
+        self.kernel.stack_top = self.regs.sp();
         let mem = &mut *self.mem;
         mem.w32(k::PCB_ENTRY, kseg1(k::PCB));
         mem.w32(k::PCB_ENTRY + 4, 4);
@@ -70,6 +71,21 @@ impl<S: Sdk> Machine<S> {
         if self.kernel.threads.count == 0 {
             self.lay_out_threads(DEFAULT_TCBS);
         }
+    }
+
+    /// How many TCBs the kernel has (lay them out first if the boot has
+    /// not).
+    pub fn thread_count(&mut self) -> u32 {
+        self.threads_ready();
+        self.kernel.threads.count
+    }
+
+    /// C(05h) `get_free_TCB_slot`: the first free TCB's index, or -1.
+    pub fn free_thread_slot(&mut self) -> u32 {
+        self.threads_ready();
+        (0..self.kernel.threads.count)
+            .find(|&i| self.mem.r32(tcb(i) + k::TCB_STATUS) == k::TCB_FREE)
+            .unwrap_or(u32::MAX)
     }
 
     /// The TCB index a handle names, if it is a thread in use.

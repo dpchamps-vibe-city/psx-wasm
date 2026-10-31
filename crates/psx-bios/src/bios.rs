@@ -6,8 +6,9 @@
 use crate::kernel;
 use crate::libc;
 use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait};
-use crate::{files, tables};
+use crate::{files, tables, threads};
 use psx_devices::cd;
+use psxw_abi::kernel as k;
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
 /// wild argument can't spin for minutes.
@@ -101,8 +102,11 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x97) => "AddMemCardDevice",
         (0xA0, 0x98) => "AddDuartTtyDevice",
         (0xA0, 0x99) => "AddNullConDevice",
-        (0xA0, 0x9F) => "SetMemSize",
+        (0xA0, 0x9C) => "SetConf",
+        (0xA0, 0x9D) => "GetConf",
+        (0xA0, 0x9F) => "SetMem",
         (0xA0, 0xA1) => "SystemError",
+        (0xA0, 0xB4) => "GetSystemInfo",
         (0xA0, 0xAB) => "_card_info",
         (0xA0, 0xAC) => "_card_load",
         (0xA0, 0xAD) => "_card_auto",
@@ -175,6 +179,10 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xC0, 0x0C) => "InitDefInt",
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
+        (0xC0, 0x04) => "get_free_EvCB_slot",
+        (0xC0, 0x05) => "get_free_TCB_slot",
+        (0xC0, 0x08) => "SysInitMemory",
+        (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => "return 0",
         (0xC0, 0x07) => "InstallExceptionHandlers",
         (0xC0, 0x1C) => "AdjustA0Table",
         (0xC0, 0x0A) => "ChangeClearRCnt",
@@ -382,6 +390,21 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.rand = a[0];
             r(0)
         }
+        // A(B4h) GetSystemInfo: the retail kernel's flags and the console's
+        // sizes. The kernel date and version string (indices 0 and 2) need
+        // identity metadata this port does not have; they stay unsupported
+        // rather than being invented.
+        (0xA0, 0xB4) => r(match a[0] {
+            0 | 2 => {
+                return Err(format!("{label}: index {:#x} needs kernel identity metadata", a[0]));
+            }
+            1 => 3,
+            5 => m.mem.r32(k::RAM_SIZE) << 10,
+            7 => 1024,
+            9 => 512,
+            12..=14 => 1,
+            _ => 0,
+        }),
         (0xA0, 0x31) => Ok(libc::qsort(m, a)),
         (0xA0, 0x33) => r(libc::malloc(mem, m.kernel.heap, a[0])),
         (0xA0, 0x34) | (0xB0, 0x01) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
@@ -400,7 +423,15 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             let flow = m.putchars(text.into_bytes())?;
             Ok(crate::machine::seq(m, flow, move |_, _| Flow::ret(n)))
         }
-        (0xA0, 0x44) | (0xA0, 0x56) | (0xA0, 0x9F) => r(0),
+        (0xA0, 0x44) | (0xA0, 0x56) => r(0),
+        // SetMem: the guest-visible RAM size the kernel reports. Retail
+        // accepts 2 and 8 MB; the host's memory backing is not resized.
+        (0xA0, 0x9F) => {
+            if matches!(a[0], 2 | 8) {
+                m.mem.w32(k::RAM_SIZE, a[0]);
+            }
+            r(0)
+        }
         // "return 0" (psx-spx), and the dummy device functions.
         (0xA0, 0x57) => r(0),
         // --- A0h: the built-in devices, over the native backends ----------
@@ -499,7 +530,39 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0x4D) => r(m.gpu_status()?),
         (0xA0, 0x4E) => r(m.gpu_sync()?),
+        // A(52h): psx-spx's summary says GetSysSp, its N/A list says
+        // SystemError, and the pinned OpenBIOS table does not implement it.
+        // Those references do not establish the retail behaviour.
+        (0xA0, 0x52) => Err(format!("{label}: GetSysSp/SystemError conflict is unresolved; retail behaviour not verified")),
         (0xA0, 0xA1) => Err(format!("{label}: SystemError({:#x}, {:#x})", a[0], a[1])),
+        (0xA0, 0x9C) => {
+            let (events, tcbs, top) = (a[0], a[1], a[2]);
+            if !(1..=k::MAX_EVENTS).contains(&events) || !(1..=k::MAX_TCBS).contains(&tcbs) {
+                return Err(format!("{label}: counts {events:#x} EvCB/{tcbs:#x} TCB out of range"));
+            }
+            // Re-laying out live threads cannot preserve the runtime's
+            // suspended stacks, so only the main thread may be reset.
+            if m.kernel.threads.current != 0 {
+                return Err(format!("{label}: resetting a thread other than the main one is not supported"));
+            }
+            let main_tcb = m.mem.bytes(threads::tcb(0), k::TCB_SIZE as usize);
+            m.lay_out_events(events);
+            m.lay_out_threads(tcbs);
+            m.mem.write(threads::tcb(0), &main_tcb);
+            m.mem.w32(threads::tcb(0) + k::TCB_STATUS, k::TCB_USED);
+            m.kernel.stack_top = top;
+            m.kernel.kheap = (0, 0);
+            m.lay_out_excb();
+            m.lay_out_kernel_handlers();
+            r(0)
+        }
+        (0xA0, 0x9D) => {
+            let (events, tcbs, top) = (m.event_count(), m.thread_count(), m.kernel.stack_top);
+            for (dst, v) in [(a[0], events), (a[1], tcbs), (a[2], top)] {
+                m.mem.w32(dst, v);
+            }
+            r(0)
+        }
         (0xA0, 0xAB) => r(m.card_info(a[0])),
         (0xA0, 0xAC) => r(m.card_load(a[0])),
         (0xA0, 0xAD) => {
@@ -662,6 +725,31 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xC0, 0x03) => r(m.deq_int_rp(a[0], a[1])),
+        (0xC0, 0x04) => r(m.free_event_slot()),
+        (0xC0, 0x05) => r(m.free_thread_slot()),
+        // C(08h) SysInitMemory: the kernel's allocate-able region. It
+        // reinitialises the allocator and intentionally invalidates the old
+        // blocks, like InitHeap; overlapping the old layout is the caller's
+        // choice, not a policy this port invents.
+        (0xC0, 0x08) => {
+            let (addr, size) = (a[0], a[1]);
+            let phys = addr & 0x1FFF_FFFF;
+            let phys_end = phys.saturating_add(size);
+            if addr == 0 || size < 4 || phys_end > psxw_abi::phys::RAM.end {
+                return Err(format!("{label}: region {addr:#010x}+{size:#x} is outside RAM"));
+            }
+            let heap = libc::heap_init(&mut *m.mem, addr, size);
+            if heap == (0, 0) {
+                return Err(format!("{label}: invalid region {addr:#010x}+{size:#x}"));
+            }
+            m.kernel.kheap = heap;
+            r(0)
+        }
+        // C(09h): psx-spx records that the boot overwrites this entry, so
+        // post-boot calls do not have a documented callable contract. Our
+        // kernel variables are live native state; do not guess a reset.
+        (0xC0, 0x09) => Err(format!("{label}: documented post-boot corruption; no native contract")),
+        (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => r(0),
         (0xC0, 0x07) => {
             m.install_exception_handlers();
             r(0)

@@ -320,6 +320,7 @@ impl<S: Sdk> Machine<S> {
         m.lay_out_files();
         m.lay_out_excb();
         m.lay_out_kernel_handlers();
+        m.kernel.stack_top = m.regs.sp();
         m
     }
 
