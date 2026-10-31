@@ -1,10 +1,11 @@
 //! libetc (chip irq, D59): the interrupt layer (`intr.o`, `intr_vb.o`,
 //! `intr_dma.o`) and `VSync` (`vsync.o`), as adapters.
 //!
-//! **State.** The callback tables, `Vcount`, `Hcount` and the dispatcher's
-//! flags live here, in the runtime: no code but libetc's own reads them in
-//! either game (`psxw sdk scan`; the games' symbol files), and every
-//! function that does is adapted. The hardware they drive stays where the
+//! **State stays where libetc keeps it** (D67): `intr.o`'s context (its
+//! flags, the line handlers, its mask), `intr_vb.o`'s `VSyncCallbacks`
+//! table and `Vcount`, `intr_dma.o`'s `DMACallback` table, `vsync.o`'s last
+//! `Vcount` and `Hcount`, found through the objects' code ([`Lib`],
+//! [`VsyncO`]). The hardware they drive stays where the
 //! emulated chips' devices see it (`psx_bios::io`): the interrupt
 //! controller's I_STAT and I_MASK, the DMA controller's DPCR and DICR, root
 //! counter 1 and GPUSTAT. Libraries that stay original read and write
@@ -25,32 +26,27 @@
 //! which DMA doesn't reach (btn's menu; libcd reads sector headers into
 //! its callback's frame).
 //!
-//! **libetc's own handlers are functions.** Line 0 is its vblank handler
-//! (Vcount, then the eight `VSyncCallbacks` channels), line 3 its DMA
-//! handler (DICR's flags, acknowledged one by one, each channel's
-//! `DMACallback`). Code may take a line and call the handler it replaced:
-//! libsnd's tick handler takes line 0 and calls libetc's first. So the
-//! handlers are stand-in functions at addresses no game code has
-//! ([`VBLANK_HANDLER`], [`DMA_HANDLER`]), which `InterruptCallback`
-//! returns and takes back; a guest call to one reaches the runtime
-//! ([`psx_bios::Sdk::stand_in`]), which makes the handler's own calls as
-//! nested guest calls.
+//! **libetc's own handlers are its own code.** Line 0 is `intr_vb.o`'s
+//! vblank handler (Vcount, then the eight `VSyncCallbacks` channels), line
+//! 3 `intr_dma.o`'s DMA handler (DICR's flags, acknowledged one by one,
+//! each channel's `DMACallback`): guest code over the state in RAM and the
+//! shared DMA controller, at their own addresses, which `InterruptCallback`
+//! returns and takes back (libsnd's tick handler takes line 0 and calls
+//! libetc's first).
 //!
 //! Semantics are PsyQ 4.7's objects (`psxw sdk disasm`; psyq-decomp
 //! `libetc/{intr,intr_vb,intr_dma,vsync}`), including what a caller can
 //! see of a misuse: `InterruptCallback` does nothing before
 //! `ResetCallback`, `StopCallback` leaves interrupts disabled.
 //!
-//! **What isn't reproduced.** libetc's own addresses: `ResetCallback`,
-//! `StopCallback` and `RestartCallback` return a pointer to its context
-//! ([`CONTEXT`] here), and its handlers' addresses are the stand-ins', all
-//! in the BIOS ROM's range. Callbacks get zero arguments, where the
-//! original leaves register values (I_STAT, DICR's address) no callback is
-//! meant to read. A callback that leaves with ReturnFromException from
-//! inside libetc's own handler isn't supported.
+//! **What isn't reproduced.** The custom exception exit: the dispatcher is
+//! entered as adapter steps, not by the BIOS longjmp-ing into the context's
+//! `jmp_buf`, which `ResetCallback` doesn't fill (registers are wasm
+//! locals). A callback that leaves with ReturnFromException from inside
+//! libetc's own handler isn't supported.
 
 use crate::{Adapter, M, Psyq, Result, bios, reg, ret, set_reg};
-use psx_bios::{Flow, GuestCall, IrqStep, StandIn, Wait};
+use psx_bios::{Flow, GuestCall, IrqStep, Wait};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("ResetCallback", reset_callback),
@@ -66,14 +62,6 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("VSync", vsync),
 ];
 
-/// `ResetCallback`'s, `StopCallback`'s and `RestartCallback`'s result: the
-/// original's is the address of `intr.o`'s context.
-pub const CONTEXT: u32 = 0xBFC7_0000;
-/// `InterruptCallback(0, …)`'s previous handler: libetc's vblank handler.
-pub const VBLANK_HANDLER: u32 = 0xBFC7_0010;
-/// `InterruptCallback(3, …)`'s previous handler: libetc's DMA handler.
-pub const DMA_HANDLER: u32 = 0xBFC7_0020;
-
 const I_STAT: u32 = psx_devices::irq::I_STAT;
 const I_MASK: u32 = psx_devices::irq::I_MASK;
 const DPCR: u32 = psx_devices::dma::DPCR;
@@ -88,79 +76,160 @@ const LINES: usize = 11;
 /// quantum. A spin loop's iteration costs quantum / budget cycles.
 pub(crate) const LOOP_BUDGET: u64 = 1000;
 
-/// What handles an interrupt line.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Handler {
-    #[default]
-    None,
-    /// An `InterruptCallback` function.
-    Guest(u32),
-    /// libetc's vblank handler (`intr_vb.o`, line 0).
-    Vblank,
-    /// libetc's DMA handler (`intr_dma.o`, line 3).
-    Dma,
-}
-
-impl Handler {
-    /// As `InterruptCallback` returns and takes it.
-    pub fn word(self) -> u32 {
-        match self {
-            Handler::None => 0,
-            Handler::Guest(f) => f,
-            Handler::Vblank => VBLANK_HANDLER,
-            Handler::Dma => DMA_HANDLER,
-        }
-    }
-
-    pub fn from_word(w: u32) -> Self {
-        match w {
-            0 => Handler::None,
-            VBLANK_HANDLER => Handler::Vblank,
-            DMA_HANDLER => Handler::Dma,
-            f => Handler::Guest(f),
-        }
-    }
-}
-
-/// libetc's state.
+/// libetc's adapter state: where the objects are, and what the dispatcher
+/// needs between its steps. Everything libetc itself keeps is in RAM.
 #[derive(Debug, Default)]
 pub struct Etc {
-    /// `intr.o`'s context is installed: `ResetCallback` (or
-    /// `RestartCallback`) ran, and no `StopCallback` since.
-    pub active: bool,
-    /// The dispatcher is running (`CheckCallback`).
-    pub dispatching: bool,
+    pub lib: Option<Lib>,
+    pub vsync: Option<VsyncO>,
     /// I_STAT as the dispatcher's pass read it, which the original leaves
-    /// in a0 for the handlers and the vblank handler's callbacks.
+    /// in a0 for the handlers.
     pub stat: u16,
-    /// Each line's handler, and the lines with one (libetc's mask, which
-    /// the dispatcher ANDs with I_STAT and I_MASK).
-    pub lines: [Handler; LINES],
-    pub mask: u16,
-    /// I_MASK and DPCR as `StopCallback` found them.
-    pub saved_mask: u16,
-    pub saved_dpcr: u32,
-    /// Exceptions in a row that left an unmasked interrupt no handler
-    /// takes; past 2048 the dispatcher clears I_STAT.
+    /// The interrupted code's sp while the dispatcher runs on `intr.o`'s
+    /// stack.
+    pub saved_sp: u32,
+}
+
+/// Where `intr.o`, `intr_vb.o` and `intr_dma.o` keep libetc's state (D67),
+/// from `intr.o`'s code (psyq-decomp `libetc-intr.h`; plans/spec-fidelity.md,
+/// Findings): the driver-table pointer `intr.o`'s functions load first, the
+/// table's context, the `jal`s of `startIntrVSync` and `startIntrDMA`, and
+/// their operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lib {
+    /// `intr.o`'s text (`ResetCallback`).
+    pub intr: u32,
+    pub driver: u32,
+    pub context: u32,
+    /// The dispatcher's count of unhandled exceptions in a row.
     pub spurious: u32,
-    /// `intr_vb.o`: vblanks its handler has counted, and the
-    /// `VSyncCallbacks` channels it calls after counting.
+    /// `intr_vb.o`: the `VSyncCallbacks` table, `Vcount`, its handler and
+    /// the table's setter.
+    pub vb_table: u32,
     pub vcount: u32,
-    pub vsync: [u32; 8],
-    /// `intr_dma.o`: the `DMACallback` per channel.
-    pub dma: [u32; 8],
-    /// `vsync.o`: Vcount and root counter 1 when the last waiting `VSync`
-    /// returned.
+    pub vb_handler: u32,
+    pub vb_setter: u32,
+    /// `intr_dma.o`: the `DMACallback` table, its handler and setter.
+    pub dma_table: u32,
+    pub dma_handler: u32,
+    pub dma_setter: u32,
+}
+
+/// `vsync.o`'s state, from `VSync`'s code: `Vcount` (intr_vb's), and the
+/// `Vcount` and root counter 1 the last waiting call left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsyncO {
+    pub text: u32,
+    pub vcount: u32,
     pub last: u32,
     pub hcount: u32,
-    /// The top of `intr.o`'s own stack, where its dispatcher runs the
-    /// handlers (0: not found, they run on the interrupted code's), and
-    /// the interrupted code's sp while it does.
-    pub stack: u32,
-    pub saved_sp: u32,
-    /// `intr.o`'s text (`ResetCallback`'s address), where the dispatcher's
-    /// messages are.
-    pub intr: u32,
+}
+
+/// `intr.o`'s functions in its text, and its code operands.
+mod at {
+    pub const RESET: u32 = 0x0;
+    pub const INTERRUPT: u32 = 0x30;
+    pub const DMA: u32 = 0x60;
+    pub const VSYNC_CALLBACK: u32 = 0x90;
+    pub const VSYNC_CALLBACKS: u32 = 0xC4;
+    pub const STOP: u32 = 0xF4;
+    pub const RESTART: u32 = 0x124;
+    pub const CHECK: u32 = 0x154;
+    pub const JAL_START_VSYNC: u32 = 0x228;
+    pub const JAL_START_DMA: u32 = 0x238;
+    pub const SPURIOUS_PAIR: u32 = 0x3B4;
+}
+
+/// The context's fields (`IntrContext`).
+mod ctx {
+    pub const ACTIVE: u32 = 0x00;
+    pub const DISPATCHING: u32 = 0x02;
+    pub const LINES: u32 = 0x04;
+    pub const MASK: u32 = 0x30;
+    pub const SAVED_MASK: u32 = 0x32;
+    pub const SAVED_DPCR: u32 = 0x34;
+    /// Its size in words, all of which `ResetCallback` clears.
+    pub const WORDS: u32 = 0x41A;
+    /// Where the dispatcher's stack starts (`stack[1024 - 20]`).
+    pub const STACK_TOP: u32 = 0x1018;
+}
+
+/// The driver table's setters.
+mod driver {
+    pub const DMA: u32 = 0x04;
+    pub const VBLANK: u32 = 0x14;
+    pub const CONTEXT: u32 = 0x1C;
+}
+
+fn pair(m: &M, at: u32) -> Option<u32> {
+    crate::libspu::pair(m, at, at + 4)
+}
+
+/// libetc from the running `intr.o` adapter, `off` into the text.
+fn lib(m: &mut M, off: u32) -> std::result::Result<Lib, String> {
+    let text = m.sdk.at.wrapping_sub(off);
+    if let Some(l) = m.sdk.etc.lib.filter(|l| l.intr == text) {
+        return Ok(l);
+    }
+    let err = |what: &str| format!("libetc/intr at {text:#010x}: no {what} where PsyQ 4.7's object has it");
+    let driver = m.mem.r32(pair(m, text + at::RESET).ok_or_else(|| err("driver table"))?);
+    let vb = crate::libspu::jal(m, text + at::JAL_START_VSYNC).ok_or_else(|| err("startIntrVSync"))?;
+    let dma = crate::libspu::jal(m, text + at::JAL_START_DMA).ok_or_else(|| err("startIntrDMA"))?;
+    let find = |m: &M, what: &str, a: u32| pair(m, a).ok_or_else(|| err(what));
+    let l = Lib {
+        intr: text,
+        driver,
+        context: m.mem.r32(driver + driver::CONTEXT),
+        spurious: find(m, "the spurious count", text + at::SPURIOUS_PAIR)?,
+        vb_table: find(m, "VSyncCallbacks' table", vb + 4)?,
+        vcount: find(m, "Vcount", vb + 0x58)?,
+        vb_handler: find(m, "the vblank handler", vb + 0x30)?,
+        vb_setter: find(m, "VSyncCallbacks' setter", vb + 0x40)?,
+        dma_table: find(m, "DMACallback's table", dma + 4)?,
+        dma_handler: find(m, "the DMA handler", dma + 0x24)?,
+        dma_setter: find(m, "DMACallback's setter", dma + 0x34)?,
+    };
+    m.sdk.etc.lib = Some(l);
+    Ok(l)
+}
+
+/// `vsync.o` from the running `VSync` adapter.
+fn vsync_o(m: &mut M) -> std::result::Result<VsyncO, String> {
+    let text = m.sdk.at;
+    if let Some(v) = m.sdk.etc.vsync.filter(|v| v.text == text) {
+        return Ok(v);
+    }
+    let err = |what: &str| format!("libetc/vsync at {text:#010x}: no {what} where PsyQ 4.7's object has it");
+    let v = VsyncO {
+        text,
+        vcount: pair(m, text + 0x60).ok_or_else(|| err("Vcount"))?,
+        hcount: pair(m, text + 0x48).ok_or_else(|| err("its Hcount"))?,
+        last: pair(m, text + 0x84).ok_or_else(|| err("its last Vcount"))?,
+    };
+    m.sdk.etc.vsync = Some(v);
+    Ok(v)
+}
+
+impl Lib {
+    pub fn active(&self, m: &M) -> bool {
+        m.mem.r16(self.context + ctx::ACTIVE) != 0
+    }
+
+    fn dispatching(&self, m: &M) -> bool {
+        m.mem.r16(self.context + ctx::DISPATCHING) != 0
+    }
+
+    pub fn line(&self, m: &M, i: u32) -> u32 {
+        m.mem.r32(self.context + ctx::LINES + 4 * i)
+    }
+
+    pub fn mask(&self, m: &M) -> u16 {
+        m.mem.r16(self.context + ctx::MASK)
+    }
+
+    pub fn vcount(&self, m: &M) -> u32 {
+        m.mem.r32(self.vcount)
+    }
 }
 
 /// `intr.o`'s stack, its context's `stack[1024]`, from `ResetCallback` at
@@ -197,7 +266,7 @@ mod step {
 /// The step the exception handler runs after the chains: the dispatcher,
 /// while libetc's context is installed.
 pub fn dispatch_step(m: &M) -> Option<u32> {
-    m.sdk.etc.active.then(|| step::make(step::DISPATCH, 0, 0))
+    m.sdk.etc.lib.filter(|l| l.active(m)).map(|_| step::make(step::DISPATCH, 0, 0))
 }
 
 pub fn irq_step(m: &mut M, s: u32) {
@@ -221,11 +290,11 @@ fn front(m: &mut M, steps: &[IrqStep]) {
 /// One of the dispatcher's messages through the game's `printf`, queued
 /// to run next: its format's `lui`/`addiu` and the `jal`, at these offsets
 /// in `intr.o`.
-fn message(m: &mut M, (hi, lo, jal): (u32, u32, u32), args: [u32; 2]) {
-    let t = m.sdk.etc.intr;
+fn message(m: &mut M, l: Lib, (hi, lo, jal): (u32, u32, u32), args: [u32; 2]) {
+    let t = l.intr;
     match (crate::libspu::jal(m, t + jal), crate::libspu::pair(m, t + hi, t + lo)) {
         (Some(f), Some(fmt)) => front(m, &[IrqStep::Chain(GuestCall { addr: f, args: [fmt, args[0], args[1], 0] }, None)]),
-        _ => m.log(&format!("libetc/intr at {:#010x}: no printf where PsyQ 4.7's object has it", m.sdk.etc.intr)),
+        _ => m.log(&format!("libetc/intr at {t:#010x}: no printf where PsyQ 4.7's object has it")),
     }
 }
 
@@ -235,33 +304,32 @@ fn guest(f: u32, a0: u32) -> GuestCall {
     GuestCall { addr: f, args: [a0, 0, 0, 0] }
 }
 
-fn pending(m: &mut M) -> std::result::Result<u32, String> {
+fn pending(m: &mut M, l: Lib) -> std::result::Result<u32, String> {
     let stat = reg(m, I_STAT, 2)?;
     m.sdk.etc.stat = stat as u16;
-    Ok(m.sdk.etc.mask as u32 & stat & reg(m, I_MASK, 2)?)
+    Ok(l.mask(m) as u32 & stat & reg(m, I_MASK, 2)?)
 }
 
 /// `intr.o`'s dispatcher, at the top of its loop.
 fn dispatch(m: &mut M) -> std::result::Result<(), String> {
-    if !m.sdk.etc.active {
+    let Some(l) = m.sdk.etc.lib else { return Ok(()) };
+    if !l.active(m) {
         // "unexpected interrupt(%04x)\n" with I_STAT; the original returns
         // from the exception.
-        if m.sdk.etc.intr != 0 {
-            let stat = reg(m, I_STAT, 2)?;
-            message(m, (0x2B0, 0x2B8, 0x2B4), [stat, 0]);
-        }
+        let stat = reg(m, I_STAT, 2)?;
+        message(m, l, (0x2B0, 0x2B8, 0x2B4), [stat, 0]);
         return Ok(());
     }
     // The exception's first pass: onto libetc's stack, as the original's
     // exit from the exception (`HookEntryInt`) enters it. The interrupted
     // code's may be the scratchpad, where no DMA reaches (libcd reads
     // sector headers into its callback's frame).
-    if !m.sdk.etc.dispatching && m.sdk.etc.stack != 0 {
+    if !l.dispatching(m) {
         m.sdk.etc.saved_sp = m.regs.sp();
-        m.regs.set_sp(m.sdk.etc.stack);
+        m.regs.set_sp(l.context + ctx::STACK_TOP);
     }
-    m.sdk.etc.dispatching = true;
-    let p = pending(m)?;
+    m.mem.w16(l.context + ctx::DISPATCHING, 1);
+    let p = pending(m, l)?;
     if p != 0 {
         front(m, &[IrqStep::Sdk(step::make(step::LINE, 0, p))]);
         return Ok(());
@@ -269,36 +337,34 @@ fn dispatch(m: &mut M) -> std::result::Result<(), String> {
     // Nothing left for libetc. An unmasked interrupt nobody handles makes
     // the exception come back; after 2048 in a row it gives up on them.
     if reg(m, I_STAT, 2)? & reg(m, I_MASK, 2)? != 0 {
-        let n = m.sdk.etc.spurious;
-        m.sdk.etc.spurious = n + 1;
+        let n = m.mem.r32(l.spurious);
+        m.mem.w32(l.spurious, n + 1);
         if n > 2048 {
             let (stat, mask) = (reg(m, I_STAT, 2)?, reg(m, I_MASK, 2)?);
             // "intr timeout(%04x:%04x)\n".
-            message(m, (0x3D8, 0x3DC, 0x3E8), [stat, mask]);
-            m.sdk.etc.spurious = 0;
+            message(m, l, (0x3D8, 0x3DC, 0x3E8), [stat, mask]);
+            m.mem.w32(l.spurious, 0);
             set_reg(m, I_STAT, 2, 0)?;
         }
     } else {
-        m.sdk.etc.spurious = 0;
+        m.mem.w32(l.spurious, 0);
     }
-    if m.sdk.etc.stack != 0 {
-        m.regs.set_sp(m.sdk.etc.saved_sp);
-    }
-    m.sdk.etc.dispatching = false;
+    m.regs.set_sp(m.sdk.etc.saved_sp);
+    m.mem.w16(l.context + ctx::DISPATCHING, 0);
     Ok(())
 }
 
 /// The dispatcher's pass over the pending lines `rest` from line `i`:
-/// acknowledge the next one and call its handler (libetc's own are
-/// stand-ins, [`stand_in`]), then go on.
+/// acknowledge the next one and call its handler, then go on.
 fn line(m: &mut M, mut i: u32, mut rest: u32) -> std::result::Result<(), String> {
+    let Some(l) = m.sdk.etc.lib else { return Ok(()) };
     while rest != 0 && (i as usize) < LINES {
         if rest & 1 != 0 {
             set_reg(m, I_STAT, 2, !(1u32 << i) & 0xFFFF)?;
-            let h = m.sdk.etc.lines[i as usize];
-            if h != Handler::None {
+            let h = l.line(m, i);
+            if h != 0 {
                 let next = IrqStep::Sdk(step::make(step::LINE, i + 1, rest >> 1));
-                front(m, &[IrqStep::Chain(guest(h.word(), m.sdk.etc.stat as u32), None), next]);
+                front(m, &[IrqStep::Chain(guest(h, m.sdk.etc.stat as u32), None), next]);
                 return Ok(());
             }
         }
@@ -309,90 +375,29 @@ fn line(m: &mut M, mut i: u32, mut rest: u32) -> std::result::Result<(), String>
     Ok(())
 }
 
-/// libetc's vblank and DMA handlers, which `InterruptCallback` hands out
-/// for lines 0 and 3 and which code may call (libsnd's tick handler takes
-/// line 0 and calls the previous handler first): a step from `state`.
-pub fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<StandIn> {
-    match addr {
-        VBLANK_HANDLER => Some(vblank_handler(m, state)),
-        DMA_HANDLER => Some(dma_handler(m, state).unwrap_or_else(|e| {
-            m.log(&format!("libetc DMA handler: {e}"));
-            StandIn::Return(0)
-        })),
-        _ => None,
-    }
-}
-
-/// `intr_vb.o`'s handler: Vcount, then each `VSyncCallbacks` channel in
-/// order. State: 0 on entry, else 1 + the channel to look at next.
-fn vblank_handler(m: &mut M, state: u32) -> StandIn {
-    if state == 0 {
-        m.sdk.etc.vcount = m.sdk.etc.vcount.wrapping_add(1);
-    }
-    let from = state.saturating_sub(1) as usize;
-    match (from..8).find(|&c| m.sdk.etc.vsync[c] != 0) {
-        Some(c) => StandIn::Call(guest(m.sdk.etc.vsync[c], m.sdk.etc.stat as u32), c as u32 + 2),
-        None => StandIn::Return(0),
-    }
-}
-
-/// `intr_dma.o`'s handler: while DICR flags a channel, acknowledge each
-/// flagged one in order and call its `DMACallback`. State: 0 at the top
-/// of the loop, else 1 + (the channel to look at next) << 8 + the flags
-/// from it.
-fn dma_handler(m: &mut M, mut state: u32) -> std::result::Result<StandIn, String> {
-    loop {
-        let (mut ch, mut rest) = if state == 0 {
-            let flags = (reg(m, DICR, 4)? >> 24) & 0x7F;
-            if flags == 0 {
-                let d = reg(m, DICR, 4)?;
-                if d & 0xFF00_0000 == 0x8000_0000 || d & 0x8000 != 0 {
-                    m.log(&format!("DMA bus error: code={d:08x}"));
-                }
-                return Ok(StandIn::Return(0));
-            }
-            (0, flags)
-        } else {
-            ((state - 1) >> 8, (state - 1) & 0xFF)
-        };
-        while rest != 0 && ch < 7 {
-            if rest & 1 != 0 {
-                // Acknowledge this channel's flag, keeping the enables.
-                let d = reg(m, DICR, 4)?;
-                set_reg(m, DICR, 4, d & (1 << (24 + ch) | 0x00FF_FFFF))?;
-                let f = m.sdk.etc.dma[ch as usize];
-                if f != 0 {
-                    // a0: `intr_dma.o`'s pointer to DICR.
-                    return Ok(StandIn::Call(guest(f, DICR), 1 + ((ch + 1) << 8 | rest >> 1)));
-                }
-            }
-            ch += 1;
-            rest >>= 1;
-        }
-        state = 0;
-    }
-}
-
 // --- intr.o ----------------------------------------------------------------
 
 /// `intr.o`'s line setter (`InterruptCallback`'s body): with the context
 /// installed, the handler, libetc's mask and I_MASK (masked meanwhile),
 /// and the kernel's acknowledge flags for the lines its own handlers
-/// share (vblank: the pad and RCntCNT3; root counters 0-2).
-fn set_line(m: &mut M, irq: usize, h: Handler) -> std::result::Result<u32, String> {
-    let prev = m.sdk.etc.lines[irq];
-    if h != prev && m.sdk.etc.active {
+/// share (vblank: the pad and RCntCNT3; root counters 0-2). The previous
+/// handler.
+fn set_line(m: &mut M, l: Lib, irq: usize, h: u32) -> std::result::Result<u32, String> {
+    let at = l.context + ctx::LINES + 4 * irq as u32;
+    let prev = m.mem.r32(at);
+    if h != prev && l.active(m) {
         let mut mask = reg(m, I_MASK, 2)?;
         set_reg(m, I_MASK, 2, 0)?;
         let bit = 1u16 << irq;
-        let off = h == Handler::None;
-        m.sdk.etc.lines[irq] = h;
+        let off = h == 0;
+        m.mem.w32(at, h);
+        let lines = l.mask(m);
         if off {
             mask &= !(bit as u32);
-            m.sdk.etc.mask &= !bit;
+            m.mem.w16(l.context + ctx::MASK, lines & !bit);
         } else {
             mask |= bit as u32;
-            m.sdk.etc.mask |= bit;
+            m.mem.w16(l.context + ctx::MASK, lines | bit);
         }
         let off = off as u32;
         if irq == 0 {
@@ -404,102 +409,109 @@ fn set_line(m: &mut M, irq: usize, h: Handler) -> std::result::Result<u32, Strin
         }
         set_reg(m, I_MASK, 2, mask)?;
     }
-    Ok(prev.word())
+    Ok(prev)
 }
-
 
 /// `ResetCallback`: once (until `StopCallback`), mask and acknowledge every
 /// interrupt, set every DMA channel's priority with none enabled, clear
 /// the context, install the dispatcher, then `startIntrVSync` (root
 /// counter 1 counts hblanks, Vcount and the channels from zero, the
-/// vblank handler on line 0) and `startIntrDMA` (no DMA callbacks, DICR's
-/// enables cleared, the DMA handler on line 3), and leave the critical
-/// section.
+/// vblank handler on line 0, its setter in the driver table) and
+/// `startIntrDMA` (no DMA callbacks, DICR's enables cleared, the DMA
+/// handler on line 3, its setter in the table), and leave the critical
+/// section. The context's address.
 fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
-    if m.sdk.etc.active {
+    let l = lib(m, at::RESET)?;
+    if l.active(m) {
         return ret(0);
     }
     set_reg(m, I_MASK, 2, 0)?;
     let v = reg(m, I_MASK, 2)?;
     set_reg(m, I_STAT, 2, v)?;
     set_reg(m, DPCR, 4, 0x3333_3333)?;
-    let e = &mut m.sdk.etc;
-    (e.dispatching, e.lines, e.mask, e.saved_mask, e.saved_dpcr) = (false, Default::default(), 0, 0, 0);
-    e.active = true;
-    let reset = m.sdk.at;
-    m.sdk.etc.intr = reset;
-    m.sdk.etc.stack = intr_stack(&mut |a| m.mem.r32(a), reset).map_or(0, |s| s.end - 4 * 20);
+    m.mem.write(l.context, &vec![0; 4 * ctx::WORDS as usize]);
+    m.mem.w16(l.context + ctx::ACTIVE, 1);
     set_reg(m, RCNT1_MODE, 4, 0x100)?;
-    m.sdk.etc.vcount = 0;
-    m.sdk.etc.vsync = [0; 8];
-    set_line(m, 0, Handler::Vblank)?;
-    m.sdk.etc.dma = [0; 8];
+    m.mem.w32(l.vcount, 0);
+    m.mem.write(l.vb_table, &[0; 32]);
+    set_line(m, l, 0, l.vb_handler)?;
+    m.mem.w32(l.driver + driver::VBLANK, l.vb_setter);
+    m.mem.write(l.dma_table, &[0; 32]);
     set_reg(m, DICR, 4, 0)?;
-    set_line(m, 3, Handler::Dma)?;
+    set_line(m, l, 3, l.dma_handler)?;
+    m.mem.w32(l.driver + driver::DMA, l.dma_setter);
     // _96_remove (the BIOS's CD handlers; this BIOS has none), then
     // ExitCriticalSection.
-    m.crit = false;
-    ret(CONTEXT)
+    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
+    ret(l.context)
 }
 
 /// `StopCallback`: with the context installed, enter a critical section,
 /// keep I_MASK and DPCR, mask and acknowledge every interrupt, disable
 /// every DMA channel, and take the dispatcher out.
 fn stop_callback(m: &mut M, _a: [u32; 4]) -> Result {
-    if !m.sdk.etc.active {
+    let l = lib(m, at::STOP)?;
+    if !l.active(m) {
         return ret(0);
     }
-    m.crit = true;
-    m.sdk.etc.saved_mask = reg(m, I_MASK, 2)? as u16;
-    m.sdk.etc.saved_dpcr = reg(m, DPCR, 4)?;
+    psx_bios::bios::syscall(m, [1, 0, 0, 0])?;
+    let mask = reg(m, I_MASK, 2)?;
+    m.mem.w16(l.context + ctx::SAVED_MASK, mask as u16);
+    let dpcr = reg(m, DPCR, 4)?;
+    m.mem.w32(l.context + ctx::SAVED_DPCR, dpcr);
     set_reg(m, I_MASK, 2, 0)?;
     let v = reg(m, I_MASK, 2)?;
     set_reg(m, I_STAT, 2, v)?;
     let d = reg(m, DPCR, 4)?;
     set_reg(m, DPCR, 4, d & 0x7777_7777)?;
-    m.sdk.etc.active = false;
-    ret(CONTEXT)
+    m.mem.w16(l.context + ctx::ACTIVE, 0);
+    ret(l.context)
 }
 
 /// `RestartCallback`: the dispatcher back, I_MASK and DPCR as
 /// `StopCallback` kept them, and the critical section left.
 fn restart_callback(m: &mut M, _a: [u32; 4]) -> Result {
-    if m.sdk.etc.active {
+    let l = lib(m, at::RESTART)?;
+    if l.active(m) {
         return ret(0);
     }
-    m.sdk.etc.active = true;
-    let (mask, dpcr) = (m.sdk.etc.saved_mask, m.sdk.etc.saved_dpcr);
+    m.mem.w16(l.context + ctx::ACTIVE, 1);
+    let (mask, dpcr) = (m.mem.r16(l.context + ctx::SAVED_MASK), m.mem.r32(l.context + ctx::SAVED_DPCR));
     set_reg(m, I_MASK, 2, mask as u32)?;
     set_reg(m, DPCR, 4, dpcr)?;
-    m.crit = false;
-    ret(CONTEXT)
+    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
+    ret(l.context)
 }
 
 /// `CheckCallback`: whether the dispatcher is running (a callback is).
 fn check_callback(m: &mut M, _a: [u32; 4]) -> Result {
-    ret(m.sdk.etc.dispatching as u32)
+    let l = lib(m, at::CHECK)?;
+    ret(l.dispatching(m) as u32)
 }
 
 /// `InterruptCallback(line, f)`: the previous handler.
 fn interrupt_callback(m: &mut M, a: [u32; 4]) -> Result {
+    let l = lib(m, at::INTERRUPT)?;
     let irq = a[0] as usize;
     if irq >= LINES {
         return Err(format!("InterruptCallback({irq}, …): no such interrupt line"));
     }
-    ret(set_line(m, irq, Handler::from_word(a[1]))?)
+    ret(set_line(m, l, irq, a[1])?)
 }
 
-/// `DMACallback(ch, f)` (`intr_dma.o`): when `f` changes the channel's
-/// callback, DICR's master enable and the channel's enable follow it. The
-/// previous callback.
+/// `DMACallback(ch, f)` (`intr_dma.o`'s setter): when `f` changes the
+/// channel's callback, DICR's master enable and the channel's enable
+/// follow it. The previous callback.
 fn dma_callback(m: &mut M, a: [u32; 4]) -> Result {
-    let (ch, f) = (a[0] as usize, a[1]);
+    let l = lib(m, at::DMA)?;
+    let (ch, f) = (a[0], a[1]);
     if ch >= 8 {
         return Err(format!("DMACallback({ch}, …): no such DMA channel"));
     }
-    let old = m.sdk.etc.dma[ch];
+    let slot = l.dma_table + 4 * ch;
+    let old = m.mem.r32(slot);
     if f != old {
-        m.sdk.etc.dma[ch] = f;
+        m.mem.w32(slot, f);
         let d = (reg(m, DICR, 4)? & 0x00FF_FFFF) | 0x0080_0000;
         let bit = 1 << (16 + ch);
         set_reg(m, DICR, 4, if f != 0 { d | bit } else { d & !bit })?;
@@ -507,18 +519,26 @@ fn dma_callback(m: &mut M, a: [u32; 4]) -> Result {
     ret(old)
 }
 
-/// `VSyncCallbacks(ch, f)` (`intr_vb.o`): the previous callback.
+/// `VSyncCallbacks(ch, f)` (`intr_vb.o`'s setter): the previous callback.
 fn vsync_callbacks(m: &mut M, a: [u32; 4]) -> Result {
-    let (ch, f) = (a[0] as usize, a[1]);
+    let l = lib(m, at::VSYNC_CALLBACKS)?;
+    set_vsync(m, l, a[0], a[1])
+}
+
+fn set_vsync(m: &mut M, l: Lib, ch: u32, f: u32) -> Result {
     if ch >= 8 {
         return Err(format!("VSyncCallbacks({ch}, …): no such channel"));
     }
-    ret(std::mem::replace(&mut m.sdk.etc.vsync[ch], f))
+    let slot = l.vb_table + 4 * ch;
+    let old = m.mem.r32(slot);
+    m.mem.w32(slot, f);
+    ret(old)
 }
 
 /// `VSyncCallback(f)`: channel 4.
 fn vsync_callback(m: &mut M, a: [u32; 4]) -> Result {
-    vsync_callbacks(m, [4, a[0], 0, 0])
+    let l = lib(m, at::VSYNC_CALLBACK)?;
+    set_vsync(m, l, 4, a[0])
 }
 
 fn get_intr_mask(m: &mut M, _a: [u32; 4]) -> Result {
@@ -550,20 +570,20 @@ fn gpustat(m: &mut M) -> u32 {
 /// field must have changed too.
 fn vsync(m: &mut M, a: [u32; 4]) -> Result {
     let mode = a[0] as i32;
+    let v = vsync_o(m)?;
     if mode < 0 {
-        return ret(m.sdk.etc.vcount);
+        return ret(m.mem.r32(v.vcount));
     }
-    let delta = rcnt1(m).wrapping_sub(m.sdk.etc.hcount) & 0xFFFF;
+    let delta = rcnt1(m).wrapping_sub(m.mem.r32(v.hcount)) & 0xFFFF;
     if mode == 1 {
         return ret(delta);
     }
-    let last = m.sdk.etc.last;
+    let last = m.mem.r32(v.last);
     let (target, timeout) = if mode > 0 { (last.wrapping_add(mode as u32 - 1), mode as u32 - 1) } else { (last, 0) };
-    let text = m.sdk.at;
-    Ok(wait_vcount(m, text, target, timeout, move |m| {
+    Ok(wait_vcount(m, v, target, timeout, move |m| {
         let field = gpustat(m);
-        let next = m.sdk.etc.vcount.wrapping_add(1);
-        wait_vcount(m, text, next, 1, move |m| interlace(m, field, delta))
+        let next = m.mem.r32(v.vcount).wrapping_add(1);
+        wait_vcount(m, v, next, 1, move |m| interlace(m, v, field, delta))
     }))
 }
 
@@ -595,12 +615,12 @@ fn spin(m: &mut M, done: Box<dyn Fn(&mut M) -> bool>, then: Box<dyn FnOnce(&mut 
 /// deadline. In NTSC it only runs out when nothing counts vblanks: inside
 /// a handler or a critical section, libetc stopped, or line 0 taken by a
 /// handler that doesn't call libetc's.
-/// `text` is VSync's: its "VSync: timeout\n" goes through the game's
-/// `puts`.
-fn wait_vcount(m: &mut M, text: u32, target: u32, timeout: u32, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
+/// Its "VSync: timeout\n" goes through the game's `puts`.
+fn wait_vcount(m: &mut M, v: VsyncO, target: u32, timeout: u32, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
+    let text = v.text;
     let iterations = ((timeout as u64) << 15) + 1;
     let deadline = m.clock.now + iterations * quantum(m) / LOOP_BUDGET;
-    let reached = move |m: &M| m.sdk.etc.vcount as i32 >= target as i32;
+    let reached = move |m: &M| m.mem.r32(v.vcount) as i32 >= target as i32;
     let then = move |m: &mut M| {
         if reached(m) {
             return then(m);
@@ -617,93 +637,214 @@ fn wait_vcount(m: &mut M, text: u32, target: u32, timeout: u32, then: impl FnOnc
 /// The end of a waiting `VSync`: interlaced, while the field is the one it
 /// was before the last wait, spin until it changes; then Vcount and root
 /// counter 1 are this call's.
-fn interlace(m: &mut M, before: u32, delta: u32) -> Flow<Psyq> {
+fn interlace(m: &mut M, v: VsyncO, before: u32, delta: u32) -> Flow<Psyq> {
     let field_changed = move |m: &mut M| before & 0x40_0000 == 0 || (before ^ gpustat(m)) & 0x8000_0000 != 0;
     let then = move |m: &mut M| {
-        m.sdk.etc.last = m.sdk.etc.vcount;
-        m.sdk.etc.hcount = rcnt1(m);
+        let vcount = m.mem.r32(v.vcount);
+        m.mem.w32(v.last, vcount);
+        let h = rcnt1(m);
+        m.mem.w32(v.hcount, h);
         Flow::ret(delta)
     };
     spin(m, Box::new(field_changed), Box::new(then))
 }
 
+/// btn's libetc as its code addresses it, for the tests: `intr.o`'s and
+/// `vsync.o`'s operands, and doubles of `intr_vb.o`'s and `intr_dma.o`'s
+/// handlers (guest code in a game).
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+
+    pub const INTR: u32 = 0x8003_2D94;
+    pub const VSYNC: u32 = 0x8003_2B84;
+    const VB: u32 = 0x8003_3454;
+    const DMA_O: u32 = 0x8003_3574;
+    const DRIVER_PTR: u32 = 0x8005_7594;
+    pub const DRIVER: u32 = 0x8005_7574;
+    pub const CONTEXT: u32 = 0x8005_650C;
+    const SPURIOUS: u32 = 0x8005_75A4;
+    pub const VB_TABLE: u32 = 0x8005_75B4;
+    pub const VCOUNT: u32 = 0x8005_75D4;
+    pub const VB_HANDLER: u32 = 0x8003_34AC;
+    const VB_SETTER: u32 = 0x8003_3518;
+    pub const DMA_TABLE: u32 = 0x8005_75E8;
+    pub const DMA_HANDLER: u32 = 0x8003_35C0;
+    const DMA_SETTER: u32 = 0x8003_3740;
+    const HCOUNT: u32 = 0x8005_64A4;
+    const LAST: u32 = 0x8005_64A8;
+
+    fn pair_at(m: &mut M, pc: u32, addr: u32) {
+        m.mem.w32(pc, 0x3C02_0000 | addr.wrapping_add(0x8000) >> 16);
+        m.mem.w32(pc + 4, 0x2442_0000 | (addr & 0xFFFF));
+    }
+
+    fn jal_to(m: &mut M, pc: u32, target: u32) {
+        m.mem.w32(pc, 0x0C00_0000 | (target >> 2) & 0x03FF_FFFF);
+    }
+
+    pub fn install(m: &mut M) {
+        pair_at(m, INTR, DRIVER_PTR);
+        m.mem.w32(DRIVER_PTR, DRIVER);
+        m.mem.w32(DRIVER + driver::CONTEXT, CONTEXT);
+        jal_to(m, INTR + at::JAL_START_VSYNC, VB);
+        jal_to(m, INTR + at::JAL_START_DMA, DMA_O);
+        pair_at(m, INTR + at::SPURIOUS_PAIR, SPURIOUS);
+        for (off, a) in [(4, VB_TABLE), (0x58, VCOUNT), (0x30, VB_HANDLER), (0x40, VB_SETTER)] {
+            pair_at(m, VB + off, a);
+        }
+        for (off, a) in [(4, DMA_TABLE), (0x24, DMA_HANDLER), (0x34, DMA_SETTER)] {
+            pair_at(m, DMA_O + off, a);
+        }
+        for (off, a) in [(0x60, VCOUNT), (0x48, HCOUNT), (0x84, LAST)] {
+            pair_at(m, VSYNC + off, a);
+        }
+        crate::testing::double(VB_HANDLER, vb_handler);
+        crate::testing::double(DMA_HANDLER, dma_handler);
+    }
+
+    pub fn reset(m: &mut M) -> u32 {
+        run(m, at::RESET, reset_callback, [0; 4])
+    }
+
+    pub fn interrupt(m: &mut M, line: u32, f: u32) -> u32 {
+        run(m, at::INTERRUPT, interrupt_callback, [line, f, 0, 0])
+    }
+
+    pub fn dma_callback(m: &mut M, ch: u32, f: u32) -> u32 {
+        run(m, at::DMA, super::dma_callback, [ch, f, 0, 0])
+    }
+
+    /// An adapter of `intr.o` at `off`, or `VSync`.
+    pub fn run(m: &mut M, off: u32, f: Adapter, a: [u32; 4]) -> u32 {
+        m.sdk.at = if f as *const () == vsync as *const () { VSYNC } else { INTR + off };
+        crate::testing::call(m, f, a)
+    }
+
+    /// `intr_vb.o`'s handler: Vcount, then each channel's callback.
+    fn vb_handler(m: &mut M) {
+        let v = m.mem.r32(VCOUNT);
+        m.mem.w32(VCOUNT, v + 1);
+        for ch in 0..8 {
+            let f = m.mem.r32(VB_TABLE + 4 * ch);
+            if f != 0 {
+                crate::testing::guest(m, f);
+            }
+        }
+    }
+
+    /// `intr_dma.o`'s handler: while DICR flags a channel, acknowledge it
+    /// and call its callback.
+    fn dma_handler(m: &mut M) {
+        loop {
+            let flags = (reg(m, DICR, 4).unwrap() >> 24) & 0x7F;
+            if flags == 0 {
+                return;
+            }
+            for ch in (0..7).filter(|c| flags & 1 << c != 0) {
+                let d = reg(m, DICR, 4).unwrap();
+                set_reg(m, DICR, 4, d & (1 << (24 + ch) | 0x00FF_FFFF)).unwrap();
+                let f = m.mem.r32(DMA_TABLE + 4 * ch);
+                if f != 0 {
+                    crate::testing::guest(m, f);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixture::{CONTEXT, DMA_HANDLER, VB_HANDLER, VCOUNT, install, run};
     use super::*;
-    use crate::testing::{call, irq_calls, machine_with_bus, vblanks};
+    use crate::testing::{irq_calls, machine_with_bus, vblanks};
 
     fn i_mask(m: &M) -> u32 {
         m.io.as_ref().unwrap().irq.mask
     }
 
+    fn game() -> M {
+        let mut m = machine_with_bus();
+        install(&mut m);
+        m
+    }
+
+    fn reset(m: &mut M) -> u32 {
+        run(m, at::RESET, reset_callback, [0; 4])
+    }
+
     #[test]
     fn reset_installs_the_dispatcher() {
-        let mut m = machine_with_bus();
+        let mut m = game();
         m.crit = true;
-        assert_eq!(call(&mut m, reset_callback, [0; 4]), CONTEXT);
+        assert_eq!(reset(&mut m), CONTEXT);
         assert!(!m.crit, "ResetCallback leaves the critical section");
         assert_eq!(i_mask(&m), 0x9, "vblank and DMA");
         assert_eq!(m.io.as_ref().unwrap().dma.dpcr, 0x3333_3333);
         assert_eq!(m.timers[1].mode, 0x100, "root counter 1 counts hblanks");
-        assert_eq!(call(&mut m, reset_callback, [0; 4]), 0, "only once");
-        assert_eq!(call(&mut m, get_intr_mask, [0; 4]), 9);
-        assert_eq!(call(&mut m, interrupt_callback, [0, 0, 0, 0]), VBLANK_HANDLER);
-        assert_eq!(call(&mut m, interrupt_callback, [0, VBLANK_HANDLER, 0, 0]), 0);
-        assert_eq!(call(&mut m, interrupt_callback, [3, 0x8001_0000, 0, 0]), DMA_HANDLER);
+        assert_eq!(m.mem.r16(CONTEXT), 1, "active, in the context");
+        assert_eq!(m.mem.r32(fixture::DRIVER + driver::VBLANK), 0x8003_3518, "VSyncCallbacks' setter");
+        assert_eq!(reset(&mut m), 0, "only once");
+        assert_eq!(run(&mut m, 0x164, get_intr_mask, [0; 4]), 9);
+        assert_eq!(run(&mut m, at::INTERRUPT, interrupt_callback, [0, 0, 0, 0]), VB_HANDLER);
+        assert_eq!(run(&mut m, at::INTERRUPT, interrupt_callback, [0, VB_HANDLER, 0, 0]), 0);
+        assert_eq!(run(&mut m, at::INTERRUPT, interrupt_callback, [3, 0x8001_0000, 0, 0]), DMA_HANDLER);
+        assert_eq!(m.mem.r32(CONTEXT + ctx::LINES + 12), 0x8001_0000, "line 3's handler, in the context");
     }
 
     #[test]
     fn vsync_waits_and_counts_hblanks() {
-        let mut m = machine_with_bus();
-        call(&mut m, reset_callback, [0; 4]);
-        assert_eq!(call(&mut m, vsync, [u32::MAX, 0, 0, 0]), 0);
-        call(&mut m, vsync, [0; 4]);
+        let mut m = game();
+        reset(&mut m);
+        assert_eq!(run(&mut m, 0, vsync, [u32::MAX, 0, 0, 0]), 0);
+        run(&mut m, 0, vsync, [0; 4]);
         assert_eq!(m.vblanks, 1);
-        assert_eq!(m.sdk.etc.vcount, 1);
+        assert_eq!(m.mem.r32(VCOUNT), 1);
         // Half a frame later, VSync(1) reports the hblanks so far.
         let half = m.clock.now + (m.clock.video.vblank_at(2) - m.clock.video.vblank_at(1)) / 2;
         m.run_until(half);
-        let h = call(&mut m, vsync, [1, 0, 0, 0]);
+        let h = run(&mut m, 0, vsync, [1, 0, 0, 0]);
         assert!((130..=132).contains(&h), "{h}");
         // VSync(3): three vblanks after the last waiting call.
-        call(&mut m, vsync, [3, 0, 0, 0]);
-        assert_eq!(m.sdk.etc.vcount, 4);
+        run(&mut m, 0, vsync, [3, 0, 0, 0]);
+        assert_eq!(m.mem.r32(VCOUNT), 4);
         // Long after, at least the next one.
         vblanks(&mut m, 5);
-        call(&mut m, vsync, [3, 0, 0, 0]);
-        assert_eq!(call(&mut m, vsync, [u32::MAX, 0, 0, 0]), 10);
+        run(&mut m, 0, vsync, [3, 0, 0, 0]);
+        assert_eq!(run(&mut m, 0, vsync, [u32::MAX, 0, 0, 0]), 10);
         // With interrupts disabled nothing counts: VSync gives up.
         m.crit = true;
         let before = m.clock.now;
-        call(&mut m, vsync, [0; 4]);
-        assert_eq!(m.sdk.etc.vcount, 10);
+        run(&mut m, 0, vsync, [0; 4]);
+        assert_eq!(m.mem.r32(VCOUNT), 10);
         assert!(m.clock.now > before);
     }
 
     #[test]
     fn callbacks_in_line_and_channel_order() {
-        let mut m = machine_with_bus();
-        call(&mut m, reset_callback, [0; 4]);
-        assert_eq!(call(&mut m, vsync_callback, [0x8001_0004, 0, 0, 0]), 0);
-        call(&mut m, vsync_callbacks, [1, 0x8001_0001, 0, 0]);
-        assert_eq!(call(&mut m, vsync_callbacks, [4, 0, 0, 0]), 0x8001_0004);
-        call(&mut m, vsync_callbacks, [4, 0x8001_0004, 0, 0]);
+        let mut m = game();
+        reset(&mut m);
+        assert_eq!(run(&mut m, at::VSYNC_CALLBACK, vsync_callback, [0x8001_0004, 0, 0, 0]), 0);
+        run(&mut m, at::VSYNC_CALLBACKS, vsync_callbacks, [1, 0x8001_0001, 0, 0]);
+        assert_eq!(run(&mut m, at::VSYNC_CALLBACKS, vsync_callbacks, [4, 0, 0, 0]), 0x8001_0004);
+        run(&mut m, at::VSYNC_CALLBACKS, vsync_callbacks, [4, 0x8001_0004, 0, 0]);
+        assert_eq!(m.mem.r32(fixture::VB_TABLE + 4), 0x8001_0001, "in intr_vb's table");
         vblanks(&mut m, 1);
         assert_eq!(irq_calls(), vec![0x8001_0001, 0x8001_0004]);
         // Root counter 2 at its target, through InterruptCallback(6, …);
         // the kernel's acknowledge flag follows.
-        call(&mut m, interrupt_callback, [6, 0x8002_0000, 0, 0]);
+        run(&mut m, at::INTERRUPT, interrupt_callback, [6, 0x8002_0000, 0, 0]);
         assert_eq!(m.kernel.clear_rcnt[2], 0);
         assert_eq!(i_mask(&m), 0x49);
         // SetRCnt(RCntCNT2, 0x100, RCntMdINTR | RCntMdSC).
-        call(&mut m, crate::libapi::set_rcnt, [0xF200_0002, 0x100, 0x1001, 0]);
+        crate::testing::call(&mut m, crate::libapi::set_rcnt, [0xF200_0002, 0x100, 0x1001, 0]);
         let until = m.clock.now + 0x1000;
         m.run_until(until);
         crate::testing::drain(&mut m);
         assert_eq!(irq_calls(), vec![0x8002_0000]);
         assert_eq!(m.io.as_ref().unwrap().irq.stat & 0x40, 0, "acknowledged");
         // A masked line runs nothing.
-        call(&mut m, set_intr_mask, [0x9, 0, 0, 0]);
+        run(&mut m, 0x17C, set_intr_mask, [0x9, 0, 0, 0]);
         m.run_until(m.clock.now + 0x200);
         crate::testing::drain(&mut m);
         assert_eq!(irq_calls(), Vec::<u32>::new());
@@ -712,16 +853,9 @@ mod tests {
     #[test]
     fn handlers_run_on_intr_stack() {
         use psx_bios::Sdk;
-        let mut m = machine_with_bus();
-        // btn's ResetCallback: `lui v0, 0x8005; lw v0, 0x7594(v0)` loads
-        // .data + 0x10E0; the driver table's eighth word is the context.
-        m.mem.w32(0x8003_2D94, 0x3C02_8005);
-        m.mem.w32(0x8003_2D98, 0x8C42_7594);
-        m.mem.w32(0x8005_7594 - 0x10E0 + 0x10DC, 0x8005_650C);
-        m.sdk.at = 0x8003_2D94;
-        call(&mut m, reset_callback, [0; 4]);
-        assert_eq!(m.sdk.etc.stack, 0x8005_7524);
-        call(&mut m, vsync_callback, [0x8001_0004, 0, 0, 0]);
+        let mut m = game();
+        reset(&mut m);
+        run(&mut m, at::VSYNC_CALLBACK, vsync_callback, [0x8001_0004, 0, 0, 0]);
         // Interrupted with its stack in the scratchpad (btn's menu).
         m.regs.set_sp(0x1F80_0378);
         m.raise_irq(psx_devices::irq::VBLANK);
@@ -740,13 +874,14 @@ mod tests {
         assert_eq!(irq_calls(), vec![0x8001_0004]);
         assert_eq!(sps, vec![0x8005_7524]);
         assert_eq!(m.regs.sp(), 0x1F80_0378, "the interrupted code's sp back");
+        assert_eq!(m.mem.r16(CONTEXT + ctx::DISPATCHING), 0);
     }
 
     #[test]
     fn dma_callbacks_by_channel() {
-        let mut m = machine_with_bus();
-        call(&mut m, reset_callback, [0; 4]);
-        assert_eq!(call(&mut m, dma_callback, [2, 0x8003_0000, 0, 0]), 0);
+        let mut m = game();
+        reset(&mut m);
+        assert_eq!(run(&mut m, at::DMA, dma_callback, [2, 0x8003_0000, 0, 0]), 0);
         assert_eq!(m.io.as_ref().unwrap().dma.dicr & 0x00FF_0000, 0x0084_0000);
         // A GPU transfer completes: its flag, the master flag, IRQ3.
         assert!(m.io.as_mut().unwrap().dma.complete(2));
@@ -754,46 +889,46 @@ mod tests {
         crate::testing::drain(&mut m);
         assert_eq!(irq_calls(), vec![0x8003_0000]);
         assert_eq!(m.io.as_ref().unwrap().dma.dicr >> 24 & 0x7F, 0, "flags acknowledged");
-        assert_eq!(call(&mut m, dma_callback, [2, 0, 0, 0]), 0x8003_0000);
+        assert_eq!(run(&mut m, at::DMA, dma_callback, [2, 0, 0, 0]), 0x8003_0000);
         assert_eq!(m.io.as_ref().unwrap().dma.dicr & 1 << 18, 0);
     }
 
     #[test]
     fn handlers_are_functions() {
-        let mut m = machine_with_bus();
-        call(&mut m, reset_callback, [0; 4]);
-        call(&mut m, vsync_callbacks, [2, 0x8001_0002, 0, 0]);
+        let mut m = game();
+        reset(&mut m);
+        run(&mut m, at::VSYNC_CALLBACKS, vsync_callbacks, [2, 0x8001_0002, 0, 0]);
         // libsnd takes line 0, and calls libetc's handler from its own.
-        let prev = call(&mut m, interrupt_callback, [0, 0x8005_0000, 0, 0]);
-        assert_eq!(prev, VBLANK_HANDLER);
+        let prev = run(&mut m, at::INTERRUPT, interrupt_callback, [0, 0x8005_0000, 0, 0]);
+        assert_eq!(prev, VB_HANDLER);
         vblanks(&mut m, 1);
         assert_eq!(irq_calls(), vec![0x8005_0000]);
-        assert_eq!(m.sdk.etc.vcount, 0);
+        assert_eq!(m.mem.r32(VCOUNT), 0);
         crate::testing::guest(&mut m, prev);
-        assert_eq!(m.sdk.etc.vcount, 1);
+        assert_eq!(m.mem.r32(VCOUNT), 1);
         assert_eq!(irq_calls(), vec![0x8001_0002]);
         // Line 0 taken by a handler that never calls libetc's: VSync's
         // countdown runs out.
         let before = m.clock.now;
-        call(&mut m, vsync, [0; 4]);
-        assert_eq!(m.sdk.etc.vcount, 1);
+        run(&mut m, 0, vsync, [0; 4]);
+        assert_eq!(m.mem.r32(VCOUNT), 1);
         assert!(m.clock.now - before >= (1 << 15) * 20);
     }
 
     #[test]
     fn stop_and_restart() {
-        let mut m = machine_with_bus();
-        call(&mut m, reset_callback, [0; 4]);
-        assert_eq!(call(&mut m, stop_callback, [0; 4]), CONTEXT);
+        let mut m = game();
+        reset(&mut m);
+        assert_eq!(run(&mut m, at::STOP, stop_callback, [0; 4]), CONTEXT);
         assert!(m.crit);
         assert_eq!(i_mask(&m), 0);
-        assert_eq!(call(&mut m, stop_callback, [0; 4]), 0);
+        assert_eq!(run(&mut m, at::STOP, stop_callback, [0; 4]), 0);
         // Stopped, InterruptCallback changes nothing.
-        assert_eq!(call(&mut m, interrupt_callback, [2, 0x8004_0000, 0, 0]), 0);
-        assert_eq!(call(&mut m, restart_callback, [0; 4]), CONTEXT);
+        assert_eq!(run(&mut m, at::INTERRUPT, interrupt_callback, [2, 0x8004_0000, 0, 0]), 0);
+        assert_eq!(run(&mut m, at::RESTART, restart_callback, [0; 4]), CONTEXT);
         assert!(!m.crit);
         assert_eq!(i_mask(&m), 0x9);
         assert_eq!(m.io.as_ref().unwrap().dma.dpcr, 0x3333_3333);
-        assert_eq!(call(&mut m, restart_callback, [0; 4]), 0);
+        assert_eq!(run(&mut m, at::RESTART, restart_callback, [0; 4]), 0);
     }
 }

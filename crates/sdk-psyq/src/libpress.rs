@@ -539,13 +539,10 @@ mod tests {
         assert_eq!(run(&mut m, at::RESET, dct_reset, [0; 4]), 0x1F80_1088);
         assert_eq!(irq_calls(), vec![RESET_CALLBACK]);
         assert_eq!(m.io.as_ref().unwrap().dma.dpcr & 0x88, 0x88);
-        // DMACallback(1, f), as libetc's adapter sets it.
-        crate::set_reg(&mut m, psx_devices::dma::DICR, 4, 0x0082_0000).unwrap();
-        m.sdk.etc.active = true;
-        m.sdk.etc.lines[3] = crate::libetc::Handler::Dma;
-        m.sdk.etc.mask = 1 << 3;
-        crate::set_reg(&mut m, psx_devices::irq::I_MASK, 2, 1 << 3).unwrap();
-        m.sdk.etc.dma[1] = CALLBACK;
+        // libetc running, with DMACallback(1, f).
+        crate::libetc::fixture::install(&mut m);
+        crate::libetc::fixture::reset(&mut m);
+        crate::libetc::fixture::dma_callback(&mut m, 1, CALLBACK);
         flat_macroblock(&mut m, IN, 32);
         assert_eq!(run(&mut m, at::DCT_IN, dct_in, [IN, 2, 0, 0]), 0x1F80_1088);
         assert_eq!(m.mem.r32(IN) >> 24, 0x3A, "15-bit, bit 15 set");

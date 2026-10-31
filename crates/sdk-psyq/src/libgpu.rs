@@ -331,10 +331,9 @@ fn r16s(m: &M, a: u32) -> i32 {
 type K = Box<dyn FnOnce(&mut M, u32) -> Flow<Psyq>>;
 type KOk = Box<dyn FnOnce(&mut M, bool) -> Flow<Psyq>>;
 
-/// libgpu's Vcount (`VSync(-1)`): libetc's adapters' count when they run,
-/// else libetc's own.
+/// libgpu's Vcount (`VSync(-1)`): libetc's, where it keeps it (D67).
 fn vcount(m: &M, s: Sys) -> u32 {
-    if m.sdk.etc.active { m.sdk.etc.vcount } else { m.mem.r32(s.vcount) }
+    m.mem.r32(s.vcount)
 }
 
 /// `sys:0x2880`: the timeout starts.

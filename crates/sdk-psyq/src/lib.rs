@@ -185,7 +185,7 @@ impl Sdk for Psyq {
     }
 
     fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
-        libetc::stand_in(m, addr, state).or_else(|| libgpu::stand_in(m, addr, state)).or_else(|| libcd::stand_in(m, addr, state))
+        libgpu::stand_in(m, addr, state).or_else(|| libcd::stand_in(m, addr, state))
     }
 }
 
@@ -326,9 +326,22 @@ pub mod testing {
         }
     }
 
-    /// A guest call: a stand-in runs (as the runtime's `untranslated`
-    /// does), anything else is logged.
+    std::thread_local! {
+        static DOUBLES: std::cell::RefCell<std::collections::BTreeMap<u32, fn(&mut M)>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+
+    /// Guest code at `addr` the tests need run (an SDK object's own
+    /// function, which only the real game has): `f` stands in for it.
+    pub fn double(addr: u32, f: fn(&mut M)) {
+        DOUBLES.with(|d| d.borrow_mut().insert(addr, f));
+    }
+
+    /// A guest call: a test double or a stand-in runs (as the runtime's
+    /// `untranslated` does), anything else is logged.
     pub fn guest(m: &mut M, addr: u32) {
+        if let Some(f) = DOUBLES.with(|d| d.borrow().get(&addr).copied()) {
+            return f(m);
+        }
         let mut state = 0;
         while let Some(step) = Psyq::stand_in(m, addr, state) {
             match step {
