@@ -39,7 +39,7 @@ manifest, without changes to the toolchain's code.
 | Pad | **Native** (D59, D60). libpad's adapters run its direct-connection engine (btn and bof4): at each vblank interrupt, one exchange per port with a digital-pad model fed by the host's buttons, the detection steps and the buffers as libpad's own state machine makes them, and the time its busy-waits take. As the fallback, libpad is original code over SIO0 (`psx-devices::sio`, D40). |
 | Memory card | **Native, per chip** (D59, D65), for libmcx, the PocketStation library (btn): its adapters run its card-port driver without SIO0's registers, a slot's card being the BIOS's image answering as a standard card does (`psx-devices::memcard`), libmcx's state where libmcx keeps it. As the fallback, libmcx is original code over SIO0, whose cards are the same images. The cards themselves are the BIOS's (D43). |
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
-| BIOS/kernel | **Native Rust, partial coverage.** The A0/B0/C0 tables and `syscall` name native stand-ins for the services the games need: events, critical sections, the heap, files and devices, memory cards (D43), threads (D57), exception hooks and kernel configuration, over the existing native backends. The guest-visible RAM tables hold those stand-ins or guest patches, and callable thunks keep saved native pointers working. Coverage is reported per call as working, partial, unsupported, fatal or no-op; public services remain partial and some remain unsupported. There is no Sony BIOS ROM and no CPU interpreter. |
+| BIOS/kernel | **Native Rust, partial coverage.** A0/B0/C0 services and syscalls implement events, critical sections, the heap, files and devices, memory cards (D43), threads (D57), exception hooks and kernel configuration over existing native facilities. The guest-visible RAM tables hold native stand-in pointers or guest patches, and callable thunks keep saved native pointers working. Coverage is reported per call as working, partial, unsupported, fatal or no-op; public services remain partial and some remain unsupported. There is no Sony BIOS ROM and no CPU interpreter. |
 
 So the CPU is not emulated: all code is compiled ahead of time. The
 hardware below the device libraries is emulated, at register level.
@@ -490,7 +490,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), with records, buffers and pending replies in the library's guest RAM, found through its relocated operands. `PadInitDirect` calls the guest `_padInitDirPort`; `PadStartCom` queues the library's own `_padVsyncParam`, which the kernel runs as an adapter step. Only the host pad's latched buttons remain adapter-owned. On the device: original code over SIO0 (D40), a port of the oracle's. |
 | libmcrd | `guest`, over the native Rust BIOS card functions (D43). |
 | libcard | `adapter`. The functions that patch Sony BIOS code in kernel RAM (`_patch_card` and its kin) are adapters with nothing to patch; the wrappers run as original code into the BIOS (D43). |
-| libmcx | `adapter-or-device`, chip memcard (D65): the PocketStation library, which drives the card slots on SIO0 itself. Native (btn): adapters for `McxStartCom` (vblank in I_STAT/I_MASK, its element appended to the kernel's priority-2 chain through the table of tables) and `_mcxDsrEntry` (each byte of a transfer, the card answering as a standard card does), with the vblank handler and both elements' verifiers run as adapter steps in their places; libmcx's state stays where libmcx keeps it (D61's way), so the command functions, `McxSync` and `McxStopCom` are guest code over it. On the device: original code over SIO0, its cards the BIOS's images, its element in the kernel's RAM chain. |
+| libmcx | `adapter-or-device`, chip memcard (D65): the PocketStation library, which drives the card slots on SIO0 itself. Native (btn): adapters for `McxStartCom` (vblank in I_STAT/I_MASK, its element appended to the kernel's priority-2 chain through the table of tables) and `_mcxDsrEntry` (each byte of a transfer, the card answering as a standard card does), with the vblank handler statically bound at `libmcx/mcxresi:0x80` and both elements entering ordinary guest-call flows after their native verifier steps; libmcx's state stays where libmcx keeps it (D61's way), so the command functions, `McxSync` and `McxStopCom` are guest code over it. On the device: original code over SIO0, its cards the BIOS's images, its element in the kernel's RAM chain. |
 | libgs | `guest`. It only writes packets into RAM; libgpu's `DrawOTag` is the device step. |
 | libgte | `guest`, with COP2 through `psx-gte`. |
 | libmath, libc, libc2 | `guest`. `rand` must be the original, or the game plays differently. |
@@ -598,7 +598,10 @@ its buffer. `ReturnFromException` leaves from any depth.
   chain itself, through the table of tables at 100h: the kernel keeps
   its exception control blocks there, in RAM, and walks the elements
   linked there after its own chain's (D65). With chip memcard native,
-  libmcx's two elements run as adapter steps in their places.
+  the element steps queue ordinary calls to the statically bound vblank
+  handler (`libmcx/mcxresi:0x80`) or `_mcxDsrEntry`. BIOS-table patches and
+  DSR callbacks finish before their handler's continuation; nested RFE
+  unwinds that continuation through the existing outer IRQ call.
 - **Translated code follows this** through wasm exceptions:
   - a recognised `setjmp` (A0h:13h) caller saves its registers inline;
   - the return address is a continuation entry that reloads them;
@@ -2575,9 +2578,10 @@ review.
   device control blocks, kernel configuration/allocation over those tables,
   and callable RAM slots/thunks are in ABI 18. Not adopted: the retail `cdrom`
   driver over the controller's registers (CD services use the native drive
-  core). The archived decision's note that pointer-called kernel element
-  functions have no code is only partly addressed by the callable slots; that
-  is not a complete-coverage claim.
+  core). Native root-counter, IRQ-event and pad/card chain functions now have
+  callable thunks; the archived claim that those pointers have no callable
+  implementation no longer applies. Other exception and service gaps remain
+  open, so this is not a complete-coverage claim.
 - **D69 (overlay residency): deferred, not imported.** Overlay dispatch remains
   D7's stub. The residency change and its prerequisite need a separate
   architecture decision.

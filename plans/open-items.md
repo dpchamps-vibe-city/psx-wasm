@@ -1,15 +1,47 @@
 # Open items
 
-Every open task, blocked item, human-needed input, unresolved finding and
-erratum, as of 2026-10-30. Milestone history is in [`completed/`](completed/).
-Each item says what it is, why it's open, and where it came from.
+Open tasks, blocked items, human-needed input, unresolved findings and errata.
+Milestone history is in [`completed/`](completed/). Older audit findings below
+retain their provenance; the active recovery status is recorded separately.
 
-- **Last full gate runs:** `psxw ci btn` passed every gate on 2026-10-27
-  (M12). `psxw ci bof4` hasn't run at the current pin (M13 task 22).
-- **The hardware boundary** (native adapters vs emulated devices) is
-  planned in [`unified-adaptor-layer/`](unified-adaptor-layer/).
+- **Active plan:** [`salvage-bios-work.md`](salvage-bios-work.md), native recovery
+  integrated with BIOS completion still in progress. Its checkpointed results
+  supersede older coverage/gate claims below.
+- **Last full gate runs:** both `psxw ci btn` and `psxw ci bof4` completed at the
+  ABI-17 recovery foundation (`a74f832`, code `4cce9e3`) and exited 2. Missing
+  oracle prerequisites, BTN mods census inputs and two BTN difftest mismatches
+  remain unresolved; regression attribution is not established. Later ABI-18
+  focused tests/builds/replays do not constitute a fresh full-CI pass.
+- **The hardware boundary** (native adapters vs per-chip device fallback) is
+  described in [`../docs/emulation-layers.md`](../docs/emulation-layers.md) and
+  [`unified-adaptor-layer/`](unified-adaptor-layer/).
 - **Shortcuts** (42, 2026-10-30 audit) are tracked in
   [`shortcuts.md`](shortcuts.md); the audit's bugs are under *Bugs* below.
+
+## Native BIOS recovery: current gaps
+
+- **General `setjmp`/`longjmp`: deferred by the user.** Recognised setjmp sites
+  save registers and have compiled continuations, but an ordinary continuation
+  call does not unwind intervening frames and returns to the wrong caller.
+  Dependent C(19h)/A(B2h) `ioabort` remains unfinished. Note the bug and revisit
+  later; no control-flow design or implementation is pending approval now.
+- **Other control-flow gaps:** build-known Exec/LoadExec, warm boot, C06 hook
+  chaining, remaining exception context and callback/IRQ thread switches are
+  still open. Do not replace existing Asyncify threading or infer approval for
+  a runtime redesign from the recovery work.
+- **Partial software services:** card helpers A7..AA/AE, built-in console input
+  and circular helpers, CD internal calls/event waits/filesystem details, and
+  non-main SetConf. Recent card Info/Load callback and guest-device console-scan
+  fixes do not complete these whole families. A52/C09 contracts remain unresolved.
+- **Resources/policy:** legally usable font data/mapping and GetSystemInfo's
+  BIOS date/version identity remain undecided; no fabricated values or pointers.
+- **Validation:** source `99fa333` passes focused BIOS/runtime/SDK tests, both
+  game builds, all four unchanged replays and memcard conformance. Non-empty
+  oracle validation, unresolved full-CI failures, two-bundle browser disc
+  isolation/locked-disc coverage and save/persistence certification remain open.
+
+See the active plan for exact service inventories, accepted source changes and
+next actions. Deferral or an unsupported diagnostic does not complete a service.
 
 ## Needs the human
 
@@ -94,17 +126,16 @@ Each item says what it is, why it's open, and where it came from.
   task 6.
 - **Task 8.** Add tasks 4–5 to `psxw ci`; docs; README status. *From:* M7
   task 8.
-- **libcard and libmcx conformance** (exit criterion 3). `psxw conform`
-  covers libpad, libgpu, libmcrd, libetc, libsnd and libspu.
-  - **libcard** keeps thin adapters: `_patch_card` scans Sony BIOS RAM,
-    which doesn't exist here.
-  - **libmcx's** adapters answer McxErrInvalid for an ordinary card, taken
-    from btn's own handling of the result. Conformance against the
-    original library needs an SIO memory card device, and the BIOS
-    exception-handler patching libmcx's fast DSR does, which the HLE BIOS
-    lacks.
+- **Card conformance and remaining persistence coverage** (exit criterion 3).
+  The old missing-device blocker is obsolete: libmcx runs against shared native
+  card images or the SIO fallback, and `conform btn --chip memcard` passes nine
+  case runs at `99fa333`. Its vblank handler is statically bound and honors BIOS
+  patches through existing Flow calls; no Sony BIOS instruction patch is executed.
+  libcard's Sony-code patch functions remain native adaptors. These gates do not
+  certify every card helper or a game save/reload session; the recordings and
+  assertions above are still missing.
 
-  *From:* M7 exit criterion 3; follow-up tasks.
+  *From:* M7 exit criterion 3; updated by the native BIOS recovery.
 
 ## M8: SDK generality
 
@@ -351,9 +382,19 @@ after a resume, statement rows, the Docker builder.
   Audit each. M13 expects more at bof4's scale. *From:* bug-follows §4;
   follow-up tasks; M13 Risks.
 
+### Historical shortcuts-audit findings
+
 Found by the shortcuts audit (2026-10-30; [`shortcuts.md`](shortcuts.md)).
-Paths are relative to `crates/`. *Unchecked* means the audit's reading
-hasn't been re-read against the code.
+Paths and line numbers below refer to that audit, not current source.
+**This is not a current unresolved-bug count.** Recovery has since addressed
+ResetEntryInt, closed-event guards, card bounds, old PAD arguments, file-slot
+allocation, printf, boot stack selection and several compiler/shared-device
+findings; per-call support classes now distinguish partial and unsupported
+services without changing the legacy `implemented` build gate. Accepted commits
+and tests are recorded in [`salvage-bios-work.md`](salvage-bios-work.md). Other
+findings have not all been revalidated; retain them as investigation leads,
+not permission for a new project-wide fidelity audit. *Unchecked* records the
+original audit's uncertainty.
 
 - **`SetDefaultExitFromException` (B0:18h) does nothing.**
   `psx-bios/src/bios.rs:339` doesn't clear `kernel.custom_exit`, so the

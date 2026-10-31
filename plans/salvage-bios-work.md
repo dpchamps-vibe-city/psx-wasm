@@ -1,11 +1,11 @@
 # Salvage the BIOS work
 
-**Status:** in progress; recovery foundation and initial parallel salvage.
+**Status:** in progress; recovery foundation integrated, BIOS completion and validation still open. General non-local returns are deferred by the user.
 **Goal:** preserve the working native-port architecture, recover useful work from
 spec-fidelity, and finish the missing BIOS functionality in Rust.
-**Supersedes:** [spec-fidelity.md](spec-fidelity.md) as the execution direction
-for this recovery and BIOS completion. That plan remains historical evidence,
-not a checklist to resume.
+**Supersedes:** `plans/spec-fidelity.md` on `archive/spec-fidelity-b8a0683`
+as the execution direction for this recovery and BIOS completion. That archived
+plan remains historical evidence, not a checklist to resume.
 
 ## Read first
 
@@ -14,9 +14,9 @@ not a checklist to resume.
 - [Conventions](conventions.md): inputs, data hygiene, commands and commits.
 - [Handoff](handoff-spec-fidelity.md): history and candidate commits. Its
   keep/remove classifications are leads to inspect, not authoritative decisions.
-- [Design](../docs/design.md): affected sections and D67–D71. Those decisions
-  were recorded without the user's input; their presence is not approval to
-  retain the architectural changes.
+- [Design](../docs/design.md): affected sections and the D67–D71 salvage
+  dispositions. The archived decisions were recorded without the user's input;
+  only the explicitly reviewed recovery portions are retained.
 - [psx-spx BIOS reference](https://psx-spx.consoledev.net/kernelbios/): retail
   A0/B0/C0 functions and syscalls. OpenBIOS and emulator observations are useful
   references, not automatically definitive evidence of Sony BIOS behaviour.
@@ -123,6 +123,34 @@ hygiene rules when deciding what belongs in commits.
   selected commit depends on them. Record a keep/rework/defer disposition rather
   than silently losing or approving these changes.
 
+## Current work and blockers
+
+Checkboxes record the stated task, not a claim that every service in a family
+is complete. Recovery and executing a gate can be complete while a service is
+partial or that gate still fails. Detailed results below are checkpointed history.
+
+| Area | Current disposition / next action |
+|---|---|
+| Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
+| `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
+| Card, console and CD | Partial; continue independently verifiable software contracts using existing backends. Do not invent missing reference behaviour. |
+| Other executable, exception and thread gaps | Still open; do not assume deferring longjmp implements these or authorises a runtime redesign. |
+| Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
+| Validation | Code at `99fa333` passes local tests, fresh builds, four replays and memcard conformance. Earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
+
+### Continuation lanes after deferring non-local returns
+
+| Owner | Checkout / authority | Contract and next gate | Independence |
+|---|---|---|---|
+| Parent | `salvage/bios`, writer | Checklist and `99fa333` build/replay/memcard gates complete; both handoffs reviewed, dispositions below | Owns plan and integration, not worker files |
+| Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
+| CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
+
+Workflow `1610e372-e898-4cf0-946a-0dc7f60bd941` completed both lanes. No active
+children, subdelegation or control-flow work. Source/gate claims remain
+checkpoint-specific; worker completion alone is not parent acceptance.
+
 ## Work order
 
 ### 1. Recover a native foundation
@@ -132,14 +160,16 @@ hygiene rules when deciding what belongs in commits.
 - [x] Create a separate salvage branch/worktree from the pinned baseline.
   Preserve this plan, the handoff and the crash replay for use there. Leave main
   and the original working tree intact.
-- [ ] Recover independent correctness fixes in coherent batches. Split mixed
-  commits or reimplement their small useful part; do not cherry-pick a chain
-  that drags the rejected map/timing work back in.
+- [x] Recover independent correctness fixes in coherent batches. Compiler,
+  lifter, libc, SDK/shared-backend and host batches were reviewed and integrated
+  without the rejected map/timing chain; separate deferred changes are recorded.
 - [x] Record dispositions for unrelated useful changes, including residency,
   browser storage and fallback-device fixes. Keep this separate from the BIOS
   completion checklist.
-- [ ] Build and check the recovered foundation using the existing commands.
-  Record actual results and pre-existing failures, not assumed green status.
+- [x] Build and check the recovered foundation using the existing commands.
+  Builds and integration gates ran; full ABI-17 CI failures are classified below.
+  Regression attribution remains unknown where no comparable baseline exists.
+  This records execution and evidence, not a green full-CI verdict.
 
 **Exit:** a buildable recovery branch retaining the original native/fallback
 architecture, without phase 6/7. Nothing has been destructively reset or merged
@@ -148,24 +178,27 @@ back to main.
 ### 2. Salvage the useful BIOS changes
 
 - [x] Recover C-library and allocation additions and existing-API bug fixes.
-- [ ] Recover event, timer, pad and card API improvements. Retain the existing
-  thread implementation; do not replace it under the heading "implement threads".
-- [ ] Recover guest-visible BIOS tables, events, handler chains and file/device
-  blocks where needed by their interfaces. Rust implements the functions;
-  populating data does not require executable Sony BIOS code.
+- [x] Recover event, timer, pad and card API improvements over existing native
+  facilities, retaining Asyncify threading. Remaining partial behaviours are
+  listed in section 3; recovery does not complete those services.
+- [x] Recover guest-visible BIOS tables, events, handler chains and file/device
+  blocks, including callable original/kernel thunks and patched SDK dispatch.
+  Rust implements the functions; no executable Sony BIOS code is required.
 - [x] Recover general file/device dispatch, including guest-provided device
   callbacks. Keep useful CD directory and error behaviour while replacing the
   controller-driven reads with native disc operations. Console input and card
   asynchronous visibility remain separate unfinished items below.
-- [ ] Implement the added BIOS GPU/CD entry points over the existing native
-  cores and scheduler. Reuse SDK/backend facilities without depending on SDK
-  initialisation or duplicating their state.
-- [ ] Restore native pad/card access while preserving corrected buffers,
-  busy/error states, completion events and persistence. Native and fallback
-  callers must see one underlying card/input state, not separate BIOS copies.
-- [ ] Recover boot fixes and BIOS oracle support. Keep ABI/linker/browser glue
-  consistent with the recovered architecture; rebuild artifacts together and
-  reject incompatible ones rather than mixing ABI 12–16 outputs.
+- [x] Recover added GPU and public CD operations over existing native cores
+  and scheduling, without requiring SDK initialization or a BIOS register driver.
+- [ ] Complete the remaining CD callable internals and partial software contracts
+  recorded in the native-CD section below; recovered public operations alone
+  do not complete the original GPU/CD task.
+- [x] Restore native pad/card access with corrected buffers, busy/error states
+  and completion events over shared native/fallback card/input state. Remaining
+  helper and completion limitations are explicitly retained in section 3.
+- [x] Recover boot fixes and BIOS oracle support with consistent ABI/linker/
+  browser glue. ABI-18 builds are isolated from old outputs. Actual non-empty
+  oracle comparison and remaining browser coverage are separate validation gaps.
 
 **Exit:** useful BIOS coverage at the audited head is retained or explicitly
 recorded as still pending, but no BIOS operation requires the rejected driver
@@ -185,8 +218,10 @@ helpers wherever possible.
 
 #### A. Entries with no handler
 
-All 29 slots below currently reach `not implemented` after alias resolution.
-Five are documented no-ops, and A(52h)'s meaning needs verification.
+At the audited head, all 29 slots below reached `not implemented` after alias
+resolution. The checkboxes now track recovered/implemented entries; unchecked
+entries may be partial rather than absent. Five are documented no-ops, and
+A(52h)'s body still needs verification.
 
 | Done | Entry | Function |
 |---|---|---|
@@ -221,11 +256,13 @@ handoff's missing-call list.
 
 #### B. Named calls and paths that are incomplete
 
-- [ ] **General `setjmp`/`longjmp`, A(13h/14h).** The Rust `setjmp` only returns
-  zero and `longjmp` always errors. Recognised lifted `setjmp` sites already save
-  registers, and exception-hook continuations already work. Extend what exists
-  for general non-local returns; do not mistake the direct Rust stub for the
-  entire current implementation.
+- [ ] **General `setjmp`/`longjmp`, A(13h/14h) — user-deferred bug.** Recognised
+  lifted `setjmp` sites save registers and produce a continuation, but entering
+  it as an ordinary call does not unwind intervening frames and eventually
+  returns to the wrong caller. The direct Rust paths remain incomplete; existing
+  exception-hook continuations do not establish general longjmp support. Record
+  and revisit later, together with dependent `_ioabort`; no design or runtime
+  implementation is authorised by the instruction to continue independent work.
 - [ ] **`Exec`/`LoadExec`, A(43h/51h).** Both always error, even for code already
   translated. Reuse executable-loading and guest-call facilities for build-known
   executables, including their argument, stack, GP and return behaviour. Loading
@@ -300,20 +337,35 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
 
 ### 4. Validate and reconcile the documentation
 
-- [ ] Run workspace tests and build both games from the recovery branch's own
-  toolchain/artifacts. Refresh census inputs when recovered compiler changes
-  require it.
-- [ ] Run existing BIOS oracle checks and focused integration tests for changed
-  families. Keep emulator/OpenBIOS results provisional where appropriate.
-- [ ] Run existing replays, including btn save/load, bof4 `title-to-field` and
-  the supplied name-select crash replay. Check native/fallback integration and
-  the mod/browser paths affected by the recovered ABI.
-- [ ] Run `psxw ci btn` and `psxw ci bof4`; classify unresolved failures rather
-  than calling the branch green. Hand off long/manual runs when necessary and
-  leave their tasks pending until results are available.
-- [ ] Update affected design sections, D67–D71 dispositions, the plan index and
-  open items to describe what actually remains. Do not preserve conflicting
-  claims that spec-fidelity or all BIOS functions are complete.
+- [x] Run workspace tests and build both games from the recovery branch's own
+  toolchain/artifacts. Latest workspace run: `6deb05b`; subsequent batches have
+  focused tests. Latest release/runtime/game builds: `99fa333`, ABI 18. Census
+  and optional-test qualifications are recorded with their actual checkpoints.
+- [x] Run focused integration tests for changed families, including guest devices,
+  card completion, patched BIOS calls and real wasm kernel/thread lowering.
+- [ ] Run non-empty BIOS oracle comparisons. The earlier zero-vector command is
+  not validation; configured images/vectors/goldens are still missing. Keep
+  emulator/OpenBIOS results provisional where appropriate.
+- [x] Run existing BTN title/card-load, BOF4 `title-to-field` and supplied
+  name-select crash replays: latest source `99fa333`, unchanged expectations.
+  Card-load has no state assertions and does not certify save persistence.
+- [ ] Validate game-level save/reload persistence once the required recordings
+  and state assertions are available; the current card-load gate is insufficient.
+- [x] Check native/fallback integration with the existing gates: full chip/SDK
+  gates at ABI 17, focused libpad/libetc/libgpu and memcard gates at ABI 18,
+  latest memcard conformance at `99fa333`. Results are not all at one checkpoint.
+- [ ] Complete affected mod/browser validation: ABI-17 browser passes are recorded,
+  but BTN mods prerequisites, two-bundle disc isolation and locked-disc coverage
+  remain open; no fresh ABI-18 browser result is claimed.
+- [x] Run `psxw ci btn` and `psxw ci bof4` and classify failures: both completed
+  at the ABI-17 foundation and exited 2. This is execution, **not a green gate**.
+- [ ] Resolve/provision the recorded full-CI blockers and run a current-source
+  full gate when meaningful. Do not repeat empty oracle checks or silently
+  change difftest input domains, exclusions, goldens or replay expectations.
+- [x] Update affected design sections, D67–D71 dispositions, the plan index and
+  native-BIOS open items. Full BIOS/CI remain unfinished; older audit entries
+  are labelled historical rather than silently treated as current bugs. This
+  does not claim every unrelated historical finding was re-audited.
 - [ ] Present the recovery branch and remaining limitations for review before
   merging into main. Do not delete the archived work.
 
@@ -910,7 +962,7 @@ ABI-17 CI failures and missing prerequisites are unresolved. General non-local
 return, executable/exception context, fonts/identity policy and other partial
 BIOS services remain open; this is not full-BIOS completion.
 
-## Next control-flow decision (not approved or implemented)
+## Deferred bug: general non-local return targets the wrong call stack
 
 Parent traced the remaining non-local return gap through `psxw-lift/src/lib.rs`
 and `emit.rs`, `psxw-link/src/game.rs`, and `psx-runtime/src/wasm.rs`/`driver.rs`:
@@ -930,13 +982,13 @@ and `emit.rs`, `psxw-link/src/game.rs`, and `psx-runtime/src/wasm.rs`/`driver.rs
   FP/RA or merely calling a compiled entry point. Callback/IRQ thread switching
   remains separately blocked; replacing Asyncify is not authorised.
 
-**Decision requested:** permit a bounded lift/link/runtime design for frame-
-targeted non-local returns, extending existing saved-register continuations and
-wasm exception support while retaining Asyncify. The design must establish
-jump-target ownership across recursion/threads, register capture at supported
-call paths, and correct frame cleanup/return. No interpreter, simulated CPU
-register file or scheduler replacement. This is a proposed direction, not an
-approved implementation; a concrete design must be reviewed before code.
+**User disposition:** note the bug and continue the independent plan work;
+revisit this later. No approval request is pending for this item, and neither
+a new control-flow design nor its implementation is part of the current work.
+When resumed, establish target ownership across recursion/threads, register
+capture and correct frame cleanup/return before proposing a concrete change.
+Retain Asyncify; no interpreter, simulated CPU register file or scheduler
+replacement. A significant architecture change still requires review before code.
 
 ## Console/card contract follow-up
 
@@ -965,7 +1017,7 @@ Parent implementation in `psx-bios/src/{files,bios,lib,card}.rs`:
 - **C15/C17/C18 remain blocked:** the pinned OpenBIOS table points them at
   `unimplementedThunk`; the circular-buffer header and DTL-H2000 TTY consumer
   do not establish retail full/empty/flags/wrap/error semantics. No guessed ring
-  buffer. C19/A(B2h) still require the unapproved non-local-return work above.
+  buffer. C19/A(B2h) still depend on the now user-deferred non-local-return bug.
 - **A8/A9/AA, pending Info/Load:** `card/backupunit.c` error callbacks clear
   `g_buOperation` and emit high 8000h/100h/2000h only for an active operation;
   they do not change low-driver status or emit its event. Existing queued native
@@ -993,9 +1045,65 @@ wasm32 runtime check. Log: `console-card-callback-integrated-tests.log` in the
 session scratchpad. Formatter-only changes were removed before integration.
 No runtime ABI, scheduler, register driver or host API change.
 
-Release/game/conformance/replay artifacts remain at **d06c81b**, predating this
-follow-up; their earlier passing results above are not a fresh game gate for
-these source changes. No full CI rerun or new oracle/browser claim.
+At initial integration, release/game/conformance/replay artifacts remained at
+**d06c81b**; the follow-up gate below now refreshes them for `99fa333`.
+
+### Console/card integration gate at `99fa333` (ABI 18)
+
+Fresh release CLI, runtime wasm and both game builds pass, with all six chip
+groups native. BTN is 2,575,785 bytes; BOF4 is 10,189,724 bytes. BIOS support
+counts are unchanged (BTN 42 working/12 partial/1 unsupported/1 fatal/1 no-op;
+BOF4 36 working/16 partial/1 unsupported/1 no-op). Asyncify scope is unchanged,
+including the single excluded exception-handler function in each game.
+
+All four unchanged no-trap replays pass: BTN title 6000 frames/all three expected
+states and card-load 3000; BOF4 title-to-field 26000/all five expected states and
+the supplied crash replay 694. Boot text matches and EDC errors are zero. BTN's
+GPU warnings at 64/65/83 remain unchanged and unclassified. Card-load and the
+crash replay still have no state assertions. Previous disposable run storage
+was moved to the session scratchpad; fresh disposable storage was used, not
+user saves. Logs/reports: `console-card-{release,build-*,replay-*}` in scratch.
+
+Memcard native-versus-device conformance passes all nine case runs, including
+four seeds each for start/command and the session case. Log:
+`console-card-conform-memcard.log`; report: `out/conform/btn/chip-memcard.json`.
+Comparison modules remain separate from normal native game artifacts. The
+already-passing BIOS 50/runtime 8/SDK 42 and wasm32 checks cover this source;
+no unnecessary workspace rerun was performed. Full CI, browser and non-empty
+oracle results are not refreshed, and their recorded gaps remain open.
+
+### Documentation and CD contract review after the deferral
+
+Both reports from workflow `1610e372-e898-4cf0-946a-0dc7f60bd941` were read in
+full: `salvage/docs-reconciliation.md` and `salvage/cd-wait-contract.md` in the
+session artifacts. Documentation commit `05024b3` was reviewed and integrated
+as `124d922`. Parent corrected the current libmcx Flow description and removed
+an ambiguous suggestion that the recovered native chain pointers still lack
+callable implementations. The plan index now identifies this active recovery;
+`plans/open-items.md` records current BIOS gaps, actual CI failures, the deferred
+non-local bug and the historical status of its old audit. No new architecture
+was accepted. A progress steer arrived after the documentation lane had already
+completed; it changed no work, and fresh validation facts were integrated here.
+
+CD review confirms the pinned OpenBIOS wait priority: seek/status test DNE before
+ERR; reads test DNE, ERR, then END. Current per-operation completion Cells do not
+fully reproduce that guest-event contract. **The scout's proposed completion-only
+selector is not accepted:** falling back to the Cell when no event is ready
+would still ignore disabled/consumed events, and it would not return when an
+early guest event becomes ready. Its proposed read-ERR test also assumes that
+SystemError(44h,16h) returns -1 immediately; the reference instead continues its
+retry loop if the SystemError patch returns. Test events injected before seek
+completion can be cleared by the next read's `cd_begin`, so phase matters.
+
+Parent read pinned `openbios/cdrom/helpers.c` and `cdrom/cdrom.c` directly.
+`helpers.c` also explicitly changes retail's sector-mangling retry bug; it is
+not unqualified retail parity evidence. The existing operation identity protects
+callback reentry and must not be discarded. Next CD work must handle event wake,
+consumption, cancellation/reentry and returning-error retry behavior coherently
+using the native software/scheduler seams; merely changing late error priority
+would be a hybrid contract. No CD code or tests were changed on this evidence,
+and no new architecture approval request is being made. These services remain
+partial, independently of the user-deferred non-local-return bug.
 
 ## Progress log
 
