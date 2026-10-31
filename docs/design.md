@@ -2866,11 +2866,15 @@ closer to the oracle's (plans/spec-fidelity.md, phase 7 step 5).
   at one of the original's loop headers once the budget has run out; an
   element's verifier spends on every walk of the chains. Conformance
   checks it: chips spu, sio0, memcard and mdec observe the budget after
-  every call or frame, chip irq root counter 2. Done: libapi's counter
-  functions and pad element, every libspu adapter and libsnd's
-  `_SsInit`, every libpad adapter and its interrupt (`_padIntPad` and
-  its callees, block by block), libmcx's `McxStartCom`, elements and
-  `_mcxDsrEntry`, every libpress adapter. Elsewhere waits and loops
+  every call or frame, chip irq after every call and vblank wait. Done:
+  libapi's counter functions and pad element, every libspu adapter and
+  libsnd's `_SsInit`, every libpad adapter and its interrupt
+  (`_padIntPad` and its callees, block by block), libmcx's
+  `McxStartCom`, elements and `_mcxDsrEntry`, every libpress adapter,
+  every libetc adapter and its dispatcher (from where the exception's
+  exit resumes, `startIntr`'s `setjmp`, to `ReturnFromException`'s
+  stub; the lift lowers `setjmp`'s call to stores, so no stub of its
+  is spent on either side). Elsewhere waits and loops
   spend a pass at the
   loop's own count (the timeout checks and calls each iteration makes
   among them): libetc's `VSync` waits (14 and 6), libgpu's (40, 41, 38),

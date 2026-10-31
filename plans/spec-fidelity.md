@@ -856,22 +856,41 @@ locals, or static translation.
     the timeout's `printf` and resets; `DecDCTPutEnv`'s copies are 6 a
     pass (D71 had 5). Chip mdec's cases observe the budget at each
     `state`: bof4's sides agree at all 132.
-  - Left: the straight-line code of libgpu's, libcd's and libetc's
-    adapters, libetc's dispatcher among them, which games run natively.
-    Measured (btn, chip irq, the budget observed after each call for the
-    occasion, not kept): `ResetCallback` spends nothing natively and
-    4,545 instructions on the device (`startIntr`, `startIntrVSync`,
-    `startIntrDMA` and their clears); `VSync(-1)` 96 natively, 214 on the
-    device. And a question first: across `vblanks(1)` the budget
-    doesn't move on either side, though on the device libetc's original
-    dispatcher, VSync handler and the callback run (entered through the
-    BIOS's custom exit, left with `ReturnFromException`); libpad's
-    handler, through the kernel's chain, does move it. Find where that
-    time goes (`guest_invoke_irq`, `psx.return_from_exception`) before
-    spending the dispatcher's path natively, or the sides will part. The
+  - The question, answered (2026-10-31, `a1e5cea`): the dispatcher's
+    time does land. With chip irq's cases observing the budget after
+    every call and every wait (btn), a vblank spends 81 instructions
+    natively (`intr_vb.o`'s handler, guest code: Vcount, then the eight
+    channels) and 166 on the device: those, and the dispatcher's 85
+    (`startIntr`'s `setjmp` continuation, which the lift translates as
+    its own function, 4; `intr.o` +26Ch's pass over line 0, 78; libapi's
+    `ReturnFromException` stub, 3). They are lifted code, spending per
+    block inside `guest_invoke_irq`'s call; the throw that leaves them
+    doesn't undo a global. The earlier reading took a vblank's spend for
+    the `VSync(-1)` after it: its 96 and 214 are `irq.sequence`'s
+    `vblanks(1)` and `VSync(-1)` together (natively 81 + the callback's
+    15 + 0; on the device 166 + 15 + 33), and the one wait that moves
+    the budget on neither side is the one with vblank masked.
+  - libetc done (`a1e5cea`): every adapter spends its original's
+    blocks, the dispatcher as `IrqStep::Sdk` steps from the continuation
+    to `ReturnFromException`'s stub, a quantum at its loop headers
+    (+300h, +30Ch) once the budget ran out, the DMA handler (`intr_dma.o`
+    +4Ch) likewise; `ResetCallback`'s clearing of the context (1,050
+    passes of 4) takes safepoints as a loop does (`sdk_psyq::spin`).
+    `ResetCallback` is 4,545 instructions the first time, 25 after,
+    `InterruptCallback` 37 to 82 by line, `VSync(-1)` 33. The lift lowers
+    `setjmp`'s call to stores, so the device spends no stub for it, and
+    neither does the adapter. Two fixes on the way: `VSync`'s countdown
+    made one pass too many (the original makes `t << 15` whole passes,
+    then times out 8 instructions into the next), and its wait for a
+    Vcount already reached is 13 instructions, not a pass. Chip irq's
+    cases now observe the budget after every call and vblank wait, and
+    `VSync`'s hblanks and root counter 2 exactly (they were rounded to
+    frames and to 0x400 counts): both games' sides agree at all of them
+    (450 budget observations in each).
+  - Left: the straight-line code of libgpu's and libcd's adapters. The
     way to do each library: its chip's cases observe the budget (as
-    sio0's, memcard's and mdec's now do), and its adapters spend their
-    originals' blocks until the sides agree at every observation.
+    irq's, sio0's, memcard's and mdec's now do), and its adapters spend
+    their originals' blocks until the sides agree at every observation.
   - How the handlers do it (2026-10-31, `368670a`, `0b2c55d`): a
     transliteration of the original's control flow, block by block
     (`sdk_psyq::irq_path`, offsets from `psxw sdk disasm`, checked
