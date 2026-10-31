@@ -7,12 +7,12 @@
 //! `libpad/{pddirini,pddirres,pdresres,pdmaiini,pdent2,pdent3,pdcmd1,
 //! pdcmd2}`), with each port's bytes answered by a pad model instead of
 //! SIO0's registers:
-//! - **`PadStartCom` installs a `SysEnqIntRP` element** at priority 2, as
-//!   the original installs `_padVsyncParam`. The kernel runs it in its
-//!   place in the chains ([`psx_bios::Sdk::chain_element`]): when vblank is
-//!   unmasked and pending (`_padIsVsync`), one exchange per port, port 1
-//!   first (`_padIntPad`). The pads' buttons are latched at the vblank, as
-//!   SIO0's are.
+//! - **`PadStartCom` queues libpad's `SysEnqIntRP` element**,
+//!   `_padVsyncParam`, at priority 2. The kernel runs it as the adapters'
+//!   step in its place in the chains ([`psx_bios::Sdk::chain_element`]):
+//!   when vblank is unmasked and pending (`_padIsVsync`), one exchange per
+//!   port, port 1 first (`_padIntPad`). The pads' buttons are latched at
+//!   the vblank, as SIO0's are.
 //! - **An exchange** is libpad's five handler states (select 01h, the
 //!   command, the TAP byte, then the data bytes), each byte needing the
 //!   pad's acknowledge for the next. Nothing connected acknowledges
@@ -45,13 +45,20 @@
 //!   frames behind the device without the time; and when each wait took a
 //!   quantum (half a frame with two pads), btn's CD outran its CPU.
 //!
-//! **State.** The port records, receive buffers and pending results are
-//! here, in the runtime: only libpad's own code reads them (`psxw sdk
-//! scan`: PadInitDirect, the one state accessor games call, is adapted
-//! too). The games' buffers are guest RAM, written as the original writes
-//! them; PadGetState reads the status byte back from there. `PadStartCom`
-//! acknowledges and unmasks vblank in the interrupt controller, which the
-//! chips share.
+//! **State stays where libpad keeps it** (D67), found through the
+//! objects' code ([`Lib`]). Each call's code reaches one of the engine's
+//! variables in `pdresres.o`'s `.data` (`_padIntExec`, `_padVsyncParam`,
+//! `_padFuncPort2Info`); the element there names `_padIntPad`, whose code
+//! names `_padRestPeriod`. `PadInitDirect` calls `_padInitDirPort` (guest
+//! code), which clears `pddirres.o`'s two port records ([`rec`]), points
+//! them at their receive and transmit buffers, installs the engine's
+//! functions and sets `_padInfoDir`, where the adapters find the records.
+//! A port's pending reply is its `_padFixResult`. The games' buffers are
+//! guest RAM, written as the original writes them; PadGetState reads the
+//! status byte back from there. `PadStartCom` acknowledges and unmasks
+//! vblank in the interrupt controller, which the chips share. Only the
+//! pad model's latched buttons, SIO0's side of the wire, are the
+//! runtime's.
 //!
 //! **What isn't reproduced.** The pad model is a digital pad, as SIO0's
 //! device is (`psx_devices::sio`): no analog or DualShock modes, so
@@ -59,12 +66,15 @@
 //! tables) are never acknowledged on either side, and `PadSetActAlign`
 //! always reports the engine busy. The bytes libpad transmits after the
 //! command (actuator levels, `PadSetAct`) aren't computed: a digital pad
-//! ignores them. Multitap and light-gun paths aren't linked in these
-//! games. `PadSetAct`'s return value, the record's address, is 0. The
-//! waits' times leave out the original's wait for /ACK to fall after
-//! each byte (the pulse lasts 32 cycles, a pass or two).
+//! ignores them, so the engine's current budget (`_padTotalCurr`) and the
+//! records' actuator gates keep what they had. Nor are the engine's own
+//! bookkeeping words written (`_padSioChan`, `_padSioState`, the data
+//! count). Multitap and light-gun paths aren't linked in these games. The
+//! waits' times leave out the original's wait for /ACK to fall after each
+//! byte (the pulse lasts 32 cycles, a pass or two).
 
 use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
+use psx_bios::Flow;
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("PadInitDirect", pad_init_direct),
@@ -76,10 +86,7 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("PadSetActAlign", pad_set_act_align),
 ];
 
-/// libpad's `SysEnqIntRP` element (`_padVsyncParam`). The adapters own it:
-/// an address in the BIOS ROM's range, which no game code or data has.
-pub const ELEMENT: u32 = 0xBFC7_0100;
-/// The exception step that runs it ([`irq_step`]).
+/// The exception step that runs libpad's element ([`irq_step`]).
 pub const STEP: u32 = 0x5000_0000;
 
 const I_STAT: u32 = psx_devices::irq::I_STAT;
@@ -88,7 +95,7 @@ const I_MASK: u32 = psx_devices::irq::I_MASK;
 const PRIORITY: u32 = 2;
 /// Bytes of one port's receive buffer: the ID, 5Ah and up to 32 data
 /// bytes.
-const RX: usize = 0x23;
+const RX: u32 = 0x23;
 
 /// PadGetState's states.
 pub const STATE_DISCON: u8 = 0;
@@ -113,74 +120,174 @@ const RETRIES: u8 = 0xB;
 /// A reply's ID in config mode.
 const ID_CONFIG: u8 = 0xF3;
 
-/// One port's record (a `PadInfo2`'s fields direct connection uses).
-/// `PadInitDirect` clears it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Port {
-    /// The game's buffer: status (0 or FFh), ID, then the data bytes.
-    pub buf: u32,
-    pub state: u8,
-    pub cmd_state: u8,
-    /// The command for the next exchange (0: poll), and the one the last
-    /// exchange sent.
-    pub request: u8,
-    pub current: u8,
-    /// Failures in a row in the current command state.
-    pub fails: u8,
-    /// The terminal type, the ID's high nibble (4: digital pad).
-    pub kind: u8,
-    pub ex_id: u16,
-    pub id_count: u8,
-    pub prev_mode: u8,
-    /// Failed exchanges (`PadInfoMode` mode 100).
-    pub failures: u32,
+/// A port record's fields direct connection uses (`PadInfo2`, psyq-decomp
+/// `libpad-internal.h`): two records in `pddirres.o`'s `.bss`.
+pub mod rec {
+    pub const SIZE: u32 = 0xF0;
+    /// The ID, actuator-alignment and combination tables' pointers.
+    pub const TABLES: u32 = 0x00;
+    pub const CHILD: u32 = 0x0C;
+    pub const ROOT: u32 = 0x10;
+    /// `PadSetActAlign`'s handlers for the info states, and its table.
+    pub const PREPARE: u32 = 0x14;
+    pub const APPLY: u32 = 0x18;
+    pub const ALIGN: u32 = 0x20;
+    /// `_padCmdParaMode`'s parameter byte; the command's bytes, and how
+    /// many.
+    pub const PARAM: u32 = 0x24;
+    pub const CMD_DATA: u32 = 0x2C;
+    pub const CMD_LEN: u32 = 0x36;
     /// `PadSetAct`'s table and size.
-    pub act: u32,
-    pub act_size: u8,
-    /// `PadSetActAlign`'s table, while its command is the engine's.
-    pub align: Option<u32>,
-    /// Reply bytes the last exchange stored.
-    pub rx_count: u8,
+    pub const ACT: u32 = 0x28;
+    pub const ACT_SIZE: u32 = 0x34;
+    /// The game's buffer: status (0 or FFh), ID, then the data bytes; and
+    /// how many the last reply put there.
+    pub const BUF: u32 = 0x30;
+    pub const BUF_LEN: u32 = 0x35;
+    /// The command for the next exchange (0: poll), the one the last
+    /// exchange sent, and the one before.
+    pub const REQUEST: u32 = 0x37;
+    pub const CURRENT: u32 = 0x38;
+    pub const PREVIOUS: u32 = 0x39;
+    /// The receive and transmit buffers, and their counts (the receive
+    /// count is FFh while the reply to select is in flight).
+    pub const RX: u32 = 0x3C;
+    pub const TX: u32 = 0x40;
+    pub const RX_COUNT: u32 = 0x44;
+    pub const TX_COUNT: u32 = 0x45;
+    pub const CMD_STATE: u32 = 0x46;
+    /// The info states' table index.
+    pub const INFO_INDEX: u32 = 0x47;
+    pub const STATE: u32 = 0x49;
+    /// Failures in a row in the current command state.
+    pub const FAILS: u32 = 0x4A;
+    /// Failed exchanges (`PadInfoMode` mode 100).
+    pub const FAILURES: u32 = 0x4C;
+    /// The actuator alignment's six bytes, FFh while unknown.
+    pub const ALIGN_REPLY: u32 = 0x5D;
+    pub const ID_COUNT: u32 = 0xE3;
+    pub const PREV_MODE: u32 = 0xE4;
+    pub const EX_ID: u32 = 0xE6;
+    /// The terminal type, the ID's high nibble (4: digital pad).
+    pub const KIND: u32 = 0xE8;
+    pub const ACT_COUNT: u32 = 0xE9;
+    pub const COMB_COUNT: u32 = 0xEA;
 }
 
-/// libpad's state.
-#[derive(Debug, Clone)]
+/// `pdresres.o`'s `.data`: the engine's variables.
+pub mod data {
+    pub const PORT2INFO: u32 = 0x1C;
+    /// The port records (`_padInfoDir`).
+    pub const INFO_DIR: u32 = 0x3C;
+    pub const INT_EXEC: u32 = 0x40;
+    pub const MODE_MTAP: u32 = 0x54;
+    /// The first and last port the engine polls (`PadEnableCom`).
+    pub const CHAN_START: u32 = 0x58;
+    pub const CHAN_STOP: u32 = 0x5C;
+    /// Each port's `_padFixResult`: 0, a reply awaits processing; -1, none.
+    pub const FIX_RESULT: u32 = 0x60;
+    /// `_padVsyncParam`: next, handler (`_padIntPad`), verifier
+    /// (`_padIsVsync`).
+    pub const VSYNC_PARAM: u32 = 0x68;
+    /// `_padCalledIntPad` (`PadChkVsync`).
+    pub const CALLED: u32 = 0x78;
+}
+
+/// Code operands, from the start of the function that has them.
+mod at {
+    /// `_padFuncPort2Info`'s pair, in `PadGetState`, `PadInfoMode`,
+    /// `PadSetAct` and `PadSetActAlign`.
+    pub const PORT2INFO: (u32, u32) = (0x00, 0x04);
+    /// `PadInitDirect`: `_padIntExec`'s pair, the `jal _padInitDirPort`.
+    pub const INIT_EXEC: (u32, u32) = (0x14, 0x18);
+    pub const JAL_INIT_PORT: u32 = 0x24;
+    /// `PadStartCom`'s and `PadStopCom`'s `_padVsyncParam` pair.
+    pub const ELEMENT: (u32, u32) = (0x1C, 0x20);
+    /// `PadSetActAlign`'s handlers' pairs.
+    pub const PREPARE: (u32, u32) = (0x4C, 0x50);
+    pub const APPLY: (u32, u32) = (0x58, 0x5C);
+    /// `_padIntPad` (`pdresres.o` +68h, `_padIsVsync` at +0): its
+    /// `_padRestPeriod` pair.
+    pub const INT_PAD: u32 = 0x68;
+    pub const REST: (u32, u32) = (0x44, 0x48);
+}
+
+/// Where libpad keeps its state (D67): `pdresres.o`'s `.data`, and
+/// `_padRestPeriod` (a common).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lib {
+    pub data: u32,
+    pub rest: u32,
+}
+
+impl Lib {
+    /// `_padVsyncParam`, the element `PadStartCom` queues.
+    pub fn element(&self) -> u32 {
+        self.data + data::VSYNC_PARAM
+    }
+
+    fn word(&self, m: &M, var: u32) -> u32 {
+        m.mem.r32(self.data + var)
+    }
+
+    /// The port records `_padInitDirPort` set out (`_padInfoDir`).
+    pub fn records(&self, m: &M) -> Option<u32> {
+        Some(self.word(m, data::INFO_DIR)).filter(|&r| r != 0)
+    }
+
+    /// `port`'s record (`_padFuncPort2Info`: ports 00h-0Fh are port 1, any
+    /// other port 2).
+    fn port(&self, m: &M, port: u32) -> Option<u32> {
+        self.records(m).map(|r| r + rec::SIZE * (port & 0xF0 != 0) as u32)
+    }
+
+    fn fix(&self, chan: u32) -> u32 {
+        self.data + data::FIX_RESULT + 4 * chan
+    }
+}
+
+/// libpad's adapter state: where libpad is, and the pad model's buttons.
+#[derive(Debug, Default)]
 pub struct Pad {
-    pub ports: [Port; 2],
-    /// `PadInitDirect` has run: the engine has its records.
-    pub direct: bool,
-    /// `PadStartCom` has put the element in the kernel's chain;
-    /// `PadStopCom` takes it out.
-    pub com: bool,
-    /// Each port's receive buffer, from the ID on. `PadInitDirect`
-    /// leaves them, as the original's live outside the records.
-    pub rx: [[u8; RX]; 2],
-    /// An exchange completed and its reply awaits processing
-    /// (`_padFixResult` 0). `PadInitDirect` leaves these too.
-    pub pending: [bool; 2],
+    pub lib: Option<Lib>,
     /// Each slot's buttons, latched at the last vblank (`None`: nothing
     /// connected).
     pub latched: [Option<[u8; 2]>; 2],
 }
 
-impl Default for Pad {
-    fn default() -> Self {
-        Pad { ports: Default::default(), direct: false, com: false, rx: [[0; RX]; 2], pending: [false; 2], latched: [None; 2] }
+/// libpad from the running adapter: the engine variable `var` (in
+/// `pdresres.o`'s `.data`) its code reaches with the pair at `hi`, `lo`.
+fn lib(m: &mut M, (hi, lo): (u32, u32), var: u32) -> std::result::Result<Lib, String> {
+    let f = m.sdk.at;
+    let data = crate::libspu::pair(m, f + hi, f + lo)
+        .ok_or_else(|| format!("libpad at {f:#010x}: no engine variable where PsyQ 4.7's object has it"))?
+        .wrapping_sub(var);
+    if let Some(l) = m.sdk.pad.lib.filter(|l| l.data == data) {
+        return Ok(l);
     }
+    let err = |what: &str| format!("libpad/pdresres's .data at {data:#010x}: no {what} where PsyQ 4.7's object has it");
+    let elem = data + data::VSYNC_PARAM;
+    let int_pad = m.mem.r32(elem + 4);
+    if m.mem.r32(elem + 8) != int_pad.wrapping_sub(at::INT_PAD) {
+        return Err(err("_padVsyncParam"));
+    }
+    let rest = crate::libspu::pair(m, int_pad + at::REST.0, int_pad + at::REST.1).ok_or_else(|| err("_padRestPeriod"))?;
+    let l = Lib { data, rest };
+    m.sdk.pad.lib = Some(l);
+    Ok(l)
 }
 
-/// `_padFuncPort2Info`: ports 00h-0Fh are port 1, any other port 2.
-fn index(port: u32) -> usize {
-    (port & 0xF0 != 0) as usize
+/// The kernel's step for `elem`, when it is libpad's element.
+pub fn chain_element(m: &M, elem: u32) -> Option<u32> {
+    m.sdk.pad.lib.filter(|l| l.element() == elem).map(|_| STEP)
 }
-
 
 // --- The vblank engine -----------------------------------------------------
 
 /// At each vblank, before the interrupt: the pads latch their buttons,
-/// as SIO0's do (`psx_bios::io`), once there are records to poll for.
+/// as SIO0's do (`psx_bios::io`), once libpad's adapters have run.
 pub fn on_vblank(m: &mut M) {
-    if !m.sdk.pad.direct || !m.sdk.pad.com {
+    if m.sdk.pad.lib.is_none() {
         return;
     }
     for p in 0..2 {
@@ -190,24 +297,41 @@ pub fn on_vblank(m: &mut M) {
 }
 
 /// The element's verifier (`_padIsVsync`: vblank unmasked and pending)
-/// and handler (`_padIntPad`): each port in turn, its pending reply
-/// processed (`_padInitSioMode`), then its exchange. The handler's
-/// busy-waits take the time they take the original ([`Spin`]): it passes
-/// in the exception, delivering nothing, as at the original's safepoints.
+/// and handler (`_padIntPad`): each port the engine polls in turn, its
+/// pending reply processed (`_padInitSioMode`), then its exchange. The
+/// handler's busy-waits take the time they take the original ([`Spin`]):
+/// it passes in the exception, delivering nothing, as at the original's
+/// safepoints.
 pub fn irq_step(m: &mut M, _step: u32) {
     let vblank = |m: &mut M, r: u32| reg(m, r, 4).is_ok_and(|v| v & 1 != 0);
-    if !vblank(m, I_MASK) || !vblank(m, I_STAT) || !m.sdk.pad.direct {
+    let Some(l) = m.sdk.pad.lib else { return };
+    if !vblank(m, I_MASK) || !vblank(m, I_STAT) {
+        return;
+    }
+    m.mem.w32(l.data + data::CALLED, 1);
+    let (start, stop) = (l.word(m, data::CHAN_START) as i32, l.word(m, data::CHAN_STOP) as i32);
+    // A port the engine doesn't poll counts its rest, up to 150 vblanks.
+    for (rest, off) in [(l.rest, start != 0), (l.rest + 4, stop == 0)] {
+        let n = m.mem.r32(rest) as i32;
+        if off && n < 150 {
+            m.mem.w32(rest, (n + 1) as u32);
+        }
+    }
+    let Some(recs) = l.records(m) else { return };
+    if l.word(m, data::INT_EXEC) == 0 || start > stop {
         return;
     }
     let budget = crate::libetc::LOOP_BUDGET;
     let mut spin = Spin { pass: (m.quantum() / budget).max(1), now: 0, passes: 0 };
-    for chan in 0..2 {
-        take_pending(m, chan);
-        match exchange(m, chan, &mut spin) {
-            Ok(()) => m.sdk.pad.pending[chan] = true,
+    for chan in start.max(0)..=stop.min(1) {
+        let chan = chan as u32;
+        let p = recs + rec::SIZE * chan;
+        take_pending(m, l, recs, chan);
+        match exchange(m, l, recs, chan, &mut spin) {
+            Ok(()) => m.mem.w32(l.fix(chan), 0),
             Err(_) => {
-                fail(m, chan);
-                clear_command(&mut m.sdk.pad.ports[chan]);
+                fail(m, p);
+                clear_command(m, p);
             }
         }
     }
@@ -311,67 +435,63 @@ impl Wire {
 /// +158Ch..+1874h, direct connection): each byte's reply is read, and its
 /// acknowledge awaited, when the next byte goes out; the last one isn't
 /// awaited. An error is the code `_padFuncNextPort` gets.
-fn exchange(m: &mut M, chan: usize, spin: &mut Spin) -> std::result::Result<(), i32> {
+fn exchange(m: &mut M, l: Lib, recs: u32, chan: u32, spin: &mut Spin) -> std::result::Result<(), i32> {
+    let p = recs + rec::SIZE * chan;
     // `_padInitSioMode` starts the wait before select.
     let start = spin.now;
-    let mut x = Exchange { wire: Wire::new(m.sdk.pad.latched[chan]), reply: (0, false), sent: 0, stored: 0, spin };
+    let mut x = Exchange { wire: Wire::new(m.sdk.pad.latched[chan as usize]), rec: p, reply: (0, false), sent: 0, spin };
     // State 0: the engine's next command; select, once the wait is over.
-    let last_id = m.sdk.pad.rx[chan][0];
-    send_auto(&mut m.sdk.pad.ports[chan], last_id);
-    m.sdk.pad.rx[chan][0] = 0;
+    send_auto(m, p);
+    let rx = m.mem.r32(p + rec::RX);
+    m.mem.w8(rx, 0);
     x.spin.until(start + SELECT_WAIT);
-    x.send(0x01);
+    x.select(m);
     // State 1: the command, after a wait (the reply to select isn't kept).
     x.reply_acknowledged(ACK_WAIT, -2)?;
     x.spin.until(x.spin.now + COMMAND_WAIT);
-    let request = m.sdk.pad.ports[chan].request;
-    x.send(if request != 0 { request } else { POLL });
+    let request = m.mem.r8(p + rec::REQUEST);
+    x.next(m, if request != 0 { request } else { POLL });
     // State 2: the ID, which says how many data bytes follow; the TAP
     // byte out (no multitap).
     x.reply_acknowledged(ACK_WAIT, -2)?;
-    let id = x.keep(&mut m.sdk.pad.rx[chan]);
+    let id = x.next(m, 0);
     let mut count = match (id & 0xF) * 2 {
         0 => 32,
         c => c as u32,
     };
-    x.send(0);
     // State 3: 5Ah; the first data byte out.
     x.reply_acknowledged(ACK_WAIT, -2)?;
-    let r = x.keep(&mut m.sdk.pad.rx[chan]);
-    x.send(0);
+    let r = x.next(m, 0);
     if !matches!(r, 0x5A | 0) {
         return Err(-4);
     }
     // State 4: the data bytes; before each but the last two, the other
     // port's pending reply.
     while count >= 2 {
-        take_pending(m, 1 - chan);
+        take_pending(m, l, recs, 1 - chan);
         x.data_acknowledged()?;
-        x.keep(&mut m.sdk.pad.rx[chan]);
-        x.send(0);
+        x.next(m, 0);
         count -= 1;
     }
     count -= 1;
     while count > 0 {
         x.data_acknowledged()?;
-        x.keep(&mut m.sdk.pad.rx[chan]);
-        x.send(0);
+        x.next(m, 0);
         count -= 1;
     }
     x.received();
-    x.keep(&mut m.sdk.pad.rx[chan]);
-    m.sdk.pad.ports[chan].rx_count = x.stored as u8;
+    x.keep(m);
     Ok(())
 }
 
 /// The wire side of an exchange: the byte in flight's reply and
-/// acknowledge, when it went out, how many replies were kept, and the
-/// handler's time.
+/// acknowledge, when it went out, the port's record, and the handler's
+/// time.
 struct Exchange<'a> {
     wire: Wire,
+    rec: u32,
     reply: (u8, bool),
     sent: u64,
-    stored: usize,
     spin: &'a mut Spin,
 }
 
@@ -379,6 +499,37 @@ impl Exchange<'_> {
     fn send(&mut self, tx: u8) {
         self.reply = self.wire.byte(tx);
         self.sent = self.spin.now;
+    }
+
+    /// `_padSioRW(-2)`: select goes out, its reply not to be kept.
+    fn select(&mut self, m: &mut M) {
+        m.mem.w8(self.rec + rec::RX_COUNT, 0xFF);
+        m.mem.w8(self.rec + rec::TX_COUNT, 1);
+        let tx = m.mem.r32(self.rec + rec::TX);
+        m.mem.w8(tx, 0x01);
+        self.send(0x01);
+    }
+
+    /// The byte in flight's reply into the receive buffer at the receive
+    /// count, unless that is FFh, and the count on.
+    fn keep(&mut self, m: &mut M) -> u8 {
+        let r = self.reply.0;
+        let n = m.mem.r8(self.rec + rec::RX_COUNT);
+        if (n as u32) < RX {
+            let rx = m.mem.r32(self.rec + rec::RX);
+            m.mem.w8(rx + n as u32, r);
+        }
+        m.mem.w8(self.rec + rec::RX_COUNT, n.wrapping_add(1));
+        r
+    }
+
+    /// The end of `_padSioRW2` and `_padSioRW`: the reply kept, `tx` out.
+    fn next(&mut self, m: &mut M, tx: u8) -> u8 {
+        let n = m.mem.r8(self.rec + rec::TX_COUNT);
+        m.mem.w8(self.rec + rec::TX_COUNT, n.wrapping_add(1));
+        let r = self.keep(m);
+        self.send(tx);
+        r
     }
 
     /// Spin until the byte in flight's reply is in.
@@ -413,92 +564,100 @@ impl Exchange<'_> {
         self.received();
         self.acknowledge(from, DATA_ACK_WAIT, -0x14)
     }
-
-    /// Keep the byte in flight's reply in the receive buffer.
-    fn keep(&mut self, rx: &mut [u8; RX]) -> u8 {
-        let r = self.reply.0;
-        if let Some(b) = rx.get_mut(self.stored) {
-            *b = r;
-        }
-        self.stored += 1;
-        r
-    }
 }
 
 /// A completed exchange's reply, if one is pending: processed, and its
 /// command retired (`_padInitSioMode`; the data state for the other port).
-fn take_pending(m: &mut M, chan: usize) {
-    if std::mem::take(&mut m.sdk.pad.pending[chan]) {
-        receive(m, chan);
-        clear_command(&mut m.sdk.pad.ports[chan]);
+fn take_pending(m: &mut M, l: Lib, recs: u32, chan: u32) {
+    if m.mem.r32(l.fix(chan)) == 0 {
+        m.mem.w32(l.fix(chan), u32::MAX);
+        let p = recs + rec::SIZE * chan;
+        receive(m, p);
+        clear_command(m, p);
     }
 }
 
 /// `_padFuncSendAuto` (direct): the command the port's command state asks
-/// for. `last_id` is the last exchange's ID byte.
-fn send_auto(p: &mut Port, last_id: u8) {
+/// for, after the last exchange's ID byte.
+fn send_auto(m: &mut M, p: u32) {
+    let last_id = m.mem.r8(m.mem.r32(p + rec::RX));
     if last_id == ID_CONFIG {
-        if p.kind == 0 || p.cmd_state == CMD_DONE {
-            p.request = CONFIG;
+        if m.mem.r8(p + rec::KIND) == 0 || m.mem.r8(p + rec::CMD_STATE) == CMD_DONE {
+            para_mode(m, p, 0);
             return;
         }
-        if p.state == STATE_FIND_CTP1 {
-            clear_info(p);
+        if m.mem.r8(p + rec::STATE) == STATE_FIND_CTP1 {
+            clear_info(m, p);
         }
     }
-    match p.cmd_state {
+    match m.mem.r8(p + rec::CMD_STATE) {
         // Into config mode, and out of it.
-        CMD_CONFIG | CMD_CONFIG_OFF => p.request = CONFIG,
+        CMD_CONFIG => para_mode(m, p, 1),
+        CMD_CONFIG_OFF => para_mode(m, p, 0),
         // The other states' requests (the info tables, `PadSetActAlign`'s
         // 4Dh) go to a pad in config mode, which a digital pad never is.
         _ => {}
     }
 }
 
+/// `_padCmdParaMode`: config mode (43h) next, its one byte `mode` (1: in,
+/// 0: out).
+fn para_mode(m: &mut M, p: u32, mode: u8) {
+    m.mem.w8(p + rec::REQUEST, CONFIG);
+    m.mem.w32(p + rec::CMD_DATA, p + rec::PARAM);
+    m.mem.w8(p + rec::PARAM, mode);
+    m.mem.w8(p + rec::CMD_LEN, 1);
+}
+
 /// `_padFuncRecvAuto` (direct): a completed exchange's reply into the
 /// game's buffer, and the detection step it makes.
-fn receive(m: &mut M, chan: usize) {
-    let rx = m.sdk.pad.rx[chan];
-    let mut p = m.sdk.pad.ports[chan];
-    let buf = p.buf;
-    if rx[0] & 0xF0 == 0 {
+fn receive(m: &mut M, p: u32) {
+    let (rx, buf) = (m.mem.r32(p + rec::RX), m.mem.r32(p + rec::BUF));
+    let id = m.mem.r8(rx);
+    if id & 0xF0 == 0 {
         m.mem.write(buf, &[0xFF, 0]);
-        p.kind = 0;
-        clear_info(&mut p);
-        m.sdk.pad.ports[chan] = p;
+        m.mem.w8(p + rec::KIND, 0);
+        m.mem.w8(p + rec::BUF_LEN, 0);
+        clear_info(m, p);
         return;
     }
-    let old = p.kind;
-    p.kind = rx[0] >> 4;
-    if p.kind == 0xF {
-        p.kind = old;
-    } else {
-        m.mem.write(buf, &[0, rx[0]]);
-        let n = (p.rx_count as usize).min(RX);
+    let old = m.mem.r8(p + rec::KIND);
+    let kind = if id >> 4 == 0xF { old } else { id >> 4 };
+    m.mem.w8(p + rec::KIND, kind);
+    if id >> 4 != 0xF {
+        m.mem.write(buf, &[0, id]);
+        let n = m.mem.r8(p + rec::RX_COUNT);
+        m.mem.w8(p + rec::BUF_LEN, n);
+        let n = (n as u32).min(RX);
         if n > 2 {
-            m.mem.write(buf + 2, &rx[2..n]);
+            let mut data = vec![0; (n - 2) as usize];
+            m.mem.read(rx + 2, &mut data);
+            m.mem.write(buf + 2, &data);
         }
     }
-    if (rx[1] == 0 && (p.cmd_state != CMD_CONFIG || p.align.is_some())) || p.kind != old {
-        clear_info(&mut p);
+    let config = m.mem.r8(p + rec::CMD_STATE) == CMD_CONFIG;
+    if (m.mem.r8(rx + 1) == 0 && (!config || m.mem.r32(p + rec::PREPARE) != 0)) || kind != old {
+        clear_info(m, p);
     }
-    p.fails = 0;
-    m.sdk.pad.ports[chan] = p;
-    let p = &mut m.sdk.pad.ports[chan];
-    if p.cmd_state == CMD_DONE || (p.cmd_state != CMD_DETECT && p.request == 0) {
+    m.mem.w8(p + rec::FAILS, 0);
+    let cmd = m.mem.r8(p + rec::CMD_STATE);
+    if cmd == CMD_DONE || (cmd != CMD_DETECT && m.mem.r8(p + rec::REQUEST) == 0) {
         return;
     }
-    if p.cmd_state.wrapping_sub(2) < 0xFC && rx[0] != ID_CONFIG {
-        clear_info(p);
+    if cmd.wrapping_sub(2) < 0xFC && id != ID_CONFIG {
+        clear_info(m, p);
         return;
     }
-    match p.cmd_state {
+    match cmd {
         CMD_DETECT => {
-            p.state = STATE_FIND_PAD;
-            p.cmd_state = CMD_CONFIG;
+            m.mem.w8(p + rec::STATE, STATE_FIND_PAD);
+            m.mem.w8(p + rec::CMD_STATE, CMD_CONFIG);
         }
-        CMD_CONFIG => p.cmd_state = 2,
-        CMD_CONFIG_OFF => p.cmd_state = CMD_DONE,
+        CMD_CONFIG => {
+            m.mem.w8(p + rec::INFO_INDEX, 0);
+            m.mem.w8(p + rec::CMD_STATE, 2);
+        }
+        CMD_CONFIG_OFF => m.mem.w8(p + rec::CMD_STATE, CMD_DONE),
         // Replies to the info and actuator requests: a pad in config
         // mode's, which a digital pad never is.
         _ => {}
@@ -506,94 +665,112 @@ fn receive(m: &mut M, chan: usize) {
 }
 
 /// `_dirFailAuto`: an exchange failed.
-fn fail(m: &mut M, chan: usize) {
-    let p = &mut m.sdk.pad.ports[chan];
-    p.failures = p.failures.wrapping_add(1);
-    match p.cmd_state {
+fn fail(m: &mut M, p: u32) {
+    let n = m.mem.r32(p + rec::FAILURES);
+    m.mem.w32(p + rec::FAILURES, n.wrapping_add(1));
+    let fails = m.mem.r8(p + rec::FAILS);
+    match m.mem.r8(p + rec::CMD_STATE) {
         CMD_DETECT => {}
         CMD_CONFIG => {
-            if p.fails < RETRIES {
-                p.fails += 1;
+            if fails < RETRIES {
+                m.mem.w8(p + rec::FAILS, fails + 1);
             } else {
-                p.state = STATE_FIND_CTP1;
-                p.cmd_state = CMD_DONE;
+                m.mem.w8(p + rec::STATE, STATE_FIND_CTP1);
+                m.mem.w8(p + rec::CMD_STATE, CMD_DONE);
             }
             return;
         }
         _ => {
-            if p.fails < RETRIES {
-                p.fails += 1;
+            if fails < RETRIES {
+                m.mem.w8(p + rec::FAILS, fails + 1);
                 return;
             }
-            if p.state != STATE_DISCON {
-                clear_info(p);
-            }
+            clear_info(m, p);
         }
     }
-    if m.sdk.pad.rx[chan][0] != ID_CONFIG {
-        p.kind = 0;
-        let buf = p.buf;
+    if m.mem.r8(m.mem.r32(p + rec::RX)) != ID_CONFIG {
+        let buf = m.mem.r32(p + rec::BUF);
         m.mem.write(buf, &[0xFF, 0]);
+        m.mem.w8(p + rec::KIND, 0);
+        m.mem.w8(p + rec::BUF_LEN, 0);
     }
 }
 
 /// `_padFuncClrInfo` (direct): a found pad is forgotten.
-fn clear_info(p: &mut Port) {
-    if p.state == STATE_DISCON {
+fn clear_info(m: &mut M, p: u32) {
+    if m.mem.r8(p + rec::STATE) == STATE_DISCON {
         return;
     }
-    p.state = STATE_DISCON;
-    p.cmd_state = CMD_DETECT;
-    p.ex_id = 0;
-    p.align = None;
-    p.id_count = 0;
-    p.prev_mode = 0;
+    for f in [rec::STATE, rec::CMD_STATE, rec::ID_COUNT, rec::PREV_MODE, rec::ACT_COUNT, rec::COMB_COUNT] {
+        m.mem.w8(p + f, 0);
+    }
+    m.mem.w16(p + rec::EX_ID, 0);
+    m.mem.w32(p + rec::PREPARE, 0);
+    m.mem.w32(p + rec::APPLY, 0);
+    m.mem.write(p + rec::TABLES, &[0; 12]);
+    m.mem.write(p + rec::ALIGN_REPLY, &[0xFF; 6]);
 }
 
 /// `_padFuncClrCmdNo`: the requested command is the current one.
-fn clear_command(p: &mut Port) {
-    p.current = std::mem::take(&mut p.request);
+fn clear_command(m: &mut M, p: u32) {
+    let r = m.mem.r8(p + rec::REQUEST);
+    m.mem.w8(p + rec::REQUEST, 0);
+    m.mem.w8(p + rec::CURRENT, r);
 }
 
 /// `_padFuncChkEng`: whether the engine is busy for a new command: always,
 /// unless the pad reported extended IDs and its info is loaded.
-fn busy(p: &Port) -> bool {
-    p.ex_id == 0 || p.cmd_state != CMD_DONE
+fn busy(m: &M, p: u32) -> bool {
+    m.mem.r16(p + rec::EX_ID) == 0 || m.mem.r8(p + rec::CMD_STATE) != CMD_DONE
 }
 
 // --- The calls ---------------------------------------------------------------
 
-/// `PadInitDirect(port1, port2)`: fresh records for both ports, their
-/// buffers `FF 00`. The original leaves 1 in v0.
+/// `PadInitDirect(port1, port2)`: `_padInitDirPort` sets out fresh
+/// records for both ports, then their buffers `FF 00`. The original
+/// leaves 1 in v0.
 fn pad_init_direct(m: &mut M, a: [u32; 4]) -> Result {
-    let pad = &mut m.sdk.pad;
-    pad.ports = Default::default();
-    pad.direct = true;
-    for (i, &buf) in a[..2].iter().enumerate() {
-        pad.ports[i].buf = buf;
-    }
-    for &buf in &a[..2] {
-        m.mem.write(buf, &[0xFF, 0]);
-    }
-    ret(1)
+    let l = lib(m, at::INIT_EXEC, data::INT_EXEC)?;
+    let f = m.sdk.at;
+    let init_port = crate::libspu::jal(m, f + at::JAL_INIT_PORT)
+        .ok_or_else(|| format!("libpad/pddirini at {f:#010x}: no _padInitDirPort call where PsyQ 4.7's object has it"))?;
+    m.mem.w32(l.data + data::INT_EXEC, 0);
+    m.mem.w32(l.data + data::MODE_MTAP, 0);
+    Ok(crate::guest_call(m, init_port, &a[..2], move |m| {
+        let recs = l.word(m, data::INFO_DIR);
+        for (i, &buf) in a[..2].iter().enumerate() {
+            let p = recs + rec::SIZE * i as u32;
+            m.mem.w32(p + rec::BUF, buf);
+            m.mem.w32(p + rec::CHILD, 0);
+            m.mem.w32(p + rec::ROOT, p);
+            m.mem.write(buf, &[0xFF, 0]);
+            m.mem.write(p + rec::ALIGN_REPLY, &[0xFF; 6]);
+        }
+        m.mem.w32(l.data + data::INT_EXEC, 1);
+        Flow::ret(1)
+    }))
 }
 
 /// `PadStartCom()`: the element (re)queued at the chain's end, vblank
 /// acknowledged and unmasked, the kernel's vblank acknowledge of root
 /// counter 3 off (ChangeClearRCnt(3, 0)), the critical section left, both
-/// ports forgotten. The original leaves 1 in v0.
+/// ports forgotten, their rests over. The original leaves 1 in v0.
 fn pad_start_com(m: &mut M, _a: [u32; 4]) -> Result {
-    bios(m, 0xC0, 0x03, [PRIORITY, ELEMENT, 0, 0])?;
-    bios(m, 0xC0, 0x02, [PRIORITY, ELEMENT, 0, 0])?;
+    let l = lib(m, at::ELEMENT, data::VSYNC_PARAM)?;
+    m.mem.w32(l.data + data::INT_EXEC, 0);
+    bios(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])?;
+    bios(m, 0xC0, 0x02, [PRIORITY, l.element(), 0, 0])?;
     set_reg(m, I_STAT, 4, !1)?;
     let mask = reg(m, I_MASK, 4)?;
     set_reg(m, I_MASK, 4, mask | 1)?;
     bios(m, 0xC0, 0x0A, [3, 0, 0, 0])?;
     psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
-    m.sdk.pad.com = true;
-    for p in &mut m.sdk.pad.ports {
-        clear_info(p);
+    if let Some(recs) = l.records(m) {
+        clear_info(m, recs);
+        clear_info(m, recs + rec::SIZE);
     }
+    m.mem.write(l.rest, &[0; 8]);
+    m.mem.w32(l.data + data::INT_EXEC, 1);
     ret(1)
 }
 
@@ -601,9 +778,9 @@ fn pad_start_com(m: &mut M, _a: [u32; 4]) -> Result {
 /// element leaves the chain, the critical section is left (v0: 0, from
 /// ExitCriticalSection).
 fn pad_stop_com(m: &mut M, _a: [u32; 4]) -> Result {
+    let l = lib(m, at::ELEMENT, data::VSYNC_PARAM)?;
     bios(m, 0xC0, 0x0A, [3, 1, 0, 0])?;
-    bios(m, 0xC0, 0x03, [PRIORITY, ELEMENT, 0, 0])?;
-    m.sdk.pad.com = false;
+    bios(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])?;
     psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
     ret(0)
 }
@@ -612,12 +789,13 @@ fn pad_stop_com(m: &mut M, _a: [u32; 4]) -> Result {
 /// status byte that isn't 0 in its buffer, FindCTP1 and FindCTP2 read as
 /// FindPad and Stable as ReqInfo.
 fn pad_get_state(m: &mut M, a: [u32; 4]) -> Result {
-    if !m.sdk.pad.direct {
-        return ret(0);
-    }
-    let p = m.sdk.pad.ports[index(a[0])];
-    let busy = p.request != 0 || p.current != 0 || m.mem.r8(p.buf) != 0;
-    let s = match (busy, p.state) {
+    let l = lib(m, at::PORT2INFO, data::PORT2INFO)?;
+    let Some(p) = l.port(m, a[0]) else { return ret(0) };
+    let b = |f: u32| m.mem.r8(p + f) != 0;
+    // A multitap's port also waits for the command before.
+    let child = m.mem.r32(p + rec::ROOT) != p && b(rec::PREVIOUS);
+    let busy = b(rec::REQUEST) || b(rec::CURRENT) || child || m.mem.r8(m.mem.r32(p + rec::BUF)) != 0;
+    let s = match (busy, m.mem.r8(p + rec::STATE)) {
         (true, STATE_FIND_CTP1 | STATE_FIND_CTP2) => STATE_FIND_PAD,
         (true, STATE_STABLE) => STATE_REQ_INFO,
         (_, s) => s,
@@ -626,50 +804,135 @@ fn pad_get_state(m: &mut M, a: [u32; 4]) -> Result {
 }
 
 /// `PadInfoMode(port, mode, id)`: 1 the terminal type, 2 the extended ID,
-/// 3 the mode offset, 4 the ID table (`id < 0`: its size), 100 the
-/// failure count, else 0.
+/// 3 the mode offset, 4 the ID table's entry `id` (`id < 0`: its size),
+/// 100 the failure count, else 0.
 fn pad_info_mode(m: &mut M, a: [u32; 4]) -> Result {
-    let p = &m.sdk.pad.ports[index(a[0])];
-    let id = a[2] as i32;
+    let l = lib(m, at::PORT2INFO, data::PORT2INFO)?;
+    let Some(p) = l.port(m, a[0]) else { return ret(0) };
+    let (id, ids) = (a[2] as i32, m.mem.r8(p + rec::ID_COUNT) as i32);
     ret(match a[1] {
-        1 => p.kind as u32,
-        2 => p.ex_id as u32,
-        3 => p.prev_mode as u32,
+        1 => m.mem.r8(p + rec::KIND) as u32,
+        2 => m.mem.r16(p + rec::EX_ID) as u32,
+        3 => m.mem.r8(p + rec::PREV_MODE) as u32,
+        4 if id < 0 => ids as u32,
         // The table's entries come from a pad in config mode; there are
         // none without one.
-        4 if id < 0 => p.id_count as u32,
-        100 => p.failures,
+        4 if id < ids => m.mem.r16(m.mem.r32(p + rec::TABLES) + 2 * id as u32) as u32,
+        100 => m.mem.r32(p + rec::FAILURES),
         _ => 0,
     })
 }
 
 /// `PadSetAct(port, table, size)`: the actuator table libpad sends from.
+/// The original leaves the port's record in v0.
 fn pad_set_act(m: &mut M, a: [u32; 4]) -> Result {
-    let p = &mut m.sdk.pad.ports[index(a[0])];
-    p.act = a[1];
-    p.act_size = a[2] as u8;
-    ret(0)
+    let l = lib(m, at::PORT2INFO, data::PORT2INFO)?;
+    let Some(p) = l.port(m, a[0]) else { return ret(0) };
+    m.mem.w32(p + rec::ACT, a[1]);
+    m.mem.w8(p + rec::ACT_SIZE, a[2] as u8);
+    ret(p)
 }
 
 /// `PadSetActAlign(port, table)`: 1 when the engine takes the actuator
-/// alignment command, 0 when it is busy.
+/// alignment command (its handlers, `pdcmd2.o`'s, for the info states),
+/// 0 when it is busy.
 fn pad_set_act_align(m: &mut M, a: [u32; 4]) -> Result {
-    let p = &mut m.sdk.pad.ports[index(a[0])];
-    if busy(p) {
+    let l = lib(m, at::PORT2INFO, data::PORT2INFO)?;
+    let Some(p) = l.port(m, a[0]) else { return ret(0) };
+    if busy(m, p) {
         return ret(0);
     }
-    p.cmd_state = CMD_CONFIG;
-    p.align = Some(a[1]);
+    let f = m.sdk.at;
+    let handler = |m: &M, (hi, lo): (u32, u32)| {
+        crate::libspu::pair(m, f + hi, f + lo).ok_or_else(|| format!("libpad/pdcmd2 at {f:#010x}: no handler where PsyQ 4.7's object has it"))
+    };
+    let (prepare, apply) = (handler(m, at::PREPARE)?, handler(m, at::APPLY)?);
+    m.mem.w8(p + rec::CMD_STATE, CMD_CONFIG);
+    m.mem.w32(p + rec::PREPARE, prepare);
+    m.mem.w32(p + rec::ALIGN, a[1]);
+    m.mem.w32(p + rec::APPLY, apply);
     ret(1)
+}
+
+/// btn's libpad as its code addresses it, for the tests: the calls'
+/// operands, `pdresres.o`'s `.data` as the EXE loads it, and a double of
+/// `_padInitDirPort` (guest code in a game).
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+    use crate::libetc::fixture::{jal_to, pair_at};
+
+    const CALLS: &[(&str, u32)] = &[
+        ("PadSetAct", 0x8004_5D24),
+        ("PadSetActAlign", 0x8004_5D64),
+        ("PadGetState", 0x8004_5ED4),
+        ("PadInfoMode", 0x8004_5FA4),
+        ("PadStartCom", 0x8004_60A4),
+        ("PadStopCom", 0x8004_6170),
+        ("PadInitDirect", 0x8004_61B4),
+    ];
+    const INIT_DIR_PORT: u32 = 0x8004_6264;
+    const IS_VSYNC: u32 = 0x8004_6CA4;
+    pub const DATA: u32 = 0x8005_E1C4;
+    pub const REST: u32 = 0x800A_7E18;
+    /// `pddirres.o`'s `.bss`: the records, then the receive and transmit
+    /// buffers.
+    pub const RECORDS: u32 = 0x800A_7B98;
+
+    fn call_at(name: &str) -> u32 {
+        CALLS.iter().find(|(n, _)| *n == name).unwrap().1
+    }
+
+    pub fn install(m: &mut M) {
+        m.mem.w32(DATA + data::CHAN_STOP, 1);
+        m.mem.write(DATA + data::FIX_RESULT, &[0xFF; 8]);
+        m.mem.w32(DATA + data::VSYNC_PARAM + 4, IS_VSYNC + at::INT_PAD);
+        m.mem.w32(DATA + data::VSYNC_PARAM + 8, IS_VSYNC);
+        pair_at(m, IS_VSYNC + at::INT_PAD + at::REST.0, REST);
+        let init = call_at("PadInitDirect");
+        pair_at(m, init + at::INIT_EXEC.0, DATA + data::INT_EXEC);
+        jal_to(m, init + at::JAL_INIT_PORT, INIT_DIR_PORT);
+        for f in ["PadStartCom", "PadStopCom"] {
+            pair_at(m, call_at(f) + at::ELEMENT.0, DATA + data::VSYNC_PARAM);
+        }
+        for f in ["PadGetState", "PadInfoMode", "PadSetAct", "PadSetActAlign"] {
+            pair_at(m, call_at(f), DATA + data::PORT2INFO);
+        }
+        let align = call_at("PadSetActAlign");
+        pair_at(m, align + at::PREPARE.0, align + 0x7C);
+        pair_at(m, align + at::APPLY.0, align + 0xA4);
+        crate::testing::double(INIT_DIR_PORT, init_dir_port);
+    }
+
+    /// The call `name`, at its place in btn.
+    pub fn run(m: &mut M, name: &str, a: [u32; 4]) -> u32 {
+        let f = ADAPTERS.iter().find(|(n, _)| *n == name).unwrap().1;
+        m.sdk.at = call_at(name);
+        crate::testing::call(m, f, a)
+    }
+
+    /// `_padInitDirPort`: the records cleared and pointed at their
+    /// buffers, `_padInfoDir` set.
+    fn init_dir_port(m: &mut M) {
+        m.mem.write(RECORDS, &[0; 2 * rec::SIZE as usize]);
+        for i in 0..2 {
+            let p = RECORDS + rec::SIZE * i;
+            m.mem.w32(p + rec::RX, RECORDS + 2 * rec::SIZE + RX * i);
+            m.mem.w32(p + rec::TX, RECORDS + 2 * rec::SIZE + 0x48 + RX * i);
+        }
+        m.mem.w32(DATA + data::INFO_DIR, RECORDS);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::fixture::{DATA, RECORDS, install, run};
     use super::*;
-    use crate::testing::{call, machine_with_bus, vblanks};
+    use crate::testing::{machine_with_bus, vblanks};
 
     const B0: u32 = 0x8010_0000;
     const B1: u32 = 0x8010_0040;
+    const ELEMENT: u32 = DATA + data::VSYNC_PARAM;
 
     fn buf(m: &M, a: u32) -> [u8; 4] {
         let mut b = [0; 4];
@@ -679,15 +942,20 @@ mod tests {
 
     fn started() -> M {
         let mut m = machine_with_bus();
+        install(&mut m);
         m.mem.write(B0, &[0xAA; 0x80]);
-        assert_eq!(call(&mut m, pad_init_direct, [B0, B1, 0, 0]), 1);
+        assert_eq!(run(&mut m, "PadInitDirect", [B0, B1, 0, 0]), 1);
         assert_eq!(buf(&m, B0), [0xFF, 0, 0xAA, 0xAA]);
-        assert_eq!(call(&mut m, pad_start_com, [0; 4]), 1);
+        assert_eq!(run(&mut m, "PadStartCom", [0; 4]), 1);
         m
     }
 
     fn state(m: &mut M, port: u32) -> u32 {
-        call(m, pad_get_state, [port, 0, 0, 0])
+        run(m, "PadGetState", [port, 0, 0, 0])
+    }
+
+    fn info(m: &mut M, port: u32, mode: u32) -> u32 {
+        run(m, "PadInfoMode", [port, mode, 0, 0])
     }
 
     #[test]
@@ -712,11 +980,13 @@ mod tests {
         assert_eq!(buf(&m, B0), [0xFF, 0, 0xAA, 0xAA], "the reply waits a vblank");
         assert_eq!(state(&mut m, 0), 0);
         assert_eq!(buf(&m, B1), [0xFF, 0, 0xAA, 0xAA]);
+        assert_eq!(m.mem.r32(DATA + data::FIX_RESULT), 0, "pending, in _padFixResult");
         vblanks(&mut m, 1);
         assert_eq!(buf(&m, B0), [0, 0x41, 0xFF, 0xEF]);
         assert_eq!(state(&mut m, 0), 1);
-        assert_eq!(call(&mut m, pad_info_mode, [0, 1, 0, 0]), 4);
-        assert_eq!(m.sdk.pad.ports[0].current, CONFIG);
+        assert_eq!(info(&mut m, 0, 1), 4);
+        assert_eq!(m.mem.r8(RECORDS + rec::CURRENT), CONFIG, "in port 1's record");
+        assert_eq!(m.mem.r32(DATA + data::CALLED), 1);
         // The handler's waits end at the pass that sees what they wait for
         // (D66): a refused command and nothing connected take 628 passes.
         // This machine has no guest budget, so the passes are its time.
@@ -726,18 +996,19 @@ mod tests {
             assert_eq!(state(&mut m, 0), 1);
             vblanks(&mut m, 1);
         }
-        assert_eq!(m.sdk.pad.ports[0].state, STATE_FIND_CTP1);
+        assert_eq!(m.mem.r8(RECORDS + rec::STATE), STATE_FIND_CTP1);
         vblanks(&mut m, 1);
         assert_eq!(state(&mut m, 0), 1, "the poll's reply is pending");
         // A poll and nothing connected: 642 passes.
         assert_eq!(spent(&m), 12_840);
         vblanks(&mut m, 1);
         assert_eq!(state(&mut m, 0), 2);
-        assert_eq!(call(&mut m, pad_info_mode, [0, 100, 0, 0]), 12);
-        assert_eq!(call(&mut m, pad_info_mode, [0x10, 1, 0, 0]), 0);
-        assert_eq!(call(&mut m, pad_info_mode, [0x10, 100, 0, 0]), 15, "port 2 fails every vblank");
+        assert_eq!(info(&mut m, 0, 100), 12);
+        assert_eq!(info(&mut m, 0x10, 1), 0);
+        assert_eq!(info(&mut m, 0x10, 100), 15, "port 2 fails every vblank");
         assert_eq!(state(&mut m, 0x10), 0);
-        assert_eq!(call(&mut m, pad_set_act_align, [0, B1, 0, 0]), 0);
+        assert_eq!(run(&mut m, "PadSetActAlign", [0, B1, 0, 0]), 0);
+        assert_eq!(run(&mut m, "PadSetAct", [0x10, B1, 2, 0]), RECORDS + rec::SIZE, "port 2's record");
         // The status byte reads as busy.
         m.mem.w8(B0, 1);
         assert_eq!(state(&mut m, 0), 1);
@@ -747,14 +1018,14 @@ mod tests {
     fn stop_and_restart() {
         let mut m = started();
         vblanks(&mut m, 3);
-        assert_eq!(call(&mut m, pad_stop_com, [0; 4]), 0);
-        assert!(!m.sdk.pad.com);
+        assert_eq!(run(&mut m, "PadStopCom", [0; 4]), 0);
+        assert!(!m.kernel.int_handlers[&2].contains(&ELEMENT));
         m.mem.write(B0, &[9; 4]);
         vblanks(&mut m, 2);
         assert_eq!(buf(&m, B0), [9; 4], "nothing polls");
-        call(&mut m, pad_start_com, [0; 4]);
-        assert_eq!(m.sdk.pad.ports[0].state, 0, "forgotten");
-        assert_eq!(m.kernel.int_handlers[&2], vec![ELEMENT]);
+        run(&mut m, "PadStartCom", [0; 4]);
+        assert_eq!(m.mem.r8(RECORDS + rec::STATE), 0, "forgotten");
+        assert_eq!(m.kernel.int_handlers[&2], vec![ELEMENT], "libpad's own element");
         // Detection again: a poll, its reply a vblank later.
         vblanks(&mut m, 1);
         assert_eq!(buf(&m, B0), [9; 4]);
@@ -765,9 +1036,9 @@ mod tests {
         // A reply still pending when PadInitDirect starts over lands in
         // the new records' buffer, whose length was cleared.
         vblanks(&mut m, 12);
-        assert!(m.sdk.pad.pending[0]);
+        assert_eq!(m.mem.r32(DATA + data::FIX_RESULT), 0);
         m.mem.write(B1 + 0x10, &[7; 4]);
-        call(&mut m, pad_init_direct, [B1 + 0x10, 0, 0, 0]);
+        run(&mut m, "PadInitDirect", [B1 + 0x10, 0, 0, 0]);
         vblanks(&mut m, 1);
         assert_eq!(buf(&m, B1 + 0x10), [0, 0x41, 7, 7]);
     }
@@ -778,6 +1049,6 @@ mod tests {
         let mask = m.io.as_ref().unwrap().irq.mask;
         set_reg(&mut m, I_MASK, 4, mask & !1).unwrap();
         vblanks(&mut m, 3);
-        assert_eq!(call(&mut m, pad_info_mode, [0x10, 100, 0, 0]), 0);
+        assert_eq!(info(&mut m, 0x10, 100), 0);
     }
 }

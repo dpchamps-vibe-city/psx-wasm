@@ -225,7 +225,7 @@ impl Sdk for Psyq {
     }
 
     fn chain_element(m: &M, elem: u32) -> Option<u32> {
-        (elem == libpad::ELEMENT).then_some(libpad::STEP).or_else(|| libmc::chain_element(m, elem))
+        libpad::chain_element(m, elem).or_else(|| libmc::chain_element(m, elem))
     }
 
 }

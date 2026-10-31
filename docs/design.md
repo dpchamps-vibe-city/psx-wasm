@@ -487,7 +487,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libpress | `adapter-or-device`, chip mdec. Native (bof4; D64): adapters for every `libpress.o` function that reaches the MDEC or its DMA (`DecDCTReset`, `DecDCTPutEnv`, `DecDCTin`, `DecDCTout`, `DecDCTinSync`, `DecDCToutSync`) over the MDEC's decode function, completing DMA0 and DMA1 on the shared controller. libpress's tables stay in its `.data` (D61), so `DecDCTGetEnv` and the callback setters stay guest code, as do the run-length coders (`DecDCTvlc*`). On the device: original code over the MDEC, DMA0 in and DMA1 out (D58). |
 | libspu | `adapter-or-device`, chip spu. Native (btn, bof4; D63): adapters where libspu touches the SPU: `spu.o`'s `_spu_init`, `_spu_FsetRXX`, `_spu_FsetRXXa`, `_spu_Fw` (SPU RAM by DMA4 or the FIFO) and `_spu_FiDMA` (DMA4's callback), and the functions that program it themselves (`SpuSetKey`, `SpuSetVoiceAttr`, `SpuSetCommonAttr`, `_SpuSetAnyVoice`, the reverb functions, `SpuClearReverbWorkArea`, the key and envelope readers), over the mixer API (`psx_spu::mixer`). libspu's state stays in its `.data`, found through the objects' code (D61), so `SpuInit`, `SpuStart`, `SpuWritePartly`, `SpuSetTransferStartAddr`, `SpuIsTransferCompleted`, the allocator and the voice-mask wrappers stay guest code over them. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
 | libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 registers from its table); natively it is an adapter (D63) that calls the original `_SsVmInit` and writes libsnd's globals where libsnd keeps them; the rest of libsnd reaches the SPU through libspu's adapters. On the device those writes reach the SPU (D47). |
-| libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), their state in the runtime, the games' buffers in guest RAM; `PadStartCom` installs a `SysEnqIntRP` element the kernel runs as an adapter step. On the device: original code over SIO0 (D40), a port of the oracle's. |
+| libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), its state where libpad keeps it (`pddirres.o`'s port records and receive buffers, `pdresres.o`'s engine variables, found through the objects' code; D67), the games' buffers in guest RAM; `PadInitDirect` calls `_padInitDirPort`, which stays guest code; `PadStartCom` queues libpad's own `SysEnqIntRP` element, `_padVsyncParam`, which the kernel runs as an adapter step. On the device: original code over SIO0 (D40), a port of the oracle's. |
 | libmcrd | `guest`, over the HLE BIOS card functions (D43). |
 | libcard | `adapter`. The functions that patch Sony BIOS code in kernel RAM (`_patch_card` and its kin) are adapters with nothing to patch; the wrappers run as original code into the BIOS (D43). |
 | libmcx | `adapter-or-device`, chip memcard (D65): the PocketStation library, which drives the card slots on SIO0 itself. Native (btn): adapters for `McxStartCom` (vblank in I_STAT/I_MASK, its element appended to the kernel's priority-2 chain through the table of tables) and `_mcxDsrEntry` (each byte of a transfer, the card answering as a standard card does), with the vblank handler and both elements' verifiers run as adapter steps in their places; libmcx's state stays where libmcx keeps it (D61's way), so the command functions, `McxSync` and `McxStopCom` are guest code over it. On the device: original code over SIO0, its cards the BIOS's images, its element in the kernel's RAM chain. |
@@ -2156,6 +2156,11 @@ that machine instead of approximating it:
   `PadStopCom`, which shares `PadStartCom`'s element. Their state (the
   port records, receive buffers, pending replies) is in the runtime; the
   games' buffers are guest RAM, written as the original writes them.
+  *Later:* D67 keeps that state where libpad keeps it: `pddirres.o`'s
+  records and buffers, which `PadInitDirect`'s call of `_padInitDirPort`
+  (guest code) sets out, and `pdresres.o`'s engine variables
+  (`_padFixResult`, `_padIntExec`, the polled ports), found through the
+  calls' code.
 - **The engine** is libpad's direct-connection code, from the 4.7
   objects: per vblank, each port's pending reply processed, then an
   exchange whose bytes a digital-pad model answers (SIO0's device model
@@ -2164,7 +2169,9 @@ that machine instead of approximating it:
 - **The interrupt is a kernel chain element the adapters own**
   (`Sdk::chain_element`): `PadStartCom` queues an address no game code
   has at priority 2, and the kernel runs it in its place in the chain.
-  The pads latch their buttons at the vblank, as SIO0's do.
+  The pads latch their buttons at the vblank, as SIO0's do. *Later:* the
+  element is libpad's own, `_padVsyncParam` in `pdresres.o`'s `.data`
+  (D67).
 - **Its busy-waits take their time.** Each of the original's waits on
   SIO0 or root counter 2 ends at the next safepoint, a quantum later,
   inside the interrupt: half a frame with two pads, where hardware takes
