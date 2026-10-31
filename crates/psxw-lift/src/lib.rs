@@ -631,6 +631,38 @@ mod tests {
         translate_all(&mut program, &originals, &["test".into()])
     }
 
+    /// A callee inlined for the registers it reads ends in a tail jump to
+    /// another function: that function returns to the inlined call's return
+    /// site, not out of the caller.
+    #[test]
+    fn tail_jump_out_of_inlined_callee() {
+        let (other, inlined) = (BASE + 0x24, BASE + 0x2C);
+        let words = [
+            0x27BD_FFE8,                               // addiu sp, sp, -24
+            0xAFBF_0010,                               // sw ra, 16(sp)
+            0x2408_0005,                               // addiu t0, zero, 5
+            0x0C00_0000 | inlined >> 2 & 0x03FF_FFFF,  // jal inlined
+            0,                                         // nop
+            0x2442_0001,                               // addiu v0, v0, 1
+            0x8FBF_0010,                               // lw ra, 16(sp)
+            0x03E0_0008,                               // jr ra
+            0x27BD_0018,                               // addiu sp, sp, 24
+            0x03E0_0008,                               // other: jr ra
+            0x2482_0007,                               //   addiu v0, a0, 7
+            0x0100_2021,                               // inlined: addu a0, t0, zero
+            0x0800_0000 | other >> 2 & 0x03FF_FFFF,    //   j other
+            0,                                         //   nop
+        ];
+        let out = lift_words(&words, &[(BASE, 0x24), (other, 8), (inlined, 0xC)]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert!(out.inline.contains_key(&("test".to_string(), inlined)), "{:?}", out.inline);
+        let t = out.ok.iter().find(|t| t.func.addr == BASE).expect("translated");
+        let ret = BASE + 0x14;
+        assert!(!t.c.contains(&format!("return psxw_f_{other:08X}(")), "{}", t.c);
+        assert!(t.c.contains(&format!("t_ = r31; switch (t_) {{ case 0x{ret:08X}u: goto L_{ret:08X};")), "{}", t.c);
+        assert_eq!(t.facts.entry_reads, 0, "v0 at the return site is the tail callee's");
+    }
+
     /// `bltzal ra` tests ra as it was before the link overwrites it.
     #[test]
     fn link_branch_tests_ra_before_linking() {
