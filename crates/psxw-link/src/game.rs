@@ -487,6 +487,9 @@ impl Resolver for R<'_, '_> {
         if name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
             return Ok(Lowered::Call(self.ctx.synth(Synth::InlineCopy)));
         }
+        if let Some(op) = crate::link::division_intrinsic(&name) {
+            return Ok(crate::link::lower_division(self, op));
+        }
         if let Some(m) = self.ctx.mod_of[self.input] {
             if let Some(l) = self.mod_call(m, symbol, sig)? {
                 return Ok(l);

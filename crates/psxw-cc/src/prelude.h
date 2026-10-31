@@ -6,6 +6,13 @@
 /* MIPS `break n` becomes a runtime call (normalize rule asm-break). */
 void __psxw_break(int code);
 
+/* 32-bit division and remainder by a non-constant (normalize, D36): calls
+ * clang can't move or drop; the linker lowers each to the R3000's. */
+int __psxw_div_s(int n, int d);
+unsigned int __psxw_div_u(unsigned int n, unsigned int d);
+int __psxw_rem_s(int n, int d);
+unsigned int __psxw_rem_u(unsigned int n, unsigned int d);
+
 /* PsyQ GTE macros become these (normalize rule asm-gte): the runtime's GTE
  * intrinsics, which the linker binds, and byte-aligned guest accesses. */
 unsigned int psx_gte_mfc2(unsigned int r);

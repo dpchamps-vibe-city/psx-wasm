@@ -130,6 +130,8 @@ pub fn compile(
     }
     // Loops read memory each pass, as lifted loops do.
     text = edit::apply(&text, ast::loop_barriers(&ast::parse(&text)));
+    // A division by a variable stays where the source puts it (D36).
+    text = edit::apply(&text, ast::divisions(&ast::parse(&text)));
 
     let i_path = work.join(format!("{stem}.i"));
     let obj = work.join(format!("{stem}.o"));
@@ -375,6 +377,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(out.ok, "{:?}", out.errors);
         Some(out.lifted.into_iter().map(|l| (l.name, l.reason)).collect())
+    }
+
+    /// A division by a variable is a call clang can neither move nor drop,
+    /// whatever the paths that use its result (D36); constant divisors,
+    /// enum ones included, stay divisions, so constant expressions stay
+    /// constant.
+    #[test]
+    fn divisions_by_variables_are_calls() {
+        let c = "enum { EIGHT = 8 };\nint g;\n\
+                 int f(int a, int b, unsigned u, unsigned v) {\n\
+                   static int s = 64 / EIGHT;\n  int q = a / b;\n  g = u % v;\n\
+                   switch (a) { case 32 / EIGHT: return s; }\n\
+                   if (g) return q;\n  return a / EIGHT + a % 3;\n}\n";
+        let Some(path) = psxw_inputs::Workspace::discover().ok().and_then(|w| w.clang().ok()) else {
+            return eprintln!("skipped: run `psxw toolchain fetch`");
+        };
+        let dir = std::env::temp_dir().join(format!("psxw-compile-test-div-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.c"), c).unwrap();
+        let clang = Clang::new(path, dir.clone(), vec![], vec![], &dir).unwrap();
+        let out = compile(&clang, &dir.join("t.c"), &dir, "t", &[], None).unwrap();
+        assert!(out.ok, "{:?}", out.errors);
+        let mut imports = Vec::new();
+        for p in wasmparser::Parser::new(0).parse_all(&std::fs::read(dir.join("t.o")).unwrap()) {
+            if let wasmparser::Payload::ImportSection(r) = p.unwrap() {
+                imports.extend(r.into_imports().map(|i| i.unwrap().name.to_string()));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        imports.retain(|n| n.starts_with("__psxw_"));
+        imports.sort();
+        assert_eq!(imports, ["__psxw_div_s", "__psxw_rem_u"]);
     }
 
     /// A non-void function that returns no value, by falling off its end

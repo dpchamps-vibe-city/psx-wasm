@@ -240,6 +240,9 @@ impl Resolver for InputResolver<'_, '_> {
         if name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
             return Ok(Lowered::Call(self.ctx.synth(Synth::InlineCopy)));
         }
+        if let Some(op) = division_intrinsic(&name) {
+            return Ok(lower_division(self, op));
+        }
         match name.as_str() {
             "psxw_sp_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.sp)])),
             "psxw_sp_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.sp)])),
@@ -333,6 +336,21 @@ impl Resolver for InputResolver<'_, '_> {
     fn division(&mut self, op: &'static str) -> Option<u32> {
         let d = self.ctx.inputs[self.input].gcc?.division;
         Some(self.ctx.synth(Synth::Division(op, d)))
+    }
+}
+
+/// The R3000 operation a C-tier division call stands for
+/// ([`psxw_cc::DIVISIONS`]).
+pub(crate) fn division_intrinsic(name: &str) -> Option<&'static str> {
+    psxw_cc::DIVISIONS.iter().find(|(n, _)| *n == name).map(|(_, op)| *op)
+}
+
+/// A C-tier division call as D36 has it: the R3000's results with the
+/// original's `break` checks; without GCC conventions, wasm's division.
+pub(crate) fn lower_division<R: Resolver>(r: &mut R, op: &'static str) -> Lowered {
+    match r.division(op) {
+        Some(h) => Lowered::Call(h),
+        None => Lowered::Instrs(vec![crate::bodies::wasm_division(op)]),
     }
 }
 

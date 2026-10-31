@@ -132,6 +132,10 @@ pub(crate) fn references(ctx: &Context, tus: &[TuReport]) -> ReferenceReport {
                 *r.resolved.entry("host-support".into()).or_default() += 1;
                 continue;
             }
+            if psxw_cc::DIVISIONS.iter().any(|(n, _)| *n == s.name) {
+                *r.resolved.entry("link".into()).or_default() += 1;
+                continue;
+            }
             match ctx.map.resolve(&tu.container, &s.name) {
                 Some(res) => *r.resolved.entry(format!("{:?}", res.via)).or_default() += 1,
                 None => {
