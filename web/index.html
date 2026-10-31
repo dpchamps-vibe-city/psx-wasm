@@ -16,6 +16,7 @@
     #mod-list li { display: flex; gap: 8px; align-items: center; padding: 2px 0; }
     #mod-list li span { flex: 1; font-family: ui-monospace, monospace; font-size: 13px; overflow-wrap: anywhere; }
     #mods-note { color: var(--muted); font-size: 13px; }
+    select { font: inherit; padding: 4px; }
     button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
   </style>
 </head>
@@ -26,6 +27,11 @@
       <label>Disc (.cue and its .bin files) <input id="disc" type="file" multiple accept=".cue,.bin"></label>
       <label><input id="instant" type="checkbox"> Instant CD loading</label>
       <label><input id="record" type="checkbox"> Record a replay</label>
+      <label>Resolution <select id="resolution-scale">
+        <option value="1">Native</option>
+        <option value="2">Upscaled 2×</option>
+        <option value="4">Upscaled 4×</option>
+      </select></label>
       <button id="start" disabled>Start</button>
       <button id="save-replay" disabled>Save replay</button>
     </section>

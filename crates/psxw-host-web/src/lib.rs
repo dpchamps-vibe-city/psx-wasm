@@ -45,6 +45,15 @@ mod web {
             format!("{:?}", self.r.info())
         }
 
+        /// Host-only internal resolution; guest-visible VRAM stays native.
+        pub fn set_resolution_scale(&mut self, scale: u32) -> Result<(), JsValue> {
+            self.r.set_resolution_scale(scale).map_err(js)
+        }
+
+        pub fn resolution_scale(&self) -> u32 {
+            self.r.resolution_scale()
+        }
+
         /// Zero VRAM and the colour-table slots (tests).
         pub fn reset(&mut self) {
             self.r.reset_vram();
@@ -79,6 +88,10 @@ mod web {
             let mut c = vec![header(op::PRESENT, psxw_abi::render::PRESENT_WORDS as u32)];
             c.extend_from_slice(&d.to_words());
             self.r.execute(&c).map_err(js)?;
+            if let Some((w, h)) = self.r.output_size() {
+                if self.canvas.width() != w { self.canvas.set_width(w); }
+                if self.canvas.height() != h { self.canvas.set_height(h); }
+            }
             self.r.blit_to_screen(self.canvas.width(), self.canvas.height());
             Ok(())
         }

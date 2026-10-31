@@ -28,6 +28,21 @@ const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
 const params = new URLSearchParams(location.search);
 
+// A host-only setting, read at presentation boundaries even when the game
+// cannot yield to Worker messages (no JSPI, or dev mode).
+const renderBuffer = new SharedArrayBuffer(4);
+const renderSettings = new Int32Array(renderBuffer);
+const resolution = document.getElementById("resolution-scale");
+let rememberedScale = "1";
+try { rememberedScale = localStorage.getItem("psxw.resolutionScale") || "1"; } catch {}
+const initialScale = Number(params.get("scale") || rememberedScale);
+resolution.value = String([1, 2, 4].includes(initialScale) ? initialScale : 1);
+Atomics.store(renderSettings, 0, Number(resolution.value));
+resolution.addEventListener("change", () => {
+  Atomics.store(renderSettings, 0, Number(resolution.value));
+  try { localStorage.setItem("psxw.resolutionScale", resolution.value); } catch {}
+});
+
 if (!crossOriginIsolated) say("This page needs cross-origin isolation (COOP/COEP headers): serve it with `psxw serve`.");
 
 // Pad words are active low (psxw-abi replay): bit order Select, L3, R3,
@@ -46,7 +61,7 @@ const pad = new Int32Array(padBuffer);
 Atomics.store(pad, 1, 0xffff);
 Atomics.store(pad, 2, -1);
 const held = new Set();
-addEventListener("keydown", (e) => { if (e.code in KEYS) { held.add(e.code); e.preventDefault(); } });
+addEventListener("keydown", (e) => { if (!(e.target instanceof HTMLSelectElement) && e.code in KEYS) { held.add(e.code); e.preventDefault(); } });
 addEventListener("keyup", (e) => held.delete(e.code));
 
 function pollInput() {
@@ -139,6 +154,8 @@ function show(bitmap) {
       }
     }
   }
+  if (screen.width !== bitmap.width) screen.width = bitmap.width;
+  if (screen.height !== bitmap.height) screen.height = bitmap.height;
   view.transferFromImageBitmap(bitmap);
   display.shown++;
   Atomics.add(pad, 4, 1);
@@ -326,6 +343,11 @@ async function start(cue, audioRing) {
     if (m.type === "frame") show(m.bitmap);
     else if (m.type === "save") saves.put(m.name, m.bytes);
     else if (m.type === "status") say(m.text);
+    else if (m.type === "resolution-scale") {
+      resolution.value = String(m.scale);
+      if (m.error) say(m.error);
+      try { localStorage.setItem("psxw.resolutionScale", resolution.value); } catch {}
+    }
     else if (m.type === "replay" && params.has("post")) {
       fetch(`/result?browser=${params.get("post") || params.get("browser")}-replay`, { method: "POST", body: m.bytes });
     } else if (m.type === "replay") {
@@ -361,7 +383,7 @@ async function start(cue, audioRing) {
       }
     }
   };
-  worker.postMessage({ type: "start", cue, padBuffer, audioRing, modBuffer, options });
+  worker.postMessage({ type: "start", cue, padBuffer, audioRing, modBuffer, renderBuffer, options });
 }
 
 const discInput = document.getElementById("disc");

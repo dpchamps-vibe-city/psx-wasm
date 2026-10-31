@@ -19,6 +19,36 @@ Test hooks (query): `?cue=NAME&autostart&frames=N&verify&hash=60,300&replay=URL&
 
 At the end of a run the Worker posts frame times (the wall time between vblanks, after pacing): `frameMs` with p50, p95, p99 and max, next to `lagFrames` (frames more than a period late). They are reported, not gated.
 
+## Rendering resolution
+
+The **Resolution** dropdown selects **Native**, **Upscaled 2×**, or **Upscaled 4×**,
+including while a game is running. The preference is remembered in this browser;
+`?scale=1`, `?scale=2`, or `?scale=4` overrides it at page load.
+
+This is host-only polygon rasterization, not a screen filter. Native VRAM,
+CPU readbacks, texture/CLUT sampling and hashes remain unchanged. An optional
+higher-resolution colour plane supplies the display, including blending, masks
+and VRAM copies. Sprites and lines retain native pixel coverage; packed 24-bit
+video is presented at native resolution. Unusual coordinate-wrapping polygons
+also retain native coverage. Textures/framebuffer feedback remain native-resolution,
+and there is no higher-precision GTE or perspective correction.
+
+Scale changes take effect at presentation boundaries without restarting the game.
+A new colour plane is initialized from native VRAM, so old content gains detail
+as it redraws. Context restoration reapplies the selected scale. Unsupported
+sizes/colour-plane allocation failures retain the previous setting and report an
+error; an output-frame allocation failure falls back to native rendering.
+
+The setting lives in the host renderer (`Renderer::set_resolution_scale` and
+`WebRenderer.set_resolution_scale`), not the guest ABI or renderer command stream.
+A shared host setting lets live changes work even without JSPI. The Worker and
+page canvas backing sizes follow the presentation resolution; CSS keeps the
+same 4:3 display size. The extra R16UI draw/read planes cost 8 MiB at 2× or
+32 MiB at 4×, plus staging, setup records, the output frame and additional
+rendering/synchronization work. Native and upscaled output implement the same
+host-local `VisualRenderer` interface; see the [renderer extension guide](../crates/psx-render-gl/README.md)
+for adding another visual renderer without changing exact VRAM execution.
+
 ## Recording a replay
 
 Tick **Record a replay** before Start, play, then press **Save replay** (any time; the recording also goes out when the run stops). The download is a psxw-abi replay (version 2): its entries are indexed by the game's frame counter, the manifest's `[oracle] frame_counter`, which `psxw build-web` writes to `game.json`. Entry `c` holds the pads the game saw at the last vblank its counter read `c`, so the native host and the emulator replay the session at the same game frames, whatever their load times.

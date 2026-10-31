@@ -1,5 +1,6 @@
-//! The shaders, GLSL ES 3.00 (WebGL2), integer-only for every pixel
-//! decision. See [`crate::setup`] for the record layout they read.
+//! The shaders, GLSL ES 3.00 (WebGL2). Native rendering is integer-only
+//! for every pixel decision; the optional enhanced path adds subpixel polygon
+//! coverage/interpolation. See [`crate::setup`] for the record layouts they read.
 //!
 //! One program draws every kind: each instance is one setup record,
 //! drawn as its covering rectangle; the fragment shader decides coverage
@@ -46,10 +47,32 @@ void main() {{
     )
 }
 
+/// Optional hooks for GL renderers reusing the PS1 pixel pipeline. Visual
+/// renderers are not required to use this shader or its packed setup layout.
+pub(crate) struct DrawShader<'a> {
+    pub triangle: &'a str,
+    pub triangle_fn: &'a str,
+    pub position: &'a str,
+    pub destination: &'a str,
+    pub copy_source: &'a str,
+}
+
 pub fn draw_fs() -> String {
+    draw_fs_with(&DrawShader {
+        triangle: "",
+        triangle_fn: "triangle",
+        position: "int px = hp.x, py = hp.y;",
+        destination: "vram(px, py)",
+        copy_source: "vram((int(m.x) + i) & 1023, (int(m.y) + j) & 511)",
+    })
+}
+
+pub(crate) fn draw_fs_with(shader: &DrawShader<'_>) -> String {
     format!(
         r#"{COMMON}
-uniform usampler2D u_vram;   // the read copy
+uniform usampler2D u_vram;   // native read copy: textures and CLUT source
+uniform usampler2D u_dest;   // enhanced read copy: destination and COPY source
+uniform int u_scale;
 uniform usampler2D u_prims;
 uniform usampler2D u_clut;
 uniform usampler2D u_stage;
@@ -207,6 +230,8 @@ void triangle(int b, int px, int py, uint flags, uvec4 h0, uvec4 tw, inout uint 
     surface(u, v, r, g, bl, flags, h0, tw, dither_at(px, py), dst, wrote);
 }}
 
+{triangle}
+
 void rect(int px, int py, uint flags, uvec4 h0, uvec4 tw, inout uint dst, inout bool wrote) {{
     uvec4 a = T(3), t = T(4), c = T(5);
     int xs = int(a.x), xb = int(a.y), ys = int(a.z), yb = int(a.w);
@@ -261,16 +286,17 @@ void line(int px, int py, uint flags, inout uint dst, inout bool wrote) {{
 }}
 
 void main() {{
-    int px = int(gl_FragCoord.x), py = int(gl_FragCoord.y);
+    ivec2 hp = ivec2(gl_FragCoord.xy);
+    {position}
     uvec4 h0 = T(0);
     uint flags = h0.x;
     uint kind = flags & 7u;
-    uint dst = vram(px, py);
+    uint dst = {destination};
     bool wrote = false;
     if (kind == TRIANGLE || kind == QUAD) {{
         uvec4 tw = T(1);
-        triangle(3, px, py, flags, h0, tw, dst, wrote);
-        if (kind == QUAD) triangle(14, px, py, flags, h0, tw, dst, wrote);
+        {triangle_fn}(3, px, py, flags, h0, tw, dst, wrote);
+        if (kind == QUAD) {triangle_fn}(14, px, py, flags, h0, tw, dst, wrote);
     }} else if (kind == RECT) {{
         rect(px, py, flags, h0, T(1), dst, wrote);
     }} else if (kind == LINE) {{
@@ -286,7 +312,7 @@ void main() {{
         }} else {{
             uint src = kind == UPLOAD
                 ? texelFetch(u_stage, ivec2(int(m.x) + i, int(m.y) + j), 0).r
-                : vram((int(m.x) + i) & 1023, (int(m.y) + j) & 511);
+                : {copy_source};
             if ((m.z & 2u) == 0u || (dst & 0x8000u) == 0u) {{
                 dst = src | ((m.z & 1u) != 0u ? 0x8000u : 0u);
                 wrote = true;
@@ -299,6 +325,11 @@ void main() {{
 "#,
         mask = PRIM_TEX_WIDTH - 1,
         shift = PRIM_TEX_WIDTH.trailing_zeros(),
+        triangle = shader.triangle,
+        triangle_fn = shader.triangle_fn,
+        position = shader.position,
+        destination = shader.destination,
+        copy_source = shader.copy_source,
     )
 }
 
@@ -321,11 +352,12 @@ uniform usampler2D u_vram;
 uniform ivec4 u_area;   // x, y, width, height
 uniform int u_depth24;
 uniform int u_flip;     // 1: output row 0 is the picture's bottom row
+uniform int u_scale;    // 24-bit packed display always uses 1
 out vec4 o_color;
 uint px16(int x, int y) {{ return texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r; }}
 void main() {{
     int ox = int(gl_FragCoord.x), oy = int(gl_FragCoord.y);
-    int row = u_flip != 0 ? u_area.w - 1 - oy : oy;
+    int row = u_flip != 0 ? u_area.w * u_scale - 1 - oy : oy;
     int y = u_area.y + row;
     uint r, g, b;
     if (u_depth24 != 0) {{
@@ -338,7 +370,9 @@ void main() {{
         g = (bytes >> (s + 8u)) & 0xFFu;
         b = (bytes >> (s + 16u)) & 0xFFu;
     }} else {{
-        uint p = px16(u_area.x + ox, y);
+        ivec2 size = ivec2(1024, 512) * u_scale;
+        ivec2 at = ivec2(u_area.x, u_area.y) * u_scale + ivec2(ox, row);
+        uint p = texelFetch(u_vram, at & (size - 1), 0).r;
         r = (p & 0x1Fu) << 3;
         g = ((p >> 5) & 0x1Fu) << 3;
         b = ((p >> 10) & 0x1Fu) << 3;

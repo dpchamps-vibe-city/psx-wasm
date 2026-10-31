@@ -48,13 +48,64 @@ async function main() {
   }
   const ms = Math.round(performance.now() - t0);
   const renderer = r.info();
+  const upscaling = checkUpscaling(canvas, r);
   const contextLoss = await loseAndRestore(canvas, r, largest);
-  const result = { browser, renderer, total: count, pass, failures, ms, contextLoss };
+  const result = { browser, renderer, total: count, pass, failures, ms, upscaling, contextLoss };
   out.textContent = JSON.stringify(result, null, 2);
   await fetch(`/result?browser=${browser}`, { method: "POST", body: JSON.stringify(result) });
 }
 
+// Real WebGL draw/read/present coverage at every host scale. A diagonal must
+// cut through a native pixel block: nearest-neighbour enlargement cannot pass.
+function checkUpscaling(canvas, r) {
+  const header = (op, n) => op | (n << 8);
+  const xy = (x, y) => x | (y << 16);
+  const tri = new Uint32Array(16);
+  tri[0] = 1;
+  [[2, 2], [14, 2], [2, 14]].forEach(([x, y], i) => {
+    tri[3 + 3 * i] = xy(x, y);
+    tri[4 + 3 * i] = 255;
+  });
+  const stream = new Uint32Array([
+    header(1, 3), 0, xy(1023, 511), 0,
+    header(2, 17), 1, ...tri,
+    header(8, 3), 1, 0, xy(16, 16),
+    header(5, 4), 0, xy(16, 0), xy(16, 16), 0,
+  ]);
+  let baseline;
+  const checks = [];
+  for (const scale of [1, 2, 4]) {
+    r.set_resolution_scale(scale);
+    r.reset();
+    r.run(stream);
+    const hash = r.vram_hash();
+    baseline ||= hash;
+    if (hash !== baseline) throw new Error(`${scale}× changed native VRAM`);
+    r.present(new Uint32Array([1, 0, 0, 32, 32]));
+    if (canvas.width !== 32 * scale || canvas.height !== 32 * scale) throw new Error(`${scale}× has wrong presentation dimensions`);
+    const gl = canvas.getContext("webgl2");
+    const px = (x, y) => {
+      const p = new Uint8Array(4);
+      gl.readPixels(x, canvas.height - 1 - y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p);
+      return p[0];
+    };
+    if (px(8 * scale, 7 * scale) !== 248) throw new Error(`${scale}× lost polygon`);
+    if (scale > 1 && px(9 * scale - 1, 8 * scale - 1) !== 0) throw new Error(`${scale}× only enlarged native pixels`);
+    if (scale > 1 && px(25 * scale - 1, 8 * scale - 1) !== 0) throw new Error(`${scale}× COPY lost enhanced detail`);
+    r.present(new Uint32Array([3, 0, 0, 32, 32]));
+    if (canvas.width !== 32 || canvas.height !== 32) throw new Error("24-bit video must retain native byte addressing");
+    checks.push(scale);
+  }
+  const before = r.vram_hash();
+  for (const scale of [2, 1, 4, 1]) {
+    r.set_resolution_scale(scale);
+    if (r.vram_hash() !== before) throw new Error("changing scale reset native VRAM");
+  }
+  return { scales: checks, ok: true };
+}
+
 async function loseAndRestore(canvas, r, stream) {
+  r.set_resolution_scale(2);
   r.reset();
   r.run(stream);
   const before = r.vram_hash();
@@ -84,8 +135,9 @@ async function loseAndRestore(canvas, r, stream) {
   const fresh = new WebRenderer(canvas);
   const empty = fresh.vram_hash();
   fresh.upload_vram(shadow);
+  fresh.set_resolution_scale(2);
   const after = fresh.vram_hash();
-  return { ok: after === before && empty !== before, before, after };
+  return { ok: after === before && empty !== before && fresh.resolution_scale() === 2, before, after, scale: fresh.resolution_scale() };
 }
 
 main().catch(async (e) => {

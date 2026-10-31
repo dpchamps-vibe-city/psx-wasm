@@ -52,7 +52,7 @@
 //   run's log lines; they come back in the `hashes` message, in the
 //   native host's shapes.
 //
-// Messages in: {type: "start", cue, padBuffer, audioRing, modBuffer, options},
+// Messages in: {type: "start", cue, padBuffer, audioRing, modBuffer, renderBuffer, options},
 // {type: "execute", id, address, args} (one call, at a borrow-free boundary),
 // {type: "cmd", id, name, args}, {type: "load", id, url, reload}.
 // Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"mods"|"scripting-ready"|"execute-result"|"cmd-result"|"load-result"|"stopped", ...}.
@@ -226,10 +226,26 @@ async function opfsMods() {
   return out;
 }
 
-async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
+async function run({ cue, padBuffer, audioRing, modBuffer, renderBuffer, options }) {
   const canvas = new OffscreenCanvas(options.width || 640, options.height || 480);
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
+  const renderSettings = new Int32Array(renderBuffer || new SharedArrayBuffer(4));
+  let appliedScale = 1;
+  const applyResolutionScale = () => {
+    const requested = Atomics.load(renderSettings, 0) || 1;
+    if (requested === appliedScale) return;
+    let error;
+    try {
+      renderer.set_resolution_scale(requested);
+    } catch (e) {
+      error = `resolution change failed: ${e.message || e}`;
+      Atomics.store(renderSettings, 0, renderer.resolution_scale());
+    }
+    appliedScale = renderer.resolution_scale();
+    postMessage({ type: "resolution-scale", scale: appliedScale, error });
+  };
+  applyResolutionScale();
   let lost = false;
   let shadow = null;
   canvas.addEventListener("webglcontextlost", (e) => {
@@ -240,6 +256,8 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   canvas.addEventListener("webglcontextrestored", () => {
     renderer = new WebRenderer(canvas);
     if (shadow) renderer.upload_vram(shadow);
+    appliedScale = 1;
+    applyResolutionScale();
     lost = false;
     postMessage({ type: "status", text: "WebGL context restored" });
   });
@@ -520,7 +538,20 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
     present(p) {
       if (lost) return;
       timed("present", () => {
-        renderer.present(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20)));
+        applyResolutionScale();
+        const desc = new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20));
+        try {
+          renderer.present(desc);
+        } catch (e) {
+          // The colour plane can fit while a larger output frame cannot.
+          // Drop enhancements rather than stopping a game on a smaller GPU.
+          if (appliedScale === 1) throw e;
+          renderer.set_resolution_scale(1);
+          appliedScale = 1;
+          Atomics.store(renderSettings, 0, 1);
+          postMessage({ type: "resolution-scale", scale: 1, error: `upscaled presentation failed; using native: ${e.message || e}` });
+          renderer.present(desc);
+        }
         // A page that falls behind misses frames rather than queueing them.
         if (framesPosted - Atomics.load(pad, 4) < 2) {
           const bitmap = canvas.transferToImageBitmap();
