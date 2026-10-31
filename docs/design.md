@@ -579,16 +579,18 @@ its buffer. `ReturnFromException` leaves from any depth.
   in the same queue: for each pending line libetc handles, in line order,
   acknowledge I_STAT and queue the line's handler as a guest call at the
   front, then look again until none is left, as `intr.o`'s loop does.
-  libetc's own vblank and DMA handlers are stand-in functions at addresses
-  no game code has: libsnd takes line 0 and calls the handler it replaced,
-  so a guest call to one runs it in the runtime (`untranslated`), its
-  callbacks as nested guest calls. The interrupt controller, DMA
+  libetc's own vblank and DMA handlers are at their own addresses (D67):
+  `intr_vb.o`'s runs as guest code over libetc's state in RAM, and
+  `intr_dma.o`'s, which reads DICR, is an adapter bound by its place
+  (`libetc/intr_dma:0x4c`); libsnd takes line 0 and calls the handler it
+  replaced, which reaches the same code. The interrupt controller, DMA
   controller and root counters stay the devices' registers, which the
   adapters change with the devices' own semantics; the emulated chips'
   devices raise their interrupts there as before.
-- **Elements the adapters own** (`Sdk::chain_element`, D60): libpad's
-  `PadStartCom` queues an element at an address no game code has, and the
-  kernel's walk runs it as an adapter step in its place in the chain
+- **Elements the adapters run** (`Sdk::chain_element`, D60): libpad's
+  `PadStartCom` queues libpad's own element (`_padVsyncParam`, in its
+  `.data`, D67), and the kernel's walk runs it as an adapter step in its
+  place in the chain
   (libpad's vblank poll, when vblank is unmasked and pending).
   libmcx's `McxStartCom` instead appends its element to priority 2's
   chain itself, through the table of tables at 100h: the kernel keeps

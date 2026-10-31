@@ -305,9 +305,14 @@ calls (TR1, B19).
    Done `b92f582` (with SDK6's libetc half): `Lib`/`VsyncO` found through
    `intr.o`'s and `vsync.o`'s code (layout in Findings); only the
    dispatcher's I_STAT and the interrupted sp stay in the runtime.
-3. [ ] **SDK1. libpad's state into its own data.** Port records, receive
+3. [x] **SDK1. libpad's state into its own data.** Port records, receive
    buffers, pending results: `sdk-psyq/src/libpad.rs:48-52, 146-161`.
    Same way as task 2. **Run:** both games' replays.
+   Done `2cc64f1` (agent): `pdresres.o`'s `.data`, `pddirres.o`'s records
+   and buffers, found through each adapter's code; `PadInitDirect` calls
+   `_padInitDirPort` as guest code; `PadStartCom` queues the real
+   `_padVsyncParam`, so libpad's `ELEMENT` stand-in is gone. Chip sio0
+   conformance passes in both games. Layout in Findings.
 4. [x] **SDK6, SDK8. The real addresses.** `ResetCallback`,
    `StopCallback`, `RestartCallback`, `InterruptCallback(0/3)`
    (`libetc.rs:69-75, 417, 436, 450`) and `DMACallback(2, …)`
@@ -617,3 +622,13 @@ locals, or static translation.
   SDK doesn't name. libcd's interrupt handler (`bios_1` +14A4h), the last
   stand-in in BIOS ROM space, went the same way (`3e7f861`), and so did
   `intr_dma.o`'s handler (`0ca8dce`): no adapter stand-ins remain.
+- **Phase 2's libpad layout** (SDK1, PsyQ 4.7). `pdresres.o`'s `.data`:
+  `_padFunc*` pointers +08h..+30h, `_padInfoDir` +3Ch, `_padIntExec`
+  +40h, `_padChanStart`/`_padChanStop` +58h/+5Ch, `_padFixResult[2]` +60h,
+  `_padVsyncParam` +68h, `_padCalledIntPad` +78h; the adapters reach it
+  from `PadInitDirect`'s pair at +14h, `PadStartCom`/`PadStopCom`'s at +1Ch,
+  the state accessors' at +0. `pddirres.o`'s `.bss`: two `PadInfo2`
+  records (F0h each), then receive buffers at +1E0h and transmit buffers
+  at +228h (23h per port). `_padRestPeriod` is a common reached from
+  `_padIntPad`'s pair at +ACh. Not written yet: `_padTotalCurr`, the
+  actuator gates, `_padSioChan`/`_padSioState`.

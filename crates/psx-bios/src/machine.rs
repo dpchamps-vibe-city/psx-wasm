@@ -189,15 +189,17 @@ pub trait Sdk: Sized {
     fn irq_step(_m: &mut Machine<Self>, _step: u32) {}
     /// Guest code called `addr`, which no guest function implements: if it
     /// is a function pointer the adapters handed out for SDK code they
-    /// replace (libetc's own interrupt handlers, D59), its next step from
-    /// `state` (0 on entry). The runtime makes the guest calls it asks for
+    /// replace, its next step from `state` (0 on entry). PsyQ's adapters
+    /// hand out none since D67: their functions are at the SDK's own
+    /// addresses. The runtime makes the guest calls it asks for
     /// as nested calls, like the original's, and comes back with the state.
     fn stand_in(_m: &mut Machine<Self>, _addr: u32, _state: u32) -> Option<StandIn> {
         None
     }
-    /// A `SysEnqIntRP` element the adapters installed for SDK code they
-    /// replace (libpad's vblank poll, D60), which has no fields in guest
-    /// RAM: the [`IrqStep::Sdk`] step to run in its place in the chain.
+    /// A `SysEnqIntRP` element whose verifier and handler the adapters
+    /// replace (libpad's vblank poll, D60; the element itself is the SDK's,
+    /// in its RAM): the [`IrqStep::Sdk`] step to run in its place in the
+    /// chain.
     fn chain_element(_m: &Machine<Self>, _elem: u32) -> Option<u32> {
         None
     }
