@@ -415,6 +415,22 @@ does not change SDK IRQ state. Resolve cross-lane hunks only during integration.
 
 ## Progress log
 
+- 2026-10-31: recovered RAM-only interrupt chains (`7b24e6c`, adapted
+  `6155844`), native card/pad gating (`a64e1b2`, `d7d8f48`) and kernel
+  handler ordering (`e3e4374`, adapted `053035d`). Pad sampling still calls
+  the host directly; only shared IRQ acknowledgement/masking uses registers.
+  `strtok` moved to 7200h (`e0a936e`) to avoid the handler elements at 7100h.
+  Integrated BIOS/SDK/runtime gates passed: 19/35/7 tests.
+- 2026-10-31: recovered timers, UnDeliverEvent and kernel allocation in
+  `4e4e74e` (adapted `d89a101`/`b9db230`). Timers call the existing core;
+  kernel allocation handles an exhausted event-block region without unsigned
+  underflow. Recovered guest-visible call tables, aliases, patched dispatch,
+  vector compatibility data and BOOT arguments in `9cf627d` (adapted
+  `4ec0ec4`). Vector bytes are data, not executed BIOS code. BIOS/runtime/lift
+  tests pass: 21/7/17. **Saved-entry pointer thunks and the accompanying ABI
+  version change remain pending** until the division worker hands back the
+  linker seam. SDK calls through patched entries also remain pending. No
+  game/workspace gate or full-BIOS completion is claimed.
 - 2026-10-31: integrated the reviewed DeepSeek lanes: compiler lowering
   (`864002e`..`030497a`), lifter correctness (`052b01f`..`f381c11`) and native
   BIOS libc/heap/printf (`8fcc9d4`). No map/timing or TR2/TR3 rules recovered.
