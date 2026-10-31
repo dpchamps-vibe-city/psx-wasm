@@ -255,6 +255,19 @@ mod tests {
         assert_eq!(m.io.as_ref().unwrap().gpu.display().dma, 0);
     }
 
+    /// SendGP1Command (A0h:48h) sets root counter 0's dot clock to the
+    /// display's width, as a GP1 write on the bus does.
+    #[test]
+    fn gpu_gp1_command_sets_the_dot_clock() {
+        let mut m = machine();
+        m.io = Some(Default::default());
+        m.timers[0].write_mode(0x100, 0);
+        let v = m.clock.video;
+        m.clock.now = v.dot_at(1000);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x48, [0x0800_0001, 0, 0, 0])), 0);
+        assert_eq!(m.timers[0].value(0, v, m.clock.now), 100);
+    }
+
     /// GPU_dw and gpu_send_dma send GP0(A0h) and the image words, in order,
     /// and leave the BIOS's arguments and result on the caller's stack;
     /// send_gpu_linked_list walks the list through channel 2.

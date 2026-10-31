@@ -250,6 +250,10 @@ fn sys(m: &mut M, off: u32) -> std::result::Result<Sys, String> {
 fn gp1(m: &mut M, v: u32) {
     if let Some(io) = m.io.as_mut() {
         io.gpu.gp1(v);
+        // Root counter 0's dot clock runs at the display's width.
+        if m.timers[0].set_display_mode(0, io.gpu.display().mode, m.clock.video, m.clock.now) {
+            m.reschedule_timer(0);
+        }
     }
 }
 
