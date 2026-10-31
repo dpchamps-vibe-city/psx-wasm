@@ -511,14 +511,16 @@ write into ROM space (before, `_patch_gte` copied code over 0–38h).
 4. **Human:** `psxw ci btn` and `psxw ci bof4`.
 
 Status (2026-10-31): 1 passes (merged at `1ba3f0e`); 2's lifts pass (3387
-of 3387, 14823 of 14823) but `psxw difftest btn` has 10 mismatches of
-2625: nine on main before phase 4 (seven unprototyped calls to `FntPrint`
-and `memset` that clang lowers to `call_indirect`; byte differences in
-`DrawTextSlotImage` and `Ovl28DrawSequenceGradientRect`; the 2026-10-29
-report had none) and one from TR13 (`AnimateMessageWindowRect`: after
-the barrier clang sinks a division into the branch that uses it, so the
-original's `break 7` on a zero divisor doesn't happen; see Findings). 3
-holds. 4 waits for the human, after `psxw census` for both games.
+of 3387, 14823 of 14823); `psxw difftest btn` has 2 mismatches of 2625
+(2620 pass, 3 excluded), down from 10. The seven `call_indirect` calls and
+the two byte differences came with FastISel (D53, `ea8afa8`), not phase
+1: the calls are direct again (`1f3d7ce`); `AnimateMessageWindowRect`'s
+division stays where the source puts it (D36, `38cb9f5`); difftest takes
+plain `char` from the reference flags (`23b0976`). The two left,
+`DrawTextSlotImage` and `Ovl28DrawSequenceGradientRect`, are seeds on
+which the original takes an address error (see Findings, "difftest's
+last two mismatches"). 3 holds. 4 waits for the human, after `psxw
+census` for both games (the `.i` files change again).
 
 ## Phase 5: overlay residency
 
@@ -625,6 +627,12 @@ locals, or static translation.
 - **2026-10-30:** plan created from the shortcuts audit
   (`plans/shortcuts.md`, `3eff117`–`0bae88a`), its bugs (moved from
   open-items) and the BIOS rework.
+- **2026-10-31:** phase 4's difftest, 10 mismatches to 2 (agent,
+  `1f3d7ce`, `23b0976`, `38cb9f5`): FastISel's `call_indirect`s are
+  direct calls again, a division by a variable stays where the source
+  puts it (D36), difftest compiles with the reference flags' plain
+  `char`. The two left are seeds where the original takes an address
+  error (Findings). Both games build; re-run `psxw census` before `ci`.
 - **2026-10-31:** phase 3: BIOS7 (`6155844`), BIOS4 (`053035d`). After
   BIOS4 every chip each game places passes conformance (irq, sio0, gpu,
   cd, spu in both; memcard in btn; mdec in bof4; `out/sf-p3-conform-*`),
@@ -729,6 +737,49 @@ locals, or static translation.
   applied after clang has optimised. Decided (2026-10-31, under the
   /goal): a division by a non-constant in decompiled C stays where the
   source puts it (opaque to clang until the link lowers it as D36 says).
+  Done `38cb9f5` (agent): the normalizer makes each 32-bit `/`, `%`, `/=`,
+  `%=` by a non-constant a call (`__psxw_div_s` and the rest), the link
+  lowers it to D36's division; `__builtin_choose_expr` keeps constant
+  divisors (enum ones too), float and 64-bit divisions as C divisions.
+  btn: 86 divisions, game.wasm 718160 → 718253 instructions (+0.01%),
+  1999238 → 1999589 bytes; bof4's C has none. A compound assignment
+  whose left side has side effects is left alone (none divide by a
+  variable in either game). difftest still compares `break`s as a set;
+  they could now be compared in order with the other call-outs.
+- **FastISel changed the C's code since the 2026-10-29 difftest**
+  (D53, `ea8afa8`, 2026-10-30; not phase 1). A difftest built with
+  SelectionDAG passes everything but `AnimateMessageWindowRect`. Two
+  effects: (1) a prototype-less function one call passes a pointer and
+  another an int has IR call types that differ though the wasm types
+  agree; FastISel calls it through the table (`call_indirect`) where
+  SelectionDAG called it directly. The link now calls it directly
+  (`1f3d7ce`): btn's seven `FntPrint`/`memset` calls. (2) A bitfield
+  store is a read-modify-write of its whole unit (`setlen`: a word load
+  and store of the tag) where SelectionDAG narrowed it to the byte store
+  GCC made. Same result in RAM; a device register would see a word read
+  and write where the original stores a byte. No C-tier bitfield reaches
+  I/O in btn or bof4 today. `-ffine-grained-bitfield-accesses` gives
+  GCC's widths but moves a lot of code (tried: other pairs then hit the
+  next finding). Also: difftest compiles the C without `-g`, and under
+  FastISel `-g` changes the code of ~40% of objects (D53), so the harness
+  doesn't run the game's exact C.
+- **difftest's last two mismatches are address errors** (2026-10-31).
+  `DrawTextSlotImage` and `Ovl28DrawSequenceGradientRect` get -1 from
+  `ReservePacketWorkBytes` (declared `s32`, so the harness may answer -1)
+  and build a packet there. The original's `lw`/`sw` at 0xFFFFFFFF takes
+  an address error; neither side models it (D5), and both treat
+  misaligned accesses as byte-addressed, which agrees everywhere but at
+  the window's end: a word at masked 0xFFFFFF reaches 3 bytes past the
+  window instead of guest bytes 0–2, so clang's merged accesses (C) and
+  the original's one-by-one ones (T) touch different bytes. With -1
+  never answered, every pair passes. No compiler keeps accesses in order
+  around one that faults, so C and T can't be expected to agree on these
+  seeds; left as mismatches, not excluded. Options: the harness detects
+  the original's address errors (an alignment check on the translation's
+  `lw`/`lh`/`sw`/`sh` in harness builds) and reports the seed as such, or
+  phase 6's map. In the game build the same straddle writes the first
+  bytes of the runtime's data (`RUNTIME_BASE` is the window's end): for
+  phase 6 (TR6).
 
 - **libapi's pad.o installs its own vblank element** (2026-10-30, BIOS1).
   `InitPAD` and `PAD_init` call a local helper that queues a priority-1
@@ -767,6 +818,7 @@ locals, or static translation.
   in the mod SDK's `flags.json`). psxw-difftest's compiler still uses
   `Clang::new`'s unsigned default; a game whose reference flags leave
   `char` signed needs it on `Clang::reference` too (phase 4's crate).
+  Done `23b0976` (agent): difftest's compiler is `Clang::reference`'d.
 - **Phase 2's libetc layout** (2026-10-30, from btn's PsyQ 4.7 objects;
   offsets in each object's `.text`). `intr.o` (`ResetCallback` at +0):
   the `lui`/`lw` at +0/+4 loads the driver-table pointer (`.data`+10E0h);
