@@ -87,5 +87,10 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
     m.lay_out_threads(tcbs);
     // The CD controller, for SDK code that drives the drive (D58).
     m.cdc_insert();
+    // Boot leaves the BIOS CD services installed. ResetCallback removes
+    // their events before libcd takes over the same native drive.
+    if m.cd_init() == u32::MAX {
+        return Err("not enough event blocks for the BIOS CD services".into());
+    }
     Ok(Boot { exe, pc0, gp0, t_addr, t_size, b_addr, b_size, sp, events, text_hash: fnv(body) })
 }

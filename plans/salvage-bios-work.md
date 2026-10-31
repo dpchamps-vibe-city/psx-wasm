@@ -591,13 +591,46 @@ exception/non-local/thread control flow and integration. No subdelegation.
 The separate ABI-17 foundation CI has completed; its failures and passing gates
 are classified above, separately from these newer source changes.
 
-Native-CD's initial `0aac185` is **not accepted or integrated**. Parent review
-found that a blocking multi-sector read wakes after its first sector, normal
-completion is confused with the early-end event, and changes to `Drive.status`
-do not update the controller's actual shared status or pending jobs. The worker
-is resumed as `b498c913-ceb9-47d3-8fe5-22dc437e8163` for bounded corrections,
-including event reuse/allocation cleanup and existing core error semantics.
-No register driver or native-core/SDK ownership rewrite is authorised.
+Native-CD's `0aac185` plus corrective `827f56f` have been source-reviewed
+and integrated with parent corrections. The original early wake, END-on-success,
+and disconnected status/job state were not retained. A(54h/56h), A(78h/7Ch/7Eh/81h),
+A(95h), and A(A4h..A6h) now use the existing native drive/controller and virtual
+scheduler. Reads expose sectors as they complete, report final ACK then pause
+DNE, and leave a missing sector's buffer unchanged with END. Shared core header,
+subchannel, mode, head, EDC accounting, pending work, IRQ-line tracking and timing
+remain coherent; bus-free reads also advance their drive head. There is no BIOS
+register-command or DMA driver.
+
+The parent separated A(95h)'s inner reset (success 1, existing events/cwd kept,
+leaves critical) from `_96_init` (allocates five events, clears cwd). Boot installs
+the events after its configured event table; SDK ResetCallback invokes the
+patchable `_96_remove` before leaving critical. Partial event allocation rolls
+back, and removal does not close slots reused for unrelated events. Per-operation
+completion results prevent callbacks starting a new operation from changing a
+blocking caller's result or consuming the new operation's event. A zero-time
+seek still yields to the existing scheduler rather than recursing in its wait.
+
+**Error-reference distinction:** psx-spx documents A(A5h/A6h) returning -1;
+OpenBIOS at `4dc70d2931121a0fde858a0354192b6df4fa22e8`, `cdrom/helpers.c`,
+`cdrom/cdrom.c` and `common/syscalls/syscalls.h`, calls A(A1h) SystemError first,
+then returns -1. The old unconditional Rust panic has been replaced by a call
+through that guest-patchable table entry, followed by -1 if it returns. The
+existing default SystemError still stops execution. This preserves both the
+error call and a returning patch, not an unconditional nonfatal error policy.
+
+Integrated tests: BIOS 36, devices 63, runtime 8 and SDK 36 plus wasm32 runtime
+check pass. They use handcrafted sectors, include core/native handover, no-bus
+head movement, multi-sector waits, zero-time seek, callback reentry, returning
+SystemError patches and event cleanup. Game rebuild/replay gates are recorded
+separately below when run; no fresh BIOS oracle comparison is claimed.
+
+**Still unfinished:** A(90h..93h), A(9Eh), A(A2h/A3h) callable handler services;
+controller INT5 production/error retries (A94 currently exposes the zero initial
+bytes, not complete error coverage); retail filesystem quirks/path-table state;
+and exact blocking behaviour under guest-disabled/replaced driver events. The
+current native wait retains an operation result rather than reproducing the
+retail TestEvent polling loop. These remain real coverage gaps, not waived
+"driver internals". No native-core/SDK ownership rewrite is authorised.
 
 Kernel/configuration's `aa9cb54` plus corrective `fd9e662` have now been
 source-reviewed together and integrated. SetConf clears chains before reinstalling
@@ -618,6 +651,12 @@ It must use existing card images/scheduling, test only handcrafted disposable
 in-memory cards, and ask before SDK scope or architectural expansion. No input
 snapshots, real saves, game outputs, full CI or oracle captures in this lane.
 Parent retains source review, integration and control-flow architecture.
+Its initial `1dcd2bb` is **not accepted or integrated**: full review found
+low-level callbacks redelivering their own low event, asynchronous FD-close/reuse
+hazards, incomplete callback state transitions/error fields, and an extra read
+completion vblank. Corrective run `15ef11e6-62fc-4b78-9fc6-442d57c0e63c` resumes
+the same isolated worker with these findings, two disposable-card lifecycle
+coverage, and public-reference verification of helper/channel semantics.
 
 ## Progress log
 

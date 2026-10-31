@@ -72,6 +72,8 @@ pub struct Kernel {
     /// The initial stack top `GetConf` reports (A0h:9Dh): the guest's sp
     /// when the thread tables were laid out, or `SetConf`'s argument.
     pub stack_top: u32,
+    /// The BIOS CD driver's software state (A0h:54h..A6h).
+    pub cd: crate::cdrom::Cd,
 }
 
 impl Kernel {

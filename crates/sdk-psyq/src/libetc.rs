@@ -510,10 +510,13 @@ fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     m.mem.write(l.dma_table, &[0; 32]);
     set_reg(m, DICR, 4, 0)?;
     set_line(m, l, 3, l.dma_handler)?;
-    // _96_remove (the BIOS's CD handlers; this BIOS has none), then
-    // ExitCriticalSection.
-    m.crit = false;
-    ret(l.context)
+    // _96_remove, then ExitCriticalSection. Keep the BIOS table patchable
+    // and allow its guest callback to return through the normal Flow.
+    let flow = psx_bios::bios::dispatch(m, 0xA0, 0x56, [0; 4])?;
+    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+        m.crit = false;
+        psx_bios::Flow::ret(l.context)
+    }))
 }
 
 /// `StopCallback`: with the context installed, enter a critical section,
@@ -856,6 +859,8 @@ mod tests {
     #[test]
     fn reset_installs_the_dispatcher() {
         let mut m = machine();
+        assert_eq!(m.cd_init(), 0);
+        assert!(m.cd_installed(), "boot's BIOS CD events");
         // Before ResetCallback there is no context: nothing changes.
         assert_eq!(fixture::interrupt(&mut m, 2, 0x8004_0000), 0);
         m.sdk.at = fixture::INTR + at::CHECK;
@@ -863,6 +868,7 @@ mod tests {
         m.crit = true;
         assert_eq!(fixture::reset(&mut m), fixture::CONTEXT);
         assert!(!m.crit, "ResetCallback leaves the critical section");
+        assert!(!m.cd_installed(), "ResetCallback removed the BIOS CD services");
         assert_eq!(i_mask(&m), 0x9, "vblank and DMA");
         assert_eq!(m.io.as_ref().unwrap().dma.dpcr, 0x3333_3333);
         assert_eq!(m.timers[1].mode, 0x100, "root counter 1 counts hblanks");

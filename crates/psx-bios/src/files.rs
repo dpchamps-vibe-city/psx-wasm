@@ -809,6 +809,14 @@ impl<S: Sdk> Machine<S> {
         0
     }
 
+    /// A(A4h) `CdGetLbn(name)`: the CD file's first sector on the native
+    /// disc, or -1.
+    pub fn cd_lbn(&mut self, name: u32) -> u32 {
+        let name = self.cd_resolve(&String::from_utf8_lossy(&self.mem.cstr(name, 128)));
+        let mut disc = HostDisc(&mut *self.host);
+        cd::find(&mut disc, &name).map_or(u32::MAX, |e| e.lba)
+    }
+
     /// `rel` from the current directory, upper-cased and without a leading
     /// backslash.
     fn cd_join(&self, rel: &str) -> String {
@@ -1203,6 +1211,9 @@ mod tests {
         assert_eq!(ret(&mut m, v, &returns), 2, "stdin and stdout are fd 0 and 1");
         let f = fcb_at(2);
         assert_eq!((m.mem.r32(f + fcb::LBA), m.mem.r32(f + fcb::LENGTH)), (19, 5));
+        m.mem.write(0x8006_0000, b"\\A.BIN;1\0");
+        let v = crate::bios::call(&mut m, 0xA0, 0xA4, [0x8006_0000, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 19, "CdGetLbn");
         let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0000, 5, 0]);
         assert_eq!(ret(&mut m, v, &returns), 5);
         assert_eq!(m.mem.bytes(0x8002_0000, 5), b"hello");

@@ -8,6 +8,7 @@
 
 pub mod bios;
 pub mod card;
+pub mod cdrom;
 pub mod files;
 pub mod io;
 pub mod kernel;

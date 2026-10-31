@@ -75,6 +75,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x4C) => "gpu_abort_dma",
         (0xA0, 0x4D) => "GetGPUStatus",
         (0xA0, 0x4E) => "gpu_sync",
+        (0xA0, 0x54) => "_96_init",
         (0xA0, 0x55) => "_bu_init",
         (0xA0, 0x56) => "_96_remove",
         (0xA0, 0x57) => "dev_null",
@@ -88,6 +89,15 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x62) => "dev_cd_firstfile",
         (0xA0, 0x63) => "dev_cd_nextfile",
         (0xA0, 0x64) => "dev_cd_chdir",
+        (0xA0, 0x78) => "CdAsyncSeekL",
+        (0xA0, 0x7C) => "CdAsyncGetStatus",
+        (0xA0, 0x7E) => "CdAsyncReadSector",
+        (0xA0, 0x81) => "CdAsyncSetMode",
+        (0xA0, 0x94) => "CdromGetInt5errCode",
+        (0xA0, 0x95) => "CdInitSubFunc",
+        (0xA0, 0xA4) => "CdGetLbn",
+        (0xA0, 0xA5) => "CdReadSector",
+        (0xA0, 0xA6) => "CdGetStatus",
         (0xA0, 0x65) => "dev_bu_open",
         (0xA0, 0x66) => "dev_bu_read",
         (0xA0, 0x67) => "dev_bu_write",
@@ -423,7 +433,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             let flow = m.putchars(text.into_bytes())?;
             Ok(crate::machine::seq(m, flow, move |_, _| Flow::ret(n)))
         }
-        (0xA0, 0x44) | (0xA0, 0x56) => r(0),
+        (0xA0, 0x44) => r(0),
         // SetMem: the guest-visible RAM size the kernel reports. Retail
         // accepts 2 and 8 MB; the host's memory backing is not resized.
         (0xA0, 0x9F) => {
@@ -444,6 +454,26 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xA0, 0x62) => r(m.dev_cd_firstfile(a[0], a[1], a[2])),
         (0xA0, 0x63) => r(m.dev_cd_nextfile(a[0], a[1])),
         (0xA0, 0x64) => r(m.dev_cd_chdir(a[1])),
+        (0xA0, 0x54) => r(m.cd_init()),
+        (0xA0, 0x95) => r(m.cd_inner_init()),
+        (0xA0, 0x56) => {
+            m.cd_remove();
+            r(0)
+        }
+        (0xA0, 0x78) => {
+            let msf = [mem.r8(a[0]), mem.r8(a[0] + 1), mem.r8(a[0] + 2)];
+            r(m.cd_seek_l(msf))
+        }
+        (0xA0, 0x7C) => r(m.cd_get_status(a[0])),
+        (0xA0, 0x7E) => r(m.cd_read(a[0], a[1], a[2])),
+        (0xA0, 0x81) => r(m.cd_set_mode(a[0])),
+        (0xA0, 0x94) => {
+            m.cd_int5_error(a[0], a[1]);
+            r(0)
+        }
+        (0xA0, 0xA4) => r(m.cd_lbn(a[0])),
+        (0xA0, 0xA5) => m.cd_block_read(a[0], a[1], a[2]),
+        (0xA0, 0xA6) => m.cd_block_status(),
         (0xA0, 0x65) => r(m.dev_bu_open(a[0], a[1], a[2])),
         (0xA0, 0x66) | (0xA0, 0x67) => r(m.dev_bu_io(a[0], a[1], a[2], func == 0x67)),
         (0xA0, 0x68) => r(m.dev_bu_close(a[0])),

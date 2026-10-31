@@ -126,6 +126,8 @@ pub enum Event {
     Sdk(u32, u32),
     /// The register-level CD controller has work due (D58).
     Cdc,
+    /// A BIOS CD software call's next step ([`crate::cdrom`]).
+    Cd,
 }
 
 /// A step of a stand-in function ([`Sdk::stand_in`]).
@@ -435,6 +437,7 @@ impl<S: Sdk> Machine<S> {
             }
             Event::Sdk(kind, data) => S::on_event(self, kind, data),
             Event::Cdc => self.cdc_sync(),
+            Event::Cd => self.cd_step(),
         }
     }
 
