@@ -112,14 +112,43 @@ mod tests {
         }
     }
 
-    /// The exception handler's queued steps, as the driver runs them: the
-    /// kernel's own (guest calls do nothing here).
+    /// Native chain functions run; ordinary guest callbacks are recorded.
+    fn invoke(m: &mut Machine<testing::NoSdk>, call: GuestCall) -> u32 {
+        if call.addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+            m.rfe = true;
+            return 0;
+        }
+        let Some(mut flow) = m.kernel_call(call.addr, call.args) else {
+            m.calls.push_back(call);
+            return 0;
+        };
+        loop {
+            match flow {
+                Flow::Return(v) => return v as u32,
+                Flow::Call { call, then } => {
+                    let v = invoke(m, call);
+                    if m.rfe { return 0; }
+                    flow = then(m, v as u64);
+                }
+                Flow::Block { .. } => panic!("kernel handler blocked"),
+            }
+        }
+    }
+
     fn take(m: &mut Machine<testing::NoSdk>) {
         while let Some(s) = m.irq_calls.pop_front() {
-            if let IrqStep::Kernel(k) = s {
-                if m.kernel_step(k) {
+            if let IrqStep::Chain(call, handler) = s {
+                m.in_irq = true;
+                m.rfe = false;
+                let v = invoke(m, call);
+                if let Some(addr) = handler.filter(|_| v != 0 && !m.rfe) {
+                    invoke(m, GuestCall { addr, args: [v, 0, 0, 0] });
+                }
+                if m.rfe {
                     while m.irq_calls.pop_front().is_some_and(|s| s != IrqStep::Exit) {}
                 }
+                m.rfe = false;
+                m.in_irq = false;
             }
         }
     }

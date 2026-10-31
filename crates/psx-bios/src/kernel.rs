@@ -3,9 +3,8 @@
 //! (psx-spx "Kernel (BIOS)").
 
 use crate::machine::Host;
-use crate::{Machine, Sdk};
-#[allow(unused_imports)]
-use crate::IrqStep;
+use crate::{Flow, GuestCall, Machine, Sdk};
+use crate::machine::seq;
 use psxw_abi::kernel as k;
 use psx_devices::mem::Mem;
 
@@ -239,6 +238,36 @@ impl<S: Sdk> Machine<S> {
         calls
     }
 
+    /// DeliverEvent as a nested BIOS call, including in an IRQ verifier.
+    /// Resume the RAM-table walk after each callback, so its edits to later
+    /// events are visible before those events are considered.
+    pub fn deliver_event_now(&mut self, class: u32, spec: u32) -> Flow<S> {
+        self.evcb(EV_HANDLE);
+        self.deliver_event_from(class, spec, 0)
+    }
+
+    fn deliver_event_from(&mut self, class: u32, spec: u32, start: u32) -> Flow<S> {
+        let n = self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE;
+        for i in start..n {
+            let Some(a) = self.evcb_at(EV_HANDLE | i) else { break };
+            let e = self.read_ev(a);
+            if e.status != EV_ENABLED || e.class != class || e.spec != spec {
+                continue;
+            }
+            if e.mode == EV_MODE_INTR {
+                if e.func != 0 {
+                    return Flow::Call {
+                        call: GuestCall { addr: e.func, args: [0; 4] },
+                        then: Box::new(move |m, _| m.deliver_event_from(class, spec, i + 1)),
+                    };
+                }
+            } else {
+                self.mem.w32(a + 4, EV_READY);
+            }
+        }
+        Flow::ret(1)
+    }
+
     /// UnDeliverEvent: ready events of mode 2000h with this class and spec
     /// are busy again (psx-spx).
     pub(crate) fn undeliver_event(&mut self, class: u32, spec: u32) {
@@ -272,14 +301,14 @@ impl<S: Sdk> Machine<S> {
 /// counters 0-2 and vblank (0-3, priority 1) and the IRQ events (priority
 /// 3), as OpenBIOS's `handlers/irq.c` enqueues them at boot, and the pad and
 /// card handler (priority 2, `sio0/driver.c`), which `StartPAD2` and
-/// `StartCARD2` enqueue. Their verifiers and handlers are kernel code here,
-/// at addresses in the BIOS ROM's range ([`KERNEL_CODE`]), run as
-/// [`IrqStep::Kernel`] steps in their places.
+/// `StartCARD2` enqueue. Their verifiers and handlers name callable native
+/// thunks in [`psxw_abi::KERNEL_STAND_INS`]. The RAM pointers, including guest
+/// replacements, are dispatched just like any other chain element.
 pub const KERNEL_ELEMENTS: u32 = 0x8000_7100;
 pub const IRQ_ELEMENT: u32 = 4;
 pub const SIO0_ELEMENT: u32 = 5;
 const ELEMENTS: u32 = 6;
-const KERNEL_CODE: u32 = 0xBFC0_8000;
+const KERNEL_CODE: u32 = psxw_abi::KERNEL_STAND_INS.start;
 
 /// The default exception exit's setjmp buffer: native ReturnFromException,
 /// the exception stack, then zeroed saved registers (psx-spx).
@@ -312,7 +341,10 @@ impl<S: Sdk> Machine<S> {
     pub fn lay_out_kernel_handlers(&mut self) {
         for i in 0..ELEMENTS {
             let e = kernel_element(i);
-            for (o, v) in [(0, 0), (4, KERNEL_CODE + 8 * i + 4), (8, KERNEL_CODE + 8 * i), (12, 0)] {
+            // IRQ and native pad/card verifiers do their work themselves
+            // and return zero: neither has a second-stage handler.
+            let handler = if i < 4 { KERNEL_CODE + 8 * i + 4 } else { 0 };
+            for (o, v) in [(0, 0), (4, handler), (8, KERNEL_CODE + 8 * i), (12, 0)] {
                 self.mem.w32(e + o, v);
             }
         }
@@ -333,57 +365,66 @@ impl<S: Sdk> Machine<S> {
         DEFAULT_EXIT
     }
 
-    /// The kernel element `h` is, if it is one.
-    pub fn kernel_element_at(&self, h: u32) -> Option<u32> {
-        let off = (h & 0x1FFF_FFFF).checked_sub(KERNEL_ELEMENTS & 0x1FFF_FFFF)?;
-        (off % 16 == 0 && off / 16 < ELEMENTS).then_some(off / 16)
+    fn irq_taken(&self, bit: u32) -> bool {
+        self.io.as_ref().is_some_and(|io| io.irq.stat & io.irq.mask & 1 << bit != 0)
     }
 
-    /// Kernel element `i`'s verifier, and its handler when that says so;
-    /// whether the handler returned from the exception (the rest of it
-    /// skipped).
-    pub fn kernel_step(&mut self, i: u32) -> bool {
-        let taken = |m: &Self, bit: u32| m.io.as_ref().is_some_and(|io| io.irq.stat & io.irq.mask & 1 << bit != 0);
-        let ack = |m: &mut Self, bit: u32| {
-            let _ = m.reg_write(psx_devices::irq::I_STAT, 4, !(1 << bit));
-        };
-        match i {
-            0..=3 => {
+    /// A saved kernel verifier/handler pointer. No machine borrow may be
+    /// held while the caller runs the returned flow's guest calls.
+    pub fn kernel_call(&mut self, addr: u32, _args: [u32; 4]) -> Option<Flow<S>> {
+        let off = addr.checked_sub(KERNEL_CODE)?;
+        if off % 4 != 0 || off >= ELEMENTS * 8 {
+            return None;
+        }
+        let (i, handler) = (off / 8, off & 4 != 0);
+        Some(match (i, handler) {
+            (0..=3, false) => {
                 let bit = if i == 3 { psx_devices::irq::VBLANK } else { psx_devices::irq::TIMER0 + i };
-                if !taken(self, bit) {
-                    return false;
-                }
-                self.deliver_event(0xF200_0000 | i, 2);
-                if self.kernel.clear_rcnt[i as usize] == 0 {
-                    return false;
-                }
-                ack(self, bit);
-                true
+                if self.irq_taken(bit) { self.deliver_event_now(0xF200_0000 | i, 2) } else { Flow::ret(0) }
             }
-            IRQ_ELEMENT => {
-                for (bit, class) in IRQ_EVENTS {
-                    if taken(self, bit) {
-                        self.deliver_event(class, 0x1000);
-                        if self.kernel.irq_auto_ack[bit as usize] != 0 {
-                            ack(self, bit);
-                        }
+            (0..=3, true) => {
+                if self.kernel.clear_rcnt[i as usize] == 0 {
+                    Flow::ret(0)
+                } else {
+                    let bit = if i == 3 { psx_devices::irq::VBLANK } else { psx_devices::irq::TIMER0 + i };
+                    let _ = self.reg_write(psx_devices::irq::I_STAT, 4, !(1 << bit));
+                    // Use the existing callable RFE thunk: its wasm tag
+                    // unwinds nested guest/native calls to invoke_irq.
+                    Flow::Call {
+                        call: GuestCall { addr: psxw_abi::BIOS_RETURN_FROM_EXCEPTION, args: [0; 4] },
+                        then: Box::new(|_, _| Flow::ret(0)),
                     }
                 }
-                false
             }
-            SIO0_ELEMENT => {
+            (IRQ_ELEMENT, false) => self.kernel_irq_events(0),
+            (SIO0_ELEMENT, false) => {
                 let vblank = psx_devices::irq::VBLANK;
-                if !taken(self, vblank) {
-                    return false;
+                if self.irq_taken(vblank) {
+                    self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
+                    if self.kernel.clear_pad != 0 {
+                        let _ = self.reg_write(psx_devices::irq::I_STAT, 4, !(1 << vblank));
+                    }
                 }
-                self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
-                if self.kernel.clear_pad != 0 {
-                    ack(self, vblank);
-                }
-                false
+                Flow::ret(0)
             }
-            _ => false,
+            _ => return None,
+        })
+    }
+
+    fn kernel_irq_events(&mut self, start: usize) -> Flow<S> {
+        for (i, (bit, class)) in IRQ_EVENTS.into_iter().enumerate().skip(start) {
+            if self.irq_taken(bit) {
+                let flow = self.deliver_event_now(class, 0x1000);
+                return seq(self, flow, move |m, _| m.kernel_irq_events(i + 1));
+            }
         }
+        // Retail IRQVerifier acknowledges configured lines after all event
+        // callbacks (the retail variant preserved in OpenBIOS irq.c).
+        let mask = self.kernel.irq_auto_ack.iter().enumerate().fold(0, |v, (bit, &ack)| v | (u32::from(ack != 0) << bit));
+        if mask != 0 {
+            let _ = self.reg_write(psx_devices::irq::I_STAT, 4, !mask);
+        }
+        Flow::ret(0)
     }
 
     /// `StartPAD2`/`StartCARD2` (OpenBIOS `startPad`, `startCard`): the pad

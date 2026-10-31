@@ -167,7 +167,7 @@ void func_80011000(int a, char *p) { func_80012200(a, 0, 8); func_80012200(p, 0,
 /// Saved native BIOS entries remain callable after a table patch. Exercise
 /// C's dynamic/constant pointers, a lifted direct call, and the o32 return.
 #[test]
-fn game_bios_saved_entry_thunks() {
+fn game_native_saved_entry_thunks() {
     use psxw_abi::{WINDOW_BASE, guest, kernel};
     use psxw_link::game::{GameSpec, Tier};
     let src = r#"
@@ -188,6 +188,27 @@ unsigned long long func_80011300(unsigned a, unsigned b, unsigned c, unsigned d)
 unsigned long long func_80011400(unsigned a, unsigned b, unsigned c, unsigned d) {
     ((fp)0xBFC0A35C)(a, b, c, d);
     return 77; /* ReturnFromException must never return here. */
+}
+unsigned long long func_80011500(unsigned a, unsigned b, unsigned c, unsigned d) {
+    fp saved = *(fp volatile *)0x7138;
+    *(fp volatile *)0x7138 = func_80011100;
+    return saved(a, b, c, d);
+}
+unsigned long long func_80011600(unsigned a, unsigned b, unsigned c, unsigned d) {
+    return ((fp)0xBFC08018)(a, b, c, d);
+}
+extern unsigned long long psxw_f_BFC08018(unsigned, unsigned, unsigned, unsigned);
+unsigned long long func_80011700(unsigned a, unsigned b, unsigned c, unsigned d) {
+    return psxw_f_BFC08018(a, b, c, d);
+}
+unsigned long long func_80011800(unsigned a, unsigned b, unsigned c, unsigned d) {
+    ((fp)0xBFC0801C)(a, b, c, d);
+    return 77;
+}
+extern unsigned long long psxw_kernel_call(unsigned, unsigned, unsigned, unsigned, unsigned);
+unsigned long long func_80011900(unsigned a, unsigned b, unsigned c, unsigned d) {
+    psxw_kernel_call(0xBFC0801C, a, b, c, d);
+    return 77;
 }
 "#;
     let Some((map, input)) = compile("psxw-link-bios-thunks", src) else {
@@ -233,6 +254,20 @@ unsigned long long func_80011400(unsigned a, unsigned b, unsigned c, unsigned d)
         })
         .unwrap();
     linker.func_wrap("psx", "return_from_exception", |mut c: wasmtime::Caller<'_, u32>| *c.data_mut() += 100).unwrap();
+    linker.func_wrap("psx", "kernel_call", |mut c: wasmtime::Caller<'_, u32>, addr: u32, a: u32, b: u32, x: u32, d: u32| -> wasmtime::Result<u64> {
+        if addr == 0xBFC0_801C {
+            // The native flow calls a guest which itself invokes RFE. The
+            // tag must cross both native and guest frames to invoke_irq,
+            // not be caught by the inner guest_invoke and resume here.
+            let invoke = c.get_export(guest::INVOKE).unwrap().into_func().unwrap().typed::<(u32, u32, u32, u32, u32), u64>(&c)?;
+            invoke.call(&mut c, (0x8001_1400, 0, 0, 0, 0))?;
+            panic!("kernel flow continued after RFE");
+        }
+        assert_eq!(addr, 0xBFC0_8018);
+        assert_eq!([a, b, x, d], [11, 22, 33, 44]);
+        *c.data_mut() += 1;
+        Ok(RESULT)
+    }).unwrap();
     linker.define_unknown_imports_as_traps(&module).unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
     instance.get_typed_func::<u32, ()>(&mut store, "guest_sp_set").unwrap().call(&mut store, STACK_TOP).unwrap();
@@ -249,6 +284,20 @@ unsigned long long func_80011400(unsigned a, unsigned b, unsigned c, unsigned d)
     let irq = instance.get_typed_func::<(u32, u32, u32, u32, u32), u64>(&mut store, guest::INVOKE_IRQ).unwrap();
     assert_eq!(irq.call(&mut store, (0x8001_1400, 0, 0, 0, 0)).unwrap(), 0);
     assert_eq!(*store.data(), 104);
+    memory.write(&mut store, (WINDOW_BASE + 0x7138) as usize, &0xBFC0_8018u32.to_le_bytes()).unwrap();
+    for addr in [0x8001_1500, 0x8001_1600, 0x8001_1700, 0xBFC0_8018] {
+        assert_eq!(invoke.call(&mut store, (addr, 11, 22, 33, 44)).unwrap(), RESULT);
+    }
+    assert_eq!(*store.data(), 108);
+    assert_eq!(invoke.call(&mut store, (0x8001_1500, 11, 22, 33, 44)).unwrap(), 42);
+    for addr in [0x8001_1800, 0x8001_1900] {
+        assert_eq!(irq.call(&mut store, (addr, 0, 0, 0, 0)).unwrap(), 0);
+    }
+    assert_eq!(*store.data(), 308);
+    spec.tiers.insert(("t".into(), 0x8000_8000), spec.tiers[&("t".into(), 0x8001_1000)]);
+    let err = psxw_link::game::link(&map, None, &spec, &inputs).unwrap_err();
+    assert!(err.to_string().contains("collides with kernel stand-in"), "{err:#}");
+    spec.tiers.remove(&("t".into(), 0x8000_8000));
     spec.tiers.insert(("t".into(), 0x8000_A000), spec.tiers[&("t".into(), 0x8001_1000)]);
     let err = psxw_link::game::link(&map, None, &spec, &inputs).unwrap_err();
     assert!(err.to_string().contains("collides with BIOS stand-in"), "{err:#}");

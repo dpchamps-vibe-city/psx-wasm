@@ -182,6 +182,8 @@ enum Synth {
     AdapterThunk { id: u32, addr: u32 },
     /// A saved BIOS table entry, calling the original native function.
     BiosThunk(u32),
+    /// A saved native kernel verifier or handler.
+    KernelThunk(u32),
     /// Dispatch on the code resident at an address shared by overlays.
     OverlayStub(u32),
     /// C `call_indirect` with a signature (the MIPS address trails).
@@ -351,6 +353,9 @@ impl Ctx<'_> {
         if psxw_abi::BIOS_STAND_INS.contains(&addr) && addr & 3 == 0 {
             return Some(self.synth(Synth::BiosThunk(addr)));
         }
+        if psxw_abi::KERNEL_STAND_INS.contains(&addr) && addr & 3 == 0 {
+            return Some(self.synth(Synth::KernelThunk(addr)));
+        }
         let tier = *self.spec.tiers.get(&(container.to_string(), addr))?;
         Some(match tier {
             Tier::Lift { input, func } => self.guest[&(input, func)],
@@ -428,6 +433,9 @@ impl Ctx<'_> {
     fn dynamic_entry(&mut self, addr: u32) -> Option<u32> {
         if psxw_abi::BIOS_STAND_INS.contains(&addr) && addr & 3 == 0 {
             return Some(self.synth(Synth::BiosThunk(addr)));
+        }
+        if psxw_abi::KERNEL_STAND_INS.contains(&addr) && addr & 3 == 0 {
+            return Some(self.synth(Synth::KernelThunk(addr)));
         }
         if self.spec.overlays.contains_key(&addr) {
             return Some(self.synth(Synth::OverlayStub(addr)));
@@ -852,6 +860,16 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             }
             f.instruction(&I::End);
             (o32(), f, format!("bios@{addr:08X}"))
+        }
+        Synth::KernelThunk(addr) => {
+            let mut f = Function::new([]);
+            f.instruction(&I::I32Const(addr as i32));
+            for l in 0..4 {
+                f.instruction(&I::LocalGet(l));
+            }
+            f.instruction(&I::Call(ctx.import(psx::KERNEL_CALL)));
+            f.instruction(&I::End);
+            (o32(), f, format!("kernel@{addr:08X}"))
         }
         Synth::AdapterThunk { id, addr } => {
             let mut f = Function::new([]);
@@ -1715,6 +1733,14 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             table_index(addr)
         );
         elements.insert(table_index(addr), ctx.synth(Synth::BiosThunk(addr)));
+    }
+    for addr in psxw_abi::KERNEL_STAND_INS.step_by(4) {
+        ensure!(
+            !elements.contains_key(&table_index(addr)),
+            "game code collides with kernel stand-in {addr:#010x} at dispatch slot {:#x}",
+            table_index(addr)
+        );
+        elements.insert(table_index(addr), ctx.synth(Synth::KernelThunk(addr)));
     }
     let mod_init = ctx.synth(Synth::ModInit);
     let mod_loaded = ctx.synth(Synth::ModLoaded);

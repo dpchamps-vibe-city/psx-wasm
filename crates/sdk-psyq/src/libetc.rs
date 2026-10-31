@@ -962,12 +962,16 @@ mod tests {
         while let Some(s) = m.irq_calls.pop_front() {
             match s {
                 IrqStep::Sdk(s) => Psyq::irq_step(&mut m, s),
-                IrqStep::Kernel(k) => {
-                    m.kernel_step(k);
-                }
-                IrqStep::Chain(c, _) => {
-                    sps.push(m.regs.sp());
-                    crate::testing::guest(&mut m, c.addr);
+                IrqStep::Chain(c, handler) => {
+                    if !psxw_abi::KERNEL_STAND_INS.contains(&c.addr) {
+                        sps.push(m.regs.sp());
+                    }
+                    m.in_irq = true;
+                    let v = crate::testing::guest_with_args(&mut m, c);
+                    if let Some(addr) = handler.filter(|_| v != 0 && !m.rfe) {
+                        crate::testing::guest_with_args(&mut m, GuestCall { addr, args: [v, 0, 0, 0] });
+                    }
+                    m.in_irq = false;
                 }
                 IrqStep::Exit => {}
             }

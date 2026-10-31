@@ -64,7 +64,7 @@ import { loadSaves, savesDir } from "./cards.js";
 import { ModLoader, takeMod } from "./mods.js";
 import { Calls, ScriptHost, mod } from "./script.js";
 
-const ABI_VERSION = 17;
+const ABI_VERSION = 18;
 const NOTHING_PRESSED = 0xffff;
 /** How far ahead of the vblanks a recorded counter may be (see `pad_state`). */
 const RECORD_AHEAD = 1 << 20;

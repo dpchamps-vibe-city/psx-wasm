@@ -54,7 +54,9 @@ pub mod replay;
 /// - 17: native BIOS call tables and callable saved-entry stand-ins. Keeps
 ///   the baseline address window and masked dispatch table; 13–16 belong
 ///   to the archived, incompatible map/residency experiments.
-pub const ABI_VERSION: u32 = 17;
+/// - 18: callable native kernel verifier/handler pointers, through the
+///   existing kernel_call and exception-exit seams.
+pub const ABI_VERSION: u32 = 18;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -203,6 +205,11 @@ pub const SYNTHETIC_CODE: core::ops::Range<u32> = 0x8020_0000..0x8040_0000;
 pub const BIOS_STAND_INS: core::ops::Range<u32> = 0xBFC0_A000..0xBFC0_A900;
 /// B(17h)'s thunk uses the existing exception-exit tag, not a normal return.
 pub const BIOS_RETURN_FROM_EXCEPTION: u32 = BIOS_STAND_INS.start + 0x300 + 4 * 0x17;
+
+/// Native root-counter, IRQ-event and pad/card functions. Like BIOS stand-ins,
+/// these reserve low-kernel masked-dispatch slots without a new address map.
+/// Offsets 24h and 2Ch are reserved: those verifiers have no second handler.
+pub const KERNEL_STAND_INS: core::ops::Range<u32> = 0xBFC0_8000..0xBFC0_8030;
 
 /// Dispatch table index for a guest function pointer. The table spans
 /// RAM plus the synthetic range; unmapped entries trap with the address.

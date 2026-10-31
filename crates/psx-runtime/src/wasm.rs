@@ -225,9 +225,12 @@ struct Guest;
 /// Guest calls in progress: 1 inside a thread's root call, more in a
 /// callback the runtime made from it.
 fn nested<R>(f: impl FnOnce() -> R) -> R {
-    DEPTH.with(|d| d.set(d.get() + 1));
+    let depth = DEPTH.with(Cell::get);
+    DEPTH.with(|d| d.set(depth + 1));
     let r = f();
-    DEPTH.with(|d| d.set(d.get() - 1));
+    // invoke_irq can catch RFE across further nested native/guest calls,
+    // whose normal return paths (and depth restoration) were unwound.
+    DEPTH.with(|d| d.set(depth));
     r
 }
 
@@ -607,8 +610,14 @@ pub extern "C" fn bad_jump(pc: u32, target: u32) {
 }
 
 #[unsafe(export_name = "kernel_call")]
-pub extern "C" fn kernel_call(addr: u32, _a0: u32, _a1: u32, _a2: u32, _a3: u32) -> u64 {
-    fatal(8, &format!("call into BIOS kernel RAM at {addr:#010x}; this function needs an adapter"))
+pub extern "C" fn kernel_call(addr: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
+    with(|rt| {
+        let flow = rt.m.borrow_mut().kernel_call(addr, [a0, a1, a2, a3]);
+        match flow {
+            Some(flow) => driver::run(&rt.m, &mut Guest, flow),
+            None => fatal(8, &format!("call into BIOS kernel at {addr:#010x}; this function needs an adapter")),
+        }
+    })
 }
 
 /// Any other function's access to the I/O window in a debug build.

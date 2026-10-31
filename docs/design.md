@@ -778,10 +778,16 @@ a call into guest code.
   parts now run in Rust over guest memory. The guest-visible A0/B0/C0
   tables hold native stand-in pointers, or guest patches. Saved native
   pointers call linker-generated o32 thunks independently of later table
-  edits; B(17h)'s thunk uses the existing exception-exit tag. ABI 17 retains
-  the baseline window/masked dispatch: stand-ins occupy low-kernel slots
-  A000h..A900h, and the linker rejects game-code collisions. It does not
-  introduce a console-wide address mapper or execute BIOS machine code.
+  edits; B(17h)'s thunk uses the existing exception-exit tag. ABI 18 retains
+  the baseline window/masked dispatch: BIOS stand-ins occupy low-kernel slots
+  A000h..A900h, kernel verifiers/handlers 8000h..8030h, and the linker rejects
+  game-code collisions. Kernel chains use their RAM function pointers, not
+  element-identity shortcuts; guest replacements and saved native pointers
+  use the same call path. DeliverEvent runs callbacks synchronously, including
+  inside a verifier, before acknowledgement or exception return. Native root
+  handlers use the existing RFE thunk/tag, without a new return-code protocol.
+  The IRQ entry restores guest-call depth after nested RFE unwinding. None of
+  this introduces a console-wide address mapper or executes BIOS machine code.
 - **clock.** The virtual timeline: vblank (NTSC 59.94 Hz, PAL 50 Hz), a
   queue of pending device events, and the safepoint quantum. It delivers
   events in a fixed order by calling guest callbacks.

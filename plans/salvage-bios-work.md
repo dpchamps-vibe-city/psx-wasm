@@ -492,8 +492,38 @@ Source checkpoint `4cce9e3`, in this recovery checkout, not main's outputs:
   goldens still need provisioning; no capture/re-record performed.
 - Full `psxw ci btn` / `psxw ci bof4` and browser disc isolation remain pending.
 
+## Current kernel-call batch (ABI 18)
+
+- Native root-counter verifiers/handlers, IRQ-event delivery and pad/card
+  sampling now have callable thunks at BFC08000h..BFC08030h (two reserved
+  second-handler slots). RAM chain pointers are dispatched normally; the old
+  element-identity bypass is removed, so guest replacements take effect.
+- DeliverEvent callbacks run synchronously, including from a verifier or nested
+  BIOS call, and see edits to later event blocks. Root acknowledgement/RFE
+  follows the callbacks. IRQ events use the retail callback-then-autoack order
+  documented by the retail variant in pinned OpenBIOS `handlers/irq.c`.
+- Native RFE uses the existing saved BIOS thunk and wasm exception tag. No
+  high-word return flag, new exception ABI, map or hardware driver was added.
+  Nested guest-call depth is restored at the IRQ catch boundary.
+- Workspace tests pass (BIOS 29, runtime 8, SDK 36, link-pass integration 6),
+  including a patched-chain/callback regression and real clang/wasmtime calls
+  through saved/constant/direct kernel pointers with nested RFE unwinding.
+  Optional compiler/Docker skips and the ignored threaded-DWARF gate remain.
+- wasm32 runtime check, release CLI and fresh builds of both games pass.
+  ABI-18 BTN `title-to-gameplay` passes 6000 frames/all three expectations;
+  BOF4 `title-to-field` passes 26000/all five. BTN's previously observed GPU
+  timeout/reset is unchanged. Browser JS syntax checks pass.
+- The isolated full-CI lane remains pinned to ABI 17 (`a74f832`); its results
+  must not be attributed to this later batch. Card-load/crash replay, SDK
+  conformance and browser gates have not been rerun at ABI 18 yet.
+- C(06h), general non-local returns, callback thread switches, SDK BIOS-table
+  replacement paths and other listed gaps remain unfinished. This batch does
+  not complete the exception/control-flow checklist or full BIOS.
+
 ## Progress log
 
+- 2026-10-31: callable kernel functions and callback ordering integrated as
+  described above; shared native/fallback state and baseline scheduling remain.
 - 2026-10-31: file follow-up, fallback batch and independent renderer/browser
   fixes source-reviewed and integrated. Combined foundation builds and replay
   gates now run as recorded above. Missing BIOS families and control-flow

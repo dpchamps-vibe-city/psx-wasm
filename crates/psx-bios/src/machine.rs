@@ -110,9 +110,6 @@ pub enum IrqStep {
     /// ([`Sdk::chain_element`]): [`Sdk::irq_step`] runs it at its turn,
     /// and may queue further steps (callbacks among them) at the front.
     Sdk(u32),
-    /// One of the kernel's own elements (D68): its verifier, and its
-    /// handler when that says so ([`Machine::kernel_step`]).
-    Kernel(u32),
     /// The end of the handler: the custom exit (`HookEntryInt`, B0h:19h)
     /// if one is set, entered like a longjmp to its buffer with 1.
     Exit,

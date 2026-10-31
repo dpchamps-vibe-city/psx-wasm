@@ -512,10 +512,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(libc::malloc(&mut *m.mem, heap, a[0]))
         }
         (0xB0, 0x02..=0x06) => timer(m, func, a).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
-        (0xB0, 0x07) => {
-            m.deliver_event(a[0], a[1]);
-            r(1)
-        }
+        (0xB0, 0x07) => Ok(m.deliver_event_now(a[0], a[1])),
         (0xB0, 0x08) => r(m.open_event(a[0], a[1], a[2], a[3])),
         (0xB0, 0x09) => {
             m.set_ev_status(a[0], kernel::EV_UNUSED);

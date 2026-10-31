@@ -57,18 +57,6 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
                 S::irq_step(&mut m, s);
                 continue;
             }
-            // The kernel's own handlers: Rust too. One that returns from
-            // the exception skips the rest of it.
-            if let IrqStep::Kernel(k) = step.0 {
-                if m.kernel_step(k) && step.1 {
-                    while let Some(s) = m.irq_calls.pop_front() {
-                        if s == IrqStep::Exit {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
             m.in_irq = true;
             m.rfe = false;
             step
@@ -92,7 +80,7 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
                     }
                 }
             }
-            IrqStep::Sdk(_) | IrqStep::Kernel(_) => unreachable!("run above"),
+            IrqStep::Sdk(_) => unreachable!("run above"),
             IrqStep::Exit => {
                 let buf = rt.borrow().kernel.custom_exit;
                 let resume = rt.borrow().mem.r32(buf);
@@ -210,6 +198,14 @@ mod tests {
     }
     impl Invoke for Guest<'_> {
         fn invoke(&mut self, call: GuestCall) -> u64 {
+            let flow = self.rt.borrow_mut().kernel_call(call.addr, call.args);
+            if let Some(flow) = flow {
+                return run(self.rt, self, flow);
+            }
+            if call.addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+                self.rt.borrow_mut().rfe = true;
+                return 0;
+            }
             self.seen.push((call.addr, call.args));
             if self.rfe.contains(&call.addr) {
                 self.rt.borrow_mut().rfe = true;
@@ -363,6 +359,84 @@ mod tests {
         let addrs: Vec<u32> = g.seen.iter().map(|c| c.0).collect();
         assert_eq!(addrs, vec![0x8001_0000, 0x8001_0000]);
         assert!(rt.borrow().irq_calls.is_empty());
+    }
+
+    #[test]
+    fn native_kernel_callbacks_and_patched_chain_functions() {
+        use psx_bios::kernel::{self, EV_ENABLED, EV_MODE_INTR};
+        use psx_devices::irq::VBLANK;
+        const EVENT: u32 = 0x8002_0000;
+        const DISABLED: u32 = EVENT + 4;
+        const NESTED: u32 = EVENT + 8;
+        const HANDLER: u32 = EVENT + 12;
+        const VERIFIER: u32 = EVENT + 16;
+        const LATER: u32 = EVENT + 20;
+        struct Patched<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            disable: u32,
+            seen: Vec<u32>,
+        }
+        impl Invoke for Patched<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                let flow = self.rt.borrow_mut().kernel_call(call.addr, call.args);
+                if let Some(flow) = flow { return run(self.rt, self, flow); }
+                let mut m = self.rt.borrow_mut();
+                assert!(m.in_irq);
+                if call.addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+                    m.rfe = true;
+                    return 0;
+                }
+                self.seen.push(call.addr);
+                assert_ne!(m.io.as_ref().unwrap().irq.stat & (1 << VBLANK), 0, "callback precedes ack");
+                match call.addr {
+                    EVENT => {
+                        m.kernel.clear_rcnt[3] = 0;
+                        m.set_ev_status(self.disable, kernel::EV_DISABLED);
+                        let f = psx_bios::bios::call(&mut m, 0xB0, 7, [0xF000_0042, 2, 0, 0]).unwrap();
+                        drop(m);
+                        run(self.rt, self, f)
+                    }
+                    HANDLER => { assert_eq!(call.args[0], 1); 0 }
+                    VERIFIER => 7,
+                    NESTED | LATER => 0,
+                    _ => panic!("unexpected callback {:#x}", call.addr),
+                }
+            }
+        }
+        let rt = machine();
+        let e = kernel::kernel_element(3);
+        let disable;
+        let saved_handler;
+        {
+            let mut m = rt.borrow_mut();
+            m.io = Some(Default::default());
+            m.io.as_mut().unwrap().irq.mask = 1 << VBLANK;
+            let event = m.open_event(0xF200_0003, 2, EV_MODE_INTR, EVENT);
+            disable = m.open_event(0xF200_0003, 2, EV_MODE_INTR, DISABLED);
+            let nested = m.open_event(0xF000_0042, 2, EV_MODE_INTR, NESTED);
+            for h in [event, disable, nested] { m.set_ev_status(h, EV_ENABLED); }
+            saved_handler = m.mem.r32(e + 4);
+            m.mem.w32(e + 4, HANDLER);
+        }
+        element(&rt, 2, 0x8000_1000, LATER, 0);
+        let mut guest = Patched { rt: &rt, disable, seen: vec![] };
+        rt.borrow_mut().raise_irq(VBLANK);
+        drain(&rt, &mut guest);
+        assert_eq!(guest.seen, [EVENT, NESTED, HANDLER, LATER]);
+        assert!(rt.borrow().calls.is_empty(), "nested event callbacks were not deferred");
+        // Patch only the verifier; the saved native handler is still callable
+        // and returns from the exception, skipping the lower-priority element.
+        {
+            let mut m = rt.borrow_mut();
+            m.mem.w32(e + 8, VERIFIER);
+            m.mem.w32(e + 4, saved_handler);
+            m.kernel.clear_rcnt[3] = 1;
+            m.queue_irq_chains();
+        }
+        drain(&rt, &mut guest);
+        assert_eq!(guest.seen, [EVENT, NESTED, HANDLER, LATER, VERIFIER]);
+        assert_eq!(rt.borrow().io.as_ref().unwrap().irq.stat & (1 << VBLANK), 0);
+        assert!(!rt.borrow().in_irq && !rt.borrow().rfe);
     }
 
     #[test]

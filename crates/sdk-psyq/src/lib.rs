@@ -285,12 +285,19 @@ pub mod testing {
         while let Some(s) = m.irq_calls.pop_front() {
             match s {
                 IrqStep::Sdk(s) => Psyq::irq_step(m, s),
-                IrqStep::Kernel(k) => {
-                    if m.kernel_step(k) {
+                IrqStep::Chain(c, handler) => {
+                    m.in_irq = true;
+                    m.rfe = false;
+                    let v = guest_with_args(m, c);
+                    if let Some(addr) = handler.filter(|_| v != 0 && !m.rfe) {
+                        guest_with_args(m, psx_bios::GuestCall { addr, args: [v, 0, 0, 0] });
+                    }
+                    if m.rfe {
                         while m.irq_calls.pop_front().is_some_and(|s| s != IrqStep::Exit) {}
                     }
+                    m.rfe = false;
+                    m.in_irq = false;
                 }
-                IrqStep::Chain(c, _) => guest_with_args(m, c),
                 IrqStep::Exit => {}
             }
         }
@@ -303,11 +310,19 @@ pub mod testing {
     }
 
     /// A guest call with the arguments the original leaves.
-    pub fn guest_with_args(m: &mut M, call: psx_bios::GuestCall) {
+    pub fn guest_with_args(m: &mut M, call: psx_bios::GuestCall) -> u32 {
         let addr = call.addr;
+        if addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+            m.rfe = true;
+            return 0;
+        }
+        if let Some(flow) = m.kernel_call(addr, call.args) {
+            return finish(m, Ok(flow));
+        }
         IRQ_ARGS.with(|v| v.borrow_mut().push(call.args));
         if let Some(f) = DOUBLES.with(|d| d.borrow().get(&addr).copied()) {
-            return f(m);
+            f(m);
+            return 0;
         }
         let mut state = 0;
         while let Some(step) = Psyq::stand_in(m, addr, state) {
@@ -316,10 +331,11 @@ pub mod testing {
                     guest_with_args(m, c);
                     state = next;
                 }
-                psx_bios::StandIn::Return(_) => return,
+                psx_bios::StandIn::Return(v) => return v as u32,
             }
         }
         IRQ_CALLS.with(|v| v.borrow_mut().push(addr));
+        0
     }
 
     /// The guest functions interrupts called since the last look.
@@ -352,8 +368,9 @@ pub mod testing {
                     f = then(m);
                 }
                 Flow::Call { call, then } => {
-                    guest_with_args(m, call);
-                    f = then(m, 0);
+                    let v = guest_with_args(m, call);
+                    if m.rfe { return 0; }
+                    f = then(m, v as u64);
                 }
             }
         }

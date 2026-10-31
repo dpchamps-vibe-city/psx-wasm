@@ -836,12 +836,8 @@ impl<S: Sdk> Machine<S> {
     pub fn queue_irq_chains(&mut self) {
         for prio in 0..4u32 {
             for h in self.chain(prio) {
-                // The kernel's own elements, and those the adapters run,
-                // are steps in their places in the chain.
-                if let Some(k) = self.kernel_element_at(h) {
-                    self.irq_calls.push_back(IrqStep::Kernel(k));
-                    continue;
-                }
+                // SDK-owned dispatcher steps retain their own seam. Native
+                // kernel elements use the RAM pointers below, just like guests.
                 if let Some(s) = S::chain_element(self, h) {
                     self.irq_calls.push_back(IrqStep::Sdk(s));
                     continue;
@@ -923,8 +919,11 @@ mod tests {
         // element (2), the kernel's IRQ events (3).
         let steps: Vec<IrqStep> = m.irq_calls.drain(..).collect();
         let chain = IrqStep::Chain(GuestCall { addr: 0x8000_2000, args: [0; 4] }, Some(0x8000_3000));
-        use IrqStep::Kernel;
-        assert_eq!(steps, [Kernel(3), Kernel(2), Kernel(1), Kernel(0), chain, Kernel(4), IrqStep::Exit]);
+        let native = |i: u32| {
+            let a = psxw_abi::KERNEL_STAND_INS.start + 8 * i;
+            IrqStep::Chain(GuestCall { addr: a, args: [0; 4] }, (i < 4).then_some(a + 4))
+        };
+        assert_eq!(steps, [native(3), native(2), native(1), native(0), chain, native(4), IrqStep::Exit]);
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
         // The SPU: main volume left reads back; the CD controller's status
@@ -959,7 +958,7 @@ mod tests {
         crate::bios::call(&mut m, 0xC0, 0x02, [2, kernel, 0, 0]).unwrap();
         m.raise_irq(psx_devices::irq::VBLANK);
         let verifiers: Vec<u32> = m.irq_calls.drain(..).filter_map(|s| if let IrqStep::Chain(c, _) = s { Some(c.addr) } else { None }).collect();
-        assert_eq!(verifiers, [0x8000_2000, 0x8000_2100]);
+        assert_eq!(verifiers, [0xBFC0_8018, 0xBFC0_8010, 0xBFC0_8008, 0xBFC0_8000, 0x8000_2000, 0x8000_2100, 0xBFC0_8020]);
         assert!(matches!(crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]), Ok(crate::Flow::Return(v)) if v as u32 == linked));
         assert_eq!(m.chain(2), [kernel]);
         assert!(matches!(crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]), Ok(crate::Flow::Return(0))), "not there: 0");
