@@ -395,9 +395,14 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    `ChangeClearRCnt`), IRQ class events (3, `SetIrqAutoAck`), the pad and
    card handler (2, `StartPAD2`/`StartCARD2`, `ChangeClearPad`). Pending
    interrupts are taken at ExitCriticalSection and I_MASK writes.
-6. [ ] **BIOS5. The pad driver drives SIO0** for `InitPAD`/`StartPAD`
+6. [x] **BIOS5. The pad driver drives SIO0** for `InitPAD`/`StartPAD`
    buffers (`psx-bios/src/kernel.rs:110-126`), through the shared port
    model.
+   Done `8be8b17`: the kernel's pad handler talks to each port's pad in
+   SIO0's model (01h, 42h, ID, 5Ah, the halfwords; status FFh on no
+   acknowledge), as OpenBIOS's `readPad`. Not modelled: the handler's own
+   CPU time in the exception (libpad's adapters spend it, D60). libapi's
+   priority-1 element and `EnablePAD`/`DisablePAD` (Findings) stay open.
 7. [x] **BIOS6, SDK10. The card driver drives SIO0, and the cards are the
    port's.** `psx-bios/src/card.rs`: transfers paced as the BIOS paces
    them; `_card_*` and the `bu` device over it. The card images move to
@@ -429,10 +434,13 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    - the A0h CD functions over the CD controller;
    - `syscall` 4 and up (the exception event), `SystemError`, exception
      hooks.
-10. [ ] **What can't be done fails with the reason.** `Exec`/`LoadExec`
+10. [x] **What can't be done fails with the reason.** `Exec`/`LoadExec`
     of an untranslated executable, `longjmp` across translated frames
     (see [Forced](#forced)): one error each, naming why.
 
+    Done `95735b7`: `Exec`, `LoadExec`, `longjmp`, `atof`, `strtod` each
+    fail with their reason (`bios::unsupported`); the build lists their
+    call sites.
 ### Exit criteria
 
 1. `cargo test --workspace` passes.
@@ -583,7 +591,9 @@ locals, or static translation.
 - **2026-10-31:** phase 3: BIOS7 (`6155844`), BIOS4 (`053035d`). After
   BIOS4 every chip each game places passes conformance (irq, sio0, gpu,
   cd, spu in both; memcard in btn; mdec in bof4; `out/sf-p3-conform-*`),
-  and both games build with every chip native.
+  and both games build with every chip native. The same holds after
+  BIOS6 and task 9's groups (`out/sf-p3b-conform-*`). BIOS5 and task 10
+  done.
 - **2026-10-31:** phase 2: SDK2, SDK6/SDK8, SDK3–5, SDK11 done (`b92f582`..
   `8e04a5b`); SDK1 with an agent. Adapters can bind by place
   (`libgpu/sys:0x23a8`, `libetc/intr_dma:0x4c`, `libcd/bios_1:0x14a4`):
