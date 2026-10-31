@@ -176,7 +176,7 @@ fn index(port: u32) -> usize {
 
 /// Whether libpad's element is in the kernel's chain.
 fn installed(m: &M) -> bool {
-    m.kernel.int_handlers.get(&PRIORITY).is_some_and(|c| c.contains(&ELEMENT))
+    m.chain(PRIORITY).contains(&ELEMENT)
 }
 
 /// At each vblank, before the interrupt: the pads latch their buttons,
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(buf(&m, B0), [9; 4], "nothing polls");
         call(&mut m, pad_start_com, [0; 4]);
         assert_eq!(m.sdk.pad.ports[0].state, 0, "forgotten");
-        assert_eq!(m.kernel.int_handlers[&2], vec![ELEMENT]);
+        assert_eq!(m.chain(2), vec![ELEMENT]);
         // Detection again: a poll, its reply a vblank later.
         vblanks(&mut m, 1);
         assert_eq!(buf(&m, B0), [9; 4]);

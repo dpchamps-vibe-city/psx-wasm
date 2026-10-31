@@ -676,11 +676,11 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// The kernel's exception control blocks in guest RAM, from the table
-    /// of tables (psx-spx "BIOS Memory Map"): a chain head per priority.
-    /// `SysEnqIntRP` keeps its chains in the kernel (`int_handlers`); SDK
-    /// code that links an element itself (libmcx's `McxStartCom` appends
-    /// to priority 2 through 100h) lands here, and the handler walks these
-    /// after the kernel's (D65).
+    /// of tables (psx-spx "BIOS Memory Map"): a chain head per priority,
+    /// each element linked through its first word (D68). `SysEnqIntRP`
+    /// links here, SDK code that links an element itself (libmcx's
+    /// `McxStartCom` appends to priority 2 through 100h) too, and the
+    /// handler walks only these.
     pub fn lay_out_excb(&mut self) {
         self.mem.w32(k::EXCB_ENTRY, 0xA000_0000 | k::EXCB);
         self.mem.w32(k::EXCB_ENTRY + 4, k::EXCB_SIZE);
@@ -688,7 +688,7 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// The elements linked into priority `prio`'s block in RAM, in order.
-    fn excb_chain(&self, prio: u32) -> Vec<u32> {
+    pub fn chain(&self, prio: u32) -> Vec<u32> {
         let mut out = Vec::new();
         let mut e = self.mem.r32(k::EXCB + 8 * prio);
         while e != 0 && out.len() < 64 && !out.contains(&e) {
@@ -698,20 +698,33 @@ impl<S: Sdk> Machine<S> {
         out
     }
 
-    /// `SysDeqIntRP` unlinks `elem` from priority `prio`'s block in RAM too.
-    pub fn excb_unlink(&mut self, prio: u32, elem: u32) {
+    /// `SysEnqIntRP(prio, elem)`: `elem` at the head of the chain (OpenBIOS
+    /// `handlers.c`).
+    pub fn enq_int_rp(&mut self, prio: u32, elem: u32) {
         if prio >= 4 {
             return;
         }
+        let head = self.mem.r32(k::EXCB + 8 * prio);
+        self.mem.w32(elem, head);
+        self.mem.w32(k::EXCB + 8 * prio, elem);
+    }
+
+    /// `SysDeqIntRP(prio, elem)`: `elem` unlinked from the chain; `elem`, or
+    /// 0 when it wasn't there.
+    pub fn deq_int_rp(&mut self, prio: u32, elem: u32) -> u32 {
+        if prio >= 4 {
+            return 0;
+        }
         let mut link = k::EXCB + 8 * prio;
-        for e in self.excb_chain(prio) {
+        for e in self.chain(prio) {
             if e == elem {
                 let next = self.mem.r32(e);
                 self.mem.w32(link, next);
-                return;
+                return elem;
             }
             link = e;
         }
+        0
     }
 
     /// Raise interrupt `bit` on the bus (if there is one) and, when it is
@@ -738,15 +751,7 @@ impl<S: Sdk> Machine<S> {
     /// then the SDK's dispatcher when adapters run it, then its exit.
     pub fn queue_irq_chains(&mut self) {
         for prio in 0..4u32 {
-            let mut chain: Vec<u32> = self.kernel.int_handlers.get(&prio).map(|c| c.iter().rev().copied().collect()).unwrap_or_default();
-            // Elements linked into the RAM block (D65) come after the
-            // kernel's, as on a chain whose tail they were appended to.
-            for e in self.excb_chain(prio) {
-                if !chain.contains(&e) {
-                    chain.push(e);
-                }
-            }
-            for h in chain {
+            for h in self.chain(prio) {
                 // An element the adapters own runs as their step, in its
                 // place in the chain.
                 if let Some(s) = S::chain_element(self, h) {
@@ -819,7 +824,7 @@ mod tests {
         // An element at 0x80001000: verifier 0x80002000, handler 0x80003000.
         m.mem.w32(0x8000_1004, 0x8000_3000);
         m.mem.w32(0x8000_1008, 0x8000_2000);
-        m.kernel.int_handlers.entry(2).or_default().push(0x8000_1000);
+        m.enq_int_rp(2, 0x8000_1000);
         m.raise_irq(psx_devices::irq::VBLANK);
         assert_eq!(m.io_read(0x1F80_1070, 4).unwrap(), 1);
         assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Chain(GuestCall { addr: 0x8000_2000, args: [0; 4] }, Some(0x8000_3000))));
@@ -839,8 +844,8 @@ mod tests {
     }
 
     /// An element linked into the RAM block through the table of tables
-    /// (libmcx's `McxStartCom` does it) runs after the kernel's chain of
-    /// its priority; `SysDeqIntRP` unlinks it there.
+    /// (libmcx's `McxStartCom` does it) and one `SysEnqIntRP` queued share
+    /// the chain; `SysDeqIntRP` unlinks it there.
     #[test]
     fn elements_linked_in_ram() {
         let mut m = machine();
@@ -851,15 +856,17 @@ mod tests {
             m.mem.w32(e + 4, v + 0x1000);
             m.mem.w32(e + 8, v);
         }
-        m.kernel.int_handlers.entry(2).or_default().push(kernel);
         let block = m.mem.r32(psxw_abi::kernel::EXCB_ENTRY) + 8 * 2;
         m.mem.w32(block, linked);
         m.mem.w32(linked, 0);
+        // Queued after: at the head, as OpenBIOS's SysEnqIntRP puts it.
+        crate::bios::call(&mut m, 0xC0, 0x02, [2, kernel, 0, 0]).unwrap();
         m.raise_irq(psx_devices::irq::VBLANK);
         let verifiers: Vec<u32> = m.irq_calls.drain(..).filter_map(|s| if let IrqStep::Chain(c, _) = s { Some(c.addr) } else { None }).collect();
         assert_eq!(verifiers, [0x8000_2000, 0x8000_2100]);
-        crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]).unwrap();
-        assert_eq!(m.mem.r32(block), 0);
+        assert!(matches!(crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]), Ok(crate::Flow::Return(v)) if v as u32 == linked));
+        assert_eq!(m.chain(2), [kernel]);
+        assert!(matches!(crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]), Ok(crate::Flow::Return(0))), "not there: 0");
     }
 
     #[test]

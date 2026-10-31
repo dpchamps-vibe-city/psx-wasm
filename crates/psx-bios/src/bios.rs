@@ -546,17 +546,10 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
 
         // --- C0h: interrupt plumbing -------------------------------------
         (0xC0, 0x02) => {
-            m.kernel.int_handlers.entry(a[0]).or_default().push(a[1]);
+            m.enq_int_rp(a[0], a[1]);
             r(0)
         }
-        (0xC0, 0x03) => {
-            if let Some(v) = m.kernel.int_handlers.get_mut(&a[0]) {
-                v.retain(|&h| h != a[1]);
-            }
-            // An element SDK code linked into the RAM blocks itself (D65).
-            m.excb_unlink(a[0], a[1]);
-            r(0)
-        }
+        (0xC0, 0x03) => r(m.deq_int_rp(a[0], a[1])),
         (0xC0, 0x1A) => {
             m.kernel.cards.find_mode = a[0];
             r(0)

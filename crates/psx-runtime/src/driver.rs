@@ -215,7 +215,7 @@ mod tests {
         let mut m = rt.borrow_mut();
         m.mem.w32(at + 4, handler);
         m.mem.w32(at + 8, verifier);
-        m.kernel.int_handlers.entry(prio).or_default().push(at);
+        m.enq_int_rp(prio, at);
     }
 
     /// The ABI 10 host: `vblank` at every delivered vblank, `wait_vblank`
