@@ -208,7 +208,7 @@ impl Mem for Window {
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), window(off), data.len()) };
     }
     fn bus_error(&self, addr: u32, len: usize, store: bool) -> ! {
-        fatal(13, &psx_devices::mem::bus_error_text(addr, len, store))
+        fatal(14, &psx_devices::mem::bus_error_text(addr, len, store))
     }
 }
 
@@ -683,8 +683,8 @@ pub extern "C" fn map_access(addr: u32, len: u32, store: u32) -> u32 {
     let store = store != 0;
     let Some(off) = map::access(addr, len, store) else {
         match map::place(addr) {
-            None => fatal(13, &psx_devices::mem::bus_error_text(addr, len as usize, store)),
-            Some(p) => fatal(13, &format!("{} bytes at {addr:#010x} run past the end of {:?}", len, p.region)),
+            None => fatal(14, &psx_devices::mem::bus_error_text(addr, len as usize, store)),
+            Some(p) => fatal(14, &format!("{} bytes at {addr:#010x} run past the end of {:?}", len, p.region)),
         }
     };
     if let (false, Some(map::Region::Expansion(v))) = (store, map::place(addr).map(|p| p.region)) {
@@ -698,7 +698,7 @@ pub extern "C" fn map_access(addr: u32, len: u32, store: u32) -> u32 {
 #[unsafe(export_name = "map_code")]
 pub extern "C" fn map_code(fp: u32) -> u32 {
     map::code_index(fp).unwrap_or_else(|| match map::place(fp) {
-        None => fatal(13, &format!("bus error: call to {fp:#010x}")),
+        None => fatal(14, &format!("bus error: call to {fp:#010x}")),
         Some(p) => fatal(4, &format!("no implementation for guest address {fp:#010x} ({:?})", p.region)),
     })
 }

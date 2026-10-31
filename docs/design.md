@@ -2736,7 +2736,7 @@ D5's single masked 16 MiB window and D6's index.
   512 KiB at `1FC0_0000`, unmirrored and read-only (zeros: the BIOS is the
   runtime's). KSEG2's cache control, 512 bytes at `FFFE_0000`, plain
   storage. Anything else is a bus error, KUSEG above 512 MiB included:
-  the runtime traps naming the access (trap 13).
+  the runtime traps naming the access (trap 14).
 - **Guest code.** A load or store takes RAM through KUSEG and KSEG0
   inline: `addr & 7F80_0000` clear gives window offset `addr & 1F_FFFF`,
   one mask and one test. Anything else calls `psx.map_access(addr, len,
