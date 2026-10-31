@@ -140,6 +140,16 @@ impl Window {
         map::access(addr, len, store).with_context(|| format!("{len} bytes at {addr:#010x}: bus error"))
     }
 
+    /// [`Self::constant`] where the access needs nothing at run time: not
+    /// an expansion region's open bus, a store to ROM, or a bus error.
+    fn folded(self, addr: u32, len: u32, store: bool) -> Option<u32> {
+        match map::place(addr)?.region {
+            map::Region::Expansion(_) => None,
+            map::Region::BiosRom if store => None,
+            _ => map::access(addr, len, store),
+        }
+    }
+
     /// A memarg at the window.
     pub fn memarg(self, align: u32) -> MemArg {
         masked(self.base, align)
@@ -237,6 +247,8 @@ pub fn rewrite_mapped<R: Resolver>(
     let mut last_const: Option<i32> = None;
     // A `call_indirect` through a constant function address: that function.
     let mut direct: Option<u32> = None;
+    // A constant address the next load or store uses, not yet emitted.
+    let mut pending: Option<u32> = None;
     let mut ops = body.get_operators_reader()?;
     while !ops.eof() {
         let pos = ops.original_position() as u32;
@@ -281,11 +293,27 @@ pub fn rewrite_mapped<R: Resolver>(
                 out.instruction(&I::I32Add);
             }
         };
+        // With the address on the stack (or `pending`): its window offset,
+        // at link time where the address is a constant in plain memory.
+        let mut offset = |out: &mut Function, off: u64, rel: Option<u32>, size: u32, store: bool| {
+            if let Some(a) = pending.take() {
+                match win.folded(a.wrapping_add(off as u32), size, store) {
+                    Some(o) if rel.is_none() => {
+                        out.instruction(&I::I32Const(o as i32));
+                        return;
+                    }
+                    _ => {
+                        out.instruction(&I::I32Const(a as i32));
+                    }
+                }
+            }
+            add_off(out, off, rel);
+            win.offset(out, t_addr, size, store);
+        };
         macro_rules! load {
             ($memarg:expr, $ins:ident, $size:expr) => {{
                 let (off, rel) = mem_reloc(r)?.unwrap_or(($memarg.offset, None));
-                add_off(&mut out, off, rel);
-                win.offset(&mut out, t_addr, $size, false);
+                offset(&mut out, off, rel, $size, false);
                 if let Some(check) = io {
                     io_guard(&mut out, t_addr, check, $size);
                 }
@@ -296,8 +324,7 @@ pub fn rewrite_mapped<R: Resolver>(
             ($memarg:expr, $ins:ident, $tmp:expr, $size:expr) => {{
                 let (off, rel) = mem_reloc(r)?.unwrap_or(($memarg.offset, None));
                 out.instruction(&I::LocalSet($tmp));
-                add_off(&mut out, off, rel);
-                win.offset(&mut out, t_addr, $size, true);
+                offset(&mut out, off, rel, $size, true);
                 if dirty.is_some() || io.is_some() {
                     out.instruction(&I::LocalTee(t_addr));
                 }
@@ -371,10 +398,14 @@ pub fn rewrite_mapped<R: Resolver>(
                 } else {
                     (value, None)
                 };
-                out.instruction(&I::I32Const(v));
-                if let Some(g) = rel {
-                    out.instruction(&I::GlobalGet(g));
-                    out.instruction(&I::I32Add);
+                if rel.is_none() && addresses(&ops) {
+                    pending = Some(v as u32);
+                } else {
+                    out.instruction(&I::I32Const(v));
+                    if let Some(g) = rel {
+                        out.instruction(&I::GlobalGet(g));
+                        out.instruction(&I::I32Add);
+                    }
                 }
             }
             Operator::I32Load { memarg } => load!(memarg, I32Load, 4),
@@ -444,6 +475,49 @@ pub fn rewrite_mapped<R: Resolver>(
         v.push(((f.body.end - f.body.start) as u32, out.byte_len() as u32));
     }
     Ok(out)
+}
+
+/// Whether an `i32.const` just read, followed by `ops`, is the address of
+/// the next load, or of a store whose value one operator pushes.
+fn addresses(ops: &wasmparser::OperatorsReader) -> bool {
+    use Operator as O;
+    let mut ops = ops.clone();
+    let is_store = |o: &Operator| {
+        matches!(
+            o,
+            O::I32Store { .. }
+                | O::I32Store8 { .. }
+                | O::I32Store16 { .. }
+                | O::I64Store { .. }
+                | O::I64Store8 { .. }
+                | O::I64Store16 { .. }
+                | O::I64Store32 { .. }
+                | O::F32Store { .. }
+                | O::F64Store { .. }
+        )
+    };
+    match ops.read() {
+        Ok(
+            O::I32Load { .. }
+            | O::I64Load { .. }
+            | O::F32Load { .. }
+            | O::F64Load { .. }
+            | O::I32Load8S { .. }
+            | O::I32Load8U { .. }
+            | O::I32Load16S { .. }
+            | O::I32Load16U { .. }
+            | O::I64Load8S { .. }
+            | O::I64Load8U { .. }
+            | O::I64Load16S { .. }
+            | O::I64Load16U { .. }
+            | O::I64Load32S { .. }
+            | O::I64Load32U { .. },
+        ) => true,
+        Ok(O::LocalGet { .. } | O::GlobalGet { .. } | O::I32Const { .. } | O::I64Const { .. } | O::F32Const { .. } | O::F64Const { .. }) => {
+            ops.read().is_ok_and(|o| is_store(&o))
+        }
+        _ => false,
+    }
 }
 
 /// A call as the linker lowered it, its arguments on the stack.
