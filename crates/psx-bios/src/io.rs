@@ -244,7 +244,13 @@ impl<S: Sdk> Machine<S> {
         if let Some(io) = self.io.as_mut() {
             io.note(now, addr, size, v & mask(size), true);
         }
-        self.reg_write(addr, size, v)
+        self.reg_write(addr, size, v)?;
+        // The guest's own write: what it left pending is taken at its next
+        // safepoint.
+        if Irq::handles(addr) {
+            self.release_irq();
+        }
+        Ok(())
     }
 
     /// Write `size` bytes of `v` to the register at `addr` (physical) with
@@ -290,6 +296,11 @@ impl<S: Sdk> Machine<S> {
             self.spu_irq();
         } else if Irq::handles(addr) {
             io.irq.write(addr, size, v);
+            // Unmasking a pending interrupt takes it (held for an adapter,
+            // as a raise is, D64).
+            if io.irq.pending() {
+                self.held_irq = true;
+            }
         } else if Cdc::handles(addr) {
             io.cdc.write(addr, v as u8, now);
             self.cdc_sync();
@@ -775,8 +786,12 @@ impl<S: Sdk> Machine<S> {
     pub fn queue_irq_chains(&mut self) {
         for prio in 0..4u32 {
             for h in self.chain(prio) {
-                // An element the adapters own runs as their step, in its
-                // place in the chain.
+                // The kernel's own elements, and those the adapters run,
+                // are steps in their places in the chain.
+                if let Some(k) = self.kernel_element_at(h) {
+                    self.irq_calls.push_back(IrqStep::Kernel(k));
+                    continue;
+                }
                 if let Some(s) = S::chain_element(self, h) {
                     self.irq_calls.push_back(IrqStep::Sdk(s));
                     continue;
@@ -850,8 +865,12 @@ mod tests {
         m.enq_int_rp(2, 0x8000_1000);
         m.raise_irq(psx_devices::irq::VBLANK);
         assert_eq!(m.io_read(0x1F80_1070, 4).unwrap(), 1);
-        assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Chain(GuestCall { addr: 0x8000_2000, args: [0; 4] }, Some(0x8000_3000))));
-        assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Exit));
+        // The kernel's root counter and vblank elements (priority 1), the
+        // element (2), the kernel's IRQ events (3).
+        let steps: Vec<IrqStep> = m.irq_calls.drain(..).collect();
+        let chain = IrqStep::Chain(GuestCall { addr: 0x8000_2000, args: [0; 4] }, Some(0x8000_3000));
+        use IrqStep::Kernel;
+        assert_eq!(steps, [Kernel(3), Kernel(2), Kernel(1), Kernel(0), chain, Kernel(4), IrqStep::Exit]);
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
         // The SPU: main volume left reads back; the CD controller's status

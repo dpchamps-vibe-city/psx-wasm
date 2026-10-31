@@ -752,7 +752,7 @@ mod tests {
             assert_eq!(m.clock.now - t, 58 * 20, "the address byte's wait: its 58 passes (D66)");
             irq_step(&mut m, STEP_START_TAIL);
             assert_eq!((get(&m, DATA + data::STAT), get(&m, DATA + data::TX_LEN), m.mem.r8(TX_BUF)), (RUNNING, 1, 0x81 + (port as u8 & 0xF)));
-            assert_eq!(m.chain(1), vec![DATA + data::DSR_ENT]);
+            assert_eq!(m.chain(1)[0], DATA + data::DSR_ENT, "at the head of priority 1, before the kernel's");
             m.step(m.clock.now + 5_000);
             let acked = reg(&mut m, I_STAT, 4).unwrap() & ACK_LINE != 0;
             assert_eq!(acked, sent == 2, "the card's /ACK");
@@ -765,7 +765,7 @@ mod tests {
             vblank_step(&mut m);
             assert_eq!((get(&m, DATA + data::STAT), get(&m, DATA + data::TX_LEN)), (TIMEOUT, sent));
             assert_eq!(reg(&mut m, I_MASK, 4).unwrap() & ACK_LINE, 0);
-            assert!(m.chain(1).is_empty());
+            assert!(!m.chain(1).contains(&(DATA + data::DSR_ENT)));
         }
     }
 }

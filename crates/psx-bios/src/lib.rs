@@ -103,6 +103,18 @@ mod tests {
         }
     }
 
+    /// The exception handler's queued steps, as the driver runs them: the
+    /// kernel's own (guest calls do nothing here).
+    fn take(m: &mut Machine<testing::NoSdk>) {
+        while let Some(s) = m.irq_calls.pop_front() {
+            if let IrqStep::Kernel(k) = s {
+                if m.kernel_step(k) {
+                    while m.irq_calls.pop_front().is_some_and(|s| s != IrqStep::Exit) {}
+                }
+            }
+        }
+    }
+
     #[test]
     fn root_counter_events() {
         let mut m = machine();
@@ -121,21 +133,28 @@ mod tests {
         // Masked, the kernel's handler doesn't see it.
         m.io = Some(Default::default());
         m.run_until(1000);
+        take(&mut m);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
-        // StartRCnt(RCntCNT2) unmasks IRQ6.
+        // StartRCnt(RCntCNT2) unmasks IRQ6: the kernel's root counter 2
+        // element, when the interrupt is taken, delivers the event and
+        // acknowledges it.
         m.io_write(0x1F80_1074, 4, 1 << 6).unwrap();
         m.run_until(2000);
+        take(&mut m);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
+        assert_eq!(m.io.as_ref().unwrap().irq.stat & 1 << 6, 0, "acknowledged");
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
         // Interrupt-mode events queue their handler; RCntCNT3 once vblank
         // is unmasked (StartRCnt(RCntCNT3)).
         let h2 = ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0003, 0x0002, 0x1000, 0x8001_2340]));
         ret(bios::call(&mut m, 0xB0, 0x0C, [h2, 0, 0, 0]));
         m.run_until(m.clock.video.vblank_at(1));
+        take(&mut m);
         assert_eq!(m.vblanks, 1);
         assert!(m.calls.is_empty(), "vblank masked");
         m.io_write(0x1F80_1074, 4, 1 << 6 | 1).unwrap();
         m.run_until(m.clock.video.vblank_at(2));
+        take(&mut m);
         assert_eq!(m.calls.pop_front().map(|c| c.addr), Some(0x8001_2340));
     }
 
@@ -184,10 +203,13 @@ mod tests {
     #[test]
     fn init_card_selects_the_pads() {
         let mut m = machine();
+        m.io = Some(Default::default());
         let buf = 0x8001_0000;
+        // A vblank taken: the pad and card handler, if in its chain.
         let filled = |m: &mut Machine<testing::NoSdk>| {
             m.mem.w8(buf, 0x5A);
-            m.kernel.pad_vblank(&mut *m.mem, &mut *m.host);
+            m.raise_irq(psx_devices::irq::VBLANK);
+            take(m);
             m.mem.r8(buf) == 0
         };
         ret(bios::call(&mut m, 0xB0, 0x12, [buf, 0x22, buf + 0x22, 0x22]));

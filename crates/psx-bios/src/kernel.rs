@@ -4,6 +4,8 @@
 
 use crate::machine::Host;
 use crate::{Machine, Sdk};
+#[allow(unused_imports)]
+use crate::IrqStep;
 use psxw_abi::kernel as k;
 use psx_devices::mem::Mem;
 use std::collections::BTreeMap;
@@ -44,9 +46,9 @@ pub struct File {
 pub struct Kernel {
     /// `InitPAD` buffers: (address, size) per port.
     pub pad_bufs: Option<[(u32, u32); 2]>,
-    /// The pad and card handler is in the chain (`StartPAD2`/`StartCARD2`;
-    /// `StopPAD2` and `StopCARD2` take it out for both).
-    pub pad_started: bool,
+    /// `StartCARD2` ran (`StopCARD2` undoes it): the pad and card handler
+    /// paces card operations.
+    pub card_started: bool,
     /// psx-spx's `pad_enable_flag`: set by `InitPAD2`, and by
     /// `InitCARD2(pad_enable)`, which selects whether the pads are read
     /// with the cards.
@@ -56,9 +58,12 @@ pub struct Kernel {
     pub pad_dest: u32,
     pub heap: (u32, u32),
     pub files: BTreeMap<u32, File>,
-    /// `ChangeClearRCnt` / `ChangeClearPad` flags.
+    /// Whether the kernel's handlers acknowledge what they handle: root
+    /// counters 0-2 and vblank (`ChangeClearRCnt`), the pad handler's vblank
+    /// (`ChangeClearPad`), the IRQ events' lines (`SetIrqAutoAck`).
     pub clear_rcnt: [u32; 4],
     pub clear_pad: u32,
+    pub irq_auto_ack: [u32; 11],
     pub custom_exit: u32,
     /// Memory cards and their files.
     pub cards: crate::card::Cards,
@@ -91,7 +96,6 @@ impl Kernel {
         let [b1, b2] = PAD_INIT2_BUFS;
         self.init_pad(mem, [(b1, PAD_BUF), (b2, PAD_BUF)]);
         self.pad_dest = dest;
-        self.pad_started = true;
         2
     }
 
@@ -123,12 +127,12 @@ impl Kernel {
         out
     }
 
-    /// Kernel pad handler: at each vblank, write each port's state into
-    /// the `InitPAD2` buffers (status 0x00 + ID + data, or 0xFF when
-    /// nothing is connected), at most 22h bytes whatever the buffer's
-    /// size; then `PAD_dr` when `PAD_init2` named a destination.
+    /// The pad and card handler's pads: each port's state into the
+    /// `InitPAD2` buffers (status 0x00 + ID + data, or 0xFF when nothing is
+    /// connected), at most 22h bytes whatever the buffer's size; then
+    /// `PAD_dr` when `PAD_init2` named a destination.
     pub fn pad_vblank(&mut self, mem: &mut dyn Mem, host: &mut dyn Host) {
-        let (Some(bufs), true) = (self.pad_bufs, self.pad_started && self.pad_enable) else { return };
+        let (Some(bufs), true) = (self.pad_bufs, self.pad_enable) else { return };
         for (port, (addr, _)) in bufs.iter().enumerate() {
             let state = host.pad_state(port as u32);
             if state.is_empty() {
@@ -234,5 +238,142 @@ impl<S: Sdk> Machine<S> {
             }
         }
         calls
+    }
+}
+
+/// The kernel's own `SysEnqIntRP` elements, in its data (D68): root
+/// counters 0-2 and vblank (0-3, priority 1) and the IRQ events (priority
+/// 3), as OpenBIOS's `handlers/irq.c` enqueues them at boot, and the pad and
+/// card handler (priority 2, `sio0/driver.c`), which `StartPAD2` and
+/// `StartCARD2` enqueue. Their verifiers and handlers are kernel code here,
+/// at addresses in the BIOS ROM's range ([`KERNEL_CODE`]), run as
+/// [`IrqStep::Kernel`] steps in their places.
+pub const KERNEL_ELEMENTS: u32 = 0x8000_7100;
+pub const IRQ_ELEMENT: u32 = 4;
+pub const SIO0_ELEMENT: u32 = 5;
+const ELEMENTS: u32 = 6;
+const KERNEL_CODE: u32 = 0xBFC0_8000;
+
+pub fn kernel_element(i: u32) -> u32 {
+    KERNEL_ELEMENTS + 16 * i
+}
+
+/// The IRQ events' order and classes (OpenBIOS's `IRQVerifier`, with the
+/// retail BIOS's RTC1 for timer 2).
+const IRQ_EVENTS: [(u32, u32); 11] = [
+    (2, 0xF000_0003),
+    (9, 0xF000_0009),
+    (1, 0xF000_0002),
+    (10, 0xF000_000A),
+    (8, 0xF000_000B),
+    (0, 0xF000_0001),
+    (4, 0xF000_0005),
+    (5, 0xF000_0006),
+    (6, 0xF000_0006),
+    (7, 0xF000_0008),
+    (3, 0xF000_0004),
+];
+
+impl<S: Sdk> Machine<S> {
+    /// The elements, the IRQ events at priority 3 and the root counters at
+    /// 1, acknowledging what they handle (`enqueueIrqHandler(3)`,
+    /// `enqueueRCntIrqs(1)`).
+    pub fn lay_out_kernel_handlers(&mut self) {
+        for i in 0..ELEMENTS {
+            let e = kernel_element(i);
+            for (o, v) in [(0, 0), (4, KERNEL_CODE + 8 * i + 4), (8, KERNEL_CODE + 8 * i), (12, 0)] {
+                self.mem.w32(e + o, v);
+            }
+        }
+        self.kernel.irq_auto_ack = [0; 11];
+        self.enq_int_rp(3, kernel_element(IRQ_ELEMENT));
+        for i in 0..4 {
+            self.kernel.clear_rcnt[i] = 1;
+            self.enq_int_rp(1, kernel_element(i as u32));
+        }
+    }
+
+    /// The kernel element `h` is, if it is one.
+    pub fn kernel_element_at(&self, h: u32) -> Option<u32> {
+        let off = (h & 0x1FFF_FFFF).checked_sub(KERNEL_ELEMENTS & 0x1FFF_FFFF)?;
+        (off % 16 == 0 && off / 16 < ELEMENTS).then_some(off / 16)
+    }
+
+    /// Kernel element `i`'s verifier, and its handler when that says so;
+    /// whether the handler returned from the exception (the rest of it
+    /// skipped).
+    pub fn kernel_step(&mut self, i: u32) -> bool {
+        let taken = |m: &Self, bit: u32| m.io.as_ref().is_some_and(|io| io.irq.stat & io.irq.mask & 1 << bit != 0);
+        let ack = |m: &mut Self, bit: u32| {
+            let _ = m.reg_write(psx_devices::irq::I_STAT, 4, !(1 << bit));
+        };
+        match i {
+            0..=3 => {
+                let bit = if i == 3 { psx_devices::irq::VBLANK } else { psx_devices::irq::TIMER0 + i };
+                if !taken(self, bit) {
+                    return false;
+                }
+                self.deliver_event(0xF200_0000 | i, 2);
+                if self.kernel.clear_rcnt[i as usize] == 0 {
+                    return false;
+                }
+                ack(self, bit);
+                true
+            }
+            IRQ_ELEMENT => {
+                for (bit, class) in IRQ_EVENTS {
+                    if taken(self, bit) {
+                        self.deliver_event(class, 0x1000);
+                        if self.kernel.irq_auto_ack[bit as usize] != 0 {
+                            ack(self, bit);
+                        }
+                    }
+                }
+                false
+            }
+            SIO0_ELEMENT => {
+                let vblank = psx_devices::irq::VBLANK;
+                if !taken(self, vblank) {
+                    return false;
+                }
+                self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
+                if self.kernel.clear_pad != 0 {
+                    ack(self, vblank);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// `StartPAD2`/`StartCARD2` (OpenBIOS `startPad`, `startCard`): the pad
+    /// and card handler at the head of priority 2, vblank acknowledged and
+    /// unmasked, its acknowledge by the pad handler instead of RCntCNT3's.
+    pub fn start_sio0(&mut self, card: bool) {
+        let e = kernel_element(SIO0_ELEMENT);
+        self.deq_int_rp(2, e);
+        self.enq_int_rp(2, e);
+        let vblank = 1 << psx_devices::irq::VBLANK;
+        let _ = self.reg_write(psx_devices::irq::I_STAT, 4, !vblank);
+        let mask = self.reg_read(psx_devices::irq::I_MASK, 4).unwrap_or(0);
+        let _ = self.reg_write(psx_devices::irq::I_MASK, 4, mask | vblank);
+        self.kernel.clear_pad = 1;
+        self.kernel.clear_rcnt[3] = 0;
+        self.kernel.card_started |= card;
+    }
+
+    /// `StopPAD2`/`StopCARD2`: RCntCNT3's acknowledge back, the handler out
+    /// (for the pads and the cards both).
+    pub fn stop_sio0(&mut self, card: bool) {
+        self.kernel.clear_rcnt[3] = 1;
+        self.deq_int_rp(2, kernel_element(SIO0_ELEMENT));
+        if card {
+            self.kernel.card_started = false;
+        }
+    }
+
+    /// Whether the pad and card handler is in its chain.
+    pub fn sio0_started(&self) -> bool {
+        self.chain(2).contains(&kernel_element(SIO0_ELEMENT))
     }
 }

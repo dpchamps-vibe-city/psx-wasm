@@ -110,6 +110,9 @@ pub enum IrqStep {
     /// ([`Sdk::chain_element`]): [`Sdk::irq_step`] runs it at its turn,
     /// and may queue further steps (callbacks among them) at the front.
     Sdk(u32),
+    /// One of the kernel's own elements (D68): its verifier, and its
+    /// handler when that says so ([`Machine::kernel_step`]).
+    Kernel(u32),
     /// The end of the handler: the custom exit (`HookEntryInt`, B0h:19h)
     /// if one is set, entered like a longjmp to its buffer with 1.
     Exit,
@@ -295,8 +298,10 @@ impl<S: Sdk> Machine<S> {
         };
         let first = m.clock.video.vblank_at(1);
         m.clock.schedule(first, Event::Vblank);
-        // The kernel's exception control blocks are there from power-on.
+        // The kernel's exception control blocks are there from power-on,
+        // its own handlers in their chains.
         m.lay_out_excb();
+        m.lay_out_kernel_handlers();
         m
     }
 
@@ -389,13 +394,8 @@ impl<S: Sdk> Machine<S> {
                 let next = self.clock.video.vblank_at(self.vblanks + 1);
                 self.clock.schedule(next, Event::Vblank);
                 S::on_vblank(self);
-                self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
-                // The kernel's vblank handler delivers RCntCNT3 events when
-                // vblank is unmasked (StartRCnt(RCntCNT3)), as its root
-                // counter handler does for the others.
-                if self.io.as_ref().is_some_and(|io| io.irq.mask & 1 << psx_devices::irq::VBLANK != 0) {
-                    self.deliver_event(0xF200_0003, 0x0002);
-                }
+                // The kernel's handlers (RCntCNT3, the pads) run in their
+                // chains when the interrupt is taken.
                 self.raise_irq(psx_devices::irq::VBLANK);
                 self.gpu_vblank();
                 self.card_vblank();
@@ -410,12 +410,8 @@ impl<S: Sdk> Machine<S> {
                 if let Some(t) = self.timers[n as usize].next_irq(n as usize, video, now + 1) {
                     self.clock.schedule(t, Event::Timer(n));
                 }
-                // The kernel's root counter handler delivers RCntCNTn when
-                // the counter's interrupt is unmasked (StartRCnt,
-                // InterruptCallback).
-                if self.io.as_ref().is_some_and(|io| io.irq.mask & 1 << (psx_devices::irq::TIMER0 + n as u32) != 0) {
-                    self.deliver_event(0xF200_0000 | n as u32, 0x0002);
-                }
+                // The kernel's root counter handlers deliver RCntCNTn in
+                // their chain when the interrupt is taken.
                 self.raise_irq(psx_devices::irq::TIMER0 + n as u32);
             }
             Event::Sdk(kind, data) => S::on_event(self, kind, data),

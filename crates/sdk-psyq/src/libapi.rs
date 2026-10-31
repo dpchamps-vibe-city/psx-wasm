@@ -173,6 +173,6 @@ mod tests {
         assert_eq!(m.mem.bytes(0x8001_0000, 0x44), [0; 0x44]);
         assert_eq!(m.mem.r32(flag), 1);
         assert_eq!(call(&mut m, start_pad, [0; 4]), 1);
-        assert!(m.kernel.pad_started);
+        assert!(m.sio0_started());
     }
 }

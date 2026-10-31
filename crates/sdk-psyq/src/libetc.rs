@@ -905,6 +905,9 @@ mod tests {
         while let Some(s) = m.irq_calls.pop_front() {
             match s {
                 IrqStep::Sdk(s) => Psyq::irq_step(&mut m, s),
+                IrqStep::Kernel(k) => {
+                    m.kernel_step(k);
+                }
                 IrqStep::Chain(c, _) => {
                     sps.push(m.regs.sp());
                     assert_eq!(c.args[0] & 1, 1, "a0: I_STAT as the dispatcher read it");
