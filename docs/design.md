@@ -2518,3 +2518,22 @@ cost of more safepoints. bof4 feels it: its pad interrupt is shorter, and
 replay was authored (counter 12390 at frame 25,138, was 24,768; the
 replay now runs 26,000 frames). Decided without the human's input
 (plans/unified-adaptor-layer, phase 1 findings).
+
+**D67. libetc's and libpad's adapters keep the SDK's state where the SDK
+keeps it** (spec fidelity, phase 2). As libgpu's, libspu's, libpress's and
+libmcx's already do (D61): libetc's `Vcount`, `Hcount`, its line handlers,
+`VSyncCallbacks` and `DMACallback` tables and its dispatcher's flags, and
+libpad's port records, receive buffers and pending results live in the
+objects' own `.data` and `.bss`, found through the objects' code; the
+adapters read and write them there. libetc's context, its handlers and
+libgpu's pump are then the objects' own addresses, not stand-ins in BIOS
+ROM space. Revises §5's "their state in the runtime" for libetc and
+libpad.
+
+*Why:* the case for runtime state was that only the libraries' own code
+reads those variables, which is a fact about two games' code, not about
+the SDK. Original code that reads them (another library, a game, a mod,
+a chip on its device) then sees what the adapters did, and a guest call
+of a returned address reaches the code at it. Decided without the human's
+input under the /goal that implements plans/spec-fidelity.md, whose
+decisions table proposes it.
