@@ -136,14 +136,14 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 | Card, console and CD | Partial; continue independently verifiable software contracts using existing backends. Do not invent missing reference behaviour. |
 | Other executable, exception and thread gaps | Still open; do not assume deferring longjmp implements these or authorises a runtime redesign. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | CD-directory/search source `bbdeb39` passes BIOS 51/runtime 8/SDK 42 tests, wasm32 check, fresh builds and four replays. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | Native source `bbdeb39` passes focused tests, wasm32 check, builds and four replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD-directory/search fixes implemented; `bbdeb39` build/four-replay gate passes; browser partial diff not accepted | Owns plan and integration, not worker files |
+| Parent | `salvage/bios`, writer | CD-directory/search `bbdeb39` build/replays pass; browser recovery reviewed/integrated as `12c5fbb`, copy-error cleanup `8e5badf`, focused browser gate passes | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -157,15 +157,16 @@ device**; the tool registry then returned `Async run not found`. Parent reported
 the failure, verified no child/build was active and preserved the partial diff
 as `browser-disc-interrupted.diff` in session scratch. No browser gate ran.
 
-One same-tool retry, `828341b3-aa23-4b55-a23d-a3dcfe76bf23`, now owns
-`../psx-wasm-salvage-lanes/browser-disc-validation` (base `aea8c94`). Filesystem
-space is available again. Parent rejected the partial lock test's same-content
-reimport as insufficient proof and its sequential-write production fix as able
-to overwrite the cue before encountering a locked bin. The retry must use
-different replacement content, preserve old cue/bin/key on refusal, and verify
-successful import after unlocking. Scope remains the focused browser test,
-packaging and a minimal demonstrated import fix; no runtime/plan writes,
-subdelegation or new storage architecture. No acceptance/browser pass yet.
+The same-tool retry, `828341b3-aa23-4b55-a23d-a3dcfe76bf23`, completed in
+`../psx-wasm-salvage-lanes/browser-disc-validation` (base `aea8c94`) as
+`e18f62e`. Parent rejected the earlier same-content test and sequential-write
+fix, then reviewed the corrected four-file diff, complete report and browser
+results before integrating it as `12c5fbb`. The new test uses different
+replacement content, verifies old cue/bin/key survive lock refusal, and proves
+successful import after unlocking. Parent `8e5badf` additionally releases
+unused preflight writers on copy failure. The integrated storage gate passes
+25 checks in each browser, detailed below. This lane is accepted and complete;
+no active child, runtime/ABI change, subdelegation or new storage architecture.
 
 ## Work order
 
@@ -370,9 +371,12 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
 - [x] Check native/fallback integration with the existing gates: full chip/SDK
   gates at ABI 17, focused libpad/libetc/libgpu and memcard gates at ABI 18,
   latest memcard conformance at `99fa333`. Results are not all at one checkpoint.
-- [ ] Complete affected mod/browser validation: ABI-17 browser passes are recorded,
-  but BTN mods prerequisites, two-bundle disc isolation and locked-disc coverage
-  remain open; no fresh ABI-18 browser result is claimed.
+- [x] Validate two-bundle browser disc isolation, locked-disc refusal and unlocked
+  replacement through production pages/OPFS. Chromium and Firefox each pass 25
+  storage checks at `8e5badf`, retaining all seven card checks.
+- [ ] Complete remaining mod/browser gates: BTN mods prerequisites remain missing;
+  the broader game/GPU/conformance browser results are still at ABI 17. The
+  focused storage gate does not start a game or run its wasm.
 - [x] Run `psxw ci btn` and `psxw ci bof4` and classify failures: both completed
   at the ABI-17 foundation and exited 2. This is execution, **not a green gate**.
 - [ ] Resolve/provision the recorded full-CI blockers and run a current-source
@@ -1186,7 +1190,44 @@ checkpoint are no longer present there; their committed plan records remain
 historical evidence. No unnecessary memcard/SDK conformance, workspace or full
 CI rerun was performed for these two CD filesystem changes. Latest memcard
 conformance remains at `99fa333`, GPU at `d06c81b`, libpad/libetc at `37e37ed`.
-Browser, non-empty oracle and save/reload-persistence gaps remain open.
+At this checkpoint browser, non-empty oracle and save/reload-persistence gaps
+remained open. The focused browser storage follow-up below is now complete.
+
+### Browser disc isolation and locked-import gate (`8e5badf`)
+
+Worker `e18f62e` was fully reviewed and integrated as `12c5fbb`. The test packages
+two production pages with different `game.json` ids on one origin, using the
+same cue/bin names but different synthetic bytes. A worker opens the production
+`Disc` and holds its real `SyncAccessHandle` while a page attempts to import a
+different replacement image. Both browsers verify the running-game diagnostic,
+unchanged cue/bin/key, unchanged worker-read sector, successful replacement
+once unlocked, and no changes to the other bundle. All seven existing card
+checks remain. The worker's negative sensitivity report, reviewed by the parent,
+fails specifically the cue-preservation check with the earlier sequential-write
+fix; the replacement check is not vacuous.
+
+The production fix acquires all incoming writable streams before copying any
+file and aborts acquired streams on lock refusal. Old metadata and stale files
+are not removed until copying succeeds. Parent `8e5badf` extends cleanup to copy
+failures too: not-yet-used writers must not keep the disc locked. A focused
+injected read failure through the real page's file input verifies its diagnostic
+and subsequent exclusive `Disc.open` with the original bytes intact. This is
+resource cleanup, **not transactional import**: a non-lock failure after some
+files have committed can still leave a partly replaced image.
+
+Parent release CLI build and
+`psxw web-test storage --browsers chromium,firefox --timeout 180` pass:
+**25 checks in Chromium and 25 in Firefox**. Both JSON reports were read under
+`out/web/test-storage-results/result-{chromium,firefox}.json`; session scratch
+logs are `browser-disc-integrated-{build,storage}.log`. The existing pinned
+browser image was reused. Synthetic disc/card bytes and browser profiles are
+disposable; no game inputs or real saves were changed.
+
+No runtime/ABI source changed, so native builds/replays remain valid at
+`bbdeb39`; no redundant native gates ran. This storage test does not start the
+full game worker/wasm or certify game save/reload, GPU/browser conformance,
+non-empty BIOS oracle comparisons or green full CI. Those separately recorded
+gaps and the user-deferred non-local-return bug remain unchanged.
 
 ## Progress log
 

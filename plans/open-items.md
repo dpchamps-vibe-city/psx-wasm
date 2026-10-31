@@ -39,9 +39,11 @@ retain their provenance; the active recovery status is recorded separately.
   BIOS/runtime/SDK tests, wasm32 check, both game builds and all four unchanged
   replays. Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
-  remain open. Two-bundle browser disc isolation/locked-disc validation is in
-  an isolated worker retry after a disk-space build failure; no browser pass
-  or acceptance is claimed yet.
+  remain open. Two-bundle browser disc isolation, locked-import refusal,
+  unlocked replacement and copy-error writer cleanup now pass 25 checks each
+  in Chromium/Firefox at `8e5badf`, through production pages and real OPFS
+  handles. This focused storage gate retains the seven card checks but does
+  not start the game wasm or refresh the broader ABI-17 browser/full-CI gates.
 
 See the active plan for exact service inventories, accepted source changes and
 next actions. Deferral or an unsupported diagnostic does not complete a service.
