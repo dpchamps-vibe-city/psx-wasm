@@ -136,14 +136,14 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 | Card, console and CD | Partial; BIOS CD opens now preserve ISO versions and accept `?` filename matching, with focused tests passing. Continue independently verifiable software contracts using existing backends; do not invent missing reference behaviour. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | Native source `bbdeb39` passes focused tests, wasm32 check, builds and four replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates pass at `9624526`. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | Native source `03c4627` (CD-open correction, including A40) passes focused tests, wasm32 check, builds and four replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates pass at `9624526`. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | A40 and subsequent BIOS CD-open filename corrections pass focused tests and wasm32 check. Builds/game browser gates still cover pre-A40 native source `bbdeb39`; latest source build/replay refresh follows. | Owns plan, integration and final acceptance |
+| Parent | `salvage/bios`, writer | CD-open/A40 source `03c4627` passes focused tests, wasm32 check, both builds and four replays. Browser gates remain at the separately recorded checkpoints. CD chain-control scout reviewed; unused flags and unhandled chain entries rejected. | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -358,7 +358,7 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
 
 - [x] Run workspace tests and build both games from the recovery branch's own
   toolchain/artifacts. Latest workspace run: `6deb05b`; subsequent batches have
-  focused tests. Latest release/runtime/game builds: `bbdeb39`, ABI 18. Census
+  focused tests. Latest release/runtime/game builds: `03c4627`, ABI 18. Census
   and optional-test qualifications are recorded with their actual checkpoints.
 - [x] Run focused integration tests for changed families, including guest devices,
   card completion, patched BIOS calls and real wasm kernel/thread lowering.
@@ -366,7 +366,7 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
   not validation; configured images/vectors/goldens are still missing. Keep
   emulator/OpenBIOS results provisional where appropriate.
 - [x] Run existing BTN title/card-load, BOF4 `title-to-field` and supplied
-  name-select crash replays: latest source `bbdeb39`, unchanged expectations.
+  name-select crash replays: latest source `03c4627`, unchanged expectations.
   Card-load has no state assertions and does not certify save persistence.
 - [ ] Validate game-level save/reload persistence once the required recordings
   and state assertions are available; the current card-load gate is insufficient.
@@ -1320,8 +1320,59 @@ and wasm32 runtime check pass**; the final versioned fixture also passes its
 focused integration rerun (`cd-open-integrated-tests.log` in session scratch).
 No input assets or user storage were changed.
 
-A separate read-only scout is examining A9E/A2/A3's chain-control contract;
-no implementation of those entries is included in this filename correction.
+### CD-open integration gate (`03c4627`, ABI 18)
+
+Fresh release CLI, runtime and both normal game builds pass, including the A40
+service from `6ab48a0`. All six chip groups remain native; BTN has 86 adapters
+and a 2,578,555-byte module, BOF4 91 and 10,192,498 bytes. Asyncify counts remain
+1,296/7,158 and 3,009/18,393, with one exception handler excluded in each build.
+Named BIOS coverage counts are unchanged (BTN 42 working/12 partial/1
+unsupported/1 fatal/1 noop; BOF4 36 working/16 partial/1 unsupported/1 noop).
+
+All four unchanged replays pass with explicit frame limits and `--check no-trap`:
+
+- BTN `title-to-gameplay`: 6,000 frames and all three state expectations.
+- BTN `card-load`: 3,000 frames; no state assertions, not save certification.
+- BOF4 `title-to-field`: 26,000 frames and all five state expectations.
+- BOF4 supplied `craash-after-name-select.rpl`: 694 frames; no state assertions.
+
+All boot text matches the disc; EDC errors are empty and guest I/O reports are
+empty. BTN's frame-64 GPU timeout and frame-65/83 resets are unchanged and still
+unclassified. Logs and copied run JSON are in session scratch under
+`cd-open-{release,build-*,replay-*}`. Previous own disposable storage was preserved
+as `cd-open-{btn,bof4}-previous-disposable-storage` before fresh run storage was
+created; user cards, input snapshots and original main were untouched.
+
+Browser storage/conformance/game and memcard/GPU/SDK conformance keep their
+previous recorded source checkpoints. No unnecessary full workspace/full CI,
+empty oracle or browser rerun; missing oracle/mod inputs and save/reload
+certification remain open.
+
+### CD chain-control contract scout disposition
+
+Read-only DeepSeek scout `3a8b5d32-7afa-4e98-8ada-bf0af141b47b` completed
+`salvage/cd-internal-chain-contract.md`; parent read the full report and checked
+psx-spx plus pinned OpenBIOS `cdrom.c` and
+[`statemachine.c`](https://raw.githubusercontent.com/pcsx-redux/nugget/4dc70d2931121a0fde858a0354192b6df4fa22e8/openbios/cdrom/statemachine.c).
+The reference has separate IO/DMA flags (A9E returns the old flag, inner init
+sets both to 1), consumed by handlers that acknowledge their shared IRQ and
+return from exception. A2 installs IO then DMA at priority 0; A3 dequeues IO
+then DMA. OpenBIOS declares those two functions void; psx-spx supplies no
+precise return contract and records retail's dequeue bug.
+
+Parent **rejected** the recommended flag/chain-plumbing-only implementation:
+unused flags and enqueuing pointers to still-unhandled A90..A93 would add no
+working completion path and could make existing interrupts fail. The present
+native CD scheduler delivers software completions directly, not through those
+handlers. Completion needs a coherent native completion/chain/event/auto-abort
+contract using existing facilities, not a reconstructed CD register driver.
+The report's claim that any such routing necessarily requires a register driver
+is not accepted. Its double-enqueue self-link claim is also imprecise: the shown
+two-element sequence produces a cycle; its final reverse-order dequeue advice
+contradicts the quoted IO-then-DMA body. The reported A93 dispatch-table anomaly
+must not be silently copied. No chain state, flags, ABI, runtime or exception
+machinery was added from this scout, and no new architecture was approved.
+No active children or pending worker changes remain.
 
 ## Progress log
 

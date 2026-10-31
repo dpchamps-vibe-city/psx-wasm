@@ -40,10 +40,9 @@ retain their provenance; the active recovery status is recorded separately.
   remain unresolved.
 - **Resources/policy:** legally usable font data/mapping and GetSystemInfo's
   BIOS date/version identity remain undecided; no fabricated values or pointers.
-- **Validation:** the latest CD-open correction passes BIOS 51 / runtime 8 /
-  SDK 42 tests and wasm32 runtime check. CD-directory/search source `bbdeb39` passes focused
-  BIOS/runtime/SDK tests, wasm32 check, both game builds and all four unchanged
-  replays. Latest memcard conformance remains at `99fa333`. Non-empty oracle
+- **Validation:** CD-open/A40 source `03c4627` passes BIOS 51 / runtime 8 /
+  SDK 42 tests, wasm32 runtime check, release/runtime/both game builds and all
+  four unchanged replays. Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
   remain open. Two-bundle browser disc isolation, locked-import refusal,
   unlocked replacement and copy-error writer cleanup now pass 25 checks each
