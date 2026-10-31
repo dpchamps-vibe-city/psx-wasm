@@ -159,6 +159,8 @@ pub fn rewrite_mapped<R: Resolver>(
     let relocs = obj.relocs_for(&f.body);
     let mut ri = 0;
     let mut last_const: Option<i32> = None;
+    // A `call_indirect` through a constant function address: that function.
+    let mut direct: Option<u32> = None;
     let mut ops = body.get_operators_reader()?;
     while !ops.eof() {
         let pos = ops.original_position() as u32;
@@ -243,25 +245,33 @@ pub fn rewrite_mapped<R: Resolver>(
             Operator::Call { function_index } => {
                 let rl = reloc_of(RelocationType::FunctionIndexLeb).context("call without relocation")?;
                 let sig = obj.func_type(function_index).clone();
-                match r.call(rl.symbol, &sig, prev_const)? {
-                    Lowered::Call(i) => {
-                        out.instruction(&I::Call(i));
-                    }
-                    Lowered::Instrs(v) => {
-                        for i in &v {
-                            out.instruction(i);
-                        }
-                    }
-                    Lowered::Copy => {
-                        bulk.emit(&mut out, r, true, io, dirty)?;
-                        out.instruction(&I::LocalGet(bulk.dst));
-                    }
-                }
+                let lowered = r.call(rl.symbol, &sig, prev_const)?;
+                emit_call(&mut out, r, bulk, io, dirty, lowered)?;
             }
             Operator::CallIndirect { type_index, .. } => {
                 let sig = obj.types[type_index as usize].clone();
-                let helper = r.call_indirect(&sig)?;
-                out.instruction(&I::Call(helper));
+                match direct.take() {
+                    Some(symbol) => {
+                        let lowered = r.call(symbol, &sig, prev_const)?;
+                        emit_call(&mut out, r, bulk, io, dirty, lowered)?;
+                    }
+                    None => {
+                        let helper = r.call_indirect(&sig)?;
+                        out.instruction(&I::Call(helper));
+                    }
+                }
+            }
+            // clang's FastISel (D53) calls a function through the table when
+            // the call's IR type isn't its declaration's, though the wasm
+            // types agree (a prototype-less function passed a pointer by one
+            // call and an int by another); SelectionDAG called it directly,
+            // as the C does. The address goes, the call is direct.
+            Operator::I32Const { .. }
+                if reloc_of(RelocationType::TableIndexSleb).is_some()
+                    && matches!(ops.clone().read(), Ok(Operator::CallIndirect { .. })) =>
+            {
+                direct = reloc_of(RelocationType::TableIndexSleb).map(|rl| rl.symbol);
+                last_const = prev_const;
             }
             Operator::GlobalGet { .. } => {
                 let rl = reloc_of(RelocationType::GlobalIndexLeb).context("global.get without relocation")?;
@@ -360,6 +370,32 @@ pub fn rewrite_mapped<R: Resolver>(
         v.push(((f.body.end - f.body.start) as u32, out.byte_len() as u32));
     }
     Ok(out)
+}
+
+/// A call as the linker lowered it, its arguments on the stack.
+fn emit_call<R: Resolver>(
+    out: &mut Function,
+    r: &mut R,
+    bulk: Bulk,
+    io: Option<u32>,
+    dirty: Option<u32>,
+    lowered: Lowered,
+) -> Result<()> {
+    match lowered {
+        Lowered::Call(i) => {
+            out.instruction(&I::Call(i));
+        }
+        Lowered::Instrs(v) => {
+            for i in &v {
+                out.instruction(i);
+            }
+        }
+        Lowered::Copy => {
+            bulk.emit(out, r, true, io, dirty)?;
+            out.instruction(&I::LocalGet(bulk.dst));
+        }
+    }
+    Ok(())
 }
 
 /// With the masked address on the stack: call `check` when it lies in the

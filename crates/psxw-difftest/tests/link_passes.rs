@@ -135,6 +135,26 @@ int func_80011000(int a) { return func_80012100("x", a, 0x1122334455667788LL, a,
     assert_eq!(c.stack, [5; 8]);
 }
 
+/// A prototype-less function one call passes an int and another a pointer:
+/// FastISel calls one through the table, and the link calls it directly,
+/// as the C does.
+#[test]
+fn prototype_less_calls_are_direct() {
+    let src = r#"
+extern void *func_80012200();
+void func_80011000(int a, char *p) { func_80012200(a, 0, 8); func_80012200(p, 0, 8); }
+"#;
+    let Some((map, input)) = compile("psxw-link-noproto", src) else { return };
+    let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
+    let linked =
+        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
+    let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
+    let f = h.func("c").unwrap();
+    let r = h.run(&f, 1, [5, 0x8001_5000, 0, 0], &[], &[0; 8], 1);
+    let calls: Vec<_> = r.log.iter().map(|c| (c.kind, c.target, c.args[0])).collect();
+    assert_eq!(calls, [(callout::CALL, 0x8001_2200, 5), (callout::CALL, 0x8001_2200, 0x8001_5000)]);
+}
+
 /// A bulk copy (a struct assignment) spends the budget, and with an I/O
 /// hook, a copy that reaches the I/O window goes byte by byte through it.
 #[test]
