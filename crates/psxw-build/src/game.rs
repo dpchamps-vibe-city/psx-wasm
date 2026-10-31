@@ -363,7 +363,8 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     let lift_dir = psxw_lift::run::out_dir(ws, &inputs);
 
     // C inputs: every census object with its prototype facts.
-    let clang = psxw_cc::Clang::new(ws.clang()?, lift_dir.clone(), vec![], vec![], &lift_dir)?;
+    let mut clang = psxw_cc::Clang::new(ws.clang()?, lift_dir.clone(), vec![], vec![], &lift_dir)?;
+    clang.reference(&inputs.manifest.reference.cc1flags);
     let gcc = Gcc {
         division: psxw_difftest::division_convention(&translations),
         builtin_memcpy: !inputs.manifest.reference.cc1flags.iter().any(|f| f == "-fno-builtin"),

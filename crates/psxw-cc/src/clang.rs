@@ -17,6 +17,10 @@ pub struct Clang {
     /// calls into the game's soft-float routines, which native wasm floats
     /// don't reproduce, so C functions doing float arithmetic are lifted.
     pub soft_float: bool,
+    /// Plain `char` is unsigned. [`Clang::reference`] sets it from the
+    /// reference flags; until then it is the UB containment flags'
+    /// `-funsigned-char`.
+    pub unsigned_char: bool,
 }
 
 /// Errors that GCC 2.95-era C trips in modern clang but that are only
@@ -36,7 +40,32 @@ impl Clang {
         std::fs::create_dir_all(work)?;
         let prelude = work.join("psxw_prelude.h");
         std::fs::write(&prelude, crate::PRELUDE)?;
-        Ok(Self { path, cwd, includes, defines, prelude, soft_float: false })
+        Ok(Self { path, cwd, includes, defines, prelude, soft_float: false, unsigned_char: true })
+    }
+
+    /// Compile as the reference compiler did, from its cc1 flags:
+    /// `-msoft-float`, and plain `char` signed as GCC's MIPS default has it
+    /// unless the last `-f[no-]{un,}signed-char` says unsigned.
+    pub fn reference(&mut self, cc1flags: &[String]) {
+        self.soft_float = cc1flags.iter().any(|f| f == "-msoft-float");
+        self.unsigned_char = cc1flags
+            .iter()
+            .rev()
+            .find_map(|f| match f.as_str() {
+                "-funsigned-char" | "-fno-signed-char" => Some(true),
+                "-fsigned-char" | "-fno-unsigned-char" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false);
+    }
+
+    /// [`crate::UB_CONTAINMENT_FLAGS`], with plain `char` as configured.
+    fn ub_flags(&self) -> Vec<&'static str> {
+        let mut flags = crate::UB_CONTAINMENT_FLAGS.to_vec();
+        if !self.unsigned_char {
+            flags.push("-fsigned-char");
+        }
+        flags
     }
 
     pub fn version(&self) -> Result<String> {
@@ -79,7 +108,7 @@ impl Clang {
         cmd.args(["-c", "-O2", "-fno-builtin", "-fno-caret-diagnostics", "-ferror-limit=0"])
             .args(crate::CODEGEN_FLAGS)
             .args(["-Xclang", "-fno-diagnostics-use-presumed-location"])
-            .args(crate::UB_CONTAINMENT_FLAGS);
+            .args(self.ub_flags());
         for w in DOWNGRADED {
             cmd.arg(format!("-Wno-error={w}"));
         }
@@ -95,7 +124,7 @@ impl Clang {
         cmd.args(["-c", "-O2", "-fno-builtin", "-nostdinc", "-fno-caret-diagnostics"])
             .args(crate::CODEGEN_FLAGS)
             .args(["-Wno-unused-label", "-Wno-unused-variable", "-Wno-unused-but-set-variable"])
-            .args(crate::UB_CONTAINMENT_FLAGS)
+            .args(self.ub_flags())
             .args(extra)
             .arg("-I")
             .arg(include);
@@ -131,7 +160,7 @@ impl Clang {
     fn mod_base(&self) -> Command {
         let mut cmd = self.base();
         cmd.args(["-fno-builtin", "-fno-caret-diagnostics", "-ferror-limit=0"])
-            .args(crate::UB_CONTAINMENT_FLAGS.iter().filter(|f| !f.starts_with("-std=")))
+            .args(self.ub_flags().into_iter().filter(|f| !f.starts_with("-std=")))
             .arg("-std=gnu99");
         // The game's headers are GCC 2.95-era C.
         for w in DOWNGRADED.iter().filter(|w| **w != "implicit-function-declaration") {
@@ -143,7 +172,7 @@ impl Clang {
     /// LLVM IR for a normalized TU, as `compile_i` would lower it.
     pub fn emit_llvm(&self, i_path: &Path) -> Result<String> {
         let mut cmd = self.base();
-        cmd.args(["-S", "-emit-llvm", "-O0", "-w", "-fno-builtin"]).args(crate::UB_CONTAINMENT_FLAGS);
+        cmd.args(["-S", "-emit-llvm", "-O0", "-w", "-fno-builtin"]).args(self.ub_flags());
         for w in DOWNGRADED {
             cmd.arg(format!("-Wno-error={w}"));
         }
@@ -158,7 +187,7 @@ impl Clang {
     /// differential harness's no-auto-inline variant.
     pub fn compile_variant(&self, i_path: &Path, obj: &Path, extra: &[&str]) -> Result<()> {
         let mut cmd = self.base();
-        cmd.args(["-c", "-O2", "-w", "-fno-builtin"]).args(crate::CODEGEN_FLAGS).args(crate::UB_CONTAINMENT_FLAGS).args(extra);
+        cmd.args(["-c", "-O2", "-w", "-fno-builtin"]).args(crate::CODEGEN_FLAGS).args(self.ub_flags()).args(extra);
         for w in DOWNGRADED {
             cmd.arg(format!("-Wno-error={w}"));
         }

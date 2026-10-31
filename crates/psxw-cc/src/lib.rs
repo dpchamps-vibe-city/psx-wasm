@@ -72,7 +72,9 @@ pub fn objects_compiled_with(dir: &std::path::Path, flags: &[&str]) -> anyhow::R
     Ok(())
 }
 
-/// UB containment flags (docs/design.md §Validation).
+/// UB containment flags (docs/design.md §Validation). A [`Clang`] whose
+/// reference flags leave plain `char` signed adds `-fsigned-char` after
+/// them ([`Clang::reference`]).
 pub const UB_CONTAINMENT_FLAGS: &[&str] = &[
     "-std=gnu89",
     "-fwrapv",

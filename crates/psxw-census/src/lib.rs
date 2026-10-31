@@ -55,7 +55,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
         manifest.c.defines.clone(),
         &out_dir,
     )?;
-    clang.soft_float = manifest.reference.cc1flags.iter().any(|f| f == "-msoft-float");
+    clang.reference(&manifest.reference.cc1flags);
 
     let tus: Vec<_> = map
         .containers
