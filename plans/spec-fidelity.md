@@ -335,10 +335,10 @@ calls (TR1, B19).
 6. [x] **SDK11. DMA1's busy bit is CHCR1's.** `libpress.rs:33-34,
    240-244, 406`: start DMA1 and poll CHCR1 bit 24 as the original does;
    drop `m.sdk.press.out`. Revise D64's note. **Run:** bof4's FMV.
-
    Done `7bb1aeb`: DMA0 and DMA1 started through the shared controller's
    registers as libpress writes them (`Machine::dma_start_held`, completion
    held per D64); `DecDCToutSync` reads CHCR1. D64 revised.
+
 ### Exit criteria
 
 1. `cargo test --workspace` passes.
