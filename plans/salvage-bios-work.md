@@ -907,6 +907,41 @@ ABI-17 CI failures and missing prerequisites are unresolved. General non-local
 return, executable/exception context, fonts/identity policy and other partial
 BIOS services remain open; this is not full-BIOS completion.
 
+## Next control-flow decision (not approved or implemented)
+
+Parent traced the remaining non-local return gap through `psxw-lift/src/lib.rs`
+and `emit.rs`, `psxw-link/src/game.rs`, and `psx-runtime/src/wasm.rs`/`driver.rs`:
+
+- Recognised A(13h) sites already save RA/SP/FP/S0–S7/GP and produce a compiled
+  continuation at the return address. Entering that continuation as an ordinary
+  guest call does **not** discard the active calls between longjmp and setjmp;
+  its eventual return would go back to the longjmp caller, not the saved caller.
+- The existing wasm RFE tag unwinds only to `guest_invoke_irq`. It is not a
+  general jump-to-live-frame mechanism. Indirect/unrecognised setjmp calls also
+  lack the caller register capture that the known-site lowering supplies.
+- Asyncify preserves live wasm locals for thread switches, but its current
+  scope excludes exception-handler functions. Adding catches to guest functions
+  cannot simply be assumed compatible with that existing thread machinery.
+- Native `Regs` exposes SP/GP only. Exec's caller context, general non-local
+  returns and editable exception contexts cannot be completed by fabricating
+  FP/RA or merely calling a compiled entry point. Callback/IRQ thread switching
+  remains separately blocked; replacing Asyncify is not authorised.
+
+**Decision requested:** permit a bounded lift/link/runtime design for frame-
+targeted non-local returns, extending existing saved-register continuations and
+wasm exception support while retaining Asyncify. The design must establish
+jump-target ownership across recursion/threads, register capture at supported
+call paths, and correct frame cleanup/return. No interpreter, simulated CPU
+register file or scheduler replacement. This is a proposed direction, not an
+approved implementation; a concrete design must be reviewed before code.
+
+Independent read-only workflow `93e1e227-2f2c-49d5-8c86-7e755960d251` checks the
+bounded public/OpenBIOS contracts of C(15h/17h/18h) and A(A7h..AAh/AEh) in
+parallel. It has no implementation authority. The first launch was rejected
+before starting children because the parallel shorthand disallowed per-child
+output paths; the single retry uses the documented scripted workflow. No files
+were changed by the failed launch.
+
 ## Progress log
 
 - 2026-10-31: callable kernel functions and callback ordering integrated as
