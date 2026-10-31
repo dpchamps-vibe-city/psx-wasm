@@ -2799,8 +2799,9 @@ closer to the oracle's (plans/spec-fidelity.md, phase 7 step 5).
   at one cycle an instruction, as planned, libetc's `VSync` countdown
   (1 << 15 passes of 14 instructions) ran out before an NTSC frame did,
   and `VSync(0)` timed out where hardware never does (a main-RAM load
-  takes about five cycles, psx-spx). Two is the average of the code that
-  matters here; step 5's comparison with the oracle is where it gets
+  takes about five cycles, psx-spx). Unverified: two was chosen because
+  it made that wait finish, not derived from the spec or measured, and
+  is not to be tuned. Two is the average of the code that matters here; step 5's comparison with the oracle is where it gets
   checked.
 - **Lifted code** spends each MIPS basic block's instructions (a branch
   with its delay slot; a block also starts after a call returns) as the

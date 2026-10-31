@@ -577,11 +577,11 @@ pub mod guest {
     /// instructions in it; decompiled C its estimate, which needs the
     /// fraction.
     pub const BUDGET_UNIT: i32 = 16;
-    /// What an instruction takes on average (D71): stalls aren't modelled
-    /// one by one, but a main-RAM load takes about five cycles where an
-    /// instruction from the cache takes one (psx-spx). At one cycle, libetc's
-    /// `VSync` countdown (1 << 15 passes of 14 instructions) ran out before
-    /// a frame did.
+    /// What an instruction takes on average (D71). Unverified: chosen
+    /// because one cycle made libetc's `VSync` countdown (1 << 15 passes of
+    /// 14 instructions) run out before a frame, not derived from the spec
+    /// (psx-spx: an instruction's cycles depend on its class and on the
+    /// region it accesses) nor measured against the oracle. Don't tune it.
     pub const CYCLES_PER_INSTRUCTION: i32 = 2;
     /// The budget a safepoint quantum gives: the default quantum's 20,000
     /// cycles of instructions.

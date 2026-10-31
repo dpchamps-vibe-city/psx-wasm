@@ -472,17 +472,19 @@ write into ROM space (before, `_patch_gte` copied code over 0–38h).
 
 ## Phase 4: translator correctness
 
-1. [x] **TR2. Registers passed outside o32 fail the lift** instead of
+1. [ ] **TR2. Registers passed outside o32 fail the lift** instead of
    arriving as 0 (`psxw-lift/src/emit.rs:128-141`). Inlining evidence
    crosses branches and joins, and counts s0–s7, fp and HI/LO
    (`analysis.rs:16-17, 109-129, 326-327`; `lib.rs:291-297, 363-382`).
    Each case that then fails gets a proper fix; open-items "Lifted SDK asm
    that reads temporaries on entry" folds in here. Update D33.
    Done `f71a5d1`, `1ba3f0e` (agent): evidence crosses branches and joins, both ways (a caller setting registers before, reading them after), with hi/lo and s0–s7/fp; a call that can't carry them (an unexpanded `jalr`/`bgezal`, a C caller, an address-taken callee, a read after a pointer, BIOS or kernel call) fails the lift; a register no caller sets is uninitialised and reads 0 (D27). btn expands 17 functions, bof4 25; nothing fails. The open item closes: `_spu_pitch2note` has no callers (uninitialised case), the msc02 helpers and `func_8003A2A4` are expanded into their callers. D33 reworded.
-2. [x] **TR3. A return address other than the caller's fails the lift.**
+   **Unwound 2026-10-31 (`491efe2`).** The rules were fit to two games: exceptions were added until btn and bof4 lifted, and the result inlined bof4's scheduler (a context save) into its caller, which broke bof4 after name select. D33 is back as it was.
+2. [ ] **TR3. A return address other than the caller's fails the lift.**
    `la ra,L; j f`, an edited saved-ra slot, a game's own setjmp/longjmp
    (`psxw-lift/src/graph.rs:345`; `emit.rs:138, 279-282, 323-324`).
    Done `3400afe`, `5efaa23` (agent): ra tracked through moves, the frame, constant-address words and calls; a `jr ra` (or tail jump) with ra known not the caller's fails the lift, and where only some paths restore it the return checks at run time and traps. btn: `DrawCulledProjectedPrimitives` returns early with sp still on the scratchpad stack (a game bug; now the checked kind); libmcx's handler's `jr k0; rfe` lowers as ReturnFromException. bof4: none.
+   **Unwound 2026-10-31 (`93e85b1`), but for `5efaa23`'s `jr k0; rfe` lowering (R3000 semantics).** Same reason as TR2: its exemptions were fit to the two games, and bof4's scheduler is a case it fails.
 3. [x] **TR7. Variadic marshalling copies every argument** and realigns
    64-bit ones to even slots (`psxw-link/src/marshal.rs:16, 96-101`).
    Done `1209426` (agent): the census records each variadic call's argument types (`protos2.json`); C→o32 copies every word any call in the object passes, 64-bit ones at even words, and fails the link where an object's calls disagree. o32→variadic C still copies 8 words as they lie (the o32 caller's types aren't known).
@@ -731,8 +733,9 @@ bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
 The new timing is closer when `ramdiff` reaches the same counters with
 fewer differing symbols than on main, and the frame counter's rate (the
 counters at each 300th or 600th frame) is nearer Beetle's. If it is
-slower or faster throughout, `guest::CYCLES_PER_INSTRUCTION` is the knob
-(Findings).
+slower or faster throughout, the fix is instruction costs from the spec
+(class and region), measured against Beetle, not a different value of
+`guest::CYCLES_PER_INSTRUCTION` (Findings).
 
 ## Risks
 
@@ -845,7 +848,10 @@ locals, or static translation.
   = 2 is their average for the code that matters here (VSync's countdown
   becomes 1.6 frames, the old loop-pass model's 20 cycles a pass sat at
   1.2), and step 5's comparison with Beetle is where it gets checked.
-  Decided under the /goal.
+  Decided under the /goal. **Unverified and fit (2026-10-31):** 2 was
+  chosen because it made `VSync(0)` finish, not derived from the spec or
+  measured. Not to be tuned; replacing it with per-class, per-region
+  costs from psx-spx is a design decision for the human.
 - **TR9's charge revised** (2026-10-31, phase 7; D71): bulk copies and
   fills spend nothing of their own. The original's instructions that move
   the bytes are already its blocks' (lifted code, where clang only ever
