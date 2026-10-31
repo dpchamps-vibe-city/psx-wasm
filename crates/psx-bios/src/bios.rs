@@ -17,6 +17,7 @@ pub(crate) const MAX_LEN: u32 = 0x0020_0000;
 pub fn name(table: u32, func: u32) -> &'static str {
     match (table, func) {
         (0xA0, 0x0A) => "todigit",
+        (0xA0, 0x0B) => "atof",
         (0xA0, 0x0C) => "strtoul",
         (0xA0, 0x0D) => "strtol",
         (0xA0, 0x0E) => "abs",
@@ -55,6 +56,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x2F) => "rand",
         (0xA0, 0x30) => "srand",
         (0xA0, 0x31) => "qsort",
+        (0xA0, 0x32) => "strtod",
         (0xA0, 0x33) => "malloc",
         (0xA0, 0x34) => "free",
         (0xA0, 0x35) => "lsearch",
@@ -206,11 +208,86 @@ pub fn name(table: u32, func: u32) -> &'static str {
     }
 }
 
-/// Whether [`call`] implements `(table, func)` (every implemented call is
-/// named, and only those).
+/// How much of `(table, func)`'s documented behaviour [`call`] provides.
+/// This classifies the current dispatch arm, not the name alone: a named
+/// entry may still be partial, deliberately unsupported, fatal or a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// The documented service, over the existing native backends.
+    Working,
+    /// Some documented behaviour is present; a recorded limitation keeps
+    /// the call incomplete.
+    Partial,
+    /// The entry is recognised but the required capability is unavailable
+    /// and the call deliberately errors.
+    Unsupported,
+    /// The documented retail behaviour is fatal and the arm reproduces it.
+    Fatal,
+    /// The documented behaviour is an absent hardware side effect here.
+    Noop,
+    /// The translated call does not have a constant function number.
+    Unknown,
+}
+
+impl Support {
+    pub fn label(self) -> &'static str {
+        match self {
+            Support::Working => "working",
+            Support::Partial => "partial",
+            Support::Unsupported => "unsupported",
+            Support::Fatal => "fatal",
+            Support::Noop => "noop",
+            Support::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether the dispatcher names and handles `(table, func)`. This is the
+/// build's compatibility gate, not a claim that the call works; see
+/// [`support`] for that.
 pub fn implemented(table: u32, func: u32) -> bool {
     let (table, func) = tables::canonical(table, func);
     name(table, func) != "?"
+}
+
+/// [`call`]'s coverage of `(table, func)`, after alias resolution, for the
+/// build's BIOS-call report.
+pub fn support(table: u32, func: u32) -> Support {
+    let (table, func) = tables::canonical(table, func);
+    if name(table, func) == "?" {
+        return Support::Unsupported;
+    }
+    match (table, func) {
+        // psx-spx: they use the absent COP1, so the console locks up.
+        (0xA0, 0x0B) | (0xA0, 0x32) | (0xA0, 0xA1) => Support::Fatal,
+        // No cache or dummy device to affect; retail returns zero.
+        (0xA0, 0x44) | (0xA0, 0x57) | (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => Support::Noop,
+        // Recognised, but the required capability is not available here.
+        (0xA0, 0x14) | (0xA0, 0x43) | (0xA0, 0x52) | (0xB0, 0x3E) | (0xC0, 0x09) => {
+            Support::Unsupported
+        }
+        // Native service present, with a recorded limitation on the
+        // documented behaviour.
+        (0xA0, 0x13)
+        | (0xA0, 0x5D)
+        | (0xA0, 0x5E)
+        | (0xA0, 0x66)
+        | (0xA0, 0x67)
+        | (0xA0, 0x94)
+        | (0xA0, 0x95)
+        | (0xA0, 0x9C)
+        | (0xA0, 0xAB)
+        | (0xA0, 0xAC)
+        | (0xA0, 0xAD)
+        | (0xA0, 0xAF)
+        | (0xA0, 0xB4)
+        | (0xB0, 0x4E)
+        | (0xB0, 0x4F)
+        | (0xB0, 0x51)
+        | (0xB0, 0x5C)
+        | (0xB0, 0x5D) => Support::Partial,
+        _ => Support::Working,
+    }
 }
 
 fn len(n: u32) -> u32 {
@@ -266,6 +343,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             // longjmp traps.
             r(0)
         }
+        (0xA0, 0x0B) | (0xA0, 0x32) => Err(format!("{label}: it uses COP1, which the console does not have (the call locks up on hardware)")),
         (0xA0, 0x14) => Err(format!("{label}: longjmp across translated frames is not supported")),
         (0xA0, 0x43) => Err(format!("{label}: loading and running another executable is not supported")),
         (0xA0, 0x15) | (0xA0, 0x16) => {
@@ -1027,4 +1105,52 @@ pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machin
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::machine;
+
+    #[test]
+    fn coverage_distinguishes_working_partial_unsupported_fatal_and_noop() {
+        // Native services, and aliases keep the same classification.
+        assert_eq!(support(0xA0, 0x1B), Support::Working);
+        assert_eq!(support(0xA0, 0x00), support(0xB0, 0x32));
+        assert_eq!(support(0xC0, 0x80 + 0x57), support(0xB0, 0x57));
+        // A returned native stand-in still names the same service.
+        assert_eq!(support(0xA0, 0x70), support(0xA0, 0x55));
+        // Native service with a recorded limitation.
+        assert_eq!(support(0xA0, 0x9C), Support::Partial);
+        assert_eq!(support(0xA0, 0xB4), Support::Partial);
+        assert_eq!(support(0xB0, 0x51), Support::Partial);
+        assert_eq!(support(0xB0, 0x5D), Support::Partial);
+        // Recognised but no required capability.
+        assert_eq!(support(0xA0, 0x14), Support::Unsupported);
+        assert_eq!(support(0xA0, 0x43), Support::Unsupported);
+        assert_eq!(support(0xA0, 0x42), Support::Unsupported);
+        assert_eq!(support(0xB0, 0x3E), Support::Unsupported);
+        assert_eq!(support(0xC0, 0x09), Support::Unsupported);
+        // Documented fatal and no-op behaviour.
+        assert_eq!(support(0xA0, 0x0B), Support::Fatal);
+        assert_eq!(support(0xA0, 0x32), Support::Fatal);
+        assert_eq!(support(0xA0, 0xA1), Support::Fatal);
+        assert_eq!(support(0xA0, 0x44), Support::Noop);
+        assert_eq!(support(0xC0, 0x0E), Support::Noop);
+        // implemented() stays the compatibility gate, not a working claim.
+        assert!(implemented(0xA0, 0x14));
+        assert!(implemented(0xA0, 0x0B));
+        assert!(!implemented(0xA0, 0x42));
+    }
+
+    #[test]
+    fn documented_fatal_float_conversion_names_its_reason() {
+        let mut m = machine();
+        for f in [0x0B, 0x32] {
+            match call(&mut m, 0xA0, f, [0x8001_0000, 0, 0, 0]) {
+                Err(e) => assert!(e.contains("COP1"), "{e}"),
+                Ok(_) => panic!("atof/strtod {f:#x} must stay fatal"),
+            }
+        }
+    }
 }

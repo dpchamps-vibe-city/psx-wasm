@@ -1106,34 +1106,60 @@ fn hardware_unbound(
 }
 
 /// The BIOS calls translated code makes (M2 task 8), by table and number,
-/// with their call sites; `bios-calls.json`. Each must be one the runtime's
-/// dispatcher implements, with a constant function number.
+/// with their call sites and coverage; `bios-calls.json`. The build still
+/// requires a constant function number the dispatcher names, but reports
+/// partial, unsupported, fatal and no-op calls rather than calling them all
+/// implemented.
 fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
     #[derive(Serialize, Default)]
     struct Call {
         name: &'static str,
         implemented: bool,
+        support: &'static str,
         sites: Vec<String>,
     }
     let mut calls: BTreeMap<String, Call> = BTreeMap::new();
     for t in lifted {
         for c in psxw_lift::bios_calls(t) {
             let site = format!("{} 0x{:08X}", t.func.name, c.pc);
+            let support = call_support(c.table as u32, c.func);
             let (key, name, ok) = match c.func {
                 Some(f) => (format!("{:02X}h:{f:02X}h", c.table), psx_bios::bios::name(c.table as u32, f), psx_bios::bios::implemented(c.table as u32, f)),
                 None => (format!("{:02X}h:?", c.table), "(function number not constant)", false),
             };
-            let e = calls.entry(key).or_insert_with(|| Call { name, implemented: ok, sites: vec![] });
+            let e = calls.entry(key).or_insert_with(|| Call { name, implemented: ok, support: support.label(), sites: vec![] });
             e.sites.push(site);
         }
     }
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("bios-calls.json"), serde_json::to_string_pretty(&calls)?)?;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in calls.values() {
+        *counts.entry(c.support).or_default() += 1;
+    }
+    let summary: Vec<String> = ["working", "partial", "unsupported", "fatal", "noop", "unknown"]
+        .into_iter()
+        .filter_map(|s| counts.get(s).map(|n| format!("{n} {s}")))
+        .collect();
+    if summary.is_empty() {
+        eprintln!("build: 0 BIOS calls");
+    } else {
+        eprintln!("build: {} BIOS calls ({})", calls.len(), summary.join(", "));
+    }
+    let gaps: Vec<String> = calls.iter().filter(|(_, c)| matches!(c.support, "unsupported" | "unknown")).map(|(k, _)| k.clone()).collect();
+    if !gaps.is_empty() {
+        eprintln!("build: BIOS calls without working support: {}", gaps.join(", "));
+    }
     let missing: Vec<String> =
         calls.iter().filter(|(_, c)| !c.implemented).map(|(k, c)| format!("{k} {} at {}", c.name, c.sites.join(", "))).collect();
     ensure!(missing.is_empty(), "translated code makes BIOS calls the runtime doesn't implement:\n  {}", missing.join("\n  "));
-    eprintln!("build: {} BIOS calls, all implemented", calls.len());
     Ok(())
+}
+
+/// The coverage a translated call reports: a non-constant function number is
+/// unknown, never working.
+fn call_support(table: u32, func: Option<u32>) -> psx_bios::bios::Support {
+    func.map_or(psx_bios::bios::Support::Unknown, |f| psx_bios::bios::support(table, f))
 }
 
 /// Instrument the guest with Asyncify over the functions that can be on
@@ -1191,4 +1217,21 @@ pub fn frame_counter(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs
     let expr = manifest.oracle.frame_counter.as_deref().with_context(|| format!("games/{game}/game.toml [oracle] frame_counter is unset"))?;
     let r = inputs.map.resolve(&inputs.map.main, expr).with_context(|| format!("[oracle] frame_counter {expr} does not resolve"))?;
     Ok(r.addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use psx_bios::bios::Support;
+
+    #[test]
+    fn bios_report_distinguishes_support_and_dynamic_calls() {
+        assert_eq!(call_support(0xA0, Some(0x1B)), Support::Working);
+        assert_eq!(call_support(0xA0, Some(0x9C)), Support::Partial);
+        assert_eq!(call_support(0xA0, Some(0x14)), Support::Unsupported);
+        assert_eq!(call_support(0xA0, Some(0x0B)), Support::Fatal);
+        assert_eq!(call_support(0xA0, Some(0x44)), Support::Noop);
+        assert_eq!(call_support(0xA0, None), Support::Unknown);
+        assert_eq!(call_support(0xA0, Some(0x00)), call_support(0xB0, Some(0x32)));
+    }
 }
