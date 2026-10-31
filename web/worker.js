@@ -13,7 +13,8 @@
 //   turn: Chromium frees the frames posted to the page only there (without
 //   it, memory grows by a frame a vblank until the GPU process dies), and
 //   context-loss events land there;
-// - the disc: a .cue/.bin image in OPFS (`disc/`), sync access handles;
+// - the disc: a .cue/.bin image in this bundle's OPFS directory (`disc-<id>/`),
+//   sync access handles;
 // - pads: the main thread's SharedArrayBuffer, or a replay file;
 // - storage (memory cards): files in OPFS `saves/` (cards.js), loaded at
 //   start; each card the game changes goes to the page, which writes it;
@@ -52,7 +53,7 @@
 //   run's log lines; they come back in the `hashes` message, in the
 //   native host's shapes.
 //
-// Messages in: {type: "start", cue, padBuffer, audioRing, modBuffer, options},
+// Messages in: {type: "start", cue, discDir, padBuffer, audioRing, modBuffer, options},
 // {type: "execute", id, address, args} (one call, at a borrow-free boundary),
 // {type: "cmd", id, name, args}, {type: "load", id, url, reload}.
 // Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"mods"|"scripting-ready"|"execute-result"|"cmd-result"|"load-result"|"stopped", ...}.
@@ -226,7 +227,7 @@ async function opfsMods() {
   return out;
 }
 
-async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
+async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, options }) {
   const canvas = new OffscreenCanvas(options.width || 640, options.height || 480);
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
@@ -246,7 +247,7 @@ async function run({ cue, padBuffer, audioRing, modBuffer, options }) {
   postMessage({ type: "status", text: `renderer: ${renderer.info()}` });
 
   const root = await navigator.storage.getDirectory();
-  const discDir = await root.getDirectoryHandle("disc").catch((e) => {
+  const discDir = await root.getDirectoryHandle(discName).catch((e) => {
     if (e.name !== "NotFoundError") throw e;
     throw new Error("no disc in this browser's storage for this address: import it");
   });
