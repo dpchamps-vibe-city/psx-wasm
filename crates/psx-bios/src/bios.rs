@@ -63,6 +63,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x13) => "StartPAD",
         (0xB0, 0x14) => "StopPAD",
         (0xB0, 0x15) => "OutdatedPadInitAndStart",
+        (0xB0, 0x16) => "OutdatedPadGetButtons",
         (0xB0, 0x17) => "ReturnFromException",
         (0xB0, 0x18) => "SetDefaultExitFromException",
         (0xB0, 0x19) => "SetCustomExitFromException",
@@ -312,7 +313,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x0F) => r(m.close_thread(a[0])),
         (0xB0, 0x10) => m.change_thread(a[0]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xB0, 0x12) => {
-            m.kernel.pad_bufs = Some([(a[0], a[1]), (a[2], a[3])]);
+            m.kernel.init_pad(&mut *m.mem, [(a[0], a[1]), (a[2], a[3])]);
             r(1)
         }
         (0xB0, 0x13) => {
@@ -323,12 +324,8 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.pad_started = false;
             r(1)
         }
-        (0xB0, 0x15) => {
-            let bufs = [(a[0], 0x22), (a[1], 0x22)];
-            m.kernel.pad_bufs = Some(bufs);
-            m.kernel.pad_started = true;
-            r(2)
-        }
+        (0xB0, 0x15) => r(m.kernel.pad_init2(&mut *m.mem, a[0], a[1])),
+        (0xB0, 0x16) => r(m.kernel.pad_dr(&mut *m.mem)),
         (0xB0, 0x17) => Err(format!("{label}: called outside an exception handler")),
         (0xB0, 0x18) => {
             // ResetEntryInt: back to the default exit (ReturnFromException).

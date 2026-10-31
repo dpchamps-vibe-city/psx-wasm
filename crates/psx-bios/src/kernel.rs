@@ -15,6 +15,12 @@ pub const EV_MODE_INTR: u32 = 0x1000;
 pub const EV_HANDLE: u32 = 0xF100_0000;
 /// Default number of event control blocks (SYSTEM.CNF `EVENT=`).
 pub const EVENTS: usize = 16;
+/// `PAD_init2`'s own buffers (B0:15h), in the kernel's data: psx-spx has
+/// them "hidden within the BIOS variables region"; the address is ours.
+pub const PAD_INIT2_BUFS: [u32; 2] = [0x8000_7000, 0x8000_7022];
+/// What the kernel's pad handler stores at most per port, whatever the
+/// buffer's size (psx-spx `InitPAD2`).
+pub const PAD_BUF: u32 = 0x22;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvCb {
@@ -38,6 +44,9 @@ pub struct Kernel {
     /// `InitPAD` buffers: (address, size) per port.
     pub pad_bufs: Option<[(u32, u32); 2]>,
     pub pad_started: bool,
+    /// `PAD_init2`'s `button_dest`: where `PAD_dr` stores its result; the
+    /// handler calls it at each vblank when nonzero.
+    pub pad_dest: u32,
     pub heap: (u32, u32),
     pub files: BTreeMap<u32, File>,
     /// `ChangeClearRCnt` / `ChangeClearPad` flags.
@@ -104,15 +113,66 @@ impl Kernel {
         calls
     }
 
-    /// Kernel pad handler: at each vblank, write each port's state into
-    /// the `InitPAD` buffers (status 0x00 + ID + data, or 0xFF when
-    /// nothing is connected).
-    pub fn pad_vblank(&mut self, mem: &mut dyn Mem, host: &mut dyn Host) {
-        let (Some(bufs), true) = (self.pad_bufs, self.pad_started) else { return };
-        for (port, (addr, size)) in bufs.iter().enumerate() {
-            if *addr == 0 || *size < 2 {
+    /// `InitPAD2`: zero-fill the buffers and remember them; `PAD_dr` is no
+    /// longer called by the handler.
+    pub fn init_pad(&mut self, mem: &mut dyn Mem, bufs: [(u32, u32); 2]) {
+        for (addr, size) in bufs {
+            // At most RAM's size.
+            mem.write(addr, &vec![0; size.min(0x20_0000) as usize]);
+        }
+        self.pad_bufs = Some(bufs);
+        self.pad_dest = 0;
+    }
+
+    /// `PAD_init2(type, button_dest)`: only types 20000000h and 20000001h;
+    /// `InitPAD2` and `StartPAD2` on the kernel's own buffers. Returns 2,
+    /// or 0 for another type.
+    pub fn pad_init2(&mut self, mem: &mut dyn Mem, ty: u32, dest: u32) -> u32 {
+        if !matches!(ty, 0x2000_0000 | 0x2000_0001) {
+            return 0;
+        }
+        let [b1, b2] = PAD_INIT2_BUFS;
+        self.init_pad(mem, [(b1, PAD_BUF), (b2, PAD_BUF)]);
+        self.pad_dest = dest;
+        self.pad_started = true;
+        2
+    }
+
+    /// `PAD_dr`: each port's buttons from `PAD_init2`'s buffers as a
+    /// byte-swapped halfword (port 1 low), FFFFh unless the pad answered
+    /// with ID 41h, or 23h (ORed with 07C7h, bits 6 and 7 cleared by the
+    /// analogue inputs past 10h); stored at `button_dest` too, even when
+    /// that's 0 (psx-spx).
+    pub fn pad_dr(&self, mem: &mut dyn Mem) -> u32 {
+        let mut v = [0xFFFFu16; 2];
+        for (h, buf) in v.iter_mut().zip(PAD_INIT2_BUFS) {
+            let b = mem.bytes(buf, 7);
+            if b[0] != 0 || !matches!(b[1], 0x41 | 0x23) {
                 continue;
             }
+            *h = (b[2] as u16) << 8 | b[3] as u16;
+            if b[1] == 0x23 {
+                *h |= 0x7C7;
+                if b[5] > 0x10 {
+                    *h &= !0x40;
+                }
+                if b[6] > 0x10 {
+                    *h &= !0x80;
+                }
+            }
+        }
+        let out = v[0] as u32 | (v[1] as u32) << 16;
+        mem.w32(self.pad_dest, out);
+        out
+    }
+
+    /// Kernel pad handler: at each vblank, write each port's state into
+    /// the `InitPAD2` buffers (status 0x00 + ID + data, or 0xFF when
+    /// nothing is connected), at most 22h bytes whatever the buffer's
+    /// size; then `PAD_dr` when `PAD_init2` named a destination.
+    pub fn pad_vblank(&mut self, mem: &mut dyn Mem, host: &mut dyn Host) {
+        let (Some(bufs), true) = (self.pad_bufs, self.pad_started) else { return };
+        for (port, (addr, _)) in bufs.iter().enumerate() {
             let state = host.pad_state(port as u32);
             if state.is_empty() {
                 mem.w8(*addr, 0xFF);
@@ -120,8 +180,11 @@ impl Kernel {
             }
             let mut out = vec![0x00, if state.len() > 2 { 0x73 } else { 0x41 }];
             out.extend(&state);
-            out.truncate(*size as usize);
+            out.truncate(PAD_BUF as usize);
             mem.write(*addr, &out);
+        }
+        if self.pad_dest != 0 {
+            self.pad_dr(mem);
         }
     }
 }

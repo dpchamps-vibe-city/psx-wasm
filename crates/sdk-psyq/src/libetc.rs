@@ -49,7 +49,7 @@
 //! meant to read. A callback that leaves with ReturnFromException from
 //! inside libetc's own handler isn't supported.
 
-use crate::{Adapter, M, Psyq, Result, reg, ret, set_reg};
+use crate::{Adapter, M, Psyq, Result, bios, reg, ret, set_reg};
 use psx_bios::{Flow, GuestCall, IrqStep, StandIn, Wait};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
@@ -379,10 +379,6 @@ fn set_line(m: &mut M, irq: usize, h: Handler) -> std::result::Result<u32, Strin
     Ok(prev.word())
 }
 
-/// A BIOS call that returns at once (ChangeClearPAD, ChangeClearRCnt).
-fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result::Result<(), String> {
-    psx_bios::bios::call(m, table, func, a).map(|_| ())
-}
 
 /// `ResetCallback`: once (until `StopCallback`), mask and acknowledge every
 /// interrupt, set every DMA channel's priority with none enabled, clear
