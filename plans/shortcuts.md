@@ -16,6 +16,9 @@ relies on a heuristic that silently mishandles cases outside it.
 Not listed here:
 - the architecture: static recompilation, adapters in place of SDK code,
   register-level devices;
+- the emulated devices' own fidelity (`psx-devices`, `psx-spu`): they are
+  the fallback while the adapters are completed
+  ([`unified-adaptor-layer/`](unified-adaptor-layer/));
 - features that aren't built yet;
 - bugs, which are in [`open-items.md`](open-items.md) under *Bugs*;
 - differences the architecture forces (see [Forced](#forced)).
@@ -46,11 +49,10 @@ audit's reading alone).
 | Area | Shortcuts | Documented | Undocumented |
 |---|---|---|---|
 | [BIOS](#bios) | 9 | 2 | 7 |
-| [Emulated devices](#emulated-devices) | 13 | 7 | 6 |
-| [SPU and renderer](#spu-and-renderer) | 4 | 1 | 3 |
+| [Renderer](#renderer) | 1 | 0 | 1 |
 | [SDK adapters](#sdk-adapters) | 16 | 14 | 2 |
 | [Translator and runtime](#translator-and-runtime) | 16 | 7 | 9 |
-| **Total** | **58** | **31** | **27** |
+| **Total** | **42** | **23** | **19** |
 
 ## Start here
 
@@ -64,9 +66,7 @@ By impact:
   other readers;
 - BIOS4, the kernel's interrupt handlers run as Rust on device events;
 - SDK3, SDK4 and SDK5, waits that don't spend the guest's budget (one
-  shared helper);
-- DEV1 and DEV2, CD command and seek times;
-- DEV7, DEV10 and DEV12, drawing, MDEC and DMA take no time.
+  shared helper).
 
 ## BIOS
 
@@ -105,80 +105,9 @@ By impact:
   no device table sits behind `open`. Ref: undocumented. Impact: low.
   Checked: yes.
 
-## Emulated devices
+## Renderer
 
-### CD controller (`psx-devices/src/cdc.rs`, `cd.rs`)
-
-- [ ] **DEV1. Every command's first response comes after a flat 1 ms.**
-  `cd.rs:259-262`, used at `cdc.rs:365-426`. Second responses are fixed
-  multiples (MotorOn/Stop ×4, Init ×2, ReadTOC ×8, GetID ×½). Spec: per
-  command; spin-up and ReadTOC take far longer. Ref: D48 and open-items
-  M10 task 4 (times); the flat ack is undocumented. Impact: med.
-  Checked: audit.
-- [ ] **DEV2. Seek time is a guessed formula.** `cd.rs:244-257`: 20 ms
-  settle plus up to 300 ms of stroke. Ref: code comment; open-items M10
-  task 4. Impact: med. Checked: audit.
-- [ ] **DEV3. One sector buffer.** `cdc.rs:473-480`. An undelivered
-  sector is replaced by the next. Ref: D66. Impact: low. Checked: audit.
-- [ ] **DEV4. Bad and unreadable sectors are invisible.**
-  `cdc.rs:461-467`. An EDC or header mismatch is only counted host-side and
-  the sector is delivered; an unreadable LBA gives no interrupt and the
-  read keeps scheduling. Spec: error or retry, INT5. Ref: undocumented.
-  Impact: low. Checked: audit.
-- [ ] **DEV5. A command written before the previous one's first response
-  cancels that response.** `cdc.rs:298`. Hardware behaviour unverified.
-  Ref: undocumented. Impact: low. Checked: audit.
-- [ ] **DEV6. Reading past the data FIFO's end returns 0.**
-  `cdc.rs:225-231`. Ref: undocumented. Impact: low. Checked: audit.
-
-### GPU front end (`psx-devices/src/gpu.rs`)
-
-- [ ] **DEV7. Drawing takes no time.** `gpu.rs:524-532, 353`. Bits 26 and
-  28 are ready between whole commands; the FIFO is unbounded.
-  Ref: D42, design §6. Impact: med. Checked: audit.
-- [ ] **DEV8. GPUREAD past the rectangle returns 0.** `gpu.rs:551-553`.
-  Spec: continues along the VRAM row. Ref: code comment. Impact: low.
-  Checked: audit.
-- [ ] **DEV9. The display's screen position is dropped.**
-  `gpu.rs:660-684`. `present_desc` uses the display ranges only for width
-  and height. Ref: undocumented. Impact: low (presentation).
-  Checked: audit.
-
-### MDEC (`psx-devices/src/mdec.rs`)
-
-- [ ] **DEV10. Decoding is instant.** `mdec.rs:9-10, 160-190`.
-  Ref: D58, D64. Impact: med (possibly open-items "FMV differences").
-  Checked: audit.
-- [ ] **DEV11. Reading an empty output FIFO returns 0.**
-  `mdec.rs:192-196, 427-430`. Spec: DMA1 waits. Ref: D64. Impact: low-med.
-  Checked: audit.
-
-### DMA (`psx-devices/src/dma.rs`)
-
-- [ ] **DEV12. Transfers complete instantly.** `dma.rs:3-5, 107-110`. No
-  device request gating, no chopping (CHCR bit 8), DPCR priority bits
-  ignored (ready channels run lowest number first). Ref: D42.
-  Impact: med. Checked: audit.
-
-### Memory card (`psx-devices/src/memcard.rs`)
-
-- [ ] **DEV13. Writes commit instantly.** `memcard.rs:384-393`. No
-  write-busy time between frames. Ref: undocumented. Impact: low.
-  Checked: audit.
-
-## SPU and renderer
-
-- [ ] **SPU1. DMA4 ignores SPUCNT's transfer mode.**
-  `psx-spu/src/lib.rs:400-413`, `psx-bios/src/io.rs:495-513`. Spec: DMA4
-  proceeds only in DMA-read/-write mode. Ref: undocumented. Impact: low.
-  Checked: audit.
-- [ ] **SPU2. SPUSTAT bit 10 (transfer busy) is never set; bits 0–5
-  mirror SPUCNT at once.** `psx-spu/src/lib.rs:290-315`. Spec: applied a
-  bit delayed. Ref: undocumented. Impact: low. Checked: audit.
-- [ ] **SPU3. SPUSTAT bit 11 only while RAMCNT = 0004h.**
-  `psx-spu/src/lib.rs:311`. Fitted from two observed Beetle states.
-  Ref: M06 Findings. Impact: low. Checked: audit.
-- [ ] **SPU4. A failed output texture or framebuffer is swallowed.**
+- [ ] **REN1. A failed output texture or framebuffer is swallowed.**
   `psx-render-gl/src/lib.rs:620-621`. The previous frame stays; other GL
   errors in the crate fail loudly. Ref: undocumented. Impact: low.
   Checked: audit.
@@ -382,24 +311,12 @@ locals, or static translation.
 - Uninitialised locals read 0 and clang's stack layout differs from GCC's
   (`-ftrivial-auto-var-init=zero`, D27).
 
-## Not shortcuts
-
-Listed so they aren't re-added:
-- "A DPCR write leaves a second ready channel pending": wrong;
-  `run_dma` (`psx-bios/src/io.rs:353-359`) runs every ready channel.
-- XA reserved shifts 13–15 and Table5 taps 24/26: the references disagree
-  (open-items M10).
-- The `Instant` CD timing mode: an opt-in option (D19).
-- The XA resampler's fixed starting phase: a determinism choice.
-- Reading SPU DATA returns 0: the register is write-only, and this
-  matches the oracle (M06).
-- GTE undefined opcodes: undefined on hardware, matching Beetle
-  (open-items).
-
 ## Progress log
 
 - 2026-10-30: list created from the audit of `psx-bios`, `psx-devices`,
   `psx-spu`, `psx-gte`, `psx-render-gl`, `sdk-psyq`, `psxw-lift`,
   `psxw-link`, `psxw-cc` and `psx-runtime` (`3eff117`, 121 items).
   Narrowed to shortcuts only: bugs moved to open-items *Bugs*; features
-  not yet built dropped (still in `3eff117`).
+  not yet built dropped (still in `3eff117`). Then the emulated devices'
+  own shortcuts (13 device, 3 SPU) dropped as out of scope (still in
+  `ff337c6`).

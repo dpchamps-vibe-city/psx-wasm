@@ -8,7 +8,7 @@ Each item says what it is, why it's open, and where it came from.
   (M12). `psxw ci bof4` hasn't run at the current pin (M13 task 22).
 - **The hardware boundary** (native adapters vs emulated devices) is
   planned in [`unified-adaptor-layer/`](unified-adaptor-layer/).
-- **Shortcuts** (58, 2026-10-30 audit) are tracked in
+- **Shortcuts** (42, 2026-10-30 audit) are tracked in
   [`shortcuts.md`](shortcuts.md); the audit's bugs are under *Bugs* below.
 
 ## Needs the human
