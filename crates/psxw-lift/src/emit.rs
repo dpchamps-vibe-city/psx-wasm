@@ -43,7 +43,7 @@ pub struct Exceptions {
 static NO_CHAIN: BTreeSet<String> = BTreeSet::new();
 
 /// `setjmp`'s buffer: register and byte offset.
-pub const JMP_BUF: [(u8, u32); 12] =
+const JMP_BUF: [(u8, u32); 12] =
     [(31, 0), (29, 4), (30, 8), (16, 12), (17, 16), (18, 20), (19, 24), (20, 28), (21, 32), (22, 36), (23, 40), (28, 44)];
 
 pub struct Emitter<'a> {

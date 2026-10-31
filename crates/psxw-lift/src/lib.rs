@@ -20,7 +20,7 @@ pub mod graph;
 pub mod program;
 pub mod run;
 
-use analysis::{Facts, S_REGS, reg_list};
+use analysis::{Facts, reg_list};
 use graph::{Callee, Dest, Explorer, Graph, LiftError, Node, Transfer};
 use program::{Function, Located, Program, Source};
 use psxw_inputs::originals::Originals;
@@ -273,101 +273,14 @@ fn early_entries(program: &Program, originals: &Originals) -> BTreeSet<(String, 
     out
 }
 
-/// Registers passed outside the o32 ABI that no expansion carries (D33),
-/// by index into `ok`. A translated caller that passes registers expands
-/// its callee; the lift fails where a call can't carry them:
-/// - a call that isn't expanded (`jalr` or `bgezal` to a known function,
-///   or a caller with C, whose C can't set registers) setting registers its
-///   callee reads on entry: the callee fails;
-/// - a function its callers pass registers to whose address is taken: it
-///   fails, since a call through a pointer passes only o32's;
-/// - a translated caller that reads, after a call that isn't expanded,
-///   registers the callee leaves outside o32 (a known callee that writes
-///   them, or one through a pointer, the BIOS or the kernel): the caller
-///   fails.
-///
-/// What a function reads on entry that no caller sets is an uninitialised
-/// value (a C variable GCC left in a register), and reads 0 as C's do
-/// (D27). Decompiled C is ABI-conformant: a C function's own entry reads
-/// are uninitialised locals, and after a call its C reads no registers.
-fn unpassed(program: &Program, ok: &[Translation], takes: &BTreeMap<(String, u32), u64>) -> BTreeMap<usize, LiftError> {
-    let index: BTreeMap<(&str, u32), usize> = ok.iter().enumerate().map(|(i, t)| ((t.func.container.as_str(), t.func.addr), i)).collect();
-    let callee = |from: &str, a: u32| match program.locate(from, a) {
-        Some(Located::Code(c)) => index.get(&(c.as_str(), a)).copied(),
-        _ => None,
-    };
-    let defined = |t: &Translation| t.func.sources.contains(&Source::Defined);
-    // What a translation reads on entry that its own start doesn't supply:
-    // a continuation starts from its buffer, and a call from a translation
-    // passes v0 as GCC's static chain.
-    let unsupplied = |t: &Translation, chain: bool| {
-        let mut supplied = if chain { 1u64 << 2 } else { 0 };
-        if t.func.sources.contains(&Source::Continuation) {
-            supplied |= 1 << 2 | emit::JMP_BUF.iter().fold(0, |a, (r, _)| a | 1u64 << r);
-        }
-        (t.facts.entry_reads | t.facts.entry_s_reads) & !supplied
-    };
-    let name = |t: &Translation| format!("{} 0x{:08X}", t.func.container, t.func.addr);
-    let mut out: BTreeMap<usize, LiftError> = BTreeMap::new();
-    let mut fail = |i: usize, pc: u32, message: String| {
-        out.entry(i).or_insert(LiftError { pc, message });
-    };
-    let mut taken: BTreeSet<usize> = ok
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.func.sources.iter().any(|s| matches!(s, Source::CodePointer | Source::DataPointer)))
-        .map(|(i, _)| i)
-        .collect();
-    for t in ok {
-        taken.extend(t.facts.code_consts.iter().filter_map(|&a| callee(&t.func.container, a)));
-        for &(pc, target, set) in &t.facts.call_sites {
-            let Some(i) = callee(&t.func.container, target) else { continue };
-            if defined(&ok[i]) {
-                continue;
-            }
-            let passed = unsupplied(&ok[i], !defined(t)) & set;
-            if passed != 0 {
-                let how = if defined(t) { "its C can't set them" } else { "the call isn't expanded" };
-                fail(i, ok[i].func.addr, format!("reads {} on entry, which {} sets before calling it at 0x{pc:08X}; {how}", reg_list(passed), name(t)));
-            }
-        }
-        if defined(t) {
-            continue;
-        }
-        for &(pc, regs, target) in &t.facts.post_call_reads {
-            let left = match target.and_then(|a| callee(&t.func.container, a)) {
-                Some(i) => regs & (ok[i].facts.defs & !S_REGS | ok[i].facts.s_changed),
-                // Through a pointer, the BIOS or the kernel: what's left is
-                // the callee's.
-                None => regs & !S_REGS,
-            };
-            if left != 0 {
-                fail(index[&(t.func.container.as_str(), t.func.addr)], pc, format!("reads {} after the call at 0x{pc:08X}, which leaves them as the callee did; the call isn't expanded", reg_list(left)));
-            }
-        }
-    }
-    for i in taken {
-        let t = &ok[i];
-        let key = (t.func.container.clone(), t.func.addr);
-        let passed = takes.get(&key).copied().unwrap_or(0) & unsupplied(t, false);
-        if passed != 0 && !t.func.sources.contains(&Source::ComputedEntry) {
-            fail(i, t.func.addr, format!("reads {} on entry, which its callers pass, and its address is taken: a call through a pointer passes only a0-a3", reg_list(passed)));
-        }
-    }
-    out
-}
-
 /// Translate to a fixed point over function starts and inline functions.
 ///
 /// A function with no C is inlined at its call sites (and fall-throughs)
-/// on evidence of register passing (D33): a caller sets, on some path
-/// before the call, registers the callee reads on entry that the o32 ABI
-/// doesn't pass, or reads after the call registers the ABI doesn't return
-/// that the callee leaves set (hand-written asm that passes values in
-/// temporaries, callee-saved registers or hi/lo). Decompiled C is
+/// when it reads registers on entry that the o32 ABI doesn't pass, or when
+/// a caller reads registers after calling it that the ABI doesn't return:
+/// hand-written asm that passes values in temporaries. Decompiled C is
 /// ABI-conformant by construction, so its entry reads are uninitialized
-/// locals, not arguments. Where a call can't carry them the lift fails
-/// ([`unpassed`]).
+/// locals, not arguments.
 pub fn translate_all(program: &mut Program, originals: &Originals, containers: &[String]) -> Outcome {
     // In address order: one an earlier one's range already holds is only
     // a start.
@@ -379,8 +292,6 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
     let mut rounds = 0;
     let mut inline: BTreeMap<(String, u32), u32> = BTreeMap::new();
     let mut inline_reasons: BTreeMap<(String, u32), String> = BTreeMap::new();
-    // Registers each function's callers were seen to pass it.
-    let mut takes: BTreeMap<(String, u32), u64> = BTreeMap::new();
     loop {
         rounds += 1;
         let funcs: Vec<Function> = containers.iter().flat_map(|c| program.functions(c)).collect();
@@ -460,9 +371,8 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
                 for &(pc, target, pre_defs) in &t.facts.call_sites {
                     let Some(c) = callee_of(&t.func.container, target) else { continue };
                     let Some(cf) = facts.get(&(c.clone(), target)) else { continue };
-                    let passed = (cf.entry_reads | cf.entry_s_reads) & pre_defs;
+                    let passed = cf.entry_reads & pre_defs;
                     if passed != 0 {
-                        *takes.entry((c.clone(), target)).or_default() |= passed;
                         let why = format!(
                             "reads {} on entry, which {} 0x{:08X} sets before 0x{pc:08X}",
                             reg_list(passed),
@@ -476,7 +386,7 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
                     let Some(a) = callee else { continue };
                     let Some(c) = callee_of(&t.func.container, a) else { continue };
                     let Some(cf) = facts.get(&(c.clone(), a)) else { continue };
-                    let returned = regs & (cf.defs & !S_REGS | cf.s_changed);
+                    let returned = regs & cf.defs;
                     if returned != 0 {
                         let why = format!(
                             "writes {}, which {} 0x{:08X} reads after calling it at 0x{pc:08X}",
@@ -500,18 +410,16 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
             // GCC's static chain: a nested function reads its parent's
             // frame through v0, which the parent sets before the call and
             // the o32 call doesn't pass. Its C is unusable (clang has no
-            // nested functions), so it is translated, and so is the parent,
-            // which expands it. Every translation that reads v0 on entry
-            // takes it from a translated caller that doesn't expand it
-            // (one that passes v0 on, or a call that isn't expanded) this
-            // way, as the hardware would.
+            // nested functions), so it is translated, and so is the parent;
+            // neither is inlined, since decompiled C is otherwise taken to
+            // be ABI-conformant. Every translation that reads v0 on entry
+            // takes it from the caller this way, as the hardware would.
             let chain: BTreeSet<String> = out
                 .ok
                 .iter()
                 .filter(|t| t.facts.entry_reads & (1 << 2) != 0)
                 .map(|t| program::call_symbol(&program.main, &t.func.container, t.func.addr))
                 .collect();
-            let mut dropped: BTreeMap<usize, LiftError> = BTreeMap::new();
             if !chain.is_empty() {
                 let again: Vec<usize> = (0..out.ok.len())
                     .filter(|&i| {
@@ -529,24 +437,18 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
                         (i, translate(program, originals, f, inline, &chain))
                     })
                     .collect();
+                let mut dropped = BTreeSet::new();
                 for (i, r) in redone {
                     match r {
                         Ok(t) => out.ok[i] = t,
                         Err(e) => {
-                            dropped.insert(i, e);
+                            out.failed.push((out.ok[i].func.clone(), e));
+                            dropped.insert(i);
                         }
                     }
                 }
-            }
-            for (i, e) in unpassed(program, &out.ok, &takes) {
-                dropped.entry(i).or_insert(e);
-            }
-            let ok = std::mem::take(&mut out.ok);
-            for (i, t) in ok.into_iter().enumerate() {
-                match dropped.remove(&i) {
-                    Some(e) => out.failed.push((t.func, e)),
-                    None => out.ok.push(t),
-                }
+                let ok = std::mem::take(&mut out.ok);
+                out.ok = ok.into_iter().enumerate().filter(|(i, _)| !dropped.contains(i)).map(|(_, t)| t).collect();
             }
             return out;
         }
@@ -693,13 +595,8 @@ impl FunctionReport {
         r.kernel = t.facts.kernel.iter().map(|(pc, a)| format!("0x{pc:08X} → 0x{a:08X}")).collect();
         r.entry_reads = reg_list(t.facts.entry_reads);
         r.entry_s_reads = reg_list(t.facts.entry_s_reads);
-        r.post_call_reads = t
-            .facts
-            .post_call_reads
-            .iter()
-            .filter(|(_, regs, _)| regs & !S_REGS != 0)
-            .map(|(pc, regs, _)| format!("0x{pc:08X}: {}", reg_list(regs & !S_REGS)))
-            .collect();
+        r.post_call_reads =
+            t.facts.post_call_reads.iter().map(|(pc, regs, _)| format!("0x{pc:08X}: {}", reg_list(*regs))).collect();
         r.inlined = t
             .graph
             .regions
@@ -832,66 +729,6 @@ mod tests {
         assert_eq!(t.facts.entry_reads, 0, "v0 at the return site is the tail callee's");
     }
 
-    /// Register passing is seen across a branch and a join, through hi/lo,
-    /// and in a callee-saved register a callee returns: both callees are
-    /// expanded into the caller.
-    #[test]
-    fn register_passing_evidence() {
-        let (takes, gives) = (BASE + 0x3C, BASE + 0x48);
-        let words = [
-            0x27BD_FFE8,                             // addiu sp, sp, -24
-            0xAFBF_0010,                             // sw ra, 16(sp)
-            0x2408_0005,                             // addiu t0, zero, 5
-            0x1080_0002,                             // beqz a0, 1f
-            0,                                       // nop
-            0x24A5_0001,                             // addiu a1, a1, 1
-            0x0085_0018,                             // 1: mult a0, a1
-            0x0C00_0000 | takes >> 2 & 0x03FF_FFFF,  // jal takes
-            0,                                       // nop
-            0x0C00_0000 | gives >> 2 & 0x03FF_FFFF,  // jal gives
-            0,                                       // nop
-            0x0050_1021,                             // addu v0, v0, s0
-            0x8FBF_0010,                             // lw ra, 16(sp)
-            0x03E0_0008,                             // jr ra
-            0x27BD_0018,                             // addiu sp, sp, 24
-            0x0000_1010,                             // takes: mfhi v0
-            0x03E0_0008,                             //   jr ra
-            0x0048_1021,                             //   addu v0, v0, t0
-            0x03E0_0008,                             // gives: jr ra
-            0x2410_0001,                             //   addiu s0, zero, 1
-        ];
-        let out = lift_words(&words, &[(BASE, 0x3C), (takes, 0xC), (gives, 8)]);
-        assert!(out.failed.is_empty(), "{:?}", out.failed);
-        let why = |a: u32| out.inline_reasons.get(&("test".to_string(), a)).cloned().unwrap_or_default();
-        assert!(why(takes).starts_with("reads t0,hi on entry"), "{}", why(takes));
-        assert!(why(gives).starts_with("writes s0"), "{}", why(gives));
-    }
-
-    /// A call the translation can't expand (`jalr` to a known function)
-    /// passes t0, which the callee reads: the lift fails instead of the
-    /// callee reading 0.
-    #[test]
-    fn unexpanded_register_passing_fails() {
-        let callee = BASE + 0x28;
-        let words = [
-            0x27BD_FFE8,                    // addiu sp, sp, -24
-            0xAFBF_0010,                    // sw ra, 16(sp)
-            0x3C19_0000 | callee >> 16,     // lui t9, %hi(callee)
-            0x2739_0000 | callee & 0xFFFF,  // addiu t9, t9, %lo(callee)
-            0x2408_0005,                    // addiu t0, zero, 5
-            0x0320_F809,                    // jalr t9
-            0,                              // nop
-            0x8FBF_0010,                    // lw ra, 16(sp)
-            0x03E0_0008,                    // jr ra
-            0x27BD_0018,                    // addiu sp, sp, 24
-            0x03E0_0008,                    // callee: jr ra
-            0x0100_1021,                    //   addu v0, t0, zero
-        ];
-        let out = lift_words(&words, &[(BASE, 0x28), (callee, 8)]);
-        let failed: Vec<String> = out.failed.iter().filter(|(f, _)| f.addr == callee).map(|(_, e)| e.message.clone()).collect();
-        assert!(matches!(failed.as_slice(), [m] if m.starts_with("reads t0 on entry")), "{:?}", out.failed);
-    }
-
     /// An exception handler's own epilogue restores ra from the interrupted
     /// context and returns with `jr k0; rfe`: a return from the exception,
     /// not a tail call to the interrupted code.
@@ -943,20 +780,20 @@ mod tests {
     }
 
     /// A GCC nested function reads its parent's frame through v0, which the
-    /// parent sets before the call. A call that isn't expanded (here
-    /// `bgezal`; a `jal` would expand the child) passes it.
+    /// parent sets before the call (here ahead of a branch, so it isn't
+    /// register passing the inliner sees): the call passes it.
     #[test]
     fn static_chain() {
         const BASE: u32 = 0x8001_0000;
         let child = BASE + 0x28;
         let words: [u32; 13] = [
-            0x27BD_FFE8, // addiu sp, sp, -24
-            0xAFBF_0010, // sw ra, 16(sp)
-            0x03A0_1021, // addu v0, sp, zero (the chain)
-            0x0411_0006, // bgezal zero, child
-            0,           // nop
-            0,           // nop
-            0,           // nop
+            0x27BD_FFE8,                              // addiu sp, sp, -24
+            0xAFBF_0010,                              // sw ra, 16(sp)
+            0x03A0_1021,                              // addu v0, sp, zero (the chain)
+            0x1000_0001,                              // b 1f
+            0,                                        // nop
+            0x0C00_0000 | (child >> 2 & 0x03FF_FFFF), // 1: jal child
+            0,                                        // nop
             0x8FBF_0010,                              // lw ra, 16(sp)
             0x03E0_0008,                              // jr ra
             0x27BD_0018,                              // addiu sp, sp, 24
