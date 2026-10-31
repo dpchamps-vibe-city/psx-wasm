@@ -568,3 +568,21 @@ locals, or static translation.
   psxw-difftest compile with `Clang::new` (unsigned `char`, and
   `-funsigned-char` stays in the shared UB-containment list). A game whose
   reference flags leave `char` signed needs both on `Clang::reference`.
+- **Phase 2's libetc layout** (2026-10-30, from btn's PsyQ 4.7 objects;
+  offsets in each object's `.text`). `intr.o` (`ResetCallback` at +0):
+  the `lui`/`lw` at +0/+4 loads the driver-table pointer (`.data`+10E0h);
+  the driver table (`.data`+10C0h) is {version, dma setter, interrupt,
+  reset, stop, vblank setter, restart, context}; the context (psyq-decomp
+  `IntrContext`) is u16 active @0, u16 dispatching @2, 11 line handlers @4,
+  u16 mask @30h, u16 saved mask @32h, u32 saved DPCR @34h, `jmp_buf` @38h,
+  stack @68h. The reset body's `jal startIntrVSync` is at +228h and `jal
+  startIntrDMA` at +238h; the dispatcher's spurious-interrupt counter is
+  the pair at +3B4h. `intr_vb.o` (`startIntrVSync` S): callback table
+  pair(S+4), its handler pair(S+30h) (= S+58h: Vcount++, then the eight
+  callbacks), Vcount pair(S+58h), its setter pair(S+40h) (= S+C4h, (ch, f),
+  returns the old one). `intr_dma.o` (`startIntrDMA` D): table pair(D+4),
+  DICR's pointer pair(D+1Ch), handler pair(D+24h) (= D+4Ch), setter
+  pair(D+34h) (= D+1CCh, updates DICR's enable). Both handlers are guest
+  code in native builds too (no hardware-unbound refusal for libetc), so
+  with the state in RAM the dispatcher can call them and the stand-ins go
+  (SDK6).
