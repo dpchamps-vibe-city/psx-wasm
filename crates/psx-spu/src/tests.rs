@@ -96,3 +96,32 @@ fn transfers_round_trip_and_trigger_irq() {
     spu.dma_read(&mut w);
     assert_eq!(w, [0x0002_0001, 0x0004_0003, 0x0006_0005]);
 }
+
+/// Muting or disabling the SPU silences its voices, not the CD input
+/// (psx-spx: SPUCNT bits 14 and 15 "don't care for CD audio").
+#[test]
+fn cd_audio_plays_through_mute_and_disable() {
+    let mut spu = Spu::new();
+    let dc = block([7; 28], 0, 0, 7);
+    load(&mut spu, 0x2000, &dc);
+    for (off, val) in [(reg::VOLL, 0x3FFF), (reg::VOLR, 0x3FFF), (reg::PITCH, 0x1000), (reg::SSA, 0x400), (reg::ADSR1, 0x00FF), (reg::ADSR2, 0x1FC0)] {
+        spu.write(reg::voice(1, off), val);
+    }
+    for (off, val) in [(reg::MVOLL, 0x3FFF), (reg::MVOLR, 0x3FFF), (reg::AVOLL, 0x7FFF), (reg::AVOLR, 0x7FFF)] {
+        spu.write(off, val);
+    }
+    spu.set_cd_input(0x2000, -0x2000);
+    spu.write(reg::SPUCNT, 0xC001);
+    spu.write(reg::KON, 2);
+    for _ in 0..100 {
+        spu.tick();
+    }
+    let cd = |s: i32| ((((s * 0x7FFF) >> 15) * 0x7FFE) >> 15) as i16;
+    let both = spu.tick();
+    assert!(both[0] > cd(0x2000), "the voice plays: {both:?}");
+    spu.write(reg::SPUCNT, 0x8001);
+    assert_eq!(spu.tick(), [cd(0x2000), cd(-0x2000)], "muted");
+    spu.write(reg::SPUCNT, 0x4001);
+    spu.tick();
+    assert_eq!(spu.tick(), [cd(0x2000), cd(-0x2000)], "disabled");
+}

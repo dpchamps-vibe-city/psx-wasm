@@ -697,6 +697,13 @@ impl Spu {
         self.capture = (idx + 1) & (CAPTURE_SAMPLES - 1);
 
         let c = self.cnt();
+        // Muting silences the voices, dry and into the reverb, but not the
+        // CD input (psx-spx: bits 14 and 15 "don't care for CD audio");
+        // the reverb runs on (Beetle). Disabling silences the voices
+        // above.
+        if c & cnt::UNMUTE == 0 {
+            (l, r, rl, rr) = (0, 0, 0, 0);
+        }
         if c & cnt::CD_ENABLE != 0 {
             let cl = (cd[0] as i32 * self.raw(reg::AVOLL) as i16 as i32) >> 15;
             let cr = (cd[1] as i32 * self.raw(reg::AVOLR) as i16 as i32) >> 15;
@@ -715,14 +722,10 @@ impl Spu {
         let (ml, mr) = (self.raw(reg::MVOLL), self.raw(reg::MVOLR));
         Self::volume(ml, &mut self.main_volx[0], &mut self.main_counter[0]);
         Self::volume(mr, &mut self.main_volx[1], &mut self.main_counter[1]);
-        let mut out = [
+        [
             clamp16((clamp16(l) * self.main_volx[0] as i32) >> 15) as i16,
             clamp16((clamp16(r) * self.main_volx[1] as i32) >> 15) as i16,
-        ];
-        if c & cnt::UNMUTE == 0 || c & cnt::ENABLE == 0 {
-            out = [0, 0];
-        }
-        out
+        ]
     }
 }
 
