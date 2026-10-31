@@ -133,17 +133,17 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 |---|---|
 | Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
-| Card, console and CD | Partial; CD blocking calls now wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts; busy-command acceptance/internal dispatch remain incomplete. CD opens preserve ISO versions and accept `?` filename matching. Continue independently verifiable software contracts using existing backends. |
+| Card, console and CD | Partial; CD blocking calls wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts. The read-command phase now honors patched A7E calls and bounded acceptance retries; seek/status/poll dispatch and native busy-progress semantics remain incomplete. CD opens preserve ISO versions and accept `?` filename matching. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
-| Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | CD live-wait batch passes BIOS 53/runtime 9/SDK 42 tests, wasm32 check, fresh native builds and four unchanged replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates remain at `9624526`, before this native batch. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Fonts and BIOS identity | Glyph-resource/identity decisions remain open. B53's resource-independent offset mapping needs better evidence: the proposed OpenBIOS table lookup aliases valid charset-3 codes and was rejected. No invented glyph pointers, dates or versions. |
+| Validation | CD read-dispatch follow-up passes BIOS 54/runtime 9/SDK 42 tests and wasm32 check. Latest native builds and four unchanged replay passes remain at the earlier live-wait batch `1fbe404`. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates remain at `9624526`, before this native batch. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD live-event waits and returning read-error retries implemented; focused tests, wasm32 check, fresh builds/four replays pass. Browser gates keep their recorded checkpoints. CD internal services and busy-command acceptance remain partial; flag-only chain-control proposal rejected. | Owns plan, integration and final acceptance |
+| Parent | `salvage/bios`, writer | CD live-event waits, returning read-error retries and patchable read-command acceptance implemented. Focused tests/wasm32 check cover the latest follow-up; builds/replays remain at `1fbe404`, browser gates at their recorded checkpoints. Remaining CD internals and seek/status acceptance are partial; flag-only chain-control proposal rejected. | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -255,7 +255,7 @@ A(52h)'s body still needs verification.
 | [ ] | A(B2h) | `ioabort_raw` |
 | [ ] | A(B4h) | `GetSystemInfo`: size/flags implemented; date/version identity unresolved |
 | [x] | B(4Dh) | `_card_info_subfunc`: native queued info, low event only |
-| [ ] | B(53h) | `Krom2Offset` |
+| [ ] | B(53h) | `Krom2Offset`: independent of glyph resources, but the proposed reference lookup has valid-codepoint conflicts; verify mapping before implementing |
 | [x] | B(58h) | `_card_chan`: last requested device ID, not slot index |
 | [x] | C(04h) | `get_free_EvCB_slot` |
 | [x] | C(05h) | `get_free_TCB_slot` |
@@ -291,6 +291,8 @@ handoff's missing-call list.
   and accessible glyph data together with B(53h). Establish a legally usable
   resource source with the user; do not commit a BIOS dump or extracted font,
   invent a valid pointer to missing data, or call this complete without glyphs.
+  B53 itself needs no glyph resource, but the inspected reference's original-font
+  lookup aliases valid charset-3 codes; its mapping remains unverified separately.
 - [x] **`SetMem`, A(9Fh).** Updates the guest-visible RAM-size variable for
   retail's 2/8 MB choices, also reported by GetSystemInfo(5). No host memory
   resizing or console-wide bus map.
@@ -1429,7 +1431,7 @@ from the verified OpenBIOS event split; no behavior or coverage classification
 changed. AF and the callbacks remain `Partial`, with no extra test/build needed
 for these comment-only corrections. No active children or pending worker edits.
 
-### CD live-event waits (ABI 18)
+### CD live-event waits (`1fbe404`, ABI 18)
 
 Parent replaced completion-Cell/Cycle selection in `cdrom.rs` with the live
 TestEvent contract from pinned OpenBIOS `helpers.c` and `cdrom.c`
@@ -1525,6 +1527,81 @@ not settled by declaring one interpretation the only functional one. A future
 implementation still needs an evidence-based contract and real runtime/return
 validation, not only a manually resumed Flow test. These open items are not
 implicitly deferred with longjmp, nor is there a new approval request now.
+
+### CD read-command dispatch follow-up
+
+`CdReadSector` now invokes A(7Eh) through the live BIOS table instead of calling
+`cd_read` directly. Pinned OpenBIOS `cdrom/helpers.c` (same `4dc70d...` reference,
+read in full) calls `syscall_cdromRead(count, buffer, 80h)` up to **99999** times
+until its v0 is nonzero. The native helper preserves that software call bound,
+original arguments and live table re-lookup. It awaits a returned Call/Block
+before continuing; immediate rejections loop without recursive Rust frames.
+Exhaustion still calls patchable SystemError(44h,0Ch), then returns -1 only if
+that handler returns. An accepted patch does not also execute the native read.
+The existing live-event wait and ten-attempt read-error retry follow acceptance.
+Cancellation attaches only to native work still active when acceptance returns.
+A guest patch may reject after starting/cancelling native work, then satisfy a
+later attempt using only software events; that successful attempt must not
+inherit the previous operation's cancelled result. A reset during an already
+active native wait still wakes that waiter as before. No fake event is delivered.
+
+This is not instruction-cost timing: no time is added per attempt and an active
+native operation is not silently cancelled or completed. Native busy progress,
+SeekL/status command acceptance and dispatch, patchable TestEvent polling, CD
+chain/INT5 services remain partial. No guest stack buffer, new ABI/import,
+register driver, scheduler change or generalized retry framework was added.
+A5/A6 classifications remain `Partial`.
+
+One grouped BIOS-dispatch test covers second/last-attempt acceptance, exactly
+99999 rejected patched calls, table changes between retries, v0-only boolean
+results, a patch's saved native entry, no duplicate native start, two-sector
+completion and the native immediate-rejection loop. Parent also covered the
+cancelled-rejection/software-completion case and a native blocking table redirect
+(A7E to A6), proving the replacement finishes before the read-event wait begins.
+Guest patch execution is a manually resumed Flow test double, not a new
+compiled-wasm test. Focused test and
+`cargo test -p psx-bios -p psx-runtime -p sdk-psyq --offline` pass **54/9/42**;
+wasm32 runtime check passes. Full logs are in session scratch as
+`cd-read-dispatch-{focused,integrated}-tests.log`. Latest release/runtime/game
+builds and four replays remain at `1fbe404`; browser/conformance/full-CI/oracle
+and save-persistence claims are unchanged. No input or user-save writes.
+
+Read-only DeepSeek review `4396461a-7529-4239-ae6c-baf9ed341834` accepted the core
+change with notes; parent read the complete report. Its source review was based
+on repo code/recorded contracts, not a fresh reference fetch (that role had no
+network/shell tools). Parent had independently read `helpers.c`. The suggested
+Block coverage is now in the same grouped test; historical checkpoints retain
+their old scope while current summaries are updated. The Rc identity assertion
+is retained alongside completion checks, not treated as sole proof of correctness.
+The fallible-dispatch note does not justify a new Flow error channel: native
+fatal/unsupported table redirects already use the established continuation panic
+policy (as in the loader). Such redirects can fail, contrary to the report's
+claim that the error path is unreachable. The parent-discovered stale-cancellation
+fix above followed this review and passed the full focused integration gate.
+
+### Krom2Offset contract scout disposition
+
+Read-only DeepSeek scout `360adf88-4886-4e63-99e8-948b0436963d` and its bounded
+clarification `bedc005b-2fa5-4d04-a991-a871456c5d49` completed without edits or
+tests; both reports were read in full. Parent independently read psx-spx and the
+full pinned OpenBIOS `charset/sjis.c` at `4dc70d2931121a0fde858a0354192b6df4fa22e8`.
+B53 is a retail callable offset helper and does not itself require glyph bytes
+or a ROM pointer. OpenBIOS's B51 multiplies its result by 30, supporting glyph
+indices rather than byte offsets; psx-spx only says offset within charset.
+
+The initial recommendation to copy `originalBiosTable` with a predecessor lookup
+was rejected. Parent found that it maps **both 899Eh and 899Fh to 00BCh**, even
+though both are valid Shift-JIS codes. The first-half rows lack the 7Fh skip
+markers present in OpenBIOS's new-font table. Checking only charset endpoints
+hides this discrepancy. The scout confirmed it and withdrew the recommendation;
+the disabled supposed-retail switch is internally inconsistent too. Neither a
+blind copy nor an inferred standard-JIS repair is accepted as retail behavior.
+The scout's single additional DuckStation check supplied no mapping evidence.
+
+No B51/B53 implementation, classification, glyph resource or identity policy was
+changed. B53's missing mapping evidence is separate from B51's resource decision:
+next work needs a reliable retail algorithm or authorized vectors, not a guessed
+pointer, an unverified copied mapping, or a claim that fonts are complete.
 
 ## Progress log
 

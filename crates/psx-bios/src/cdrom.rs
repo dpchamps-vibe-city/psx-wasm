@@ -529,7 +529,8 @@ impl<S: Sdk> Machine<S> {
     /// A(A5h) `CdReadSector(count, sector, dst)` (OpenBIOS
     /// `cdromBlockReading`): SeekL to `sector`, then ReadN at double speed;
     /// `count`, or -1 on failure if SystemError returns. A read ERR retries
-    /// after that call, up to ten attempts. Waits through every sector and the pause.
+    /// after that call, up to ten attempts. Read-command acceptance calls the
+    /// live A7E table at most 99999 times, then waits for the completion event.
     pub fn cd_block_read(&mut self, count: u32, sector: u32, dst: u32) -> Result<Flow<S>, String> {
         Ok(self.cd_block_read_attempt(count, sector.wrapping_add(cd::PREGAP), dst, 10))
     }
@@ -550,21 +551,50 @@ impl<S: Sdk> Machine<S> {
             if result as u32 != DNE {
                 return system_error(m, 0x0C);
             }
-            if m.cd_read(count, dst, 0x80) == 0 {
-                return system_error(m, 0x0C);
-            }
-            let wait = cd_wait(m, m.kernel.cd.done.clone(), true);
-            crate::machine::seq(m, wait, move |m, result| match result as u32 {
-                DNE => Flow::ret(count),
-                END => system_error(m, 0x17),
-                _ => {
-                    let error = system_error(m, 0x16);
-                    crate::machine::seq(m, error, move |m, _| {
-                        m.cd_block_read_attempt(count, sector, dst, left - 1)
-                    })
+            let accept = m.cd_read_accept(count, dst, 99999);
+            crate::machine::seq(m, accept, move |m, accepted| {
+                if accepted as u32 == 0 {
+                    return system_error(m, 0x0C);
                 }
+                // A patch can complete entirely through software events. Only
+                // active native work can subsequently cancel this wait; do not
+                // inherit cancellation from an earlier rejected attempt.
+                let done = if m.kernel.cd.op.is_some() { m.kernel.cd.done.clone() }
+                    else { Rc::new(Cell::new(None)) };
+                let wait = cd_wait(m, done, true);
+                crate::machine::seq(m, wait, move |m, result| match result as u32 {
+                    DNE => Flow::ret(count),
+                    END => system_error(m, 0x17),
+                    _ => {
+                        let error = system_error(m, 0x16);
+                        crate::machine::seq(m, error, move |m, _| {
+                            m.cd_block_read_attempt(count, sector, dst, left - 1)
+                        })
+                    }
+                })
             })
         })
+    }
+
+    /// helpers.c retries the patchable A(7Eh) call at most 99999 times.
+    /// Immediate rejections loop without Rust recursion; guest calls/blocks
+    /// resume before re-reading the table. These are software attempts, not
+    /// instruction-cost timing or an excuse to cancel the drive's pending work.
+    fn cd_read_accept(&mut self, count: u32, dst: u32, mut tries: u32) -> Flow<S> {
+        while tries != 0 {
+            tries -= 1;
+            let flow = crate::bios::dispatch(self, 0xA0, 0x7E, [count, dst, 0x80, 0])
+                .unwrap_or_else(|e| panic!("CdReadSector: {e}"));
+            match flow {
+                Flow::Return(v) if v as u32 == 0 => {}
+                Flow::Return(v) => return Flow::Return(v),
+                flow => return crate::machine::seq(self, flow, move |m, v| {
+                    if v as u32 == 0 { m.cd_read_accept(count, dst, tries) }
+                    else { Flow::Return(v) }
+                }),
+            }
+        }
+        Flow::ret(0)
     }
 
     /// A(A6h) `CdGetStatus()` (OpenBIOS `cdromBlockGetStatus`): the drive's
@@ -1132,6 +1162,125 @@ mod tests {
             assert_eq!(run(&mut m, flow), u32::MAX as u64);
             assert!(m.kernel.cd.op.is_none(), "seek/status errors do not retry");
         }
+    }
+
+    /// Read acceptance honors the live A7E table and saved original entry,
+    /// resumes before retrying, and does not run the native read a second time.
+    #[test]
+    fn blocking_read_honors_patched_read_acceptance() {
+        for (accept_at, software) in [(2, false), (99999, false), (0, false), (2, true)] {
+            let mut sectors = vec![[0u8; cd::RAW]; 4];
+            sectors[2] = sector(2, b"first");
+            sectors[3] = sector(3, b"tail");
+            let mut m = machine_with_disc(sectors);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let entry = crate::tables::entry(0xA0, 0x7E).unwrap();
+            let saved = m.mem.r32(entry);
+            let patch = 0x8001_1000;
+            let error = 0x8001_2000;
+            let dst = 0x8002_0000;
+            m.mem.w32(entry, patch);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+            m.mem.write(dst, b"keep");
+            let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 2, dst, 0]).unwrap();
+            let Flow::Block { then, .. } = flow else { panic!("seek") };
+            m.step(m.cd_due());
+            let mut flow = then(&mut m);
+            let now = m.clock.now;
+            for attempt in 1..=99999 {
+                let Flow::Call { call, then } = flow else { panic!("read attempt {attempt}") };
+                assert_eq!(call, GuestCall { addr: patch + (attempt - 1) * 4, args: [2, dst, 0x80, 0] });
+                assert!(m.kernel.cd.op.is_none(), "no native read before the patch returns");
+                assert_eq!(m.mem.bytes(dst, 4), b"keep");
+                assert_eq!(m.clock.now, now, "no fabricated instruction time");
+                if attempt == accept_at {
+                    if software {
+                        assert_eq!(m.kernel.cd.done.get(), Some(ERR as u64));
+                        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                    } else {
+                        // Model a guest patch calling its saved original pointer.
+                        let (table, func) = crate::tables::stand_in_fn(saved).unwrap();
+                        assert_eq!(ret(bios::call(&mut m, table, func, call.args)), 1);
+                    }
+                    let done = m.kernel.cd.done.clone();
+                    flow = then(&mut m, u32::MAX as u64); // any nonzero v0 accepts
+                    assert!(Rc::ptr_eq(&done, &m.kernel.cd.done), "no duplicate native start");
+                    break;
+                }
+                if software {
+                    // A rejected patch may start and cancel native work. The
+                    // next accepted software completion must not inherit it.
+                    let (table, func) = crate::tables::stand_in_fn(saved).unwrap();
+                    assert_eq!(ret(bios::call(&mut m, table, func, call.args)), 1);
+                    ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+                }
+                // Re-read the table on every retry, without replacing the
+                // original count/destination with a patch's return value.
+                m.mem.w32(entry, patch + attempt * 4);
+                flow = then(&mut m, 0x1_0000_0000); // only v0 decides acceptance
+            }
+            if accept_at == 0 {
+                let Flow::Call { call, then } = flow else { panic!("acceptance exhausted") };
+                assert_eq!(call, GuestCall { addr: error, args: [0x44, 0x0C, 0, 0] });
+                assert!(m.kernel.cd.op.is_none());
+                assert_eq!(m.clock.now, now, "99999 calls, not instruction costs");
+                let flow = then(&mut m, 123);
+                assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            } else if software {
+                assert_eq!(run(&mut m, flow), 2, "software DNE, not stale cancellation");
+                assert_eq!(m.mem.bytes(dst, 4), b"keep", "no unsolicited native read");
+                assert!(!m.event_ready(m.kernel.cd.events[1]));
+                assert!(m.kernel.cd.op.is_none());
+                assert_eq!(m.clock.now, now);
+            } else {
+                assert!(matches!(flow, Flow::Block { .. }), "accepted read must still wait");
+                assert_eq!(run(&mut m, flow), 2);
+                assert_eq!(m.mem.bytes(dst, 5), b"first");
+                assert_eq!(m.mem.bytes(dst + 0x800, 4), b"tail");
+            }
+        }
+
+        // Immediate native rejections also have the exact bound, without
+        // recursive continuations or a synthetic completion event.
+        let mut m = machine_with_disc(vec![]);
+        m.drive.timing = cd::Timing::Instant;
+        m.cd_init();
+        let error = 0x8001_2000;
+        m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [0, 0, 0x8002_0000, 0]).unwrap();
+        let Flow::Block { then, .. } = flow else { panic!("seek") };
+        m.step(m.cd_due());
+        let now = m.clock.now;
+        let Flow::Call { call, then } = then(&mut m) else { panic!("invalid read count") };
+        assert_eq!(call, GuestCall { addr: error, args: [0x44, 0x0C, 0, 0] });
+        assert_eq!(m.counts["bios.A0h:7Eh CdAsyncReadSector"], 99999);
+        assert_eq!(m.clock.now, now);
+        assert!(m.kernel.cd.op.is_none());
+        let flow = then(&mut m, 0);
+        assert_eq!(run(&mut m, flow), u32::MAX as u64);
+
+        // Redirecting the entry to another native blocking function must also
+        // finish that function before A5 tests its read-completion flags.
+        let mut m = machine_with_disc(vec![]);
+        m.drive.timing = cd::Timing::Instant;
+        m.cd_init();
+        let status = m.mem.r32(crate::tables::entry(0xA0, 0xA6).unwrap());
+        m.mem.w32(crate::tables::entry(0xA0, 0x7E).unwrap(), status);
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 0, 0x8002_0000, 0]).unwrap();
+        let Flow::Block { then, .. } = flow else { panic!("seek") };
+        m.step(m.cd_due());
+        let Flow::Block { then, .. } = then(&mut m) else { panic!("redirected status") };
+        assert!(matches!(m.kernel.cd.op, Some(Op::Status { .. })));
+        m.step(m.cd_due());
+        let Flow::Block { until, then } = then(&mut m) else { panic!("read waits after the replacement returns") };
+        assert!(!m.holds(&until), "status consumed its DNE before returning nonzero");
+        let now = m.clock.now;
+        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+        assert!(m.holds(&until));
+        let flow = then(&mut m);
+        assert_eq!(run(&mut m, flow), 2);
+        assert_eq!(m.clock.now, now);
     }
 
     /// Returning from a read error retries, but not before SystemError returns.
