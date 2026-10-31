@@ -794,11 +794,12 @@ a call into guest code.
   never switches gets stubs and no instrumentation.
 - **BIOS.** The A0/B0/C0 call tables and `syscall`: events (`OpenEvent`,
   `EnableEvent`, `TestEvent`, `WaitEvent`, `DeliverEvent`), the callback
-  registry, critical sections, the heap, the file API on top of the CD,
-  the memory card functions (D43), exception hooks, and `setjmp` support
-  (guest `setjmp`/`longjmp` use wasm exception handling, D45). The pure
-  parts (heap, the string table) could come from OpenBIOS's C, compiled as
-  guest code.
+  registry, critical sections, the heap, the file API over `AddDrv`'s
+  device table (`cdrom` through the CD controller, `bu`, `tty`), the
+  memory card functions (D43), exception hooks, and `setjmp` support
+  (guest `setjmp`/`longjmp` use wasm exception handling, D45). Its tables
+  and control blocks are in kernel RAM (D68); a call goes through the
+  table there.
 - **clock.** The virtual timeline: vblank (NTSC 59.94 Hz, PAL 50 Hz), a
   queue of pending device events, and the safepoint quantum. It delivers
   events in a fixed order by calling guest callbacks.
@@ -2605,19 +2606,34 @@ decisions table proposes it.
 **D68. The kernel keeps its state in kernel RAM, as the BIOS does** (spec
 fidelity, phase 3). The A0h, B0h and C0h call tables (at 200h, 874h and
 674h), the event control blocks (through the table of tables, sized by
-`SYSTEM.CNF` `EVENT=`) and the interrupt chains (`SysEnqIntRP` elements
-linked into the exception control blocks) live in kernel RAM where psx-spx
-and OpenBIOS put them, with stand-in entries that reach the Rust BIOS; a
-game that calls through a table, patches an entry, or walks a chain
-sees what the BIOS's own code would. The kernel's own interrupt handlers
-(root counters, vblank, the pad and card handler) are chain elements, run
-when the interrupt is taken, in priority order, honouring
-`ChangeClearRCnt`, `ChangeClearPad` and `SetIrqAutoAck`. Its pad and card
-drivers drive SIO0 through the shared port model, the cards being the
-port's; its file functions go through `AddDrv`'s device table, `cdrom`
-over the CD controller. Extends D57 and D65 (the thread and exception
-tables already in RAM); revises D43's card driver (the BIOS's cards were
-its own images, reached directly).
+`SYSTEM.CNF` `EVENT=`), the interrupt chains (`SysEnqIntRP` elements
+linked into the exception control blocks) and the file and device
+control blocks (through the table of tables at 140h and 150h) live in
+kernel RAM where psx-spx and OpenBIOS put them; so do the vectors at
+A0h, B0h and C0h with their dispatchers, the exception vector and the
+variables psx-spx gives fixed addresses (`psxw_abi::kernel`). Each table
+entry holds a stand-in, an address in BIOS ROM space naming a Rust BIOS
+function; the runtime's `bios` export reads the entry as the dispatcher
+does, so a stand-in runs its function and an address a game patched in
+is called as guest code with the same arguments. A game that calls
+through a table, patches an entry, or walks a chain sees what the BIOS's
+own code would. The kernel's own interrupt handlers (root counters,
+vblank, the pad and card handler, the CD-ROM driver's, the syscall
+handler) are chain elements, run when the interrupt is taken, in priority
+order, honouring `ChangeClearRCnt`, `ChangeClearPad`, `SetIrqAutoAck` and
+`SetCdromIrqAutoAbort`. Its pad and card drivers drive SIO0 through the
+shared port model, the cards being the port's. Its file functions go
+through `AddDrv`'s device table: a device function is the DCB's pointer,
+a stand-in for the built-in devices (`cdrom`, `bu`, `tty`), a guest
+driver's function called as guest code. `cdrom` is the retail BIOS's
+driver over the CD controller's registers, with the drive's timing; the
+boot leaves it installed (`_96_init`) and libetc's `ResetCallback` takes
+it out (`_96_remove`) before libcd drives the controller. Extends D57 and
+D65 (the thread and exception tables already in RAM); revises D43's card
+driver (the BIOS's cards were its own images, reached directly). Not
+covered: a guest calling a stand-in through a function pointer reaches
+the runtime's `untranslated`, which has no arguments to pass on (a
+linker ABI change).
 
 *Why:* the HLE BIOS kept this state in the runtime, which only works while
 no game reads or patches the kernel's tables, and its handlers ran on
