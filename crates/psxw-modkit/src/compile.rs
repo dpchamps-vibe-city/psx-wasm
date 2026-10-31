@@ -71,7 +71,8 @@ pub fn flat_header(flags: &Flags, m: &Mod, mod_include: &Path, work: &Path) -> R
     std::fs::create_dir_all(work)?;
     let mut includes = flags.includes.clone();
     includes.push(mod_include.to_path_buf());
-    let clang = Clang::new(flags.clang.clone(), work.to_path_buf(), includes, flags.defines.clone(), work)?;
+    let mut clang = Clang::new(flags.clang.clone(), work.to_path_buf(), includes, flags.defines.clone(), work)?;
+    clang.unsigned_char = flags.unsigned_char;
     let src = work.join("mod_flat.c");
     std::fs::write(&src, "#include \"mod.h\"\n")?;
     let text = clang.preprocess(&src, &[])?;
@@ -159,7 +160,8 @@ pub fn compile(flags: &Flags, m: &Mod, mod_include: &Path, work: &Path) -> Resul
     std::fs::create_dir_all(work)?;
     let mut includes = flags.includes.clone();
     includes.push(mod_include.to_path_buf());
-    let clang = Clang::new(flags.clang.clone(), m.dir.clone(), includes, flags.defines.clone(), work)?;
+    let mut clang = Clang::new(flags.clang.clone(), m.dir.clone(), includes, flags.defines.clone(), work)?;
+    clang.unsigned_char = flags.unsigned_char;
     let mut out = Vec::new();
     let mut failures = Vec::new();
     for src in m.sources()? {

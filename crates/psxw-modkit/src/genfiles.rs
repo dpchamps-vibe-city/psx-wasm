@@ -160,6 +160,8 @@ pub struct Flags {
     pub prelude: PathBuf,
     pub includes: Vec<PathBuf>,
     pub defines: Vec<String>,
+    /// Plain `char` as the game's reference compiler has it.
+    pub unsigned_char: bool,
 }
 
 pub const STD: &str = "-std=gnu99";
@@ -175,7 +177,7 @@ impl Flags {
             "-nostdinc".into(),
             STD.into(),
             "-ffreestanding".into(),
-            "-funsigned-char".into(),
+            if self.unsigned_char { "-funsigned-char" } else { "-fsigned-char" }.into(),
             "-include".into(),
             self.prelude.display().to_string(),
         ];

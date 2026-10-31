@@ -25,7 +25,7 @@ pub mod linemap;
 pub mod probe;
 pub mod protos;
 
-pub use clang::Clang;
+pub use clang::{Clang, plain_char_unsigned};
 pub use compile::{Compiled, Lifted, compile};
 
 /// Force-included ahead of every guest TU.
