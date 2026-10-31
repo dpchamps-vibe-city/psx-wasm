@@ -95,6 +95,11 @@ pub struct Translation {
     pub graph: Graph,
     pub facts: Facts,
     pub externs: BTreeSet<String>,
+    /// Returns and tail jumps where ra isn't the caller's return address
+    /// (TR3, [`analysis::ForeignReturns::wrong`]). The translation would
+    /// still return to the caller, so [`translate_all`] fails it once
+    /// discovery is done.
+    pub foreign_returns: Vec<(u32, Option<u32>, String)>,
 }
 
 pub fn translate(
@@ -137,14 +142,18 @@ pub fn translate(
         });
     }
     let exceptions = exception_sites(program, originals, func, &graph, &facts);
+    let returns = analysis::foreign_returns(&graph, &exceptions.rfe);
     let mut graph = graph;
     for &b in &exceptions.setjmp {
         graph.wanted.insert((func.container.clone(), b + 8, Source::Continuation));
     }
     let reads_chain = chain.contains(&program::call_symbol(&program.main, &func.container, func.addr));
-    let (c, externs) =
-        emit::Emitter::new(&graph, &facts)?.exceptions(exceptions).chain(chain, reads_chain).function(&cname, &comment);
-    Ok(Translation { func: func.clone(), cname, c, graph, facts, externs })
+    let (c, externs) = emit::Emitter::new(&graph, &facts)?
+        .exceptions(exceptions)
+        .chain(chain, reads_chain)
+        .guarded(returns.guarded)
+        .function(&cname, &comment);
+    Ok(Translation { func: func.clone(), cname, c, graph, facts, externs, foreign_returns: returns.wrong })
 }
 
 /// Result of translating every function of the requested containers.
@@ -350,6 +359,36 @@ fn unpassed(program: &Program, ok: &[Translation], takes: &BTreeMap<(String, u32
     out
 }
 
+/// Translations that return, or tail-jump, with ra other than the caller's
+/// return address (TR3), by index into `ok`: a wasm return goes back to
+/// the caller whatever ra holds. A tail jump is fine when its callee
+/// writes ra before reading it (the rest of the same function, which
+/// reloads ra from the frame). A block entered at computed offsets runs
+/// only expanded into the function that jumps into it (design §4), where
+/// its jumps are checked.
+fn foreign_returns(program: &Program, ok: &[Translation]) -> BTreeMap<usize, LiftError> {
+    let index: BTreeMap<(&str, u32), usize> = ok.iter().enumerate().map(|(i, t)| ((t.func.container.as_str(), t.func.addr), i)).collect();
+    let mut out = BTreeMap::new();
+    for (i, t) in ok.iter().enumerate() {
+        if t.func.sources.contains(&Source::ComputedEntry) {
+            continue;
+        }
+        let reads_ra = |a: u32| match program.locate(&t.func.container, a) {
+            Some(Located::Code(c)) => index.get(&(c.as_str(), a)).is_none_or(|&j| ok[j].facts.entry_ra),
+            _ => true,
+        };
+        if let Some((pc, callee, holds)) = t.foreign_returns.iter().find(|(_, c, _)| c.is_none_or(reads_ra)) {
+            let what = match callee {
+                None if t.graph.nodes.get(&Node::Normal(*pc)).is_some_and(|d| d.insn.op == decode::Op::Jr && d.insn.rs == 31) => "jr ra".to_string(),
+                None => "a tail jump".to_string(),
+                Some(a) => format!("a tail jump to 0x{a:08X}, which returns through ra,"),
+            };
+            out.insert(i, LiftError { pc: *pc, message: format!("{what} where {holds}, not the caller's return address: the translation returns to the caller") });
+        }
+    }
+    out
+}
+
 /// Translate to a fixed point over function starts and inline functions.
 ///
 /// A function with no C is inlined at its call sites (and fall-throughs)
@@ -532,6 +571,9 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
                 }
             }
             for (i, e) in unpassed(program, &out.ok, &takes) {
+                dropped.entry(i).or_insert(e);
+            }
+            for (i, e) in foreign_returns(program, &out.ok) {
                 dropped.entry(i).or_insert(e);
             }
             let ok = std::mem::take(&mut out.ok);
@@ -852,22 +894,65 @@ mod tests {
         assert!(matches!(failed.as_slice(), [m] if m.starts_with("reads t0 on entry")), "{:?}", out.failed);
     }
 
+    /// `la ra, L; j f`: f returns to L, not to the caller, so the lift
+    /// fails instead of the tail call returning to the caller.
+    #[test]
+    fn tail_jump_with_another_return_address_fails() {
+        let (f, l) = (BASE + 0x10, BASE + 0x40);
+        let words = [
+            0x3C1F_0000 | l >> 16,            // lui ra, %hi(L)
+            0x27FF_0000 | l & 0xFFFF,         // addiu ra, ra, %lo(L)
+            0x0800_0000 | f >> 2 & 0x03FF_FFFF, // j f
+            0,                                // nop
+            0x03E0_0008,                      // f: jr ra
+            0,                                //   nop
+        ];
+        let out = lift_words(&words, &[(BASE, 0x10), (f, 8)]);
+        let failed: Vec<&str> = out.failed.iter().filter(|(t, _)| t.addr == BASE).map(|(_, e)| e.message.as_str()).collect();
+        assert!(matches!(failed.as_slice(), [m] if m.contains(&format!("ra holds 0x{l:08X}"))), "{:?}", out.failed);
+    }
+
+    /// A path that leaves with ra loaded from elsewhere than where it was
+    /// saved: the `jr ra` returns only when ra is the caller's, and traps
+    /// otherwise.
+    #[test]
+    fn return_with_another_return_address_on_one_path_is_guarded() {
+        let words = [
+            0x27BD_FFE8, // addiu sp, sp, -24
+            0xAFBF_0010, // sw ra, 16(sp)
+            0x1080_0004, // beqz a0, 1f
+            0,           // nop
+            0x8FBF_0010, // lw ra, 16(sp)
+            0x1000_0003, // b 2f
+            0,           // nop
+            0x8CBF_0000, // 1: lw ra, 0(a1)
+            0,           // nop
+            0x03E0_0008, // 2: jr ra
+            0x27BD_0018, // addiu sp, sp, 24
+        ];
+        let out = lift_words(&words, &[(BASE, 4 * words.len() as u32)]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let c = &out.ok[0].c;
+        assert!(c.contains(&format!("case 0x00000000u: return ((uint64_t)r3 << 32) | r2; default: psxw_bad_jump(0x{:08X}u, t_);", BASE + 0x24)), "{c}");
+    }
+
     /// `bltzal ra` tests ra as it was before the link overwrites it.
     #[test]
     fn link_branch_tests_ra_before_linking() {
         let words = [
+            0x03E0_8021, // addu s0, ra, zero
             0x07F0_0003, // bltzal ra, callee
             0,           // nop
-            0x03E0_0008, // jr ra
+            0x0200_0008, // jr s0
             0,           // nop
             0x03E0_0008, // callee: jr ra
             0,           // nop
         ];
-        let out = lift_words(&words, &[(BASE, 0x10), (BASE + 0x10, 8)]);
+        let out = lift_words(&words, &[(BASE, 0x14), (BASE + 0x14, 8)]);
         assert!(out.failed.is_empty(), "{:?}", out.failed);
         let c = &out.ok.iter().find(|t| t.func.addr == BASE).expect("translated").c;
         let test = c.find("c_ = (int32_t)r31 < 0;").expect(c);
-        let link = c.find(&format!("r31 = 0x{:08X}u;", BASE + 8)).expect(c);
+        let link = c.find(&format!("r31 = 0x{:08X}u;", BASE + 0xC)).expect(c);
         assert!(test < link && c.contains("if (c_) {"), "{c}");
     }
 

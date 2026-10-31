@@ -37,6 +37,9 @@ pub struct Facts {
     /// Callee-saved registers whose entry value is used for more than
     /// saving it.
     pub entry_s_reads: u64,
+    /// ra on entry is read on some path (to return through, save, or pass
+    /// to a tail callee) before anything writes it.
+    pub entry_ra: bool,
     /// Calls after which a caller-saved register (other than v0/v1) or a
     /// callee-saved one is read before being written: (pc of the call,
     /// registers, direct callee).
@@ -129,19 +132,19 @@ fn insn_defs(i: &Insn) -> u64 {
 /// where `step` gives a node's state on exit from its state on entry and
 /// `join` merges two states (it must only lose information, so the walk
 /// ends).
-fn forward<T: Copy + PartialEq>(
+fn forward<T: Clone + PartialEq>(
     g: &Graph,
     succs: &dyn Fn(Node) -> Vec<Node>,
-    step: impl Fn(Node, T) -> T,
-    join: impl Fn(T, T) -> T,
+    step: impl Fn(Node, &T) -> T,
+    join: impl Fn(&T, &T) -> T,
     entry: T,
 ) -> BTreeMap<Node, T> {
     let mut state = BTreeMap::from([(Node::Normal(g.entry), entry)]);
     let mut work = VecDeque::from([Node::Normal(g.entry)]);
     while let Some(n) = work.pop_front() {
-        let out = step(n, state[&n]);
+        let out = step(n, &state[&n]);
         for s in succs(n) {
-            let new = state.get(&s).map_or(out, |&old| join(old, out));
+            let new = state.get(&s).map_or_else(|| out.clone(), |old| join(old, &out));
             if state.get(&s) != Some(&new) {
                 state.insert(s, new);
                 work.push_back(s);
@@ -149,6 +152,213 @@ fn forward<T: Copy + PartialEq>(
         }
     }
     state
+}
+
+/// A value as the return-address check sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Val {
+    /// ra on entry: the caller's return address.
+    Ra,
+    Const(u32),
+    /// sp on entry plus an offset.
+    Sp(u32),
+    /// Not ra on entry, nor anything derived from sp: another register's
+    /// value on entry (plus a constant), or a word loaded from memory the
+    /// function didn't store ra to.
+    Other,
+    Top,
+}
+
+/// Registers, and memory words by address: in the stack (`true`, by offset
+/// from sp on entry) or at a constant address (a global, the scratchpad).
+#[derive(Clone, PartialEq, Debug)]
+struct Frame {
+    regs: [Val; 32],
+    words: BTreeMap<(bool, u32), Val>,
+}
+
+fn join_val(a: Val, b: Val) -> Val {
+    use Val::*;
+    match (a, b) {
+        _ if a == b => a,
+        (Const(_) | Other, Const(_) | Other) => Other,
+        _ => Top,
+    }
+}
+
+/// One node's effect on [`Frame`]: constants and sp offsets through
+/// `addiu`/`addu`/`subu`/`ori`/moves, words stored and loaded back, a
+/// call's link, and a call clobbering the temporaries (an inlined one, the
+/// registers its code writes; it keeps sp). Other functions are taken not
+/// to write the words this one stores. A load of ra from a stack word the
+/// function never stored, at or above sp on entry, is in its caller's
+/// frame: the function shares that frame (it is the rest of a function
+/// that falls or calls into it), and the word is that function's saved ra.
+fn frame_step(g: &Graph, n: Node, st: &Frame, inlined_defs: u64) -> Frame {
+    use Val::*;
+    let d = &g.nodes[&n];
+    let i = &d.insn;
+    let mut out = st.clone();
+    let v = |r: u8| st.regs[r as usize];
+    let add = |a: Val, b: Val| match (a, b) {
+        (Const(x), Const(y)) => Const(x.wrapping_add(y)),
+        (Sp(x), Const(y)) | (Const(y), Sp(x)) => Sp(x.wrapping_add(y)),
+        (x, Const(0)) | (Const(0), x) => x,
+        (Other, Const(_)) | (Const(_), Other) => Other,
+        _ => Top,
+    };
+    let at = match v(i.rs) {
+        Sp(o) => Some((true, o.wrapping_add(i.simm as u32))),
+        Const(c) => Some((false, c.wrapping_add(i.simm as u32))),
+        _ => None,
+    };
+    let value = match i.op {
+        Op::Lui => Const(i.uimm << 16),
+        Op::Addiu | Op::Addi => add(v(i.rs), Const(i.simm as u32)),
+        Op::Addu | Op::Add => add(v(i.rs), v(i.rt)),
+        Op::Subu | Op::Sub => match (v(i.rs), v(i.rt)) {
+            (x, Const(y)) => add(x, Const(y.wrapping_neg())),
+            _ => Top,
+        },
+        Op::Ori => match v(i.rs) {
+            Const(x) => Const(x | i.uimm),
+            x if i.uimm == 0 => x,
+            _ => Top,
+        },
+        Op::Or => match (v(i.rs), v(i.rt)) {
+            (Const(x), Const(y)) => Const(x | y),
+            (x, Const(0)) | (Const(0), x) => x,
+            _ => Top,
+        },
+        Op::Jal | Op::Jalr | Op::Bltzal | Op::Bgezal => Const(n.pc().wrapping_add(8)),
+        Op::Lw => match (v(i.rs), at.map(|a| (a, st.words.get(&a)))) {
+            (_, Some((_, Some(&x)))) => x,
+            (_, Some(((true, o), None))) if i.rt == 31 && (o as i32) >= 0 => Ra,
+            (Sp(_) | Const(_) | Other, _) => Other,
+            _ => Top,
+        },
+        _ => Top,
+    };
+    if let (true, Some((stack, a))) = (i.op.is_store(), at) {
+        // The words the store's bytes touch hold it (a word store) or no
+        // value known; `swl`/`swr` stay in their aligned word.
+        let (a, size) = match i.op {
+            Op::Sb => (a, 1),
+            Op::Sh => (a, 2),
+            Op::Swl | Op::Swr => (a & !3, 4),
+            _ => (a, 4),
+        };
+        out.words.retain(|&(s, k), _| s != stack || !((k.wrapping_sub(a) as i32) < size && (a.wrapping_sub(k) as i32) < 4));
+        out.words.insert((stack, a & !3), if i.op == Op::Sw { v(i.rt) } else { Top });
+    }
+    if let Some(r) = i.writes() {
+        out.regs[r as usize] = value;
+    }
+    let clobbered = match &d.transfer {
+        Transfer::Call { .. } | Transfer::CondCall { .. } => CALLER_SAVED & !(1 << 31),
+        _ if inlined_call(g, n) => inlined_defs & !(1 << 29),
+        _ => 0,
+    };
+    for r in 1..32 {
+        if clobbered & (1 << r) != 0 {
+            out.regs[r] = Top;
+        }
+    }
+    out.regs[0] = Const(0);
+    out
+}
+
+/// Returns and tail jumps where ra may not be the caller's return address
+/// (TR3): `jr ra` returns from the translation, and a tail callee's `jr ra`
+/// returns from it too, so either goes back to the caller whatever ra
+/// holds. `la ra, L; j f`, a saved ra written over, and a longjmp's `lw ra`
+/// from its buffer show here. A tail callee that writes ra before it reads
+/// it (the rest of a function, which reloads it from the frame) doesn't
+/// care what ra holds. A jump through another register holding ra on entry
+/// returns. `skip`: tail jumps that never return (`ReturnFromException`).
+/// Falling or calling into the next function shares the frame with it,
+/// and that is checked on its own; a `jr ra` in inlined code dispatches on
+/// ra, failing at run time.
+pub fn foreign_returns(g: &Graph, skip: &BTreeSet<u32>) -> ForeignReturns {
+    let mut regs = [Val::Other; 32];
+    regs[0] = Val::Const(0);
+    regs[29] = Val::Sp(0);
+    regs[31] = Val::Ra;
+    let entry = Frame { regs, words: BTreeMap::new() };
+    let join = |a: &Frame, b: &Frame| {
+        let mut out = a.clone();
+        for r in 0..32 {
+            out.regs[r] = join_val(a.regs[r], b.regs[r]);
+        }
+        for (k, &x) in &b.words {
+            out.words.insert(*k, a.words.get(k).map_or(Val::Top, |&y| join_val(x, y)));
+        }
+        for (k, x) in out.words.iter_mut() {
+            if !b.words.contains_key(k) {
+                *x = Val::Top;
+            }
+        }
+        out
+    };
+    let inlined_defs = g.nodes.iter().filter(|(n, _)| g.inlined(n.pc())).fold(0u64, |a, (_, d)| a | insn_defs(&d.insn));
+    let states = forward(g, &|n| o32_succs(g, n), |n, s| frame_step(g, n, s, inlined_defs), join, entry);
+    let mut out = ForeignReturns::default();
+    for (&n, st) in &states {
+        let Node::Slot(b) = n else { continue };
+        if g.tail_returns(n) {
+            continue;
+        }
+        let callee = |c: &Callee| match c {
+            Callee::Direct { addr, .. } => Some(*addr),
+            _ => None,
+        };
+        let tails: Vec<Option<u32>> = match &g.nodes[&n].transfer {
+            Transfer::Return => vec![None],
+            // `jr` through a register holding ra on entry (read before the
+            // slot runs) returns.
+            Transfer::Jump(Dest::Tail(Callee::Indirect { reg })) if st.regs[*reg as usize] == Val::Ra => Vec::new(),
+            Transfer::Jump(Dest::Tail(c)) if !skip.contains(&b) => vec![callee(c)],
+            Transfer::Cond { taken, fall } => [taken, fall]
+                .into_iter()
+                .filter_map(|d| match d {
+                    Dest::Tail(c) => Some(callee(c)),
+                    Dest::Local(_) => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if tails.is_empty() {
+            continue;
+        }
+        let ra = frame_step(g, n, st, inlined_defs).regs[31];
+        let back = matches!(ra, Val::Const(c) if g.inline_returns.contains(&c));
+        if matches!(g.nodes[&n].transfer, Transfer::Return) && (ra == Val::Top || back) {
+            out.guarded.insert(b);
+            continue;
+        }
+        let holds = match ra {
+            Val::Ra => continue,
+            Val::Const(c) => format!("ra holds 0x{c:08X}"),
+            Val::Other => "ra was loaded from memory it wasn't saved to".into(),
+            _ => "ra may not hold what it held on entry, or what was saved of it".into(),
+        };
+        out.wrong.extend(tails.into_iter().map(|t| (b, t, holds.clone())));
+    }
+    out
+}
+
+/// [`foreign_returns`]' findings.
+#[derive(Debug, Clone, Default)]
+pub struct ForeignReturns {
+    /// Returns and tail jumps where ra isn't the caller's return address:
+    /// (branch pc, the tail callee when it is a known function, what ra
+    /// holds).
+    pub wrong: Vec<(u32, Option<u32>, String)>,
+    /// `jr ra` where ra is the caller's on some paths and may not be on
+    /// others (a path that leaves without restoring it): it dispatches on
+    /// ra as an inlined callee's `jr ra` does, returning only when ra is
+    /// the caller's, and trapping at run time otherwise.
+    pub guarded: BTreeSet<u32>,
 }
 
 /// Successors for callee-saved registers read on entry: an inlined call is
@@ -159,13 +369,20 @@ fn forward<T: Copy + PartialEq>(
 /// the caller reads the registers it saved and set.
 fn o32_succs(g: &Graph, n: Node) -> Vec<Node> {
     match (n, &g.nodes[&n].transfer) {
-        (Node::Slot(b), Transfer::Jump(Dest::Local(_)))
-            if g.nodes[&Node::Normal(b)].insn.op == Op::Jal && g.inline_returns.contains(&(b + 8)) =>
-        {
-            vec![Node::Normal(b + 8)]
-        }
+        (Node::Slot(b), _) if inlined_call(g, n) => vec![Node::Normal(b + 8)],
         (_, Transfer::InlineReturn { .. }) => Vec::new(),
         _ => g.next(n),
+    }
+}
+
+/// The delay slot of a `jal` expanded in place: a jump into the callee,
+/// which returns past the slot.
+fn inlined_call(g: &Graph, n: Node) -> bool {
+    match (n, &g.nodes[&n].transfer) {
+        (Node::Slot(b), Transfer::Jump(Dest::Local(_))) => {
+            g.nodes[&Node::Normal(b)].insn.op == Op::Jal && g.inline_returns.contains(&(b + 8))
+        }
+        _ => false,
     }
 }
 
@@ -192,24 +409,24 @@ fn sites(g: &Graph, f: &mut Facts) {
         &|n| g.succs(n),
         |n, s| {
             let call = matches!(g.nodes[&n].transfer, Transfer::Call { .. } | Transfer::CondCall { .. }) || g.tail_returns(n);
-            s | insn_defs(&g.nodes[&n].insn) | if call { (1 << 2) | (1 << 3) } else { 0 }
+            *s | insn_defs(&g.nodes[&n].insn) | if call { (1 << 2) | (1 << 3) } else { 0 }
         },
-        |a, b| a | b,
+        |a, b| *a | *b,
         0u64,
     );
     // Callee-saved registers changed and not restored: a load into one the
     // function saves restores it.
     let saved = g.nodes.values().filter(|d| d.insn.op == Op::Sw).fold(0u64, |a, d| a | 1 << d.insn.rt) & S_REGS;
-    let restore = |n: Node, s: u64| {
+    let restore = |n: Node, &s: &u64| {
         let i = &g.nodes[&n].insn;
         let w = i.writes().map_or(0, |r| 1u64 << r) & S_REGS;
         if i.op.is_load() && w & saved != 0 { s & !w } else { s | w }
     };
-    let changed = forward(g, &|n| g.succs(n), restore, |a, b| a | b, 0u64);
+    let changed = forward(g, &|n| g.succs(n), restore, |a, b| *a | *b, 0u64);
     for (&n, d) in &g.nodes {
         f.defs |= insn_defs(&d.insn);
         if is_exit(g, n) {
-            f.s_changed |= changed.get(&n).map_or(0, |&s| restore(n, s));
+            f.s_changed |= changed.get(&n).map_or(0, |s| restore(n, s));
         }
         let target = match &d.transfer {
             Transfer::Call { callee: Callee::Direct { addr, .. }, .. }
@@ -386,10 +603,18 @@ fn use_def(g: &Graph, n: Node, args: bool) -> (u64, u64, u64) {
     // The transfer happens after the slot instruction.
     let uses_of = |c: &Callee| if args { call_uses(c) } else { 0 };
     let call_defs = (1 << 2) | (1 << 3) | (CALLER_SAVED & !(1 << 31));
+    // A tail callee returns through ra (out of inlined code, ra is
+    // dispatched on as the inlined `jr ra` would).
+    let tail_uses = |c: &Callee| uses_of(c) | if args && !g.tail_returns(n) { 1 << 31 } else { 0 };
     let (tu, td) = match &d.transfer {
         Transfer::Call { callee, .. } | Transfer::CondCall { callee, .. } => (uses_of(callee), call_defs),
-        Transfer::Jump(crate::graph::Dest::Tail(c)) | Transfer::FallOff(c) => {
-            (uses_of(c), if g.tail_returns(n) { call_defs } else { 0 })
+        Transfer::Jump(Dest::Tail(c)) | Transfer::FallOff(c) => (tail_uses(c), if g.tail_returns(n) { call_defs } else { 0 }),
+        Transfer::Cond { taken, fall } => {
+            let tails = [taken, fall].into_iter().filter_map(|d| match d {
+                Dest::Tail(c) => Some(tail_uses(c)),
+                Dest::Local(_) => None,
+            });
+            (tails.fold(0, |a, u| a | u), 0)
         }
         _ => (0, 0),
     };
@@ -431,6 +656,7 @@ fn liveness(g: &Graph, f: &mut Facts) {
     let succs: BTreeMap<Node, Vec<Node>> = nodes.iter().map(|&n| (n, g.succs(n))).collect();
     let at_entry = live_in(g, &nodes, &succs, true)[&Node::Normal(g.entry)];
     f.entry_reads = at_entry & !ENTRY_OK & ((1 << 34) - 2);
+    f.entry_ra = at_entry & (1 << 31) != 0;
     let o32: BTreeMap<Node, Vec<Node>> = nodes.iter().map(|&n| (n, o32_succs(g, n))).collect();
     f.entry_s_reads = live_in(g, &nodes, &o32, true)[&Node::Normal(g.entry)] & S_REGS;
     // After a call, only reads by instructions count: argument setup for a
