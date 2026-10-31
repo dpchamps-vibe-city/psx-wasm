@@ -128,21 +128,24 @@ mod tests {
         assert_eq!(m.mem.bytes(evcb, 16), [2, 0, 0, 0xF2, 0, 0x10, 0, 0, 2, 0, 0, 0, 0, 0x20, 0, 0]);
         ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
-        m.timers[2].write_mode(0x58, 0);
-        m.timers[2].target = 999;
-        m.reschedule_timer(2);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x02, [0xF200_0002, 999, 0x1001, 0])), 1);
+        assert_eq!(m.timers[2].mode, 0x58);
         // Masked, the kernel's handler doesn't see it.
         m.io = Some(Default::default());
         m.run_until(1000);
         take(&mut m);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
-        // StartRCnt(RCntCNT2) unmasks IRQ6: the kernel's root counter 2
-        // element, when the interrupt is taken, delivers the event and
-        // acknowledges it.
-        m.io_write(0x1F80_1074, 4, 1 << 6).unwrap();
+        // enable_timer_irq unmasks IRQ6, including the pending interrupt.
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x04, [0xF200_0002, 0, 0, 0])), 1);
+        take(&mut m);
+        assert_eq!(m.ev(h).unwrap().status, kernel::EV_READY);
+        ret(bios::call(&mut m, 0xB0, 0x20, [0xF200_0002, 0x0002, 0, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
         m.run_until(2000);
         take(&mut m);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x06, [2, 0, 0, 0])), 1);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x03, [2, 0, 0, 0])), 0);
         assert_eq!(m.io.as_ref().unwrap().irq.stat & 1 << 6, 0, "acknowledged");
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 0);
         // Interrupt-mode events queue their handler; RCntCNT3 once vblank
@@ -153,7 +156,7 @@ mod tests {
         take(&mut m);
         assert_eq!(m.vblanks, 1);
         assert!(m.calls.is_empty(), "vblank masked");
-        m.io_write(0x1F80_1074, 4, 1 << 6 | 1).unwrap();
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x04, [3, 0, 0, 0])), 0);
         m.run_until(m.clock.video.vblank_at(2));
         take(&mut m);
         assert_eq!(m.calls.pop_front().map(|c| c.addr), Some(0x8001_2340));
@@ -182,6 +185,20 @@ mod tests {
         assert_eq!(m.ev(h).unwrap().status, kernel::EV_UNUSED);
         // The slot is free for the next OpenEvent.
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x08, [0xF200_0002, 0x0002, 0x2000, 0])), h);
+    }
+
+    #[test]
+    fn kernel_memory_follows_the_event_blocks() {
+        let mut m = machine();
+        let a = ret(bios::call(&mut m, 0xB0, 0x00, [0x10, 0, 0, 0]));
+        assert_eq!(a, 0xA000_F9D4);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x00, [0x1000, 0, 0, 0])), 0, "too big");
+        ret(bios::call(&mut m, 0xB0, 0x01, [a, 0, 0, 0]));
+        assert_eq!(m.mem.r32(a - 4), 0x10 | 1);
+        assert_eq!(m.kernel.heap, (0, 0), "application heap untouched");
+        let mut m = machine();
+        m.lay_out_events(psxw_abi::kernel::MAX_EVENTS);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x00, [0x100, 0, 0, 0])), 0, "no wrap past kernel RAM");
     }
 
     #[test]

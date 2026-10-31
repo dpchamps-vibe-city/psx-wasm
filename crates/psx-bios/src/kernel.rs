@@ -16,6 +16,8 @@ pub const EV_ENABLED: u32 = 0x2000;
 pub const EV_READY: u32 = 0x4000;
 /// Event mode: call the handler from the interrupt.
 pub const EV_MODE_INTR: u32 = 0x1000;
+/// Event mode: no handler, the event becomes ready.
+pub const EV_MODE_NOINTR: u32 = 0x2000;
 pub const EV_HANDLE: u32 = 0xF100_0000;
 /// Default number of event control blocks (SYSTEM.CNF `EVENT=`).
 pub const EVENTS: usize = 16;
@@ -57,6 +59,8 @@ pub struct Kernel {
     /// handler calls it at each vblank when nonzero.
     pub pad_dest: u32,
     pub heap: (u32, u32),
+    /// The kernel's heap, set up on first allocation after the event blocks.
+    pub kheap: (u32, u32),
     /// Where `strtok`'s next fragment starts (0: none).
     pub strtok: u32,
     pub files: BTreeMap<u32, File>,
@@ -240,6 +244,34 @@ impl<S: Sdk> Machine<S> {
             }
         }
         calls
+    }
+
+    /// UnDeliverEvent: ready events of mode 2000h with this class and spec
+    /// are busy again (psx-spx).
+    pub(crate) fn undeliver_event(&mut self, class: u32, spec: u32) {
+        let n = self.evcb(EV_HANDLE).map_or(0, |_| self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE);
+        for i in 0..n {
+            let a = self.evcb_at(EV_HANDLE | i).expect("in range");
+            let e = self.read_ev(a);
+            if e.status == EV_READY && e.mode == EV_MODE_NOINTR && e.class == class && e.spec == spec {
+                self.mem.w32(a + 4, EV_ENABLED);
+            }
+        }
+    }
+
+    /// B0h:00h uses the space left after the kernel's control blocks, not
+    /// the application's InitHeap area. Our blocks have fixed addresses;
+    /// the event count determines how much of the remaining RAM is free.
+    pub fn kernel_heap(&mut self) -> (u32, u32) {
+        if self.kernel.kheap == (0, 0) {
+            self.evcb(EV_HANDLE);
+            let start = self.mem.r32(k::EVCB_ENTRY).checked_add(self.mem.r32(k::EVCB_ENTRY + 4));
+            if let Some(start) = start {
+                let size = 0xA001_0000u32.saturating_sub(start);
+                self.kernel.kheap = crate::libc::heap_init(&mut *self.mem, start, size);
+            }
+        }
+        self.kernel.kheap
     }
 }
 

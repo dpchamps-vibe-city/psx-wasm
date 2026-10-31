@@ -72,6 +72,13 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0xAC) => "_card_load",
         (0xA0, 0xAD) => "_card_auto",
         (0xA0, 0xAF) => "card_write_test",
+        (0xB0, 0x00) => "alloc_kernel_memory",
+        (0xB0, 0x01) => "free_kernel_memory",
+        (0xB0, 0x02) => "init_timer",
+        (0xB0, 0x03) => "get_timer",
+        (0xB0, 0x04) => "enable_timer_irq",
+        (0xB0, 0x05) => "disable_timer_irq",
+        (0xB0, 0x06) => "restart_timer",
         (0xB0, 0x07) => "DeliverEvent",
         (0xB0, 0x08) => "OpenEvent",
         (0xB0, 0x09) => "CloseEvent",
@@ -90,6 +97,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x17) => "ReturnFromException",
         (0xB0, 0x18) => "SetDefaultExitFromException",
         (0xB0, 0x19) => "SetCustomExitFromException",
+        (0xB0, 0x20) => "UnDeliverEvent",
         (0xB0, 0x32) => "open",
         (0xB0, 0x33) => "lseek",
         (0xB0, 0x34) => "read",
@@ -310,7 +318,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0x31) => Ok(libc::qsort(m, a)),
         (0xA0, 0x33) => r(libc::malloc(mem, m.kernel.heap, a[0])),
-        (0xA0, 0x34) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x34) | (0xB0, 0x01) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
         (0xA0, 0x35) => Ok(libc::lsearch(m, a)),
         (0xA0, 0x36) => Ok(libc::bsearch(m, a)),
         (0xA0, 0x37) => r(libc::calloc(mem, m.kernel.heap, a[0], a[1])),
@@ -344,7 +352,12 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0xAF) => r(m.card_write_test(a[0])),
 
-        // --- B0h: events, pads, files, cards -----------------------------
+        // --- B0h: kernel memory, timers, events, pads, files, cards -----
+        (0xB0, 0x00) => {
+            let heap = m.kernel_heap();
+            r(libc::malloc(&mut *m.mem, heap, a[0]))
+        }
+        (0xB0, 0x02..=0x06) => timer(m, func, a).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xB0, 0x07) => {
             m.deliver_event(a[0], a[1]);
             r(1)
@@ -418,6 +431,10 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x19) => {
             m.kernel.custom_exit = a[0];
             r(0)
+        }
+        (0xB0, 0x20) => {
+            m.undeliver_event(a[0], a[1]);
+            r(1)
         }
         (0xB0, 0x32) => {
             // OpenBIOS `psxopen`: a free descriptor first, then the device.
@@ -592,7 +609,6 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
             m.crit = true;
             Ok(was as u32)
         }
-        // ExitCriticalSection.
         // ExitCriticalSection: an interrupt left pending is taken.
         2 => {
             m.crit = false;
@@ -605,6 +621,44 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
         3 => Ok(1),
         0 => Ok(0),
         n => Err(format!("syscall {n} not implemented")),
+    }
+}
+
+/// B0h:02h-06h over the shared timer core and IRQ mask. Unlike the SDK's
+/// SetRCnt, the BIOS uses the same mode calculation for all three timers
+/// (psx-spx "BIOS Timer Functions"). Counter 3 selects vblank's IRQ only.
+fn timer<S: Sdk>(m: &mut Machine<S>, func: u32, a: [u32; 4]) -> Result<u32, String> {
+    let t = (a[0] & 0xFFFF) as usize;
+    match func {
+        0x02 if t < 3 => {
+            let mut mode = if a[2] & 0x10 == 0 { 0x48 } else { 0x49 };
+            if a[2] & 1 == 0 {
+                mode |= 0x100;
+            }
+            if a[2] & 0x1000 != 0 {
+                mode |= 0x10;
+            }
+            let now = m.timer_now(t);
+            m.timers[t].target = a[1] as u16;
+            m.timers[t].write_mode(mode, now);
+            m.reschedule_timer(t);
+            Ok(1)
+        }
+        0x03 if t < 3 => Ok(m.timers[t].value(t, m.clock.video, m.timer_now(t)) as u32),
+        0x04 | 0x05 => {
+            let irq = [0x10, 0x20, 0x40, 0x01].get(t).copied().unwrap_or(0);
+            let mask = m.reg_read(psx_devices::irq::I_MASK, 4)?;
+            m.reg_write(psx_devices::irq::I_MASK, 4, if func == 0x04 { mask | irq } else { mask & !irq })?;
+            m.release_irq();
+            Ok((func == 0x05 || t < 3) as u32)
+        }
+        0x06 if t < 3 => {
+            let (video, now) = (m.clock.video, m.timer_now(t));
+            m.timers[t].write_count(t, video, now, 0);
+            m.reschedule_timer(t);
+            Ok(1)
+        }
+        _ => Ok(0),
     }
 }
 
