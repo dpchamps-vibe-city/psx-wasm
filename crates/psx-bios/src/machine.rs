@@ -388,8 +388,12 @@ impl<S: Sdk> Machine<S> {
                 self.clock.schedule(next, Event::Vblank);
                 S::on_vblank(self);
                 self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
-                // The kernel's vblank handler delivers RCntCNT3 events.
-                self.deliver_event(0xF200_0003, 0x0002);
+                // The kernel's vblank handler delivers RCntCNT3 events when
+                // vblank is unmasked (StartRCnt(RCntCNT3)), as its root
+                // counter handler does for the others.
+                if self.io.as_ref().is_some_and(|io| io.irq.mask & 1 << psx_devices::irq::VBLANK != 0) {
+                    self.deliver_event(0xF200_0003, 0x0002);
+                }
                 self.raise_irq(psx_devices::irq::VBLANK);
                 self.gpu_vblank();
                 self.card_vblank();
