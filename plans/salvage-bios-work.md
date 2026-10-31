@@ -147,7 +147,7 @@ back to main.
 
 ### 2. Salvage the useful BIOS changes
 
-- [ ] Recover C-library and allocation additions and existing-API bug fixes.
+- [x] Recover C-library and allocation additions and existing-API bug fixes.
 - [ ] Recover event, timer, pad and card API improvements. Retain the existing
   thread implementation; do not replace it under the heading "implement threads".
 - [ ] Recover guest-visible BIOS tables, events, handler chains and file/device
@@ -392,8 +392,43 @@ These are independent source contracts. Shared dispatcher conflicts are resolved
 by the parent at integration; workers do not edit one another's trees. Further
 Qwen work waits for the scout to finish.
 
+Wave `cc86f2b4-4a1b-478d-9efd-3616d1d8452e`: all three DeepSeek writers have
+completed and their source diffs were reviewed and integrated. Qwen's SDK scout
+also completed. Detailed handoffs are in this session's subagent artifacts,
+under `outputs/cc86f2b4-4a1b-478d-9efd-3616d1d8452e/salvage/` (`cc.md`,
+`lift.md`, `libc.md`, `sdk-state.md`). Its SDK dispositions are research leads,
+not accepted wholesale: phase 6/7 do touch these files, contrary to the report's
+opening assertion. Inspect original commit boundaries, not current whole files.
+
+### Second delegation wave
+
+| Lane | Model / authority | Owned contract | Worktree / branch | Gate |
+|---|---|---|---|---|
+| Division | DeepSeek / writer | Source-placement division normalisation through linker imports | `../psx-wasm-salvage-lanes/division`, `salvage/division` | C and linker integration tests |
+| SDK IRQ state | DeepSeek / writer | RAM-visible libetc state and native IRQ callback binding, including required SDK consumers | `../psx-wasm-salvage-lanes/sdk-irq`, `salvage/sdk-irq` | SDK tests and build check |
+| BIOS GPU | DeepSeek / writer | Added BIOS GPU entry points over the existing native GPU core | `../psx-wasm-salvage-lanes/bios-gpu`, `salvage/bios-gpu` | BIOS integration test and SDK checks |
+| Library review | Qwen, low / read-only | Recovered BIOS libc/heap/callback correctness | recovery checkout, read-only pinned source | actionable findings only |
+
+Parent owns guest-visible kernel chains/tables and subsequent runtime control
+flow. The IRQ worker does not change BIOS kernel/runtime files; the GPU worker
+does not change SDK IRQ state. Resolve cross-lane hunks only during integration.
+
 ## Progress log
 
+- 2026-10-31: integrated the reviewed DeepSeek lanes: compiler lowering
+  (`864002e`..`030497a`), lifter correctness (`052b01f`..`f381c11`) and native
+  BIOS libc/heap/printf (`8fcc9d4`). No map/timing or TR2/TR3 rules recovered.
+  Parent recovered narrow-argument/variadic marshalling, unnamed writable-data
+  rejection, signed-char propagation and constant indirect-call lowering (the
+  last adapted without the upstream timing-dependent bulk-memory machinery).
+- 2026-10-31: recovered ResetEntryInt/event/card/descriptor corrections,
+  SYSTEM.CNF stack selection, native PAD_init2/PAD_dr and RAM-backed event
+  blocks with reporting (`435d8e8`). Card/pad transports remain native. Targeted
+  gates passed at integration points: BIOS 18, C lowering 18, lifter 17, linker
+  9, link-pass integration 4, modkit 8 tests; runtime checks pass. The existing
+  Docker/debug threaded-DWARF integration test remains explicitly ignored.
+  Workspace/game gates have not run. Source-placement division correction and
+  SDK-state salvage remain pending, as do the later BIOS services.
 - 2026-10-31: delegation tools restored. Confirmed the requested DeepSeek model
   identifier and prepared isolated lifter, C-lowering and BIOS-library lanes.
   Parent retains architectural and integration authority.
