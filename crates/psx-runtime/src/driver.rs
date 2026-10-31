@@ -16,24 +16,32 @@ pub trait Invoke {
     fn invoke_irq(&mut self, call: GuestCall) -> u64 {
         self.invoke(call)
     }
-    /// The disc wrote `len` bytes at `addr` (mods' overlay data patches).
+    /// The disc wrote `len` bytes at `addr` (overlay residency, D69, and
+    /// mods' overlay data patches).
     fn loaded(&mut self, _addr: u32, _len: u32) {}
     /// Service a host-requested call, with no machine borrow held and
     /// outside interrupt handlers and critical sections.
     fn host_calls(&mut self) {}
 }
 
-/// Run queued callbacks, unless one is already running (no nesting:
-/// interrupts are disabled in a handler, as on hardware). Then service a
-/// pending host call, with the machine unborrowed.
-pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
-    // What the disc wrote first, so no guest code sees an overlay before
-    // its mods' patches (even in a handler).
+/// Tell the guest what the disc wrote since it last heard, before any of
+/// its code runs again: which overlay code is resident is decided from
+/// these writes (D69), and mods' overlay data patches apply with them.
+pub fn deliver_loaded<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
     let loaded = std::mem::take(&mut rt.borrow_mut().loaded);
     for (addr, len) in loaded {
         inv.loaded(addr, len);
     }
+}
+
+/// Run queued callbacks, unless one is already running (no nesting:
+/// interrupts are disabled in a handler, as on hardware). Then service a
+/// pending host call, with the machine unborrowed.
+pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
     loop {
+        // What the disc wrote first, so no guest code sees an overlay
+        // before its residency and its mods' patches (even in a handler).
+        deliver_loaded(rt, inv);
         let (step, exception) = {
             let mut m = rt.borrow_mut();
             if m.in_irq || m.crit {
@@ -114,7 +122,9 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
             Flow::Return(v) => {
                 // An adapter whose original makes no runtime call here
                 // returns without a safepoint (`Machine::quiet`, D63).
-                if !std::mem::take(&mut rt.borrow_mut().quiet) {
+                if std::mem::take(&mut rt.borrow_mut().quiet) {
+                    deliver_loaded(rt, inv);
+                } else {
                     drain(rt, inv);
                 }
                 return v;
@@ -143,6 +153,7 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
                 flow = then(&mut m);
             }
             Flow::Call { call, then } => {
+                deliver_loaded(rt, inv);
                 let v = inv.invoke(call);
                 let mut m = rt.borrow_mut();
                 flow = then(&mut m, v);

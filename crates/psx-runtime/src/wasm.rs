@@ -662,6 +662,8 @@ pub extern "C" fn io_access(off: u32, kind: u32) {
         fatal(9, &e)
     }
     shadow_note(addr, size);
+    // A CD DMA wrote RAM: the guest hears of it before it runs on.
+    with(|rt| driver::deliver_loaded(&rt.m, &mut Guest));
 }
 
 /// A mod's `psxmod_log(fmt, ...)`: clang's va-buffer holds the arguments,
