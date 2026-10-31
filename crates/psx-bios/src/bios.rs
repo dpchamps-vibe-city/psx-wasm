@@ -66,6 +66,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x38) => "realloc",
         (0xA0, 0x39) => "InitHeap",
         (0xA0, 0x3F) => "printf",
+        (0xA0, 0x40) => "SystemErrorUnresolvedException",
         (0xA0, 0x41) => "LoadTest",
         (0xA0, 0x42) => "Load",
         (0xA0, 0x43) => "Exec",
@@ -269,8 +270,8 @@ pub fn support(table: u32, func: u32) -> Support {
         return Support::Unsupported;
     }
     match (table, func) {
-        // psx-spx: they use the absent COP1, so the console locks up.
-        (0xA0, 0x0B) | (0xA0, 0x32) | (0xA0, 0xA1) => Support::Fatal,
+        // psx-spx: absent COP1 or an explicit SystemError locks up.
+        (0xA0, 0x0B) | (0xA0, 0x32) | (0xA0, 0x40) | (0xA0, 0xA1) => Support::Fatal,
         // No cache or dummy device to affect; retail returns zero.
         (0xA0, 0x44) | (0xA0, 0x57) | (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => Support::Noop,
         // Recognised, but the required capability is not available here.
@@ -653,6 +654,9 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         // SystemError, and the pinned OpenBIOS table does not implement it.
         // Those references do not establish the retail behaviour.
         (0xA0, 0x52) => Err(format!("{label}: GetSysSp/SystemError conflict is unresolved; retail behaviour not verified")),
+        // Like A(A1h), retail loops forever. Use the existing fatal BIOS
+        // error path rather than returning or spinning the host.
+        (0xA0, 0x40) => Err(format!("{label}: unresolved exception (the console locks up)")),
         (0xA0, 0xA1) => Err(format!("{label}: SystemError({:#x}, {:#x})", a[0], a[1])),
         (0xA0, 0x9C) => {
             let (events, tcbs, top) = (a[0], a[1], a[2]);

@@ -27,7 +27,9 @@ retain their provenance; the active recovery status is recorded separately.
   later; no control-flow design or implementation is pending approval now.
 - **Other control-flow gaps:** build-known Exec/LoadExec, warm boot, C06 hook
   chaining, remaining exception context and callback/IRQ thread switches are
-  still open. Do not replace existing Asyncify threading or infer approval for
+  still open. A(40h) now has its documented fatal handling and patchable table
+  dispatch, with focused tests passing; BREAK event/exception entry is still
+  count-only. Do not replace existing Asyncify threading or infer approval for
   a runtime redesign from the recovery work.
 - **Partial software services:** card helpers A7..AA/AE, built-in console input
   and circular helpers, CD internal calls/event waits/filesystem details, and

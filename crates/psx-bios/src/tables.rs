@@ -133,6 +133,27 @@ mod tests {
         assert_eq!(stand_in_fn(STAND_INS + 0x900), None);
         assert_eq!(m.mem.r16(k::EXCEPTION_VECTOR + 6), 0x275A);
         assert_eq!(m.mem.r32(k::RAM_SIZE), 2);
+
+        // A40 is a documented fatal service, not a missing entry. A table
+        // patch can still replace it; a saved native pointer stays fatal.
+        assert_eq!(bios::name(0xA0, 0x40), "SystemErrorUnresolvedException");
+        assert!(bios::implemented(0xA0, 0x40));
+        assert_eq!(bios::support(0xA0, 0x40), bios::Support::Fatal);
+        let at = entry(0xA0, 0x40).unwrap();
+        let native = m.mem.r32(at);
+        assert!(matches!(bios::dispatch(&mut m, 0xA0, 0x40, [0; 4]), Err(e) if e.contains("SystemErrorUnresolvedException: unresolved exception")));
+        m.mem.w32(at, 0x8002_0040);
+        match bios::dispatch(&mut m, 0xA0, 0x40, [0; 4]).unwrap() {
+            Flow::Call { call, then } => {
+                assert_eq!(call, GuestCall { addr: 0x8002_0040, args: [0; 4] });
+                assert!(matches!(then(&mut m, 42), Flow::Return(42)));
+            }
+            _ => panic!("not the patched fatal service"),
+        }
+        let (t, f) = stand_in_fn(native).unwrap();
+        assert!(matches!(bios::call(&mut m, t, f, [0; 4]), Err(e) if e.contains("SystemErrorUnresolvedException: unresolved exception")));
+        m.mem.w32(at, native);
+
         m.mem.write(0x8001_0000, b"abc\0");
         assert_eq!(ret(bios::dispatch(&mut m, 0xA0, 0x1B, [0x8001_0000, 0, 0, 0])), 3);
         assert_eq!(ret(bios::dispatch(&mut m, 0xC0, 0x80 + 0x57, [0; 4])), k::B0_TABLE);

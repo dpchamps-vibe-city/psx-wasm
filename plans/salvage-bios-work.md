@@ -134,7 +134,7 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 | Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
 | Card, console and CD | Partial; continue independently verifiable software contracts using existing backends. Do not invent missing reference behaviour. |
-| Other executable, exception and thread gaps | Still open; do not assume deferring longjmp implements these or authorises a runtime redesign. |
+| Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
 | Validation | Native source `bbdeb39` passes focused tests, wasm32 check, builds and four replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates pass at `9624526`. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
@@ -143,7 +143,7 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD-directory/search `bbdeb39` build/replays pass; browser recovery reviewed/integrated as `12c5fbb`, copy-error cleanup `8e5badf`, focused browser gate passes | Owns plan, integration and final acceptance |
+| Parent | `salvage/bios`, writer | Browser gates recorded in `d20fcd9`; independent A40 fatal-service follow-up passes focused BIOS/runtime tests and wasm32 check. Builds/game browser gates still cover pre-A40 native source `bbdeb39`. | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -321,7 +321,9 @@ handoff's missing-call list.
   file without a separately approved design.
 - [ ] **Exception and hook paths.** Normal IRQ dispatch and recognised
   `ReturnFromException` already work. C(06h) chaining is rejected; `break` merely
-  logs rather than delivering the unresolved-exception event/error. Native
+  logs rather than delivering the unresolved-exception event/error. A(40h)
+  itself now has its documented fatal handling and patchable table dispatch;
+  this does not implement BREAK's exception entry/return path. Native
   kernel-handler pointers are now callable, and libapi/libetc/libpad/libgpu and
   libmcx calls honor BIOS patches, including libmcx's vblank handler. Complete
   the remaining exception paths through existing driver, guest-call and lowering
@@ -1261,6 +1263,36 @@ The pinned browser image was reused. These gates refresh the broader BTN
 browser coverage beyond ABI 17, but do not provide missing GPU-oracle goldens,
 BTN mod inputs, BOF4 browser coverage, save/reload certification or green full
 CI. No source/runtime/ABI changes were needed for this validation batch.
+
+### A(40h) fatal service and BREAK contract review
+
+After the browser gate, parent implemented the independently specified
+A(40h) `SystemErrorUnresolvedException`: its default entry uses the same fatal
+BIOS error path as A(A1h), rather than returning or spinning the host. Coverage
+now names/classifies it as `Fatal`, not missing/`Unsupported`. The existing
+BIOS table integration test checks the native error, guest-patched call/result,
+and saved native pointer remaining fatal. **BIOS 51 / runtime 8 tests and
+wasm32 runtime check pass** (`a40-integrated-tests.log` in session scratch).
+No runtime import, ABI, event scheduler or compiler change. Existing builds and
+browser/game gates remain at their stated pre-A40 source checkpoints; no fresh
+full build/CI or BREAK integration test is claimed for this small service change.
+
+Read-only DeepSeek scout `6c29956f-b4a7-44ce-9e51-61b6a5c3ba62` completed;
+parent read its full `salvage/break-contract.md` report and independently checked
+[psx-spx's BIOS contract](https://psx-spx.consoledev.net/kernelbios/), runtime
+flow/exception handling, and linker division helpers. BREAK must deliver
+`F0000010h/1000h` then call A40, not the unknown-syscall event `4000h`.
+The proposed plain `deliver_event_now`/`driver::run` composition does not
+establish exception context, RFE unwinding or custom-exit/return behavior, so
+it was not implemented. BREAK remains count-only and visibly unfinished.
+
+Parent **rejected** the report's claimed need to distinguish compiler division
+checks from explicit BREAK: those helpers deliberately reproduce the original
+GCC BREAK instructions. The differential harness's returning callout does not
+establish a separate production exception policy. No origin discriminator,
+new import, or speculative patched-return termination policy was added.
+The general longjmp/ioabort deferral is unchanged; this review neither designs
+that work nor declares all exception work dependent on it. No child remains active.
 
 ## Progress log
 
