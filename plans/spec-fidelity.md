@@ -375,7 +375,7 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    `GetB0Table`/`GetC0Table` return them; the vectors and kernel variables
    where psx-spx and OpenBIOS put them. A game calling through a table, or
    patching an entry, then works.
-   Done `4ec0ec4` (agent): each entry is a stand-in in ROM space (BFC0A000h + table base + 4·function); the runtime's `bios` export reads the entry, a stand-in runs the Rust BIOS, anything else is called as guest code. Vectors, dispatchers, the garbage area, the exception vector (retail opcodes), RAM-size variables and the BOOT argument laid out; `GetB0Table`/`GetC0Table` return 874h/674h (psx-spx; OpenBIOS returns its own). The layout is in D68. A guest calling a stand-in through a function pointer reaches its thunk since `THUNK` (ABI 15; see Findings); the Rust BIOS's own internal calls bypass the tables. SDK adapters' BIOS calls go through them since `782a6c3`; a patched entry fails there, naming it, since adapters call the BIOS synchronously.
+   Done `4ec0ec4` (agent): each entry is a stand-in in ROM space (BFC0A000h + table base + 4·function); the runtime's `bios` export reads the entry, a stand-in runs the Rust BIOS, anything else is called as guest code. Vectors, dispatchers, the garbage area, the exception vector (retail opcodes), RAM-size variables and the BOOT argument laid out; `GetB0Table`/`GetC0Table` return 874h/674h (psx-spx; OpenBIOS returns its own). The layout is in D68. A guest calling a stand-in through a function pointer reaches its thunk since `77ee6fd` (ABI 15; see Findings); the Rust BIOS's own internal calls bypass the tables. SDK adapters' BIOS calls go through them since `782a6c3`; a patched entry fails there, naming it, since adapters call the BIOS synchronously.
 3. [x] **BIOS8. Event control blocks in kernel RAM**, through the table
    of tables, sized by `SYSTEM.CNF` `EVENT=` (`psx-bios/src/kernel.rs`).
    Done `5e52ad2`: after the TCBs (`psxw_abi::kernel::EVCBS`), through
@@ -736,7 +736,7 @@ locals, or static translation.
   switch threads; the boot's disc work (CdlInit, path table, executable)
   is still the runtime's through the host.
 - **A stand-in called through a pointer** (phase 3 task 2; done
-  2026-10-31, `THUNK`). Phase 6's `map_code` gave ROM space no code, and
+  2026-10-31, `77ee6fd`). Phase 6's `map_code` gave ROM space no code, and
   `untranslated` carries no arguments. Instead of widening `untranslated`,
   each stand-in has a dispatch-table slot at the top of `SYNTHETIC_CODE`
   (`BIOS_THUNKS`) whose thunk calls `psx.bios` with the stand-in's
