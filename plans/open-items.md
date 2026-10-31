@@ -345,6 +345,12 @@ after a resume, statement rows, the Docker builder.
   Detection doesn't cover a `void` function reached only by pointer whose
   v0 at return is a temporary rather than a call's result. *From:*
   bug-follows §1; follow-up tasks.
+- **Lifted SDK asm that reads temporaries on entry:** `_spu_pitch2note`
+  (t1/t2), `func_80037470` and `func_80037494` (t0–t2), `func_8003A2A4`
+  (t3). They aren't inlined, so their callers' values don't reach them.
+  Audit each. M13 expects more at bof4's scale. *From:* bug-follows §4;
+  follow-up tasks; M13 Risks. (Spec-fidelity's TR2 closed it and was
+  unwound on 2026-10-31.)
 
 The 23 bugs the 2026-10-30 shortcuts audit found are tasks B1–B23 in
 [`spec-fidelity.md`](spec-fidelity.md), phase 1.
