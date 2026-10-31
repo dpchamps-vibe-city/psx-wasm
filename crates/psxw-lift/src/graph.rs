@@ -342,10 +342,10 @@ impl Explorer<'_> {
         }
     }
 
-    /// Inside this function's extent, past its entry: where hand-written
-    /// code keeps a jump table among its instructions.
-    fn in_own_text(&self, a: u32) -> bool {
-        a > self.func.addr && a < self.func.end
+    /// The extent the code at `pc` comes from: this function's, or that of
+    /// the inlined function it was brought in with.
+    fn region_of(&self, g: &Graph, pc: u32) -> (u32, u32) {
+        g.regions.iter().find(|(s, e, _)| pc >= *s && pc < *e).map_or((self.func.addr, self.func.end), |&(s, e, _)| (s, e))
     }
 
     fn in_extent(&self, g: &Graph, a: u32) -> bool {
@@ -524,7 +524,7 @@ impl Explorer<'_> {
                 }
             }
             Op::Jr if insn.rs == 31 => Transfer::Return,
-            Op::Jr => match self.window(pc, insn.rs) {
+            Op::Jr => match self.window(g, pc, insn.rs) {
                 Window::Const(c) if self.program.locate(&self.func.container, c).is_some() => {
                     g.const_targets.insert(pc, (insn.rs, c));
                     match self.program.locate(&self.func.container, c) {
@@ -588,7 +588,7 @@ impl Explorer<'_> {
                 Window::Unknown | Window::Const(_) => Transfer::Jump(Dest::Tail(Callee::Indirect { reg: insn.rs })),
             },
             Op::Jalr => {
-                let callee = match self.window(pc, insn.rs) {
+                let callee = match self.window(g, pc, insn.rs) {
                     Window::Const(c) if self.program.locate(&self.func.container, c).is_some() => {
                         g.const_targets.insert(pc, (insn.rs, c));
                         self.callee(g, pc, c, Source::CallTarget)?
@@ -609,12 +609,16 @@ impl Explorer<'_> {
     /// sltiu t, idx, N ; beqz t, default ; sll s, idx, 2
     /// lui at, %hi(T)  ; addu at, at, s  ; lw r, %lo(T)(at) ; jr r
     /// ```
-    fn window(&self, pc: u32, reg: u8) -> Window {
+    /// It reads back over the region `pc` lies in, an inlined function's
+    /// own and not the caller's, where hand-written code keeps a table.
+    fn window(&self, g: &Graph, pc: u32, reg: u8) -> Window {
         const SPAN: u32 = 160;
         if self.not_const.contains(&pc) {
             return Window::Unknown;
         }
-        let start = pc.saturating_sub(4 * SPAN).max(self.func.addr);
+        let (lo, hi) = self.region_of(g, pc);
+        let in_own_text = |a: u32| a > lo && a < hi;
+        let start = pc.saturating_sub(4 * SPAN).max(lo);
         let mut sym = SymState::new();
         let mut a = start;
         while a < pc {
@@ -630,10 +634,10 @@ impl Explorer<'_> {
                 match terms.as_slice() {
                     [Sym::Shl(idx, 2)] => match sym.bound_for(idx) {
                         Some(len) => Window::Table { base, len },
-                        None if self.in_own_text(base) => Window::Embedded(base),
+                        None if in_own_text(base) => Window::Embedded(base),
                         None => Window::Unbounded(base),
                     },
-                    [_] if self.in_own_text(base) => Window::Embedded(base),
+                    [_] if in_own_text(base) => Window::Embedded(base),
                     _ => Window::Unknown,
                 }
             }
