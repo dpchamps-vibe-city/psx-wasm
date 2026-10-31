@@ -77,6 +77,9 @@ pub struct PairReport {
     /// Seeds where both sides ran out of fuel.
     #[serde(skip_serializing_if = "is_zero")]
     pub both_fuel: u32,
+    /// Seeds where both sides took a bus error.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub both_fault: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -274,6 +277,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                     detail: Some(reason),
                     seed: None,
                     both_fuel: 0,
+                    both_fault: 0,
                 });
                 false
             }
@@ -383,6 +387,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                         detail: Some(format!("{e:#}")),
                         seed: None,
                         both_fuel: 0,
+                        both_fault: 0,
                     })
                     .collect()
             })
@@ -583,6 +588,7 @@ fn run_pair(
         detail: None,
         seed: None,
         both_fuel: 0,
+        both_fault: 0,
     };
     for k in 0..seeds {
         let seed = runner::mix(base_seed ^ ((p.addr as u64) << 16) ^ k as u64);
@@ -624,6 +630,7 @@ fn run_pair(
         match verdict {
             Ok(Agree::Same) => {}
             Ok(Agree::BothFuel) => report.both_fuel += 1,
+            Ok(Agree::BothFault) => report.both_fault += 1,
             Err((verdict, detail)) => {
                 report.verdict = verdict.into();
                 report.detail = Some(detail);
@@ -672,6 +679,7 @@ fn explain(h: &Harness, p: &Pair, args: &[u32; 4], stack: &[u32; 8], c: &Run, t:
 enum Agree {
     Same,
     BothFuel,
+    BothFault,
 }
 
 fn compare(
@@ -701,6 +709,10 @@ fn compare(
             }
             return Ok(Agree::BothFuel);
         }
+        // Both sides take a bus error (D70): the console's exception. What
+        // each did before it isn't compared: no compiler keeps memory
+        // accesses in order around one that faults.
+        (Outcome::Trap(a), Outcome::Trap(b)) if a == runner::BUS_ERROR && b == runner::BUS_ERROR => return Ok(Agree::BothFault),
         (Outcome::Fuel, _) | (_, Outcome::Fuel) => {
             return Err(("fuel", format!("C {:?} vs translated {:?}", c.outcome, t.outcome)));
         }
