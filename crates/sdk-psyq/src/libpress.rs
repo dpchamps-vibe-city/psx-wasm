@@ -15,14 +15,15 @@
 //!
 //! **The hardware.** The MDEC is the bus's core (`psx_devices::mdec`),
 //! driven through its decode function ([`Mdec::input`], [`Mdec::output`]),
-//! the one the device's DMA0 and DMA1 use, without the register protocol:
-//! `DecDCTin`'s command and parameter words go in as the DMA0 transfer
-//! libpress programs would deliver them (blocks of 32 words, at least
-//! one), and `DecDCTout`'s words come out as DMA1 would take them. DMA1
-//! waits, as its request line does on the device, while a decode is still
-//! taking input and hasn't produced the words asked for; `DecDCTin`, a
-//! reset or a timeout lets it go. The channels' completions are the DMA
-//! controller's ([`psx_bios::Machine::dma_done_held`]): DICR's flags and
+//! the one the device's DMA0 and DMA1 use. The channels are started
+//! through the shared DMA controller's registers as libpress writes them
+//! (MADR, BCR, CHCR; psyq-decomp's `func_00000428`/`func_000004B8`), and
+//! the controller moves the words: `DecDCTin`'s command and parameters in
+//! by DMA0, `DecDCTout`'s words out by DMA1, which waits, as its request
+//! line does, while a decode is still taking input and hasn't produced the
+//! words asked for; `DecDCTin`, a reset or a timeout lets it go. DMA1's
+//! busy bit is CHCR1's, as `DecDCToutSync` polls it. The channels'
+//! completions are held ([`psx_bios::Machine::dma_start_held`]): DICR's flags and
 //! IRQ3, so the callbacks `DecDCTinCallback`/`DecDCToutCallback` set run
 //! through libetc's DMA handler (its adapters' or its own). IRQ3 is held
 //! until the adapter returns, as one libpress's register write raises is
@@ -30,8 +31,7 @@
 //! player goes on decoding the next frame's run-length codes after
 //! `DecDCTout`, and the callbacks that load each slice come when that work
 //! reaches a safepoint, natively as on the device. DPCR gets libpress's
-//! enables. CHCR0 and CHCR1 are left alone: DMA1's busy bit is
-//! [`Press::out`], which only libpress's own functions read.
+//! enables.
 //!
 //! **Waits spin like libpress's loops** (the MDEC taking input, DMA1
 //! running): a safepoint quantum per thousand iterations, interrupts
@@ -109,6 +109,8 @@ const MADR0: u32 = 0x1F80_1080;
 const BCR0: u32 = 0x1F80_1084;
 const MADR1: u32 = 0x1F80_1090;
 const BCR1: u32 = 0x1F80_1094;
+const CHCR0: u32 = 0x1F80_1088;
+const CHCR1: u32 = 0x1F80_1098;
 /// The MDEC's control words libpress writes: reset, then both DMA
 /// requests on.
 const RESET: u32 = 0x8000_0000;
@@ -133,9 +135,6 @@ pub struct Obj {
 #[derive(Debug, Default)]
 pub struct Press {
     pub obj: Option<Obj>,
-    /// DMA1, started by `DecDCTout` and not done: where its words go, and
-    /// how many (CHCR1's busy bit on the device).
-    pub out: Option<(u32, u32)>,
     /// The phase of libpress's wait loops within a safepoint quantum.
     pub phase: u32,
 }
@@ -183,34 +182,12 @@ fn fail(e: String) -> Flow<Psyq> {
 
 // --- DMA1 and the resets -----------------------------------------------------
 
-/// DMA1 as the controller runs it: a transfer `DecDCTout` started goes
-/// once the MDEC isn't holding it back (a decode still taking input that
-/// hasn't produced the words asked for), its words into RAM, then the
-/// channel's completion. What the device does after every MDEC write.
+/// The shared controller runs what's ready, each completion held (D64):
+/// DMA1, which `DecDCTout` started, goes once the MDEC isn't holding it
+/// back (a decode still taking input that hasn't produced the words asked
+/// for). What the device does after every MDEC write.
 fn pump(m: &mut M) -> std::result::Result<(), String> {
-    let Some((addr, n)) = m.sdk.press.out else { return Ok(()) };
-    let md = mdec(m)?;
-    if md.busy() && md.available() < n as usize {
-        return Ok(());
-    }
-    let words = md.output(n as usize);
-    m.sdk.press.out = None;
-    let mut a = addr & 0x1F_FFFC;
-    for w in words {
-        m.mem.w32(a, w);
-        a = a.wrapping_add(4) & 0x1F_FFFC;
-    }
-    finished(m, MADR1, BCR1, a)?;
-    m.dma_done_held(1);
-    Ok(())
-}
-
-/// A block transfer's end on the channel at `madr`/`bcr`: the address past
-/// its last word, no blocks left (the controller's sync mode 1).
-fn finished(m: &mut M, madr: u32, bcr: u32, end: u32) -> std::result::Result<(), String> {
-    set_reg(m, madr, 4, end)?;
-    let b = reg(m, bcr, 4)?;
-    set_reg(m, bcr, 4, b & 0xFFFF)
+    m.run_dma_held()
 }
 
 /// DPCR with DMA0 and DMA1 on, as libpress sets it before a transfer.
@@ -226,15 +203,10 @@ fn enable(m: &mut M) -> std::result::Result<(), String> {
 fn stop(m: &mut M) -> std::result::Result<(), String> {
     mdec(m)?.control(RESET);
     pump(m)?;
-    m.sdk.press.out = None;
+    set_reg(m, CHCR0, 4, 0)?;
+    set_reg(m, CHCR1, 4, 0)?;
     mdec(m)?.control(REQUESTS);
     pump(m)
-}
-
-/// DMA blocks of 32 words, as libpress counts them into BCR: `n` words'
-/// worth, at least one block (what the controller makes of zero blocks).
-fn blocks(n: u32) -> u32 {
-    32 * ((n >> 5) & 0xFFFF).max(1)
 }
 
 // --- Waits -------------------------------------------------------------------
@@ -250,10 +222,10 @@ enum Busy {
     Out,
 }
 
-fn busy(m: &M, b: Busy) -> bool {
+fn busy(m: &mut M, b: Busy) -> bool {
     match b {
         Busy::In => m.io.as_ref().is_some_and(|io| io.mdec.command_busy()),
-        Busy::Out => m.sdk.press.out.is_some(),
+        Busy::Out => reg(m, CHCR1, 4).is_ok_and(|c| c & psx_devices::dma::CHCR_BUSY != 0),
     }
 }
 
@@ -321,13 +293,9 @@ fn send(m: &mut M, o: Obj, p: u32, n: u32, k: K) -> Flow<Psyq> {
                 let cmd = m.mem.r32(p);
                 mdec(m)?.input(&[cmd]);
                 pump(m)?;
-                let from = p.wrapping_add(4) & 0x1F_FFFC;
+                set_reg(m, MADR0, 4, p.wrapping_add(4) & 0x00FF_FFFF)?;
                 set_reg(m, BCR0, 4, (n >> 5) << 16 | 0x20)?;
-                let words: Vec<u32> = (0..blocks(n)).map(|i| m.mem.r32(from.wrapping_add(4 * i) & 0x1F_FFFC)).collect();
-                mdec(m)?.input(&words);
-                finished(m, MADR0, BCR0, from.wrapping_add(4 * blocks(n)) & 0x1F_FFFC)?;
-                m.dma_done_held(0);
-                pump(m)
+                m.dma_start_held(0, 0x0100_0201)
             })();
             match r {
                 Ok(()) => {
@@ -419,10 +387,10 @@ fn dct_out(m: &mut M, a: [u32; 4]) -> Result {
             let r = (|| -> std::result::Result<(), String> {
                 enable(m)?;
                 pump(m)?;
+                set_reg(m, CHCR1, 4, 0)?;
                 set_reg(m, MADR1, 4, buf & 0x00FF_FFFF)?;
                 set_reg(m, BCR1, 4, (size >> 5) << 16 | 0x20)?;
-                m.sdk.press.out = Some((buf, blocks(size)));
-                pump(m)
+                m.dma_start_held(1, 0x0100_0200)
             })();
             match r {
                 Ok(()) => {

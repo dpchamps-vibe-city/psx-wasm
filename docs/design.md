@@ -2377,8 +2377,9 @@ loading each slice).
   for, and `DecDCTin`, a reset or a timeout lets it go.
 - **Completions are the shared DMA controller's** (DICR's flags, IRQ3),
   so the callbacks run through libetc's DMA handler, its adapters' or its
-  own. CHCR0/1 stay untouched: DMA1's busy bit is the adapters' state,
-  which only libpress reads.
+  own. DMA0 and DMA1 are started through the controller's registers as
+  libpress writes them, and DMA1's busy bit is CHCR1's, as libpress polls
+  it (spec fidelity SDK11, 2026-10-30; it was the adapters' own state).
 - **The interrupt is held** (`Machine::hold_irq`, `dma_done_held`): the
   original's IRQ3, raised by a register write inside guest code, waits for
   the guest's next safepoint, while what an adapter raises would run at its

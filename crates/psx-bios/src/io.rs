@@ -355,10 +355,29 @@ impl<S: Sdk> Machine<S> {
     /// MDEC output waits (as its request line does) while a decode is
     /// still taking input and hasn't produced the words asked for.
     fn run_dma(&mut self) -> Result<(), String> {
+        self.run_ready_dma(false)
+    }
+
+    /// The same for an adapter (D64): each completion held
+    /// ([`Self::dma_done_held`]). A channel its device was holding back
+    /// (DMA1 while the MDEC decodes) goes once the adapter has fed it.
+    pub fn run_dma_held(&mut self) -> Result<(), String> {
+        self.run_ready_dma(true)
+    }
+
+    /// An adapter starts channel `ch` with `chcr`, as the original's
+    /// register write does, its completion held.
+    pub fn dma_start_held(&mut self, ch: usize, chcr: u32) -> Result<(), String> {
+        let io = self.io.as_mut().ok_or_else(|| no_bus(psx_devices::dma::BASE + 0x10 * ch as u32 + 8))?;
+        io.dma.write(psx_devices::dma::BASE + 0x10 * ch as u32 + 8, 4, chcr);
+        self.run_dma_held()
+    }
+
+    fn run_ready_dma(&mut self, held: bool) -> Result<(), String> {
         let waits = |io: &Io, ch: usize| ch == DMA_MDEC_OUT && io.mdec.busy() && io.mdec.available() < io.dma.words(ch) as usize;
         while let Some(ch) = self.io.as_ref().and_then(|io| (0..7).find(|&c| io.dma.ready(c) && !waits(io, c))) {
             self.dma_transfer(ch)?;
-            self.dma_done(ch);
+            if held { self.dma_done_held(ch) } else { self.dma_done(ch) }
         }
         Ok(())
     }
