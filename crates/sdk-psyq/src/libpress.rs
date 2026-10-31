@@ -39,11 +39,10 @@
 //! which prints libpress's message through the game's `printf` and resets
 //! the MDEC and both channels, as the original does.
 //!
-//! **What isn't reproduced.** DMA0 and DMA1's address and count registers
-//! after a transfer (nothing but the controller reads them); DPCR turning
-//! DMA1 off while it waits (libpress turns it on before every transfer);
-//! the safepoint budget libpress's own table copies spend (`DecDCTPutEnv`,
-//! 32 iterations).
+//! DMA0's and DMA1's address and block registers hold what libpress wrote
+//! and, once a transfer ends, what the controller leaves (the address past
+//! the last word, no blocks left). `DecDCTPutEnv`'s table copies spend the
+//! guest's safepoint budget, 32 passes.
 
 use crate::{Adapter, M, Psyq, Result, reg, set_reg};
 use psx_bios::{Flow, GuestCall, Wait};
@@ -105,6 +104,11 @@ const DPCR: u32 = psx_devices::dma::DPCR;
 /// DPCR's enables for DMA0 and DMA1, which libpress sets before each
 /// transfer.
 const ENABLES: u32 = 0x88;
+/// DMA0's and DMA1's address and block registers.
+const MADR0: u32 = 0x1F80_1080;
+const BCR0: u32 = 0x1F80_1084;
+const MADR1: u32 = 0x1F80_1090;
+const BCR1: u32 = 0x1F80_1094;
 /// The MDEC's control words libpress writes: reset, then both DMA
 /// requests on.
 const RESET: u32 = 0x8000_0000;
@@ -196,8 +200,17 @@ fn pump(m: &mut M) -> std::result::Result<(), String> {
         m.mem.w32(a, w);
         a = a.wrapping_add(4) & 0x1F_FFFC;
     }
+    finished(m, MADR1, BCR1, a)?;
     m.dma_done_held(1);
     Ok(())
+}
+
+/// A block transfer's end on the channel at `madr`/`bcr`: the address past
+/// its last word, no blocks left (the controller's sync mode 1).
+fn finished(m: &mut M, madr: u32, bcr: u32, end: u32) -> std::result::Result<(), String> {
+    set_reg(m, madr, 4, end)?;
+    let b = reg(m, bcr, 4)?;
+    set_reg(m, bcr, 4, b & 0xFFFF)
 }
 
 /// DPCR with DMA0 and DMA1 on, as libpress sets it before a transfer.
@@ -309,8 +322,10 @@ fn send(m: &mut M, o: Obj, p: u32, n: u32, k: K) -> Flow<Psyq> {
                 mdec(m)?.input(&[cmd]);
                 pump(m)?;
                 let from = p.wrapping_add(4) & 0x1F_FFFC;
+                set_reg(m, BCR0, 4, (n >> 5) << 16 | 0x20)?;
                 let words: Vec<u32> = (0..blocks(n)).map(|i| m.mem.r32(from.wrapping_add(4 * i) & 0x1F_FFFC)).collect();
                 mdec(m)?.input(&words);
+                finished(m, MADR0, BCR0, from.wrapping_add(4 * blocks(n)) & 0x1F_FFFC)?;
                 m.dma_done_held(0);
                 pump(m)
             })();
@@ -373,7 +388,8 @@ fn dct_put_env(m: &mut M, a: [u32; 4]) -> Result {
         m.mem.w32(o.data + data::LUMA + 4 * i, luma);
         m.mem.w32(o.data + data::CHROMA + 4 * i, chroma);
     }
-    Ok(tables(m, o, Box::new(move |_, _| Flow::ret(env))))
+    // The copy's two loops of 16 passes.
+    Ok(crate::libspu::spend(m, 32, Box::new(move |m| tables(m, o, Box::new(move |_, _| Flow::ret(env))))))
 }
 
 /// `DecDCTin(buf, mode)`: the command word's depth (mode bit 0: 24-bit,
@@ -403,6 +419,8 @@ fn dct_out(m: &mut M, a: [u32; 4]) -> Result {
             let r = (|| -> std::result::Result<(), String> {
                 enable(m)?;
                 pump(m)?;
+                set_reg(m, MADR1, 4, buf & 0x00FF_FFFF)?;
+                set_reg(m, BCR1, 4, (size >> 5) << 16 | 0x20)?;
                 m.sdk.press.out = Some((buf, blocks(size)));
                 pump(m)
             })();
@@ -535,6 +553,10 @@ mod tests {
         // 16×16 halfwords: 128 words.
         assert_eq!(run(&mut m, at::DCT_OUT, dct_out, [OUT, 128, 0, 0]), 0x1F80_1098);
         assert_eq!(irq_calls(), vec![CALLBACK], "DMA1's callback");
+        // The controller's registers as the transfers leave them.
+        let d = &m.io.as_ref().unwrap().dma;
+        assert_eq!((d.madr[0], d.bcr[0]), ((IN + 4 + 4 * 32) & 0x1F_FFFC, 0x20));
+        assert_eq!((d.madr[1], d.bcr[1]), ((OUT + 4 * 128) & 0x1F_FFFC, 0x20));
         let px = m.mem.r32(OUT);
         assert_eq!(px & 0x8000, 0x8000);
         assert!((0..128).all(|i| m.mem.r32(OUT + 4 * i) == px), "flat");
