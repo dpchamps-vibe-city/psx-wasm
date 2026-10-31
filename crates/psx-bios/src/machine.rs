@@ -298,8 +298,10 @@ impl<S: Sdk> Machine<S> {
         };
         let first = m.clock.video.vblank_at(1);
         m.clock.schedule(first, Event::Vblank);
-        // The kernel's exception control blocks are there from power-on,
-        // its own handlers in their chains.
+        // The kernel's call tables and vectors, its exception control
+        // blocks and its own handlers in their chains are there before a
+        // game runs.
+        m.lay_out_tables();
         m.lay_out_excb();
         m.lay_out_kernel_handlers();
         m

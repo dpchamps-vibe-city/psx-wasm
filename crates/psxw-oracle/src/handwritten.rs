@@ -310,6 +310,10 @@ fn bios_disputed() -> Vec<Handwritten> {
         // nothing).
         call("bios_gpu_cwp", 0x4A, [s, 1, 0, 0], vec![(s, vec![0; 4])], vec![]),
         call("bios_gpu_abort_dma", 0x4C, [0, 0, 0, 0], vec![], vec![]),
+        // The tables at 874h and 674h (OpenBIOS: wherever its .data puts
+        // them).
+        bios_call("bios_get_b0_table", 0xB0, 0x57, [0; 4], vec![], vec![]),
+        bios_call("bios_get_c0_table", 0xB0, 0x56, [0; 4], vec![], vec![]),
     ]
 }
 

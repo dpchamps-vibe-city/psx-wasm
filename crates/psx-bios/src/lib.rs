@@ -12,6 +12,7 @@ pub mod io;
 pub mod kernel;
 pub mod libc;
 pub mod machine;
+pub mod tables;
 pub mod threads;
 
 pub use machine::{Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, StandIn, Wait};
@@ -252,6 +253,29 @@ mod tests {
         m.mem.write(0x8001_0000, b"cdrom:\\A.BIN;1\0");
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, 1, 0, 0])), u32::MAX);
         assert_eq!(ret(bios::call(&mut m, 0xB0, 0x54, [0; 4])), card::E_NO_FDS);
+    }
+
+    /// A call goes through the table in kernel RAM: a stand-in runs the
+    /// Rust BIOS (another function's, when a game copied it there), a
+    /// game's own entry is called as guest code with the arguments.
+    #[test]
+    fn calls_read_the_tables() {
+        let mut m = machine();
+        let b0 = |f: u32| psxw_abi::kernel::B0_TABLE + 4 * f;
+        m.mem.write(0x8001_0000, b"abc\0");
+        assert_eq!(ret(bios::dispatch(&mut m, 0xA0, 0x1B, [0x8001_0000, 0, 0, 0])), 3);
+        assert_eq!(ret(bios::dispatch(&mut m, 0xB0, 0x57, [0; 4])), psxw_abi::kernel::B0_TABLE);
+        assert_eq!(ret(bios::dispatch(&mut m, 0xC0, 0x80 + 0x57, [0; 4])), psxw_abi::kernel::B0_TABLE, "C(80h..) is B0h's table");
+        m.mem.w32(b0(0x57), tables::stand_in(0xB0, 0x56));
+        assert_eq!(ret(bios::dispatch(&mut m, 0xB0, 0x57, [0; 4])), psxw_abi::kernel::C0_TABLE);
+        m.mem.w32(b0(0x57), 0x8002_0000);
+        match bios::dispatch(&mut m, 0xB0, 0x57, [1, 2, 3, 4]).unwrap() {
+            Flow::Call { call, then } => {
+                assert_eq!(call, GuestCall { addr: 0x8002_0000, args: [1, 2, 3, 4] });
+                assert!(matches!(then(&mut m, 7 | 9 << 32), Flow::Return(v) if v == 7 | 9 << 32));
+            }
+            _ => panic!("not a guest call"),
+        }
     }
 
     #[test]

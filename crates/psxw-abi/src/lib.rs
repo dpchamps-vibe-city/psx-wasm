@@ -80,19 +80,59 @@ pub const WINDOW_MASK: u32 = 0x00FF_FFFF;
 /// above it).
 pub const RUNTIME_BASE: u32 = 0x0200_0000;
 
-/// The kernel's tables in guest RAM (D57, M13): what the BIOS lays out
-/// for games to read and edit directly (psx-spx "BIOS Memory Map"). The
-/// rest of the kernel's state stays in the runtime. Addresses are
+/// The kernel's tables in guest RAM (D57, M13, D68): what the BIOS lays
+/// out for games to read and edit directly (psx-spx "BIOS Memory Map").
+/// The rest of the kernel's state stays in the runtime. Addresses are
 /// physical; the BIOS points at them through KSEG1, as the console's does.
 pub mod kernel {
     use core::ops::Range;
+    /// The garbage area at 0: a copy of the exception vector, its first
+    /// word smashed to 3 (psx-spx).
+    pub const GARBAGE: u32 = 0x00;
+    /// RAM size in megabytes, then 0 and FFh (psx-spx).
+    pub const RAM_SIZE: u32 = 0x60;
+    /// The exception vector (four opcodes, KSEG0).
+    pub const EXCEPTION_VECTOR: u32 = 0x80;
+    /// The A(nnh), B(nnh) and C(nnh) function vectors (four opcodes each).
+    pub const A0_VECTOR: u32 = 0xA0;
+    pub const B0_VECTOR: u32 = 0xB0;
+    pub const C0_VECTOR: u32 = 0xC0;
+    /// The vectors' dispatchers, which read the tables (OpenBIOS's code;
+    /// psx-spx's kernel code area): eight opcodes each, A0h's first.
+    pub const DISPATCHERS: u32 = 0x5C0;
+    /// The SYSTEM.CNF `BOOT` line's argument (80h bytes).
+    pub const BOOT_ARGUMENT: u32 = 0x180;
+    /// The call tables: an entry per function (psx-spx). C(80h..) reads
+    /// B0h's table, which follows C0h's.
+    pub const A0_TABLE: u32 = 0x200;
+    pub const A0_LEN: u32 = 0xC0;
+    pub const C0_TABLE: u32 = 0x674;
+    pub const C0_LEN: u32 = 0x80;
+    pub const B0_TABLE: u32 = 0x874;
+    pub const B0_LEN: u32 = 0x100;
     /// The table of tables: a (pointer, size) pair per table from 0x100.
-    /// These four entries are filled: the exception control blocks, the
-    /// process control block, the thread control blocks and the event
-    /// control blocks.
+    /// These are filled: the exception control blocks, the process control
+    /// block, the thread control blocks, the event control blocks, the
+    /// file control blocks and the device control blocks.
     pub const EXCB_ENTRY: u32 = 0x100;
     pub const PCB_ENTRY: u32 = 0x108;
     pub const TCB_ENTRY: u32 = 0x110;
+    /// The file control blocks (psx-spx: 16 of 2Ch bytes, `fd` 0-15) and
+    /// the device control blocks (10 of 50h bytes), at fixed addresses in
+    /// the kernel's data, after `strtok`'s buffer (psx-bios).
+    pub const FCB_ENTRY: u32 = 0x140;
+    pub const DCB_ENTRY: u32 = 0x150;
+    pub const FCBS: u32 = 0x7300;
+    pub const FCB_SIZE: u32 = 0x2C;
+    pub const FILES: u32 = 16;
+    pub const DCBS: u32 = FCBS + FILES * FCB_SIZE;
+    pub const DCB_SIZE: u32 = 0x50;
+    pub const DEVICES: u32 = 10;
+    /// The kernel's data around them (psx-bios: the pad buffers, its
+    /// handler elements, `strtok`'s buffer, the control blocks, the device
+    /// names, the default exception exit and the CD driver's sector
+    /// buffer).
+    pub const DATA: Range<u32> = 0x7000..0x8800;
     /// The PCB: one word, the current thread's TCB.
     pub const PCB: u32 = 0xE000;
     /// The TCBs (SYSTEM.CNF `TCB=`, at most [`MAX_TCBS`]); TCB 0 is the
@@ -121,8 +161,12 @@ pub mod kernel {
     pub const EVCB_SIZE: u32 = 0x1C;
     pub const MAX_EVENTS: u32 = 64;
     /// Kernel RAM a game may read and write at constant addresses: the
-    /// lift's kernel rule accepts these and still fails on the rest.
-    pub const RAM_BACKED: [Range<u32>; 2] = [EXCB_ENTRY..EVCB_ENTRY + 8, EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE];
+    /// lift's kernel rule accepts these and still fails on the rest (the
+    /// patch area at DF80h among it). The vectors, variables and table of
+    /// tables; the boot argument, the call tables and their dispatchers;
+    /// the kernel's data; the control blocks.
+    pub const RAM_BACKED: [Range<u32>; 4] =
+        [0..DCB_ENTRY + 8, BOOT_ARGUMENT..B0_TABLE + 4 * B0_LEN, DATA, EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE];
 
     /// Whether physical address `addr` lies in [`RAM_BACKED`].
     pub fn ram_backed(addr: u32) -> bool {

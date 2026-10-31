@@ -476,7 +476,9 @@ pub extern "C" fn bios(table: u32, func: u32, a0: u32, a1: u32, a2: u32, a3: u32
         return 1;
     }
     let v = with(|rt| {
-        let flow = psx_bios::bios::call(&mut rt.m.borrow_mut(), table, func, [a0, a1, a2, a3]);
+        // Through the table in kernel RAM: a game's patched entry is called
+        // as guest code (D68).
+        let flow = psx_bios::bios::dispatch(&mut rt.m.borrow_mut(), table, func, [a0, a1, a2, a3]);
         match flow {
             Ok(f) => driver::run(&rt.m, &mut Guest, f),
             Err(e) => fatal(5, &e),
