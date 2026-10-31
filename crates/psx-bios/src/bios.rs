@@ -616,10 +616,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x46) => m.erase(a[0], files::dcb::UNDELETE),
         (0xB0, 0x47) => m.add_drv(a[0]),
         (0xB0, 0x48) => m.del_drv(a[0]),
-        (0xB0, 0x49) => {
-            m.print_devices();
-            r(0)
-        }
+        (0xB0, 0x49) => m.print_devices(),
         (0xB0, 0x59) => m.test_device(a[0]),
         (0xB0, 0x4A) => r(m.card_init(a[0])),
         // StartCARD2, StopCARD2: the pad and card handler in or out of the
@@ -684,6 +681,14 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             }
             r(0)
         }
+        (0xC0, 0x12) => {
+            // InstallDevices(ttyflag): the control blocks, the console as
+            // KernelRedirect mounts it, cdrom and bu.
+            m.lay_out_files();
+            m.kernel_redirect(a[0])
+        }
+        (0xC0, 0x13) => m.reopen_stdio(),
+        (0xC0, 0x1B) => m.kernel_redirect(a[0]),
         _ => Err(format!("{label}: not implemented")),
     }
 }

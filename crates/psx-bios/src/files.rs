@@ -265,17 +265,18 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// The device `path` names, its port and where the rest of the name
-    /// starts; none for an unknown device, which OpenBIOS reports on the
-    /// console.
-    fn device_of(&mut self, path: u32) -> Option<(u32, u32, u32)> {
+    /// starts; none for an unknown device, whose console message is the
+    /// flow the caller must run before failing.
+    fn device_of(&mut self, path: u32) -> Result<(Option<(u32, u32, u32)>, Option<Flow<S>>), String> {
         let p = self.mem.cstr(path, 128);
         let (name, port, rest) = split(&p);
-        let found = self.find_device(&name);
-        if found.is_none() {
-            let text = format!("{} is not known device\n", String::from_utf8_lossy(&name));
-            self.console(text.as_bytes());
+        match self.find_device(&name) {
+            Some(d) => Ok((Some((d, port, path + rest)), None)),
+            None => {
+                let text = format!("{} is not known device\n", String::from_utf8_lossy(&name));
+                Ok((None, Some(self.console(text.as_bytes())?)))
+            }
         }
-        found.map(|d| (d, port, path + rest))
     }
 
     /// Device function `off` of `dcb` with `args`, then `then` with its v0:
@@ -293,7 +294,16 @@ impl<S: Sdk> Machine<S> {
     /// (OpenBIOS `psxopen`); `fd`, or -1.
     pub fn open(&mut self, path: u32, mode: u32) -> Result<Flow<S>, String> {
         let Some(f) = self.free_fcb() else { return Ok(self.fail(E_NO_FDS, u32::MAX)) };
-        let Some((d, port, rest)) = self.device_of(path) else { return Ok(self.fail(E_NO_DEVICE, u32::MAX)) };
+        let (found, message) = self.device_of(path)?;
+        let Some((d, port, rest)) = found else {
+            return Ok(match message {
+                Some(flow) => seq(self, flow, |m, _| {
+                    m.kernel.files.errno = E_NO_DEVICE;
+                    Flow::ret(u32::MAX)
+                }),
+                None => self.fail(E_NO_DEVICE, u32::MAX),
+            });
+        };
         let flags = self.mem.r32(d + dcb::FLAGS);
         for (o, v) in [(fcb::FLAGS, mode), (fcb::DEVICE_ID, port), (fcb::DCB, d), (fcb::DEVICE_FLAGS, flags)] {
             self.mem.w32(f + o, v);
@@ -351,8 +361,8 @@ impl<S: Sdk> Machine<S> {
         if self.mem.r32(d + dcb::FLAGS) & BLOCK != 0 {
             let block = self.mem.r32(d + dcb::BLOCK).max(1);
             if self.mem.r32(f + fcb::OFFSET) % block != 0 {
-                self.console(b"offset not on block boundary\n");
-                return Ok(Flow::ret(u32::MAX));
+                let flow = self.console(b"offset not on block boundary\n")?;
+                return Ok(seq(self, flow, |_, _| Flow::ret(u32::MAX)));
             }
             self.mem.w32(f + fcb::COUNT, len / block);
         }
@@ -472,9 +482,10 @@ impl<S: Sdk> Machine<S> {
         Flow::ret(0)
     }
 
-    /// What the BIOS reports on its console (OpenBIOS's messages).
-    fn console(&mut self, text: &[u8]) {
-        if let Ok(Flow::Return(_)) = self.putchars(text.to_vec()) {}
+    /// What the BIOS reports on its console (OpenBIOS's messages), through
+    /// the console device: a guest tty driver's writes are calls to run.
+    fn console(&mut self, text: &[u8]) -> Result<Flow<S>, String> {
+        self.putchars(text.to_vec())
     }
 
     /// The console's output: the host's log, a line at a time.
@@ -527,7 +538,16 @@ impl<S: Sdk> Machine<S> {
     /// `done(device's v0) -> (failed, v0)`.
     fn on_name(&mut self, path: u32, off: u32, fail: u32, done: fn(u32) -> (bool, u32)) -> Result<Flow<S>, String> {
         let Some(f) = self.free_fcb() else { return Ok(self.fail(E_NO_FDS, fail)) };
-        let Some((d, port, rest)) = self.device_of(path) else { return Ok(self.fail(E_NO_DEVICE, fail)) };
+        let (found, message) = self.device_of(path)?;
+        let Some((d, port, rest)) = found else {
+            return Ok(match message {
+                Some(flow) => seq(self, flow, move |m, _| {
+                    m.kernel.files.errno = E_NO_DEVICE;
+                    Flow::ret(fail)
+                }),
+                None => self.fail(E_NO_DEVICE, fail),
+            });
+        };
         self.mem.w32(f + fcb::DEVICE_ID, port);
         self.mem.w32(f + fcb::DCB, d);
         let args = if off == dcb::FORMAT { [f, 0, 0, 0] } else { [f, rest, 0, 0] };
@@ -563,8 +583,26 @@ impl<S: Sdk> Machine<S> {
         // The second is the first again: psx-spx's bug, rename "does
         // accidently use only 1 handle".
         let f2 = f1;
-        let Some((d1, p1, r1)) = self.device_of(old) else { return Ok(self.fail(E_NO_DEVICE, 0)) };
-        let Some((d2, p2, r2)) = self.device_of(new) else { return Ok(self.fail(E_NO_DEVICE, 0)) };
+        let (old_path, old_message) = self.device_of(old)?;
+        let Some((d1, p1, r1)) = old_path else {
+            return Ok(match old_message {
+                Some(flow) => seq(self, flow, |m, _| {
+                    m.kernel.files.errno = E_NO_DEVICE;
+                    Flow::ret(0)
+                }),
+                None => self.fail(E_NO_DEVICE, 0),
+            });
+        };
+        let (new_path, new_message) = self.device_of(new)?;
+        let Some((d2, p2, r2)) = new_path else {
+            return Ok(match new_message {
+                Some(flow) => seq(self, flow, |m, _| {
+                    m.kernel.files.errno = E_NO_DEVICE;
+                    Flow::ret(0)
+                }),
+                None => self.fail(E_NO_DEVICE, 0),
+            });
+        };
         if p1 != p2 || d1 != d2 {
             return Ok(self.fail(E_CROSS_DEVICE, 0));
         }
@@ -589,9 +627,18 @@ impl<S: Sdk> Machine<S> {
             self.kernel.files.first = f;
         }
         let f = self.kernel.files.first;
-        let Some((d, port, rest)) = self.device_of(path) else {
-            self.mem.w32(f + fcb::FLAGS, 0);
-            return Ok(Flow::ret(0));
+        let (found, message) = self.device_of(path)?;
+        let Some((d, port, rest)) = found else {
+            return Ok(match message {
+                Some(flow) => seq(self, flow, move |m, _| {
+                    m.mem.w32(f + fcb::FLAGS, 0);
+                    Flow::ret(0)
+                }),
+                None => {
+                    self.mem.w32(f + fcb::FLAGS, 0);
+                    Flow::ret(0)
+                }
+            });
         };
         self.mem.w32(f + fcb::DEVICE_ID, port);
         self.mem.w32(f + fcb::DCB, d);
@@ -710,7 +757,7 @@ impl<S: Sdk> Machine<S> {
     /// A(5Fh) `dev_cd_open(fcb, name, mode)`: the native disc's file, its
     /// first sector, size and offset in the FCB; 0, or -1.
     pub fn dev_cd_open(&mut self, f: u32, name: u32) -> u32 {
-        let name = String::from_utf8_lossy(&self.mem.cstr(name, 128)).into_owned();
+        let name = self.cd_resolve(&String::from_utf8_lossy(&self.mem.cstr(name, 128)));
         let mut disc = HostDisc(&mut *self.host);
         match cd::find(&mut disc, &name) {
             Some(e) if !e.dir => {
@@ -762,24 +809,64 @@ impl<S: Sdk> Machine<S> {
         0
     }
 
-    /// The `cdrom` device's current directory's entries.
+    /// `rel` from the current directory, upper-cased and without a leading
+    /// backslash.
+    fn cd_join(&self, rel: &str) -> String {
+        let rel = rel.trim_matches('\\');
+        if rel.is_empty() {
+            return self.kernel.files.cd_cwd.clone();
+        }
+        if self.kernel.files.cd_cwd.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{}\\{rel}", self.kernel.files.cd_cwd)
+        }
+    }
+
+    /// A file path absolute from the disc root or relative to the current
+    /// directory.
+    fn cd_resolve(&self, raw: &str) -> String {
+        let p = raw.replace('/', "\\");
+        let absolute = p.starts_with('\\');
+        let p = p.trim_start_matches('\\');
+        (if absolute { p.to_string() } else { self.cd_join(p) }).to_ascii_uppercase()
+    }
+
+    /// A search pattern split into its directory and pattern, absolute from
+    /// the root or relative to the current directory.
+    fn cd_search_path(&self, raw: &str) -> (String, String) {
+        let p = raw.replace('/', "\\");
+        let absolute = p.starts_with('\\');
+        let p = p.trim_start_matches('\\');
+        match p.rfind('\\') {
+            Some(i) => {
+                let dir = if absolute { p[..i].to_string() } else { self.cd_join(&p[..i]) };
+                (dir.to_ascii_uppercase(), p[i + 1..].to_string())
+            }
+            None => {
+                let dir = if absolute { String::new() } else { self.kernel.files.cd_cwd.clone() };
+                (dir, p.to_string())
+            }
+        }
+    }
+
+    /// The `cdrom` device's directory's entries, walking the native disc's
+    /// root and subdirectories.
     fn cd_entries(&mut self, dir: &str) -> Option<Vec<cd::DirEntry>> {
         let mut disc = HostDisc(&mut *self.host);
-        let root = cd::root(&mut disc)?;
-        let here = if dir.is_empty() { root } else { cd::find(&mut disc, &format!("\\{dir}"))? };
-        here.dir.then(|| cd::list(&mut disc, &here))
+        let mut here = cd::root(&mut disc)?;
+        for part in dir.split('\\').filter(|p| !p.is_empty()) {
+            let want = part.to_ascii_uppercase();
+            here = cd::list(&mut disc, &here).into_iter().find(|e| e.dir && e.name.to_ascii_uppercase() == want)?;
+        }
+        Some(cd::list(&mut disc, &here))
     }
 
     /// A(62h) `dev_cd_firstfile(fcb, pattern, direntry)`: the pattern's
     /// directory listed on the native disc.
     pub fn dev_cd_firstfile(&mut self, _f: u32, name: u32, dir: u32) -> u32 {
         let raw = String::from_utf8_lossy(&self.mem.cstr(name, 128)).into_owned();
-        let s = raw.replace('/', "\\");
-        let s = s.trim_start_matches('\\');
-        let (where_, pattern) = match s.rfind('\\') {
-            Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
-            None => (self.kernel.files.cd_cwd.clone(), s.to_string()),
-        };
+        let (where_, pattern) = self.cd_search_path(&raw);
         let pattern = match pattern.to_ascii_uppercase() {
             p if p.is_empty() => "*".to_string(),
             p => p,
@@ -819,8 +906,11 @@ impl<S: Sdk> Machine<S> {
     /// A(64h) `dev_cd_chdir(fcb, path)`: the current directory, upper-cased;
     /// 1 when it is on the native disc, or 0.
     pub fn dev_cd_chdir(&mut self, path: u32) -> u32 {
-        let p = String::from_utf8_lossy(&self.mem.cstr(path, 128)).into_owned();
-        let p = p.replace('/', "\\");
+        let raw = String::from_utf8_lossy(&self.mem.cstr(path, 128)).into_owned();
+        let p = raw.replace('/', "\\");
+        let absolute = p.starts_with('\\');
+        let p = p.trim_matches('\\');
+        let p = if absolute { p.to_string() } else { self.cd_join(p) };
         let p = p.trim_matches('\\').to_ascii_uppercase();
         if self.cd_entries(&p).is_none() {
             return 0;
@@ -867,30 +957,31 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// B(49h) `PrintInstalledDevices()`.
-    pub fn print_devices(&mut self) {
+    pub fn print_devices(&mut self) -> Result<Flow<S>, String> {
+        let mut text = String::new();
         for i in 0..k::DEVICES {
             let d = 0xA000_0000 | (k::DCBS + i * k::DCB_SIZE);
             let name = self.mem.r32(d + dcb::NAME);
             if name != 0 {
-                let line = format!(
+                text.push_str(&format!(
                     "\t{}:\t{}\n",
                     String::from_utf8_lossy(&self.mem.cstr(name, 32)),
                     String::from_utf8_lossy(&self.mem.cstr(self.mem.r32(d + dcb::DESC), 32))
-                );
-                self.console(line.as_bytes());
+                ));
             }
         }
+        self.console(text.as_bytes())
     }
 
     /// C(1Bh) `KernelRedirect(ttyflag)`: the console out, the dummy one (0)
     /// or the DUART's (1) in, `fd` 0 and 1 reopened on it; nothing for other
     /// values (psx-spx).
     pub fn kernel_redirect(&mut self, tty: u32) -> Result<Flow<S>, String> {
-        if let Some(d) = self.find_device(b"tty") {
-            self.mem.w32(d + dcb::NAME, 0);
-        }
         if tty > 1 {
             return Ok(Flow::ret(0));
+        }
+        if let Some(d) = self.find_device(b"tty") {
+            self.mem.w32(d + dcb::NAME, 0);
         }
         self.add_builtin(if tty == 0 { &NULLCON } else { &DUART });
         self.reopen_stdio()
@@ -957,11 +1048,11 @@ mod tests {
     use super::*;
     use crate::testing::{machine, NoSdk};
 
-    fn ret(m: &mut Machine<NoSdk>, f: Result<Flow<NoSdk>, String>, returns: &dyn Fn(u32) -> u32) -> u32 {
+    fn ret(m: &mut Machine<NoSdk>, f: Result<Flow<NoSdk>, String>, returns: &dyn Fn(&mut Machine<NoSdk>, GuestCall) -> u32) -> u32 {
         match f.unwrap() {
             Flow::Return(v) => v as u32,
             Flow::Call { call, then } => {
-                let v = returns(call.addr);
+                let v = returns(m, call);
                 let next = then(m, v as u64);
                 ret(m, Ok(next), returns)
             }
@@ -977,24 +1068,35 @@ mod tests {
         assert_eq!(split(b"tty"), (b"tty".to_vec(), 0, 3));
     }
 
-    /// A guest driver's functions are called through `Flow::Call`, their
-    /// results reach the caller, and their DCB is freed by DelDrv.
+    /// A guest driver's functions are called through `Flow::Call` with the
+    /// BIOS's arguments, their results reach the caller, and their DCB is
+    /// freed by DelDrv. Its tty also receives a diagnostic's writes.
     #[test]
     fn guest_device_callbacks_carry_results() {
         let mut m = machine();
         let s = 0x8001_0000;
         let info = 0x8002_0000;
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let written = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         m.mem.write(s + 0x10, b"sim\0");
         m.mem.w32(info, s + 0x10);
         m.mem.w32(info + dcb::FLAGS, FS);
         for o in (dcb::INIT..=dcb::CHECK).step_by(4) {
             m.mem.w32(info + o, 0x8003_0000 + o);
         }
-        let seen = calls.clone();
-        let returns = move |addr: u32| {
-            seen.borrow_mut().push(addr);
-            if addr == 0x8003_0000 + dcb::READ { 8 } else { 0 }
+        let (seen, out) = (calls.clone(), written.clone());
+        let returns = move |m: &mut Machine<NoSdk>, call: GuestCall| {
+            seen.borrow_mut().push((call.addr, call.args));
+            if call.addr == 0x8003_0000 + dcb::READ {
+                8
+            } else if call.addr == 0x8003_0000 + dcb::IN_OUT {
+                let f = call.args[0];
+                let (buf, n) = (m.mem.r32(f + fcb::BUFFER), m.mem.r32(f + fcb::COUNT));
+                out.borrow_mut().extend(m.mem.bytes(buf, n as usize));
+                n
+            } else {
+                0
+            }
         };
         let v = m.add_drv(info);
         assert_eq!(ret(&mut m, v, &returns), 1);
@@ -1011,16 +1113,43 @@ mod tests {
         let fcb = fcb_at(2);
         assert_eq!(m.mem.r32(fcb + fcb::FLAGS), 0);
         assert!(m.find_device(b"sim").is_none());
-        assert_eq!(
-            calls.borrow().as_slice(),
-            &[
-                0x8003_0000 + dcb::INIT,
-                0x8003_0000 + dcb::OPEN,
-                0x8003_0000 + dcb::READ,
-                0x8003_0000 + dcb::CLOSE,
-                0x8003_0000 + dcb::REMOVE,
-            ]
-        );
+        let recorded = calls.borrow();
+        assert_eq!(recorded[0], (0x8003_0000 + dcb::INIT, [0; 4]));
+        assert_eq!(recorded[1], (0x8003_0000 + dcb::OPEN, [fcb, s + 4, READ, 0]));
+        assert_eq!(recorded[2], (0x8003_0000 + dcb::READ, [fcb, 0x8004_0000, 16, 0]));
+        assert_eq!(recorded[3], (0x8003_0000 + dcb::CLOSE, [fcb, 0, 0, 0]));
+        assert_eq!(recorded[4], (0x8003_0000 + dcb::REMOVE, [0; 4]));
+        drop(recorded);
+
+        // Redirect stdout to a guest tty: a diagnostic goes through its
+        // IN_OUT function, and PrintInstalledDevices does too.
+        m.mem.write(s, b"tty\0");
+        let v = m.del_drv(s);
+        assert_eq!(ret(&mut m, v, &returns), 1);
+        let info2 = 0x8002_1000;
+        m.mem.write(s + 0x10, b"tty\0");
+        m.mem.w32(info2, s + 0x10);
+        m.mem.w32(info2 + dcb::FLAGS, CHAR);
+        m.mem.w32(info2 + dcb::DESC, s + 0x10);
+        for o in (dcb::INIT..=dcb::CHECK).step_by(4) {
+            m.mem.w32(info2 + o, 0x8003_1000);
+        }
+        m.mem.w32(info2 + dcb::IN_OUT, 0x8003_0000 + dcb::IN_OUT);
+        let v = m.add_drv(info2);
+        assert_eq!(ret(&mut m, v, &returns), 1);
+        written.borrow_mut().clear();
+        m.mem.write(s, b"nodev:x\0");
+        let v = m.open(s, READ);
+        assert_eq!(ret(&mut m, v, &returns), u32::MAX);
+        assert_eq!(m.kernel.files.errno, E_NO_DEVICE);
+        assert_eq!(written.borrow().as_slice(), b"nodev is not known device\r\n");
+        let recorded = calls.borrow();
+        assert!(recorded.iter().any(|(a, args)| *a == 0x8003_0000 + dcb::IN_OUT && *args == [fcb_at(1), 2, 0, 0]));
+        drop(recorded);
+        written.borrow_mut().clear();
+        let v = crate::bios::call(&mut m, 0xB0, 0x49, [0; 4]);
+        assert_eq!(ret(&mut m, v, &returns), 0);
+        assert!(String::from_utf8_lossy(&written.borrow()).contains("tty"));
     }
 
     fn iso_sector(lba: u32, data: &[u8]) -> [u8; cd::RAW] {
@@ -1043,10 +1172,12 @@ mod tests {
     }
 
     /// A `cdrom:` file goes through the device table to the native disc:
-    /// open, seek, read, firstfile and close keep the FCB's fields.
+    /// open, seek, read, firstfile and close keep the FCB's fields, and
+    /// paths are absolute from the root or relative to the current
+    /// directory.
     #[test]
     fn native_cdrom_files_through_the_device_table() {
-        let mut sectors = vec![[0u8; cd::RAW]; 20];
+        let mut sectors = vec![[0u8; cd::RAW]; 24];
         let mut pvd = vec![0u8; cd::USER];
         pvd[0] = 1;
         pvd[1..6].copy_from_slice(b"CD001");
@@ -1056,11 +1187,18 @@ mod tests {
         root.extend(iso_record("\0", 18, 2048, true));
         root.extend(iso_record("\x01", 18, 2048, true));
         root.extend(iso_record("A.BIN;1", 19, 5, false));
+        root.extend(iso_record("DATA", 20, 2048, true));
         sectors[18] = iso_sector(18, &root);
         sectors[19] = iso_sector(19, b"hello");
+        let mut sub = Vec::new();
+        sub.extend(iso_record("\0", 20, 2048, true));
+        sub.extend(iso_record("\x01", 18, 2048, true));
+        sub.extend(iso_record("B.BIN;1", 21, 3, false));
+        sectors[20] = iso_sector(20, &sub);
+        sectors[21] = iso_sector(21, b"bye");
         let mut m = crate::testing::machine_with_disc(sectors);
+        let returns = |_: &mut Machine<NoSdk>, _: GuestCall| 0;
         m.mem.write(0x8001_0000, b"cdrom:\\A.BIN;1\0");
-        let returns = |_: u32| 0;
         let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 2, "stdin and stdout are fd 0 and 1");
         let f = fcb_at(2);
@@ -1073,13 +1211,36 @@ mod tests {
         let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0010, 2, 0]);
         assert_eq!(ret(&mut m, v, &returns), 2);
         assert_eq!(m.mem.bytes(0x8002_0010, 2), b"el");
+        let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 2);
+
+        m.mem.write(0x8005_0000, b"cdrom:DATA\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x40, [0x8005_0000, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 1);
+        assert_eq!(m.kernel.files.cd_cwd, "DATA");
+        m.mem.write(0x8001_0000, b"cdrom:B.BIN;1\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 2, "relative to DATA");
+        let f = fcb_at(2);
+        assert_eq!((m.mem.r32(f + fcb::LBA), m.mem.r32(f + fcb::LENGTH)), (21, 3));
+        let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0020, 3, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 3);
+        assert_eq!(m.mem.bytes(0x8002_0020, 3), b"bye");
+        let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 2);
+
+        m.mem.write(0x8003_0000, b"cdrom:*.BIN\0");
+        let v = crate::bios::call(&mut m, 0xB0, 0x42, [0x8003_0000, 0x8004_0000, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 0x8004_0000);
+        assert_eq!(m.mem.cstr(0x8004_0000, 32), b"B.BIN;1", "relative to DATA");
+        assert_eq!(m.mem.r32(0x8004_0020), 21);
+        let v = crate::bios::call(&mut m, 0xB0, 0x43, [0x8004_0000, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 0);
         m.mem.write(0x8003_0000, b"cdrom:\\*.BIN\0");
         let v = crate::bios::call(&mut m, 0xB0, 0x42, [0x8003_0000, 0x8004_0000, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 0x8004_0000);
-        assert_eq!(m.mem.cstr(0x8004_0000, 32), b"A.BIN;1");
+        assert_eq!(m.mem.cstr(0x8004_0000, 32), b"A.BIN;1", "an absolute pattern ignores the cwd");
         assert_eq!(m.mem.r32(0x8004_0020), 19);
-        let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
-        assert_eq!(ret(&mut m, v, &returns), 2);
     }
 
     /// The console is the host's log: TAB and LF are expanded through the
@@ -1087,12 +1248,21 @@ mod tests {
     #[test]
     fn the_console_is_the_log() {
         let mut m = machine();
+        // The BIOS tables reach InstallDevices, FlushStdInOutPut and
+        // KernelRedirect; an invalid redirect leaves the console alone.
+        let v = crate::bios::dispatch(&mut m, 0xC0, 0x12, [0; 4]);
+        assert_eq!(ret(&mut m, v, &|_, _| 0), 0);
+        let v = crate::bios::dispatch(&mut m, 0xC0, 0x13, [0; 4]);
+        assert_eq!(ret(&mut m, v, &|_, _| 0), 0);
+        let v = crate::bios::dispatch(&mut m, 0xC0, 0x1B, [2, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &|_, _| 0), 0);
+        assert!(m.find_device(b"tty").is_some(), "an invalid KernelRedirect changes nothing");
         m.mem.write(0x8001_0000, b"a\tb\n\0");
         let v = crate::bios::call(&mut m, 0xB0, 0x3F, [0x8001_0000, 0, 0, 0]);
-        ret(&mut m, v, &|_| 0);
+        ret(&mut m, v, &|_, _| 0);
         assert!(m.kernel.files.line.is_empty());
         let v = crate::bios::call(&mut m, 0xB0, 0x3D, [b'x' as u32, 0, 0, 0]);
-        ret(&mut m, v, &|_| 0);
+        ret(&mut m, v, &|_, _| 0);
         assert_eq!(m.kernel.files.line, b"x");
         assert_eq!(m.mem.r32(fcb_at(1) + fcb::OFFSET), 12, "a TAB to column 8, LF as CR LF, then x");
         let v = crate::bios::call(&mut m, 0xB0, 0x3E, [0x8001_0000, 0, 0, 0]);
