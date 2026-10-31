@@ -1,7 +1,6 @@
 # Salvage the BIOS work
 
-**Status:** approved; recovery setup complete, implementation blocked on missing
-subagent tools in the current session.
+**Status:** in progress; recovery foundation and initial parallel salvage.
 **Goal:** preserve the working native-port architecture, recover useful work from
 spec-fidelity, and finish the missing BIOS functionality in Rust.
 **Supersedes:** [spec-fidelity.md](spec-fidelity.md) as the execution direction
@@ -373,13 +372,31 @@ changed call paths; do not build a new monitoring subsystem for this.
   acceptance. First delegate independent compiler fixes, SDK-state review and
   BIOS library salvage; do not give multiple workers the shared BIOS dispatcher
   in the same worktree.
-- Tooling blocker: neither `subagent` nor `subagents_enable` is exposed to this
-  session. The package is installed in the original checkout. No child has been
-  launched and no alternative CLI/SDK runner has been substituted. Reload with
-  the extension tools available before starting the delegated implementation.
+- Tooling blocker resolved: the session now exposes the native subagent tools.
+  No alternative CLI/SDK agent runner was substituted.
+
+### Initial delegation wave
+
+All writers start from `c510849` and commit only inside their own worktree.
+No child may push, merge into main or expand the approved architecture.
+
+| Lane | Model / authority | Owned seam | Worktree | Gate / handoff |
+|---|---|---|---|---|
+| Lifter | DeepSeek / writer | `psxw-lift` independent correctness fixes | `../psx-wasm-salvage-lanes/lift`, `salvage/lift` | crate tests; reviewed commits |
+| C lowering | DeepSeek / writer | Standalone `psxw-cc` correctness fixes, excluding cross-crate ABI work | `../psx-wasm-salvage-lanes/cc`, `salvage/cc` | crate tests; reviewed commits |
+| BIOS C library | DeepSeek / writer | Native libc/heap/printf salvage and its BIOS dispatch arms | `../psx-wasm-salvage-lanes/libc`, `salvage/libc` | BIOS tests; reviewed commits |
+| SDK state | Qwen, low / read-only scout | Dispositions and dependencies of SDK shared-state changes | original checkout, read-only | source-backed bounded report |
+| Integration | parent / writer | Link/runtime integration, guest-visible kernel interfaces and final acceptance | recovery worktree, `salvage/bios` | integrated tests and source review |
+
+These are independent source contracts. Shared dispatcher conflicts are resolved
+by the parent at integration; workers do not edit one another's trees. Further
+Qwen work waits for the scout to finish.
 
 ## Progress log
 
+- 2026-10-31: delegation tools restored. Confirmed the requested DeepSeek model
+  identifier and prepared isolated lifter, C-lowering and BIOS-library lanes.
+  Parent retains architectural and integration authority.
 - 2026-10-31: created the archive and recovery branch/worktree; preserved the
   user's instructions and working files. Baseline `cargo test -p psx-bios`
   passes in the recovery worktree: 12 tests, 0 failures. No source changes or
