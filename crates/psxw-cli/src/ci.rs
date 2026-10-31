@@ -84,7 +84,7 @@ pub fn run(ws: &Workspace, game: &str) -> Result<bool> {
         let opts = psxw_difftest::Options { game: game.into(), only: None, seeds: 64, keep: false, verbose: false };
         let (r, json) = psxw_difftest::run(ws, &opts)?;
         let counts: Vec<String> = r.counts.iter().map(|(k, n)| format!("{k} {n}")).collect();
-        Ok((r.pass(), format!("{}; {}", counts.join(", "), json.display())))
+        Ok((r.pass(), format!("{}; {}; {}", counts.join(", "), r.outside(), json.display())))
     })());
     gate!("unit-tests", "M1", (|| {
         let out = std::process::Command::new("cargo")

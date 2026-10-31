@@ -1619,9 +1619,24 @@ call is a logged call-out, answered identically to both sides:
   sequences (stack addresses equivalent, narrow arguments compared at their
   declared width, `break` events compared as a set of codes), and every
   page either side touched, apart from the stack.
+- **Only inputs inside the function's domain are compared,** and the
+  original alone decides it. Each seed runs the original first; it is
+  outside when the original faults (a bus error, any trap), or when the
+  original run again with its stack moved down `STACK_SHIFT` (sp, the
+  stack arguments and the stack area with it) differs from the first run
+  by the same comparison, the stack area of both excluded. A seed outside
+  is counted by kind (`fault`, `stack-dependent`) and replaced by the next,
+  up to 4× the seeds; a function short of its seeds says how many it got,
+  and one with none is `outside`, listed, not failed. Nothing is excluded
+  by name. A seed on which only the C faults is still a mismatch.
 
 *Why:* this is what isolates a single function's semantics. Each relaxation
-has a recorded reason in `crates/psxw-difftest`.
+has a recorded reason in `crates/psxw-difftest`. A verdict that depends on
+undefined behaviour tests nothing: where the original faults, no compiler
+keeps the accesses before the fault in order (clang may sink a load past
+an early return), and where its result moves with its stack, it reached
+its frame in a way C leaves undefined, and C's frame and the original's
+differ there.
 
 **D35. Normalizer lift rules from M1:**
 - functions using a GNU global register variable (`global-register`);
@@ -2776,7 +2791,8 @@ D5's single masked 16 MiB window and D6's index.
   runtime, the native host's tools, the browser's script mods, types and
   conformance page (`psxw_guest_ptr`, ABI 13), the lifter's plain-memory
   test, and the differential harness, which answers `h.map_access` from
-  the same map (a bus error is a fault on both sides).
+  the same map (a bus error is a fault on both sides; one in the original
+  puts the seed outside the function's domain, D34).
 - **Where psx-spx and Beetle differ, psx-spx is followed.** Beetle raises
   no bus error anywhere: unmapped loads read 0 (FFFF_FFFFh in DEV0's whole
   8 MiB), stores are dropped. Beetle doesn't mask KUSEG, so KUSEG above
