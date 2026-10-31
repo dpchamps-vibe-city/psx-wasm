@@ -363,7 +363,7 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
   not validation; configured images/vectors/goldens are still missing. Keep
   emulator/OpenBIOS results provisional where appropriate.
 - [x] Run existing BTN title/card-load, BOF4 `title-to-field` and supplied
-  name-select crash replays: latest source `99fa333`, unchanged expectations.
+  name-select crash replays: latest source `bbdeb39`, unchanged expectations.
   Card-load has no state assertions and does not certify save persistence.
 - [ ] Validate game-level save/reload persistence once the required recordings
   and state assertions are available; the current card-load gate is insufficient.
