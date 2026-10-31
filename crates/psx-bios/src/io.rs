@@ -323,6 +323,10 @@ impl<S: Sdk> Machine<S> {
             self.gp0(v);
         } else if addr & !3 == GP1 {
             io.gpu.gp1(v);
+            // Root counter 0's dot clock runs at the display's width.
+            if self.timers[0].set_display_mode(0, io.gpu.display().mode, video, now) {
+                self.reschedule_timer(0);
+            }
         } else {
             return Err(format!("write of {v:#x} to unmodelled I/O register {addr:#010x} ({size} bytes)"));
         }

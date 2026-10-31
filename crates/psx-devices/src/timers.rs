@@ -6,8 +6,18 @@
 //! 5 IRQ at 0xFFFF, 6 repeat IRQ, 8-9 clock source; read, 11 and 12, the
 //! counter reached its target or 0xFFFF since the mode was last read or
 //! written. Sync (gate) modes are not modelled.
+//!
+//! The dot clock (timer 0) is the video clock divided by the GPU's
+//! horizontal resolution's divider, which the bus passes on when GP1 sets
+//! the display mode ([`Timer::set_display_mode`]).
 
 use crate::clock::Video;
+
+/// Video clocks per dot at GP1(08h) display mode `mode` (psx-spx "GPU
+/// Timings"): 256, 320, 512 or 640 pixels wide, or 368 with bit 6.
+fn dot_div(mode: u32) -> u64 {
+    if mode & 0x40 != 0 { 7 } else { [10, 8, 5, 4][(mode & 3) as usize] }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Timer {
@@ -21,14 +31,19 @@ pub struct Timer {
     /// The cycle the mode register was last read: bits 11 and 12 count
     /// from there (or from the last write).
     pub flags_since: u64,
+    /// The GPU's display mode (GP1(08h)), for the dot clock's divider.
+    display_mode: u32,
 }
 
 impl Timer {
     /// Ticks of this counter's clock source elapsed between two cycles.
-    fn ticks(n: usize, mode: u16, video: Video, from: u64, to: u64) -> u64 {
-        let src = (mode >> 8) & 3;
+    fn ticks(&self, n: usize, video: Video, from: u64, to: u64) -> u64 {
+        let src = (self.mode >> 8) & 3;
         match (n, src) {
-            (0, 1) | (0, 3) => video.dots(to) - video.dots(from),
+            (0, 1) | (0, 3) => {
+                let d = dot_div(self.display_mode);
+                video.dots(to) / d - video.dots(from) / d
+            }
             (1, 1) | (1, 3) => video.hblanks(to) - video.hblanks(from),
             (2, 2) | (2, 3) => to / 8 - from / 8,
             _ => to - from,
@@ -36,10 +51,13 @@ impl Timer {
     }
 
     /// The cycle at which `ticks` source ticks after `from` have elapsed.
-    fn cycle_after(n: usize, mode: u16, video: Video, from: u64, ticks: u64) -> u64 {
-        let src = (mode >> 8) & 3;
+    fn cycle_after(&self, n: usize, video: Video, from: u64, ticks: u64) -> u64 {
+        let src = (self.mode >> 8) & 3;
         match (n, src) {
-            (0, 1) | (0, 3) => video.dot_at(video.dots(from) + ticks),
+            (0, 1) | (0, 3) => {
+                let d = dot_div(self.display_mode);
+                video.dot_at((video.dots(from) / d + ticks) * d)
+            }
             (1, 1) | (1, 3) => video.hblank_at(video.hblanks(from) + ticks),
             (2, 2) | (2, 3) => (from / 8 + ticks) * 8,
             _ => from + ticks,
@@ -54,7 +72,7 @@ impl Timer {
     pub fn value(&self, n: usize, video: Video, now: u64) -> u16 {
         // Written ahead of `now` (the guest's cycle, D66): as written.
         let now = now.max(self.base_cycle);
-        let t = Self::ticks(n, self.mode, video, self.base_cycle, now) + self.base_value as u64;
+        let t = self.ticks(n, video, self.base_cycle, now) + self.base_value as u64;
         let p = self.period();
         if (self.base_value as u64) < p {
             return (t % p) as u16;
@@ -66,7 +84,7 @@ impl Timer {
     /// Where the counter is at `c`, its ticks from its last write
     /// unwrapped.
     fn position(&self, n: usize, video: Video, c: u64) -> u64 {
-        Self::ticks(n, self.mode, video, self.base_cycle, c) + self.base_value as u64
+        self.ticks(n, video, self.base_cycle, c) + self.base_value as u64
     }
 
     /// Whether the counter took value `v` at a position in `(t0, t1]`.
@@ -109,6 +127,21 @@ impl Timer {
         self.base_value = v;
     }
 
+    /// GP1 set the GPU's display mode to `mode` at `now`: from here the
+    /// dot clock runs at its horizontal resolution's rate. Whether this
+    /// counter's rate changed, so its next IRQ moves.
+    pub fn set_display_mode(&mut self, n: usize, mode: u32, video: Video, now: u64) -> bool {
+        let changed = n == 0 && self.mode & 0x100 != 0 && dot_div(mode) != dot_div(self.display_mode);
+        if changed {
+            // The count so far at the old rate.
+            let now = now.max(self.base_cycle);
+            self.base_value = self.value(n, video, now);
+            self.base_cycle = now;
+        }
+        self.display_mode = mode;
+        changed
+    }
+
     /// The next cycle after `now` at which this counter raises its IRQ.
     pub fn next_irq(&self, n: usize, video: Video, now: u64) -> Option<u64> {
         let at_target = self.mode & 0x10 != 0;
@@ -131,7 +164,7 @@ impl Timer {
         if at_wrap && p == 0x1_0000 {
             consider(0xFFFF);
         }
-        best.map(|d| Self::cycle_after(n, self.mode, video, now, d))
+        best.map(|d| self.cycle_after(n, video, now, d))
     }
 }
 
@@ -158,6 +191,27 @@ mod tests {
         let v = Video::Ntsc;
         assert_eq!(t.value(1, v, v.vblank_at(1)), 262);
         assert_eq!(t.value(1, v, v.hblank_at(263)), 263);
+    }
+
+    /// Timer 0's dot clock: video clocks over the display mode's divider
+    /// (10 at 256 wide, 8 at 320, 7 at 368), from the cycle GP1 sets it.
+    #[test]
+    fn dot_clock_follows_the_display_mode() {
+        let v = Video::Ntsc;
+        let mut t = Timer::default();
+        t.write_mode(0x100, 0);
+        assert_eq!(t.value(0, v, v.dot_at(1000)), 100);
+        assert!(t.set_display_mode(0, 0x01, v, v.dot_at(1000)));
+        assert_eq!(t.value(0, v, v.dot_at(1800)), 200);
+        assert!(t.set_display_mode(0, 0x41, v, v.dot_at(1800)));
+        assert!(!t.set_display_mode(0, 0x45, v, v.dot_at(1800)), "the same width");
+        assert_eq!(t.value(0, v, v.dot_at(2500)), 300);
+        // Kept while counting another source; IRQs come at dot times.
+        let mut t = Timer::default();
+        assert!(!t.set_display_mode(0, 0x01, v, 0));
+        t.write_mode(0x110, 0);
+        t.target = 50;
+        assert_eq!(t.next_irq(0, v, 0), Some(v.dot_at(400)));
     }
 
     #[test]
