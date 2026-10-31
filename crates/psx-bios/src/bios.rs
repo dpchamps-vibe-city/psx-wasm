@@ -542,21 +542,37 @@ impl cd::Disc for HostDisc<'_> {
 
 /// The BIOS printf: `%d %i %u %x %X %o %c %s %p %%`, with flags, width and
 /// precision. Arguments come from a1..a3, then the guest stack.
-pub fn printf<S: Sdk>(m: &Machine<S>, a: [u32; 4]) -> String {
+pub fn printf<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> String {
     let mut k = 1;
-    format(m, a[0], &mut || {
+    let mut counts = Vec::new();
+    let text = format(m, a[0], &mut counts, &mut || {
         let v = m.arg(&a, k);
         k += 1;
         v
-    })
+    });
+    for (addr, n, half) in counts {
+        if half { m.mem.w16(addr, n as u16) } else { m.mem.w32(addr, n) }
+    }
+    text
 }
 
 /// [`printf`]'s formatting of the string at guest address `fmt`, each
-/// argument word from `next`.
-pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, next: &mut dyn FnMut() -> u32) -> String {
+/// argument word from `next`: psx-spx's conversions (`c s d i D u U o O p
+/// x X n`) and prefixes (`+`, space, `-`, `#`, `0`, a width or `*`, a
+/// precision or `.*`, `h`, `l`, `L`), with C's meaning. `%n`'s writes
+/// (address, length, 16-bit) go to `counts`.
+pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool)>, next: &mut dyn FnMut() -> u32) -> String {
     let fmt = m.mem.cstr(fmt, 1024);
     let mut out = String::new();
     let mut i = 0;
+    let digits = |fmt: &[u8], i: &mut usize| {
+        let mut n = 0usize;
+        while *i < fmt.len() && fmt[*i].is_ascii_digit() {
+            n = n * 10 + (fmt[*i] - b'0') as usize;
+            *i += 1;
+        }
+        n
+    };
     while i < fmt.len() {
         let c = fmt[i];
         i += 1;
@@ -569,50 +585,93 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, next: &mut dyn FnMut() -> u32) -
             flags.push(fmt[i] as char);
             i += 1;
         }
-        let mut width = 0usize;
-        while i < fmt.len() && fmt[i].is_ascii_digit() {
-            width = width * 10 + (fmt[i] - b'0') as usize;
+        let mut left = flags.contains('-');
+        let width = if fmt.get(i) == Some(&b'*') {
             i += 1;
-        }
+            let w = next() as i32;
+            left |= w < 0;
+            w.unsigned_abs() as usize
+        } else {
+            digits(&fmt, &mut i)
+        };
         let mut prec: Option<usize> = None;
-        if i < fmt.len() && fmt[i] == b'.' {
+        if fmt.get(i) == Some(&b'.') {
             i += 1;
-            let mut p = 0;
-            while i < fmt.len() && fmt[i].is_ascii_digit() {
-                p = p * 10 + (fmt[i] - b'0') as usize;
+            prec = Some(if fmt.get(i) == Some(&b'*') {
                 i += 1;
-            }
-            prec = Some(p);
+                (next() as i32).max(0) as usize
+            } else {
+                digits(&fmt, &mut i)
+            });
         }
-        while i < fmt.len() && (fmt[i] == b'l' || fmt[i] == b'h') {
+        let mut half = false;
+        while i < fmt.len() && b"hlL".contains(&fmt[i]) {
+            half = fmt[i] == b'h';
             i += 1;
         }
         let Some(&conv) = fmt.get(i) else { break };
         i += 1;
-        let body = match conv {
-            b'd' | b'i' => (next() as i32).to_string(),
-            b'u' => next().to_string(),
-            b'x' | b'p' => format!("{:x}", next()),
-            b'X' => format!("{:X}", next()),
-            b'o' => format!("{:o}", next()),
-            b'c' => ((next() as u8) as char).to_string(),
+        // h: the argument sign-extended from 16 bits, for every conversion
+        // (psx-spx: unsigned ones too).
+        let mut arg = || {
+            let v = next();
+            if half { v as i16 as i32 as u32 } else { v }
+        };
+        let (sign, prefix, mut body) = match conv {
+            b'd' | b'i' | b'D' => {
+                let v = arg() as i32;
+                let sign = if v < 0 {
+                    "-"
+                } else if flags.contains('+') {
+                    "+"
+                } else if flags.contains(' ') {
+                    " "
+                } else {
+                    ""
+                };
+                (sign, "", v.unsigned_abs().to_string())
+            }
+            b'u' | b'U' => ("", "", arg().to_string()),
+            b'o' | b'O' => ("", if flags.contains('#') { "0" } else { "" }, format!("{:o}", arg())),
+            b'x' | b'X' | b'p' => {
+                let v = arg();
+                let prefix = match (flags.contains('#') && v != 0 && conv != b'p', conv) {
+                    (true, b'X') => "0X",
+                    (true, _) => "0x",
+                    _ => "",
+                };
+                ("", prefix, if conv == b'X' { format!("{v:X}") } else { format!("{v:x}") })
+            }
+            b'c' => ("", "", ((arg() as u8) as char).to_string()),
             b's' => {
                 let s = m.mem.cstr(next(), prec.unwrap_or(1024));
-                String::from_utf8_lossy(&s).into_owned()
+                ("", "", String::from_utf8_lossy(&s).into_owned())
             }
-            b'%' => "%".into(),
-            other => format!("%{}", other as char),
+            b'n' => {
+                counts.push((next(), out.len() as u32, half));
+                continue;
+            }
+            b'%' => ("", "", "%".into()),
+            other => ("", "", format!("%{}", other as char)),
         };
-        let pad = width.saturating_sub(body.len());
-        if flags.contains('-') {
-            out.push_str(&body);
-            out.push_str(&" ".repeat(pad));
-        } else if flags.contains('0') && conv != b's' {
-            out.push_str(&"0".repeat(pad));
-            out.push_str(&body);
+        let numeric = b"diDuUoOxXp".contains(&conv);
+        if numeric {
+            if let Some(p) = prec {
+                if body.len() < p {
+                    body = "0".repeat(p - body.len()) + &body;
+                }
+            }
+            if prefix == "0" && body.starts_with('0') {
+                body.remove(0);
+            }
+        }
+        let pad = width.saturating_sub(sign.len() + prefix.len() + body.len());
+        if left {
+            out.push_str(&format!("{sign}{prefix}{body}{}", " ".repeat(pad)));
+        } else if flags.contains('0') && numeric && prec.is_none() {
+            out.push_str(&format!("{sign}{prefix}{}{body}", "0".repeat(pad)));
         } else {
-            out.push_str(&" ".repeat(pad));
-            out.push_str(&body);
+            out.push_str(&format!("{}{sign}{prefix}{body}", " ".repeat(pad)));
         }
     }
     out
