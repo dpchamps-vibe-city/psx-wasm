@@ -60,6 +60,9 @@ pub struct Kernel {
     pub pad_dest: u32,
     /// The `InitHeap` heap, (base, end) (`crate::libc`); none until then.
     pub heap: (u32, u32),
+    /// The kernel's heap (`alloc_kernel_memory`), set up on first use
+    /// ([`Machine::kernel_heap`]).
+    pub kheap: (u32, u32),
     /// Where `strtok`'s next fragment starts (0: none).
     pub strtok: u32,
     pub files: BTreeMap<u32, File>,
@@ -256,6 +259,20 @@ impl<S: Sdk> Machine<S> {
                 self.mem.w32(a + 4, EV_ENABLED);
             }
         }
+    }
+
+    /// The kernel's heap (B0h:00h `alloc_kernel_memory`), set up on first
+    /// use. Sony's kernel allocates the control blocks from A000E000h-
+    /// A000FFFFh and leaves the rest to this heap; here the blocks sit at
+    /// fixed addresses (`psxw_abi::kernel`), so the heap is what follows
+    /// the event control blocks.
+    pub fn kernel_heap(&mut self) -> (u32, u32) {
+        if self.kernel.kheap == (0, 0) {
+            self.evcb(EV_HANDLE);
+            let start = self.mem.r32(k::EVCB_ENTRY) + self.mem.r32(k::EVCB_ENTRY + 4);
+            self.kernel.kheap = crate::libc::heap_init(&mut *self.mem, start, 0xA001_0000 - start);
+        }
+        self.kernel.kheap
     }
 }
 

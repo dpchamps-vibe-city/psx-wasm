@@ -72,6 +72,8 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0xAC) => "_card_load",
         (0xA0, 0xAD) => "_card_auto",
         (0xA0, 0xAF) => "card_write_test",
+        (0xB0, 0x00) => "alloc_kernel_memory",
+        (0xB0, 0x01) => "free_kernel_memory",
         (0xB0, 0x02) => "init_timer",
         (0xB0, 0x03) => "get_timer",
         (0xB0, 0x04) => "enable_timer_irq",
@@ -325,7 +327,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0x31) => Ok(libc::qsort(m, a)),
         (0xA0, 0x33) => r(libc::malloc(mem, m.kernel.heap, a[0])),
-        (0xA0, 0x34) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x34) | (0xB0, 0x01) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
         (0xA0, 0x35) => Ok(libc::lsearch(m, a)),
         (0xA0, 0x36) => Ok(libc::bsearch(m, a)),
         (0xA0, 0x37) => r(libc::calloc(mem, m.kernel.heap, a[0], a[1])),
@@ -359,7 +361,11 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0xAF) => r(m.card_write_test(a[0])),
 
-        // --- B0h: root counters, events, pads, files, cards ---------------
+        // --- B0h: kernel memory, root counters, events, pads, files, cards
+        (0xB0, 0x00) => {
+            let heap = m.kernel_heap();
+            r(libc::malloc(&mut *m.mem, heap, a[0]))
+        }
         (0xB0, 0x02..=0x06) => timer(m, func, a).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xB0, 0x07) => {
             m.deliver_event(a[0], a[1]);

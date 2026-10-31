@@ -190,6 +190,17 @@ mod tests {
     }
 
     #[test]
+    fn kernel_memory_follows_the_event_blocks() {
+        let mut m = machine();
+        // 16 event blocks end at F9D0h; the kernel's heap runs on to 10000h.
+        let a = ret(bios::call(&mut m, 0xB0, 0x00, [0x10, 0, 0, 0]));
+        assert_eq!(a, 0xA000_F9D4);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x00, [0x1000, 0, 0, 0])), 0, "too big");
+        ret(bios::call(&mut m, 0xB0, 0x01, [a, 0, 0, 0]));
+        assert_eq!(m.mem.r32(a - 4), 0x10 | 1);
+    }
+
+    #[test]
     fn pad_init2_and_pad_dr() {
         let mut m = machine();
         let dest = 0x8001_0000;
