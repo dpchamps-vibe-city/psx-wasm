@@ -206,6 +206,12 @@ impl<S: Sdk> Machine<S> {
         u32::MAX
     }
 
+    /// Every block, in order (the run report).
+    pub fn events(&self) -> Vec<EvCb> {
+        let n = self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE;
+        (0..n).filter_map(|i| self.evcb_at(EV_HANDLE | i)).map(|a| self.read_ev(a)).collect()
+    }
+
     pub fn event_ready(&self, h: u32) -> bool {
         self.evcb_at(h).is_some_and(|a| self.mem.r32(a + 4) == EV_READY)
     }
