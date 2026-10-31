@@ -125,16 +125,19 @@ out:
   taken from the matching build's ELFs and link maps.
 - **Pointer values.** Pointers keep their PSX values (`0x80xxxxxx`) in
   registers and in memory. Only the *effective address* of a load or store
-  is translated:
+  is translated, through the console's memory map (D70, psxw-abi `map`):
 
   ```
-  ea = (addr & 0x00FF_FFFF) + WINDOW_BASE
+  ea = addr & 0x7F80_0000 == 0 ? addr & 0x001F_FFFF   // RAM, KUSEG/KSEG0
+                               : psx.map_access(addr, len, store)
   ```
 
-  The `+ WINDOW_BASE` folds into the wasm `memarg` offset immediate, so each
-  guest memory access costs one `i32.and`. The same mask folds KSEG0, KSEG1
-  and KUSEG onto one physical view and puts the scratchpad at window offset
-  `0x800000`.
+  RAM through KUSEG and KSEG0, any of its four mirrors, is inline: one mask
+  and one test. Anything else (KSEG1, the scratchpad, I/O, the expansion
+  regions, the BIOS ROM, KSEG2's cache control) is a call to the runtime,
+  which traps on a bus error. A constant address in plain memory is mapped
+  at link time. `WINDOW_BASE` folds into the wasm `memarg` offset
+  immediate.
 - **Initial memory comes from the disc.** At boot the runtime loads the
   PS-X EXE from the user's disc into RAM, as the BIOS does. Overlays arrive
   the way the game always loaded them, through its own CD reads. The wasm build
@@ -153,13 +156,13 @@ What this buys:
 | wasm address | Contents |
 |---|---|
 | `0x0000_0000`–`0x00FF_FFFF` | Unused. This keeps null out of both the guest and the runtime. |
-| `0x0100_0000`–`0x01FF_FFFF` | **Guest window.** Window offsets `0x000000`–`0x1FFFFF` are RAM, `0x200000`–`0x5FFFFF` hold auxiliary data (literals and constant pools that only clang emits), `0x600000`–`0x7FFFFF` hold mods' data and stacks (M11), `0x800000` is the scratchpad, `0x801000`–`0x802FFF` are the I/O registers (below), and `0xF00000` is a runtime-private page (the GTE register file). |
+| `0x0100_0000`–`0x01FF_FFFF` | **Guest window.** Window offsets `0x000000`–`0x1FFFFF` are RAM, `0x200000`–`0x5FFFFF` hold auxiliary data (literals and constant pools that only clang emits), `0x600000`–`0x7FFFFF` hold mods' data and stacks (M11), `0x800000` is the scratchpad, `0x801000`–`0x801FFF` are the I/O registers (below), `0xC00000` the BIOS ROM, `0xF00000` a runtime-private page (the GTE register file, the open-bus scratch) and `0xFE0000` KSEG2's cache control. Auxiliary and mod data have their own guest addresses, `0x8100_0000` plus the window offset (D70). |
 | `0x0200_0000`– | The runtime's own data, stack and heap, placed there by the linker. |
 
 A debug build moves the window to `0x8000_0000` (§9).
 
 **The I/O window.** psxw-link wraps each load and store of a device
-library's functions (§5) with a range check on the masked address
+library's functions (§5) with a range check on the window offset
 (`rewrite::io_call`). An access in the I/O range calls the runtime's bus,
 `psx.io_access` (`psx-bios::io`): a load calls it before reading, so the
 device puts the register's value in place, and a store calls it after
@@ -185,8 +188,13 @@ number the game would see on hardware. Every indirect call goes through one
 dense funcref table:
 
 ```
-call_indirect $dispatch ((fp & 0x003F_FFFC) >> 2)
+call_indirect $dispatch (fp & 0x7F80_0000 == 0 ? (fp & 0x001F_FFFC) >> 2
+                                               : psx.map_code(fp))
 ```
+
+RAM through KUSEG and KSEG0 is inline; `psx.map_code` gives the index of
+code in RAM through KSEG1 and of synthetic code, and traps where no code
+can be (D70).
 
 - **One indirect signature.** Every table entry has the same wasm type, the
   *o32 indirect ABI*: `(a0, a1, a2, a3: i32) -> i64`. The result packs `v0`
@@ -201,8 +209,8 @@ call_indirect $dispatch ((fp & 0x003F_FFFC) >> 2)
   traps on these. Under o32 semantics they are harmless: extra arguments are
   ignored and missing ones read as garbage, as on hardware.
 - **Functions with no MIPS address.** Compiler-generated helpers whose
-  address is taken get synthetic addresses above RAM, in window offsets
-  `0x200000`–`0x3FFFFF`.
+  address is taken get synthetic addresses in psx-wasm's own space,
+  `0x8120_0000`–`0x813F_FFFF` (D70).
 
 ### 3. Overlays: what the disc wrote decides
 
@@ -1372,9 +1380,15 @@ no source patches, pointers in assets keep working, data is verifiable,
 and RAM is comparable by symbol. The M0 layout probe validated it (8,374
 of 8,374 entries match). (design §1)
 
+*Later:* D70 replaced the mask with the console's memory map: RAM's
+mirrors, the regions, bus errors.
+
 **D6. Function pointers are MIPS addresses.** One dispatch table,
 `table_index = (addr & 0x003F_FFFC) >> 2`. Indirect calls use the o32
 indirect ABI `(a0..a3) -> i64`. (design §2)
+
+*Later:* D70 indexes it through the map: code in RAM through any segment
+and mirror, synthetic code at `0x8120_0000`; elsewhere a call traps.
 
 **D7. Overlays dispatch on resident bytes.** A stub compares code words in
 RAM against each candidate overlay. *Why:* it's how hardware decides, and
@@ -2709,15 +2723,69 @@ and main/overlay-overlap calls went unchecked. Decided without the human's
 input under the /goal that implements plans/spec-fidelity.md, whose
 decisions table proposes it.
 
-**D70. The memory map is the console's** (spec fidelity, phase 6;
-planned, the body changes with the code). RAM is mirrored four times in
-8 MB; KSEG0/KSEG1 and KSEG2's cache control, the scratchpad's real extent,
-the expansion regions and the BIOS ROM are their own regions; elsewhere
-an access is a bus error, and a function pointer into unmapped space
-traps. Devices and the BIOS use the same map for guest pointers. Revises
-D5's single masked 16 MiB window. Its cost on every access is measured
-and recorded when it is built. Decided without the human's input under
-the /goal, as above.
+**D70. The memory map is the console's** (spec fidelity, phase 6, TR6
+and TR16). psxw-abi's `map` is the one map every part follows. Revises
+D5's single masked 16 MiB window and D6's index.
+- **Regions** (psx-spx "Memory Map", "Memory Control"). Main RAM, 2 MiB
+  mirrored four times in the first 8 MiB, through KUSEG, KSEG0 and KSEG1.
+  The scratchpad, 1 KiB at `1F80_0000`, through KUSEG and KSEG0 only. The
+  I/O ports, 4 KiB at `1F80_1000`. The expansion regions at the sizes the
+  BIOS leaves in memory control (DEV0 512 KiB at `1F00_0000`, DEV8 128
+  bytes at `1F80_2000`, DEV1 one byte at `1FA0_0000`), with nothing
+  attached: loads read FFh, 00h and 00h, stores do nothing. The BIOS ROM,
+  512 KiB at `1FC0_0000`, unmirrored and read-only (zeros: the BIOS is the
+  runtime's). KSEG2's cache control, 512 bytes at `FFFE_0000`, plain
+  storage. Anything else is a bus error, KUSEG above 512 MiB included:
+  the runtime traps naming the access (trap 13).
+- **Guest code.** A load or store takes RAM through KUSEG and KSEG0
+  inline: `addr & 7F80_0000` clear gives window offset `addr & 1F_FFFF`,
+  one mask and one test. Anything else calls `psx.map_access(addr, len,
+  store)`, which puts an expansion region's byte where the load reads it
+  and sends a store that does nothing to a scratch (`phys::OPEN_BUS`); an
+  access must lie in one region. The link maps a constant address in
+  plain memory itself. Bulk copies and fills map both ranges through the
+  call. A function pointer takes RAM through KUSEG and KSEG0 inline and
+  calls `psx.map_code` for anything else: RAM through KSEG1 and synthetic
+  code have their table index, unmapped space is a bus error, and the
+  scratchpad, I/O, the ROM and the expansion regions trap as having no
+  code.
+- **psx-wasm's own space.** AUX data, mods' data and stacks and synthetic
+  code leave RAM's mirrors for KSEG0 addresses from `8100_0000`, physical
+  space the console leaves unmapped: `own(offset) = 8100_0000 | offset`,
+  through KSEG0 only, with their window offsets unchanged (AUX
+  `8120_0000`, mods `8160_0000`, synthetic code `8120_0000`–`813F_FFFF`,
+  table indices unchanged). A debug build's window doesn't put them at
+  their own wasm addresses, as it does RAM (D53): DWARF for clang-only
+  data points past its memory.
+- **One map everywhere** (TR16). The BIOS's and the devices' `Mem`, the
+  runtime, the native host's tools, the browser's script mods, types and
+  conformance page (`psxw_guest_ptr`, ABI 13), the lifter's plain-memory
+  test, and the differential harness, which answers `h.map_access` from
+  the same map (a bus error is a fault on both sides).
+- **Where psx-spx and Beetle differ, psx-spx is followed.** Beetle raises
+  no bus error anywhere: unmapped loads read 0 (FFFF_FFFFh in DEV0's whole
+  8 MiB), stores are dropped. Beetle doesn't mask KUSEG, so KUSEG above
+  512 MiB reaches nothing (reads 0) rather than mirroring or faulting. It
+  maps the scratchpad through KSEG1 (`BF80_0000`). It ignores memory
+  control's region sizes. Of KSEG2 it has only `FFFE_0130`. psx-spx
+  doesn't say what an unconnected expansion region reads: Beetle's values
+  are taken.
+- **Not modelled.** Memory control's size registers and RAM_SIZE are
+  fixed at the BIOS's values; cache isolation (SR.IsC, the cache control
+  bits); address errors on misaligned accesses (wasm doesn't fault); an
+  inline access straddling RAM's end reads the window's next bytes rather
+  than wrapping to RAM's start.
+- **Cost** (2026-10-31, against main `8754894`). game.wasm: btn 2,179,517
+  to 2,805,927 bytes (+28.7%; gzip −9 +5.5%), bof4 10,141,350 to
+  16,140,663 (+59.2%; gzip +14.1%). Instructions (`llvm-objdump -d`): btn
+  788,699 to 1,074,314 (+36%), bof4 3,905,446 to 6,642,703 (+70%); each
+  mapped access is ~24 bytes where the mask was 6. A micro-benchmark (V8,
+  a loop of one load and one store, wasm-opt `-O2`): RAM unchanged (1.54
+  to 1.51 ns a pass), the scratchpad 0.52 to 4.2–5.0 ns (two calls). A
+  second inline test for the scratchpad would bring it to 1.4–1.9 ns for
+  ~20 more bytes per access; not taken until frame times say so.
+
+Decided without the human's input under the /goal, as above.
 
 **D71. Virtual time comes from the original's instruction counts**
 (spec fidelity, phase 7; planned, the body changes with the code). Clang
