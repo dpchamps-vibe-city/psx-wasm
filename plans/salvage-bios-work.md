@@ -135,7 +135,7 @@ hygiene rules when deciding what belongs in commits.
 - [ ] Recover independent correctness fixes in coherent batches. Split mixed
   commits or reimplement their small useful part; do not cherry-pick a chain
   that drags the rejected map/timing work back in.
-- [ ] Record dispositions for unrelated useful changes, including residency,
+- [x] Record dispositions for unrelated useful changes, including residency,
   browser storage and fallback-device fixes. Keep this separate from the BIOS
   completion checklist.
 - [ ] Build and check the recovered foundation using the existing commands.
@@ -153,9 +153,10 @@ back to main.
 - [ ] Recover guest-visible BIOS tables, events, handler chains and file/device
   blocks where needed by their interfaces. Rust implements the functions;
   populating data does not require executable Sony BIOS code.
-- [ ] Recover general file/device dispatch, including guest-provided device
+- [x] Recover general file/device dispatch, including guest-provided device
   callbacks. Keep useful CD directory and error behaviour while replacing the
-  controller-driven reads with native disc operations.
+  controller-driven reads with native disc operations. Console input and card
+  asynchronous visibility remain separate unfinished items below.
 - [ ] Implement the added BIOS GPU/CD entry points over the existing native
   cores and scheduler. Reuse SDK/backend facilities without depending on SDK
   initialisation or duplicating their state.
@@ -437,28 +438,66 @@ the parent, not by workers modifying one another's trees.
 
 ### Follow-up lanes and dispositions
 
-Wave three is complete. Oracle and SDK pads are integrated after parent review.
-The files lane (`cd7589c`) is **not yet integrated**: parent found missing
-C(12h/13h/1Bh) dispatch arms, discarded console guest-callback flows, and
-inconsistent CD current-directory handling. The same isolated worker is fixing
-these and strengthening its existing integration tests.
+Wave three and its files follow-up are complete and source-reviewed. Files
+`cd7589c`/`fc93f94` are integrated as `1ed72a8`/`53a61b2`. The follow-up fixes
+C(12h/13h/1Bh) dispatch, console guest-callback propagation, invalid redirects
+and CD current-directory handling; its integration tests now assert callback
+arguments and diagnostic output. Native card protocol/timing was not changed.
 
-A separate DeepSeek fallback lane starts at `bb68c6f` in
-`../psx-wasm-salvage-lanes/fallback`, branch `salvage/fallback`, recovering
-`7716465`, `c14c58d`, `28f4a57`, `8736711`, `8a91a38` in order. It owns only the
-shared CDC/GPU/timer/SPU corrections and necessary BIOS/SDK call sites. No new
-map, instruction timing or BIOS hardware driver is authorised.
+The isolated fallback lane recovered `7716465`, `c14c58d`, `28f4a57`,
+`8736711`, `8a91a38` as parent commits `dc979a6`, `b989225`, `bf11e61`,
+`71045f9`, `b0e9003`. Only shared CDC/GPU/timer/SPU corrections and necessary
+BIOS/SDK call sites changed; no map, instruction timing or BIOS driver.
 
 Unrelated source-backed dispositions:
-- **Keep separately:** renderer error propagation `f664edd` (not yet applied).
-- **Keep with small rework:** browser per-bundle disc storage `280b9e2`, including
-  its message-shape documentation and browser check (not yet applied).
-- **Keep/rework:** the fallback batch above; no game-level result yet.
+- **Keep separately:** renderer error propagation `f664edd` -> `d1eb62d`.
+- **Keep with small rework:** browser per-bundle disc storage `280b9e2` ->
+  `4cce9e3`, including its message-shape documentation. Renderer tests and
+  web/native compile checks passed; the changed disc path's browser gate is
+  still pending. The existing card-storage browser test does not cover it.
+- **Keep/rework:** the fallback batch above; integrated game gates below.
 - **Defer:** overlay residency `474fb20` and prerequisite `4a92c4c`, pending a
   separate architecture decision; not needed for BIOS completion. Do not import
   archived ABI 13 or its phase-6 follow-ups.
 
+## Current foundation validation (ABI 17)
+
+Source checkpoint `4cce9e3`, in this recovery checkout, not main's outputs:
+
+- `cargo test --workspace -- --nocapture`: pass after `2f1ac98` updates a stale
+  lifter assertion: 150h is now the RAM-backed device-table pointer. BIOS 29,
+  devices 63, SPU 9, SDK 36, runtime 7. Optional compiler test skipped without
+  `PSXW_TEST_CC1`/`PSXW_TEST_CLANG`; two Docker oracle tests skipped without
+  `.oracle/images.json`; threaded Docker/DWARF test remains explicitly ignored.
+  Workspace run preceded the two isolated host patches, whose worker tests
+  passed (renderer 9 and host-web/gpu-oracle checks).
+- Release CLI and wasm32 runtime check: pass, rebuilt after integration.
+- `census btn`: pass, including 8977/8977 layout entries. BOF4's default census
+  could not find its matching cc1; `census bof4 --no-probe` passes, following
+  the existing manifest's documented setting (not a newly weakened gate).
+- `build btn` and `build bof4`: pass, all six chip groups native. Fresh ABI-17
+  game/runtime outputs under this checkout's `out/`. Build's wording that all
+  named BIOS calls are implemented is **not** a full-coverage certification.
+- `run btn --replay title-to-gameplay --check no-trap`: 6000 frames, three
+  expected states pass. `card-load`: 3000 frames, no trap; this alone is not a
+  new save/persistence assertion. BTN logs a GPU timeout/reset around frame 64;
+  not classified as introduced or resolved by these changes.
+- `run bof4 --replay title-to-field --check no-trap`: 26000 frames, all five
+  expected states pass. Supplied `craash-after-name-select`: 694-frame replay
+  finishes without trap. No recordings or expectations changed.
+- `conform btn --lib libpad`: 125 steps pass; `--lib libetc`: 60 steps pass,
+  original translated SDK vs adaptors. Other SDK/chip/browser gates pending.
+- `oracle check btn --device bios`: command prints PASS but compares **zero
+  vectors** in the fresh store. Not accepted as oracle validation. Images and
+  goldens still need provisioning; no capture/re-record performed.
+- Full `psxw ci btn` / `psxw ci bof4` and browser disc isolation remain pending.
+
 ## Progress log
+
+- 2026-10-31: file follow-up, fallback batch and independent renderer/browser
+  fixes source-reviewed and integrated. Combined foundation builds and replay
+  gates now run as recorded above. Missing BIOS families and control-flow
+  limitations below remain; this is not a full-BIOS completion checkpoint.
 
 - 2026-10-31: parent integrated saved BIOS entry thunks in `bfc37c8`, with
   **ABI 17** in runtime/link/worker/conform contracts. Baseline masked dispatch
