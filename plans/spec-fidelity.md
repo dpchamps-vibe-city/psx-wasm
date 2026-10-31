@@ -728,8 +728,13 @@ locals, or static translation.
     start as a `volatile` asm on the budget global, with no memory
     clobber, so clang keeps it in place but still optimises memory
     around it. The link checks the budget at loop headers, as today.
-    Measure the cost; fall back to a call the link lowers if clang's wasm
-    asm can't name the global. TR9's charge (a pass per word, including
+    Checked (2026-10-31): the pinned clang (wasi-sdk 34) accepts
+    `.globaltype psxw_budget, i32` and `global.get`/`global.set` in a
+    `volatile` asm, relocating them to the symbol
+    (`R_WASM_GLOBAL_INDEX_LEB`). The link's global resolver
+    (`psxw-link/src/game.rs`, which maps `__stack_pointer` today) needs one
+    more name. An unrolled loop keeps a spend in each copy. Measure the
+    cost. TR9's charge (a pass per word, including
     clang's zero-fills of locals) moves to the same units.
 
 - **Overlay residency's limits** (2026-10-31, TR4). A unit is a
