@@ -668,11 +668,13 @@ anything else.
 Status (2026-10-31): 1 and 2 pass on `worktree-agent-a91665ec38f961809`
 (`dee627e`..). `psxw difftest btn`: 2,620 pass, 3 excluded, the known
 `AlignPadActuators` mismatch and `Ovl11ProbeActorBounds` trap, as
-before. Conformance: chips irq, gpu and cd pass in btn, gpu, cd and mdec
-in bof4; sio0 (both), memcard (btn) and spu (both; btn 20 of 47 cases)
-fail on time where adapters don't yet spend their originals'
-straight-line instructions (Findings). Step 5 and 3 wait for the human,
-and, before them, the rest of the adapters' time.
+before. Conformance: chips irq, gpu and cd pass in btn; irq, gpu, cd and
+mdec in bof4; sio0 (both), memcard (btn) and spu (both; btn 20 of 47
+cases, bof4 20 of 47) fail on time where adapters don't yet spend their originals'
+straight-line instructions (Findings). Both games boot to their main
+loops and run 1,200 frames without a trap (`psxw run <game> --check boot
+--check no-trap`). Step 5 and 3 wait for the human, and, before them,
+the rest of the adapters' time.
 
 Step 5, the human's (each game; btn's replay `title-to-gameplay`,
 bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
