@@ -221,8 +221,11 @@ impl<'a> Emitter<'a> {
         let dis = disasm(&head, b);
         let mut c_expr = cond.clone();
         if let Some(c) = &cond {
+            // The condition reads rs before the link (`bltzal`/`bgezal`
+            // write ra) and the delay slot change it.
+            let link = head.writes().map_or(0, |r| 1u32 << r);
             let slot_writes = slot.insn.writes().map_or(0, |r| 1u32 << r);
-            if head.reads() & slot_writes != 0 || ov.is_some() {
+            if head.reads() & (link | slot_writes) != 0 || ov.is_some() {
                 self.line(&format!("c_ = {c}; /* {b:08X}: {dis} */"));
                 c_expr = Some("c_".into());
             }
