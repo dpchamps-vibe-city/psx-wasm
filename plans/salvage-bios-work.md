@@ -265,10 +265,10 @@ handoff's missing-call list.
 - [ ] **Exception and hook paths.** Normal IRQ dispatch and recognised
   `ReturnFromException` already work. C(06h) chaining is rejected; `break` merely
   logs rather than delivering the unresolved-exception event/error. Native
-  kernel-handler pointers are now callable, and libapi/libetc/libpad plus libmcx
-  start/end and libgpu calls honor BIOS patches. Four libmcx void IRQ-step calls
-  still bypass patches. Complete the remaining paths through existing driver,
-  guest-call and lowering seams; do not infer a general exception context.
+  kernel-handler pointers are now callable, and libapi/libetc/libpad/libgpu and
+  libmcx calls honor BIOS patches, including libmcx's vblank handler. Complete
+  the remaining exception paths through existing driver, guest-call and lowering
+  seams; do not infer a general exception context.
 - [x] **Coverage reporting.** Build reports distinguish working, partial,
   unsupported, documented fatal/no-op and dynamic unknown calls. The old
   `implemented` field remains a compatibility gate, not a completeness claim.
@@ -848,11 +848,31 @@ existing error handling; GPU reset/GEnv writes wait for that call to return.
 SDK 41/runtime 8 and wasm32 runtime check pass. These later changes are locally
 gated; release/game/replay/conformance artifacts are still at `37e37ed`.
 
-Four BIOS calls in libmcx's void IRQ-step path remain parent-owned. Read-only
-scout `a122da85-3103-4a9a-9839-7e88fdaf259a` investigates the existing static
-SDK-adapter binding seam for the vblank handler (mcxresi+80h), without an API,
-runtime or source change. It is feasibility evidence, not authority for a new
-framework or for modifying the existing wire/timing/backend behavior.
+The four remaining libmcx IRQ-path BIOS bypasses are now converted by the
+parent. Read-only scout `a122da85-3103-4a9a-9839-7e88fdaf259a` identified the
+existing static member/offset binding and ordinary Chain/Flow seam. Parent
+verified `mcxresi.o`'s actual handler and BIOS/DSR call ordering. The handler
+is bound as `libmcx/mcxresi:0x80`, under the existing member identity hash;
+STEP_CARD queues it as an ordinary guest call in exception context, like
+STEP_DSR. It locates its data through the handler's first relocated load of
+`_mcxCmdSeq`, not by treating its text address as data.
+
+Dequeue/enqueue calls now use patchable dispatch and `machine::seq`; retry and
+timeout state changes retain their places around those calls. The DSR call
+and its subsequent IRQ7 acknowledgement/unmask are one Flow continuation,
+replacing the old separate tail step. A nested RFE unwinds to the existing
+outer IRQ call, skipping the continuation. Captured library operands survive
+SDK reentry, and retry status is reread after the patched dequeue. The now
+unused synchronous SDK BIOS helper is removed. No trait, runtime, ABI, shared
+IRQ, wire or clock changes are introduced.
+
+Focused gate: SDK 42/runtime 8 tests and wasm32 runtime check pass. Existing
+slot/card tests now traverse the queued handler/DSR path; one grouped test
+checks reserved/retry/timeout order, patched services without native duplicate
+execution, reentry, retry cancellation and RFE skipping. The existing memcard
+conformance cases exercise this handler on every transfer and now name it in
+their coverage. Fresh builds, memcard conformance and replay gates are pending;
+previous `37e37ed` artifacts are not evidence for this change.
 
 ## Progress log
 

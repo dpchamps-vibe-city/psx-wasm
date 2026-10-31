@@ -19,12 +19,12 @@
 //! **libmcx's state stays where libmcx keeps it** (D59's second option, as
 //! libgpu's, D61): `_mcxStat`, `_mcxCmdSeq`, the buffers and lengths, the
 //! callbacks. So the command functions, `McxSync` and `McxStopCom` stay
-//! original guest code over it. The adapters are the two functions that
-//! drive the hardware: `McxStartCom` (I_STAT and I_MASK, and its element
-//! linked into the kernel's chain through the table of tables) and
-//! `_mcxDsrEntry` (the transfer's bytes on SIO0). The two elements'
-//! verifiers and the vblank handler run as adapter steps in the elements'
-//! places ([`chain_element`]). Their addresses come from the objects'
+//! original guest code over it. The adapters are `McxStartCom` (I_STAT and
+//! I_MASK, and its element linked through the table of tables), the vblank
+//! handler, and `_mcxDsrEntry` (the transfer's bytes on SIO0). The two
+//! elements' verifiers run as adapter steps in the elements' places
+//! ([`chain_element`]); their handlers run as ordinary guest calls, so a
+//! patched BIOS call can suspend and resume the adapter. Their addresses come from the objects'
 //! relocated code (`mcxinit`, `mcxmain`, `mcxresi`, `mcxdsr`, validated, so
 //! every operand is where PsyQ 4.7's objects have it).
 //!
@@ -53,7 +53,7 @@
 //! interrupt flag, the received byte and the baud (for the /ACK's time)
 //! are kept.
 
-use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
+use crate::{Adapter, M, Result, reg, ret, set_reg};
 use psx_bios::{Event, Flow, GuestCall, IrqStep};
 use psx_devices::memcard::Responder;
 
@@ -68,14 +68,12 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
 ];
 
 /// Chip memcard's adapters (libmcx).
-pub const MCX: &[(&str, Adapter)] = &[("McxStartCom", start_com), ("_mcxDsrEntry", dsr_entry)];
+pub const MCX: &[(&str, Adapter)] = &[("McxStartCom", start_com), ("_mcxDsrEntry", dsr_entry), ("libmcx/mcxresi:0x80", card_handler)];
 
-/// The exception steps that run libmcx's elements: the vblank element
-/// (`_mcxTblCardEnt`), the /ACK element (`_mcxTblDsrEnt`), and the vblank
-/// handler's tail after its call of `_mcxDsrEntry`.
+/// The exception steps that verify libmcx's elements: the vblank element
+/// (`_mcxTblCardEnt`) and the /ACK element (`_mcxTblDsrEnt`).
 pub const STEP_CARD: u32 = 0x4D43_0001;
 pub const STEP_DSR: u32 = 0x4D43_0002;
-const STEP_START_TAIL: u32 = 0x4D43_0003;
 /// The event a card's /ACK is (data: the wire's generation).
 pub const EV_ACK: u32 = 0x4D43_0001;
 
@@ -136,8 +134,9 @@ const BAUD: u16 = 0x88;
 /// Where libmcx is in this game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lib {
-    /// `mcxresi`'s `.data`, and `_mcxDsrEntry`.
+    /// `mcxresi`'s `.data`, its vblank handler, and `_mcxDsrEntry`.
     pub data: u32,
+    pub card_handler: u32,
     pub dsr_entry: u32,
     /// `mcxdsr`'s bulk-transfer words ([`fast`]).
     pub fast: u32,
@@ -217,6 +216,7 @@ fn locate(m: &mut M, data: u32) -> std::result::Result<Lib, String> {
     let left = find(m, "_mcxIntRestSize", h + 0x110, h + 0x114)?;
     let l = Lib {
         data,
+        card_handler: h,
         dsr_entry,
         fast: left.wrapping_sub(fast::LEFT),
         func_no: find(m, "_mcxFuncNo", h + 0x18, h + 0x1C)?,
@@ -571,7 +571,7 @@ pub fn chain_element(m: &M, elem: u32) -> Option<u32> {
 }
 
 pub fn owns(step: u32) -> bool {
-    matches!(step, STEP_CARD | STEP_DSR | STEP_START_TAIL)
+    matches!(step, STEP_CARD | STEP_DSR)
 }
 
 /// Interrupt line `bit` is unmasked and pending.
@@ -581,30 +581,29 @@ fn pending(m: &mut M, bit: u32) -> bool {
 
 pub fn irq_step(m: &mut M, step: u32) {
     let Some(l) = m.sdk.mc.lib else { return };
-    let r = match step {
-        STEP_CARD if pending(m, 1) => card_handler(m, l),
-        // The /ACK element's handler is `_mcxDsrEntry`, an adapter: called
-        // as the kernel calls it, with its verifier's 1.
-        STEP_DSR if pending(m, ACK_LINE) => {
-            m.irq_calls.push_front(IrqStep::Chain(GuestCall { addr: l.dsr_entry, args: [1, 0, 0, 0] }, None));
-            Ok(())
-        }
-        STEP_START_TAIL => set_reg(m, I_STAT, 4, !ACK_LINE).and_then(|_| {
-            let mask = reg(m, I_MASK, 4)?;
-            set_reg(m, I_MASK, 4, mask | ACK_LINE)
-        }),
-        _ => Ok(()),
+    // Both handlers are adapters, called in exception context with their
+    // verifier's 1. Their Flow calls must finish before the next IRQ step.
+    let addr = match step {
+        STEP_CARD if pending(m, 1) => l.card_handler,
+        STEP_DSR if pending(m, ACK_LINE) => l.dsr_entry,
+        _ => return,
     };
-    if let Err(e) = r {
-        m.log(&format!("libmcx: {e}"));
-    }
+    m.irq_calls.push_front(IrqStep::Chain(GuestCall { addr, args: [1, 0, 0, 0] }, None));
 }
 
 /// The vblank handler (`mcxresi`'s): a transfer still running at the vblank
 /// has timed out (`SetUIFS`'s retries twice); a reserved one starts: the
 /// /ACK element into priority 1's chain, `_mcxDsrEntry` called for the
 /// first step, then IRQ7 acknowledged and unmasked.
-fn card_handler(m: &mut M, l: Lib) -> std::result::Result<(), String> {
+fn card_handler(m: &mut M, _a: [u32; 4]) -> Result {
+    // The handler's first load is _mcxCmdSeq. Capture the object before a
+    // patched BIOS function can re-enter another adapter and move sdk.at.
+    let at = m.sdk.at;
+    let seq = pair(m, at, at + 4).ok_or_else(|| format!("libmcx/mcxresi at {at:#010x}: no _mcxCmdSeq where PsyQ 4.7's object has it"))?;
+    let l = locate(m, seq.wrapping_sub(data::CMD_SEQ))?;
+    if l.card_handler != at {
+        return Err(format!("libmcx: vblank handler is {:#010x}, not {at:#010x}", l.card_handler));
+    }
     if get(m, l.at(data::CMD_SEQ)) != 0 {
         let retry = get(m, l.func_no) == SET_UIFS && {
             let n = get(m, l.at(data::UIFS_RETRY)) + 1;
@@ -618,24 +617,46 @@ fn card_handler(m: &mut M, l: Lib) -> std::result::Result<(), String> {
             put(m, l.at(data::STAT), RESERVED);
             quiet(m)?;
             put(m, l.at(data::CMD_SEQ), 0);
-            bios(m, 0xC0, 0x03, [1, l.at(data::DSR_ENT), 0, 0])?;
         } else {
             put(m, l.at(data::CMD_SEQ), 0);
             quiet(m)?;
             put(m, l.at(data::UIFS_RETRY), 0);
-            bios(m, 0xC0, 0x03, [1, l.at(data::DSR_ENT), 0, 0])?;
-            put(m, l.fast + fast::LEFT, 0);
-            reset_port(m);
-            return Ok(());
         }
+        let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [1, l.at(data::DSR_ENT), 0, 0])?;
+        return Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+            if retry {
+                start_reserved(m, l).unwrap_or_else(|e| panic!("libmcx vblank: {e}"))
+            } else {
+                put(m, l.fast + fast::LEFT, 0);
+                reset_port(m);
+                Flow::ret(0)
+            }
+        }));
     }
-    if get(m, l.at(data::STAT)) & IDLE_BIT == 0 {
-        bios(m, 0xC0, 0x03, [1, l.at(data::DSR_ENT), 0, 0])?;
-        bios(m, 0xC0, 0x02, [1, l.at(data::DSR_ENT), 0, 0])?;
-        m.irq_calls.push_front(IrqStep::Sdk(STEP_START_TAIL));
-        m.irq_calls.push_front(IrqStep::Chain(GuestCall { addr: l.dsr_entry, args: [0; 4] }, None));
+    start_reserved(m, l)
+}
+
+/// The vblank handler's reserved-transfer tail. The status is read after
+/// any timeout dequeue returns: a patched call may have changed it.
+fn start_reserved(m: &mut M, l: Lib) -> Result {
+    if get(m, l.at(data::STAT)) & IDLE_BIT != 0 {
+        return ret(0);
     }
-    Ok(())
+    let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [1, l.at(data::DSR_ENT), 0, 0])?;
+    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+        let flow = psx_bios::bios::dispatch(m, 0xC0, 0x02, [1, l.at(data::DSR_ENT), 0, 0]).unwrap_or_else(|e| panic!("libmcx vblank: {e}"));
+        psx_bios::machine::seq(m, flow, move |_, _| {
+            // This was a direct call, not another exception. RFE in it or
+            // a patched BIOS function unwinds the entire handler; otherwise
+            // IRQ7 is acknowledged/unmasked only after _mcxDsrEntry returns.
+            call(l.dsr_entry, 0, |m, _| {
+                set_reg(m, I_STAT, 4, !ACK_LINE)?;
+                let mask = reg(m, I_MASK, 4)?;
+                set_reg(m, I_MASK, 4, mask | ACK_LINE)?;
+                ret(0)
+            }).expect("construct _mcxDsrEntry call")
+        })
+    }))
 }
 
 // --- libcard ------------------------------------------------------------------------
@@ -684,6 +705,7 @@ mod tests {
         let h = RESI + text::HANDLER;
         let s = RESI + text::STEP_SIO;
         for (hi, lo, addr) in [
+            (h, h + 4, DATA + data::CMD_SEQ),
             (h + 0x18, h + 0x1C, FUNC_NO),
             (h + 0x110, h + 0x114, FAST + fast::LEFT),
             (s + 0x70, s + 0x74, TX_BUF),
@@ -703,6 +725,14 @@ mod tests {
         m.mem.w32(DATA + data::STAT, IDLE_BIT);
         m.mem.w32(GET_TX, 0x8007_0000);
         m.mem.w32(APPLY_RX, 0x8007_0100);
+        crate::testing::double(h, |m| {
+            assert!(m.in_irq);
+            adapter(m, card_handler, RESI + text::HANDLER);
+        });
+        crate::testing::double(DSR_ENTRY, |m| {
+            assert!(m.in_irq);
+            adapter(m, dsr_entry, DSR_ENTRY);
+        });
         m
     }
 
@@ -753,12 +783,11 @@ mod tests {
             adapter(&mut m, start_com, START_COM);
             reserve(&mut m, port);
             let steps = vblank_step(&mut m);
-            assert_eq!(steps[0], IrqStep::Chain(GuestCall { addr: DSR_ENTRY, args: [0; 4] }, None));
-            assert_eq!(steps[1], IrqStep::Sdk(STEP_START_TAIL));
+            assert_eq!(steps, [IrqStep::Chain(GuestCall { addr: RESI + text::HANDLER, args: [1, 0, 0, 0] }, None)]);
             let t = m.clock.now;
-            adapter(&mut m, dsr_entry, DSR_ENTRY);
+            m.irq_calls.extend(steps);
+            crate::testing::drain(&mut m);
             assert_eq!(m.clock.now - t, 58 * 20, "the address byte's wait: its 58 passes (D66)");
-            irq_step(&mut m, STEP_START_TAIL);
             assert_eq!((get(&m, DATA + data::STAT), get(&m, DATA + data::TX_LEN), m.mem.r8(TX_BUF)), (RUNNING, 1, 0x81 + (port as u8 & 0xF)));
             assert_eq!(m.chain(1)[0], DATA + data::DSR_ENT, "at the head of priority 1, before the kernel's");
             m.step(m.clock.now + 5_000);
@@ -766,14 +795,98 @@ mod tests {
             assert_eq!(acked, sent == 2, "the card's /ACK");
             if acked {
                 irq_step(&mut m, STEP_DSR);
-                assert_eq!(m.irq_calls.pop_front(), Some(IrqStep::Chain(GuestCall { addr: DSR_ENTRY, args: [1, 0, 0, 0] }, None)));
-                adapter(&mut m, dsr_entry, DSR_ENTRY);
+                assert_eq!(m.irq_calls.front(), Some(&IrqStep::Chain(GuestCall { addr: DSR_ENTRY, args: [1, 0, 0, 0] }, None)));
+                crate::testing::drain(&mut m);
                 assert_eq!((m.mem.r8(RX_BUF), get(&m, DATA + data::RX_LEN)), (0xFF, 1), "the address's answer");
             }
-            vblank_step(&mut m);
+            let steps = vblank_step(&mut m);
+            m.irq_calls.extend(steps);
+            crate::testing::drain(&mut m);
             assert_eq!((get(&m, DATA + data::STAT), get(&m, DATA + data::TX_LEN)), (TIMEOUT, sent));
             assert_eq!(reg(&mut m, I_MASK, 4).unwrap() & ACK_LINE, 0);
             assert!(!m.chain(1).contains(&(DATA + data::DSR_ENT)));
+        }
+    }
+
+    /// Patched entries run inside the IRQ, with the original's state/order,
+    /// and can re-enter another adapter or leave the exception altogether.
+    #[test]
+    fn patched_vblank_calls_finish_before_the_transfer_tail() {
+        const MODE: u32 = COMMON + 0x200;
+        const DEQUEUE: u32 = 0x8007_1200;
+        const ENQUEUE: u32 = 0x8007_1204;
+        const SKIPPED: u32 = 0x8007_1208;
+        const AFTER_EXIT: u32 = 0x8007_120C;
+        // 0: reserved; 1: retry; 2: timeout; 3: RFE; 4: retry cancelled by patch.
+        for mode in 0..5 {
+            let mut m = game();
+            adapter(&mut m, start_com, START_COM);
+            psx_bios::bios::call(&mut m, 0xC0, 0x02, [1, DATA + data::DSR_ENT, 0, 0]).unwrap();
+            let chain = m.chain(1);
+            put(&mut m, MODE, mode);
+            put(&mut m, DATA + data::STAT, if mode == 0 || mode == 3 { RESERVED } else { RUNNING });
+            put(&mut m, DATA + data::CMD_SEQ, if mode == 0 || mode == 3 { 0 } else { 7 });
+            put(&mut m, FUNC_NO, if mode == 1 || mode == 4 { SET_UIFS } else { 19 });
+            put(&mut m, FAST + fast::LEFT, 9);
+            crate::testing::double(DEQUEUE, |m| {
+                assert!(m.in_irq);
+                assert_eq!(args(), [1, DATA + data::DSR_ENT, 0, 0]);
+                assert_eq!(get(m, DATA + data::CMD_SEQ), 0);
+                assert_eq!(get(m, FAST + fast::LEFT), 9, "timeout reset is after the call");
+                assert_eq!(m.sdk.mc.wire.baud, 0, "port reset is after the call");
+                assert_eq!(reg(m, I_MASK, 4).unwrap() & ACK_LINE, 0);
+                let mode = get(m, MODE);
+                assert_eq!(get(m, DATA + data::STAT), if mode == 2 { TIMEOUT } else { RESERVED });
+                assert_eq!(get(m, DATA + data::UIFS_RETRY), u32::from(mode == 1 || mode == 4));
+                note(m, 3);
+                m.sdk.at = 0x8004_0000;
+                crate::testing::call(m, zero, [0; 4]);
+                if mode == 3 {
+                    m.rfe = true;
+                } else if mode == 4 {
+                    put(m, DATA + data::STAT, IDLE_BIT);
+                }
+            });
+            crate::testing::double(ENQUEUE, |m| {
+                assert!(m.in_irq);
+                assert_eq!(args(), [1, DATA + data::DSR_ENT, 0, 0]);
+                assert_eq!(reg(m, I_MASK, 4).unwrap() & ACK_LINE, 0);
+                note(m, 2);
+            });
+            crate::testing::double(DSR_ENTRY, |m| {
+                assert!(m.in_irq);
+                assert_eq!(args(), [0; 4]);
+                assert_eq!(reg(m, I_MASK, 4).unwrap() & ACK_LINE, 0, "unmask only after DSR returns");
+                // The tail must acknowledge even an IRQ raised during DSR.
+                m.io.as_mut().unwrap().irq.raise(psx_devices::irq::SIO0);
+                note(m, 4);
+            });
+            crate::testing::double(SKIPPED, |_| panic!("RFE must skip remaining exception steps"));
+            crate::testing::double(AFTER_EXIT, |m| note(m, 9));
+            patch(&mut m, 0x03, DEQUEUE);
+            patch(&mut m, 0x02, ENQUEUE);
+            let steps = vblank_step(&mut m);
+            assert_eq!(notes(&m), [], "the verifier only queues the handler");
+            m.irq_calls.extend(steps);
+            if mode == 3 {
+                m.irq_calls.extend([
+                    IrqStep::Chain(GuestCall { addr: SKIPPED, args: [0; 4] }, None),
+                    IrqStep::Exit,
+                    IrqStep::Chain(GuestCall { addr: AFTER_EXIT, args: [0; 4] }, None),
+                ]);
+            }
+            crate::testing::drain(&mut m);
+            assert_eq!(notes(&m), match mode {
+                0 => vec![3, 2, 4],
+                1 => vec![3, 3, 2, 4],
+                3 => vec![3, 9],
+                _ => vec![3],
+            });
+            assert_eq!(m.chain(1), chain, "patched services do not also run their native bodies");
+            assert_eq!(reg(&mut m, I_MASK, 4).unwrap() & ACK_LINE, if mode < 2 { ACK_LINE } else { 0 });
+            assert_eq!(reg(&mut m, I_STAT, 4).unwrap() & ACK_LINE, 0);
+            assert_eq!(get(&m, FAST + fast::LEFT), if mode == 2 { 0 } else { 9 });
+            assert_eq!(m.sdk.mc.wire.baud, if mode == 2 { BAUD } else { 0 });
         }
     }
 

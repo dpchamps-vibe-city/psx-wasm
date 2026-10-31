@@ -8,8 +8,8 @@
 //! address), McxErrNoCard without. `McxExecFlag` sends a card's read
 //! command, which the card does answer. The command functions and
 //! `McxSync` are original code on both sides, over libmcx's state in
-//! guest RAM; the adapters are `McxStartCom` and `_mcxDsrEntry`, which the
-//! vblank handler calls for every transfer.
+//! guest RAM; the adapters are `McxStartCom`, the vblank handler, and
+//! `_mcxDsrEntry`, which that handler calls for every transfer.
 //!
 //! Observation notes, beyond the module's specs:
 //! - **Per vblank:** `McxSync(1, …)` and the command number and result it
@@ -69,12 +69,12 @@ pub fn cases() -> Vec<Case> {
             name: "memcard.start-com",
             chip: "memcard",
             level: 1,
-            covers: &["McxStartCom", "_mcxDsrEntry"],
+            covers: &["McxStartCom", "_mcxDsrEntry", "libmcx/mcxresi:0x80"],
             needs: &["McxStartCom", "McxSync", "McxCardType", "ResetCallback", "SetIntrMask", "GetIntrMask", "GetRCnt"],
             run: start_com,
         },
-        Case { name: "memcard.command", chip: "memcard", level: 1, covers: &["McxStartCom", "_mcxDsrEntry"], needs: ALL, run: command },
-        Case { name: "memcard.session", chip: "memcard", level: 2, covers: &["McxStartCom", "_mcxDsrEntry"], needs: ALL, run: session },
+        Case { name: "memcard.command", chip: "memcard", level: 1, covers: &["McxStartCom", "_mcxDsrEntry", "libmcx/mcxresi:0x80"], needs: ALL, run: command },
+        Case { name: "memcard.session", chip: "memcard", level: 2, covers: &["McxStartCom", "_mcxDsrEntry", "libmcx/mcxresi:0x80"], needs: ALL, run: session },
     ]
 }
 

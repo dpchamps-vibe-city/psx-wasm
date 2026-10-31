@@ -50,14 +50,6 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
     m.reg_write(addr, size, v)
 }
 
-/// A BIOS call the replaced code makes, which returns at once: its v0.
-pub(crate) fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result::Result<u32, String> {
-    match psx_bios::bios::call(m, table, func, a)? {
-        Flow::Return(v) => Ok(v as u32),
-        _ => Err(format!("BIOS {table:02X}h:{func:02X}h blocks in an adapter")),
-    }
-}
-
 /// Libraries that run as original code, their I/O-window accesses reaching
 /// the runtime's register-level devices (`psx_bios::io`), instead of
 /// being replaced.
