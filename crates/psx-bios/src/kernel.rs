@@ -348,13 +348,34 @@ impl<S: Sdk> Machine<S> {
                 self.mem.w32(e + o, v);
             }
         }
-        self.kernel.irq_auto_ack = [0; 11];
-        self.enq_int_rp(3, kernel_element(IRQ_ELEMENT));
+        self.init_def_int(3);
+        self.enqueue_rcnt_irqs(1);
+        self.lay_out_default_exit();
+    }
+
+    /// C(00h): enqueue the four native counter/vblank elements, enable
+    /// their acknowledgements, mask their IRQs and reset the timer core
+    /// (OpenBIOS `enqueueRCntIrqs`). Existing element pointers stay editable.
+    pub fn enqueue_rcnt_irqs(&mut self, priority: u32) {
+        if let Some(io) = self.io.as_mut() {
+            io.irq.mask &= !0x71;
+        }
         for i in 0..4 {
             self.kernel.clear_rcnt[i] = 1;
-            self.enq_int_rp(1, kernel_element(i as u32));
+            self.enq_int_rp(priority, kernel_element(i as u32));
         }
-        self.lay_out_default_exit();
+        for i in 0..3 {
+            let now = self.timer_now(i);
+            self.timers[i].write_mode(0, now);
+            self.timers[i].target = 0;
+            self.reschedule_timer(i);
+        }
+    }
+
+    /// C(0Ch): enqueue IRQ-event delivery and clear all automatic acks.
+    pub fn init_def_int(&mut self, priority: u32) {
+        self.kernel.irq_auto_ack = [0; 11];
+        self.enq_int_rp(priority, kernel_element(IRQ_ELEMENT));
     }
 
     /// ResetEntryInt's guest-visible default exit structure.

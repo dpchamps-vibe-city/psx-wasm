@@ -200,6 +200,41 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_native_irq_services() {
+        let mut m = machine();
+        m.io = Some(Default::default());
+        m.run_until(1000);
+        // Dequeue the defaults, preserving the elements and unrelated state.
+        for i in 0..4 {
+            ret(bios::call(&mut m, 0xC0, 3, [1, kernel::kernel_element(i), 0, 0]));
+        }
+        ret(bios::call(&mut m, 0xC0, 3, [3, kernel::kernel_element(kernel::IRQ_ELEMENT), 0, 0]));
+        let root = kernel::kernel_element(3);
+        m.mem.w32(root + 4, 0x8001_2340);
+        m.kernel.clear_rcnt = [0; 4];
+        m.kernel.clear_pad = 7;
+        m.kernel.irq_auto_ack = [1; 11];
+        m.io.as_mut().unwrap().irq.mask = 0x7FF;
+        m.io.as_mut().unwrap().irq.stat = 0x71;
+        ret(bios::call(&mut m, 0xB0, 2, [0, 50, 0x1000, 0]));
+        ret(bios::call(&mut m, 0xC0, 0, [2, 0, 0, 0]));
+        ret(bios::call(&mut m, 0xC0, 0xC, [3, 0, 0, 0]));
+        assert_eq!(m.chain(2), [3, 2, 1, 0].map(kernel::kernel_element));
+        assert_eq!(m.chain(3), [kernel::kernel_element(kernel::IRQ_ELEMENT)]);
+        assert!(m.chain(0).is_empty() && m.chain(1).is_empty());
+        assert_eq!(m.mem.r32(root + 4), 0x8001_2340);
+        assert_eq!(m.kernel.clear_rcnt, [1; 4]);
+        assert_eq!(m.kernel.clear_pad, 7);
+        assert_eq!(m.kernel.irq_auto_ack, [0; 11]);
+        assert_eq!(m.io.as_ref().unwrap().irq.mask, 0x7FF & !0x71);
+        assert_eq!(m.io.as_ref().unwrap().irq.stat, 0x71, "masking is not acknowledgement");
+        for (i, timer) in m.timers.iter().enumerate() {
+            assert_eq!((timer.mode, timer.target, timer.value(i, m.clock.video, m.timer_now(i))), (0, 0, 0));
+        }
+        assert!(m.clock.pending(|e| matches!(e, Event::Timer(_))).is_none());
+    }
+
+    #[test]
     fn critical_sections_hold_interrupts() {
         let mut m = machine();
         assert_eq!(bios::syscall(&mut m, [1, 0, 0, 0]), Ok(1));

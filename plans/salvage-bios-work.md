@@ -494,6 +494,12 @@ Source checkpoint `4cce9e3`, in this recovery checkout, not main's outputs:
 
 ## Current kernel-call batch (ABI 18)
 
+- Source checkpoint `1513330`: callable kernel functions and callback ordering.
+  A subsequent small batch restores C(00h) and C(0Ch) over those same native
+  elements: counter IRQ masking/reset, enqueue order and autoack initialization.
+  Its BIOS/runtime/SDK tests pass (30/8/36) and wasm32 check passes. C(01h)'s
+  syscall handler remains pending a real native exception context; it is not
+  guessed from IRQ state. Game artifacts/gates below are still at `1513330`.
 - Native root-counter verifiers/handlers, IRQ-event delivery and pad/card
   sampling now have callable thunks at BFC08000h..BFC08030h (two reserved
   second-handler slots). RAM chain pointers are dispatched normally; the old
@@ -519,6 +525,18 @@ Source checkpoint `4cce9e3`, in this recovery checkout, not main's outputs:
 - C(06h), general non-local returns, callback thread switches, SDK BIOS-table
   replacement paths and other listed gaps remain unfinished. This batch does
   not complete the exception/control-flow checklist or full BIOS.
+
+### Next independent lanes
+
+Workflow `2c933d53-de0b-4cad-8f92-79aeae391e51` starts two DeepSeek workers
+from `1513330`, isolated in `../psx-wasm-salvage-lanes/kernel-services`
+(`salvage/kernel-services`) and `../psx-wasm-salvage-lanes/native-cd`
+(`salvage/native-cd`). The former owns only the listed kernel/configuration
+APIs; the latter owns the missing BIOS CD APIs over existing native cores,
+not the rejected register driver. Each must report disputed behaviour or a
+required architecture change rather than invent it. Parent retains IRQ enqueue,
+exception/non-local/thread control flow and integration. No subdelegation.
+The separate ABI-17 foundation CI remains active and pinned to its own source.
 
 ## Progress log
 

@@ -171,6 +171,8 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x5C) => "_card_status",
         (0xB0, 0x5D) => "_card_wait",
         (0xB0, 0x59) => "testdevice",
+        (0xC0, 0x00) => "EnqueueTimerAndVblankIrqs",
+        (0xC0, 0x0C) => "InitDefInt",
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
         (0xC0, 0x07) => "InstallExceptionHandlers",
@@ -647,6 +649,14 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x5B) => r(std::mem::replace(&mut m.kernel.clear_pad, a[0])),
 
         // --- C0h: interrupt plumbing -------------------------------------
+        (0xC0, 0x00) => {
+            m.enqueue_rcnt_irqs(a[0]);
+            r(0)
+        }
+        (0xC0, 0x0C) => {
+            m.init_def_int(a[0]);
+            r(0)
+        }
         (0xC0, 0x02) => {
             m.enq_int_rp(a[0], a[1]);
             r(0)
