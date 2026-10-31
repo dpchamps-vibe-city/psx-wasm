@@ -5,6 +5,8 @@
 //! 1. **Masking.** Every load, store, `memory.copy` and `memory.fill`
 //!    address becomes `(addr + offset) & WINDOW_MASK`, with the memarg
 //!    offset set to the window's base (`WINDOW_BASE`, or a debug build's).
+//!    A bulk copy or fill reaches the I/O hook as its bytes would, and
+//!    spends the safepoint budget (`Resolver::bulk_spend`).
 //! 2. **Guest SP.** `__stack_pointer` becomes the guest's `$sp` global.
 //! 3. **Calls** are resolved by the linker, which may lower intrinsics to
 //!    plain instructions.
@@ -22,6 +24,8 @@ use wasmparser::{BinaryReader, FunctionBody, Operator, RelocationType};
 pub enum Lowered {
     Call(u32),
     Instrs(Vec<I<'static>>),
+    /// `memcpy(dst, src, n) -> dst` as a bulk copy (GCC's builtin, D36).
+    Copy,
 }
 
 /// What the rewriter needs from the linker.
@@ -56,6 +60,11 @@ pub trait Resolver {
     fn prologue(&mut self, func_symbol: Option<&str>) -> Result<Vec<I<'static>>>;
     /// Instructions at the top of every loop body: the safepoint budget.
     fn loop_entry(&mut self) -> Vec<I<'static>> {
+        Vec::new()
+    }
+    /// Instructions after a bulk copy or fill of the bytes counted in local
+    /// `n`: the safepoint budget the loop that moves them spends.
+    fn bulk_spend(&mut self, _n: u32) -> Vec<I<'static>> {
         Vec::new()
     }
     /// When set, the function (`(window offset, kind) -> ()`) every access
@@ -138,7 +147,9 @@ pub fn rewrite_mapped<R: Resolver>(
     let t_f32 = nlocals + 3;
     let t_f64 = nlocals + 4;
     let t_addr = nlocals + 5;
-    locals.extend([(2, ValType::I32), (1, ValType::I64), (1, ValType::F32), (1, ValType::F64), (1, ValType::I32)]);
+    // Bulk memory: destination, index and byte (see `Bulk`).
+    let bulk = Bulk { n: t_i32b, from: t_i32, dst: nlocals + 6, i: nlocals + 7, byte: nlocals + 8, addr: t_addr, window };
+    locals.extend([(2, ValType::I32), (1, ValType::I64), (1, ValType::F32), (1, ValType::F64), (4, ValType::I32)]);
     let mut out = Function::new(locals);
     let index = func as u32 + obj.num_imported_funcs();
     for i in r.prologue(obj.func_symbol(index).map(|s| s.name.as_str()))? {
@@ -241,6 +252,10 @@ pub fn rewrite_mapped<R: Resolver>(
                             out.instruction(i);
                         }
                     }
+                    Lowered::Copy => {
+                        bulk.emit(&mut out, r, true, io, dirty)?;
+                        out.instruction(&I::LocalGet(bulk.dst));
+                    }
                 }
             }
             Operator::CallIndirect { type_index, .. } => {
@@ -301,31 +316,8 @@ pub fn rewrite_mapped<R: Resolver>(
             Operator::I64Store32 { memarg } => store!(memarg, I64Store32, t_i64, 4),
             Operator::F32Store { memarg } => store!(memarg, F32Store, t_f32, 4),
             Operator::F64Store { memarg } => store!(memarg, F64Store, t_f64, 8),
-            Operator::MemoryCopy { .. } => {
-                // [dst, src, n]
-                out.instruction(&I::LocalSet(t_i32b));
-                out.instruction(&I::LocalSet(t_i32));
-                mask_plus_base(&mut out, window);
-                if dirty.is_some() {
-                    mark(&mut out, t_addr, t_i32b, r.mark_range());
-                }
-                out.instruction(&I::LocalGet(t_i32));
-                mask_plus_base(&mut out, window);
-                out.instruction(&I::LocalGet(t_i32b));
-                out.instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 0 });
-            }
-            Operator::MemoryFill { .. } => {
-                // [dst, value, n]
-                out.instruction(&I::LocalSet(t_i32b));
-                out.instruction(&I::LocalSet(t_i32));
-                mask_plus_base(&mut out, window);
-                if dirty.is_some() {
-                    mark(&mut out, t_addr, t_i32b, r.mark_range());
-                }
-                out.instruction(&I::LocalGet(t_i32));
-                out.instruction(&I::LocalGet(t_i32b));
-                out.instruction(&I::MemoryFill(0));
-            }
+            Operator::MemoryCopy { .. } => bulk.emit(&mut out, r, true, io, dirty)?,
+            Operator::MemoryFill { .. } => bulk.emit(&mut out, r, false, io, dirty)?,
             Operator::I32DivS | Operator::I32DivU | Operator::I32RemS | Operator::I32RemU => {
                 let name = match op {
                     Operator::I32DivS => "div_s",
@@ -398,6 +390,127 @@ fn io_call(out: &mut Function, t_addr: u32, check: u32, kind: u32) {
     out.instruction(&I::I32Const(kind as i32));
     out.instruction(&I::Call(check));
     out.instruction(&I::End);
+}
+
+/// Scratch locals for `memory.copy` and `memory.fill`: byte count, source
+/// address (a fill's value), destination, index, the byte moved, and the
+/// masked address of an access.
+#[derive(Clone, Copy)]
+struct Bulk {
+    n: u32,
+    from: u32,
+    dst: u32,
+    i: u32,
+    byte: u32,
+    addr: u32,
+    window: u32,
+}
+
+impl Bulk {
+    /// A bulk copy (`[dst, src, n]` on the stack) or fill (`[dst, value,
+    /// n]`): masked into the window, the destination's pages marked dirty,
+    /// and the budget spent ([`Resolver::bulk_spend`]). With an I/O hook,
+    /// one whose bytes reach the I/O window moves them one at a time
+    /// through it, as the loads and stores it stands for would.
+    fn emit<R: Resolver>(self, out: &mut Function, r: &mut R, copy: bool, io: Option<u32>, dirty: Option<u32>) -> Result<()> {
+        out.instruction(&I::LocalSet(self.n));
+        out.instruction(&I::LocalSet(self.from));
+        out.instruction(&I::LocalSet(self.dst));
+        if let Some(check) = io {
+            self.touches_io(out, self.dst);
+            if copy {
+                self.touches_io(out, self.from);
+                out.instruction(&I::I32Or);
+            }
+            out.instruction(&I::If(wasm_encoder::BlockType::Empty));
+            self.bytes(out, copy, check, dirty);
+            out.instruction(&I::Else);
+        }
+        out.instruction(&I::LocalGet(self.dst));
+        mask_plus_base(out, self.window);
+        if dirty.is_some() {
+            mark(out, self.addr, self.n, r.mark_range());
+        }
+        out.instruction(&I::LocalGet(self.from));
+        if copy {
+            mask_plus_base(out, self.window);
+            out.instruction(&I::LocalGet(self.n));
+            out.instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        } else {
+            out.instruction(&I::LocalGet(self.n));
+            out.instruction(&I::MemoryFill(0));
+        }
+        if io.is_some() {
+            out.instruction(&I::End);
+        }
+        for i in r.bulk_spend(self.n) {
+            out.instruction(&i);
+        }
+        Ok(())
+    }
+
+    /// Whether `[addr, addr + n)`, masked, reaches the I/O window.
+    fn touches_io(self, out: &mut Function, addr: u32) {
+        let io = psxw_abi::phys::IO;
+        out.instruction(&I::LocalGet(addr));
+        out.instruction(&I::I32Const(WINDOW_MASK as i32));
+        out.instruction(&I::I32And);
+        out.instruction(&I::LocalTee(self.addr));
+        out.instruction(&I::I32Const(io.end as i32));
+        out.instruction(&I::I32LtU);
+        out.instruction(&I::LocalGet(self.addr));
+        out.instruction(&I::LocalGet(self.n));
+        out.instruction(&I::I32Add);
+        out.instruction(&I::I32Const(io.start as i32));
+        out.instruction(&I::I32GtU);
+        out.instruction(&I::I32And);
+    }
+
+    /// Byte by byte, each load and store through the I/O hook.
+    fn bytes(self, out: &mut Function, copy: bool, check: u32, dirty: Option<u32>) {
+        let at = |out: &mut Function, base: u32| {
+            out.instruction(&I::LocalGet(base));
+            out.instruction(&I::LocalGet(self.i));
+            out.instruction(&I::I32Add);
+            out.instruction(&I::I32Const(WINDOW_MASK as i32));
+            out.instruction(&I::I32And);
+        };
+        out.instruction(&I::I32Const(0));
+        out.instruction(&I::LocalSet(self.i));
+        out.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+        out.instruction(&I::Loop(wasm_encoder::BlockType::Empty));
+        out.instruction(&I::LocalGet(self.i));
+        out.instruction(&I::LocalGet(self.n));
+        out.instruction(&I::I32GeU);
+        out.instruction(&I::BrIf(1));
+        if copy {
+            at(out, self.from);
+            io_guard(out, self.addr, check, 1);
+            out.instruction(&I::I32Load8U(masked(self.window, 0)));
+        } else {
+            out.instruction(&I::LocalGet(self.from));
+        }
+        out.instruction(&I::LocalSet(self.byte));
+        at(out, self.dst);
+        out.instruction(&I::LocalTee(self.addr));
+        out.instruction(&I::LocalGet(self.byte));
+        out.instruction(&I::I32Store8(masked(self.window, 0)));
+        io_after_store(out, self.addr, check, 1);
+        if let Some(map) = dirty {
+            out.instruction(&I::LocalGet(self.addr));
+            out.instruction(&I::I32Const(DIRTY_PAGE_SHIFT as i32));
+            out.instruction(&I::I32ShrU);
+            out.instruction(&I::I32Const(1));
+            out.instruction(&I::I32Store8(MemArg { offset: map as u64, align: 0, memory_index: 0 }));
+        }
+        out.instruction(&I::LocalGet(self.i));
+        out.instruction(&I::I32Const(1));
+        out.instruction(&I::I32Add);
+        out.instruction(&I::LocalSet(self.i));
+        out.instruction(&I::Br(0));
+        out.instruction(&I::End);
+        out.instruction(&I::End);
+    }
 }
 
 /// Mark `[dst, dst + n)` dirty, keeping `dst` (a wasm address) on the stack.

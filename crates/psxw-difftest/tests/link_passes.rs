@@ -135,6 +135,67 @@ int func_80011000(int a) { return func_80012100("x", a, 0x1122334455667788LL, a,
     assert_eq!(c.stack, [5; 8]);
 }
 
+/// A bulk copy (a struct assignment) spends the budget, and with an I/O
+/// hook, a copy that reaches the I/O window goes byte by byte through it.
+#[test]
+fn bulk_copies_spend_and_reach_the_io_hook() {
+    use psxw_link::object::FuncType;
+    use psxw_link::rewrite::{Lowered, Resolver, rewrite};
+    use wasm_encoder::Instruction as I;
+    use wasmparser::{BinaryReader, FunctionBody, Operator as O};
+    struct R;
+    impl Resolver for R {
+        fn call(&mut self, _: u32, _: &FuncType, _: Option<i32>) -> anyhow::Result<Lowered> {
+            anyhow::bail!("no calls")
+        }
+        fn call_indirect(&mut self, _: &FuncType) -> anyhow::Result<u32> {
+            anyhow::bail!("no calls")
+        }
+        fn global(&mut self, _: u32) -> anyhow::Result<u32> {
+            Ok(0)
+        }
+        fn data_addr(&mut self, _: u32) -> anyhow::Result<u32> {
+            anyhow::bail!("no data")
+        }
+        fn func_addr(&mut self, _: u32) -> anyhow::Result<u32> {
+            anyhow::bail!("no functions")
+        }
+        fn type_index(&mut self, ty: u32) -> u32 {
+            ty
+        }
+        fn dirty_map(&self) -> Option<u32> {
+            None
+        }
+        fn mark_range(&mut self) -> u32 {
+            0
+        }
+        fn division(&mut self, _: &'static str) -> Option<u32> {
+            None
+        }
+        fn prologue(&mut self, _: Option<&str>) -> anyhow::Result<Vec<I<'static>>> {
+            Ok(Vec::new())
+        }
+        fn bulk_spend(&mut self, _: u32) -> Vec<I<'static>> {
+            vec![I::Call(41)]
+        }
+        fn io_check(&mut self) -> Option<u32> {
+            Some(42)
+        }
+    }
+    let src = "struct B { int w[256]; };\nvoid func_80011000(struct B *d, struct B *s) { *d = *s; }\n";
+    let Some((_, input)) = compile("psxw-link-bulk", src) else { return };
+    let func = (0..input.obj.funcs.len())
+        .find(|&f| input.obj.func_symbol(f as u32 + input.obj.num_imported_funcs()).is_some_and(|s| s.name == "func_80011000"))
+        .unwrap();
+    let bytes = rewrite(&input.obj, func, &mut R).unwrap().into_raw_body();
+    let body = FunctionBody::new(BinaryReader::new(&bytes, 0));
+    let ops: Vec<O> = body.get_operators_reader().unwrap().into_iter().collect::<Result<_, _>>().unwrap();
+    let calls = |f: u32| ops.iter().filter(|o| **o == O::Call { function_index: f }).count();
+    assert!(ops.iter().any(|o| matches!(o, O::MemoryCopy { .. })), "{ops:?}");
+    // The byte loop's load and store each call the hook; the copy spends.
+    assert_eq!((calls(42), calls(41)), (2, 1), "{ops:?}");
+}
+
 /// A writable static the address map doesn't name has an original address
 /// the link can't know: it fails naming it, rather than placing a second
 /// copy in AUX.

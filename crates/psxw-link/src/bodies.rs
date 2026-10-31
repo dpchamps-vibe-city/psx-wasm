@@ -1,8 +1,7 @@
 //! Function bodies both link modes synthesize.
 
 use crate::link::Division;
-use psxw_abi::WINDOW_MASK;
-use wasm_encoder::{BlockType, Function, Instruction as I, ValType};
+use wasm_encoder::{BlockType, Function, Instruction as I};
 
 /// abs/labs `(i32) -> i32` or fabs `(f64) -> f64` (D29).
 pub fn support(name: &str) -> Function {
@@ -80,30 +79,6 @@ pub fn division(op: &str, conv: Division, brk: u32) -> Function {
         "rem_s" => &I::I32RemS,
         _ => &I::I32RemU,
     });
-    f.instruction(&I::End);
-    f
-}
-
-/// `memcpy(dst, src, n) -> dst` as a window copy; `mark` is the harness's
-/// `(wasm dst, n)` dirty-marking helper.
-pub fn inline_copy(window: u32, mark: Option<u32>) -> Function {
-    let mut f = Function::new([(1, ValType::I32)]);
-    for l in [0, 1] {
-        f.instruction(&I::LocalGet(l));
-        f.instruction(&I::I32Const(WINDOW_MASK as i32));
-        f.instruction(&I::I32And);
-        f.instruction(&I::I32Const(window as i32));
-        f.instruction(&I::I32Add);
-        if let (0, Some(m)) = (l, mark) {
-            f.instruction(&I::LocalTee(3));
-            f.instruction(&I::LocalGet(2));
-            f.instruction(&I::Call(m));
-            f.instruction(&I::LocalGet(3));
-        }
-    }
-    f.instruction(&I::LocalGet(2));
-    f.instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 0 });
-    f.instruction(&I::LocalGet(0));
     f.instruction(&I::End);
     f
 }

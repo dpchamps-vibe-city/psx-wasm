@@ -192,7 +192,6 @@ enum Synth {
     Throw,
     Support(String, FuncType),
     Division(&'static str, crate::link::Division),
-    InlineCopy,
     SpGet,
     SpSet,
     GpGet,
@@ -485,7 +484,7 @@ impl Resolver for R<'_, '_> {
             return Ok(Lowered::Call(self.ctx.synth(Synth::Support(name, sig.clone()))));
         }
         if name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
-            return Ok(Lowered::Call(self.ctx.synth(Synth::InlineCopy)));
+            return Ok(Lowered::Copy);
         }
         if let Some(m) = self.ctx.mod_of[self.input] {
             if let Some(l) = self.mod_call(m, symbol, sig)? {
@@ -703,6 +702,38 @@ impl Resolver for R<'_, '_> {
             I::I32Const(n),
             I::GlobalSet(b),
             I::Call(self.ctx.import(psx::SAFEPOINT)),
+            I::End,
+        ]
+    }
+
+    /// A bulk copy or fill stands for a loop moving a word a pass, as libc's
+    /// `memcpy`/`memset` and GCC's block moves do: it spends a pass per
+    /// word, and every safepoint that many passes reach.
+    fn bulk_spend(&mut self, n: u32) -> Vec<I<'static>> {
+        if self.ctx.mod_of[self.input].is_some() {
+            return Vec::new();
+        }
+        let (b, q) = (self.ctx.budget, self.ctx.spec.budget as i32);
+        vec![
+            I::GlobalGet(b),
+            I::LocalGet(n),
+            I::I32Const(2),
+            I::I32ShrU,
+            I::I32Sub,
+            I::GlobalSet(b),
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::GlobalGet(b),
+            I::I32Const(0),
+            I::I32GtS,
+            I::BrIf(1),
+            I::GlobalGet(b),
+            I::I32Const(q),
+            I::I32Add,
+            I::GlobalSet(b),
+            I::Call(self.ctx.import(psx::SAFEPOINT)),
+            I::Br(0),
+            I::End,
             I::End,
         ]
     }
@@ -945,10 +976,6 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let brk = ctx.import(psx::BREAK);
             let sig = FuncType { params: vec![V::I32; 2], results: vec![V::I32] };
             (sig, crate::bodies::division(op, conv, brk), format!("r3000_{op}"))
-        }
-        Synth::InlineCopy => {
-            let sig = FuncType { params: vec![V::I32; 3], results: vec![V::I32] };
-            (sig, crate::bodies::inline_copy(window, None), "builtin_memcpy".into())
         }
         Synth::Window => {
             let mut f = Function::new([]);

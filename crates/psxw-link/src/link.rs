@@ -151,8 +151,6 @@ enum Synth {
     MarkRange,
     /// R3000 division semantics for C code (`div_s`, `div_u`, `rem_s`, `rem_u`).
     Division(&'static str, Division),
-    /// `memcpy(dst, src, n) -> dst` expanded as a copy.
-    InlineCopy,
 }
 
 struct Ctx<'a> {
@@ -238,7 +236,7 @@ impl Resolver for InputResolver<'_, '_> {
         let s = &inp.obj.symbols[symbol as usize];
         let name = s.name.clone();
         if name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
-            return Ok(Lowered::Call(self.ctx.synth(Synth::InlineCopy)));
+            return Ok(Lowered::Copy);
         }
         match name.as_str() {
             "psxw_sp_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.sp)])),
@@ -689,12 +687,6 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             f.instruction(&I::End);
             let sig = FuncType { params: vec![wasmparser::ValType::I32; 2], results: vec![] };
             (sig, f, "mark_range".into())
-        }
-        Synth::InlineCopy => {
-            let Mode::Harness { dirty, .. } = ctx.mode;
-            let mark = dirty.map(|_| ctx.synth(Synth::MarkRange));
-            let sig = FuncType { params: vec![wasmparser::ValType::I32; 3], results: vec![wasmparser::ValType::I32] };
-            (sig, crate::bodies::inline_copy(WINDOW_BASE, mark), "builtin_memcpy".into())
         }
         Synth::Division(op, conv) => {
             let brk = ctx.synth(Synth::Service {
