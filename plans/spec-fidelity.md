@@ -629,6 +629,47 @@ locals, or static translation.
 
 ## Findings
 
+- **Phase 7, step 3's design: decompiled C's counts** (2026-10-31, under
+  the /goal; recorded before building, as step 3 asks).
+  - *Where the counts come from:* the original, through the lifter. It
+    already builds each function's CFG from the original image, so the
+    instruction count of every basic block, and its natural loops, are
+    known without the matching compiler.
+  - *Line tables, considered and not used:* the matching pipeline
+    (cc1 → maspsx → the assembler) is each decomp's own toolchain, run in
+    its own environment. psx-wasm would have to run it with `-g`, per
+    game, and line info would have to survive maspsx and the assembler.
+    Even with lines, GCC 2.x has no columns, and a `for` line's init, test
+    and step land in different blocks in both compilers. Lines alone
+    don't pair blocks.
+  - *Chosen: regions by loop nest.*
+    - The link sees each decompiled C function's wasm, whose `loop`s are
+      the source's loops: TR13's barriers stop unrolling, and step 1
+      stops vectorising and loop idioms.
+    - Pair them with the original's natural loops by nesting and order.
+      Where the shapes differ, the whole function is one region.
+    - A region's ratio is the original's instructions in it ÷ wasm
+      instructions in it.
+    - Each straight-line wasm segment spends its wasm instruction count ×
+      its region's ratio, in fixed point, on the budget lifted code
+      spends per MIPS block (step 2).
+  - *What it gets right:* a path costs the segments it runs, and a loop's
+    iteration costs what the original's costs on average.
+  - *What it doesn't:* how cost spreads over blocks within a region (GCC
+    and clang place work differently), and load and multiply stalls (as
+    in step 2).
+  - *Check before re-recording baselines:* every function difftest runs
+    in both tiers spends exact counts as lift and estimated counts as C.
+    Compare them over the same seeds and record the distribution of the
+    error.
+  - *Step 2's mechanism:* the lifter writes a spend at each MIPS block's
+    start as a `volatile` asm on the budget global, with no memory
+    clobber, so clang keeps it in place but still optimises memory
+    around it. The link checks the budget at loop headers, as today.
+    Measure the cost; fall back to a call the link lowers if clang's wasm
+    asm can't name the global. TR9's charge (a pass per word, including
+    clang's zero-fills of locals) moves to the same units.
+
 - **Phase 4's limits** (2026-10-31). D33: a value a function passes on
   without setting it is no evidence for its callee; calls through
   pointers carry only o32 registers; GCC's large-frame prologue saves
