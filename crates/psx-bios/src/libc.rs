@@ -8,8 +8,9 @@ use crate::machine::{Flow, GuestCall, Machine, Sdk};
 use psx_devices::mem::Mem;
 
 /// Where `strtok` copies its string: a 100h-byte buffer in the kernel's
-/// variables (psx-spx); the address is ours.
-pub const STRTOK_BUF: u32 = 0x8000_7100;
+/// variables (psx-spx); the address is ours, after the kernel's
+/// handler elements ([`crate::kernel::KERNEL_ELEMENTS`]).
+pub const STRTOK_BUF: u32 = 0x8000_7200;
 
 /// `todigit`: 0-9 for digits, 10-35 for letters, 9999999 for anything
 /// else (psx-spx; for 80h-FFh, "garbage", 9999999 here too).
