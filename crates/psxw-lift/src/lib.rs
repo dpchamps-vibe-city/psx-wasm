@@ -511,23 +511,14 @@ pub struct BiosCall {
 pub fn bios_calls(t: &Translation) -> Vec<BiosCall> {
     let mut out = Vec::new();
     for (n, d) in &t.graph.nodes {
-        let Node::Slot(_) = *n else { continue };
+        let Node::Slot(b) = *n else { continue };
         let table = match &d.transfer {
             Transfer::Jump(Dest::Tail(Callee::Bios { table })) => *table,
             Transfer::Call { callee: Callee::Bios { table }, .. } => *table,
             Transfer::Call { next: Dest::Tail(Callee::Bios { table }), .. } => *table,
             _ => continue,
         };
-        let st = t.facts.consts.get(n).copied().unwrap_or([None; 32]);
-        // t1 after the slot instruction runs.
-        let mut after = st;
-        if let Some(w) = d.insn.writes() {
-            after[w as usize] = None;
-            if d.insn.op == decode::Op::Addiu && d.insn.rs == 0 {
-                after[w as usize] = Some(d.insn.simm as u32);
-            }
-        }
-        out.push(BiosCall { pc: n.pc(), table, func: after[9] });
+        out.push(BiosCall { pc: n.pc(), table, func: t1_after_slot(&t.graph, &t.facts, b) });
     }
     out
 }
@@ -615,6 +606,42 @@ impl FunctionReport {
 mod tests {
     use super::*;
     use program::{Code, Start};
+
+    const BASE: u32 = 0x8001_0000;
+
+    /// Translate `words` placed at [`BASE`], with function starts at the
+    /// given (address, size) pairs.
+    fn lift_words(words: &[u32], starts: &[(u32, u32)]) -> Outcome {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let start = |size: u32| Start { name: None, size: Some(size), sources: [Source::Symbol].into(), boundary: true };
+        let mut program = Program {
+            main: "test".into(),
+            containers: [(
+                "test".to_string(),
+                Code {
+                    id: "test".into(),
+                    text: vec![BASE..BASE + code.len() as u32],
+                    data: vec![],
+                    starts: starts.iter().map(|&(a, n)| (a, start(n))).collect(),
+                },
+            )]
+            .into(),
+        };
+        let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
+        translate_all(&mut program, &originals, &["test".into()])
+    }
+
+    /// A BIOS trampoline sets its function number with `addiu` or `ori`.
+    #[test]
+    fn bios_call_numbers() {
+        for li_t1 in [0x2409_0010 /* addiu t1, zero, 0x10 */, 0x3409_0010 /* ori t1, zero, 0x10 */] {
+            // addiu t2, zero, 0xB0 ; jr t2 ; li t1, 0x10
+            let out = lift_words(&[0x240A_00B0, 0x0140_0008, li_t1], &[(BASE, 12)]);
+            assert!(out.failed.is_empty(), "{:?}", out.failed);
+            let calls: Vec<(u8, Option<u32>)> = bios_calls(&out.ok[0]).iter().map(|c| (c.table, c.func)).collect();
+            assert_eq!(calls, [(0xB0, Some(0x10))], "{li_t1:08X}");
+        }
+    }
 
     /// A GCC nested function reads its parent's frame through v0, which the
     /// parent sets before the call (here ahead of a branch, so it isn't
