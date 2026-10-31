@@ -119,6 +119,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
         (0xC0, 0x0A) => "ChangeClearRCnt",
+        (0xC0, 0x0D) => "SetIrqAutoAck",
         (0xC0, 0x1A) => "set_card_find_mode",
         (0xC0, 0x1D) => "get_card_find_mode",
         _ => "?",
@@ -393,14 +394,20 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(1)
         }
         (0xB0, 0x13) => {
-            m.kernel.pad_started = true;
+            m.start_sio0(false);
             r(1)
         }
         (0xB0, 0x14) => {
-            m.kernel.pad_started = false;
+            m.stop_sio0(false);
             r(1)
         }
-        (0xB0, 0x15) => r(m.kernel.pad_init2(&mut *m.mem, a[0], a[1])),
+        (0xB0, 0x15) => {
+            let v = m.kernel.pad_init2(&mut *m.mem, a[0], a[1]);
+            if v != 0 {
+                m.start_sio0(false);
+            }
+            r(v)
+        }
         (0xB0, 0x16) => r(m.kernel.pad_dr(&mut *m.mem)),
         (0xB0, 0x17) => Err(format!("{label}: called outside an exception handler")),
         (0xB0, 0x18) => {
@@ -521,7 +528,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         // chain.
         (0xB0, 0x4B) | (0xB0, 0x4C) => {
             m.cards_ready();
-            m.kernel.pad_started = func == 0x4B;
+            if func == 0x4B { m.start_sio0(true) } else { m.stop_sio0(true) }
             r(1)
         }
         (0xB0, 0x4E) => r(m.card_write(a[0], a[1], a[2])),
@@ -543,10 +550,9 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         // Kernel tables: addresses in kernel RAM, as the Sony BIOS has them.
         (0xB0, 0x56) => r(0x0000_0674),
         (0xB0, 0x57) => r(0x0000_0874),
-        (0xB0, 0x5B) => {
-            m.kernel.clear_pad = a[0];
-            r(0)
-        }
+        // ChangeClearPad: whether the pad handler acknowledges vblank; the
+        // old setting (OpenBIOS `setSIO0AutoAck`).
+        (0xB0, 0x5B) => r(std::mem::replace(&mut m.kernel.clear_pad, a[0])),
 
         // --- C0h: interrupt plumbing -------------------------------------
         (0xC0, 0x02) => {
@@ -565,6 +571,13 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.clear_rcnt[i] = a[1];
             r(old)
         }
+        // SetIrqAutoAck(irq, flag): the IRQ events' acknowledge.
+        (0xC0, 0x0D) => {
+            if let Some(f) = m.kernel.irq_auto_ack.get_mut(a[0] as usize) {
+                *f = a[1];
+            }
+            r(0)
+        }
         _ => Err(format!("{label}: not implemented")),
     }
 }
@@ -580,8 +593,12 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
             Ok(was as u32)
         }
         // ExitCriticalSection.
+        // ExitCriticalSection: an interrupt left pending is taken.
         2 => {
             m.crit = false;
+            if m.io.as_ref().is_some_and(|io| io.irq.pending()) && !m.in_irq {
+                m.queue_irq_chains();
+            }
             Ok(0)
         }
         // ChangeThreadSubFunction.

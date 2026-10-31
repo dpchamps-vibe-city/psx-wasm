@@ -93,13 +93,11 @@ fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 }
 
 fn init_pad(m: &mut M, a: [u32; 4]) -> Result {
-    m.kernel.pad_bufs = Some([(a[0], a[1]), (a[2], a[3])]);
-    ret(1)
+    psx_bios::bios::call(m, 0xB0, 0x12, a)
 }
 
-fn start_pad(m: &mut M, _a: [u32; 4]) -> Result {
-    m.kernel.pad_started = true;
-    ret(1)
+fn start_pad(m: &mut M, a: [u32; 4]) -> Result {
+    psx_bios::bios::call(m, 0xB0, 0x13, a)
 }
 
 /// `PAD_init(type, button_dest, …)`: `ChangeClearPAD(0)`, then the BIOS's
@@ -137,5 +135,15 @@ mod tests {
         call(&mut m, set_rcnt, [0xF200_0002, 0x1000, 0x1000, 0]);
         assert_eq!(m.timers[2].mode, 0x258);
         assert_eq!(call(&mut m, get_rcnt, [3, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn pads_through_the_bios() {
+        let mut m = machine(vec![], Default::default());
+        m.mem.write(0x8001_0000, &[0x5A; 0x44]);
+        assert_eq!(call(&mut m, init_pad, [0x8001_0000, 0x22, 0x8001_0022, 0x22]), 1);
+        assert_eq!(m.mem.bytes(0x8001_0000, 0x44), [0; 0x44]);
+        assert_eq!(call(&mut m, start_pad, [0; 4]), 1);
+        assert!(m.sio0_started());
     }
 }

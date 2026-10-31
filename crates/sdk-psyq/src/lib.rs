@@ -277,6 +277,11 @@ pub mod testing {
         while let Some(s) = m.irq_calls.pop_front() {
             match s {
                 IrqStep::Sdk(s) => Psyq::irq_step(m, s),
+                IrqStep::Kernel(k) => {
+                    if m.kernel_step(k) {
+                        while m.irq_calls.pop_front().is_some_and(|s| s != IrqStep::Exit) {}
+                    }
+                }
                 IrqStep::Chain(c, _) => guest(m, c.addr),
                 IrqStep::Exit => {}
             }

@@ -57,6 +57,18 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
                 S::irq_step(&mut m, s);
                 continue;
             }
+            // The kernel's own handlers: Rust too. One that returns from
+            // the exception skips the rest of it.
+            if let IrqStep::Kernel(k) = step.0 {
+                if m.kernel_step(k) && step.1 {
+                    while let Some(s) = m.irq_calls.pop_front() {
+                        if s == IrqStep::Exit {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             m.in_irq = true;
             m.rfe = false;
             step
@@ -80,7 +92,7 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
                     }
                 }
             }
-            IrqStep::Sdk(_) => unreachable!("run above"),
+            IrqStep::Sdk(_) | IrqStep::Kernel(_) => unreachable!("run above"),
             IrqStep::Exit => {
                 let buf = rt.borrow().kernel.custom_exit;
                 let resume = rt.borrow().mem.r32(buf);
