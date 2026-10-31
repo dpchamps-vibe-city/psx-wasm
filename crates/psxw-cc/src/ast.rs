@@ -337,13 +337,6 @@ pub fn harness_variant(text: &str) -> String {
     out
 }
 
-/// The hooked variant of a normalized TU (plans/M11): each function in
-/// `names` it defines becomes `weak` and `noinline`, so clang neither
-/// inlines its calls nor uses its body to fold or delete them, the way
-/// GCC 2.95 at `-O2` left every call to a non-inline function. A `static`
-/// one loses `static` (a weak definition can't be internal) on every
-/// file-scope declaration. `inline` functions are left alone: GCC inlined
-/// them too, so the original program has no such calls.
 /// A compiler memory barrier, as lifted loop heads have (psxw-lift's emit).
 pub const BARRIER: &str = "__asm__ __volatile__(\"\" ::: \"memory\");";
 
@@ -497,6 +490,13 @@ pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
     out
 }
 
+/// The hooked variant of a normalized TU (plans/M11): each function in
+/// `names` it defines becomes `weak` and `noinline`, so clang neither
+/// inlines its calls nor uses its body to fold or delete them, the way
+/// GCC 2.95 at `-O2` left every call to a non-inline function. A `static`
+/// one loses `static` (a weak definition can't be internal) on every
+/// file-scope declaration. `inline` functions are left alone: GCC inlined
+/// them too, so the original program has no such calls.
 pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>) -> String {
     let ast = parse(text);
     let mut edits: Vec<crate::edit::Edit> = Vec::new();
