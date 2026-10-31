@@ -24,9 +24,10 @@ type Ov = Option<(u8, String)>;
 ///   registers into the buffer, which the BIOS can't see in translated
 ///   code: ra (the return address), sp, fp, s0-s7, gp, as PsyQ's layout
 ///   has them, and returns 0.
-/// - A `ReturnFromException` (B0h:17h; branch pc in `rfe`) calls
-///   `psxw_return_from_exception`, which unwinds to the runtime's
-///   interrupt entry (psxw-link `guest_invoke_irq`).
+/// - A `ReturnFromException` (B0h:17h), or a handler's own `jr k0; rfe`
+///   (branch pc in `rfe`), calls `psxw_return_from_exception`, which
+///   unwinds to the runtime's interrupt entry (psxw-link
+///   `guest_invoke_irq`).
 /// - A `continuation` function is entered at a `setjmp` return address
 ///   by a longjmp: `a0` is the buffer, `a1` the value `setjmp` returns.
 #[derive(Debug, Clone, Default)]
