@@ -268,11 +268,15 @@ fn send(m: &mut M, b: u8) {
     };
     w.rx = w.card.next().unwrap_or(0xFF);
     if w.card.byte(m.kernel.cards.slots[slot].as_mut(), b).is_some() {
-        let bit = (w.baud as u64 & !1).max(0x20);
-        let at = now + 8 * bit + psx_devices::sio::CARD_ACK_DELAY as u64;
+        let at = now + byte_time(w) + psx_devices::sio::CARD_ACK_DELAY as u64;
         let g = w.generation;
         m.clock.schedule(at, Event::Sdk(EV_ACK, g));
     }
+}
+
+/// A byte's time on the wire at the port's baud: eight bits.
+fn byte_time(w: &Wire) -> u64 {
+    8 * (w.baud as u64 & !1).max(0x20)
 }
 
 /// A card's /ACK: the port's interrupt raised (JOY_CTRL bit 12, which
@@ -494,12 +498,13 @@ fn received(m: &mut M, l: Lib, b: u8, k: Then) -> Result {
 }
 
 /// The transfer's last byte, read once it has arrived, with no /ACK to wait
-/// for (a byte's time: the wait ends at the next safepoint). `ReadDev` and
-/// `WriteDev` don't wait when all the rest is in.
+/// for: a byte's time from its send, just made. `ReadDev` and `WriteDev`
+/// don't wait when all the rest is in.
 fn last(m: &mut M, l: Lib, k: Then) -> Result {
     let f = get(m, l.func_no);
     if !((f == 14 || f == 15) && get(m, l.at(data::RX_LEN)) == get(m, l.data_len) + 4) {
-        spin(m, 1);
+        let t = byte_time(&m.sdk.mc.wire);
+        spin(m, t);
     }
     let seq = get(m, l.at(data::CMD_SEQ)) + 1;
     put(m, l.at(data::CMD_SEQ), seq);
