@@ -233,9 +233,9 @@ fn eval(s: &str) -> Option<u32> {
             None => t.parse().ok(),
         }
     }
-    // Precedence climbing: | < & < + < shifts.
+    // Precedence climbing, as C has it: | < & < shifts < +.
     fn level(t: &[String], p: &mut usize, lv: usize) -> Option<u32> {
-        const OPS: [&[&str]; 4] = [&["|"], &["&"], &["+"], &["<<", ">>"]];
+        const OPS: [&[&str]; 4] = [&["|"], &["&"], &["<<", ">>"], &["+"]];
         if lv == OPS.len() {
             let tok = t.get(*p)?;
             *p += 1;
@@ -462,6 +462,10 @@ mod tests {
         // gte_mvmva(...) through the "g" operand.
         let c = lower("nop;nop;.word %0", ": : \"g\"( 0x000013bf | ((1)<<25) | ((0)<<23) | ((0)<<21) | ((3)<<19) | ((0)<<18) )").unwrap();
         assert!(c.contains("psx_gte_exec(0x486012u);"), "{c}");
+        // C's precedence: `+` binds tighter than a shift, a shift tighter
+        // than `&` and `|`.
+        assert_eq!(eval("1 << 2 + 1"), Some(8));
+        assert_eq!(eval("1 | 2 << 1 & 4"), Some(5));
         // gte_stflg(p)
         let c = lower("cfc2\t$12, $31;nop;sw\t$12, 0( %0 )", ": : \"r\"( p ) : \"$12\", \"memory\"").unwrap();
         assert!(c.contains("__r12 = psx_gte_cfc2(31u); __psxw_sw((__op0 + (unsigned int)0), __r12);"));
