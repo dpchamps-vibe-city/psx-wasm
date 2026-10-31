@@ -2544,3 +2544,27 @@ a chip on its device) then sees what the adapters did, and a guest call
 of a returned address reaches the code at it. Decided without the human's
 input under the /goal that implements plans/spec-fidelity.md, whose
 decisions table proposes it.
+
+**D68. The kernel keeps its state in kernel RAM, as the BIOS does** (spec
+fidelity, phase 3). The A0h, B0h and C0h call tables (at 200h, 874h and
+674h), the event control blocks (through the table of tables, sized by
+`SYSTEM.CNF` `EVENT=`) and the interrupt chains (`SysEnqIntRP` elements
+linked into the exception control blocks) live in kernel RAM where psx-spx
+and OpenBIOS put them, with stand-in entries that reach the Rust BIOS; a
+game that calls through a table, patches an entry, or walks a chain
+sees what the BIOS's own code would. The kernel's own interrupt handlers
+(root counters, vblank, the pad and card handler) are chain elements, run
+when the interrupt is taken, in priority order, honouring
+`ChangeClearRCnt`, `ChangeClearPad` and `SetIrqAutoAck`. Its pad and card
+drivers drive SIO0 through the shared port model, the cards being the
+port's; its file functions go through `AddDrv`'s device table, `cdrom`
+over the CD controller. Extends D57 and D65 (the thread and exception
+tables already in RAM); revises D43's card driver (the BIOS's cards were
+its own images, reached directly).
+
+*Why:* the HLE BIOS kept this state in the runtime, which only works while
+no game reads or patches the kernel's tables, and its handlers ran on
+device events rather than as the kernel's chain, so their order and
+acknowledgement weren't the BIOS's. Decided without the human's input
+under the /goal that implements plans/spec-fidelity.md, whose decisions
+table proposes it.
