@@ -1,0 +1,1 @@
+- **High precision GTE:** Preserve higher-precision projected vertices for enhanced rendering to reduce PS1 vertex wobble; unlike host-only 2×/4× rasterization, this would require carrying extra precision from the GTE through the renderer interface.
