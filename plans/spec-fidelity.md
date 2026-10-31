@@ -1,6 +1,6 @@
 # Spec fidelity
 
-**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress; phase 6 done on its branch but for the human's runs; phase 7's steps 2 and 3 built, the adapters' time all but libgpu's, libcd's, libetc's dispatcher's and libpress's straight-line code, baselines the human's.
+**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress; phase 6 done on its branch but for the human's runs; phase 7's steps 2 and 3 built, the adapters' time all but libgpu's, libcd's and libetc's straight-line code, baselines the human's.
 **Depends on:** [unified adapter layer, phase 1](unified-adaptor-layer/phase1.md)
 (done): the adapters this plan corrects.
 **Replaces:** `plans/shortcuts.md` (the 2026-10-30 audit, commits
@@ -674,9 +674,12 @@ irq, gpu, cd, sio0, memcard and spu in btn, and irq, gpu, cd, mdec, sio0
 and spu in bof4, sio0 and memcard now observing the budget at every
 look. Both games boot to their main loops and run 1,200 frames without
 a trap (`psxw run <game> --check boot --check no-trap`, before the
-handlers' time). Left before step 5: the straight-line code of libgpu's,
-libcd's, libetc's dispatcher's and libpress's adapters (Findings). Step
-5 and exit criterion 3 are the human's.
+handlers' time). libpress's time is done too (`df365f7`, chip mdec
+observing the budget). Left before step 5: the straight-line code of
+libgpu's, libcd's and libetc's adapters, libetc's dispatcher among
+them, and first why the budget doesn't move across a vblank on chip
+irq's device side (Findings). Step 5 and exit criterion 3 are the
+human's.
 
 Step 5, the human's (each game; btn's replay `title-to-gameplay`,
 bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
@@ -847,9 +850,28 @@ locals, or static translation.
     and libsnd's `_SsInit` (spu, `38bf58e`, `69ebfa8`); every libpad
     adapter and its interrupt (sio0, `368670a`); libmcx's `McxStartCom`,
     elements and `_mcxDsrEntry` (memcard, `0b2c55d`).
-  - Left: the straight-line code of libgpu's, libcd's, libetc's
-    dispatcher's and libpress's adapters, which no case sees yet but
-    games run natively.
+  - Done since: libpress's whole paths (mdec, `df365f7`): every
+    adapter's blocks, the waits' first look and return, a pass of 16 at
+    the countdown's header, the pass that sees the MDEC or DMA1 done,
+    the timeout's `printf` and resets; `DecDCTPutEnv`'s copies are 6 a
+    pass (D71 had 5). Chip mdec's cases observe the budget at each
+    `state`: bof4's sides agree at all 132.
+  - Left: the straight-line code of libgpu's, libcd's and libetc's
+    adapters, libetc's dispatcher among them, which games run natively.
+    Measured (btn, chip irq, the budget observed after each call for the
+    occasion, not kept): `ResetCallback` spends nothing natively and
+    4,545 instructions on the device (`startIntr`, `startIntrVSync`,
+    `startIntrDMA` and their clears); `VSync(-1)` 96 natively, 214 on the
+    device. And a question first: across `vblanks(1)` the budget
+    doesn't move on either side, though on the device libetc's original
+    dispatcher, VSync handler and the callback run (entered through the
+    BIOS's custom exit, left with `ReturnFromException`); libpad's
+    handler, through the kernel's chain, does move it. Find where that
+    time goes (`guest_invoke_irq`, `psx.return_from_exception`) before
+    spending the dispatcher's path natively, or the sides will part. The
+    way to do each library: its chip's cases observe the budget (as
+    sio0's, memcard's and mdec's now do), and its adapters spend their
+    originals' blocks until the sides agree at every observation.
   - How the handlers do it (2026-10-31, `368670a`, `0b2c55d`): a
     transliteration of the original's control flow, block by block
     (`sdk_psyq::irq_path`, offsets from `psxw sdk disasm`, checked

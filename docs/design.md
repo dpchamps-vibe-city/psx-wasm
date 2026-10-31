@@ -2865,19 +2865,19 @@ closer to the oracle's (plans/spec-fidelity.md, phase 7 step 5).
   sees what it waits for, and a quantum passes, delivering nothing, only
   at one of the original's loop headers once the budget has run out; an
   element's verifier spends on every walk of the chains. Conformance
-  checks it: chips spu, sio0 and memcard observe the budget after every
-  call or frame, chip irq root counter 2. Done: libapi's counter
+  checks it: chips spu, sio0, memcard and mdec observe the budget after
+  every call or frame, chip irq root counter 2. Done: libapi's counter
   functions and pad element, every libspu adapter and libsnd's
   `_SsInit`, every libpad adapter and its interrupt (`_padIntPad` and
   its callees, block by block), libmcx's `McxStartCom`, elements and
-  `_mcxDsrEntry`. Elsewhere waits and loops spend a pass at the
+  `_mcxDsrEntry`, every libpress adapter. Elsewhere waits and loops
+  spend a pass at the
   loop's own count (the timeout checks and calls each iteration makes
   among them): libetc's `VSync` waits (14 and 6), libgpu's (40, 41, 38),
-  libcd's (35, 38, 30, 30), libpress's (16; `DecDCTPutEnv`'s copies 160);
-  waits that spin through quanta carry the budget as the original's loop
-  does, instead of starting it over. Not yet: the straight-line code of
-  libgpu's, libcd's, libetc's dispatcher's and libpress's adapters
-  (plans/spec-fidelity.md, Findings).
+  libcd's (35, 38, 30, 30); waits that spin through quanta carry the
+  budget as the original's loop does, instead of starting it over. Not
+  yet: the straight-line code of libgpu's, libcd's and libetc's adapters,
+  libetc's dispatcher among them (plans/spec-fidelity.md, Findings).
 - **The check** (difftest, btn @ c77a66f, 64 seeds): every pair spends
   exact counts as lift and the estimate as C over the same seeds. Over
   160,119 runs where both sides returned alike, the error (C − T) / T
