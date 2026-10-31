@@ -58,6 +58,49 @@ pub(crate) fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result
     }
 }
 
+/// A call the replaced code makes to a guest function `f` (the game's
+/// `printf`, `puts`) as its own nested call, then `k`. Arguments past the
+/// fourth go on the stack, in a frame below the caller's, where the
+/// original's own frame holds them.
+pub(crate) fn guest_call(m: &mut M, f: u32, args: &[u32], k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
+    let sp = m.regs.sp();
+    let mut a = [0; 4];
+    for (d, v) in a.iter_mut().zip(args) {
+        *d = *v;
+    }
+    let framed = args.len() > 4;
+    if framed {
+        let frame = sp - ((args.len() as u32 * 4 + 7) & !7);
+        for (i, v) in args.iter().enumerate().skip(4) {
+            m.mem.w32(frame + 4 * i as u32, *v);
+        }
+        m.regs.set_sp(frame);
+    }
+    Flow::Call {
+        call: psx_bios::GuestCall { addr: f, args: a },
+        then: Box::new(move |m, _| {
+            if framed {
+                m.regs.set_sp(sp);
+            }
+            k(m)
+        }),
+    }
+}
+
+/// One of the SDK's own messages, printed as the original prints it: the
+/// `jal` of the game's `printf` or `puts` at `jal`, the format from the
+/// `lui`/`addiu` pair at `hi`, `lo`, then `args`; then `k`. Where the code
+/// isn't the object's, the host log says so and `k` runs.
+pub(crate) fn say(m: &mut M, (hi, lo, jal): (u32, u32, u32), args: &[u32], k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
+    match (libspu::jal(m, jal), libspu::pair(m, hi, lo)) {
+        (Some(f), Some(fmt)) => guest_call(m, f, &[&[fmt][..], args].concat(), k),
+        _ => {
+            m.log(&format!("SDK message at {jal:#010x}: no printf call where PsyQ 4.7's object has it"));
+            k(m)
+        }
+    }
+}
+
 /// Libraries that run as original code, their I/O-window accesses reaching
 /// the runtime's register-level devices (`psx_bios::io`), instead of
 /// being replaced.
@@ -336,6 +379,28 @@ pub mod testing {
         let until = m.vblanks + n;
         let f: Result = Ok(Flow::Block { until: psx_bios::Wait::Vblanks(until), then: Box::new(|_| Flow::Return(0)) });
         finish(m, f);
+    }
+}
+
+#[cfg(test)]
+mod calls {
+    use super::*;
+
+    /// The SDK's messages: a fifth argument goes on the stack, below the
+    /// caller's frame, and sp comes back.
+    #[test]
+    fn guest_call_puts_extra_arguments_on_the_stack() {
+        let mut m = testing::machine(vec![], Default::default());
+        let sp = m.regs.sp();
+        let f = guest_call(&mut m, 0x8001_0000, &[1, 2, 3, 4, 5], |m| {
+            assert_eq!(m.mem.r32(m.regs.sp() - 24 + 16), 5);
+            Flow::Return(0)
+        });
+        let Flow::Call { call, then } = f else { panic!("not a call") };
+        assert_eq!((call.addr, call.args), (0x8001_0000, [1, 2, 3, 4]));
+        assert_eq!(m.regs.sp(), sp - 24);
+        let _ = then(&mut m, 0);
+        assert_eq!(m.regs.sp(), sp);
     }
 }
 

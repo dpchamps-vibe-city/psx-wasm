@@ -338,13 +338,25 @@ fn timeout_start(m: &mut M, s: Sys) {
     m.mem.w32(s.data + data::COUNT, 0);
 }
 
-/// `sys:0x28b4` after it runs out: the message, the queue emptied, DMA2
-/// stopped and enabled, the GPU's interrupt acknowledged and its command
-/// buffer reset.
-fn timeout(m: &mut M, s: Sys) -> std::result::Result<(), String> {
+/// `sys:0x28b4` after it runs out: the message through the game's
+/// `printf` ("GPU timeout:que=%d,stat=%08x,chcr=%08x,madr=%08x\n"), then
+/// [`reset_after_timeout`]; then `k(false)`.
+fn timeout(m: &mut M, s: Sys, k: KOk) -> Flow<Psyq> {
     let que = queued(m, s);
-    let (stat, chcr, madr) = (gpustat(m), reg(m, CHCR2, 4)?, reg(m, MADR2, 4)?);
-    m.host.log(2, &format!("GPU timeout:que={que},stat={stat:08x},chcr={chcr:08x},madr={madr:08x}"));
+    let (stat, chcr, madr) = match (|| Ok::<_, String>((gpustat(m), reg(m, CHCR2, 4)?, reg(m, MADR2, 4)?)))() {
+        Ok(v) => v,
+        Err(e) => return fail(m, e),
+    };
+    let t = s.text;
+    crate::say(m, (t + 0x2910, t + 0x2914, t + 0x2950), &[que, stat, chcr, madr], move |m| match reset_after_timeout(m, s) {
+        Ok(()) => k(m, false),
+        Err(e) => fail(m, e),
+    })
+}
+
+/// The queue emptied, DMA2 stopped and enabled, the GPU's interrupt
+/// acknowledged and its command buffer reset.
+fn reset_after_timeout(m: &mut M, s: Sys) -> std::result::Result<(), String> {
     mask(m, s, data::MASK_RESET)?;
     m.mem.w32(s.data + data::QOUT, 0);
     m.mem.w32(s.data + data::QIN, 0);
@@ -372,10 +384,7 @@ fn iterate(m: &mut M, s: Sys, n: u32, k: KOk) -> Flow<Psyq> {
     if (deadline as i32) < vcount(m) as i32 || room < n {
         let done = if (deadline as i32) < vcount(m) as i32 { 0 } else { room + 1 };
         m.mem.w32(s.data + data::COUNT, count + done);
-        return match timeout(m, s) {
-            Ok(()) => k(m, false),
-            Err(e) => fail(m, e),
-        };
+        return timeout(m, s, k);
     }
     m.mem.w32(s.data + data::COUNT, count + n);
     m.sdk.gpu.phase += n;
@@ -868,12 +877,23 @@ fn reset_graph(m: &mut M, a: [u32; 4]) -> Result {
     if !matches!(mode & 7, 0 | 3 | 5) {
         return ret(reset(m, s, 1)?);
     }
-    if mode & 7 != 5 {
-        let table = m.mem.r32(s.data + data::TABLE);
-        m.host.log(2, &format!("ResetGraph:jtb={table:08x},env={g:08x}"));
+    let rest = move |m: &mut M| {
+        m.mem.write(g, &[0; genv::SIZE as usize]);
+        reset_graph_rest(s, mode)
+    };
+    if mode & 7 == 5 {
+        return Ok(rest(m));
     }
-    m.mem.write(g, &[0; genv::SIZE as usize]);
-    Ok(Flow::Call {
+    // "ResetGraph:jtb=%08x,env=%08x\n" with the addresses of the table and
+    // GEnv.
+    let t = s.text + at::RESET_GRAPH;
+    Ok(crate::say(m, (t + 0x4C, t + 0x50, t + 0x60), &[s.data + 8, g], rest))
+}
+
+/// `ResetGraph` from its `ResetCallback` on.
+fn reset_graph_rest(s: Sys, mode: u32) -> Flow<Psyq> {
+    let g = s.genv();
+    Flow::Call {
         call: GuestCall { addr: s.reset_callback, args: [0; 4] },
         then: Box::new(move |m, _| {
             let r = (|| -> std::result::Result<u32, String> {
@@ -895,7 +915,7 @@ fn reset_graph(m: &mut M, a: [u32; 4]) -> Result {
                 Err(e) => fail(m, e),
             }
         }),
-    })
+    }
 }
 
 /// `SetDispMask(mask)`: GP1(03h); with 0 the DISPENV copy invalid. Its

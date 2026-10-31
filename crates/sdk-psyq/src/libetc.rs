@@ -158,6 +158,9 @@ pub struct Etc {
     /// the interrupted code's sp while it does.
     pub stack: u32,
     pub saved_sp: u32,
+    /// `intr.o`'s text (`ResetCallback`'s address), where the dispatcher's
+    /// messages are.
+    pub intr: u32,
 }
 
 /// `intr.o`'s stack, its context's `stack[1024]`, from `ResetCallback` at
@@ -215,6 +218,17 @@ fn front(m: &mut M, steps: &[IrqStep]) {
     }
 }
 
+/// One of the dispatcher's messages through the game's `printf`, queued
+/// to run next: its format's `lui`/`addiu` and the `jal`, at these offsets
+/// in `intr.o`.
+fn message(m: &mut M, (hi, lo, jal): (u32, u32, u32), args: [u32; 2]) {
+    let t = m.sdk.etc.intr;
+    match (crate::libspu::jal(m, t + jal), crate::libspu::pair(m, t + hi, t + lo)) {
+        (Some(f), Some(fmt)) => front(m, &[IrqStep::Chain(GuestCall { addr: f, args: [fmt, args[0], args[1], 0] }, None)]),
+        _ => m.log(&format!("libetc/intr at {:#010x}: no printf where PsyQ 4.7's object has it", m.sdk.etc.intr)),
+    }
+}
+
 /// A call of `f` with the a0 the original leaves; the other argument
 /// registers hold whatever it last put there, which nothing reads.
 fn guest(f: u32, a0: u32) -> GuestCall {
@@ -230,7 +244,12 @@ fn pending(m: &mut M) -> std::result::Result<u32, String> {
 /// `intr.o`'s dispatcher, at the top of its loop.
 fn dispatch(m: &mut M) -> std::result::Result<(), String> {
     if !m.sdk.etc.active {
-        // "unexpected interrupt": the original returns from the exception.
+        // "unexpected interrupt(%04x)\n" with I_STAT; the original returns
+        // from the exception.
+        if m.sdk.etc.intr != 0 {
+            let stat = reg(m, I_STAT, 2)?;
+            message(m, (0x2B0, 0x2B8, 0x2B4), [stat, 0]);
+        }
         return Ok(());
     }
     // The exception's first pass: onto libetc's stack, as the original's
@@ -254,7 +273,8 @@ fn dispatch(m: &mut M) -> std::result::Result<(), String> {
         m.sdk.etc.spurious = n + 1;
         if n > 2048 {
             let (stat, mask) = (reg(m, I_STAT, 2)?, reg(m, I_MASK, 2)?);
-            m.log(&format!("intr timeout({stat:04x}:{mask:04x})"));
+            // "intr timeout(%04x:%04x)\n".
+            message(m, (0x3D8, 0x3DC, 0x3E8), [stat, mask]);
             m.sdk.etc.spurious = 0;
             set_reg(m, I_STAT, 2, 0)?;
         }
@@ -407,6 +427,7 @@ fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     (e.dispatching, e.lines, e.mask, e.saved_mask, e.saved_dpcr) = (false, Default::default(), 0, 0, 0);
     e.active = true;
     let reset = m.sdk.at;
+    m.sdk.etc.intr = reset;
     m.sdk.etc.stack = intr_stack(&mut |a| m.mem.r32(a), reset).map_or(0, |s| s.end - 4 * 20);
     set_reg(m, RCNT1_MODE, 4, 0x100)?;
     m.sdk.etc.vcount = 0;
@@ -538,10 +559,11 @@ fn vsync(m: &mut M, a: [u32; 4]) -> Result {
     }
     let last = m.sdk.etc.last;
     let (target, timeout) = if mode > 0 { (last.wrapping_add(mode as u32 - 1), mode as u32 - 1) } else { (last, 0) };
-    Ok(wait_vcount(m, target, timeout, move |m| {
+    let text = m.sdk.at;
+    Ok(wait_vcount(m, text, target, timeout, move |m| {
         let field = gpustat(m);
         let next = m.sdk.etc.vcount.wrapping_add(1);
-        wait_vcount(m, next, 1, move |m| interlace(m, field, delta))
+        wait_vcount(m, text, next, 1, move |m| interlace(m, field, delta))
     }))
 }
 
@@ -573,17 +595,21 @@ fn spin(m: &mut M, done: Box<dyn Fn(&mut M) -> bool>, then: Box<dyn FnOnce(&mut 
 /// deadline. In NTSC it only runs out when nothing counts vblanks: inside
 /// a handler or a critical section, libetc stopped, or line 0 taken by a
 /// handler that doesn't call libetc's.
-fn wait_vcount(m: &mut M, target: u32, timeout: u32, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
+/// `text` is VSync's: its "VSync: timeout\n" goes through the game's
+/// `puts`.
+fn wait_vcount(m: &mut M, text: u32, target: u32, timeout: u32, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
     let iterations = ((timeout as u64) << 15) + 1;
     let deadline = m.clock.now + iterations * quantum(m) / LOOP_BUDGET;
     let reached = move |m: &M| m.sdk.etc.vcount as i32 >= target as i32;
     let then = move |m: &mut M| {
-        if !reached(m) {
-            m.log("VSync: timeout");
+        if reached(m) {
+            return then(m);
+        }
+        crate::say(m, (text + 0x1C0, text + 0x1C8, text + 0x1C4), &[], move |m| {
             let _ = bios(m, 0xB0, 0x5B, [0; 4]);
             let _ = bios(m, 0xC0, 0x0A, [3, 0, 0, 0]);
-        }
-        then(m)
+            then(m)
+        })
     };
     spin(m, Box::new(move |m| reached(m) || m.clock.now >= deadline), Box::new(then))
 }

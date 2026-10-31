@@ -117,7 +117,25 @@ mod d {
     pub const INTR: u32 = 0x2E4;
     /// What `CD_init` prints as its address.
     pub const INIT_ADDR: u32 = 0x2E8;
+    /// The names the timeout message gives: per command, per interrupt
+    /// state (string pointers).
+    pub const COM_NAMES: u32 = 0x2C;
+    pub const INTR_NAMES: u32 = 0xAC;
 }
+
+/// A wait's "CD timeout" in `bios_1`'s text: its name's `lui`/`addiu`
+/// (`CD_sync`, …) and the `jal` of `puts("CD timeout: ")`, whose format's
+/// `lui` comes before it and `addiu` in its delay slot; the `printf` of
+/// the details follows, laid out the same, 4Ch on.
+#[derive(Debug, Clone, Copy)]
+struct Site {
+    name: u32,
+    puts: u32,
+}
+
+const SYNC: Site = Site { name: 0x5CC, puts: 0x634 };
+const READY: Site = Site { name: 0x84C, puts: 0x8B4 };
+const CW: Site = Site { name: 0xC90, puts: 0xD10 };
 
 /// `bios_1`'s `.bss`: the result buffers the callbacks get.
 mod bs {
@@ -409,13 +427,25 @@ type Done = fn(&mut M, Bios1) -> Option<u32>;
 /// [`TIMEOUT_PASSES`]: "CD timeout", `CD_flush`, -1. A wait that spun
 /// leaves the guest's safepoint budget as the loop's last safepoint did:
 /// full (D60).
-fn wait(m: &mut M, b: Bios1, what: &'static str, once: bool, done: Done, then: Then) -> Flow<Psyq> {
+fn wait(m: &mut M, b: Bios1, site: Site, once: bool, done: Done, then: Then) -> Flow<Psyq> {
     let deadline = m.clock.now + (TIMEOUT_PASSES + 1) * quantum(m) / LOOP_BUDGET;
-    pass(m, b, what, once, deadline, false, done, then)
+    pass(m, b, site, once, deadline, false, done, then)
+}
+
+/// "CD timeout: " through the game's `puts`, then "%s:(%s) Sync=%s,
+/// Ready=%s\n" through its `printf`: the wait's name, the command's, the
+/// two interrupt states'. Then `k`.
+fn timeout_message(m: &mut M, b: Bios1, site: Site, k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
+    let (t, p) = (b.text, b.text + site.puts);
+    let name = hi_lo(m, t + site.name, t + site.name + 4).unwrap_or(0);
+    let names = |m: &M, table: u32, i: u8| m.mem.r32(b.data + table + 4 * i as u32);
+    let com = m.mem.r8(b.data + d::COM);
+    let args = [name, names(m, d::COM_NAMES, com), names(m, d::INTR_NAMES, b.intr(m, 0)), names(m, d::INTR_NAMES, b.intr(m, 1))];
+    crate::say(m, (p - 4, p + 4, p), &[], move |m| crate::say(m, (p + 0x48, p + 0x50, p + 0x4C), &args, k))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pass(m: &mut M, b: Bios1, what: &'static str, once: bool, deadline: u64, spun: bool, done: Done, then: Then) -> Flow<Psyq> {
+fn pass(m: &mut M, b: Bios1, site: Site, once: bool, deadline: u64, spun: bool, done: Done, then: Then) -> Flow<Psyq> {
     let end = move |m: &mut M, v: u32, then: Then| {
         if spun {
             m.regs.reset_budget();
@@ -423,10 +453,10 @@ fn pass(m: &mut M, b: Bios1, what: &'static str, once: bool, deadline: u64, spun
         then(m, v)
     };
     if m.clock.now >= deadline {
-        let com = m.mem.r8(b.data + d::COM);
-        m.log(&format!("CD timeout: {what}: com={com} sync={} ready={}", b.intr(m, 0), b.intr(m, 1)));
-        flush(m, b);
-        return end(m, u32::MAX, then);
+        return timeout_message(m, b, site, move |m| {
+            flush(m, b);
+            end(m, u32::MAX, then)
+        });
     }
     let rest: Next = Box::new(move |m: &mut M| {
         if let Some(v) = done(m, b) {
@@ -437,7 +467,7 @@ fn pass(m: &mut M, b: Bios1, what: &'static str, once: bool, deadline: u64, spun
         }
         let until = m.clock.now + quantum(m);
         m.run_until(until);
-        Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, what, once, deadline, true, done, then)) }
+        Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, site, once, deadline, true, done, then)) }
     });
     // In a callback (libetc's dispatcher, or any exception) no interrupt
     // is taken: the loop polls the controller itself.
@@ -455,7 +485,7 @@ fn sync(m: &mut M, b: Bios1, once: bool, result: u32, then: Then) -> Flow<Psyq> 
     wait(
         m,
         b,
-        "CD_sync",
+        SYNC,
         once,
         done,
         Box::new(move |m, v| {
@@ -484,7 +514,7 @@ fn ready(m: &mut M, b: Bios1, once: bool, result: u32, then: Then) -> Flow<Psyq>
     wait(
         m,
         b,
-        "CD_ready",
+        READY,
         once,
         done,
         Box::new(move |m, v| {
@@ -537,7 +567,7 @@ fn cw(m: &mut M, b: Bios1, com: u8, param: u32, result: u32, nowait: bool, then:
             copy8(m, b.bss + bs::SYNC, result);
             then(m, if b.intr(m, 0) == 5 { u32::MAX } else { 0 })
         });
-        if b.intr(m, 0) != 0 { answer(m, 0) } else { wait(m, b, "CD_cw", false, answered, answer) }
+        if b.intr(m, 0) != 0 { answer(m, 0) } else { wait(m, b, CW, false, answered, answer) }
     };
     sync(m, b, false, 0, Box::new(issue))
 }
@@ -635,7 +665,15 @@ fn cd_initintr(m: &mut M, _a: [u32; 4]) -> Result {
 /// with the shell open), Init and Demute, and Init's completion: 0, or -1.
 fn cd_init(m: &mut M, _a: [u32; 4]) -> Result {
     let b = bios1(m, at::CD_INIT)?;
-    m.log(&format!("CD_init:addr={:08x}", b.data + d::INIT_ADDR));
+    // "CD_init:" through the game's `puts`, then "addr=%08x\n" through its
+    // `printf`.
+    let t = b.text;
+    Ok(crate::say(m, (t + 0x1154, t + 0x1158, t + 0x1160), &[], move |m| {
+        crate::say(m, (t + 0x1168, t + 0x116C, t + 0x1174), &[b.data + d::INIT_ADDR], move |m| cd_init_rest(m, b).unwrap_or_else(|e| panic!("CD_init: {e}")))
+    }))
+}
+
+fn cd_init_rest(m: &mut M, b: Bios1) -> Result {
     m.mem.w8(b.data + d::COM, 0);
     m.mem.w8(b.data + d::MODE, 0);
     let fail = (-1i32) as u32;
