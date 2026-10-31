@@ -2,7 +2,6 @@
 //! buffers the kernel fills at vblank, open files, the heap, interrupt
 //! handler queues (psx-spx "Kernel (BIOS)").
 
-use crate::machine::Host;
 use crate::{Machine, Sdk};
 #[allow(unused_imports)]
 use crate::IrqStep;
@@ -135,27 +134,6 @@ impl Kernel {
         out
     }
 
-    /// The pad and card handler's pads: each port's state into the
-    /// `InitPAD2` buffers (status 0x00 + ID + data, or 0xFF when nothing is
-    /// connected), at most 22h bytes whatever the buffer's size; then
-    /// `PAD_dr` when `PAD_init2` named a destination.
-    pub fn pad_vblank(&mut self, mem: &mut dyn Mem, host: &mut dyn Host) {
-        let (Some(bufs), true) = (self.pad_bufs, self.pad_enable) else { return };
-        for (port, (addr, _)) in bufs.iter().enumerate() {
-            let state = host.pad_state(port as u32);
-            if state.is_empty() {
-                mem.w8(*addr, 0xFF);
-                continue;
-            }
-            let mut out = vec![0x00, if state.len() > 2 { 0x73 } else { 0x41 }];
-            out.extend(&state);
-            out.truncate(PAD_BUF as usize);
-            mem.write(*addr, &out);
-        }
-        if self.pad_dest != 0 {
-            self.pad_dr(mem);
-        }
-    }
 }
 
 /// The event control blocks, in kernel RAM through the table of tables
@@ -371,7 +349,7 @@ impl<S: Sdk> Machine<S> {
                 if !taken(self, vblank) {
                     return false;
                 }
-                self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
+                self.read_pads();
                 if self.kernel.clear_pad != 0 {
                     ack(self, vblank);
                 }
@@ -407,6 +385,53 @@ impl<S: Sdk> Machine<S> {
         self.deq_int_rp(2, kernel_element(SIO0_ELEMENT));
         if card {
             self.kernel.card_started = false;
+        }
+    }
+
+    /// The pad and card handler's pads (OpenBIOS `readPad`, psx-spx
+    /// `InitPAD2`): each port's pad through SIO0's model of it, with the
+    /// buttons it latched at this vblank (BIOS5): selected, 01h, 42h (its
+    /// ID), 00h (5Ah), then as many halfwords as the ID's low nibble says
+    /// (16 for 0), stored after the status and the ID, at most 22h bytes
+    /// whatever the buffer's size; the status is 00h, or FFh when the pad
+    /// doesn't acknowledge or answer 5Ah. Then `PAD_dr` when `PAD_init2`
+    /// named a destination.
+    fn read_pads(&mut self) {
+        let (Some(bufs), true) = (self.kernel.pad_bufs, self.kernel.pad_enable) else { return };
+        for (port, (addr, _)) in bufs.into_iter().enumerate() {
+            let Some(io) = self.io.as_mut() else { return };
+            let pad = &mut io.sio0.pads[port];
+            pad.select();
+            let mut got = vec![0xFF];
+            let (_, ack) = pad.exchange(0x01);
+            if ack {
+                let (id, ack) = pad.exchange(0x42);
+                got.push(id);
+                let (z, mut ack) = if ack { pad.exchange(0) } else { (0, false) };
+                if ack && z == 0x5A {
+                    let n = match id & 0x0F {
+                        0 => 32,
+                        h => 2 * h as usize,
+                    };
+                    for i in 0..n {
+                        if !ack {
+                            break;
+                        }
+                        let (b, a) = pad.exchange(0);
+                        got.push(b);
+                        ack = a || i + 1 == n;
+                    }
+                    if ack {
+                        got[0] = 0x00;
+                    }
+                }
+            }
+            pad.deselect();
+            got.truncate(PAD_BUF as usize);
+            self.mem.write(addr, &got);
+        }
+        if self.kernel.pad_dest != 0 {
+            self.kernel.pad_dr(&mut *self.mem);
         }
     }
 

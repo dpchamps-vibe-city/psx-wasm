@@ -96,6 +96,30 @@ pub struct Pad {
 }
 
 impl Pad {
+    /// A transfer a byte at a time, for a driver that talks to the pad
+    /// without the port's registers (the BIOS's pad handler): the pad is
+    /// selected, each byte clocked through it bit by bit as the port does,
+    /// and deselected.
+    pub fn select(&mut self) {
+        self.set_dtr(false);
+        self.set_dtr(true);
+    }
+
+    /// Byte `b` out: the pad's byte back, and whether it acknowledged.
+    pub fn exchange(&mut self, b: u8) -> (u8, bool) {
+        let (mut rx, mut ack) = (0u8, false);
+        for bit in 0..8 {
+            let mut delay = 0;
+            rx |= (self.clock(b >> bit & 1 != 0, &mut delay) as u8) << bit;
+            ack |= delay != 0;
+        }
+        (rx, ack)
+    }
+
+    pub fn deselect(&mut self) {
+        self.set_dtr(false);
+    }
+
     fn set_dtr(&mut self, dtr: bool) {
         if !self.dtr && dtr {
             self.phase = 0;
