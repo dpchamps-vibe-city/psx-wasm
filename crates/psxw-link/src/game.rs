@@ -436,7 +436,7 @@ impl Ctx<'_> {
 
     /// How guest addresses reach the window: the console's map.
     fn window(&self) -> rewrite::Window {
-        rewrite::Window { base: self.spec.window_base, map: Some(self.import(psx::MAP_ACCESS)) }
+        rewrite::Window { base: self.spec.window_base, map: self.import(psx::MAP_ACCESS) }
     }
 
     /// The o32 entry of the function at (container, addr): its hook chain
@@ -789,8 +789,8 @@ impl Resolver for R<'_, '_> {
         self.ctx.spec.window_base
     }
 
-    fn map_access(&mut self) -> Option<u32> {
-        Some(self.ctx.import(psx::MAP_ACCESS))
+    fn map_access(&mut self) -> u32 {
+        self.ctx.import(psx::MAP_ACCESS)
     }
 
     fn dirty_map(&self) -> Option<u32> {

@@ -24,12 +24,15 @@ pub const STACK_EXCLUDE: u32 = 0x1_0000;
 /// into the stack frames, where C and the original lay out spills
 /// differently; the guard ends such a scan first, on both sides alike.
 pub const STACK_GUARD: u32 = 0x100;
-/// Seeded scratch memory that pointer arguments point into.
-pub const SCRATCH: u32 = 0x8070_0000;
+/// Seeded scratch memory that pointer arguments point into: in
+/// psx-wasm's own space (psxw-abi `own`), clear of RAM and its mirrors.
+pub const SCRATCH: u32 = psxw_abi::own(0x0070_0000);
 pub const SCRATCH_LEN: u32 = 0x8000;
 /// Snapshot extent: RAM, AUX and the scratchpad.
 const SNAPSHOT_LEN: usize = 0x0080_0400;
 const MAX_CALLOUTS: usize = 4096;
+/// The trap of an access the console's map has no memory for, on either side.
+pub const BUS_ERROR: &str = "bus error";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Callout {
@@ -160,6 +163,23 @@ impl Harness {
                 let v = answer(st, i, kind, target);
                 st.log[i].ret = v;
                 Ok(v)
+            },
+        )?;
+        // The console's map, as the game's runtime answers it (psx-runtime
+        // `map_access`). A bus error is a fault on either side, wherever
+        // it falls.
+        linker.func_wrap(
+            "h",
+            psxw_abi::psx::MAP_ACCESS,
+            |mut caller: Caller<'_, State>, addr: i32, len: i32, store: i32| -> wasmtime::Result<i32> {
+                let (addr, len, store) = (addr as u32, len as u32, store != 0);
+                let off = psxw_abi::map::access(addr, len, store).ok_or_else(|| wasmtime::Error::msg(BUS_ERROR))?;
+                if let (false, Some(psxw_abi::map::Region::Expansion(v))) = (store, psxw_abi::map::place(addr).map(|p| p.region)) {
+                    let mem = caller.get_export("memory").and_then(|e| e.into_memory()).expect("memory");
+                    let at = WINDOW_BASE + off as usize;
+                    mem.data_mut(&mut caller)[at..at + len as usize].fill(v);
+                }
+                Ok(off as i32)
             },
         )?;
         let mut store = Store::new(&engine, State { ret_ext, ..Default::default() });

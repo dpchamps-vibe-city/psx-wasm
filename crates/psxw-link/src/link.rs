@@ -12,7 +12,7 @@ use crate::marshal;
 use crate::object::{FuncType, NameClass, SymbolKind, WasmObject, classify_name};
 use crate::rewrite::{self, Lowered, Resolver};
 use anyhow::{Context as _, Result, anyhow, bail};
-use psxw_abi::{WINDOW_BASE, WINDOW_MASK};
+use psxw_abi::WINDOW_BASE;
 use psxw_cc::protos::Proto;
 use psxw_inputs::AddressMap;
 use std::collections::{BTreeMap, HashMap};
@@ -174,6 +174,10 @@ struct Ctx<'a> {
 }
 
 const CALLOUT_IMPORT: u32 = 0;
+/// `h.map_access`: psxw-abi `psx::MAP_ACCESS`, which the harness answers from
+/// the same map (a bus error traps on both sides).
+const MAP_IMPORT: u32 = 1;
+const WINDOW: rewrite::Window = rewrite::Window { base: WINDOW_BASE, map: MAP_IMPORT };
 
 impl Ctx<'_> {
     fn intern(&mut self, t: &FuncType) -> u32 {
@@ -309,6 +313,10 @@ impl Resolver for InputResolver<'_, '_> {
         self.ctx.intern(&t)
     }
 
+    fn map_access(&mut self) -> u32 {
+        MAP_IMPORT
+    }
+
     fn dirty_map(&self) -> Option<u32> {
         match self.ctx.mode {
             Mode::Harness { dirty, .. } => dirty,
@@ -379,7 +387,7 @@ pub fn link(
         mode,
         types: Vec::new(),
         type_ix: HashMap::new(),
-        nimports: 1,
+        nimports: 2,
         guest: HashMap::new(),
         guest_order: Vec::new(),
         synth: Vec::new(),
@@ -388,6 +396,7 @@ pub fn link(
         gp: 1,
         chain: 2,
     };
+    let map_ty = ctx.intern(&FuncType { params: vec![wasmparser::ValType::I32; 3], results: vec![wasmparser::ValType::I32] });
     let callout_ty = ctx.intern(&FuncType {
         params: vec![wasmparser::ValType::I32; 8],
         results: vec![wasmparser::ValType::I64],
@@ -462,6 +471,7 @@ pub fn link(
     module.section(&types);
     let mut imports = ImportSection::new();
     imports.import("h", "callout", EntityType::Function(callout_ty));
+    imports.import("h", psxw_abi::psx::MAP_ACCESS, EntityType::Function(map_ty));
     module.section(&imports);
     let mut functions = FunctionSection::new();
     for (t, _) in &bodies {
@@ -504,7 +514,8 @@ pub fn link(
     for &(i, si, addr) in &ctx.layout.aux.clone() {
         let fa = |input: usize, sym: u32| func_addr(&ctx, input, sym);
         let bytes = ctx.layout.bytes_of(&ctx.view, map, i, si, &fa)?;
-        data.active(0, &ConstExpr::i32_const((WINDOW_BASE + (addr & WINDOW_MASK)) as i32), bytes);
+        let at = WINDOW.constant(addr, bytes.len() as u32, true).context("AUX data")?;
+        data.active(0, &ConstExpr::i32_const((WINDOW_BASE + at) as i32), bytes);
         aux.push((inputs[i].label.clone(), inputs[i].obj.symbols[si as usize].name.clone(), addr));
     }
     module.section(&data);
@@ -557,7 +568,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 sig,
                 &words,
                 sp,
-                rewrite::Window::masked(WINDOW_BASE),
+                WINDOW,
                 &|f| {
                     f.instruction(&I::I32Const(callout::CALL as i32));
                     f.instruction(&I::I32Const(addr as i32));
@@ -600,7 +611,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 &helper,
                 &words,
                 sp,
-                rewrite::Window::masked(WINDOW_BASE),
+                WINDOW,
                 &|f| {
                     f.instruction(&I::I32Const(callout::INDIRECT as i32));
                     f.instruction(&I::LocalGet(target));
@@ -719,7 +730,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             let sig = obj.types[obj.funcs[*func as usize].ty as usize].clone();
             let proto = ctx.inputs[*input].protos.get(name);
             let callee = ctx.guest[&(*input, *func)];
-            let body = marshal::o32_to_c(&sig, proto, callee, sp, rewrite::Window::masked(WINDOW_BASE));
+            let body = marshal::o32_to_c(&sig, proto, callee, sp, WINDOW);
             (o32_sig(), body, format!("o32:{name}"))
         }
     })

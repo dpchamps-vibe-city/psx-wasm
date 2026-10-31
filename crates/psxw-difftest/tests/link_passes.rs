@@ -233,6 +233,9 @@ fn bulk_copies_spend_and_reach_the_io_hook() {
         fn io_check(&mut self) -> Option<u32> {
             Some(42)
         }
+        fn map_access(&mut self) -> u32 {
+            40
+        }
     }
     let src = "struct B { int w[256]; };\nvoid func_80011000(struct B *d, struct B *s) { *d = *s; }\n";
     let Some((_, input)) = compile("psxw-link-bulk", src) else { return };

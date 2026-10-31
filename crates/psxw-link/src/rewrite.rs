@@ -17,7 +17,7 @@
 
 use crate::object::{FuncType, WasmObject};
 use anyhow::{Context as _, Result, bail};
-use psxw_abi::{WINDOW_BASE, WINDOW_MASK, map};
+use psxw_abi::{WINDOW_BASE, map};
 use wasm_encoder::reencode::Reencode;
 use wasm_encoder::{BlockType, Function, Instruction as I, MemArg, ValType};
 use wasmparser::{BinaryReader, FunctionBody, Operator, RelocationType};
@@ -91,13 +91,9 @@ pub trait Resolver {
     fn window_base(&self) -> u32 {
         WINDOW_BASE
     }
-    /// `psx.map_access`: what an access outside RAM's inline path calls.
-    /// `None`: addresses are masked into the window instead (the
-    /// differential harness, which compares two translations of one
-    /// function and has no console behind it).
-    fn map_access(&mut self) -> Option<u32> {
-        None
-    }
+    /// The function an access outside RAM's inline path calls
+    /// (`(addr, len, store) -> window offset`, psxw-abi `psx::MAP_ACCESS`).
+    fn map_access(&mut self) -> u32;
 }
 
 /// How a module's guest addresses become window offsets ([`psxw_abi::map`]).
@@ -105,21 +101,17 @@ pub trait Resolver {
 pub struct Window {
     /// The window's wasm address: every access's memarg offset.
     pub base: u32,
-    /// `psx.map_access`, or `None` to mask (see [`Resolver::map_access`]).
-    pub map: Option<u32>,
+    /// [`Resolver::map_access`].
+    pub map: u32,
 }
 
 impl Window {
-    pub fn masked(base: u32) -> Self {
-        Window { base, map: None }
-    }
-
     /// With a guest address on the stack: the window offset of the `len`
     /// bytes a load (or a store) there reaches. RAM through KUSEG and KSEG0
     /// inline (one mask and one test, using scratch local `t`), anything
     /// else through `psx.map_access`, which traps on a bus error.
     pub fn offset(self, f: &mut Function, t: u32, len: u32, store: bool) {
-        let Some(map) = self.map else { return mask(f) };
+        let map = self.map;
         f.instruction(&I::LocalTee(t));
         f.instruction(&I::I32Const(map::FAST_MASK as i32));
         f.instruction(&I::I32And);
@@ -138,29 +130,20 @@ impl Window {
     /// The same with no scratch local, always through `psx.map_access`;
     /// `len` pushes the byte count.
     pub fn offset_call(self, f: &mut Function, store: bool, len: impl FnOnce(&mut Function)) {
-        let Some(map) = self.map else { return mask(f) };
         len(f);
         f.instruction(&I::I32Const(store as i32));
-        f.instruction(&I::Call(map));
+        f.instruction(&I::Call(self.map));
     }
 
     /// The window offset of the `len` bytes at constant guest `addr`.
     pub fn constant(self, addr: u32, len: u32, store: bool) -> Result<u32> {
-        match self.map {
-            None => Ok(addr & WINDOW_MASK),
-            Some(_) => map::access(addr, len, store).with_context(|| format!("{len} bytes at {addr:#010x}: bus error")),
-        }
+        map::access(addr, len, store).with_context(|| format!("{len} bytes at {addr:#010x}: bus error"))
     }
 
     /// A memarg at the window.
     pub fn memarg(self, align: u32) -> MemArg {
         masked(self.base, align)
     }
-}
-
-fn mask(f: &mut Function) {
-    f.instruction(&I::I32Const(WINDOW_MASK as i32));
-    f.instruction(&I::I32And);
 }
 
 /// The dispatch-table index of the function pointer in local `a`

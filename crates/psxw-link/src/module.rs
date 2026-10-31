@@ -205,7 +205,7 @@ impl M<'_> {
     /// How guest addresses reach the window: the console's map, through
     /// the base's `map_access`.
     fn window(&self) -> rewrite::Window {
-        rewrite::Window { base: WINDOW_BASE, map: Some(self.import_ix[psxw_abi::psx::MAP_ACCESS]) }
+        rewrite::Window { base: WINDOW_BASE, map: self.import_ix[psxw_abi::psx::MAP_ACCESS] }
     }
 
     fn synth(&mut self, s: S) -> u32 {
@@ -395,7 +395,7 @@ impl Resolver for R<'_, '_> {
         None
     }
 
-    fn map_access(&mut self) -> Option<u32> {
+    fn map_access(&mut self) -> u32 {
         self.m.window().map
     }
 

@@ -714,7 +714,7 @@ mod tests {
         let narrow = [Kind::I8 { signed: true }, Kind::I8 { signed: false }, Kind::I16 { signed: true }, Kind::I16 { signed: false }];
         let sig = FuncType { params: vec![I32; 4], results: vec![] };
         let proto = Proto { name: "f".into(), defined: true, ret: Kind::Void, params: narrow.to_vec(), variadic: false, va_calls: Vec::new() };
-        let bytes = o32_to_c(&sig, Some(&proto), 0, 0, Window::masked(0)).into_raw_body();
+        let bytes = o32_to_c(&sig, Some(&proto), 0, 0, Window { base: 0, map: 0 }).into_raw_body();
         let body = FunctionBody::new(BinaryReader::new(&bytes, 0));
         let ops: Vec<O> = body.get_operators_reader().unwrap().into_iter().collect::<Result<_, _>>().unwrap();
         // What follows each parameter's word.
