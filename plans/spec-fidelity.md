@@ -318,8 +318,8 @@ calls (TR1, B19).
    Done `b92f582` (libetc: the context, intr_vb's and intr_dma's own
    handlers) and `b1f07f4` (libgpu's pump: an adapter
    bound by its place in `sys.o`, `libgpu/sys:0x23a8`, which psxw-build now
-   supports for static functions). libcd's interrupt handler is still a
-   stand-in (`libcd::HANDLER`); the same binding would retire it (Findings).
+   supports for static functions). libcd's interrupt handler went the same
+   way (`3e7f861`), and `intr_dma.o`'s handler (`0ca8dce`).
 5. [x] **SDK3–5. One wait that spends what the original's loop would.**
    A shared helper that blocks with events delivered and spends the
    guest's budget pass by pass, as `libpad::spend_in_exception`
@@ -613,6 +613,6 @@ locals, or static translation.
 - **Adapters can bind by place** (SDK8): an adapter named
   `<member>:<offset>` binds to the function at that offset in the
   member's text (`psxw-build` `adapter_name`), for static functions the
-  SDK doesn't name. libcd's interrupt handler (`bios_1`'s, passed to
-  `InterruptCallback(2, …)` by `CD_init`; +14A4h in btn) is the last
-  stand-in in BIOS ROM space (`libcd::HANDLER`) and could go the same way.
+  SDK doesn't name. libcd's interrupt handler (`bios_1` +14A4h), the last
+  stand-in in BIOS ROM space, went the same way (`3e7f861`), and so did
+  `intr_dma.o`'s handler (`0ca8dce`): no adapter stand-ins remain.
