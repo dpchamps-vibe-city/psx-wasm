@@ -68,12 +68,17 @@ pub struct Facts {
     /// scratchpad: device registers and the other bus regions. Each is
     /// emitted volatile, between compiler barriers, so clang keeps it,
     /// doesn't merge it, and keeps it in order with every other access.
+    /// In a function that reaches registers through pointers in data, also
+    /// every access through a base that isn't a constant or the stack
+    /// pointer.
     pub device: BTreeSet<Node>,
 }
 
-pub fn analyze(g: &Graph, in_code: &dyn Fn(u32) -> bool) -> Facts {
+/// `through_pointers`: the function reaches device registers through
+/// pointers in data ([`crate::program::Program::through_pointers`]).
+pub fn analyze(g: &Graph, in_code: &dyn Fn(u32) -> bool, through_pointers: bool) -> Facts {
     let mut f = Facts::default();
-    constants(g, in_code, &mut f);
+    constants(g, in_code, through_pointers, &mut f);
     liveness(g, &mut f);
     hazards(g, &mut f);
     sites(g, &mut f);
@@ -500,7 +505,7 @@ fn is_call(t: &Transfer) -> bool {
     matches!(t, Transfer::Call { .. } | Transfer::CondCall { .. })
 }
 
-fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, f: &mut Facts) {
+fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, through_pointers: bool, f: &mut Facts) {
     let mut entry: Consts = [None; 32];
     entry[0] = Some(0);
     let mut work = VecDeque::from([Node::Normal(g.entry)]);
@@ -543,16 +548,22 @@ fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, f: &mut Facts) {
             f.kernel.push((n.pc(), *addr));
         }
         if i.op.is_load() || i.op.is_store() {
-            if let Some(base) = st[i.rs as usize] {
-                let a = base.wrapping_add(i.simm as u32);
-                if !is_memory(a) {
+            match st[i.rs as usize] {
+                Some(base) => {
+                    let a = base.wrapping_add(i.simm as u32);
+                    if !is_memory(a) {
+                        f.device.insert(*n);
+                    }
+                    if is_io(a) {
+                        f.io.push((n.pc(), a));
+                    } else if is_kernel(a) {
+                        f.kernel.push((n.pc(), a));
+                    }
+                }
+                None if through_pointers && i.rs != 29 => {
                     f.device.insert(*n);
                 }
-                if is_io(a) {
-                    f.io.push((n.pc(), a));
-                } else if is_kernel(a) {
-                    f.kernel.push((n.pc(), a));
-                }
+                None => {}
             }
         }
         if matches!(i.op, Op::Addiu | Op::Ori) {

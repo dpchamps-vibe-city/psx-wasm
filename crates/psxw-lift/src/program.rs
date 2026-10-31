@@ -92,6 +92,10 @@ pub enum Located {
 pub struct Program {
     pub main: String,
     pub containers: BTreeMap<String, Code>,
+    /// SDK functions that reach device registers through pointers in data
+    /// (`psxw sdk scan`'s reach, TR1): every access but the stack's is
+    /// volatile in them.
+    pub through_pointers: BTreeSet<(String, u32)>,
 }
 
 impl Program {
@@ -126,7 +130,7 @@ impl Program {
             }
             containers.insert(c.id.clone(), code);
         }
-        Self { main: map.main.clone(), containers }
+        Self { main: map.main.clone(), containers, through_pointers: BTreeSet::new() }
     }
 
     pub fn code(&self, container: &str) -> Option<&Code> {
@@ -275,7 +279,7 @@ mod tests {
         for &(a, size) in starts {
             code.add(a, None, size, Source::Symbol, true);
         }
-        Program { main: "exe".into(), containers: [("exe".to_string(), code)].into() }
+        Program { main: "exe".into(), containers: [("exe".to_string(), code)].into(), through_pointers: BTreeSet::new() }
     }
 
     #[test]

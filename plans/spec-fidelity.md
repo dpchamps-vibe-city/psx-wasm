@@ -253,6 +253,7 @@ Renderer, SDK, translator, runtime:
   lifter can't prove is plain RAM (constant I/O addresses, and every access
   in device-tier SDK objects).
   Partly done `ec4826f` (agent): loads and stores at constant device addresses (1F80_1000–1F80_2FFF in every mirror, expansion regions, unmapped space, FFFE_0130) are volatile and fenced on both sides; unaligned ones are fenced only. *Not done:* accesses in device-tier SDK objects through register pointers in data. Lifting runs once per game, before `psxw-build` decides which chips run on their devices, and that decision uses the lift; the register-pointer table is loaded only in `psxw-build`. Doing it needs those functions re-emitted after the chip decision, or the table passed to the lifter: a design decision (see Findings).
+  Done (second half): the lifter loads `psxw sdk scan`'s reach (`run::load`), and in every SDK function that reaches a chip (not just kernel RAM) every access through a base that isn't a constant or sp is volatile and fenced, in every build. btn's default build: game.wasm +71 bytes (most such functions are adapters there).
 - [x] **TR10. o32→C wrappers don't extend narrow parameters.**
   `psxw-link/src/marshal.rs:356, 512`. Fix: sign- or zero-extend from
   the known kinds.

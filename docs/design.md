@@ -366,7 +366,11 @@ How each tier is produced:
   otherwise.
 
   A load whose result nothing reads is kept, as a volatile read: from an
-  I/O register it pops a FIFO.
+  I/O register it pops a FIFO. An access at a constant address that isn't
+  RAM or the scratchpad is volatile and fenced, so clang neither drops,
+  merges nor reorders it; so is every access but the stack's in an SDK
+  function that reaches device registers through pointers in data
+  (`psxw sdk scan`'s reach, `boundary/reach/`), in every build.
 - **A translated SDK is reusable.** Games link SDK members byte for byte, so
   the translated C can be cached per SDK release, keyed by member hash, and
   reused by every game linking that member. It is derived from Sony's

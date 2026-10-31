@@ -125,6 +125,7 @@ fn run(words: &[u32], args: [u32; 4], data: &[u8]) -> Option<Run> {
     );
     let program = Program {
         main: "test".into(),
+        through_pointers: Default::default(),
         containers: [("test".to_string(), Code { id: "test".into(), text: vec![text.clone()], data: vec![], starts })].into(),
     };
     let originals = Originals::from_images(vec![("test".into(), BASE, code.clone())]);
