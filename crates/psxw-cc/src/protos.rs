@@ -40,6 +40,10 @@ pub struct Proto {
     pub ret: Kind,
     pub params: Vec<Kind>,
     pub variadic: bool,
+    /// For a variadic function, the kinds of the variadic arguments at each
+    /// distinct call the TU makes to it (after C's promotions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub va_calls: Vec<Vec<Kind>>,
 }
 
 impl Proto {
@@ -71,9 +75,10 @@ pub fn for_tu(clang: &Clang, i_path: &Path) -> Result<Vec<Proto>> {
     parse_ir(&ir)
 }
 
-/// Cached next to the TU's object as `<stem>.protos.json`.
+/// Cached next to the TU's object as `<stem>.protos2.json` (2: with the
+/// variadic calls).
 pub fn cached(clang: &Clang, i_path: &Path) -> Result<Vec<Proto>> {
-    let json = i_path.with_extension("protos.json");
+    let json = i_path.with_extension("protos2.json");
     if let (Ok(j), Ok(i)) = (std::fs::metadata(&json), std::fs::metadata(i_path)) {
         if j.modified()? >= i.modified()? {
             let text = std::fs::read_to_string(&json)?;
@@ -131,7 +136,27 @@ pub fn parse_ir(ir: &str) -> Result<Vec<Proto>> {
             }
             params.push(param_kind(p, &layout)?);
         }
-        out.push(Proto { name, defined, ret, params, variadic });
+        out.push(Proto { name, defined, ret, params, variadic, va_calls: Vec::new() });
+    }
+    // Variadic calls: `call i32 (ptr, ...) @f(ptr noundef %0, i32 noundef
+    // %1)` names its fixed parameters' types before the `...`.
+    for line in ir.lines() {
+        let Some(c) = line.find("call ") else { continue };
+        let Some(at) = line[c..].find(" @").map(|a| c + a) else { continue };
+        let ty = &line[c..at];
+        let Some(open) = ty.find('(').filter(|_| ty.ends_with("...)")) else { continue };
+        let fixed = split_top(&ty[open + 1..ty.len() - 1]).len() - 1;
+        let rest = &line[at + 2..];
+        let Some(paren) = rest.find('(') else { continue };
+        let name = rest[..paren].trim_matches('"');
+        let close = matching(rest, paren).context("unbalanced call arguments")?;
+        let args: Vec<Kind> =
+            split_top(&rest[paren + 1..close]).iter().skip(fixed).map(|a| param_kind(a.trim(), &layout)).collect::<Result<_>>()?;
+        if let Some(p) = out.iter_mut().find(|p| p.name == name && p.variadic) {
+            if !p.va_calls.contains(&args) {
+                p.va_calls.push(args);
+            }
+        }
     }
     Ok(out)
 }
@@ -282,6 +307,8 @@ mod tests {
 %struct.P = type <{ i8, i32 }>
 %union.U = type { [3 x i32] }
 define dso_local signext i16 @f(ptr noundef byval(%struct.S) align 4 %s, i32 noundef %n) #0 {
+  %1 = call i32 (ptr, ...) @FntPrint(ptr noundef @.str, i32 noundef %n, double noundef 1.500000e+00)
+  %2 = call i32 (ptr, ...) @FntPrint(ptr noundef @.str, i32 noundef %n, double noundef 1.500000e+00)
 declare void @g(ptr dead_on_unwind writable sret(%union.U) align 4, i8 noundef zeroext) #1
 declare i32 @FntPrint(ptr noundef, ...) #1
 declare double @"quoted name"(i64 noundef, double noundef, ptr byval(%struct.P) align 1)
@@ -294,6 +321,7 @@ declare double @"quoted name"(i64 noundef, double noundef, ptr byval(%struct.P) 
         assert_eq!(p[0].o32_words(), 3);
         assert_eq!(p[1].params, vec![Kind::Sret { size: 12 }, Kind::I8 { signed: false }]);
         assert!(p[2].variadic);
+        assert_eq!(p[2].va_calls, vec![vec![Kind::I32, Kind::F64]]);
         assert_eq!(p[3].name, "quoted name");
         assert_eq!(p[3].params[2], Kind::ByVal { size: 5, align: 1 });
         assert_eq!(p[3].o32_words(), 6);

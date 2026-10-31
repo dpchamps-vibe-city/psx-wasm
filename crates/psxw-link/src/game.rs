@@ -806,7 +806,9 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
         Synth::ToO32 { input, name, sig, target } => {
             let proto = ctx.inputs[input].protos.get(&name);
             let (kinds, variadic) = marshal::param_kinds(&sig, proto);
-            let (words, _) = marshal::words(&kinds, variadic);
+            let calls = proto.map_or(&[][..], |p| &p.va_calls);
+            let (words, _) = marshal::call_words(&kinds, variadic, calls)
+                .with_context(|| format!("{}: variadic calls to {name}", ctx.inputs[input].label))?;
             let f = marshal::c_to_o32(&sig, &words, sp, window, &|_| {}, &|_, _| {}, &|f| {
                 f.instruction(&I::Call(target));
             });
@@ -1911,7 +1913,7 @@ mod tests {
     use psxw_cc::protos::{Kind, Proto};
 
     fn proto(params: Vec<Kind>, variadic: bool) -> Proto {
-        Proto { name: "f".into(), defined: false, ret: Kind::I32, params, variadic }
+        Proto { name: "f".into(), defined: false, ret: Kind::I32, params, variadic, va_calls: Vec::new() }
     }
 
     #[test]

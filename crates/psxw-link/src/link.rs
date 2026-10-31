@@ -533,7 +533,9 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
         Synth::CallStub { input, name, addr, sig } => {
             let proto = ctx.inputs[*input].protos.get(name);
             let (kinds, variadic) = marshal::param_kinds(sig, proto);
-            let (words, fixed) = marshal::words(&kinds, variadic);
+            let calls = proto.map_or(&[][..], |p| &p.va_calls);
+            let (words, fixed) =
+                marshal::call_words(&kinds, variadic, calls).with_context(|| format!("variadic calls to {name}"))?;
             let addr = *addr;
             let body = marshal::c_to_o32(
                 sig,
