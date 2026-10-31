@@ -657,10 +657,12 @@ fn dma4(m: &mut M, addr: u32, words: u32, read: bool) -> std::result::Result<(),
         let buf: Vec<u32> = (0..words).map(|i| m.mem.r32(at(i))).collect();
         sp(m, |s| s.dma_write(&buf));
     }
-    let io = m.io.as_mut().ok_or("no DMA controller on the bus")?;
-    io.dma.chcr[4] = chcr;
-    io.dma.madr[4] = at(words);
-    io.dma.bcr[4] &= 0xFFFF;
+    // The controller's end of it, through its registers: the channel
+    // stopped, MADR4 past the words, no blocks left.
+    set_reg(m, CHCR4, 4, chcr & !psx_devices::dma::CHCR_BUSY)?;
+    set_reg(m, MADR4, 4, at(words))?;
+    let bcr = reg(m, BCR4, 4)?;
+    set_reg(m, BCR4, 4, bcr & 0xFFFF)?;
     m.dma_done_held(4);
     Ok(())
 }
