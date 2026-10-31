@@ -24,8 +24,6 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("InitPAD", init_pad),
     ("StartPAD", start_pad),
     ("PAD_init", pad_init),
-    ("SetInitPadFlag", nop),
-    ("ReadInitPadFlag", nop),
     ("EnablePAD", nop),
     ("DisablePAD", nop),
     ("_patch_pad", nop),
@@ -92,13 +90,20 @@ fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     ret(1)
 }
 
+/// `InitPAD(buf1, siz1, buf2, siz2)`: `ChangeClearPAD(0)`, then the BIOS's
+/// `InitPAD2` (B0:12h); 1. `_patch_pad`, which patches the Sony BIOS's pad
+/// handler, has nothing to patch.
 fn init_pad(m: &mut M, a: [u32; 4]) -> Result {
-    m.kernel.pad_bufs = Some([(a[0], a[1]), (a[2], a[3])]);
+    bios(m, 0xB0, 0x5B, [0; 4])?;
+    bios(m, 0xB0, 0x12, a)?;
     ret(1)
 }
 
+/// `StartPAD`: `StartPAD2` (B0:13h), `ChangeClearPAD(0)`; 1. `EnablePAD`
+/// jumps into the patched BIOS.
 fn start_pad(m: &mut M, _a: [u32; 4]) -> Result {
-    m.kernel.pad_started = true;
+    bios(m, 0xB0, 0x13, [0; 4])?;
+    bios(m, 0xB0, 0x5B, [0; 4])?;
     ret(1)
 }
 
@@ -137,5 +142,15 @@ mod tests {
         call(&mut m, set_rcnt, [0xF200_0002, 0x1000, 0x1000, 0]);
         assert_eq!(m.timers[2].mode, 0x258);
         assert_eq!(call(&mut m, get_rcnt, [3, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn pads_through_the_bios() {
+        let mut m = machine(vec![], Default::default());
+        m.mem.write(0x8001_0000, &[0x5A; 0x44]);
+        assert_eq!(call(&mut m, init_pad, [0x8001_0000, 0x22, 0x8001_0022, 0x22]), 1);
+        assert_eq!(m.mem.bytes(0x8001_0000, 0x44), [0; 0x44]);
+        assert_eq!(call(&mut m, start_pad, [0; 4]), 1);
+        assert!(m.kernel.pad_started);
     }
 }
