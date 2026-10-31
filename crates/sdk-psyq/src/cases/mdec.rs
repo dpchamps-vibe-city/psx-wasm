@@ -186,8 +186,11 @@ fn dct_in(h: &mut dyn Harness, at: u32, mode: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// The MDEC's and DMA1's busy bits, and the callbacks so far.
+/// The guest's budget left (the original's instructions so far, D71), the
+/// MDEC's and DMA1's busy bits, and the callbacks so far.
 fn state(h: &mut dyn Harness, what: &str, cb_state: u32) -> Result<(), String> {
+    let b = h.budget();
+    h.observe(&format!("{what}: budget"), b.to_string());
     let i = h.call("DecDCTinSync", &[1])?;
     let o = h.call("DecDCToutSync", &[1])?;
     h.observe(&format!("{what}: taking input, DMA1 running"), format!("{i} {o}"));

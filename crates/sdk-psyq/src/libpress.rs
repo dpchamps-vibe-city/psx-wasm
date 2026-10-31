@@ -227,43 +227,72 @@ fn busy(m: &mut M, b: Busy) -> bool {
     }
 }
 
-/// The waits' loops (PsyQ 4.7, `libpress:0x4fc..0x518` and
-/// `0x530..0x54c`, the same at `0x590`): the original's instructions an
-/// iteration (D71).
-const WAIT_PASS: u32 = 16;
-
-/// `libpress:0x4cc` (the input) and `0x560` (DMA1): while busy, count
-/// down from 0x100000, timing out past zero. `k` gets 0, or -1 after the
-/// timeout.
-fn wait(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
-    if !busy(m, b) {
-        return k(m, 0);
-    }
-    spin(m, o, b, TIMEOUT + 1, k)
+/// The waits (PsyQ 4.7 `libpress:0x4cc`, the input; `0x560`, DMA1), the
+/// same blocks from each: the first look (+0h..+28h); while busy (+2Ch),
+/// the countdown from 0x100000, a pass (+30h..+4Ch, +64h..+80h, its header
+/// at +30h) of 16 instructions (D71) a look; past zero, the timeout
+/// (+50h..+58h, then +5Ch..+60h); the return (+84h..+90h).
+fn base(b: Busy) -> u32 {
+    if b == Busy::In { 0x4CC } else { 0x560 }
 }
 
-/// `left` iterations to the timeout: those before the next safepoint, then
-/// a quantum (what fell due delivered, interrupts taken, those held
-/// included), and another look.
-fn spin(m: &mut M, o: Obj, b: Busy, left: u32, k: K) -> Flow<Psyq> {
-    let room = crate::room(m, WAIT_PASS) as u32;
-    if left <= room {
-        crate::take(m, left as u64 * WAIT_PASS as u64);
-        return timeout(m, o, b, k);
+const WAIT_PASS: u32 = 16;
+
+/// `k` gets 0, or -1 after the timeout.
+fn wait(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
+    let w = base(b);
+    crate::path(m, &[(w, w + 0x28)]);
+    if !busy(m, b) {
+        crate::path(m, &[(w + 0x84, w + 0x90)]);
+        return k(m, 0);
     }
-    crate::take(m, room as u64 * WAIT_PASS as u64);
-    crate::safepoint(m, move |m| if busy(m, b) { spin(m, o, b, left - room, k) } else { k(m, 0) })
+    crate::path(m, &[(w + 0x2C, w + 0x2C)]);
+    spin(m, o, b, TIMEOUT, k)
+}
+
+/// The countdown's passes, `left` before the one that times out. What
+/// `busy` reads changes only at a safepoint, so after a pass that sees it
+/// busy, those up to the next safepoint are spent at once.
+fn spin(m: &mut M, o: Obj, b: Busy, left: u32, k: K) -> Flow<Psyq> {
+    crate::libspu::header(
+        m,
+        Box::new(move |m| {
+            let w = base(b);
+            if left == 0 {
+                crate::path(m, &[(w + 0x30, w + 0x4C), (w + 0x50, w + 0x58)]);
+                return timeout(m, o, b, k);
+            }
+            crate::path(m, &[(w + 0x30, w + 0x4C), (w + 0x64, w + 0x80)]);
+            if !busy(m, b) {
+                crate::path(m, &[(w + 0x84, w + 0x90)]);
+                return k(m, 0);
+            }
+            let room = crate::room(m, WAIT_PASS) as u32;
+            let n = room.min(left - 1);
+            crate::take(m, n as u64 * WAIT_PASS as u64);
+            if n == room {
+                return crate::safepoint(m, move |m| spin(m, o, b, left - 1 - n, k));
+            }
+            spin(m, o, b, left - 1 - n, k)
+        }),
+    )
 }
 
 /// `libpress:0x60c`: "<what> timeout:" through `printf`, then the MDEC and
 /// both channels reset.
-fn timeout(_m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
+fn timeout(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
+    crate::path(m, &[(0x60C, 0x624)]);
     let what = o.rdata + if b == Busy::In { rdata::IN_SYNC } else { rdata::OUT_SYNC };
     Flow::Call {
         call: GuestCall { addr: o.printf, args: [o.rdata + rdata::TIMEOUT, what, 0, 0] },
-        then: Box::new(move |m, _| match stop(m) {
-            Ok(()) => k(m, u32::MAX),
-            Err(e) => fail(e),
+        then: Box::new(move |m, _| {
+            crate::path(m, &[(0x628, 0x684)]);
+            if let Err(e) = stop(m) {
+                return fail(e);
+            }
+            let w = base(b);
+            crate::path(m, &[(w + 0x5C, w + 0x60), (w + 0x84, w + 0x90)]);
+            k(m, u32::MAX)
         }),
     }
 }
@@ -275,11 +304,13 @@ fn timeout(_m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
 /// `p + 4`) into the MDEC; DMA0's completion, then DMA1's if it was waiting
 /// for them. `k` gets what the original leaves in v0 (DMA0's CHCR pointer).
 fn send(m: &mut M, o: Obj, p: u32, n: u32, k: K) -> Flow<Psyq> {
+    crate::path(m, &[(0x3B0, 0x3C8)]);
     wait(
         m,
         o,
         Busy::In,
         Box::new(move |m, _| {
+            crate::path(m, &[(0x3CC, 0x43C)]);
             let r = (|| -> std::result::Result<(), String> {
                 enable(m)?;
                 pump(m)?;
@@ -302,13 +333,36 @@ fn send(m: &mut M, o: Obj, p: u32, n: u32, k: K) -> Flow<Psyq> {
 }
 
 /// The tables in libpress's `.data` into the MDEC: quantization, then
-/// scale.
-fn tables(m: &mut M, o: Obj, k: K) -> Flow<Psyq> {
-    send(m, o, o.data + data::QUANT, 32, Box::new(move |m, _| send(m, o, o.data + data::SCALE, 32, k)))
+/// scale, the caller's blocks `between` and `after` the two.
+fn tables(m: &mut M, o: Obj, between: (u32, u32), after: (u32, u32), k: K) -> Flow<Psyq> {
+    send(
+        m,
+        o,
+        o.data + data::QUANT,
+        32,
+        Box::new(move |m, _| {
+            crate::path(m, &[between]);
+            send(
+                m,
+                o,
+                o.data + data::SCALE,
+                32,
+                Box::new(move |m, v| {
+                    crate::path(m, &[after]);
+                    k(m, v)
+                }),
+            )
+        }),
+    )
 }
 
-fn done() -> K {
-    Box::new(|_, v| Flow::ret(v))
+/// Return `v` after the blocks `tail` (each adapter's spends its
+/// original's path, D71).
+fn back(tail: &'static [(u32, u32)]) -> K {
+    Box::new(move |m, v| {
+        crate::path(m, tail);
+        Flow::ret(v)
+    })
 }
 
 // --- The adapters --------------------------------------------------------
@@ -319,28 +373,47 @@ fn done() -> K {
 fn dct_reset(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::RESET)?;
     let mode = a[0];
+    crate::path(m, &[(0x0, 0x10)]);
     if mode == 0 {
-        return Ok(Flow::Call { call: GuestCall { addr: o.reset_callback, args: [0; 4] }, then: Box::new(move |m, _| reset(m, o, mode)) });
+        crate::path(m, &[(0x14, 0x18)]);
+        return Ok(Flow::Call {
+            call: GuestCall { addr: o.reset_callback, args: [0; 4] },
+            then: Box::new(move |m, _| {
+                crate::path(m, &[(0x1C, 0x20)]);
+                reset(m, o, mode)
+            }),
+        });
     }
+    crate::path(m, &[(0x1C, 0x20)]);
     Ok(reset(m, o, mode))
 }
 
 /// `libpress:0x2c0`, the reset by mode.
 fn reset(m: &mut M, o: Obj, mode: u32) -> Flow<Psyq> {
+    const TAIL: &[(u32, u32)] = &[(0x3A0, 0x3AC), (0x24, 0x30)];
+    crate::path(m, &[(0x2C0, 0x2CC)]);
     match mode {
         0 | 1 => {
+            crate::path(m, if mode == 0 { &[(0x2E4, 0x328)] } else { &[(0x2D0, 0x2D8), (0x344, 0x390)] });
             if let Err(e) = stop(m) {
                 return fail(e);
             }
-            if mode == 1 { Flow::ret(REQUESTS) } else { tables(m, o, done()) }
+            if mode == 1 {
+                return back(TAIL)(m, REQUESTS);
+            }
+            tables(m, o, (0x32C, 0x338), (0x33C, 0x340), back(TAIL))
         }
-        _ => Flow::Call { call: GuestCall { addr: o.printf, args: [o.rdata + rdata::BAD_OPTION, mode, 0, 0] }, then: Box::new(|_, v| Flow::Return(v)) },
+        _ => {
+            crate::path(m, &[(0x2D0, 0x2D8), (0x2DC, 0x2E0), (0x394, 0x39C)]);
+            Flow::Call { call: GuestCall { addr: o.printf, args: [o.rdata + rdata::BAD_OPTION, mode, 0, 0] }, then: Box::new(|m, v| back(TAIL)(m, v as u32)) }
+        }
     }
 }
 
 /// `DecDCTPutEnv(env)`: the environment's quantization tables into
-/// libpress's, then both of libpress's tables into the MDEC (the scale
-/// table is libpress's own, not the environment's). Returns `env`.
+/// libpress's (two copy loops of 16 passes, +E0h and +10Ch), then both of
+/// libpress's tables into the MDEC (the scale table is libpress's own, not
+/// the environment's). Returns `env`.
 fn dct_put_env(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::PUT_ENV)?;
     let env = a[0];
@@ -349,8 +422,17 @@ fn dct_put_env(m: &mut M, a: [u32; 4]) -> Result {
         m.mem.w32(o.data + data::LUMA + 4 * i, luma);
         m.mem.w32(o.data + data::CHROMA + 4 * i, chroma);
     }
-    // The copy's two loops of 16 iterations (+E0h..+F4h, +10Ch..+120h).
-    Ok(crate::libspu::spend(m, 2 * 16 * 5, Box::new(move |m| tables(m, o, Box::new(move |_, _| Flow::ret(env))))))
+    crate::path(m, &[(0xC0, 0xDC)]);
+    let none = || std::rc::Rc::new(|_: &mut M, _: u32| {});
+    let load: crate::libspu::K = Box::new(move |m| {
+        crate::path(m, &[(0x124, 0x130)]);
+        tables(m, o, (0x134, 0x140), (0x144, 0x154), Box::new(move |_, _| Flow::ret(env)))
+    });
+    let chroma: crate::libspu::K = Box::new(move |m| {
+        crate::path(m, &[(0xF8, 0x108)]);
+        crate::libspu::each(m, 0, 16, 6, none(), load)
+    });
+    Ok(crate::libspu::each(m, 0, 16, 6, none(), chroma))
 }
 
 /// `DecDCTin(buf, mode)`: the command word's depth (mode bit 0: 24-bit,
@@ -364,19 +446,24 @@ fn dct_in(m: &mut M, a: [u32; 4]) -> Result {
     w = if mode & 1 != 0 { w & !0x0800_0000 } else { w | 0x0800_0000 };
     w = if mode & 2 != 0 { w | 0x0200_0000 } else { w & !0x0200_0000 };
     m.mem.w32(buf, w);
-    Ok(send(m, o, buf, w & 0xFFFF, done()))
+    let depth = if mode & 1 != 0 { (0x168, 0x178) } else { (0x17C, 0x184) };
+    let half = if mode & 2 != 0 { (0x198, 0x1A0) } else { (0x1A4, 0x1B0) };
+    crate::path(m, &[(0x158, 0x164), depth, (0x188, 0x194), half, (0x1B4, 0x1C0)]);
+    Ok(send(m, o, buf, w & 0xFFFF, back(&[(0x1C4, 0x1D0)])))
 }
 
-/// `DecDCTout(buf, size)`: after the DMA1 wait, DMA1 for `size` words (in
-/// blocks) into `buf`, now or when the MDEC has them.
+/// `DecDCTout(buf, size)` (`libpress:0x440`): after the DMA1 wait, DMA1
+/// for `size` words (in blocks) into `buf`, now or when the MDEC has them.
 fn dct_out(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::DCT_OUT)?;
     let (buf, size) = (a[0], a[1]);
+    crate::path(m, &[(0x1D4, 0x1E0), (0x440, 0x458)]);
     Ok(wait(
         m,
         o,
         Busy::Out,
         Box::new(move |m, _| {
+            crate::path(m, &[(0x45C, 0x4C8)]);
             let r = (|| -> std::result::Result<(), String> {
                 enable(m)?;
                 pump(m)?;
@@ -388,7 +475,7 @@ fn dct_out(m: &mut M, a: [u32; 4]) -> Result {
             match r {
                 Ok(()) => {
                     let v = m.mem.r32(o.data + data::CHCR1_PTR);
-                    Flow::ret(v)
+                    back(&[(0x1E4, 0x1F0)])(m, v)
                 }
                 Err(e) => fail(e),
             }
@@ -397,12 +484,15 @@ fn dct_out(m: &mut M, a: [u32; 4]) -> Result {
 }
 
 /// `DecDCTinSync(mode)`: mode 0 waits while the MDEC takes input (0, or
-/// -1 after the timeout); otherwise whether it is.
+/// -1 after the timeout); otherwise whether it is (`libpress:0x5f4`).
 fn dct_in_sync(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::IN_SYNC)?;
+    crate::path(m, &[(0x1F4, 0x1FC)]);
     if a[0] == 0 {
-        return Ok(wait(m, o, Busy::In, done()));
+        crate::path(m, &[(0x200, 0x204)]);
+        return Ok(wait(m, o, Busy::In, back(&[(0x208, 0x20C), (0x220, 0x22C)])));
     }
+    crate::path(m, &[(0x210, 0x214), (0x5F4, 0x608), (0x218, 0x21C), (0x220, 0x22C)]);
     Ok(Flow::ret(busy(m, Busy::In) as u32))
 }
 
@@ -410,9 +500,12 @@ fn dct_in_sync(m: &mut M, a: [u32; 4]) -> Result {
 /// timeout); otherwise whether it does.
 fn dct_out_sync(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::OUT_SYNC)?;
+    crate::path(m, &[(0x230, 0x238)]);
     if a[0] == 0 {
-        return Ok(wait(m, o, Busy::Out, done()));
+        crate::path(m, &[(0x23C, 0x240)]);
+        return Ok(wait(m, o, Busy::Out, back(&[(0x244, 0x248), (0x268, 0x274)])));
     }
+    crate::path(m, &[(0x24C, 0x264), (0x268, 0x274)]);
     Ok(Flow::ret(busy(m, Busy::Out) as u32))
 }
 
@@ -545,12 +638,13 @@ mod tests {
         flat_macroblock(&mut m, IN, 40);
         run(&mut m, at::DCT_OUT, dct_out, [OUT, 256, 0, 0]);
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [1, 0, 0, 0]), 1);
-        // The wait for DMA1 times out after 0x100001 iterations of 16
-        // instructions (1,677 quanta and some), prints, and resets: DMA1
-        // takes zeros.
+        // The wait for DMA1 times out after 0x100000 iterations of 16
+        // instructions and the start of one more (this machine has no guest
+        // budget: a quantum each 626 passes, 1,675 and some), prints, and
+        // resets: DMA1 takes zeros.
         let t = m.clock.now;
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [0, 0, 0, 0]), u32::MAX);
-        assert_eq!((m.clock.now - t) / 20_000, 1677);
+        assert_eq!((m.clock.now - t) / 20_000, 1675);
         assert_eq!(irq_calls(), vec![PRINTF]);
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [1, 0, 0, 0]), 0);
         assert_eq!(run(&mut m, at::IN_SYNC, dct_in_sync, [1, 0, 0, 0]), 0);
