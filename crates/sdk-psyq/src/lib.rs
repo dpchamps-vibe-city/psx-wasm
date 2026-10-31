@@ -51,9 +51,14 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
 }
 
 /// A BIOS call the replaced code makes, which returns at once: its v0.
+/// It goes through the table's entry, as the original's vector call does,
+/// and fails on an entry the game patched.
 pub(crate) fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result::Result<u32, String> {
-    match psx_bios::bios::call(m, table, func, a)? {
+    match psx_bios::bios::dispatch(m, table, func, a)? {
         Flow::Return(v) => Ok(v as u32),
+        Flow::Call { call, .. } => {
+            Err(format!("BIOS {table:02X}h:{func:02X}h is patched to {:#010x}, which an adapter doesn't call", call.addr))
+        }
         _ => Err(format!("BIOS {table:02X}h:{func:02X}h blocks in an adapter")),
     }
 }
