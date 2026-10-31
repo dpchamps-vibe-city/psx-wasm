@@ -919,34 +919,31 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
-    /// A(60h) `dev_cd_read(fcb, dst, len)`: the file's bytes from its
-    /// offset through the native disc; the count, or -1.
+    /// A(60h) `dev_cd_read(fcb, dst, len)`: sector-aligned reads through
+    /// the native disc; the count, or -1. OpenBIOS `dev_cd_read` transfers
+    /// the full request before clipping the result/offset to the file size.
+    /// Status/path-table checks and the zero-count command error remain partial.
     pub fn dev_cd_read(&mut self, f: u32, dst: u32, len: u32) -> u32 {
         let (off, size) = (self.mem.r32(f + fcb::OFFSET), self.mem.r32(f + fcb::LENGTH));
-        if (len as i32) < 0 || off > size {
+        if (len as i32) < 0 || (len | off) & (cd::USER as u32 - 1) != 0 || off >= size {
             self.mem.w32(f + fcb::ERRNO, E_ALIGN);
             return u32::MAX;
         }
-        let n = len.min(size - off);
-        let lba = self.mem.r32(f + fcb::LBA);
-        let mut got = Vec::with_capacity(n as usize);
+        let lba = self.mem.r32(f + fcb::LBA).wrapping_add(off / cd::USER as u32);
         let mut raw = [0u8; cd::RAW];
-        let mut s = off / cd::USER as u32;
-        while (got.len() as u32) < n {
-            if !self.host.disc_read(lba + s, &mut raw) {
+        for pos in (0..len).step_by(cd::USER) {
+            if !self.host.disc_read(lba.wrapping_add(pos / cd::USER as u32), &mut raw) {
                 self.mem.w32(f + fcb::ERRNO, E_GENERAL);
                 return u32::MAX;
             }
-            let user = cd::user_data(&raw);
-            let start = if s == off / cd::USER as u32 { (off % cd::USER as u32) as usize } else { 0 };
-            let take = ((n as usize) - got.len()).min(cd::USER - start);
-            got.extend_from_slice(&user[start..start + take]);
-            s += 1;
+            // A later failure leaves completed sectors in RAM, but does not
+            // advance the file offset. The full request may extend past EOF.
+            let at = dst.wrapping_add(pos);
+            self.mem.write(at, cd::user_data(&raw));
+            self.loaded.push((at, cd::USER as u32));
         }
-        self.mem.write(dst, &got);
-        self.loaded.push((dst, got.len() as u32));
+        let n = len.min(size - off);
         self.mem.w32(f + fcb::OFFSET, off + n);
-        self.mem.w32(f + fcb::ERRNO, 0);
         n
     }
 
@@ -1448,14 +1445,15 @@ mod tests {
         m.mem.write(0x8006_0000, b"\\A.BIN;1\0");
         let v = crate::bios::call(&mut m, 0xA0, 0xA4, [0x8006_0000, 0, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 19, "CdGetLbn");
-        let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0000, 5, 0]);
+        let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0000, 2048, 0]);
         assert_eq!(ret(&mut m, v, &returns), 5);
         assert_eq!(m.mem.bytes(0x8002_0000, 5), b"hello");
         let v = crate::bios::call(&mut m, 0xB0, 0x33, [2, 1, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 1);
-        let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0010, 2, 0]);
-        assert_eq!(ret(&mut m, v, &returns), 2);
-        assert_eq!(m.mem.bytes(0x8002_0010, 2), b"el");
+        let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0010, 2048, 0]);
+        assert_eq!(ret(&mut m, v, &returns), u32::MAX, "unaligned file position");
+        assert_eq!(m.mem.r32(f + fcb::OFFSET), 1);
+        assert_eq!(m.kernel.files.errno, E_ALIGN);
         let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 2);
 
@@ -1480,7 +1478,7 @@ mod tests {
         assert_eq!(ret(&mut m, v, &returns), 2, "relative to DATA");
         let f = fcb_at(2);
         assert_eq!((m.mem.r32(f + fcb::LBA), m.mem.r32(f + fcb::LENGTH)), (21, 3));
-        let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0020, 3, 0]);
+        let v = crate::bios::call(&mut m, 0xB0, 0x34, [2, 0x8002_0020, 2048, 0]);
         assert_eq!(ret(&mut m, v, &returns), 3);
         assert_eq!(m.mem.bytes(0x8002_0020, 3), b"bye");
         let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
@@ -1565,6 +1563,86 @@ mod tests {
                 v = ret(&mut m, next, &returns);
             }
             assert_eq!(v, 0, "no more matches for {pattern}");
+        }
+    }
+
+    /// Public read aliases and the direct CD device entry enforce the same
+    /// validation, full-sector writes, clipped result and error bookkeeping.
+    #[test]
+    fn cdrom_reads_validate_and_transfer_whole_sectors() {
+        let sector = cd::USER as u32;
+        let sectors = (0..3).map(|lba| iso_sector(lba, &vec![0x11 * (lba as u8 + 1); cd::USER])).collect();
+        let mut m = crate::testing::machine_with_disc(sectors);
+        let f = fcb_at(2);
+        let dst = 0x8002_0001; // Only the file position/length require sector alignment.
+        m.mem.w32(f + fcb::FLAGS, READ);
+        m.mem.w32(f + fcb::DCB, m.find_device(b"cdrom").unwrap());
+        m.mem.w32(f + fcb::DEVICE_FLAGS, FS);
+        m.mem.w32(f + fcb::LBA, 0);
+        let returns = |_: &mut Machine<NoSdk>, _: GuestCall| panic!("no guest callback");
+        for (vector, func, arg) in [(0xB0, 0x34, 2), (0xA0, 0x02, 2), (0xA0, 0x60, f)] {
+            let direct = func == 0x60;
+            for (off, len, size) in [
+                (0, 1, sector),
+                (1, sector, sector),
+                (0, 0xFFFF_F800, sector),
+                (sector, sector, sector),
+                (2 * sector, sector, sector),
+                (0, sector, 0),
+                (sector, 0, sector),
+            ] {
+                m.mem.w32(f + fcb::OFFSET, off);
+                m.mem.w32(f + fcb::LENGTH, size);
+                m.mem.w32(f + fcb::ERRNO, 0x1234);
+                m.kernel.files.errno = 0x5678;
+                m.mem.write(dst, &vec![0xCC; cd::USER]);
+                m.loaded.clear();
+                let v = crate::bios::dispatch(&mut m, vector, func, [arg, dst, len, 0]);
+                assert_eq!(ret(&mut m, v, &returns), u32::MAX, "{vector:02X}:{func:02X} offset={off} length={len} size={size}");
+                assert_eq!(m.mem.r32(f + fcb::OFFSET), off);
+                assert_eq!(m.mem.r32(f + fcb::ERRNO), E_ALIGN);
+                assert_eq!(m.kernel.files.errno, if direct { 0x5678 } else { E_ALIGN });
+                assert_eq!(m.mem.bytes(dst, cd::USER), vec![0xCC; cd::USER]);
+                assert!(m.loaded.is_empty());
+            }
+            // Clip only the return value and final offset, not the sectors
+            // written. Starting at the second sector also covers a short tail.
+            for off in [0, sector] {
+                m.mem.w32(f + fcb::OFFSET, off);
+                m.mem.w32(f + fcb::LENGTH, sector + 5);
+                m.mem.w32(f + fcb::ERRNO, 0x1234);
+                m.kernel.files.errno = 0x5678;
+                m.mem.write(dst - 1, &vec![0xCC; 2 * cd::USER + 2]);
+                m.loaded.clear();
+                let v = crate::bios::dispatch(&mut m, vector, func, [arg, dst, 2 * sector, 0]);
+                assert_eq!(ret(&mut m, v, &returns), sector + 5 - off);
+                assert_eq!(m.mem.r32(f + fcb::OFFSET), sector + 5);
+                assert_eq!(m.mem.r32(f + fcb::ERRNO), 0x1234, "success does not clear the FCB error");
+                assert_eq!(m.kernel.files.errno, 0x5678);
+                for i in 0..2 {
+                    assert_eq!(m.mem.bytes(dst + i * sector, cd::USER), vec![0x11 * ((off / sector + i) as u8 + 1); cd::USER]);
+                }
+                assert_eq!((m.mem.r8(dst - 1), m.mem.r8(dst + 2 * sector)), (0xCC, 0xCC));
+                assert_eq!(m.loaded, [(dst, sector), (dst + sector, sector)]);
+            }
+            // A failed later sector cannot turn a request into a short success
+            // merely because its first sector already covered the logical EOF.
+            m.mem.w32(f + fcb::OFFSET, sector);
+            m.mem.w32(f + fcb::LENGTH, sector + 5);
+            m.mem.w32(f + fcb::ERRNO, 0x1234);
+            m.kernel.files.errno = 0x5678;
+            m.mem.write(dst - 1, &vec![0xCC; 3 * cd::USER + 2]);
+            m.loaded.clear();
+            let v = crate::bios::dispatch(&mut m, vector, func, [arg, dst, 3 * sector, 0]);
+            assert_eq!(ret(&mut m, v, &returns), u32::MAX);
+            assert_eq!(m.mem.r32(f + fcb::OFFSET), sector, "failure does not advance the offset");
+            assert_eq!(m.mem.r32(f + fcb::ERRNO), E_GENERAL);
+            assert_eq!(m.kernel.files.errno, if direct { 0x5678 } else { E_GENERAL });
+            assert_eq!(m.mem.r8(dst - 1), 0xCC);
+            assert_eq!(m.mem.bytes(dst, cd::USER), vec![0x22; cd::USER]);
+            assert_eq!(m.mem.bytes(dst + sector, cd::USER), vec![0x33; cd::USER]);
+            assert_eq!(m.mem.bytes(dst + 2 * sector, cd::USER + 1), vec![0xCC; cd::USER + 1]);
+            assert_eq!(m.loaded, [(dst, sector), (dst + sector, sector)]);
         }
     }
 
