@@ -281,10 +281,9 @@ Renderer, SDK, translator, runtime:
 **Status (2026-10-30): done but for the human's runs.** Every item is
 ticked except B15 (blocked: needs hardware) and TR1's second half (needs a
 decision, Findings). 1: `cargo test --workspace` passes. 2: both games
-build, every chip native (`out/sf-p1-build-*.log`). 3: can't run yet:
-the oracle harness has no psx-wasm `bios` device under test ("no
-implementation of bios"), so the 5 archived `BIOS_CALL` vectors wait;
-building it moved to phase 3 task 9. 4: **waiting on the human:**
+build, every chip native (`out/sf-p1-build-*.log`). 3: passes since
+`7e748f0` added psx-wasm's `bios` device under test (5 vectors,
+provisional against OpenBIOS). 4: **waiting on the human:**
 `./target/release/psxw ci btn` and `./target/release/psxw ci bof4`. What
 moved that the runs may show: GPUSTAT bits 13/25/31 (B11, B12), timer 0's
 dot clock (B13), CD audio while the SPU is muted (B14), `GetlocP` (B10),
@@ -388,11 +387,9 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    device table (`cdrom`, `bu`, `tty`); `cdrom` reads through the CD
    controller with its timing (`psx-bios/src/bios.rs:344-436`).
 9. [ ] **Every call psx-spx documents.** Group by group, each with
-   `BIOS_CALL` vectors (`psxw-oracle/src/handwritten.rs`, `bios()`). First
-   the harness's psx-wasm side: `psxw oracle check --device bios` has no
-   `DeviceUnderTest` for `bios` (phase 1 found it), so a vector runs a call
-   through `psx_bios::bios::call` on a test machine and compares RAM and
-   v0 with the golden:
+   `BIOS_CALL` vectors (`psxw-oracle/src/handwritten.rs`, `bios()`). The
+   harness's psx-wasm side is `psxw_oracle::bios::Device` (`7e748f0`): a
+   vector's call on a bare psx-bios machine, v0 and the captures:
    - the C library, including `malloc`/`free`/`calloc`/`realloc` over
      `InitHeap`, number conversion, `qsort`;
    - events (`UnDeliverEvent`), timers, kernel memory;
@@ -552,6 +549,13 @@ locals, or static translation.
 - **2026-10-30:** plan created from the shortcuts audit
   (`plans/shortcuts.md`, `3eff117`–`0bae88a`), its bugs (moved from
   open-items) and the BIOS rework.
+- **2026-10-31:** phase 2: SDK2, SDK6/SDK8, SDK3–5, SDK11 done (`b92f582`..
+  `8e04a5b`); SDK1 with an agent. Adapters can bind by place
+  (`libgpu/sys:0x23a8`, `libetc/intr_dma:0x4c`). Chip irq conformance (both
+  games) and chip mdec (bof4) pass. Phase 3: D68, BIOS8 (`5e52ad2`), the
+  oracle's `bios` device (`7e748f0`; phase 1's exit criterion 3 passes);
+  task 9's C library, events, timers, memory and GPU groups with an agent.
+  Phase 4 with an agent.
 - **2026-10-30:** phase 1 implemented (`c484570`..`7ee8c3d`): 36 items done,
   B16 struck (the shift is Beetle's), B15 blocked, TR1 half done. Device
   bugs and translator items by two agents in worktrees, cherry-picked.
