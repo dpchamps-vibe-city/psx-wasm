@@ -39,6 +39,11 @@ fn counter(spec: u32) -> Option<usize> {
     (n < 3).then_some(n)
 }
 
+/// Root counter `n`'s registers: the count, the mode, the target.
+fn rcnt(n: usize, reg: u32) -> u32 {
+    0x1F80_1100 + 0x10 * n as u32 + reg
+}
+
 pub(crate) fn set_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let Some(n) = counter(a[0]) else { return ret(0) };
     let mode_in = a[2];
@@ -56,16 +61,16 @@ pub(crate) fn set_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     if mode_in & 0x1000 != 0 {
         mode |= 0x10;
     }
-    let now = m.timer_now(n);
-    m.timers[n].target = a[1] as u16;
-    m.timers[n].write_mode(mode, now);
-    m.reschedule_timer(n);
+    // As counter.o writes them: the mode cleared, the target, the mode.
+    set_reg(m, rcnt(n, 4), 2, 0)?;
+    set_reg(m, rcnt(n, 8), 2, a[1] & 0xFFFF)?;
+    set_reg(m, rcnt(n, 4), 2, mode as u32)?;
     ret(1)
 }
 
 fn get_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let Some(n) = counter(a[0]) else { return ret(0) };
-    ret(m.timers[n].value(n, m.clock.video, m.timer_now(n)) as u32)
+    ret(reg(m, rcnt(n, 0), 2)? & 0xFFFF)
 }
 
 fn start_rcnt(m: &mut M, a: [u32; 4]) -> Result {
@@ -84,9 +89,7 @@ fn stop_rcnt(m: &mut M, a: [u32; 4]) -> Result {
 
 fn reset_rcnt(m: &mut M, a: [u32; 4]) -> Result {
     let Some(n) = counter(a[0]) else { return ret(0) };
-    let (video, now) = (m.clock.video, m.timer_now(n));
-    m.timers[n].write_count(n, video, now, 0);
-    m.reschedule_timer(n);
+    set_reg(m, rcnt(n, 0), 2, 0)?;
     ret(1)
 }
 
@@ -145,7 +148,7 @@ mod tests {
 
     #[test]
     fn counters() {
-        let mut m = machine(vec![], Default::default());
+        let mut m = crate::testing::machine_with_bus();
         // RCntCNT2, target 0x1000, RCntMdINTR | RCntMdSC (system clock).
         assert_eq!(call(&mut m, set_rcnt, [0xF200_0002, 0x1000, 0x1001, 0]), 1);
         assert_eq!(m.timers[2].mode, 0x58);
