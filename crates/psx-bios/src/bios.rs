@@ -3,10 +3,10 @@
 //! anything else is an error naming the table and number, so a gap fails
 //! loudly instead of returning garbage.
 
-use crate::kernel::{self, File};
+use crate::kernel;
 use crate::libc;
 use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait};
-use crate::tables;
+use crate::{files, tables};
 use psx_devices::cd;
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
@@ -76,6 +76,31 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x4E) => "gpu_sync",
         (0xA0, 0x55) => "_bu_init",
         (0xA0, 0x56) => "_96_remove",
+        (0xA0, 0x57) => "dev_null",
+        (0xA0, 0x5B) => "dev_tty_init",
+        (0xA0, 0x5C) => "dev_tty_open",
+        (0xA0, 0x5D) => "dev_tty_in_out",
+        (0xA0, 0x5E) => "dev_tty_ioctl",
+        (0xA0, 0x5F) => "dev_cd_open",
+        (0xA0, 0x60) => "dev_cd_read",
+        (0xA0, 0x61) => "dev_cd_close",
+        (0xA0, 0x62) => "dev_cd_firstfile",
+        (0xA0, 0x63) => "dev_cd_nextfile",
+        (0xA0, 0x64) => "dev_cd_chdir",
+        (0xA0, 0x65) => "dev_bu_open",
+        (0xA0, 0x66) => "dev_bu_read",
+        (0xA0, 0x67) => "dev_bu_write",
+        (0xA0, 0x68) => "dev_bu_close",
+        (0xA0, 0x69) => "dev_bu_firstfile",
+        (0xA0, 0x6A) => "dev_bu_nextfile",
+        (0xA0, 0x6B) => "dev_bu_erase",
+        (0xA0, 0x6C) => "dev_bu_undelete",
+        (0xA0, 0x6D) => "dev_bu_format",
+        (0xA0, 0x6E) => "dev_bu_rename",
+        (0xA0, 0x96) => "AddCdromDevice",
+        (0xA0, 0x97) => "AddMemCardDevice",
+        (0xA0, 0x98) => "AddDuartTtyDevice",
+        (0xA0, 0x99) => "AddNullConDevice",
         (0xA0, 0x9F) => "SetMemSize",
         (0xA0, 0xA1) => "SystemError",
         (0xA0, 0xAB) => "_card_info",
@@ -113,13 +138,24 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x34) => "read",
         (0xB0, 0x35) => "write",
         (0xB0, 0x36) => "close",
+        (0xB0, 0x37) => "ioctl",
+        (0xB0, 0x39) => "isatty",
+        (0xB0, 0x3A) => "getc",
+        (0xB0, 0x3B) => "putc",
+        (0xB0, 0x3C) => "getchar",
+        (0xB0, 0x3D) => "putchar",
+        (0xB0, 0x3E) => "gets",
         (0xB0, 0x3F) => "puts",
+        (0xB0, 0x40) => "cd",
         (0xB0, 0x41) => "format",
         (0xB0, 0x42) => "firstfile",
         (0xB0, 0x43) => "nextfile",
         (0xB0, 0x44) => "rename",
         (0xB0, 0x45) => "erase",
         (0xB0, 0x46) => "undelete",
+        (0xB0, 0x47) => "AddDrv",
+        (0xB0, 0x48) => "DelDrv",
+        (0xB0, 0x49) => "PrintInstalledDevices",
         (0xB0, 0x4A) => "InitCard",
         (0xB0, 0x4B) => "StartCard",
         (0xB0, 0x4C) => "StopCard",
@@ -134,12 +170,16 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x5B) => "ChangeClearPad",
         (0xB0, 0x5C) => "_card_status",
         (0xB0, 0x5D) => "_card_wait",
+        (0xB0, 0x59) => "testdevice",
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
         (0xC0, 0x07) => "InstallExceptionHandlers",
         (0xC0, 0x1C) => "AdjustA0Table",
         (0xC0, 0x0A) => "ChangeClearRCnt",
         (0xC0, 0x0D) => "SetIrqAutoAck",
+        (0xC0, 0x12) => "InstallDevices",
+        (0xC0, 0x13) => "FlushStdInOutPut",
+        (0xC0, 0x1B) => "KernelRedirect",
         (0xC0, 0x1A) => "set_card_find_mode",
         (0xC0, 0x1D) => "get_card_find_mode",
         _ => "?",
@@ -352,11 +392,34 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xA0, 0x3F) => {
+            // Through putchar, to the console (psx-spx).
             let text = printf(m, a);
-            m.host.log(2, text.trim_end_matches('\n'));
-            r(text.len() as u32)
+            let n = text.len() as u32;
+            let flow = m.putchars(text.into_bytes())?;
+            Ok(crate::machine::seq(m, flow, move |_, _| Flow::ret(n)))
         }
         (0xA0, 0x44) | (0xA0, 0x56) | (0xA0, 0x9F) => r(0),
+        // "return 0" (psx-spx), and the dummy device functions.
+        (0xA0, 0x57) => r(0),
+        // --- A0h: the built-in devices, over the native backends ----------
+        (0xA0, 0x5B) | (0xA0, 0x5E) => r(0),
+        (0xA0, 0x5C) => r(m.tty_open(a[0])),
+        (0xA0, 0x5D) => m.tty_in_out(a[0], a[1]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x5F) => r(m.dev_cd_open(a[0], a[1])),
+        (0xA0, 0x60) => r(m.dev_cd_read(a[0], a[1], a[2])),
+        (0xA0, 0x61) => r(m.dev_cd_close(a[0])),
+        (0xA0, 0x62) => r(m.dev_cd_firstfile(a[0], a[1], a[2])),
+        (0xA0, 0x63) => r(m.dev_cd_nextfile(a[0], a[1])),
+        (0xA0, 0x64) => r(m.dev_cd_chdir(a[1])),
+        (0xA0, 0x65) => r(m.dev_bu_open(a[0], a[1], a[2])),
+        (0xA0, 0x66) | (0xA0, 0x67) => r(m.dev_bu_io(a[0], a[1], a[2], func == 0x67)),
+        (0xA0, 0x68) => r(m.dev_bu_close(a[0])),
+        (0xA0, 0x69) => r(m.dev_bu_find(a[0], a[1], a[2])),
+        (0xA0, 0x6A) => r(m.dev_bu_find(a[0], 0, a[1])),
+        (0xA0, 0x6B) | (0xA0, 0x6C) => r(m.dev_bu_erase(a[0], a[1], func == 0x6C)),
+        (0xA0, 0x6D) => r(m.dev_bu_format(a[0])),
+        (0xA0, 0x6E) => r(m.dev_bu_rename(a[0], a[1], a[3])),
+        (0xA0, 0x96..=0x99) => r(m.add_device(func)),
         (0xA0, 0x45) => {
             m.install_vectors();
             r(0)
@@ -527,110 +590,37 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.undeliver_event(a[0], a[1]);
             r(1)
         }
-        (0xB0, 0x32) => {
-            // OpenBIOS `psxopen`: a free descriptor first, then the device.
-            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            let Some(fd) = (0..16).find(|f| !m.kernel.files.contains_key(f) && !m.kernel.cards.files.contains_key(f)) else {
-                m.kernel.cards.errno = crate::card::E_NO_FDS;
-                return r(u32::MAX);
-            };
-            if crate::card::parse_path(&path).is_some() {
-                return r(m.card_open(&path, a[1], fd));
-            }
-            if !path.to_ascii_lowercase().starts_with("cdrom:") {
-                m.kernel.cards.errno = crate::card::E_NO_DEVICE;
-                return r(u32::MAX);
-            }
-            let mut disc = HostDisc(&mut *m.host);
-            match cd::find(&mut disc, &path) {
-                Some(e) if !e.dir => {
-                    m.kernel.files.insert(fd, File { lba: e.lba, size: e.size, pos: 0 });
-                    r(fd)
-                }
-                _ => {
-                    m.kernel.cards.errno = crate::card::E_NOT_FOUND;
-                    r(u32::MAX)
-                }
-            }
-        }
-        (0xB0, 0x33) => {
-            if let Some(f) = m.kernel.cards.files.get_mut(&a[0]) {
-                f.pos = match a[2] {
-                    0 => a[1],
-                    1 => f.pos.wrapping_add(a[1]),
-                    _ => return r(u32::MAX),
-                };
-                return r(f.pos);
-            }
-            let Some(f) = m.kernel.files.get_mut(&a[0]) else { return r(u32::MAX) };
-            f.pos = match a[2] {
-                0 => a[1],
-                1 => f.pos.wrapping_add(a[1]),
-                _ => return r(u32::MAX),
-            };
-            r(f.pos)
-        }
-        (0xB0, 0x34) => {
-            if m.kernel.cards.files.contains_key(&a[0]) {
-                return r(m.card_io(a[0], a[1], a[2], false));
-            }
-            let Some(f) = m.kernel.files.get(&a[0]).copied() else { return r(u32::MAX) };
-            let n = a[2].min(f.size.saturating_sub(f.pos));
-            let disc = HostDisc(&mut *m.host);
-            let mut got = Vec::with_capacity(n as usize);
-            let mut raw = [0u8; cd::RAW];
-            let mut s = f.pos / cd::USER as u32;
-            while (got.len() as u32) < n {
-                if !disc.0.disc_read(f.lba + s, &mut raw) {
-                    return r(u32::MAX);
-                }
-                let user = cd::user_data(&raw);
-                let start = if s == f.pos / cd::USER as u32 { (f.pos % cd::USER as u32) as usize } else { 0 };
-                let take = ((n as usize) - got.len()).min(cd::USER - start);
-                got.extend_from_slice(&user[start..start + take]);
-                s += 1;
-            }
-            m.mem.write(a[1], &got);
-            m.loaded.push((a[1], got.len() as u32));
-            m.kernel.files.get_mut(&a[0]).unwrap().pos += n;
-            r(n)
-        }
-        (0xB0, 0x35) => {
-            if m.kernel.cards.files.contains_key(&a[0]) {
-                return r(m.card_io(a[0], a[1], a[2], true));
-            }
-            r(u32::MAX)
-        }
-        (0xB0, 0x36) => {
-            let known = m.kernel.files.remove(&a[0]).is_some() | m.kernel.cards.files.remove(&a[0]).is_some();
-            r(if known { a[0] } else { u32::MAX })
-        }
-        (0xB0, 0x41) => {
-            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            r(m.card_format(&path))
-        }
+        // --- B0h: the file functions over the device table (crate::files)
+        (0xB0, 0x32) => m.open(a[0], a[1]),
+        (0xB0, 0x33) => r(m.lseek(a[0], a[1], a[2])),
+        (0xB0, 0x34) | (0xB0, 0x35) => m.transfer(a[0], a[1], a[2], func == 0x35),
+        (0xB0, 0x36) => m.close(a[0]),
+        (0xB0, 0x37) => m.ioctl(a[0], a[1], a[2]),
+        (0xB0, 0x39) => r(m.isatty(a[0])),
+        (0xB0, 0x3A) => m.getc(a[0]),
+        (0xB0, 0x3B) => m.putc(a[0], a[1]),
+        (0xB0, 0x3C) => m.getchar(),
+        (0xB0, 0x3D) => m.putchars(vec![a[0] as u8]),
+        (0xB0, 0x3E) => Err(format!("{label}: pending host console input for gets")),
         (0xB0, 0x3F) => {
-            let s = String::from_utf8_lossy(&mem.cstr(a[0], 1024)).into_owned();
-            m.host.log(2, &s);
+            // puts: "<NULL>" for a null pointer (psx-spx).
+            let s = if a[0] == 0 { b"<NULL>".to_vec() } else { mem.cstr(a[0], MAX_LEN as usize) };
+            m.putchars(s)
+        }
+        (0xB0, 0x40) => m.cd(a[0]),
+        (0xB0, 0x41) => m.erase(a[0], files::dcb::FORMAT),
+        (0xB0, 0x42) => m.firstfile(a[0], a[1]),
+        (0xB0, 0x43) => m.nextfile(a[0]),
+        (0xB0, 0x44) => m.rename(a[0], a[1]),
+        (0xB0, 0x45) => m.erase(a[0], files::dcb::ERASE),
+        (0xB0, 0x46) => m.erase(a[0], files::dcb::UNDELETE),
+        (0xB0, 0x47) => m.add_drv(a[0]),
+        (0xB0, 0x48) => m.del_drv(a[0]),
+        (0xB0, 0x49) => {
+            m.print_devices();
             r(0)
         }
-        (0xB0, 0x42) => {
-            let pat = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            if crate::card::parse_path(&pat).is_some() {
-                return r(m.card_find(Some(&pat), a[1]));
-            }
-            r(0)
-        }
-        (0xB0, 0x43) => r(m.card_find(None, a[0])),
-        (0xB0, 0x44) => {
-            let from = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            let to = String::from_utf8_lossy(&mem.cstr(a[1], 128)).into_owned();
-            r(m.card_rename(&from, &to))
-        }
-        (0xB0, 0x45) | (0xB0, 0x46) => {
-            let path = String::from_utf8_lossy(&mem.cstr(a[0], 128)).into_owned();
-            r(m.card_erase(&path, func == 0x46))
-        }
+        (0xB0, 0x59) => m.test_device(a[0]),
         (0xB0, 0x4A) => r(m.card_init(a[0])),
         // StartCARD2, StopCARD2: the pad and card handler in or out of the
         // chain.
@@ -646,8 +636,8 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.card_new(0x10);
             r(1)
         }
-        (0xB0, 0x54) => r(m.kernel.cards.errno),
-        (0xB0, 0x55) => r(if m.kernel.cards.files.contains_key(&a[0]) { m.kernel.cards.errno } else { u32::MAX }),
+        (0xB0, 0x54) => r(m.kernel.files.errno),
+        (0xB0, 0x55) => r(m.get_error(a[0])),
         (0xB0, 0x5C) => {
             m.cards_ready();
             r(m.kernel.cards.status[(a[0] & 1) as usize])

@@ -117,6 +117,10 @@ pub mod kernel {
     pub const EXCB_ENTRY: u32 = 0x100;
     pub const PCB_ENTRY: u32 = 0x108;
     pub const TCB_ENTRY: u32 = 0x110;
+    /// The file and device control blocks' table-of-tables entries
+    /// (psx-spx "BIOS Control Blocks").
+    pub const FCB_ENTRY: u32 = 0x140;
+    pub const DCB_ENTRY: u32 = 0x150;
     /// The PCB: one word, the current thread's TCB.
     pub const PCB: u32 = 0xE000;
     /// The TCBs (SYSTEM.CNF `TCB=`, at most [`MAX_TCBS`]); TCB 0 is the
@@ -144,10 +148,23 @@ pub mod kernel {
     pub const EVCBS: u32 = TCBS + MAX_TCBS * TCB_SIZE;
     pub const EVCB_SIZE: u32 = 0x1C;
     pub const MAX_EVENTS: u32 = 64;
+    /// The file control blocks, then the device control blocks and their
+    /// names (psx-spx: FCB 2Ch bytes, DCB 50h bytes).
+    pub const FCBS: u32 = 0x7300;
+    pub const FCB_SIZE: u32 = 0x2C;
+    pub const FILES: u32 = 16;
+    pub const DCBS: u32 = FCBS + FILES * FCB_SIZE;
+    pub const DCB_SIZE: u32 = 0x50;
+    pub const DEVICES: u32 = 10;
     /// Kernel RAM a game may read and write at constant addresses: the
     /// lift's kernel rule accepts these and still fails on the rest.
-    pub const RAM_BACKED: [Range<u32>; 4] =
-        [0..EVCB_ENTRY + 8, BOOT_ARGUMENT..B0_TABLE + 4 * B0_LEN, DATA, EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE];
+    pub const RAM_BACKED: [Range<u32>; 5] = [
+        0..DCB_ENTRY + 8,
+        BOOT_ARGUMENT..B0_TABLE + 4 * B0_LEN,
+        DATA,
+        FCBS..DCBS + DEVICES * DCB_SIZE + 0x100,
+        EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE,
+    ];
 
     /// Whether physical address `addr` lies in [`RAM_BACKED`].
     pub fn ram_backed(addr: u32) -> bool {

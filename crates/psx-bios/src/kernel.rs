@@ -1,6 +1,6 @@
 //! Kernel state behind the BIOS functions: event control blocks, the pad
-//! buffers the kernel fills at vblank, open files, the heap, interrupt
-//! handler queues (psx-spx "Kernel (BIOS)").
+//! buffers the kernel fills at vblank, the heap, interrupt handler queues
+//! (psx-spx "Kernel (BIOS)").
 
 use crate::machine::Host;
 use crate::{Machine, Sdk};
@@ -8,7 +8,6 @@ use crate::{Machine, Sdk};
 use crate::IrqStep;
 use psxw_abi::kernel as k;
 use psx_devices::mem::Mem;
-use std::collections::BTreeMap;
 
 pub const EV_UNUSED: u32 = 0x0000;
 pub const EV_DISABLED: u32 = 0x1000;
@@ -37,13 +36,6 @@ pub struct EvCb {
     pub status: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct File {
-    pub lba: u32,
-    pub size: u32,
-    pub pos: u32,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Kernel {
     /// `InitPAD` buffers: (address, size) per port.
@@ -63,7 +55,8 @@ pub struct Kernel {
     pub kheap: (u32, u32),
     /// Where `strtok`'s next fragment starts (0: none).
     pub strtok: u32,
-    pub files: BTreeMap<u32, File>,
+    /// The file functions' state outside the control blocks.
+    pub files: crate::files::Files,
     /// Whether the kernel's handlers acknowledge what they handle: root
     /// counters 0-2 and vblank (`ChangeClearRCnt`), the pad handler's vblank
     /// (`ChangeClearPad`), the IRQ events' lines (`SetIrqAutoAck`).

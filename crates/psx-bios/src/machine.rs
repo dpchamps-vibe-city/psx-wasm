@@ -158,6 +158,28 @@ impl<S> Flow<S> {
     }
 }
 
+/// `flow`, then `f` with its result: at once when it returns, else once
+/// its wait or guest call is over.
+pub fn seq<S: Sdk>(m: &mut Machine<S>, flow: Flow<S>, f: impl FnOnce(&mut Machine<S>, u64) -> Flow<S> + 'static) -> Flow<S> {
+    match flow {
+        Flow::Return(v) => f(m, v),
+        Flow::Block { until, then } => Flow::Block {
+            until,
+            then: Box::new(move |m| {
+                let next = then(m);
+                seq(m, next, f)
+            }),
+        },
+        Flow::Call { call, then } => Flow::Call {
+            call,
+            then: Box::new(move |m, v| {
+                let next = then(m, v);
+                seq(m, next, f)
+            }),
+        },
+    }
+}
+
 /// Conditions a blocked call waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
@@ -172,7 +194,7 @@ pub enum Wait {
 }
 
 /// SDK adapter state plugs into the machine through this trait.
-pub trait Sdk: Sized {
+pub trait Sdk: Sized + 'static {
     /// Handle an `Event::Sdk` the adapters scheduled.
     fn on_event(m: &mut Machine<Self>, kind: u32, data: u32);
     /// Whether `Wait::Sdk(cond)` holds.
@@ -298,6 +320,7 @@ impl<S: Sdk> Machine<S> {
         m.clock.schedule(first, Event::Vblank);
         // Guest-visible native kernel data exists before a game runs.
         m.lay_out_tables();
+        m.lay_out_files();
         m.lay_out_excb();
         m.lay_out_kernel_handlers();
         m
