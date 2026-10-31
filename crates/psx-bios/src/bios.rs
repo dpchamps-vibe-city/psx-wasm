@@ -15,6 +15,7 @@ pub(crate) const MAX_LEN: u32 = 0x0020_0000;
 pub fn name(table: u32, func: u32) -> &'static str {
     match (table, func) {
         (0xA0, 0x0A) => "todigit",
+        (0xA0, 0x0B) => "atof",
         (0xA0, 0x0C) => "strtoul",
         (0xA0, 0x0D) => "strtol",
         (0xA0, 0x0E) => "abs",
@@ -53,6 +54,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x2F) => "rand",
         (0xA0, 0x30) => "srand",
         (0xA0, 0x31) => "qsort",
+        (0xA0, 0x32) => "strtod",
         (0xA0, 0x33) => "malloc",
         (0xA0, 0x34) => "free",
         (0xA0, 0x35) => "lsearch",
@@ -62,6 +64,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x39) => "InitHeap",
         (0xA0, 0x3F) => "printf",
         (0xA0, 0x43) => "Exec",
+        (0xA0, 0x51) => "LoadExec",
         (0xA0, 0x44) => "FlushCache",
         (0xA0, 0x46) => "GPU_dw",
         (0xA0, 0x47) => "gpu_send_dma",
@@ -154,7 +157,9 @@ pub fn implemented(table: u32, func: u32) -> bool {
 pub fn unsupported(table: u32, func: u32) -> Option<&'static str> {
     match (table, func) {
         (0xA0, 0x14) => Some("longjmp across translated frames is not supported"),
-        (0xA0, 0x43) => Some("loading and running another executable is not supported"),
+        (0xA0, 0x43) | (0xA0, 0x51) => Some("loading and running another executable is not supported: only what was translated at build time runs"),
+        // psx-spx: they use the absent COP1, so the console locks up.
+        (0xA0, 0x0B) | (0xA0, 0x32) => Some("it uses COP1, which the console doesn't have (the call locks up on hardware)"),
         _ => None,
     }
 }
@@ -200,7 +205,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             // longjmp traps.
             r(0)
         }
-        (0xA0, 0x14) | (0xA0, 0x43) => Err(format!("{label}: {}", unsupported(table, func).unwrap_or_default())),
+        (0xA0, 0x0B) | (0xA0, 0x14) | (0xA0, 0x32) | (0xA0, 0x43) | (0xA0, 0x51) => Err(format!("{label}: {}", unsupported(table, func).unwrap_or_default())),
         (0xA0, 0x15) | (0xA0, 0x16) => {
             // strcat, strncat (at most maxlen characters, none for a
             // negative maxlen); 0 for a null pointer.
