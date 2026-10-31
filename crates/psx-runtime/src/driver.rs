@@ -177,12 +177,12 @@ mod tests {
         }
         fn report(&mut self, _: &str) {}
     }
-    struct Regs;
+    struct Regs(u32);
     impl psx_bios::Regs for Regs {
         fn sp(&self) -> u32 {
-            0x801F_F000
+            self.0
         }
-        fn set_sp(&mut self, _: u32) {}
+        fn set_sp(&mut self, sp: u32) { self.0 = sp; }
         fn gp(&self) -> u32 {
             0
         }
@@ -215,7 +215,7 @@ mod tests {
     }
 
     fn machine() -> RefCell<Machine<Psyq>> {
-        RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(Host), Box::new(Regs), Default::default(), Psyq::default()))
+        RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(Host), Box::new(Regs(0x801F_F000)), Default::default(), Psyq::default()))
     }
 
     /// A `SysEnqIntRP` element at `at` (verifier, handler) in a chain.
@@ -226,24 +226,43 @@ mod tests {
         m.enq_int_rp(prio, at);
     }
 
-    /// A queued guest callback delivers ERR or cancels CdGetStatus. The
-    /// ordinary driver must resume immediately, before the native CD deadline.
+    /// A queued guest callback delivers ERR, cancels CdGetStatus, or writes
+    /// the patched command's local status byte before delivering DNE. The
+    /// ordinary driver resumes immediately with the frame intact throughout.
     #[test]
     fn cd_event_wait_wakes_from_a_guest_callback_without_advancing_time() {
         use psx_bios::{bios, cdrom};
         const DELIVER: u32 = 0x8001_1000;
         const ERROR: u32 = 0x8001_2000;
+        const STATUS: u32 = 0x8001_3000;
+        const SP: u32 = 0x801F_F000;
         struct CdGuest<'a> {
             rt: &'a RefCell<Machine<Psyq>>,
             seen: Vec<u32>,
             cancel: bool,
+            status: Option<u32>,
         }
         impl Invoke for CdGuest<'_> {
             fn invoke(&mut self, call: GuestCall) -> u64 {
                 self.seen.push(call.addr);
+                assert_eq!(self.rt.borrow().regs.sp(), SP - 24);
+                if call.addr == STATUS {
+                    let mut m = self.rt.borrow_mut();
+                    assert!(!m.in_irq);
+                    assert_eq!(call.args, [SP - 8, 0, 0, 0]);
+                    m.mem.write(SP - 24, &[0xCC; 16]); // o32 argument homes
+                    m.mem.w8(call.args[0], 0x42);
+                    self.status = Some(call.args[0]);
+                    return 1;
+                }
                 if call.addr == DELIVER {
                     assert!(self.rt.borrow().in_irq);
-                    let flow = if self.cancel {
+                    let flow = if let Some(status) = self.status {
+                        let mut m = self.rt.borrow_mut();
+                        assert_eq!(m.mem.r8(status), 0x42);
+                        m.mem.w8(status, 0xA5);
+                        bios::dispatch(&mut m, 0xB0, 0x07, [cdrom::EV_CD, cdrom::DNE, 0, 0]).unwrap()
+                    } else if self.cancel {
                         bios::dispatch(&mut self.rt.borrow_mut(), 0xA0, 0x95, [0; 4]).unwrap()
                     } else {
                         bios::dispatch(&mut self.rt.borrow_mut(), 0xB0, 0x07,
@@ -260,23 +279,25 @@ mod tests {
                 }
             }
         }
-        for cancel in [false, true] {
+        for (cancel, software) in [(false, false), (true, false), (false, true)] {
             let rt = machine();
             let (flow, now, due) = {
                 let mut m = rt.borrow_mut();
                 m.cd_init();
                 m.mem.w32(psx_bios::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+                if software { m.mem.w32(psx_bios::tables::entry(0xA0, 0x7C).unwrap(), STATUS); }
                 let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
                 m.calls.push_back(GuestCall { addr: DELIVER, args: [0; 4] });
                 (flow, m.clock.now, m.cd_due())
             };
             assert!(due > now);
-            let mut guest = CdGuest { rt: &rt, seen: vec![], cancel };
-            assert_eq!(run(&rt, &mut guest, flow), u32::MAX as u64);
-            assert_eq!(guest.seen, [DELIVER, ERROR]);
+            let mut guest = CdGuest { rt: &rt, seen: vec![], cancel, status: None };
+            assert_eq!(run(&rt, &mut guest, flow), if software { 0xA5 } else { u32::MAX as u64 });
+            assert_eq!(guest.seen, if software { [STATUS, DELIVER] } else { [DELIVER, ERROR] });
+            assert_eq!(rt.borrow().regs.sp(), SP);
             assert_eq!(rt.borrow().clock.now, now);
             assert_eq!(rt.borrow().clock.pending(|e| *e == psx_bios::Event::Cd),
-                if cancel { None } else { Some(due) });
+                if cancel || software { None } else { Some(due) });
         }
     }
 
@@ -318,7 +339,7 @@ mod tests {
         let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
         let hold = std::rc::Rc::new(crate::hold::Hold::new());
         let host = Paced { seen: seen.clone(), hold: hold.clone() };
-        let rt = RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(host), Box::new(Regs), Default::default(), Psyq::default()));
+        let rt = RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(host), Box::new(Regs(0x801F_F000)), Default::default(), Psyq::default()));
         let mut g = Guest { rt: &rt, rfe: vec![], seen: vec![] };
         let vblank = psx_devices::clock::CPU_HZ / 60;
         let run_vblanks = |g: &mut Guest, n: u64| {

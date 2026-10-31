@@ -123,8 +123,7 @@ fn sector_bytes(raw: &[u8; cd::RAW], mode: u8) -> &[u8] {
 }
 
 /// Poll and consume the live TestEvent flags, not the operation's result.
-/// Keep its captured status across callback re-entry. A premature software DNE
-/// has no captured status yet (native zero, not retail's uninitialized byte).
+/// The caller's status byte lives in its guest stack frame across re-entry.
 /// Cancellation remains a separate native failure, not an invented INT5 event.
 /// Like TestEvent polling, an unready/closed flag can wait indefinitely: no
 /// pending drive operation does not exclude a later guest DeliverEvent.
@@ -529,13 +528,23 @@ impl<S: Sdk> Machine<S> {
     /// A(A5h) `CdReadSector(count, sector, dst)` (OpenBIOS
     /// `cdromBlockReading`): SeekL to `sector`, then ReadN at double speed;
     /// `count`, or -1 on failure if SystemError returns. A read ERR retries
-    /// after that call, up to ten attempts. Read-command acceptance calls the
-    /// live A7E table at most 99999 times, then waits for the completion event.
+    /// after that call, up to ten attempts. Seek/read acceptance calls the
+    /// live A78/A7E tables at most 99999 times each before waiting for events.
     pub fn cd_block_read(&mut self, count: u32, sector: u32, dst: u32) -> Result<Flow<S>, String> {
-        Ok(self.cd_block_read_attempt(count, sector.wrapping_add(cd::PREGAP), dst, 10))
+        // Like the SDK's StCdInterrupt, reserve guest locals below the caller,
+        // with 16 bytes for o32 outgoing arguments. Keep the MSF across all
+        // calls, waits and read retries; nested calls get independent frames.
+        let sp = self.regs.sp();
+        let frame = sp.wrapping_sub(24);
+        self.regs.set_sp(frame);
+        let flow = self.cd_block_read_attempt(count, sector.wrapping_add(cd::PREGAP), dst, frame.wrapping_add(16), 10);
+        Ok(crate::machine::seq(self, flow, move |m, v| {
+            m.regs.set_sp(sp);
+            Flow::Return(v)
+        }))
     }
 
-    fn cd_block_read_attempt(&mut self, count: u32, sector: u32, dst: u32, left: u32) -> Flow<S> {
+    fn cd_block_read_attempt(&mut self, count: u32, sector: u32, dst: u32, msf_addr: u32, left: u32) -> Flow<S> {
         if left == 0 {
             return system_error(self, 0x0C);
         }
@@ -543,53 +552,61 @@ impl<S: Sdk> Machine<S> {
         // Retail computes MSF inside the retry loop and loses the minutes
         // from `sector`. OpenBIOS helpers.c documents but fixes that bug.
         let sector = sector % 4500;
-        if self.cd_seek_l(msf) == 0 {
-            return system_error(self, 0x0B);
-        }
-        let wait = cd_wait(self, self.kernel.cd.done.clone(), false);
-        crate::machine::seq(self, wait, move |m, result| {
-            if result as u32 != DNE {
-                return system_error(m, 0x0C);
+        self.mem.write(msf_addr, &msf);
+        let accept = self.cd_accept(0x78, [msf_addr, 0, 0, 0], 99999);
+        crate::machine::seq(self, accept, move |m, accepted| {
+            if accepted as u32 == 0 {
+                return system_error(m, 0x0B);
             }
-            let accept = m.cd_read_accept(count, dst, 99999);
-            crate::machine::seq(m, accept, move |m, accepted| {
-                if accepted as u32 == 0 {
+            let wait = m.cd_accepted_wait(false);
+            crate::machine::seq(m, wait, move |m, result| {
+                if result as u32 != DNE {
                     return system_error(m, 0x0C);
                 }
-                // A patch can complete entirely through software events. Only
-                // active native work can subsequently cancel this wait; do not
-                // inherit cancellation from an earlier rejected attempt.
-                let done = if m.kernel.cd.op.is_some() { m.kernel.cd.done.clone() }
-                    else { Rc::new(Cell::new(None)) };
-                let wait = cd_wait(m, done, true);
-                crate::machine::seq(m, wait, move |m, result| match result as u32 {
-                    DNE => Flow::ret(count),
-                    END => system_error(m, 0x17),
-                    _ => {
-                        let error = system_error(m, 0x16);
-                        crate::machine::seq(m, error, move |m, _| {
-                            m.cd_block_read_attempt(count, sector, dst, left - 1)
-                        })
+                let accept = m.cd_accept(0x7E, [count, dst, 0x80, 0], 99999);
+                crate::machine::seq(m, accept, move |m, accepted| {
+                    if accepted as u32 == 0 {
+                        return system_error(m, 0x0C);
                     }
+                    let wait = m.cd_accepted_wait(true);
+                    crate::machine::seq(m, wait, move |m, result| match result as u32 {
+                        DNE => Flow::ret(count),
+                        END => system_error(m, 0x17),
+                        _ => {
+                            let error = system_error(m, 0x16);
+                            crate::machine::seq(m, error, move |m, _| {
+                                m.cd_block_read_attempt(count, sector, dst, msf_addr, left - 1)
+                            })
+                        }
+                    })
                 })
             })
         })
     }
 
-    /// helpers.c retries the patchable A(7Eh) call at most 99999 times.
+    /// A patch can complete entirely through software events. Only active
+    /// native work can subsequently cancel its wait; do not inherit a prior
+    /// rejected attempt's cancellation (applies to seek, read and status).
+    fn cd_accepted_wait(&mut self, read: bool) -> Flow<S> {
+        let done = if self.kernel.cd.op.is_some() { self.kernel.cd.done.clone() }
+            else { Rc::new(Cell::new(None)) };
+        cd_wait(self, done, read)
+    }
+
+    /// helpers.c/cdrom.c retry the patchable command with a bounded count.
     /// Immediate rejections loop without Rust recursion; guest calls/blocks
     /// resume before re-reading the table. These are software attempts, not
     /// instruction-cost timing or an excuse to cancel the drive's pending work.
-    fn cd_read_accept(&mut self, count: u32, dst: u32, mut tries: u32) -> Flow<S> {
+    fn cd_accept(&mut self, func: u32, args: [u32; 4], mut tries: u32) -> Flow<S> {
         while tries != 0 {
             tries -= 1;
-            let flow = crate::bios::dispatch(self, 0xA0, 0x7E, [count, dst, 0x80, 0])
-                .unwrap_or_else(|e| panic!("CdReadSector: {e}"));
+            let flow = crate::bios::dispatch(self, 0xA0, func, args)
+                .unwrap_or_else(|e| panic!("CD command: {e}"));
             match flow {
                 Flow::Return(v) if v as u32 == 0 => {}
                 Flow::Return(v) => return Flow::Return(v),
                 flow => return crate::machine::seq(self, flow, move |m, v| {
-                    if v as u32 == 0 { m.cd_read_accept(count, dst, tries) }
+                    if v as u32 == 0 { m.cd_accept(func, args, tries) }
                     else { Flow::Return(v) }
                 }),
             }
@@ -597,18 +614,28 @@ impl<S: Sdk> Machine<S> {
         Flow::ret(0)
     }
 
-    /// A(A6h) `CdGetStatus()` (OpenBIOS `cdromBlockGetStatus`): the drive's
-    /// status byte kept in the driver state.
+    /// A(A6h) `CdGetStatus()` (OpenBIOS `cdromBlockGetStatus`): ask A7C
+    /// to write a local status byte, then read it after DNE. An early software
+    /// DNE can expose the prior stack byte, as no command has written it yet.
     pub fn cd_block_status(&mut self) -> Result<Flow<S>, String> {
-        if self.cd_get_status_at(None) == 0 {
-            return Ok(system_error(self, 0x1F));
-        }
-        let wait = cd_wait(self, self.kernel.cd.done.clone(), false);
-        Ok(crate::machine::seq(self, wait, move |m, result| {
-            match result as u32 {
-                DNE => Flow::ret((result >> 32) as u32),
-                _ => system_error(m, 0x20),
+        let sp = self.regs.sp();
+        let frame = sp.wrapping_sub(24); // o32 argument area plus the local byte
+        let status = frame.wrapping_add(16);
+        self.regs.set_sp(frame);
+        let accept = self.cd_accept(0x7C, [status, 0, 0, 0], 9);
+        let flow = crate::machine::seq(self, accept, move |m, accepted| {
+            if accepted as u32 == 0 {
+                return system_error(m, 0x1F);
             }
+            let wait = m.cd_accepted_wait(false);
+            crate::machine::seq(m, wait, move |m, result| match result as u32 {
+                DNE => Flow::ret(m.mem.r8(status) as u32),
+                _ => system_error(m, 0x20),
+            })
+        });
+        Ok(crate::machine::seq(self, flow, move |m, v| {
+            m.regs.set_sp(sp);
+            Flow::Return(v)
         }))
     }
 }
@@ -1074,6 +1101,7 @@ mod tests {
         m.cd_init();
         let error = 0x8001_1000;
         m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+        let sp = m.regs.sp();
         let f = m.cd_block_read(1, 40, 0x8002_0000).unwrap();
         m.mem.write(0x8002_0000, b"keep");
         let mut f = f;
@@ -1096,6 +1124,7 @@ mod tests {
             }
         }
         assert_eq!(m.mem.bytes(0x8002_0000, 4), b"keep");
+        assert_eq!(m.regs.sp(), sp, "returning END error releases the frame");
 
         let h = m.open_event(EV_CD, DNE, kernel::EV_MODE_INTR, 0x8001_2000);
         m.set_ev_status(h, kernel::EV_ENABLED);
@@ -1162,6 +1191,147 @@ mod tests {
             assert_eq!(run(&mut m, flow), u32::MAX as u64);
             assert!(m.kernel.cd.op.is_none(), "seek/status errors do not retry");
         }
+    }
+
+    /// Seek/status pass real guest locals through the live command table;
+    /// retries keep the pointer and guest edits, nested calls keep separate
+    /// frames, and every returning success/error restores the caller's SP.
+    #[test]
+    fn blocking_seek_and_status_honor_patched_acceptance() {
+        for (outer, command, bound, code) in [(0xA5, 0x78, 99999, 0x0B), (0xA6, 0x7C, 9, 0x1F)] {
+            for (accept_at, software) in [(2, true), (bound, false), (0, false)] {
+                let mut sectors = vec![[0u8; cd::RAW]; 5];
+                sectors[3] = sector(3, b"edited");
+                let mut m = machine_with_disc(sectors);
+                m.drive.timing = cd::Timing::Instant;
+                m.cd_init();
+                let sp = m.regs.sp();
+                let entry = crate::tables::entry(0xA0, command).unwrap();
+                let saved = m.mem.r32(entry);
+                let patch = 0x8001_1000;
+                let error = 0x8001_2000;
+                let read_patch = 0x8001_3000;
+                let dst = 0x8002_0000;
+                m.mem.w32(entry, patch);
+                m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+                if software { m.mem.w32(crate::tables::entry(0xA0, 0x7E).unwrap(), read_patch); }
+                m.mem.write(dst, b"keep");
+                let mut flow = bios::dispatch(&mut m, 0xA0, outer, [1, 2, dst, 0]).unwrap();
+                let frame = sp - 24;
+                let local = frame + 16;
+                for attempt in 1..=bound {
+                    let Flow::Call { call, then } = flow else { panic!("command {command:x}, attempt {attempt}") };
+                    assert_eq!(call, GuestCall { addr: patch + (attempt - 1) * 4, args: [local, 0, 0, 0] });
+                    assert_eq!(m.regs.sp(), frame);
+                    assert_eq!(m.clock.now, 0, "no instruction-cost timing");
+                    assert!(m.kernel.cd.op.is_none(), "no unsolicited native command");
+                    // A callee may spill all four arguments into its incoming
+                    // o32 home area. The pointed-to local must survive.
+                    m.mem.write(frame, &[0xCC; 16]);
+                    if command == 0x78 {
+                        assert_eq!(m.mem.bytes(local, 3), if attempt == 1 { vec![0, 2, 2] } else { vec![0, 2, 3] });
+                    }
+                    if attempt == accept_at {
+                        if software {
+                            assert_eq!(m.kernel.cd.done.get(), Some(ERR as u64), "old cancellation");
+                            if command == 0x7C {
+                                // A nested status call shares the backend, not
+                                // the outer call's stack local or saved SP.
+                                m.mem.w8(local, 0xA5);
+                                let nested = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+                                let Flow::Call { call, then } = nested else { panic!("nested status patch") };
+                                assert_eq!(m.regs.sp(), frame - 24);
+                                assert_eq!(call.args[0], local - 24);
+                                m.mem.w8(call.args[0], 0x5A);
+                                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                                let nested = then(&mut m, 1);
+                                assert_eq!(run(&mut m, nested), 0x5A);
+                                assert_eq!(m.regs.sp(), frame);
+                                assert_eq!(m.mem.r8(local), 0xA5);
+                            }
+                            ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                        } else {
+                            let (t, f) = crate::tables::stand_in_fn(saved).unwrap();
+                            assert_eq!(ret(bios::call(&mut m, t, f, call.args)), 1);
+                        }
+                        flow = then(&mut m, u32::MAX as u64);
+                        break;
+                    }
+                    if attempt == 1 {
+                        if software {
+                            let (t, f) = crate::tables::stand_in_fn(saved).unwrap();
+                            assert_eq!(ret(bios::call(&mut m, t, f, call.args)), 1);
+                            ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+                        }
+                        if command == 0x78 { m.mem.w8(local + 2, 3); }
+                    }
+                    m.mem.w32(entry, patch + attempt * 4);
+                    flow = then(&mut m, 0x1_0000_0000); // only v0 is the boolean
+                }
+                if accept_at == 0 {
+                    let Flow::Call { call, then } = flow else { panic!("exhaustion") };
+                    assert_eq!(call, GuestCall { addr: error, args: [0x44, code, 0, 0] });
+                    assert_eq!(m.regs.sp(), frame, "frame lives through the error callback");
+                    flow = then(&mut m, 123);
+                    assert_eq!(run(&mut m, flow), u32::MAX as u64);
+                    assert_eq!(m.clock.now, 0);
+                } else if software {
+                    if command == 0x78 {
+                        let Flow::Call { call, then } = flow else { panic!("read after software seek") };
+                        assert_eq!(call, GuestCall { addr: read_patch, args: [1, dst, 0x80, 0] });
+                        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                        flow = then(&mut m, 1);
+                    }
+                    assert_eq!(run(&mut m, flow), if command == 0x78 { 1 } else { 0xA5 });
+                    assert_eq!(m.mem.bytes(dst, 4), b"keep");
+                    assert!(m.kernel.cd.op.is_none());
+                    assert_eq!(m.clock.now, 0);
+                } else {
+                    assert!(matches!(flow, Flow::Block { .. }));
+                    assert_eq!(m.regs.sp(), frame, "frame lives through native completion");
+                    assert_eq!(run(&mut m, flow), if command == 0x78 { 1 } else { 2 });
+                    if command == 0x78 { assert_eq!(m.mem.bytes(dst, 6), b"edited"); }
+                }
+                assert_eq!(m.regs.sp(), sp);
+            }
+
+            // Native immediate busy rejections use the same exact bound;
+            // neither advancing virtual time nor cancelling the pending job.
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            assert_eq!(m.cd_get_status(0x8002_1000), 1);
+            let done = m.kernel.cd.done.clone();
+            let sp = m.regs.sp();
+            let error = 0x8001_2000;
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+            let flow = bios::dispatch(&mut m, 0xA0, outer, [1, 2, 0x8002_0000, 0]).unwrap();
+            let Flow::Call { call, then } = flow else { panic!("busy command exhaustion") };
+            assert_eq!(call, GuestCall { addr: error, args: [0x44, code, 0, 0] });
+            let name = format!("bios.A0h:{command:02X}h {}", bios::name(0xA0, command));
+            assert_eq!(m.counts[&name], bound as u64);
+            assert_eq!(m.clock.now, 0);
+            assert!(Rc::ptr_eq(&done, &m.kernel.cd.done));
+            assert!(m.kernel.cd.op.is_some());
+            let flow = then(&mut m, 0);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert_eq!(m.regs.sp(), sp);
+        }
+
+        // A premature software DNE reads the as-yet unwritten guest byte,
+        // not a fabricated zero or a prior operation's captured status.
+        let mut m = machine_with_disc(vec![]);
+        m.cd_init();
+        let sp = m.regs.sp();
+        m.mem.w8(sp - 8, 0xB7);
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        let Flow::Block { until, then } = flow else { panic!("native status") };
+        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+        assert!(m.holds(&until));
+        let flow = then(&mut m);
+        assert_eq!(run(&mut m, flow), 0xB7);
+        assert_eq!(m.regs.sp(), sp);
+        assert_eq!(m.clock.now, 0);
+        assert!(m.kernel.cd.op.is_some(), "software DNE does not cancel native work");
     }
 
     /// Read acceptance honors the live A7E table and saved original entry,
@@ -1275,6 +1445,9 @@ mod tests {
         m.step(m.cd_due());
         let Flow::Block { until, then } = then(&mut m) else { panic!("read waits after the replacement returns") };
         assert!(!m.holds(&until), "status consumed its DNE before returning nonzero");
+        assert!(m.kernel.cd.op.is_none());
+        ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+        assert!(!m.holds(&until), "reset cannot cancel a software-only wait");
         let now = m.clock.now;
         ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
         assert!(m.holds(&until));

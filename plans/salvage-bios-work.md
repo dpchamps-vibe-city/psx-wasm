@@ -133,17 +133,17 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 |---|---|
 | Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
-| Card, console and CD | Partial; CD blocking calls wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts. The read-command phase now honors patched A7E calls and bounded acceptance retries; seek/status/poll dispatch and native busy-progress semantics remain incomplete. CD opens preserve ISO versions and accept `?` filename matching. |
+| Card, console and CD | Partial; CD blocking calls wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts. Seek/read/status now honor patched A78/A7E/A7C commands and bounded acceptance retries, with per-call guest stack locals. Patched event polling and native busy-progress semantics remain incomplete. CD opens preserve ISO versions and accept `?` filename matching. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
 | Fonts and BIOS identity | Glyph-resource/identity decisions remain open. B53's resource-independent offset mapping needs better evidence: the proposed OpenBIOS table lookup aliases valid charset-3 codes and was rejected. No invented glyph pointers, dates or versions. |
-| Validation | CD read-dispatch follow-up passes BIOS 54/runtime 9/SDK 42 tests and wasm32 check. Latest native builds and four unchanged replay passes remain at the earlier live-wait batch `1fbe404`. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates remain at `9624526`, before this native batch. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | CD seek/status-dispatch follow-up passes BIOS 55/runtime 9/SDK 42 tests and wasm32 check. Fresh native builds and all four unchanged replays pass for the seek/status follow-up. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates remain at `9624526`, before this native batch. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
 
 | Owner | Checkout / authority | Contract and next gate | Independence |
 |---|---|---|---|
-| Parent | `salvage/bios`, writer | CD live-event waits, returning read-error retries and patchable read-command acceptance implemented. Focused tests/wasm32 check cover the latest follow-up; builds/replays remain at `1fbe404`, browser gates at their recorded checkpoints. Remaining CD internals and seek/status acceptance are partial; flag-only chain-control proposal rejected. | Owns plan, integration and final acceptance |
+| Parent | `salvage/bios`, writer | CD live-event waits, returning read-error retries and patchable seek/read/status command acceptance implemented. Focused tests/wasm32 check and fresh native builds/four replays pass for this follow-up; browser gates remain at their recorded checkpoints. Patched event polling, native busy progress and CD internals remain partial; flag-only chain-control proposal rejected. | Owns plan, integration and final acceptance |
 | Documentation worker | `../psx-wasm-salvage-lanes/docs-reconciliation`, writer at `99fa333` | Complete: `05024b3` reviewed and integrated as `124d922`; parent corrections and open-items update follow | Separate worktree; no runtime/code/build changes |
 | CD contract scout | Parent checkout, read-only at `99fa333` | Complete: confirmed event-wait gap; proposed late-only event-selection fix rejected after source review | No edits, tests, outputs in the repo, or architecture authority |
 
@@ -1528,7 +1528,7 @@ implementation still needs an evidence-based contract and real runtime/return
 validation, not only a manually resumed Flow test. These open items are not
 implicitly deferred with longjmp, nor is there a new approval request now.
 
-### CD read-command dispatch follow-up
+### CD read-command dispatch follow-up (`a9b31c3`, historical checkpoint)
 
 `CdReadSector` now invokes A(7Eh) through the live BIOS table instead of calling
 `cd_read` directly. Pinned OpenBIOS `cdrom/helpers.c` (same `4dc70d...` reference,
@@ -1602,6 +1602,101 @@ No B51/B53 implementation, classification, glyph resource or identity policy was
 changed. B53's missing mapping evidence is separate from B51's resource decision:
 next work needs a reliable retail algorithm or authorized vectors, not a guessed
 pointer, an unverified copied mapping, or a claim that fonts are complete.
+
+### CD seek/status command dispatch follow-up
+
+A5's seek phase now calls the live A(78h) table, and A6 calls A(7Ch), rather
+than bypassing guest patches. Parent re-read pinned OpenBIOS `cdrom/helpers.c`
+and `cdrom/cdrom.c` at `4dc70d2931121a0fde858a0354192b6df4fa22e8` in full:
+SeekL has at most **99999** acceptance calls, status has **9**. Exhaustion calls
+SystemError(44h,0Bh) / (44h,1Fh); event errors remain (44h,0Ch) / (44h,20h).
+A returning error patch is still required before -1 can return. The existing
+read acceptance helper now serves these three command sites; only v0 decides
+acceptance, every retry re-reads the table, Call/Block finish before continuing,
+and immediate rejection does not recurse in Rust or spend invented clock time.
+Pending native work is neither cancelled nor advanced to force acceptance.
+
+Both calls use the existing `Regs::sp/set_sp` and SDK `StCdInterrupt` frame
+pattern: 24 bytes below the caller, including 16 bytes of o32 argument homes,
+with MSF/status at frame+16. The frame survives calls and waits and is restored
+after every normal return, including returning SystemError. Nested calls have
+separate locals. MSF is written once per outer read attempt, not each acceptance
+retry, so patches' byte edits persist through rejected seek calls. The retail
+lost-minute retry behavior is unchanged. Status reads its actual guest byte
+after DNE, not `last_status` or a synthesized return; an early software DNE can
+expose the pre-existing guest stack byte before the native write. The minimal
+frame is native implementation layout, not a claim to Sony's exact stack offsets.
+No allocator, fixed scratch address, ABI/import, scheduler or exception framework
+was introduced. Non-local-return work remains user-deferred.
+
+Cancellation capture now uses the same small helper at all three accepted
+command sites: only still-active native work can cancel the wait. Software-only
+acceptance does not inherit a rejected attempt's old cancellation. This does
+not cancel pending native work on early software DNE/ERR; a status command's
+pending write still targets the pointer supplied to A7C, as for direct calls.
+Patched B0B TestEvent polling, native busy progress, INT5 and chain services
+remain open; A5/A6 remain `Partial`.
+
+One grouped BIOS-dispatch integration test covers second/final acceptance,
+exact exhaustion bounds, live table changes, v0-only boolean results, saved
+native entries, MSF mutation, separate nested status locals, o32 argument-home
+writes, SP restoration through waits/errors, stale cancellation and early DNE.
+The existing runtime-driver CD test now has a mutable SP test double and a third
+case: patched A7C supplies a local, a queued callback edits it and delivers DNE,
+and the real driver returns the edited byte without advancing time, restoring
+SP only after completion. Existing cancellation/error cases retain their checks.
+These guest patches are Flow/Invoke test doubles, not new compiled-wasm fixtures.
+Focused test and BIOS **55** / runtime **9** / SDK **42** plus wasm32 runtime
+check pass; complete logs are `cd-command-{focused,integrated}-tests.log` in
+session scratch. Fresh release/runtime/game builds and four unchanged replays
+also pass for this source, as detailed below.
+
+Read-only DeepSeek stack-seam scout `661d2e72-5f0b-4418-8332-ab386a1bf83b`
+completed without edits/tests; parent read all 98 report lines. Its useful
+argument-home/frame-lifetime observations are covered above. Parent independently
+verified the status bound from the pinned source. MSF is read by native SeekL
+at acceptance, not written at completion as one report sentence stated; it is
+recomputed per read attempt, not per rejected command. Early status is guest
+RAM, not nondeterministic Rust memory. No non-local/thread redesign or recursive
+A7C-to-A6 redirect test is inferred from the report.
+
+Independent DeepSeek review `4f40f9ef-17e8-49ae-b373-d6b36f8f6767` found no
+established production defect and accepted with notes; parent read the complete
+35-line report. That read-only role had no network/shell, so numeric reference
+provenance is the parent's full-source read above, not an independent re-fetch.
+The now-unused private `cd_get_status_at(None)` case is harmless and retained
+rather than adding unrelated cleanup. Parent accepted two small test gaps:
+returning END/SystemError restores SP, and resetting with no active operation
+does not wake a software-only wait. Both assertions extend existing tests;
+all six blocking-CD tests pass in `cd-command-review-focused-tests.log`.
+The full 55/9/42 + wasm32 gate already includes the enhanced driver test; only
+these extra assertions followed the gate/builds, with no production change.
+
+Fresh native gate for this follow-up (ABI **18**, including `a9b31c3` read
+acceptance): release CLI, runtime and both game builds pass. All six chip groups
+remain native. BTN is **2,597,315 bytes / 86 adapters**; BOF4 is **10,211,434
+bytes / 91 adapters**. Asyncify remains 1296/7158 and 3009/18393 with one exception
+handler excluded. BIOS coverage is unchanged: BTN 42 Working / 12 Partial /
+1 Unsupported (B51) / 1 Fatal / 1 Noop; BOF4 36 Working / 16 Partial /
+1 Unsupported (A43) / 1 Noop. Named unsupported-call reporting remains intact.
+
+The four unchanged replays pass explicit frame limits and `--check no-trap`:
+BTN title **6000** (all three expectations), card-load **3000** (no state
+assertions); BOF4 title **26000** (all five expectations), supplied crash **694**
+(no state assertions). All stop at FrameLimit, boot text matches disc, EDC errors
+are empty, `io_accesses` is empty, `crit/in_irq` are false and held waits/queued
+calls are zero. Sector counts remain 1419/697/12695/680. BTN's GPU timeout at
+64 and resets at 65/83 remain unchanged and unclassified, not silently removed.
+Parent read the complete logs and parsed all four reports/check results.
+
+Builds used the checkout's ignored `out/tmp-cd-live-wait` as TMPDIR. Logs and
+copied replay/check JSON are `cd-command-{release,build-*,replay-*}` in session
+scratch. Prior own run cards were moved there as
+`cd-command-{btn,bof4}-previous-disposable-storage` before fresh disposable
+storage was created. No input snapshots or user saves were written. No new
+workspace/full-CI/browser/conformance/oracle run or save/reload certification is
+claimed. Browser, memcard, GPU and pad/IRQ conformance retain their earlier
+checkpoint-specific results, not refreshed claims for these native changes.
 
 ## Progress log
 

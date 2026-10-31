@@ -41,12 +41,13 @@ retain their provenance; the active recovery status is recorded separately.
   expansion; shared disc lookup and CdGetLbn are unchanged. CD read errors now
   retry after a returning SystemError patch, bounded to ten attempts. Blocking
   calls now use live ordered event flags, including early software wakes and
-  disabled/consumed/reused slots, while preserving captured status and native
-  cancellation. The read phase now calls the live A7E table with up to 99999
-  acceptance attempts, preserving arguments and awaiting patched continuations.
+  disabled/consumed/reused slots and native cancellation. Seek/read/status now
+  call live A78/A7E/A7C entries with at most 99999/99999/9 acceptance attempts,
+  preserving arguments and awaiting patched continuations. MSF/status locals
+  use per-call guest stack frames; status reads the actual byte after DNE.
   Software completion after a rejected/cancelled attempt does not inherit that
-  stale native cancellation. Seek/status acceptance and dispatch, patched
-  TestEvent polling, native busy progress and INT5 production remain unfinished.
+  stale native cancellation. Patched TestEvent polling, native busy progress
+  and INT5 production remain unfinished.
   An early read ERR can still encounter busy SeekL after the patch returns;
   no silent native-read cancellation is added.
   A52/C09 contracts remain unresolved.
@@ -55,15 +56,13 @@ retain their provenance; the active recovery status is recorded separately.
   B53's offset calculation itself needs no glyph resource, but the proposed
   OpenBIOS original-font lookup aliases valid 899Eh/899Fh codes. Parent rejected
   that mapping; reliable algorithm/vector evidence remains a separate gap.
-- **Validation:** the CD read-dispatch follow-up passes BIOS 54 / runtime 9 /
-  SDK 42 tests and wasm32 runtime check. Latest release/runtime/both game builds
-  and all four unchanged replay passes remain at the earlier CD live-wait batch
-  `1fbe404`, not this follow-up. That batch's independent review was accepted
-  with focused test additions; no new timeout imposed on legitimately unready
-  event flags. The first game
-  build failed while `/tmp` was full; retry using this worktree's ignored
-  `out/tmp-cd-live-wait` passed. Logs, replay JSON and prior disposable run cards
-  are preserved there; inputs and user saves were untouched.
+- **Validation:** the CD seek/status follow-up passes BIOS 55 / runtime 9 /
+  SDK 42 tests and wasm32 runtime check. Fresh release/runtime/both game builds
+  and all four unchanged replays pass for this source, including the prior A7E
+  follow-up. All six chip groups remain native; ABI 18 and coverage classifications
+  are unchanged. Logs, replay/check JSON and prior disposable run cards are in
+  session scratch under `cd-command-*`; builds used the checkout's ignored
+  `out/tmp-cd-live-wait` as TMPDIR. Inputs and user saves were untouched.
   Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
   remain open. Two-bundle browser disc isolation, locked-import refusal,
