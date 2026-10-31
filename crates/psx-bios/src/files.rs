@@ -920,9 +920,9 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// A(60h) `dev_cd_read(fcb, dst, len)`: sector-aligned reads through
-    /// the native blocking CD helper. OpenBIOS calls that helper directly,
-    /// not the A(A5h) table; its command/event/error calls remain patchable.
-    /// Status/path-table/disc-identity checks are still incomplete.
+    /// the native blocking status/read helpers. OpenBIOS calls them directly,
+    /// not the A(A6h/A5h) tables; their command/event/error calls remain patchable.
+    /// Path-table/disc-identity checks are still incomplete.
     pub fn dev_cd_read(&mut self, f: u32, dst: u32, len: u32) -> Result<Flow<S>, String> {
         let (off, size) = (self.mem.r32(f + fcb::OFFSET), self.mem.r32(f + fcb::LENGTH));
         if (len as i32) < 0 || (len | off) & (cd::USER as u32 - 1) != 0 || off >= size {
@@ -930,19 +930,31 @@ impl<S: Sdk> Machine<S> {
             return Ok(Flow::ret(u32::MAX));
         }
         let count = len / cd::USER as u32;
-        let lba = self.mem.r32(f + fcb::LBA).wrapping_add(off / cd::USER as u32);
-        let read = self.cd_block_read(count, lba, dst)?;
-        Ok(seq(self, read, move |m, v| {
-            if v as u32 != count {
+        let status = self.cd_block_status()?;
+        Ok(seq(self, status, move |m, v| {
+            // The reference tests only the door-open bit. A returning status
+            // error yields -1, which also takes this branch.
+            if v as u32 & 0x10 != 0 {
                 m.mem.w32(f + fcb::ERRNO, E_GENERAL);
                 return Flow::ret(u32::MAX);
             }
-            // Only after the full request succeeds, re-read the live FCB
-            // and clip the result/offset, not the bytes already transferred.
-            let (off, size) = (m.mem.r32(f + fcb::OFFSET), m.mem.r32(f + fcb::LENGTH));
-            let n = if size < off.wrapping_add(len) { size.wrapping_sub(off) } else { len };
-            m.mem.w32(f + fcb::OFFSET, off.wrapping_add(n));
-            Flow::ret(n)
+            // Status callbacks may edit the FCB before the read is issued.
+            // Do not revalidate it or capture the sector before those calls.
+            let off = m.mem.r32(f + fcb::OFFSET);
+            let lba = m.mem.r32(f + fcb::LBA).wrapping_add(off / cd::USER as u32);
+            let read = m.cd_block_read(count, lba, dst).unwrap_or_else(|e| panic!("CD file read: {e}"));
+            seq(m, read, move |m, v| {
+                if v as u32 != count {
+                    m.mem.w32(f + fcb::ERRNO, E_GENERAL);
+                    return Flow::ret(u32::MAX);
+                }
+                // Only after the full request succeeds, re-read the live FCB
+                // and clip the result/offset, not the bytes already transferred.
+                let (off, size) = (m.mem.r32(f + fcb::OFFSET), m.mem.r32(f + fcb::LENGTH));
+                let n = if size < off.wrapping_add(len) { size.wrapping_sub(off) } else { len };
+                m.mem.w32(f + fcb::OFFSET, off.wrapping_add(n));
+                Flow::ret(n)
+            })
         }))
     }
 
@@ -1693,19 +1705,34 @@ mod tests {
             m.mem.w32(f + off, value);
         }
         m.kernel.files.errno = 0x5678;
-        let (seek, read, poll, error) = (0x8005_0000, 0x8005_0100, 0x8005_0200, 0x8005_0300);
+        let (seek, read, poll, error, status) = (0x8005_0000, 0x8005_0100, 0x8005_0200, 0x8005_0300, 0x8005_0500);
         for (vector, func, addr) in [(0xA0, 0x78, seek), (0xA0, 0x7E, read), (0xB0, 0x0B, poll),
-            (0xA0, 0xA5, 0x8005_0400), (0xA0, 0xA1, error)] {
+            (0xA0, 0xA5, 0x8005_0400), (0xA0, 0xA6, 0x8005_0400), (0xA0, 0x7C, status), (0xA0, 0xA1, error)] {
             m.mem.w32(tables::entry(vector, func).unwrap(), addr);
         }
         let sp = m.regs.sp();
         let flow = crate::bios::dispatch(&mut m, 0xB0, 0x34, [2, dst, 2 * sector, 0]).unwrap();
+        let Flow::Call { call, then } = flow else { panic!("status command, not the A(A6h) patch") };
+        assert_eq!((call.addr, call.args), (status, [sp - 8, 0, 0, 0]));
+        assert_eq!(m.regs.sp(), sp - 24);
+        m.mem.w8(call.args[0], 0x10);
+        let flow = then(&mut m, 1);
+        let Flow::Call { call, then } = flow else { panic!("status TestEvent") };
+        assert_eq!((call.addr, call.args), (poll, [m.kernel.cd.events[1], 0, 0, 0]));
+        // Read the live status byte after polling, not the command's return
+        // or the native drive byte. Other status bits do not reject the read.
+        m.mem.w8(sp - 8, 0xEF);
+        m.drive.status = 0x10;
+        m.mem.w32(f + fcb::LBA, 7);
+        m.mem.w32(f + fcb::OFFSET, 2 * sector + 1);
+        m.mem.w32(f + fcb::LENGTH, 1); // No second alignment/EOF validation.
+        let flow = then(&mut m, 1);
         let Flow::Call { call, then } = flow else { panic!("seek command, not the A(A5h) patch") };
         assert_eq!(call.addr, seek);
         assert_eq!(call.args, [sp - 8, 0, 0, 0]);
-        assert_eq!(m.mem.bytes(call.args[0], 3), cd::lba_to_msf(4));
-        assert_eq!(m.regs.sp(), sp - 24);
-        assert_eq!(m.mem.r32(f + fcb::OFFSET), sector);
+        assert_eq!(m.mem.bytes(call.args[0], 3), cd::lba_to_msf(9));
+        assert_eq!(m.regs.sp(), sp - 24, "status frame restored before the read frame");
+        assert_eq!(m.mem.r32(f + fcb::OFFSET), 2 * sector + 1);
         // These changes cannot retarget the request already submitted. The
         // offset and length, unlike the request operands, are read after it.
         m.mem.w32(f + fcb::LBA, 99);
@@ -1739,9 +1766,10 @@ mod tests {
 
         // Zero bytes before EOF are not a successful no-op: the native helper
         // seeks, exhausts ReadN acceptance, then calls SystemError(44h,0Ch).
-        for (vector, func) in [(0xA0, 0x78), (0xA0, 0x7E), (0xB0, 0x0B)] {
+        for (vector, func) in [(0xA0, 0x78), (0xA0, 0x7E), (0xA0, 0x7C), (0xB0, 0x0B)] {
             m.mem.w32(tables::entry(vector, func).unwrap(), tables::stand_in(vector, func));
         }
+        m.drive.status = 2;
         m.mem.w32(f + fcb::OFFSET, 0);
         m.mem.w32(f + fcb::LENGTH, sector);
         let errors = std::cell::Cell::new(0);
@@ -1762,6 +1790,88 @@ mod tests {
         assert_eq!(m.clock.pending(|e| *e == crate::Event::Cd), None);
         assert_eq!(m.regs.sp(), sp);
         assert_eq!(m.counts.get("bios.A0h:7Eh CdAsyncReadSector"), Some(&99999));
+    }
+
+    /// Status failure short-circuits before any seek/data transfer, through
+    /// both public aliases and the device entry, but only after its Flow returns.
+    #[test]
+    fn cdrom_file_reads_check_status_before_transfer() {
+        use std::cell::Cell;
+
+        for (vector, func, arg) in [(0xB0, 0x34, 2), (0xA0, 0x02, 2), (0xA0, 0x60, fcb_at(2))] {
+            // Native door-open status; rejected status command; early software
+            // ERR while native status is pending. None may reach SeekL/ReadN.
+            for mode in 0..3 {
+                let mut m = machine();
+                m.lay_out_events(16);
+                assert_eq!(m.cd_init(), 0);
+                let (f, dst, sector) = (fcb_at(2), 0x8002_0000, cd::USER as u32);
+                for (off, value) in [(fcb::FLAGS, READ), (fcb::DCB, m.find_device(b"cdrom").unwrap()),
+                    (fcb::DEVICE_FLAGS, FS), (fcb::LBA, 3), (fcb::OFFSET, 0), (fcb::LENGTH, sector)] {
+                    m.mem.w32(f + off, value);
+                }
+                m.mem.write(dst, &vec![0xCC; cd::USER]);
+                m.drive.status = 0x12;
+                let (poll, error, poison) = (0x8005_0000, 0x8005_0100, 0x8005_0200);
+                for (func, addr) in [(0xA1, error), (0xA5, poison), (0xA6, poison), (0x78, poison), (0x7E, poison)] {
+                    m.mem.w32(tables::entry(0xA0, func).unwrap(), addr);
+                }
+                if mode == 1 {
+                    m.mem.w32(tables::entry(0xA0, 0x7C).unwrap(), tables::stand_in(0xA0, 0x57));
+                } else if mode == 2 {
+                    m.mem.w32(tables::entry(0xB0, 0x0B).unwrap(), poll);
+                }
+                let sp = m.regs.sp();
+                let now = m.clock.now;
+                // Validation must still precede even a rejecting status check.
+                let flow = crate::bios::dispatch(&mut m, vector, func, [arg, dst, 1, 0]);
+                assert_eq!(ret(&mut m, flow, &|_, _| panic!("invalid read must not call status")), u32::MAX);
+                assert_eq!(m.mem.r32(f + fcb::ERRNO), E_ALIGN);
+                assert!(!m.counts.contains_key("bios.A0h:7Ch CdAsyncGetStatus"));
+                assert_eq!((m.clock.now, m.regs.sp()), (now, sp));
+                m.mem.w32(f + fcb::ERRNO, 0x1234);
+                m.kernel.files.errno = 0x5678;
+                let errors = Cell::new(0);
+                let polls = Cell::new(0);
+                let flow = crate::bios::dispatch(&mut m, vector, func, [arg, dst, sector, 0]);
+                assert_eq!(matches!(&flow, Ok(Flow::Block { .. })), mode == 0);
+                assert_eq!(m.regs.sp(), sp - 24);
+                assert_eq!(m.mem.r32(f + fcb::ERRNO), 0x1234);
+                assert_eq!(m.kernel.files.errno, 0x5678);
+                assert_eq!(ret(&mut m, flow, &|m, call| {
+                    assert_eq!(m.regs.sp(), sp - 24);
+                    assert_eq!(m.mem.r32(f + fcb::ERRNO), 0x1234);
+                    assert_eq!(m.kernel.files.errno, 0x5678);
+                    assert_eq!(m.mem.bytes(dst, cd::USER), vec![0xCC; cd::USER]);
+                    if call.addr == poll {
+                        let n = polls.get();
+                        assert!(n < 2);
+                        assert_eq!(call.args, [m.kernel.cd.events[if n == 0 { 1 } else { 4 }], 0, 0, 0]);
+                        polls.set(n + 1);
+                        return n; // DNE false, ERR true.
+                    }
+                    assert_eq!((call.addr, call.args), (error, [0x44, if mode == 1 { 0x1F } else { 0x20 }, 0, 0]));
+                    errors.set(errors.get() + 1);
+                    0 // File errno is written only after SystemError returns.
+                }), u32::MAX);
+                assert_eq!(errors.get(), u32::from(mode != 0));
+                assert_eq!(polls.get(), if mode == 2 { 2 } else { 0 });
+                assert_eq!(m.mem.r32(f + fcb::ERRNO), E_GENERAL);
+                assert_eq!(m.kernel.files.errno, if func == 0x60 { 0x5678 } else { E_GENERAL });
+                assert_eq!(m.mem.r32(f + fcb::OFFSET), 0);
+                assert_eq!(m.mem.bytes(dst, cd::USER), vec![0xCC; cd::USER]);
+                assert!(m.loaded.is_empty());
+                assert_eq!(m.regs.sp(), sp);
+                assert!(!m.counts.contains_key("bios.A0h:78h CdAsyncSeekL"));
+                assert!(!m.counts.contains_key("bios.A0h:7Eh CdAsyncReadSector"));
+                let status_call = if mode == 1 { "bios.A0h:57h dev_null" } else { "bios.A0h:7Ch CdAsyncGetStatus" };
+                assert_eq!(m.counts.get(status_call), Some(&if mode == 1 { 9 } else { 1 }));
+                assert_eq!(m.clock.pending(|e| *e == crate::Event::Cd).is_some(), mode == 2,
+                    "early software ERR does not cancel the pending native status");
+                if mode == 0 { assert!(m.clock.now > now); }
+                else { assert_eq!(m.clock.now, now); }
+            }
+        }
     }
 
     /// chdir stores its name before either metadata read. Failures return

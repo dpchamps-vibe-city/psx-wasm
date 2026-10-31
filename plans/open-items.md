@@ -40,14 +40,17 @@ retain their provenance; the active recovery status is recorded separately.
   ISO versions, default to `;1`, and support `?` filename matching without star
   expansion; shared disc lookup and CdGetLbn are unchanged. CD file reads now
   enforce 800h length/position alignment and reject positions at/beyond EOF.
-  They now use the existing native blocking helper directly, honoring its live
-  command/event/error calls and scheduled completion, not the A(A5h) table slot.
+  They now use the existing native blocking status/read helpers directly,
+  honoring live command/event/error calls and scheduled completion, not the
+  A(A6h/A5h) table slots. Status bit 10h rejects before any seek/read; returning
+  status errors do too. The read's LBA/offset are obtained after status callbacks.
   Full requested sectors transfer before clipping against live post-callback
   FCB metadata. Completed sectors survive later failure; FCB error 10h/return -1
   occur only if SystemError returns (its default is fatal). Success preserves
   errno. Zero-count reads before EOF now reach the helper's bounded command
   failure, not a no-op; installed BIOS CD events are required, as boot provides.
-  Status/path-table/disc-identity checks remain partial. No new CD driver or
+  Path-table/disc-identity checks, status checks in other file operations and
+  native shell-open/acknowledgment behavior remain partial. No new CD driver or
   scheduler was added. CD read errors now
   retry after a returning SystemError patch, bounded to ten attempts. Blocking
   calls now use live ordered event flags, including early software wakes and
@@ -74,17 +77,20 @@ retain their provenance; the active recovery status is recorded separately.
   B53's offset calculation itself needs no glyph resource, but the proposed
   OpenBIOS original-font lookup aliases valid 899Eh/899Fh codes. Parent rejected
   that mapping; reliable algorithm/vector evidence remains a separate gap.
-- **Validation:** the CD file-read Flow follow-up passes BIOS 58 /
-  runtime 11 / SDK 42 tests and wasm32 runtime check. Fresh release/runtime/both
-  game builds and four unchanged replays pass for this batch, including prior
-  acceptance-progress/TestEvent dispatch. Replays do not call A60; the file
-  integration tests cover the new path. All six chip groups are native;
-  ABI 18 and coverage classifications are unchanged. Logs, run/check JSON and
-  preserved prior disposable run cards are in session scratch under
-  `cd-file-flow-*`; tests/builds use the checkout's ignored
+- **Validation:** the CD file-status follow-up passes BIOS 59 /
+  runtime 11 / SDK 42 tests and wasm32 runtime check. The initial focused run
+  found a test counter assertion counting the wrong redirected native callee;
+  corrected before the passing gate. Parent reviewed the diff and contract scout.
+  Logs are in session scratch under `cd-file-status-*`. No new game build/replay
+  cycle: release/runtime/game artifacts and four passing replays remain at
+  `15d15f3`, before the status change. Those replays do not call A60; file
+  integration tests cover it. All six chip groups were native in those builds;
+  ABI 18 and coverage classifications are unchanged. Previous logs, run/check
+  JSON and disposable run cards remain under `cd-file-flow-*`. Tests use ignored
   `out/tmp-cd-live-wait` as TMPDIR. Inputs and user saves were untouched.
-  Independent code review is accepted; the active plan records its notes and
-  the distinction between reference-backed behavior and retail oracle proof.
+  Following the operator's concern about prolonged tail work, no new follow-up
+  lanes are being opened at this checkpoint. Full BIOS remains unfinished;
+  the substantive gaps above are not merely final cleanup.
   BTN's existing GPU timeout/reset logs remain unclassified.
   Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
