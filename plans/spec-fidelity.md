@@ -1,6 +1,6 @@
 # Spec fidelity
 
-**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress.
+**Status:** phases 1 and 2 done but for the human's runs; phases 3 and 4 in progress; phase 6 done on its branch but for the human's runs.
 **Depends on:** [unified adapter layer, phase 1](unified-adaptor-layer/phase1.md)
 (done): the adapters this plan corrects.
 **Replaces:** `plans/shortcuts.md` (the 2026-10-30 audit, commits
@@ -559,15 +559,32 @@ human.
 ## Phase 6: the memory map
 
 1. [x] **Record the decision** (D5). Done: D70.
-2. [ ] **TR6. The console's map.** RAM mirrored four times in 8 MB, KSEG0/1
+2. [x] **TR6. The console's map.** RAM mirrored four times in 8 MB, KSEG0/1
    and KSEG2's cache control, the scratchpad's real extent, the
    expansion regions and the BIOS ROM as their own regions, bus errors
    elsewhere; function pointers into unmapped space trap
    (`psxw-link/src/rewrite.rs:199-200, 212-213, 411-416`;
    `game.rs:780-783, 795-798`; `psxw-lift/src/analysis.rs:133-143`).
    Measure the cost of the check in every access and record it.
-3. [ ] **TR16. Devices and the BIOS use the same map** for guest pointers
+   Done `60f2ec4`, `82fb587`, `b4baaf8`, `3adbc00` (agent); design and
+   cost in D70. psxw-abi's `map` is the map. Guest code takes RAM through
+   KUSEG and KSEG0 inline (one mask, one test) and calls
+   `psx.map_access` for anything else; the link maps constant addresses
+   in plain memory itself; function pointers go through `psx.map_code`
+   outside RAM's inline view. AUX data, mods' data and synthetic code
+   move out of RAM's mirrors to `8100_0000` (psxw-abi `own`). A bus error
+   is trap 14. ABI 14. Cost: btn game.wasm +28.4% bytes (+5.3% gzipped),
+   +35.8% instructions; bof4 +59.3% (+14.2%), +69.9%; RAM accesses cost
+   nothing measurable in a V8 micro-benchmark, scratchpad accesses
+   through a pointer ~2 ns more each (D70).
+3. [x] **TR16. Devices and the BIOS use the same map** for guest pointers
    (`psx-devices/src/mem.rs:4, 63-72`; `psx-runtime/src/wasm.rs:196-221`).
+   Done `60f2ec4`, `ee73211`, `49e442b` (agent): `Mem::read`/`write`
+   go through the map (expansion reads, dropped ROM stores, a bus error
+   traps), as do the native host's tools, the browser's script mods,
+   types and conformance page (`psxw_guest_ptr`), the lifter's
+   plain-memory test, and the differential harness (`h.map_access`; a bus
+   error on both sides is agreement, counted as `both_fault`).
 
 ### Exit criteria
 
@@ -576,11 +593,32 @@ human.
    against the previous build in Findings.
 3. **Human:** `psxw ci btn` and `psxw ci bof4`.
 
-Status (2026-10-31, 01:55): in progress on `worktree-agent-ad8770dee57c0dd1f`
-(6 commits, `0aa6ea5`..`40c6c46`, plus an uncommitted psxw-abi edit); the
-agent stopped on the account's usage limit before its final checks
-(`cargo test --workspace`, both builds, `psxw difftest btn`). Not merged:
-resume it, or verify and cherry-pick, before phase 7.
+Status (2026-10-31): done but for the human's runs, on
+`worktree-agent-ad8770dee57c0dd1f` (`60f2ec4`..`3adbc00`, rebased on
+`f4eacc2`). 1 passes; 2: both games build, sizes and instruction counts in
+D70; frame time needs a run, the human's (below). `psxw difftest btn`:
+`DrawTextSlotImage` and `Ovl28DrawSequenceGradientRect` pass (both sides
+now take the bus error); two other functions fail where the old window
+hid what their seeds do (Findings). 3 and the frame times wait for the
+human. Frame time, before (main) and after (this branch), each built with
+its own psxw (the ABI differs):
+
+    git checkout f4eacc2 && cargo build --release -p psxw-cli
+    ./target/release/psxw census btn
+    ./target/release/psxw build btn && ./target/release/psxw build bof4
+    time ./target/release/psxw run btn --replay title-to-gameplay
+    time ./target/release/psxw run bof4 --replay title-to-field
+    git checkout <phase 6> && cargo build --release -p psxw-cli
+    ./target/release/psxw build btn && ./target/release/psxw build bof4
+    time ./target/release/psxw run btn --replay title-to-gameplay
+    time ./target/release/psxw run bof4 --replay title-to-field
+
+The native host doesn't pace, so wall time over the replay's frames (6,000
+and 26,000) is the frame time; it includes Cranelift compiling the larger
+module. Then `./target/release/psxw ci btn` and `./target/release/psxw ci
+bof4`. A trap 14 (bus error) in a run is the map at work: a game access
+the console would fault on, or one the map gets wrong; look at it before
+anything else.
 
 ## Phase 7: time
 
@@ -646,6 +684,12 @@ locals, or static translation.
 - **2026-10-30:** plan created from the shortcuts audit
   (`plans/shortcuts.md`, `3eff117`–`0bae88a`), its bugs (moved from
   open-items) and the BIOS rework.
+- **2026-10-31:** phase 6 (agent, `60f2ec4`..`3adbc00`): the console's
+  memory map (D70) for guest code, function pointers, the BIOS, the
+  devices, both hosts and the differential harness; psx-wasm's own data
+  at `8100_0000`; ABI 14. Tests pass, both games build; btn's difftest
+  keeps its two address-error seeds as both-fault agreements and gains
+  two the old window hid (Findings). Human: frame times and `ci`.
 - **2026-10-31:** phase 4's difftest, 10 mismatches to 2 (agent,
   `1f3d7ce`, `23b0976`, `38cb9f5`): FastISel's `call_indirect`s are
   direct calls again, a division by a variable stays where the source
@@ -825,6 +869,49 @@ locals, or static translation.
   phase 6's map. In the game build the same straddle writes the first
   bytes of the runtime's data (`RUNTIME_BASE` is the window's end): for
   phase 6 (TR6).
+  Settled by phase 6 (2026-10-31): 0xFFFFFFFF is KSEG2, no memory, so
+  both sides take a bus error, and the harness counts a bus error on both
+  sides as agreement (`both_fault`) without comparing what came before
+  it. Both pass. The address error itself still isn't modelled.
+
+- **Phase 6: where psx-spx and Beetle differ** (2026-10-31; D70 follows
+  psx-spx). Beetle (`libretro.c` `PSX_MemRead*`/`PSX_MemWrite*`, `cpu.c`
+  `addr_mask`) raises no bus error at all: an unmapped load reads 0, a
+  store is dropped (DBE/IBE are defined, never raised). It masks KSEG0
+  and KSEG1 but not KUSEG, so KUSEG above 512 MiB reaches nothing (reads
+  0): neither a mirror nor psx-spx's exception. Its scratchpad test runs
+  after masking, so the scratchpad answers through KSEG1 (`BF80_0000`),
+  where psx-spx has none. It ignores memory control's region sizes: DEV0
+  reads FFFF_FFFFh over all 8 MiB, DEV8's first 4 KiB sit in its I/O
+  block and read 0, DEV1 reads 0. Of KSEG2 it has only `FFFE_0130`. Both
+  agree on RAM's four mirrors, the 512 KiB ROM unmirrored and stores to
+  it dropped. psx-spx doesn't say what an unconnected expansion region
+  reads; Beetle's FFh/00h are taken.
+- **Phase 6's limits** (2026-10-31). Memory control's size registers and
+  RAM_SIZE aren't consulted (the BIOS's values are fixed); cache isolation
+  (SR.IsC, the cache control bits) isn't modelled; nor are address errors
+  on misaligned accesses (wasm doesn't fault). The inline path doesn't
+  wrap at RAM's end: a merged access straddling `801F_FFFF` reads the
+  window's next bytes (AUX), not RAM's start. Scratchpad accesses through
+  a pointer (a stack moved there, as btn's
+  `DrawCulledProjectedPrimitives` does) call the runtime, ~2 ns each in
+  V8; a second inline test would cost ~20 bytes per access (D70). A debug
+  build's DWARF for clang-only data points at its own address, which a
+  debug window doesn't reach (D53). psx-wasm's own data lives at KSEG0
+  `8120_0000`–`817F_FFFF`, so game code that checks a pointer against
+  RAM's range (`p < 8020_0000`) would refuse a clang-only literal; none
+  seen.
+- **Phase 6's difftest** (2026-10-31): the harness maps as the game does,
+  its scratch moved to own space (`own(0x70_0000)`, clear of RAM's
+  mirrors). Two pairs fail where the old window hid what their seeds do.
+  `AlignPadActuators` indexes a stack variable with a random argument
+  (`(u8 *)&ports + portIndex`): C's and the original's frames differ, so
+  the byte read differs; the masked window put both on zeros, the map
+  puts them on RAM's mirror. `Ovl11ProbeActorBounds` loads through a
+  random pointer before an early return: the original takes the bus
+  error, clang sinks the loads past the return (C may; nothing in C
+  faults). Both are the harness's inputs, not translation bugs; left as
+  reported, not excluded.
 
 - **libapi's pad.o installs its own vblank element** (2026-10-30, BIOS1).
   `InitPAD` and `PAD_init` call a local helper that queues a priority-1

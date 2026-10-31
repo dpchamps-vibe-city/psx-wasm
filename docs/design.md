@@ -2775,11 +2775,13 @@ D5's single masked 16 MiB window and D6's index.
   bits); address errors on misaligned accesses (wasm doesn't fault); an
   inline access straddling RAM's end reads the window's next bytes rather
   than wrapping to RAM's start.
-- **Cost** (2026-10-31, against main `8754894`). game.wasm: btn 2,179,517
-  to 2,805,927 bytes (+28.7%; gzip −9 +5.5%), bof4 10,141,350 to
-  16,140,663 (+59.2%; gzip +14.1%). Instructions (`llvm-objdump -d`): btn
-  788,699 to 1,074,314 (+36%), bof4 3,905,446 to 6,642,703 (+70%); each
-  mapped access is ~24 bytes where the mask was 6. A micro-benchmark (V8,
+- **Cost** (2026-10-31, against main `6dfbf32`, phase 5 in). game.wasm:
+  btn 2,236,143 to 2,871,301 bytes (+28.4%; gzip −9 +5.3%), bof4
+  10,389,483 to 16,547,473 (+59.3%; gzip +14.2%). Instructions
+  (`llvm-objdump -d`): btn 809,071 to 1,098,523 (+35.8%), bof4 4,019,990
+  to 6,830,098 (+69.9%); each mapped access is ~24 bytes where the mask
+  was 6 (mapping constant addresses at link time took 5–6% off). Frame
+  time is the human's run (plans/spec-fidelity.md). A micro-benchmark (V8,
   a loop of one load and one store, wasm-opt `-O2`): RAM unchanged (1.54
   to 1.51 ns a pass), the scratchpad 0.52 to 4.2–5.0 ns (two calls). A
   second inline test for the scratchpad would bring it to 1.4–1.9 ns for
