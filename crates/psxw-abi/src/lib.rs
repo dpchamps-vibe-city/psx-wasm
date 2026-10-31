@@ -107,8 +107,9 @@ pub mod kernel {
     pub const C0_LEN: u32 = 0x80;
     pub const B0_TABLE: u32 = 0x874;
     pub const B0_LEN: u32 = 0x100;
-    /// Native kernel data: pad buffers, handler elements and strtok buffer.
-    pub const DATA: Range<u32> = 0x7000..0x7300;
+    /// Native kernel data: pad buffers, handler elements, strtok/file
+    /// storage and the default exception exit buffer at 7940h.
+    pub const DATA: Range<u32> = 0x7000..0x7970;
     /// The table of tables: a (pointer, size) pair per table from 0x100.
     /// These four entries are filled: the exception control blocks, the
     /// process control block, the thread control blocks and the event

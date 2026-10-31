@@ -288,6 +288,10 @@ pub const SIO0_ELEMENT: u32 = 5;
 const ELEMENTS: u32 = 6;
 const KERNEL_CODE: u32 = 0xBFC0_8000;
 
+/// The default exception exit's setjmp buffer: native ReturnFromException,
+/// the exception stack, then zeroed saved registers (psx-spx).
+pub const DEFAULT_EXIT: u32 = 0xA000_7940;
+
 pub fn kernel_element(i: u32) -> u32 {
     KERNEL_ELEMENTS + 16 * i
 }
@@ -325,6 +329,15 @@ impl<S: Sdk> Machine<S> {
             self.kernel.clear_rcnt[i] = 1;
             self.enq_int_rp(1, kernel_element(i as u32));
         }
+        self.lay_out_default_exit();
+    }
+
+    /// ResetEntryInt's guest-visible default exit structure.
+    pub fn lay_out_default_exit(&mut self) -> u32 {
+        self.mem.write(DEFAULT_EXIT, &[0; 0x30]);
+        self.mem.w32(DEFAULT_EXIT, psxw_abi::BIOS_RETURN_FROM_EXCEPTION);
+        self.mem.w32(DEFAULT_EXIT + 4, 0x8000_6FFC);
+        DEFAULT_EXIT
     }
 
     /// The kernel element `h` is, if it is one.

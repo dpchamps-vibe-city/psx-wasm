@@ -515,12 +515,12 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x16) => r(m.kernel.pad_dr(&mut *m.mem)),
         (0xB0, 0x17) => Err(format!("{label}: called outside an exception handler")),
         (0xB0, 0x18) => {
-            // ResetEntryInt: back to the default exit (ReturnFromException).
+            // ResetEntryInt: restore and return the default exit structure.
             m.kernel.custom_exit = 0;
-            r(0)
+            r(m.lay_out_default_exit())
         }
         (0xB0, 0x19) => {
-            m.kernel.custom_exit = a[0];
+            m.kernel.custom_exit = if a[0] & 0x1FFF_FFFF == kernel::DEFAULT_EXIT & 0x1FFF_FFFF { 0 } else { a[0] };
             r(0)
         }
         (0xB0, 0x20) => {
@@ -719,7 +719,13 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
         // ChangeThreadSubFunction.
         3 => Ok(1),
         0 => Ok(0),
-        n => Err(format!("syscall {n} not implemented")),
+        // Other syscall numbers deliver the unresolved-exception event.
+        // The current seam has no incoming v0: it returns 0 rather than
+        // preserving that register as the console does.
+        _ => {
+            m.deliver_event(0xF000_0010, 0x4000);
+            Ok(0)
+        },
     }
 }
 

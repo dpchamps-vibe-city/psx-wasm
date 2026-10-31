@@ -324,8 +324,28 @@ mod tests {
         let mut m = machine();
         ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));
         assert_eq!(m.kernel.custom_exit, 0x8001_0000);
-        ret(bios::call(&mut m, 0xB0, 0x18, [0; 4]));
+        let d = ret(bios::call(&mut m, 0xB0, 0x18, [0; 4]));
         assert_eq!(m.kernel.custom_exit, 0);
+        assert_eq!(d, kernel::DEFAULT_EXIT);
+        assert_eq!((m.mem.r32(d), m.mem.r32(d + 4)), (tables::stand_in(0xB0, 0x17), 0x8000_6FFC));
+        assert_eq!(m.mem.bytes(d + 8, 0x28), vec![0; 0x28]);
+        for alias in [d, d & 0x1FFF_FFFF, (d & 0x1FFF_FFFF) | 0x8000_0000] {
+            ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));
+            ret(bios::call(&mut m, 0xB0, 0x19, [alias, 0, 0, 0]));
+            assert_eq!(m.kernel.custom_exit, 0);
+        }
+    }
+
+    #[test]
+    fn unknown_syscalls_deliver_the_exception_event() {
+        let mut m = machine();
+        m.lay_out_events(16);
+        let h = ret(bios::call(&mut m, 0xB0, 0x08, [0xF000_0010, 0x4000, 0x2000, 0]));
+        ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
+        for n in [4, 7, u32::MAX] {
+            assert_eq!(bios::syscall(&mut m, [n, 0, 0, 0]), Ok(0));
+            assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [h, 0, 0, 0])), 1);
+        }
     }
 
     #[test]
