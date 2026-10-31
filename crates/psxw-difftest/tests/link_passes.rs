@@ -30,24 +30,23 @@ int func_80011000(int a, int b) {
 }
 "#;
 
-#[test]
-fn guest_passes_and_adapters() {
-    let Ok(ws) = Workspace::discover() else { return };
+/// Compile `src` as container `t` (text at 8001_0000..8002_0000), in its
+/// own temp directory `name`. None without the pinned toolchain.
+fn compile(name: &str, src: &str) -> Option<(AddressMap, Input)> {
+    let Ok(ws) = Workspace::discover() else { return None };
     let Ok(clang_path) = ws.clang() else {
         eprintln!("skipping: run `psxw toolchain fetch`");
-        return;
+        return None;
     };
-    let dir = std::env::temp_dir().join("psxw-link-passes");
+    let dir = std::env::temp_dir().join(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("t.c");
-    std::fs::write(&src, SRC).unwrap();
+    let src_path = dir.join("t.c");
+    std::fs::write(&src_path, src).unwrap();
     let clang = psxw_cc::Clang::new(clang_path, dir.clone(), vec![], vec![], &dir).unwrap();
     let obj_path = dir.join("t.o");
-    clang.compile_variant(&src, &obj_path, &[]).unwrap();
+    clang.compile_variant(&src_path, &obj_path, &[]).unwrap();
     let protos: BTreeMap<String, psxw_cc::protos::Proto> =
-        psxw_cc::protos::for_tu(&clang, &src).unwrap().into_iter().map(|p| (p.name.clone(), p)).collect();
-    assert!(protos["func_80012100"].variadic);
-
+        psxw_cc::protos::for_tu(&clang, &src_path).unwrap().into_iter().map(|p| (p.name.clone(), p)).collect();
     let text = 0x8001_0000..0x8002_0000;
     let container = Container {
         id: "t".into(),
@@ -71,6 +70,13 @@ fn guest_passes_and_adapters() {
         generated: false,
         gcc: None,
     };
+    Some((map, input))
+}
+
+#[test]
+fn guest_passes_and_adapters() {
+    let Some((map, input)) = compile("psxw-link-passes", SRC) else { return };
+    assert!(input.protos["func_80012100"].variadic);
     let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
     let linked =
         psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
@@ -106,4 +112,16 @@ fn guest_passes_and_adapters() {
     let c2 = &r.log[2];
     assert_eq!((c2.kind, c2.target), (callout::INDIRECT, b));
     assert_eq!(c2.args[..2], [5, 3]);
+}
+
+/// A writable static the address map doesn't name has an original address
+/// the link can't know: it fails naming it, rather than placing a second
+/// copy in AUX.
+#[test]
+fn unnamed_writable_data_fails_the_link() {
+    let src = "static int counter;\nint func_80011000(void) { return ++counter; }\n";
+    let Some((map, input)) = compile("psxw-link-unnamed", src) else { return };
+    let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
+    let err = psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap_err();
+    assert!(err.to_string().contains("t counter"), "{err}");
 }
