@@ -300,17 +300,11 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             }
             r(ready as u32)
         }
-        (0xB0, 0x0C) => {
-            if let Some(e) = m.kernel.ev(a[0]) {
-                if e.status != kernel::EV_READY {
-                    e.status = kernel::EV_ENABLED;
-                }
-            }
-            r(1)
-        }
-        (0xB0, 0x0D) => {
-            if let Some(e) = m.kernel.ev(a[0]) {
-                e.status = kernel::EV_DISABLED;
+        // EnableEvent, DisableEvent: a closed slot stays closed; enabling
+        // a ready event makes it busy again (OpenBIOS `events.c`).
+        (0xB0, 0x0C) | (0xB0, 0x0D) => {
+            if let Some(e) = m.kernel.ev(a[0]).filter(|e| e.status != kernel::EV_UNUSED) {
+                e.status = if func == 0x0C { kernel::EV_ENABLED } else { kernel::EV_DISABLED };
             }
             r(1)
         }
