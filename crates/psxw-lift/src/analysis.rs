@@ -4,7 +4,7 @@
 //! load-delay hazards.
 
 use crate::decode::{Insn, Op};
-use crate::graph::{Callee, Graph, Node, Transfer};
+use crate::graph::{Callee, Dest, Graph, Node, Transfer};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Registers the callee may clobber, as the o32 ABI defines.
@@ -14,7 +14,8 @@ pub const LO: u64 = 1 << 33;
 /// Registers a function may legitimately read on entry: arguments, `gp`,
 /// `sp`, `ra`, and callee-saved registers (read only to be saved).
 const ENTRY_OK: u64 = (0xF << 4) | (1 << 28) | (1 << 29) | (1 << 31) | (0xFF << 16) | (1 << 30);
-const S_REGS: u64 = (0xFF << 16) | (1 << 30);
+/// The callee-saved registers, s0-s7 and fp.
+pub const S_REGS: u64 = (0xFF << 16) | (1 << 30);
 
 pub type Consts = [Option<u32>; 32];
 
@@ -36,8 +37,9 @@ pub struct Facts {
     /// Callee-saved registers whose entry value is used for more than
     /// saving it.
     pub entry_s_reads: u64,
-    /// Calls after which a caller-saved register (other than v0/v1) is read
-    /// before being written: (pc of the call, registers, direct callee).
+    /// Calls after which a caller-saved register (other than v0/v1) or a
+    /// callee-saved one is read before being written: (pc of the call,
+    /// registers, direct callee).
     pub post_call_reads: Vec<(u32, u64, Option<u32>)>,
     /// Direct callees whose result (v0) is read after a call to them.
     pub result_uses: BTreeSet<u32>,
@@ -46,10 +48,14 @@ pub struct Facts {
     pub returns_callee_v0: bool,
     /// Loads whose next instruction reads the loaded register.
     pub hazards: BTreeMap<Node, u8>,
-    /// Registers any instruction of the function writes.
+    /// Registers any instruction of the function writes, hi/lo included.
     pub defs: u64,
+    /// Callee-saved registers that may not hold their entry value where the
+    /// function returns: hand-written code that returns a value in one.
+    pub s_changed: u64,
     /// Direct calls and fall-throughs to code addresses: (pc, target,
-    /// registers written in the straight-line block leading to it).
+    /// registers set on some path from the entry to it, hi/lo and earlier
+    /// calls' v0/v1 included).
     pub call_sites: Vec<(u32, u32, u64)>,
     /// Loads whose result nothing reads (or that load into `zero`). They
     /// still happen on hardware, and from an I/O register a read pops a
@@ -108,30 +114,110 @@ fn returns_callee_v0(g: &Graph) -> bool {
     exits > 0
 }
 
+/// Registers an instruction writes: its GPR, and hi/lo.
+fn insn_defs(i: &Insn) -> u64 {
+    let hilo = match i.op {
+        Op::Mthi => HI,
+        Op::Mtlo => LO,
+        Op::Mult | Op::Multu | Op::Div | Op::Divu => HI | LO,
+        _ => 0,
+    };
+    i.writes().map_or(0, |r| 1u64 << r) | hilo
+}
+
+/// Forward over the graph, from the entry: `state` on entry to each node,
+/// where `step` gives a node's state on exit from its state on entry and
+/// `join` merges two states (it must only lose information, so the walk
+/// ends).
+fn forward<T: Copy + PartialEq>(
+    g: &Graph,
+    succs: &dyn Fn(Node) -> Vec<Node>,
+    step: impl Fn(Node, T) -> T,
+    join: impl Fn(T, T) -> T,
+    entry: T,
+) -> BTreeMap<Node, T> {
+    let mut state = BTreeMap::from([(Node::Normal(g.entry), entry)]);
+    let mut work = VecDeque::from([Node::Normal(g.entry)]);
+    while let Some(n) = work.pop_front() {
+        let out = step(n, state[&n]);
+        for s in succs(n) {
+            let new = state.get(&s).map_or(out, |&old| join(old, out));
+            if state.get(&s) != Some(&new) {
+                state.insert(s, new);
+                work.push_back(s);
+            }
+        }
+    }
+    state
+}
+
+/// Successors for callee-saved registers read on entry: an inlined call is
+/// a call, which the o32 ABI says leaves them as they were (the callee's
+/// own facts say whether it does, and decide its expansion), and a `jr ra`
+/// outside the function's own extent returns. So a callee inlined at two
+/// call sites doesn't lead from one call to the other's return site, where
+/// the caller reads the registers it saved and set.
+fn o32_succs(g: &Graph, n: Node) -> Vec<Node> {
+    match (n, &g.nodes[&n].transfer) {
+        (Node::Slot(b), Transfer::Jump(Dest::Local(_)))
+            if g.nodes[&Node::Normal(b)].insn.op == Op::Jal && g.inline_returns.contains(&(b + 8)) =>
+        {
+            vec![Node::Normal(b + 8)]
+        }
+        (_, Transfer::InlineReturn { .. }) => Vec::new(),
+        _ => g.next(n),
+    }
+}
+
+/// A way out of the function: a return (an inlined callee's `jr ra` too,
+/// with ra the caller's), or a tail transfer, whose callee returns to this
+/// function's caller.
+fn is_exit(g: &Graph, n: Node) -> bool {
+    matches!(
+        g.nodes[&n].transfer,
+        Transfer::Return
+            | Transfer::InlineReturn { .. }
+            | Transfer::Jump(Dest::Tail(_))
+            | Transfer::FallOff(_)
+            | Transfer::Call { next: Dest::Tail(_), .. }
+    )
+}
+
 fn sites(g: &Graph, f: &mut Facts) {
-    let preds = g.preds();
+    // Registers set on some path from the entry: a value passed to a callee
+    // can be set ahead of a branch or a join, and a call sets v0 and v1
+    // (the locals a callee's other registers would be stay as they were).
+    let set = forward(
+        g,
+        &|n| g.succs(n),
+        |n, s| {
+            let call = matches!(g.nodes[&n].transfer, Transfer::Call { .. } | Transfer::CondCall { .. }) || g.tail_returns(n);
+            s | insn_defs(&g.nodes[&n].insn) | if call { (1 << 2) | (1 << 3) } else { 0 }
+        },
+        |a, b| a | b,
+        0u64,
+    );
+    // Callee-saved registers changed and not restored: a load into one the
+    // function saves restores it.
+    let saved = g.nodes.values().filter(|d| d.insn.op == Op::Sw).fold(0u64, |a, d| a | 1 << d.insn.rt) & S_REGS;
+    let restore = |n: Node, s: u64| {
+        let i = &g.nodes[&n].insn;
+        let w = i.writes().map_or(0, |r| 1u64 << r) & S_REGS;
+        if i.op.is_load() && w & saved != 0 { s & !w } else { s | w }
+    };
+    let changed = forward(g, &|n| g.succs(n), restore, |a, b| a | b, 0u64);
     for (&n, d) in &g.nodes {
-        f.defs |= d.insn.writes().map_or(0, |r| 1u64 << r);
+        f.defs |= insn_defs(&d.insn);
+        if is_exit(g, n) {
+            f.s_changed |= changed.get(&n).map_or(0, |&s| restore(n, s));
+        }
         let target = match &d.transfer {
             Transfer::Call { callee: Callee::Direct { addr, .. }, .. }
-            | Transfer::Jump(crate::graph::Dest::Tail(Callee::Direct { addr, .. }))
+            | Transfer::Jump(Dest::Tail(Callee::Direct { addr, .. }))
             | Transfer::FallOff(Callee::Direct { addr, .. }) => *addr,
             _ => continue,
         };
-        // Walk back through the block: unique predecessors that flow
-        // straight into this node.
-        let mut defs = d.insn.writes().map_or(0, |r| 1u64 << r);
-        let mut cur = n;
-        for _ in 0..64 {
-            let Some([p]) = preds.get(&cur).map(Vec::as_slice) else { break };
-            let pd = &g.nodes[p];
-            if !matches!(pd.transfer, Transfer::Seq(_)) {
-                break;
-            }
-            defs |= pd.insn.writes().map_or(0, |r| 1u64 << r);
-            cur = *p;
-        }
-        f.call_sites.push((n.pc(), target, defs));
+        f.call_sites.push((n.pc(), target, set.get(&n).copied().unwrap_or(0) | insn_defs(&d.insn)));
     }
 }
 
@@ -345,7 +431,8 @@ fn liveness(g: &Graph, f: &mut Facts) {
     let succs: BTreeMap<Node, Vec<Node>> = nodes.iter().map(|&n| (n, g.succs(n))).collect();
     let at_entry = live_in(g, &nodes, &succs, true)[&Node::Normal(g.entry)];
     f.entry_reads = at_entry & !ENTRY_OK & ((1 << 34) - 2);
-    f.entry_s_reads = at_entry & S_REGS;
+    let o32: BTreeMap<Node, Vec<Node>> = nodes.iter().map(|&n| (n, o32_succs(g, n))).collect();
+    f.entry_s_reads = live_in(g, &nodes, &o32, true)[&Node::Normal(g.entry)] & S_REGS;
     // After a call, only reads by instructions count: argument setup for a
     // later call doesn't depend on what the callee left behind.
     let live_in = live_in(g, &nodes, &succs, false);
@@ -364,7 +451,7 @@ fn liveness(g: &Graph, f: &mut Facts) {
             if let (true, Callee::Direct { addr, .. }) = (after & (1 << 2) != 0, callee) {
                 f.result_uses.insert(*addr);
             }
-            let bad = after & CALLER_SAVED & !((1 << 2) | (1 << 3) | (1 << 31));
+            let bad = after & (CALLER_SAVED | S_REGS) & !((1 << 2) | (1 << 3) | (1 << 31));
             if bad != 0 {
                 let target = match callee {
                     Callee::Direct { addr, .. } => Some(*addr),

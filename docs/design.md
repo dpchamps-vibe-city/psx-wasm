@@ -315,13 +315,20 @@ How each tier is produced:
   Generated code assumes o32 at function boundaries. Handwritten asm that
   passes values in non-argument registers (libgte's normalize helper takes
   and returns `t0`–`t2`) is handled by *inline expansion*, not a separate
-  full-state mode. When a caller writes registers the callee reads on
-  entry, or reads registers after the call that the callee writes, the
-  callee is expanded into the caller with every register shared, and its
-  `jr ra` dispatches over the known return sites. That is exactly the
-  hardware's behaviour, and needs no register file in memory. Decompiled C
-  is ABI-conformant by construction, so C-defined functions and their
-  translations never inline.
+  full-state mode. When a caller sets, on some path to the call, registers
+  the callee reads on entry that o32 doesn't pass (temporaries, hi/lo, or
+  callee-saved registers it uses for more than saving them), or reads
+  after the call registers the callee leaves set (temporaries and hi/lo it
+  writes, callee-saved registers it doesn't restore), the callee is
+  expanded into the caller with every register shared, and its `jr ra`
+  dispatches over the known return sites. That is exactly the hardware's
+  behaviour, and needs no register file in memory. Decompiled C is
+  ABI-conformant by construction, so C-defined functions and their
+  translations never inline. Where a call that passes registers can't be
+  expanded (a `jalr` or `bgezal`, a caller with C, a call through a
+  pointer), the lift fails rather than the registers arriving as 0. A
+  register a function reads on entry that no caller sets is an
+  uninitialised value, and reads 0 (D33).
 
   Function discovery runs to a fixed point. Starts are seeded from the
   inputs:
@@ -1516,16 +1523,37 @@ decomp repos come from paths the human supplies.
 ### M1: translator, harness and toolchain
 
 **D33. Register passing is handled by inline expansion, not full-state
-mode** (M1 task 15). A function with no C is expanded into its callers when
-there's evidence of register passing:
-- a caller writes, before the call, a register the callee reads on entry;
-- or a caller reads, after the call, a register the callee writes.
+mode** (M1 task 15; revised by spec-fidelity TR2). A function with no C is
+expanded into its callers when there's evidence of register passing:
+- a caller sets, on some path from its entry to the call (across branches
+  and joins; a call's v0 and v1 count), a register the callee reads on
+  entry that o32 doesn't pass: a temporary, hi/lo, or a callee-saved
+  register it uses for more than saving it;
+- or a caller reads, after the call, a register the callee leaves set: a
+  temporary or hi/lo it writes, or a callee-saved register it doesn't
+  restore.
 
 Registers are shared and `jr ra` dispatches over the return sites, which is
-the hardware's behaviour. C-defined functions never inline. *Why:* btn needs
-it only for libgte `msc02` (helper in/out via `t0`–`t2`), the BIOS GTE patch
-stub, and 7 undecompiled game functions. A memory register file would cost
-every translated function. (design §4)
+the hardware's behaviour. C-defined functions never inline. Where a call
+can't carry the registers, the lift fails instead of them arriving as 0:
+- a call that isn't expanded (`jalr` or `bgezal` to a known function, or a
+  caller with C, whose C can't set registers) sets registers its callee
+  reads on entry;
+- a function its callers pass registers to has its address taken (a call
+  through a pointer passes only a0–a3);
+- a translated caller reads, after a call that isn't expanded, registers
+  the callee leaves set (a known callee that writes them, or any callee
+  through a pointer, the BIOS or the kernel).
+
+A register a function reads on entry that no caller sets is an
+uninitialised value: GCC leaves a C variable it never assigns on some path
+in whatever register the caller left, and the lift reads 0 there, as
+decompiled C's uninitialised locals do (D27). A value a function passes on
+without setting it is no evidence for its callee. *Why:* the inliner sees
+what the caller's own code does; btn expands 17 functions this way (libgte
+`msc02`'s helper, in and out through `t0`–`t2`; the BIOS GTE patch stub;
+GCC nested functions; libgpu's and libmcx's helpers) and bof4 25. A memory
+register file would cost every translated function. (design §4)
 
 **D34. The differential harness compares function by function.** Every
 call is a logged call-out, answered identically to both sides:
