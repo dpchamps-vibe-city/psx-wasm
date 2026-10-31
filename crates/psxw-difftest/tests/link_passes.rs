@@ -303,6 +303,90 @@ unsigned long long func_80011900(unsigned a, unsigned b, unsigned c, unsigned d)
     assert!(err.to_string().contains("collides with BIOS stand-in"), "{err:#}");
 }
 
+/// A direct syscall has the same unwind/rewind contract as ChangeThread.
+/// Run real clang/link/Asyncify output, retaining locals across the import.
+#[test]
+fn game_syscall_asyncify_resume() {
+    use psxw_abi::{WINDOW_BASE, guest};
+    use psxw_link::game::{GameSpec, Tier};
+    use std::process::Command;
+    let src = r#"
+extern unsigned psxw_syscall(unsigned, unsigned, unsigned, unsigned);
+int func_80011100(int x) { return x + psxw_syscall(3, 0xA000E0D0, 0, 0); }
+int func_80011000(int x) { return x + func_80011100(x * 2); }
+"#;
+    let Some((map, input)) = compile("psxw-link-syscall-asyncify", src) else { return };
+    let ws = Workspace::discover().unwrap();
+    let Ok(tool) = ws.tool("binaryen", "bin/wasm-opt") else {
+        eprintln!("skipping: run `psxw toolchain fetch` for Binaryen");
+        return;
+    };
+    let tiers = (0..input.obj.funcs.len() as u32).filter_map(|f| {
+        let name = &input.obj.func_symbol(f + input.obj.num_imported_funcs())?.name;
+        let addr = u32::from_str_radix(name.strip_prefix("func_")?, 16).ok()?;
+        Some((("t".into(), addr), Tier::C { input: 0, func: f }))
+    }).collect();
+    let spec = GameSpec {
+        tiers, overlays: BTreeMap::new(), budget: 1000, debug_io: false,
+        device_funcs: Default::default(), main: "t".into(),
+        min_pages: psxw_abi::window_pages(WINDOW_BASE), window_base: WINDOW_BASE,
+        debug_info: false, probes: vec![], mods: None, slots: None, threads: true,
+    };
+    let linked = psxw_link::game::link(&map, None, &spec, &[input]).unwrap();
+    let scope = psxw_link::asyncify::scope(&linked.wasm, &["t:func_80011100".to_string()].into()).unwrap();
+    let dir = std::env::temp_dir().join("psxw-link-syscall-asyncify");
+    let raw = dir.join("guest.wasm");
+    let out = dir.join("asyncify.wasm");
+    std::fs::write(&raw, &linked.wasm).unwrap();
+    let features = ["--enable-bulk-memory", "--enable-bulk-memory-opt", "--enable-sign-ext",
+        "--enable-mutable-globals", "--enable-nontrapping-float-to-int", "--enable-multivalue",
+        "--enable-reference-types", "--enable-call-indirect-overlong", "--enable-exception-handling"];
+    let names = Command::new(&tool).args(features).arg("--print-function-map").arg(&raw).output().unwrap();
+    assert!(names.status.success(), "{}", String::from_utf8_lossy(&names.stderr));
+    let names: BTreeMap<u32, String> = String::from_utf8(names.stdout).unwrap().lines().filter_map(|s| {
+        let (i, n) = s.split_once(':')?;
+        Some((i.parse().ok()?, n.into()))
+    }).collect();
+    let list = dir.join("only.txt");
+    std::fs::write(&list, scope.instrument.iter().map(|i| names[i].as_str()).collect::<Vec<_>>().join("\n")).unwrap();
+    let status = Command::new(&tool).args(features).arg("--asyncify")
+        .arg(format!("--pass-arg=asyncify-imports@{}", psxw_link::asyncify::IMPORTS))
+        .arg(format!("--pass-arg=asyncify-onlylist@@{}", list.display()))
+        .arg(&raw).arg("-o").arg(&out).status().unwrap();
+    assert!(status.success());
+    let mut config = wasmtime::Config::new();
+    config.wasm_exceptions(true);
+    let engine = wasmtime::Engine::new(&config).unwrap();
+    let module = wasmtime::Module::from_file(&engine, out).unwrap();
+    let mut store = wasmtime::Store::new(&engine, 0u32);
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker.func_wrap("psx", "syscall", |mut c: wasmtime::Caller<'_, u32>, n: u32, addr: u32, _: u32, _: u32| -> wasmtime::Result<u32> {
+        assert_eq!((n, addr), (3, 0xA000_E0D0));
+        let state = c.get_export(guest::ASYNCIFY_GET_STATE).unwrap().into_func().unwrap().typed::<(), i32>(&c)?.call(&mut c, ())?;
+        if state == 2 {
+            c.get_export(guest::ASYNCIFY_STOP_REWIND).unwrap().into_func().unwrap().typed::<(), ()>(&c)?.call(&mut c, ())?;
+        } else {
+            *c.data_mut() += 1;
+            c.get_export(guest::ASYNCIFY_START_UNWIND).unwrap().into_func().unwrap().typed::<u32, ()>(&c)?.call(&mut c, 0x1000)?;
+        }
+        Ok(1)
+    }).unwrap();
+    linker.define_unknown_imports_as_traps(&module).unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    instance.get_typed_func::<u32, ()>(&mut store, "guest_sp_set").unwrap().call(&mut store, STACK_TOP).unwrap();
+    let mem = instance.get_memory(&mut store, guest::MEMORY).unwrap();
+    mem.write(&mut store, 0x1000, &[0x08, 0x10, 0, 0, 0, 0, 1, 0]).unwrap();
+    let invoke = instance.get_typed_func::<(u32, u32, u32, u32, u32), u64>(&mut store, guest::INVOKE).unwrap();
+    let state = instance.get_typed_func::<(), i32>(&mut store, guest::ASYNCIFY_GET_STATE).unwrap();
+    invoke.call(&mut store, (0x8001_1000, 7, 0, 0, 0)).unwrap();
+    assert_eq!(state.call(&mut store, ()).unwrap(), 1, "the whole call stack suspended");
+    instance.get_typed_func::<(), ()>(&mut store, guest::ASYNCIFY_STOP_UNWIND).unwrap().call(&mut store, ()).unwrap();
+    instance.get_typed_func::<u32, ()>(&mut store, guest::ASYNCIFY_START_REWIND).unwrap().call(&mut store, 0x1000).unwrap();
+    assert_eq!(invoke.call(&mut store, (0x8001_1000, 99, 0, 0, 0)).unwrap(), 22, "locals restored, not recomputed from the new argument");
+    assert_eq!(state.call(&mut store, ()).unwrap(), 0);
+    assert_eq!(*store.data(), 1, "rewinding must not request another switch");
+}
+
 /// A writable static the address map doesn't name has an original address
 /// the link can't know: it fails naming it, rather than placing a second
 /// copy in AUX.

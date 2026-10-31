@@ -251,8 +251,10 @@ handoff's missing-call list.
   reads error; low-level TTY `ioctl` is a zero-return stub. `getc`/`getchar` and
   output wrappers already exist. Complete the missing software and host-input
   integration, reusing file/device dispatch.
-- [ ] **Direct SYS(03h).** It returns 1 without switching threads. Route the
-  TCB-address syscall through existing switching support. B(10h) already works.
+- [x] **Direct SYS(03h).** The TCB-address syscall now uses the same pending
+  switch, SP/GP bookkeeping and Asyncify stacks as B(10h). Build scope includes
+  syscall sites; the syscall import stops rewind without repeating the switch.
+  Native thread lifecycle and real clang/link/Asyncify resume tests pass.
 - [ ] **Thread limitations.** Review and resolve the rejection of switching
   from callbacks/interrupts and the limited externally editable TCB context.
   Do not replace working Asyncify threading or invent a simulated CPU register
@@ -525,6 +527,23 @@ Source checkpoint `4cce9e3`, in this recovery checkout, not main's outputs:
 - C(06h), general non-local returns, callback thread switches, SDK BIOS-table
   replacement paths and other listed gaps remain unfinished. This batch does
   not complete the exception/control-flow checklist or full BIOS.
+
+### Direct thread syscall follow-up (ABI 18 unchanged)
+
+- SYS(03h) accepts an active TCB address and preserves its segment alias in the
+  PCB, using the existing ChangeThread bookkeeping and runtime stacks. Invalid
+  or closed TCBs fail explicitly; switching to self does not unwind.
+- Both `psx.bios` and `psx.syscall` are Asyncify suspension imports. The build
+  conservatively includes syscall sites because their selector may be dynamic.
+  Rewind returns 1 at the suspended syscall without executing it again.
+- BIOS 31 and runtime 8 tests pass; build crate compiles; wasm32 runtime check
+  passes. All 7 link-pass tests pass, including a real clang/link/Binaryen/
+  Wasmtime nested-call test that checks preserved locals and a single switch.
+  The wasm test uses a host implementation of the suspension import; it is not
+  a full-runtime thread oracle. No new game artifacts or replay results yet.
+- Callback/IRQ switching and externally editable full TCB register contexts
+  remain unfinished. No scheduler replacement, exception-context invention or
+  ABI signature change was introduced.
 
 ### Next independent lanes
 

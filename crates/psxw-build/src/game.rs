@@ -522,11 +522,15 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         );
     }
     bios_calls(&out_dir(ws, &opts.game), &lifted)?;
-    // Thread switches (ChangeThread, B0h:10h) seed the Asyncify scope (D57),
-    // by their wasm names.
+    // Thread switches (ChangeThread, B0h:10h, or SYS(03h)) seed Asyncify
+    // by their wasm names. Conservatively include every syscall site:
+    // its function number may be computed at runtime.
     let switches: BTreeSet<String> = lifted
         .iter()
-        .filter(|t| psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10)))
+        .filter(|t| {
+            psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10))
+                || t.graph.nodes.values().any(|d| d.insn.op == psxw_lift::decode::Op::Syscall)
+        })
         .map(|t| format!("{}:{}", t.func.container, t.cname))
         .collect();
     let failures = psxw_lift::run::write_and_compile(ws, &lift_dir, &lifted)?;
@@ -1134,7 +1138,7 @@ fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
 
 /// Instrument the guest with Asyncify over the functions that can be on
 /// the stack at a thread switch (D57; `psxw_link::asyncify`). Only
-/// `psx.bios` unwinds. Prints the scope's size.
+/// `psx.bios` and `psx.syscall` unwind. Prints the scope's size.
 fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>, debug: bool) -> Result<Vec<u8>> {
     let tool = if debug { psxw_inputs::toolchain::dwarf_binaryen(ws)? } else { ws.tool("binaryen", "bin/wasm-opt")? };
     let scope = psxw_link::asyncify::scope(wasm, switches)?;
@@ -1168,7 +1172,7 @@ fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>
         .args(FEATURES)
         .arg(&linked)
         .arg("--asyncify")
-        .arg(format!("--pass-arg=asyncify-imports@{}.{}", psxw_abi::psx::MODULE, psxw_abi::psx::BIOS))
+        .arg(format!("--pass-arg=asyncify-imports@{}", psxw_link::asyncify::IMPORTS))
         .arg(format!("--pass-arg=asyncify-onlylist@@{}", list_path.display()))
         .arg("-g")
         .arg("-o")

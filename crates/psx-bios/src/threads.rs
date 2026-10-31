@@ -127,6 +127,22 @@ impl<S: Sdk> Machine<S> {
         Ok(1)
     }
 
+    /// SYS(03h) takes a TCB address, not a thread handle. Use the same
+    /// pending switch and stack bookkeeping as ChangeThread; no second
+    /// thread implementation or simulated register context is needed.
+    pub fn change_thread_tcb(&mut self, addr: u32) -> Result<u32, String> {
+        self.threads_ready();
+        let offset = (addr & psxw_abi::WINDOW_MASK).checked_sub(k::TCBS);
+        let i = offset.filter(|o| o % k::TCB_SIZE == 0).map(|o| o / k::TCB_SIZE)
+            .filter(|&i| i < self.kernel.threads.count)
+            .ok_or_else(|| format!("ChangeThreadSubFunction({addr:#010x}): not a TCB address"))?;
+        let result = self.change_thread(HANDLE | i)?;
+        // Unlike the handle wrapper, the syscall receives the actual
+        // pointer to install. Retain its segment alias in the visible PCB.
+        self.mem.w32(k::PCB, addr);
+        Ok(result)
+    }
+
     /// The runtime switches to TCB `i`: it becomes current, and its sp and
     /// gp are the guest's. Returns its start address when it starts afresh
     /// (OpenThread since it last ran), `None` when it resumes.
@@ -177,6 +193,34 @@ mod tests {
         assert!(m.change_thread(h).is_err(), "a closed thread can't be switched to");
         assert_eq!(m.open_thread(0x8002_0000, 0x801F_F800, 0), h, "its TCB is reused, afresh");
         assert_eq!(m.enter_thread(1), Some(0x8002_0000));
+    }
+
+    #[test]
+    fn syscall_and_handle_switches_share_threads() {
+        let mut m = machine();
+        let h = m.open_thread(0x8001_0000, 0x801F_E000, 0x8002_4000);
+        let addr = 0x8000_0000 | tcb(1);
+        assert_eq!(crate::bios::syscall(&mut m, [3, addr, 0, 0]), Ok(1));
+        assert_eq!(m.mem.r32(k::PCB), addr);
+        assert_eq!(m.mem.r32(reg(0, 29)), 0x801F_F000);
+        assert_eq!(m.kernel.threads.switch_to.take(), Some(1));
+        assert_eq!(m.enter_thread(1), Some(0x8001_0000));
+        assert_eq!((m.regs.sp(), m.regs.gp()), (0x801F_E000, 0x8002_4000));
+        assert_eq!(m.change_thread(HANDLE), Ok(1));
+        assert_eq!(m.kernel.threads.switch_to.take(), Some(0));
+        assert_eq!(m.enter_thread(0), None);
+        assert_eq!(crate::bios::syscall(&mut m, [3, kseg1(tcb(1)), 0, 0]), Ok(1));
+        assert_eq!(m.kernel.threads.switch_to.take(), Some(1));
+        assert_eq!(m.enter_thread(1), None, "resume the same worker, not a fresh thread");
+        assert_eq!(crate::bios::syscall(&mut m, [3, tcb(1), 0, 0]), Ok(1));
+        assert_eq!(m.kernel.threads.switch_to, None, "switching to self needs no unwind");
+        assert_eq!(m.mem.r32(k::PCB), tcb(1));
+        m.close_thread(h);
+        for bad in [addr, addr + 4, tcb(DEFAULT_TCBS), HANDLE] {
+            assert!(crate::bios::syscall(&mut m, [3, bad, 0, 0]).is_err());
+            assert_eq!(m.kernel.threads.switch_to, None);
+            assert_eq!(m.mem.r32(k::PCB), tcb(1));
+        }
     }
 
     #[test]

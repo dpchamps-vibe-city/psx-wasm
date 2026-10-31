@@ -15,6 +15,10 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use wasmparser::{KnownCustom, Name, Operator, Parser, Payload};
 
+/// Runtime imports that can suspend a guest thread. Both the handle BIOS
+/// service and the TCB-address syscall use the same Asyncify stacks.
+pub const IMPORTS: &str = "psx.bios,psx.syscall";
+
 #[derive(Debug, Default)]
 pub struct Scope {
     /// Function indices to instrument, imports counted.

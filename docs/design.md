@@ -2053,12 +2053,14 @@ locals, so the wasm stack itself switches.
 - **How:** binaryen Asyncify (pinned, version 133; the debug path uses its
   separately pinned DWARF repair) instruments the guest
   after the link, only the functions that can be on the stack at a
-  switch: the reverse closure of the functions making B0h:10h calls,
+  switch: the reverse closure of the functions making B0h:10h calls or
+  syscalls (SYS(03h) can switch; a computed syscall number is included),
   through direct calls, plus every function making an indirect call (an
   indirect call can reach any function in the dispatch table). The pinned
   regular bof4 build instruments 2,951 of 17,777 functions; moddable bases
-  have their existing additional wrappers/dispatch scope. `psx.bios` is the one import that
-  unwinds. Functions with exception handlers (`guest_invoke_irq`) can't be
+  have their existing additional wrappers/dispatch scope. These counts precede
+  the recovery's syscall support: `psx.bios` and `psx.syscall` can now unwind.
+  Functions with exception handlers (`guest_invoke_irq`) can't be
   instrumented and are left out; a switch from a callback or interrupt
   handler traps.
 - **The runtime's side:** ChangeThread saves the running thread's sp and
@@ -2066,7 +2068,11 @@ locals, so the wasm stack itself switches.
   into its buffer, back to the thread's root call in `run_threads`, which
   starts the target afresh at its TCB's start address (and sp, gp, which
   the game may have edited) or rewinds the target's own stack to the
-  ChangeThread it called, which returns 1 there.
+  ChangeThread it called, which returns 1 there. Direct SYS(03h) resolves its
+  TCB address to this same switch, preserving the supplied pointer in the PCB;
+  its unwind/rewind stops at `syscall` instead of `bios`. No second scheduler
+  or simulated CPU context is added. Externally edited registers other than
+  the existing SP/GP/start-PC support and callback/IRQ switches remain limited.
 - **A game that never switches** gets stubs for Asyncify's exports, so
   its module is unchanged otherwise (ABI 11).
 - **Debugging keeps DWARF and variables.** Reader/Flatten producer identities

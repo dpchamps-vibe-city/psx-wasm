@@ -587,10 +587,18 @@ fn suspend() {
 
 #[unsafe(export_name = "syscall")]
 pub extern "C" fn syscall(a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
+    // A SYS(03h) suspension rewinds to this import, not `bios`.
+    if THREADS.with(|t| t.borrow_mut().as_mut().is_some_and(|s| std::mem::take(&mut s.rewinding))) {
+        unsafe { asyncify_stop_rewind() };
+        return 1;
+    }
     let r = with(|rt| psx_bios::bios::syscall(&mut rt.m.borrow_mut(), [a0, a1, a2, a3]));
     let v = r.unwrap_or_else(|e| fatal(5, &e));
     // Leaving a critical section lets pending interrupts through.
     with(|rt| driver::drain(&rt.m, &mut Guest));
+    if with(|rt| rt.m.borrow().kernel.threads.switch_to.is_some()) {
+        suspend();
+    }
     v
 }
 

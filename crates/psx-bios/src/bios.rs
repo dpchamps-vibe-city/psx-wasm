@@ -718,8 +718,8 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
             }
             Ok(0)
         }
-        // ChangeThreadSubFunction.
-        3 => Ok(1),
+        // ChangeThreadSubFunction: a1 is a TCB pointer, not a handle.
+        3 => m.change_thread_tcb(a[1]),
         0 => Ok(0),
         // Other syscall numbers deliver the unresolved-exception event.
         // The current seam has no incoming v0: it returns 0 rather than
