@@ -1159,38 +1159,21 @@ impl<S: Sdk> Machine<S> {
     }
 }
 
-/// `?` matches one character; `*` matches everything after it. The ISO
-/// version (`;1`) is not part of the match.
+/// BIOS CD search, not a shell glob: `*` discards the rest of the pattern,
+/// and `?` matching the name's terminator accepts the rest too (psx-spx;
+/// OpenBIOS `dev_cd_firstFile` / `patternMatches`). Unlike open, directory
+/// searches compare the ISO version suffix as part of the name.
 fn glob(pattern: &str, name: &str) -> bool {
-    let name = name.split(';').next().unwrap_or(name);
-    let (p, n) = (pattern.as_bytes(), name.as_bytes());
-    let (mut pi, mut ni) = (0, 0);
-    let (mut star, mut mark) = (None, 0);
-    while ni < n.len() {
-        let c = n[ni].to_ascii_uppercase();
-        match p.get(pi) {
-            Some(b'*') => {
-                star = Some(pi);
-                pi += 1;
-                mark = ni;
-            }
-            Some(b'?') => {
-                pi += 1;
-                ni += 1;
-            }
-            Some(&cp) if cp == c => {
-                pi += 1;
-                ni += 1;
-            }
-            _ if star.is_some() => {
-                pi = star.unwrap() + 1;
-                mark += 1;
-                ni = mark;
-            }
+    let p = pattern.as_bytes();
+    for (i, c) in name.bytes().enumerate() {
+        match p.get(i) {
+            Some(b'*') => return true,
+            Some(b'?') => {}
+            Some(&cp) if cp == c.to_ascii_uppercase() => {}
             _ => return false,
         }
     }
-    p[pi..].iter().all(|&c| c == b'*')
+    matches!(p.get(name.len()), None | Some(b'?' | b'*'))
 }
 
 #[cfg(test)]
@@ -1434,6 +1417,8 @@ mod tests {
         root.extend(iso_record("\x01", 18, 2048, true));
         root.extend(iso_record("A.BIN;1", 19, 5, false));
         root.extend(iso_record("DATA", 20, 2048, true));
+        root.extend(iso_record("AX.DAT;1", 22, 1, false));
+        root.extend(iso_record("A", 23, 1, false));
         sectors[18] = iso_sector(18, &root);
         sectors[19] = iso_sector(19, b"hello");
         let mut sub = Vec::new();
@@ -1511,6 +1496,30 @@ mod tests {
         m.mem.write(0x8001_0000, b"cdrom:A.BIN;1\0");
         let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 2, "relative open after clearing cwd");
+        let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 2);
+
+        // Search matches the on-disc name, including its version. A star
+        // ignores the suffix after it; a question mark at NUL accepts the
+        // remaining pattern as well. Exercise both firstfile and nextfile.
+        for (pattern, expected) in [
+            ("a*.missing", vec!["A.BIN;1", "AX.DAT;1", "A"]),
+            ("A?.DAT;1", vec!["AX.DAT;1", "A"]),
+            ("A.BIN;1", vec!["A.BIN;1"]),
+            ("A.BIN;2", vec![]),
+            ("A.BIN", vec![]),
+        ] {
+            m.mem.write(0x8003_0000, format!("cdrom:{pattern}\0").as_bytes());
+            let v = crate::bios::call(&mut m, 0xB0, 0x42, [0x8003_0000, 0x8004_0000, 0, 0]);
+            let mut v = ret(&mut m, v, &returns);
+            for name in expected {
+                assert_eq!(v, 0x8004_0000, "pattern {pattern}, expected {name}");
+                assert_eq!(m.mem.cstr(v, 32), name.as_bytes(), "pattern {pattern}");
+                let next = crate::bios::call(&mut m, 0xB0, 0x43, [0x8004_0000, 0, 0, 0]);
+                v = ret(&mut m, next, &returns);
+            }
+            assert_eq!(v, 0, "no more matches for {pattern}");
+        }
     }
 
     /// chdir stores its name before either metadata read. Failures return

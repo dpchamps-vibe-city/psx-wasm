@@ -136,7 +136,7 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 | Card, console and CD | Partial; continue independently verifiable software contracts using existing backends. Do not invent missing reference behaviour. |
 | Other executable, exception and thread gaps | Still open; do not assume deferring longjmp implements these or authorises a runtime redesign. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | CD-directory follow-up passes BIOS 51/runtime 8/SDK 42 tests and wasm32 check. Release/game/replay/memcard artifacts remain at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | CD-directory/search follow-ups pass BIOS 51/runtime 8/SDK 42 tests and wasm32 check. Release/game/replay/memcard artifacts remain at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
@@ -1111,9 +1111,9 @@ would be a hybrid contract. No CD code or tests were changed on this evidence,
 and no new architecture approval request is being made. These services remain
 partial, independently of the user-deferred non-local-return bug.
 
-### CD-directory software follow-up
+### CD-directory and search software follow-ups
 
-Parent corrected A(64h) `dev_cd_chdir`, also reached through B(40h) `cd`, using
+Parent commit `7422359` corrected A(64h) `dev_cd_chdir`, also reached through B(40h) `cd`, using
 psx-spx's file-function contract and pinned OpenBIOS
 [`filesystem.c`](https://github.com/pcsx-redux/nugget/blob/4dc70d2931121a0fde858a0354192b6df4fa22e8/openbios/cdrom/filesystem.c).
 The old native implementation incorrectly required the directory to exist and
@@ -1139,6 +1139,20 @@ the separately documented event-wait/retry contract are unchanged. This does
 not resolve the rejected wait proposal. Release/game/replay/conformance outputs
 remain at `99fa333` until a later integrated refresh; no new full CI, browser or
 oracle pass is claimed.
+
+The next small follow-up corrects the CD `firstfile`/`nextfile` name matcher,
+using the same pinned reference's `dev_cd_firstFile` and `patternMatches`:
+`*` ignores all following pattern text rather than implementing a shell glob;
+`?` matching the name terminator also accepts the remaining pattern (the
+documented BIOS bug). Searches compare the full ISO name, including `;1`,
+rather than stripping its version. File-open's existing optional-version lookup
+is unchanged. The shared native disc core and card matcher are not modified.
+The existing device-table test covers first/next search order, lower-case input,
+star suffix rejection avoidance, the question-mark terminator case and explicit
+matching/mismatching/omitted versions. BIOS 51/runtime 8/SDK 42 plus wasm32 check
+pass (`cd-search-integrated-tests.log`). A62/A63 and B42/B43 remain `Partial`;
+this does not implement Sony's directory cache, disk-change quirks or arbitrary
+invalid/overlong filename behavior.
 
 ## Progress log
 
