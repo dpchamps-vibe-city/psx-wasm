@@ -174,11 +174,12 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// `_card_read(port, sector, dst)`.
+    /// OpenBIOS's check: 400h is accepted, and the card rejects it.
     pub fn card_read(&mut self, port: u32, sector: u32, dst: u32) -> u32 {
         if sector > memcard::FRAMES {
             return 0;
         }
-        self.card_queue(slot_of(port), Op::Read { frame: sector.min(memcard::FRAMES - 1), dst }) as u32
+        self.card_queue(slot_of(port), Op::Read { frame: sector, dst }) as u32
     }
 
     /// `_card_write(port, sector, src)`: the frame is taken now.
@@ -188,7 +189,7 @@ impl<S: Sdk> Machine<S> {
         }
         let mut data = vec![0u8; memcard::FRAME];
         self.mem.read(src, &mut data);
-        self.card_queue(slot_of(port), Op::Write { frame: sector.min(memcard::FRAMES - 1), data, high: false }) as u32
+        self.card_queue(slot_of(port), Op::Write { frame: sector, data, high: false }) as u32
     }
 
     pub fn card_info(&mut self, port: u32) -> u32 {
@@ -251,6 +252,15 @@ impl<S: Sdk> Machine<S> {
             self.kernel.cards.status[slot] = FAIL_GENERAL;
             self.card_event(SPEC_NEW, high);
             return;
+        }
+        if let Op::Read { frame, .. } | Op::Write { frame, .. } = op {
+            // The card answers a sector past its last with FFFFh, and the
+            // driver fails the operation.
+            if frame >= memcard::FRAMES {
+                self.kernel.cards.status[slot] = FAIL_GENERAL;
+                self.card_event(SPEC_ERROR, high);
+                return;
+            }
         }
         match op {
             Op::Read { frame, dst } => {
@@ -448,6 +458,11 @@ mod tests {
         let mut back = [0u8; 128];
         m.mem.read(out, &mut back);
         assert_eq!(back, [0x5A; 128]);
+        // Sector 400h reaches the card, which rejects it; 401h doesn't.
+        assert_eq!(m.card_read(0x00, 0x400, out), 1);
+        m.card_vblank();
+        assert_eq!(m.kernel.cards.status[0], super::FAIL_GENERAL);
+        assert_eq!(m.card_read(0x00, 0x401, out), 0);
         // Slot 2 is empty.
         m.card_info(0x10);
         m.card_vblank();
