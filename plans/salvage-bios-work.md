@@ -136,7 +136,7 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 | Card, console and CD | Partial; continue independently verifiable software contracts using existing backends. Do not invent missing reference behaviour. |
 | Other executable, exception and thread gaps | Still open; do not assume deferring longjmp implements these or authorises a runtime redesign. |
 | Fonts and BIOS identity | Resource/policy decisions remain open; no invented glyph pointers, dates or versions. |
-| Validation | Native source `bbdeb39` passes focused tests, wasm32 check, builds and four replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
+| Validation | Native source `bbdeb39` passes focused tests, wasm32 check, builds and four replays. Browser storage at `8e5badf` passes 25 checks each in Chromium/Firefox; ABI-18 BTN browser conformance and game/recording gates pass at `9624526`. Memcard conformance remains at `99fa333`; earlier full CI has classified failures and missing prerequisites, not a green verdict. |
 | Documentation | Front checklist, design/archived-decision dispositions, plan index and native-BIOS open items reconciled. Older broad audit findings remain historical leads, not a new audit or a current unresolved-bug count. |
 
 ### Continuation lanes after deferring non-local returns
@@ -374,9 +374,12 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
 - [x] Validate two-bundle browser disc isolation, locked-disc refusal and unlocked
   replacement through production pages/OPFS. Chromium and Firefox each pass 25
   storage checks at `8e5badf`, retaining all seven card checks.
-- [ ] Complete remaining mod/browser gates: BTN mods prerequisites remain missing;
-  the broader game/GPU/conformance browser results are still at ABI 17. The
-  focused storage gate does not start a game or run its wasm.
+- [x] Refresh BTN browser conformance and game/recording gates at ABI 18:
+  Chromium/Firefox pass five scenarios and the 6,000-frame title replay with
+  native RAM/VRAM/audio comparisons at `9624526`, detailed below.
+- [ ] Complete remaining mod/GPU-oracle browser gates: BTN mods census inputs
+  and GPU vectors/goldens remain missing. Cross-host agreement is not an oracle
+  comparison or a full-CI pass.
 - [x] Run `psxw ci btn` and `psxw ci bof4` and classify failures: both completed
   at the ABI-17 foundation and exited 2. This is execution, **not a green gate**.
 - [ ] Resolve/provision the recorded full-CI blockers and run a current-source
@@ -1228,6 +1231,36 @@ No runtime/ABI source changed, so native builds/replays remain valid at
 full game worker/wasm or certify game save/reload, GPU/browser conformance,
 non-empty BIOS oracle comparisons or green full CI. Those separately recorded
 gaps and the user-deferred non-local-return bug remain unchanged.
+
+### ABI-18 browser conformance and game gate (`9624526`)
+
+The existing CLI gates ran against native source `bbdeb39`, browser source
+`8e5badf`, and fresh ABI-18 bundles at documentation checkpoint `9624526`:
+
+- `web-test conform btn --browsers chromium,firefox --timeout 600`: both
+  browsers pass libpad (846 steps), libgpu (263), libmcrd (105), libetc (122)
+  and libspu (14). All five result records are present in each JSON, with no
+  diffs and matching native final VRAM/audio. The existing command omits
+  scenarios needing probes; this is not all SDK/chip conformance.
+- `web-test game btn --replay title-to-gameplay --frames 6000 --hash
+  300,1200,2400,3600,4800,6000 --record --browsers chromium,firefox --timeout
+  1800`: both browsers and native reach 6,000 frames; all six RAM/VRAM samples
+  and all 4,423,466 audio frames match. Both pages display lit frames, import
+  the read-only disc into OPFS and execute the real wasm. Browser recordings
+  replayed natively reproduce the same sampled RAM. No replay expectations
+  changed, no EDC errors or guest I/O accesses reported.
+
+Parent read both logs and all four result JSONs. Reports are in
+`out/web/test-conform-btn-results/` and `out/web/test-btn-results/`; logs are
+`browser-abi18-{conform,game}.log` in session scratch. Previous own disposable
+BTN storage was preserved there as
+`browser-abi18-btn-previous-disposable-storage`; tests used fresh own storage
+and disposable browser profiles, not user cards or writable input snapshots.
+
+The pinned browser image was reused. These gates refresh the broader BTN
+browser coverage beyond ABI 17, but do not provide missing GPU-oracle goldens,
+BTN mod inputs, BOF4 browser coverage, save/reload certification or green full
+CI. No source/runtime/ABI changes were needed for this validation batch.
 
 ## Progress log
 
