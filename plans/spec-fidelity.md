@@ -1,6 +1,6 @@
 # Spec fidelity
 
-**Status:** not started.
+**Status:** phase 1 done but for the human's runs; phases 2 and 4 in progress.
 **Depends on:** [unified adapter layer, phase 1](unified-adaptor-layer/phase1.md)
 (done): the adapters this plan corrects.
 **Replaces:** `plans/shortcuts.md` (the 2026-10-30 audit, commits
@@ -278,6 +278,21 @@ Renderer, SDK, translator, runtime:
    against OpenBIOS).
 4. **Human:** `psxw ci btn` and `psxw ci bof4` pass.
 
+**Status (2026-10-30): done but for the human's runs.** Every item is
+ticked except B15 (blocked: needs hardware) and TR1's second half (needs a
+decision, Findings). 1: `cargo test --workspace` passes. 2: both games
+build, every chip native (`out/sf-p1-build-*.log`). 3: can't run yet:
+the oracle harness has no psx-wasm `bios` device under test ("no
+implementation of bios"), so the 5 archived `BIOS_CALL` vectors wait;
+building it moved to phase 3 task 9. 4: **waiting on the human:**
+`./target/release/psxw ci btn` and `./target/release/psxw ci bof4`. What
+moved that the runs may show: GPUSTAT bits 13/25/31 (B11, B12), timer 0's
+dot clock (B13), CD audio while the SPU is muted (B14), `GetlocP` (B10),
+the BIOS pad and card paths (B4, BIOS1, BIOS2: libcard's wrappers now run
+the original code), the boot stack (B23), libetc's handler a0 (SDK7), the
+SDK's messages (SDK9), the translator's volatile I/O and inlined tail
+calls (TR1, B19).
+
 ## Phase 2: SDK state and waits
 
 1. [ ] **Record the decision** (table above, phase 2).
@@ -355,7 +370,11 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    device table (`cdrom`, `bu`, `tty`); `cdrom` reads through the CD
    controller with its timing (`psx-bios/src/bios.rs:344-436`).
 9. [ ] **Every call psx-spx documents.** Group by group, each with
-   `BIOS_CALL` vectors (`psxw-oracle/src/handwritten.rs`, `bios()`):
+   `BIOS_CALL` vectors (`psxw-oracle/src/handwritten.rs`, `bios()`). First
+   the harness's psx-wasm side: `psxw oracle check --device bios` has no
+   `DeviceUnderTest` for `bios` (phase 1 found it), so a vector runs a call
+   through `psx_bios::bios::call` on a test machine and compares RAM and
+   v0 with the golden:
    - the C library, including `malloc`/`free`/`calloc`/`realloc` over
      `InitHeap`, number conversion, `qsort`;
    - events (`UnDeliverEvent`), timers, kernel memory;
@@ -515,6 +534,11 @@ locals, or static translation.
 - **2026-10-30:** plan created from the shortcuts audit
   (`plans/shortcuts.md`, `3eff117`–`0bae88a`), its bugs (moved from
   open-items) and the BIOS rework.
+- **2026-10-30:** phase 1 implemented (`c484570`..`7ee8c3d`): 36 items done,
+  B16 struck (the shift is Beetle's), B15 blocked, TR1 half done. Device
+  bugs and translator items by two agents in worktrees, cherry-picked.
+  Workspace tests pass; both games build. Human runs pending (phase 1 exit
+  criteria). D67 recorded for phase 2 (`c3aa557`).
 
 ## Findings
 
