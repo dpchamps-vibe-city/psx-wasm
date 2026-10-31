@@ -665,8 +665,7 @@ anything else.
 3. **Human:** `psxw ci btn` and `psxw ci bof4` against the re-recorded
    baselines; `psxw oracle ramdiff` no worse than before.
 
-Status (2026-10-31): 1 and 2 pass on `worktree-agent-a91665ec38f961809`
-(`dee627e`..). `psxw difftest btn`: 2,620 pass, 3 excluded, the known
+Status (2026-10-31): merged to main at `9f00d2b`; 1 and 2 pass. `psxw difftest btn`: 2,620 pass, 3 excluded, the known
 `AlignPadActuators` mismatch and `Ovl11ProbeActorBounds` trap, as
 before. Conformance: chips irq, gpu, cd and spu pass in both games, mdec
 in bof4; sio0 (both) and memcard (btn) fail on time: their interrupt
