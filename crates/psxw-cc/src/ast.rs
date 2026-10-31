@@ -249,10 +249,11 @@ pub struct Object {
 #[cfg(test)]
 mod tests {
     /// Every loop body starts with a barrier, a body that isn't a block
-    /// becoming one; a label only a later `goto` reaches is a loop head.
+    /// becoming one; a label only a later `goto` reaches is a loop head;
+    /// `do { } while (0)` isn't a loop.
     #[test]
     fn loop_barriers() {
-        let src = "int g;\nvoid f(int n) {\n  while (g == 0) ;\n  for (; n; n--) { g++; }\n  do g--; while (g);\nback:\n  if (g) goto back;\n  goto out;\nout:\n  ;\n}\n";
+        let src = "int g;\nvoid f(int n) {\n  while (g == 0) ;\n  for (; n; n--) { g++; }\n  do g--; while (g);\nback:\n  if (g) goto back;\n  goto out;\nout:\n  do { g = 1; } while (0);\n}\n";
         let text = crate::edit::apply(src, super::loop_barriers(&super::parse(src)));
         let b = super::BARRIER;
         assert_eq!(text.matches(b).count(), 4, "{text}");
@@ -331,12 +332,15 @@ pub const BARRIER: &str = "__asm__ __volatile__(\"\" ::: \"memory\");";
 /// to), on the body's own line. Interrupt handlers and callbacks run at
 /// safepoints the linker adds to loops after clang, so clang must not keep
 /// a load in a register across iterations: the original reads memory each
-/// pass. A body that isn't a block becomes one.
+/// pass. A body that isn't a block becomes one; `do { } while (0)` runs once.
 pub fn loop_barriers(ast: &Ast) -> Vec<crate::edit::Edit> {
     use crate::edit::Edit;
     fn walk(ast: &Ast, n: Node, labels: &mut Vec<(String, usize, usize)>, gotos: &mut Vec<(String, usize)>, out: &mut Vec<Edit>) {
+        // `do { } while (0)` (a statement macro's) runs once: no loop.
+        let once = n.kind() == "do_statement"
+            && n.child_by_field_name("condition").is_some_and(|c| ast.text(c).trim_matches(['(', ')', ' ']) == "0");
         match n.kind() {
-            "for_statement" | "while_statement" | "do_statement" => {
+            "for_statement" | "while_statement" | "do_statement" if !once => {
                 if let Some(body) = n.child_by_field_name("body") {
                     if body.kind() == "compound_statement" {
                         out.push(Edit::insert(body.start_byte() + 1, format!(" {BARRIER}")));
