@@ -409,16 +409,10 @@ fn memset(m: &mut M, p: u32, v: u8, n: u32, k: Then) -> Flow<Psyq> {
         return k(m);
     }
     crate::path(m, &[(0x2EE0, 0x2EE0)]);
-    passes(
-        m,
-        false,
-        4,
-        n,
-        Box::new(move |m| {
-            crate::path(m, &[(0x2EF4, 0x2EF8)]);
-            k(m)
-        }),
-    )
+    passes(m, false, 4, n, Box::new(move |m| {
+        crate::path(m, &[(0x2EF4, 0x2EF8)]);
+        k(m)
+    }))
 }
 
 /// The game's `memcpy(dst, src, n)` that the `jal` at `pc` calls, then `k`
@@ -603,20 +597,13 @@ fn enqueue_look(m: &mut M, s: Sys, job: Job, k: K) -> Flow<Psyq> {
     crate::path(m, &[(0x2144, 0x2160)]);
     if full {
         crate::path(m, &[(0x212C, 0x2130)]);
-        return iterate(
-            m,
-            s,
-            0,
-            0,
-            1,
-            Box::new(move |m, ok| {
-                if !ok {
-                    return failed(m, k);
-                }
-                crate::path(m, &[(0x2134, 0x2140)]);
-                pump(m, s, false, Box::new(move |m, _| enqueue_room(m, s, job, k)))
-            }),
-        );
+        return iterate(m, s, 0, 0, 1, Box::new(move |m, ok| {
+            if !ok {
+                return failed(m, k);
+            }
+            crate::path(m, &[(0x2134, 0x2140)]);
+            pump(m, s, false, Box::new(move |m, _| enqueue_room(m, s, job, k)))
+        }));
     }
     crate::path(m, &[(0x2164, 0x2168)]);
     if let Err(e) = mask(m, s, data::MASK_QUEUE) {
@@ -641,22 +628,14 @@ fn enqueue_look(m: &mut M, s: Sys, job: Job, k: K) -> Flow<Psyq> {
         // is between commands, ready at the first look.
         return header(m, false, move |m| {
             crate::path(m, &[(0x21E4, 0x21F4), (0x21F8, 0x2200)]);
-            work(
-                m,
-                s,
-                false,
-                s.text + job.func,
-                job.p,
-                job.arg,
-                Box::new(move |m| {
-                    crate::path(m, &[(0x2204, 0x2210)]);
-                    if let Err(e) = unmask(m, s, data::MASK_QUEUE) {
-                        return fail(m, e);
-                    }
-                    crate::path(m, &[(0x2214, 0x2218), (0x238C, 0x23A4)]);
-                    k(m, 0)
-                }),
-            )
+            work(m, s, false, s.text + job.func, job.p, job.arg, Box::new(move |m| {
+                crate::path(m, &[(0x2204, 0x2210)]);
+                if let Err(e) = unmask(m, s, data::MASK_QUEUE) {
+                    return fail(m, e);
+                }
+                crate::path(m, &[(0x2214, 0x2218), (0x238C, 0x23A4)]);
+                k(m, 0)
+            }))
         });
     }
     crate::path(m, &[(0x221C, 0x2228)]);
@@ -685,16 +664,11 @@ fn enqueue_look(m: &mut M, s: Sys, job: Job, k: K) -> Flow<Psyq> {
                     return fail(m, e);
                 }
                 crate::path(m, &[(0x2368, 0x236C)]);
-                pump(
-                    m,
-                    s,
-                    false,
-                    Box::new(move |m, _| {
-                        crate::path(m, &[(0x2370, 0x2388), (0x238C, 0x23A4)]);
-                        let n = queued(m, s);
-                        k(m, n)
-                    }),
-                )
+                pump(m, s, false, Box::new(move |m, _| {
+                    crate::path(m, &[(0x2370, 0x2388), (0x238C, 0x23A4)]);
+                    let n = queued(m, s);
+                    k(m, n)
+                }))
             };
             if job.len == 0 {
                 crate::path(m, &[(0x22D8, 0x22F8)]);
@@ -704,18 +678,12 @@ fn enqueue_look(m: &mut M, s: Sys, job: Job, k: K) -> Flow<Psyq> {
             // looks once more to leave.
             crate::path(m, &[(0x2234, 0x2240)]);
             let per = len(&[(0x2244, 0x2248), (0x2250, 0x2290)]) as u32;
-            passes(
-                m,
-                false,
-                per,
-                job.len / 4,
-                Box::new(move |m| {
-                    header(m, false, move |m| {
-                        crate::path(m, &[(0x2244, 0x2248), (0x2250, 0x225C), (0x2294, 0x22D4)]);
-                        queue(m)
-                    })
-                }),
-            )
+            passes(m, false, per, job.len / 4, Box::new(move |m| {
+                header(m, false, move |m| {
+                    crate::path(m, &[(0x2244, 0x2248), (0x2250, 0x225C), (0x2294, 0x22D4)]);
+                    queue(m)
+                })
+            }))
         }),
     }
 }
@@ -770,26 +738,18 @@ fn pump_work(m: &mut M, s: Sys, irq: bool, k: K) -> Flow<Psyq> {
     let o = qout(m, s);
     let e = s.que + o * ENTRY;
     let (func, p, arg) = (m.mem.r32(e), m.mem.r32(e + 4), m.mem.r32(e + 8));
-    work(
-        m,
-        s,
-        irq,
-        func,
-        p,
-        arg,
-        Box::new(move |m| {
-            crate::path(m, &[(0x2500, 0x2534)]);
-            m.mem.w32(s.data + data::QOUT, (o + 1) & (QUEUE_LEN - 1));
-            if queued(m, s) == 0 {
-                return pump_drained(m, s, k);
-            }
-            crate::path(m, &[(0x2538, 0x2554)]);
-            if busy(m) {
-                return pump_drained(m, s, k);
-            }
-            pump_next(m, s, irq, k)
-        }),
-    )
+    work(m, s, irq, func, p, arg, Box::new(move |m| {
+        crate::path(m, &[(0x2500, 0x2534)]);
+        m.mem.w32(s.data + data::QOUT, (o + 1) & (QUEUE_LEN - 1));
+        if queued(m, s) == 0 {
+            return pump_drained(m, s, k);
+        }
+        crate::path(m, &[(0x2538, 0x2554)]);
+        if busy(m) {
+            return pump_drained(m, s, k);
+        }
+        pump_next(m, s, irq, k)
+    }))
 }
 
 /// The pump past its loop (+2558h): I_MASK back, and the DrawSync
@@ -885,28 +845,16 @@ fn sync_queue_look(m: &mut M, s: Sys, k: K) -> Flow<Psyq> {
         return spin_checks(m, s, before, 2, Box::new(move |m, ok| if ok { sync_queue_look(m, s, k) } else { failed(m, k) }));
     }
     crate::take(m, lead);
-    pump(
-        m,
-        s,
-        false,
-        Box::new(move |m, _| {
-            crate::path(m, &[(0x276C, 0x2770)]);
-            iterate(
-                m,
-                s,
-                0,
-                0,
-                1,
-                Box::new(move |m, ok| {
-                    if !ok {
-                        return failed(m, k);
-                    }
-                    crate::path(m, &[(0x2774, 0x2778)]);
-                    sync_queue(m, s, k)
-                }),
-            )
-        }),
-    )
+    pump(m, s, false, Box::new(move |m, _| {
+        crate::path(m, &[(0x276C, 0x2770)]);
+        iterate(m, s, 0, 0, 1, Box::new(move |m, ok| {
+            if !ok {
+                return failed(m, k);
+            }
+            crate::path(m, &[(0x2774, 0x2778)]);
+            sync_queue(m, s, k)
+        }))
+    }))
 }
 
 /// `DrawSync(0)`'s second loop, at its header (+27B0h): until DMA2 is idle
@@ -924,19 +872,13 @@ fn sync_idle_look(m: &mut M, s: Sys, k: K) -> Flow<Psyq> {
         crate::path(m, &[(0x27B0, 0x27CC), (0x27D0, 0x27EC), (0x27F0, 0x27F4), (0x2870, 0x287C)]);
         return k(m, 0);
     };
-    spin_checks(
-        m,
-        s,
-        before,
-        2,
-        Box::new(move |m, ok| {
-            if ok {
-                return sync_idle_look(m, s, k);
-            }
-            crate::path(m, &[(0x27A8, 0x27AC), (0x2870, 0x287C)]);
-            k(m, u32::MAX)
-        }),
-    )
+    spin_checks(m, s, before, 2, Box::new(move |m, ok| {
+        if ok {
+            return sync_idle_look(m, s, k);
+        }
+        crate::path(m, &[(0x27A8, 0x27AC), (0x2870, 0x287C)]);
+        k(m, u32::MAX)
+    }))
 }
 
 // --- The work functions --------------------------------------------------
@@ -1074,7 +1016,9 @@ fn image_start(m: &mut M, s: Sys, r: u32, at: [(u32, u32); 9]) -> Option<(u32, u
 /// (+1CF0h), the blocks by DMA2.
 fn load_work(m: &mut M, s: Sys, irq: bool, r: u32, mut p: u32, k: Then) -> Flow<Psyq> {
     crate::path(m, &[(0x1B44, 0x1B6C)]);
-    let blocks = [(0x1B70, 0x1B7C), (0x1BA8, 0x1BA8), (0x1B80, 0x1B9C), (0x1BA0, 0x1BA4), (0x1BAC, 0x1BB8), (0x1BE4, 0x1BE8), (0x1BBC, 0x1BD8), (0x1BDC, 0x1BE0), (0x1BEC, 0x1C14)];
+    #[rustfmt::skip]
+    let blocks = [(0x1B70, 0x1B7C), (0x1BA8, 0x1BA8), (0x1B80, 0x1B9C), (0x1BA0, 0x1BA4), (0x1BAC, 0x1BB8),
+        (0x1BE4, 0x1BE8), (0x1BBC, 0x1BD8), (0x1BDC, 0x1BE0), (0x1BEC, 0x1C14)];
     let Some((words, blocks)) = image_start(m, s, r, blocks) else {
         crate::path(m, &[(0x1C18, 0x1C1C), (0x1D5C, 0x1D7C)]);
         return k(m);
@@ -1097,32 +1041,28 @@ fn load_work(m: &mut M, s: Sys, irq: bool, r: u32, mut p: u32, k: Then) -> Flow<
         crate::path(m, &[(0x1CEC, 0x1CEC)]);
     }
     let per = len(&[(0x1CF0, 0x1D08)]) as u32;
-    passes(
-        m,
-        irq,
-        per,
-        n,
-        Box::new(move |m| {
-            crate::path(m, &[(0x1D0C, 0x1D10)]);
-            if blocks != 0 {
-                crate::path(m, &[(0x1D14, 0x1D54)]);
-                gp1(m, 0x0400_0002);
-                let r = set_reg(m, MADR2, 4, p).and_then(|_| set_reg(m, BCR2, 4, blocks << 16 | 0x10)).and_then(|_| set_reg(m, CHCR2, 4, 0x0100_0201));
-                if let Err(e) = r {
-                    return fail(m, e);
-                }
+    passes(m, irq, per, n, Box::new(move |m| {
+        crate::path(m, &[(0x1D0C, 0x1D10)]);
+        if blocks != 0 {
+            crate::path(m, &[(0x1D14, 0x1D54)]);
+            gp1(m, 0x0400_0002);
+            let r = set_reg(m, MADR2, 4, p).and_then(|_| set_reg(m, BCR2, 4, blocks << 16 | 0x10)).and_then(|_| set_reg(m, CHCR2, 4, 0x0100_0201));
+            if let Err(e) = r {
+                return fail(m, e);
             }
-            crate::path(m, &[(0x1D58, 0x1D58), (0x1D5C, 0x1D7C)]);
-            k(m)
-        }),
-    )
+        }
+        crate::path(m, &[(0x1D58, 0x1D58), (0x1D5C, 0x1D7C)]);
+        k(m)
+    }))
 }
 
 /// StoreImage's work (`sys:0x1d80`): VRAM→CPU, the same way round (its
 /// loop +1F70h).
 fn store_work(m: &mut M, s: Sys, irq: bool, r: u32, mut p: u32, k: Then) -> Flow<Psyq> {
     crate::path(m, &[(0x1D80, 0x1DA4)]);
-    let blocks = [(0x1DA8, 0x1DB4), (0x1DDC, 0x1DDC), (0x1DB8, 0x1DD0), (0x1DD4, 0x1DD8), (0x1DE0, 0x1DEC), (0x1E18, 0x1E1C), (0x1DF0, 0x1E0C), (0x1E10, 0x1E14), (0x1E20, 0x1E48)];
+    #[rustfmt::skip]
+    let blocks = [(0x1DA8, 0x1DB4), (0x1DDC, 0x1DDC), (0x1DB8, 0x1DD0), (0x1DD4, 0x1DD8), (0x1DE0, 0x1DEC),
+        (0x1E18, 0x1E1C), (0x1DF0, 0x1E0C), (0x1E10, 0x1E14), (0x1E20, 0x1E48)];
     let Some((words, blocks)) = image_start(m, s, r, blocks) else {
         crate::path(m, &[(0x1E4C, 0x1E50), (0x1FE0, 0x1FFC)]);
         return k(m);
@@ -1143,25 +1083,19 @@ fn store_work(m: &mut M, s: Sys, irq: bool, r: u32, mut p: u32, k: Then) -> Flow
         p = p.wrapping_add(4);
     }
     let per = len(&[(0x1F70, 0x1F8C)]) as u32;
-    passes(
-        m,
-        irq,
-        per,
-        n,
-        Box::new(move |m| {
-            crate::path(m, &[(0x1F90, 0x1F94)]);
-            if blocks != 0 {
-                crate::path(m, &[(0x1F98, 0x1FD8)]);
-                gp1(m, 0x0400_0003);
-                let r = set_reg(m, MADR2, 4, p).and_then(|_| set_reg(m, BCR2, 4, blocks << 16 | 0x10)).and_then(|_| set_reg(m, CHCR2, 4, 0x0100_0200));
-                if let Err(e) = r {
-                    return fail(m, e);
-                }
+    passes(m, irq, per, n, Box::new(move |m| {
+        crate::path(m, &[(0x1F90, 0x1F94)]);
+        if blocks != 0 {
+            crate::path(m, &[(0x1F98, 0x1FD8)]);
+            gp1(m, 0x0400_0003);
+            let r = set_reg(m, MADR2, 4, p).and_then(|_| set_reg(m, BCR2, 4, blocks << 16 | 0x10)).and_then(|_| set_reg(m, CHCR2, 4, 0x0100_0200));
+            if let Err(e) = r {
+                return fail(m, e);
             }
-            crate::path(m, &[(0x1FDC, 0x1FDC), (0x1FE0, 0x1FFC)]);
-            k(m)
-        }),
-    )
+        }
+        crate::path(m, &[(0x1FDC, 0x1FDC), (0x1FE0, 0x1FFC)]);
+        k(m)
+    }))
 }
 
 /// `sys:0x2608`: the queue emptied and, by `mode`, the GPU reset (0, 5:
@@ -1213,16 +1147,10 @@ fn reset(m: &mut M, s: Sys, mode: u32, k: K) -> Flow<Psyq> {
         0 | 5 => {
             crate::path(m, &[(0x2678, 0x26B8)]);
             gp1(m, 0);
-            memset(
-                m,
-                s.que,
-                0,
-                QUEUE_LEN * ENTRY,
-                Box::new(move |m| {
-                    crate::path(m, &[(0x26BC, 0x26C0)]);
-                    rest(m)
-                }),
-            )
+            memset(m, s.que, 0, QUEUE_LEN * ENTRY, Box::new(move |m| {
+                crate::path(m, &[(0x26BC, 0x26C0)]);
+                rest(m)
+            }))
         }
         1 | 3 => {
             crate::path(m, &[(0x26C4, 0x270C)]);
@@ -1410,15 +1338,10 @@ fn reset_graph(m: &mut M, a: [u32; 4]) -> Result {
     if !full {
         // The table's reset, mode 1 (+34h or +44h, the same length).
         crate::path(m, &[(0x34, 0x38), (0x110, 0x124), (0x144, 0x15C)]);
-        return Ok(reset(
-            m,
-            s,
-            1,
-            Box::new(|m, v| {
-                crate::path(m, &[(0x160, 0x170)]);
-                Flow::ret(v)
-            }),
-        ));
+        return Ok(reset(m, s, 1, Box::new(|m, v| {
+            crate::path(m, &[(0x160, 0x170)]);
+            Flow::ret(v)
+        })));
     }
     let rest = move |m: &mut M| {
         crate::path(m, &[(0x68, 0x7C)]);
@@ -1448,40 +1371,23 @@ fn reset_graph_rest(m: &mut M, s: Sys, mode: u32) -> Flow<Psyq> {
                 return fail(m, e);
             }
             crate::path(m, &[(0xA0, 0xA4)]);
-            reset(
-                m,
-                s,
-                mode,
-                Box::new(move |m, t| {
-                    crate::path(m, &[(0xA8, 0xF0)]);
-                    let t = t & 0xFF;
-                    m.mem.w8(g + genv::TYPE, t as u8);
-                    m.mem.w8(g + genv::QUEUE, 1);
-                    let w = m.mem.r16(s.data + data::WIDTHS + 4 * t);
-                    m.mem.w16(g + genv::WIDTH, w);
-                    let h = m.mem.r16(s.data + data::HEIGHTS + 4 * t);
-                    m.mem.w16(g + genv::HEIGHT, h);
-                    memset(
-                        m,
-                        g + genv::DRAW,
-                        0xFF,
-                        drawenv::SIZEOF,
-                        Box::new(move |m| {
-                            crate::path(m, &[(0xF4, 0x100)]);
-                            memset(
-                                m,
-                                g + genv::DISP,
-                                0xFF,
-                                dispenv::SIZEOF,
-                                Box::new(move |m| {
-                                    crate::path(m, &[(0x104, 0x10C), (0x160, 0x170)]);
-                                    Flow::ret(t)
-                                }),
-                            )
-                        }),
-                    )
-                }),
-            )
+            reset(m, s, mode, Box::new(move |m, t| {
+                crate::path(m, &[(0xA8, 0xF0)]);
+                let t = t & 0xFF;
+                m.mem.w8(g + genv::TYPE, t as u8);
+                m.mem.w8(g + genv::QUEUE, 1);
+                let w = m.mem.r16(s.data + data::WIDTHS + 4 * t);
+                m.mem.w16(g + genv::WIDTH, w);
+                let h = m.mem.r16(s.data + data::HEIGHTS + 4 * t);
+                m.mem.w16(g + genv::HEIGHT, h);
+                memset(m, g + genv::DRAW, 0xFF, drawenv::SIZEOF, Box::new(move |m| {
+                    crate::path(m, &[(0xF4, 0x100)]);
+                    memset(m, g + genv::DISP, 0xFF, dispenv::SIZEOF, Box::new(move |m| {
+                        crate::path(m, &[(0x104, 0x10C), (0x160, 0x170)]);
+                        Flow::ret(t)
+                    }))
+                }))
+            }))
         }),
     }
 }
@@ -1515,29 +1421,19 @@ fn set_disp_mask(m: &mut M, a: [u32; 4]) -> Result {
 fn draw_sync(m: &mut M, a: [u32; 4]) -> Result {
     let s = sys(m, at::DRAW_SYNC)?;
     crate::path(m, &[(0x37C, 0x398), (0x3B8, 0x3D0)]);
-    Ok(sync(
-        m,
-        s,
-        a[0],
-        Box::new(|m, v| {
-            crate::path(m, &[(0x3D4, 0x3E0)]);
-            Flow::ret(v)
-        }),
-    ))
+    Ok(sync(m, s, a[0], Box::new(|m, v| {
+        crate::path(m, &[(0x3D4, 0x3E0)]);
+        Flow::ret(v)
+    })))
 }
 
 /// The image functions' tail: queue `job` and return what `enqueue` does,
 /// through their last block, `last`.
 fn image(m: &mut M, s: Sys, job: Job, last: (u32, u32)) -> Result {
-    Ok(enqueue(
-        m,
-        s,
-        job,
-        Box::new(move |m, v| {
-            crate::path(m, &[last]);
-            Flow::ret(v)
-        }),
-    ))
+    Ok(enqueue(m, s, job, Box::new(move |m, v| {
+        crate::path(m, &[last]);
+        Flow::ret(v)
+    })))
 }
 
 /// `ClearImage(rect, r, g, b)`.
@@ -1649,19 +1545,13 @@ fn move_image2_look(m: &mut M, s: Sys, go: Then) -> Flow<Psyq> {
         crate::path(m, &[busy_test, (0x2D00, 0x2D1C)]);
         return go(m);
     };
-    spin_checks(
-        m,
-        s,
-        before,
-        round,
-        Box::new(move |m, ok| {
-            if ok {
-                return move_image2_look(m, s, go);
-            }
-            crate::path(m, &[(0x2CD8, 0x2CDC), (0x2D9C, 0x2DB0)]);
-            Flow::ret(u32::MAX)
-        }),
-    )
+    spin_checks(m, s, before, round, Box::new(move |m, ok| {
+        if ok {
+            return move_image2_look(m, s, go);
+        }
+        crate::path(m, &[(0x2CD8, 0x2CDC), (0x2D9C, 0x2DB0)]);
+        Flow::ret(u32::MAX)
+    }))
 }
 
 /// `_GPU_ResetCallback()`: the pump DMA2's callback again.
@@ -1716,18 +1606,13 @@ fn put_draw_env(m: &mut M, a: [u32; 4]) -> Result {
     crate::path(m, &[(0xA3C, 0xA70)]);
     let tag = m.mem.r32(p) | 0xFF_FFFF;
     m.mem.w32(p, tag);
-    Ok(enqueue(
-        m,
-        s,
-        Job { func: at::EXEC, p, len: 0x40, arg: 0 },
-        Box::new(move |m, _| {
-            crate::path(m, &[(0xA74, 0xA80)]);
-            memcpy(m, s.text + 0xA7C, (s.genv() + genv::DRAW, env, drawenv::SIZEOF), move |m, _| {
-                crate::path(m, &[(0xA84, 0xA9C)]);
-                Flow::ret(env)
-            })
-        }),
-    ))
+    Ok(enqueue(m, s, Job { func: at::EXEC, p, len: 0x40, arg: 0 }, Box::new(move |m, _| {
+        crate::path(m, &[(0xA74, 0xA80)]);
+        memcpy(m, s.text + 0xA7C, (s.genv() + genv::DRAW, env, drawenv::SIZEOF), move |m, _| {
+            crate::path(m, &[(0xA84, 0xA9C)]);
+            Flow::ret(env)
+        })
+    })))
 }
 
 /// `DrawOTagEnv(p, env)`: `env`'s packet, linked to the table at `p`,
@@ -1741,18 +1626,13 @@ fn draw_otag_env(m: &mut M, a: [u32; 4]) -> Result {
     crate::path(m, &[(0xB08, 0xB48)]);
     let tag = (m.mem.r32(p) & 0xFF00_0000) | (ot & 0xFF_FFFF);
     m.mem.w32(p, tag);
-    Ok(enqueue(
-        m,
-        s,
-        Job { func: at::EXEC, p, len: 0x40, arg: 0 },
-        Box::new(move |m, _| {
-            crate::path(m, &[(0xB4C, 0xB58)]);
-            memcpy(m, s.text + 0xB54, (s.genv() + genv::DRAW, env, drawenv::SIZEOF), move |m, v| {
-                crate::path(m, &[(0xB5C, 0xB74)]);
-                Flow::ret(v)
-            })
-        }),
-    ))
+    Ok(enqueue(m, s, Job { func: at::EXEC, p, len: 0x40, arg: 0 }, Box::new(move |m, _| {
+        crate::path(m, &[(0xB4C, 0xB58)]);
+        memcpy(m, s.text + 0xB54, (s.genv() + genv::DRAW, env, drawenv::SIZEOF), move |m, v| {
+            crate::path(m, &[(0xB5C, 0xB74)]);
+            Flow::ret(v)
+        })
+    })))
 }
 
 /// `PutDispEnv(env)`: the display area's start (GP1(05h)); when the
@@ -1935,9 +1815,13 @@ fn disp_screen(m: &mut M, s: Sys, env: u32) -> Flow<Psyq> {
             // after; y1 at least two lines, above, within.
             #[rustfmt::skip]
             let (x_lo, x_hi, x_end, y_lo, y_hi, y_end, b) = if pal {
-                (540, 3220, 3260, 19, 303, 305, [(0xEF4, 0xEF8), (0xEFC, 0xF04), (0xF08, 0xF08), (0xF0C, 0xF2C), (0xF30, 0xF38), (0xF3C, 0xF3C), (0xF40, 0xF40), (0xF44, 0xF48), (0xF60, 0xF60), (0xF4C, 0xF54), (0xF58, 0xF5C), (0xF64, 0xF74), (0xF78, 0xF7C), (0x1014, 0x1014)])
+                (540, 3220, 3260, 19, 303, 305, [(0xEF4, 0xEF8), (0xEFC, 0xF04), (0xF08, 0xF08), (0xF0C, 0xF2C), (0xF30, 0xF38),
+                    (0xF3C, 0xF3C), (0xF40, 0xF40), (0xF44, 0xF48), (0xF60, 0xF60), (0xF4C, 0xF54), (0xF58, 0xF5C), (0xF64, 0xF74),
+                    (0xF78, 0xF7C), (0x1014, 0x1014)])
             } else {
-                (500, 3250, 3290, 16, 257, 258, [(0xF80, 0xF88), (0xF8C, 0xF94), (0xF98, 0xF98), (0xF9C, 0xFBC), (0xFC0, 0xFC8), (0xFCC, 0xFCC), (0xFD0, 0xFD0), (0xFD4, 0xFD8), (0xFF0, 0xFF0), (0xFDC, 0xFE4), (0xFE8, 0xFEC), (0xFF4, 0x1004), (0x1008, 0x1010), (0x1014, 0x1014)])
+                (500, 3250, 3290, 16, 257, 258, [(0xF80, 0xF88), (0xF8C, 0xF94), (0xF98, 0xF98), (0xF9C, 0xFBC), (0xFC0, 0xFC8),
+                    (0xFCC, 0xFCC), (0xFD0, 0xFD0), (0xFD4, 0xFD8), (0xFF0, 0xFF0), (0xFDC, 0xFE4), (0xFE8, 0xFEC), (0xFF4, 0x1004),
+                    (0x1008, 0x1010), (0x1014, 0x1014)])
             };
             crate::path(m, &[b[0]]);
             if x0 >= x_lo {
