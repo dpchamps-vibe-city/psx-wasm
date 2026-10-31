@@ -89,7 +89,39 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Code outside the function's own extent (an inlined callee's, or a
+    /// block entered at computed offsets), by the instruction or branch at
+    /// `at`. Its `jr ra` returns to the inlined calls' return sites.
+    pub fn inlined(&self, at: u32) -> bool {
+        self.regions.first().is_some_and(|(s, e, _)| !(*s..*e).contains(&at))
+    }
+
+    /// A tail transfer out of inlined code: the callee returns through ra,
+    /// to an inlined call's return site, not from this function.
+    pub fn tail_returns(&self, n: Node) -> bool {
+        let tail = |d: &Dest| matches!(d, Dest::Tail(_));
+        let tails = match &self.nodes[&n].transfer {
+            Transfer::FallOff(_) => true,
+            Transfer::Jump(d) | Transfer::Call { next: d, .. } | Transfer::CondCall { next: d, .. } => tail(d),
+            Transfer::Cond { taken, fall } => tail(taken) || tail(fall),
+            _ => false,
+        };
+        let (Node::Normal(at) | Node::Slot(at)) = n;
+        tails && self.inlined(at)
+    }
+
+    /// What runs after `n` (dataflow): [`Graph::next`], and where a tail
+    /// transfer out of inlined code comes back.
     pub fn succs(&self, n: Node) -> Vec<Node> {
+        let mut out = self.next(n);
+        if self.tail_returns(n) {
+            out.extend(self.inline_returns.iter().map(|&a| Node::Normal(a)));
+        }
+        out
+    }
+
+    /// The nodes of this function that can run right after `n`.
+    pub fn next(&self, n: Node) -> Vec<Node> {
         let local = |d: &Dest| match d {
             Dest::Local(a) => Some(Node::Normal(*a)),
             Dest::Tail(_) => None,

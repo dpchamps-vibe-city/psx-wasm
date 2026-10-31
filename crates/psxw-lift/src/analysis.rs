@@ -190,7 +190,8 @@ fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, f: &mut Facts) {
         let mut st = f.consts[&n];
         let d = &g.nodes[&n];
         step(&d.insn, n.pc(), &mut st);
-        if is_call(&d.transfer) {
+        // A tail transfer out of inlined code comes back as a call does.
+        if is_call(&d.transfer) || g.tail_returns(n) {
             clobber_call(&mut st);
         }
         for s in g.succs(n) {
@@ -279,11 +280,12 @@ fn use_def(g: &Graph, n: Node, args: bool) -> (u64, u64, u64) {
     }
     // The transfer happens after the slot instruction.
     let uses_of = |c: &Callee| if args { call_uses(c) } else { 0 };
+    let call_defs = (1 << 2) | (1 << 3) | (CALLER_SAVED & !(1 << 31));
     let (tu, td) = match &d.transfer {
-        Transfer::Call { callee, .. } | Transfer::CondCall { callee, .. } => {
-            (uses_of(callee), (1 << 2) | (1 << 3) | (CALLER_SAVED & !(1 << 31)))
+        Transfer::Call { callee, .. } | Transfer::CondCall { callee, .. } => (uses_of(callee), call_defs),
+        Transfer::Jump(crate::graph::Dest::Tail(c)) | Transfer::FallOff(c) => {
+            (uses_of(c), if g.tail_returns(n) { call_defs } else { 0 })
         }
-        Transfer::Jump(crate::graph::Dest::Tail(c)) | Transfer::FallOff(c) => (uses_of(c), 0),
         _ => (0, 0),
     };
     // Order: slot uses, slot defs, then the call's uses and defs.
@@ -361,7 +363,7 @@ fn hazards(g: &Graph, f: &mut Facts) {
             continue;
         }
         let Some(r) = d.insn.writes() else { continue };
-        for s in g.succs(n) {
+        for s in g.next(n) {
             let si = &g.nodes[&s].insn;
             let merges = matches!(d.insn.op, Op::Lwl | Op::Lwr)
                 && matches!(si.op, Op::Lwl | Op::Lwr)

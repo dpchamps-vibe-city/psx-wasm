@@ -63,7 +63,7 @@ impl<'a> Emitter<'a> {
     pub fn new(g: &'a Graph, facts: &'a Facts) -> Result<Self, LiftError> {
         let preds = g.preds();
         for (&n, _) in &facts.hazards {
-            let succs = g.succs(n);
+            let succs = g.next(n);
             let ok = matches!(n, Node::Normal(_)) && succs.len() == 1 && matches!(succs[0], Node::Normal(_));
             if !ok {
                 return Err(LiftError {
@@ -196,8 +196,8 @@ impl<'a> Emitter<'a> {
                 Some(next)
             }
             Transfer::FallOff(c) => {
-                let call = self.call(&c);
-                self.line(&format!("return {call}; /* falls into the next function */"));
+                let s = self.tail(pc, &c);
+                self.line(&format!("{s} /* falls into the next function */"));
                 None
             }
             other => unreachable!("non-branch with transfer {other:?}"),
@@ -248,86 +248,107 @@ impl<'a> Emitter<'a> {
             }
             Transfer::Call { next, .. } if self.x.rfe.contains(&b) => {
                 self.line(&format!("psxw_return_from_exception(); /* {b:08X}: {dis} */"));
-                self.fall(&next)
+                self.fall(b, &next)
             }
             Transfer::Call { next, .. } if self.x.setjmp.contains(&b) => {
                 let saves: Vec<String> = JMP_BUF.iter().map(|(r, o)| format!("PSXW_SW(r4 + {o}u, r{r});")).collect();
                 self.line(&format!("{} r2 = 0; r3 = 0; /* {b:08X}: {dis} (setjmp) */", saves.join(" ")));
-                self.fall(&next)
+                self.fall(b, &next)
             }
             Transfer::Jump(d) => {
-                let d = self.dest(&d);
+                let d = self.dest(b, &d);
                 self.line(&format!("{d} /* {b:08X}: {dis} */"));
                 None
             }
             Transfer::Cond { taken, fall } => {
-                let t = self.dest(&taken);
+                let t = self.dest(b, &taken);
                 self.line(&format!("if ({c}) {t} /* {b:08X}: {dis} */"));
-                self.fall(&fall)
+                self.fall(b, &fall)
             }
             Transfer::Call { callee, next } => {
                 let call = self.call(&callee);
                 self.line(&format!(
                     "{{ uint64_t v_ = {call}; r2 = (uint32_t)v_; r3 = (uint32_t)(v_ >> 32); }} /* {b:08X}: {dis} */"
                 ));
-                self.fall(&next)
+                self.fall(b, &next)
             }
             Transfer::CondCall { callee, next } => {
                 let call = self.call(&callee);
                 self.line(&format!(
                     "if ({c}) {{ uint64_t v_ = {call}; r2 = (uint32_t)v_; r3 = (uint32_t)(v_ >> 32); }} /* {b:08X}: {dis} */"
                 ));
-                self.fall(&next)
+                self.fall(b, &next)
             }
             Transfer::Return => {
                 self.line("return ((uint64_t)r3 << 32) | r2;");
                 None
             }
-            Transfer::Table { base: _, ref targets, .. } | Transfer::InlineReturn { ref targets } => {
-                let inline = matches!(slot.transfer, Transfer::InlineReturn { .. });
+            Transfer::Table { base: _, ref targets, .. } => {
                 let targets = targets.clone();
                 self.line("switch (t_) {");
                 let set: BTreeSet<u32> = targets.into_iter().collect();
                 for t in set {
                     self.line(&format!("case 0x{t:08X}u: goto L_{t:08X};"));
                 }
-                // r31 starts at 0, standing for the caller's return
-                // address: a `jr ra` in code reached by a branch (a tail
-                // shared with another function) after `ra` was restored
-                // returns to the caller.
-                if inline {
-                    self.line("case 0x00000000u: return ((uint64_t)r3 << 32) | r2;");
-                }
                 self.line(&format!("default: psxw_bad_jump(0x{b:08X}u, t_);"));
                 self.line("}");
+                None
+            }
+            Transfer::InlineReturn { .. } => {
+                let back = self.back(b);
+                self.line(&back);
                 None
             }
             Transfer::Seq(_) | Transfer::FallOff(_) => unreachable!("branch without a transfer"),
         }
     }
 
-    fn fall(&mut self, d: &Dest) -> Option<Node> {
+    fn fall(&mut self, b: u32, d: &Dest) -> Option<Node> {
         match d {
             Dest::Local(a) => Some(Node::Normal(*a)),
             Dest::Tail(c) => {
-                let call = self.call(c);
-                self.line(&format!("return {call};"));
+                let s = self.tail(b, c);
+                self.line(&s);
                 None
             }
         }
     }
 
-    fn dest(&mut self, d: &Dest) -> String {
+    fn dest(&mut self, b: u32, d: &Dest) -> String {
         match d {
             Dest::Local(a) => format!("goto L_{a:08X};"),
-            // r31 starts at 0, standing for the caller's return address, so
-            // a jump to 0 through another register (hand-written code that
-            // kept `ra` elsewhere) returns.
-            Dest::Tail(c @ Callee::Indirect { .. }) => {
-                format!("if (t_ == 0u) return ((uint64_t)r3 << 32) | r2; return {};", self.call(c))
-            }
-            Dest::Tail(c) => format!("return {};", self.call(c)),
+            Dest::Tail(c) => self.tail(b, c),
         }
+    }
+
+    /// A tail transfer at `at` (the branch, or the last instruction).
+    fn tail(&mut self, at: u32, c: &Callee) -> String {
+        let call = self.call(c);
+        // r31 starts at 0, standing for the caller's return address, so a
+        // jump to 0 through another register (hand-written code that kept
+        // `ra` elsewhere) returns.
+        let zero = match c {
+            Callee::Indirect { .. } => "if (t_ == 0u) return ((uint64_t)r3 << 32) | r2; ",
+            _ => "",
+        };
+        if !self.g.inlined(at) {
+            return format!("{zero}return {call};");
+        }
+        // Out of an inlined callee: the callee returns through ra, to the
+        // inlined call's return site.
+        let back = self.back(at);
+        format!("{{ {zero}{{ uint64_t v_ = {call}; r2 = (uint32_t)v_; r3 = (uint32_t)(v_ >> 32); }} t_ = r31; {back} }}")
+    }
+
+    /// `jr ra` in inlined code (`t_` holds ra): to an inlined call's return
+    /// site. r31 starts at 0, standing for the caller's return address: a
+    /// `jr ra` in code reached by a branch (a tail shared with another
+    /// function) after `ra` was restored returns to the caller.
+    fn back(&self, at: u32) -> String {
+        let cases: String = self.g.inline_returns.iter().map(|t| format!("case 0x{t:08X}u: goto L_{t:08X}; ")).collect();
+        format!(
+            "switch (t_) {{ {cases}case 0x00000000u: return ((uint64_t)r3 << 32) | r2; default: psxw_bad_jump(0x{at:08X}u, t_); }}"
+        )
     }
 
     fn call(&mut self, c: &Callee) -> String {
