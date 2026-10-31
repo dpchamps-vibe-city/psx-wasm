@@ -90,6 +90,9 @@ pub struct Cdc {
     vol: [u8; 4],
     /// The last data sector's header and subheader (GetlocL).
     loc: [u8; 8],
+    /// The sector whose subchannel Q the drive last read (GetlocP): a
+    /// seek's target as the seek starts (Beetle), then each sector read.
+    subq: u32,
     /// Track start LBAs, and the disc's end.
     pub tracks: Vec<u32>,
     pub end: u32,
@@ -131,6 +134,7 @@ impl Default for Cdc {
             vol_next: [0x80, 0, 0x80, 0],
             vol: [0x80, 0, 0x80, 0],
             loc: [0; 8],
+            subq: 0,
             tracks: vec![0],
             end: 0,
             region: *b"SCEI",
@@ -321,14 +325,15 @@ impl Cdc {
     }
 
     /// Move the head to the Setloc target, if one is pending: the seek's
-    /// duration.
+    /// duration. The subchannel Q is the target's from here.
     fn seek(&mut self) -> u64 {
-        if !self.setloc_pending {
-            return 0;
+        let mut t = 0;
+        if self.setloc_pending {
+            self.setloc_pending = false;
+            t = self.drive.seek_cycles(self.drive.head, self.drive.setloc);
+            self.drive.head = self.drive.setloc;
         }
-        self.setloc_pending = false;
-        let t = self.drive.seek_cycles(self.drive.head, self.drive.setloc);
-        self.drive.head = self.drive.setloc;
+        self.subq = self.drive.head;
         t
     }
 
@@ -387,13 +392,13 @@ impl Cdc {
             0x0F => res.extend([self.drive.mode, 0, self.filter.0, self.filter.1]),
             0x10 => res = self.loc.to_vec(),
             0x11 => {
-                let lba = self.drive.head;
+                let lba = self.subq;
                 let track = self.tracks.iter().rposition(|&t| t <= lba).unwrap_or(0);
-                let rel = cd::lba_to_msf(lba - self.tracks[track]);
-                // Relative to the track start: lba_to_msf adds the pregap.
-                let rel = [rel[0], bcd(from_bcd(rel[1]).saturating_sub(2)), rel[2]];
+                let rel = lba.saturating_sub(self.tracks[track]);
                 let abs = cd::lba_to_msf(lba);
-                res = vec![bcd(track as u32 + 1), 1, rel[0], rel[1], rel[2], abs[0], abs[1], abs[2]];
+                // Index 1: only each track's index 1 start is known here,
+                // not its pregap (index 0).
+                res = vec![bcd(track as u32 + 1), 1, bcd(rel / 75 / 60), bcd(rel / 75 % 60), bcd(rel % 75), abs[0], abs[1], abs[2]];
             }
             0x12 => self.schedule(now + self.drive.ack_cycles() * 4, Job::Done(c)),
             0x13 => res.extend([1, bcd(self.tracks.len() as u32)]),
@@ -466,6 +471,7 @@ impl Cdc {
             self.edc_errors.push(e);
         }
         self.sectors += 1;
+        self.subq = lba;
         self.loc.copy_from_slice(&raw[12..20]);
         if self.xa_sector(&raw) {
             return;
@@ -701,6 +707,39 @@ mod tests {
         assert_eq!(ack(&mut c), [stat::MOTOR]);
         assert_eq!(c.next_due(), None);
         assert!(c.edc_errors.is_empty());
+    }
+
+    /// GetlocP: track 2, 00:58:10 into it (where seconds minus the 2 s
+    /// pregap needs a borrow), at the seek's target and then at the sector
+    /// read, not the next one under the head.
+    #[test]
+    fn getlocp_reports_the_sector_read() {
+        let mut c = Cdc { tracks: vec![0, 300_000], end: 320_000, ..Default::default() };
+        let mut now = 0;
+        c.write(BASE, 1, 0);
+        c.write(BASE + 2, 0x1F, 0);
+        let lba = 300_000 + 58 * 75 + 10;
+        let abs = cd::lba_to_msf(lba);
+        let want = [2, 1, 0x00, 0x58, 0x10, abs[0], abs[1], abs[2]];
+        cmd(&mut c, &mut now, 0x02, &abs);
+        until_int(&mut c, &mut now);
+        ack(&mut c);
+        cmd(&mut c, &mut now, 0x15, &[]);
+        assert_eq!(until_int(&mut c, &mut now), INT3);
+        ack(&mut c);
+        assert_eq!(until_int(&mut c, &mut now), INT2);
+        ack(&mut c);
+        cmd(&mut c, &mut now, 0x11, &[]);
+        until_int(&mut c, &mut now);
+        assert_eq!(ack(&mut c), want);
+        cmd(&mut c, &mut now, 0x06, &[]);
+        until_int(&mut c, &mut now);
+        ack(&mut c);
+        assert_eq!(until_int(&mut c, &mut now), INT1);
+        ack(&mut c);
+        cmd(&mut c, &mut now, 0x11, &[]);
+        assert_eq!(until_int(&mut c, &mut now), INT3);
+        assert_eq!(ack(&mut c), want);
     }
 
     #[test]
