@@ -159,10 +159,14 @@ impl<S: Sdk> Machine<S> {
         true
     }
 
-    /// Queue a low-level operation; false when the slot has no card
-    /// (the failure is delivered at once).
+    /// Queue a low-level operation; false while the slot's last one is
+    /// still running (OpenBIOS: flags bit 0 clear). A missing card fails
+    /// later, with its event.
     fn card_queue(&mut self, slot: usize, op: Op) -> bool {
         self.cards_ready();
+        if self.kernel.cards.status[slot] & READY == 0 {
+            return false;
+        }
         let busy = match op {
             Op::Read { .. } => BUSY_READ,
             Op::Write { .. } => BUSY_WRITE,
@@ -206,8 +210,9 @@ impl<S: Sdk> Machine<S> {
         let slot = slot_of(port);
         self.cards_ready();
         let data = self.kernel.cards.slots[slot].as_ref().map(|c| c.frame(0x3F).to_vec()).unwrap_or_else(|| vec![0; memcard::FRAME]);
-        self.kernel.cards.ignore_new[slot] = true;
-        self.card_queue(slot, Op::Write { frame: 0x3F, data, high: true }) as u32
+        let queued = self.card_queue(slot, Op::Write { frame: 0x3F, data, high: true });
+        self.kernel.cards.ignore_new[slot] |= queued;
+        queued as u32
     }
 
     pub fn card_new(&mut self, port: u32) {
@@ -447,6 +452,7 @@ mod tests {
         m.mem.write(buf, &[0x5A; 128]);
         assert_eq!(m.card_write(0x00, 0x40, buf), 1);
         assert_eq!(m.kernel.cards.status[0], super::BUSY_WRITE);
+        assert_eq!(m.card_read(0x00, 0x40, out), 0, "busy");
         m.card_vblank();
         assert_eq!(m.kernel.cards.status[0], super::FAIL_GENERAL, "new card refuses I/O");
         m.card_new(0x00);
