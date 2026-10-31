@@ -7,18 +7,18 @@
 //!   sides (D67). Cases leave lines 0 and 3 (libetc's own vblank and DMA
 //!   handlers) to libetc.
 //! - **Hblanks are time.** `VSync(n >= 0)` returns the hblanks since the
-//!   last waiting call. The original over the devices spends virtual time
-//!   in its loops (a safepoint quantum per thousand iterations), the
-//!   adapters don't, so the count is observed in frames, rounded, as
-//!   conformance compares timing at sync points. Vcount (`VSync(-1)`) is
-//!   exact.
+//!   last waiting call, exactly: both sides spend the original's
+//!   instructions (D71), so their safepoints fall alike.
 //! - **Sync before timing.** A case that reads a root counter or counts
 //!   timer interrupts lets a vblank pass first, so both sides start from
-//!   the same cycle; straight-line SDK code moves no time.
+//!   the same cycle.
+//! - **The budget.** After every call and every wait for vblanks, the
+//!   guest's budget left: the original's instructions so far, libetc's
+//!   dispatcher and handlers among them (D71).
 //! - Fake function pointers go only where nothing calls them: lines and
 //!   channels that raise nothing in the case.
 
-use super::{Case, Harness, Rng, call};
+use super::{Case, Harness, Rng};
 
 const RCNT: u32 = 0xF200_0000;
 /// SetRCnt modes: interrupt at target, system clock (counter 2: not /8).
@@ -26,8 +26,6 @@ const RCNT_MD_INTR: u32 = 0x1000;
 const RCNT_MD_SC: u32 = 0x0001;
 /// Lines no case raises (not vblank or DMA, which are libetc's own).
 const QUIET_LINES: [u32; 9] = [1, 2, 4, 5, 6, 7, 8, 9, 10];
-/// NTSC hblanks per frame.
-const LINES_PER_FRAME: u32 = 263;
 
 pub fn cases() -> Vec<Case> {
     vec![
@@ -106,18 +104,40 @@ pub fn cases() -> Vec<Case> {
     ]
 }
 
+/// The guest's budget left: the original's instructions so far (D71).
+fn budget(h: &mut dyn Harness, what: &str) {
+    let b = h.budget();
+    h.observe(&format!("{what}: budget"), b.to_string());
+}
+
+/// Call `name`, and record its result and the budget.
+fn call(h: &mut dyn Harness, name: &str, args: &[u32]) -> Result<u32, String> {
+    let v = super::call(h, name, args)?;
+    budget(h, name);
+    Ok(v)
+}
+
+/// Let `n` vblanks pass, and record the budget.
+fn vblanks(h: &mut dyn Harness, n: u32) -> Result<(), String> {
+    h.vblanks(n)?;
+    budget(h, &format!("{n} vblanks"));
+    Ok(())
+}
+
 /// A call whose result is libetc's context pointer (or 0).
 fn call_context(h: &mut dyn Harness, name: &str) -> Result<u32, String> {
     let v = h.call(name, &[])?;
     h.observe(&format!("{name}()"), format!("{v:#010x}"));
+    budget(h, name);
     Ok(v)
 }
 
-/// `VSync(mode)`: Vcount exactly, hblanks in frames (rounded).
+/// `VSync(mode)`: Vcount, or the hblanks.
 fn vsync_call(h: &mut dyn Harness, mode: i32) -> Result<u32, String> {
     let v = h.call("VSync", &[mode as u32])?;
-    let shown = if mode < 0 { format!("Vcount {v}") } else { format!("{} frames", (v + LINES_PER_FRAME / 2) / LINES_PER_FRAME) };
+    let shown = if mode < 0 { format!("Vcount {v}") } else { format!("{v} hblanks") };
     h.observe(&format!("VSync({mode})"), shown);
+    budget(h, "VSync");
     Ok(v)
 }
 
@@ -149,7 +169,7 @@ fn reset(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     // Once: a second call changes nothing.
     call_context(h, "ResetCallback")?;
     vsync_call(h, -1)?;
-    h.vblanks(2)?;
+    vblanks(h, 2)?;
     vsync_call(h, -1)?;
     call(h, "GetIntrMask", &[])?;
     Ok(())
@@ -167,7 +187,7 @@ fn stop_restart(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     call(h, "GetIntrMask", &[])?;
     call_context(h, "RestartCallback")?;
     call(h, "InterruptCallback", &[line, 0])?;
-    h.vblanks(1)?;
+    vblanks(h, 1)?;
     call(h, "GetIntrMask", &[])?;
     Ok(())
 }
@@ -235,13 +255,13 @@ fn vsync(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     call_context(h, "ResetCallback")?;
     // VSync(1) from the start: hblanks since root counter 1 began.
     vsync_call(h, 1)?;
-    h.vblanks(rng.range(0, 3))?;
+    vblanks(h, rng.range(0, 3))?;
     vsync_call(h, -1)?;
     for _ in 0..4 {
         let mode = [-1, 0, 1, 2, 3, 4][rng.range(0, 6) as usize];
         vsync_call(h, mode)?;
         vsync_call(h, -1)?;
-        h.vblanks(rng.range(0, 2))?;
+        vblanks(h, rng.range(0, 2))?;
     }
     vsync_call(h, 1)?;
     Ok(())
@@ -254,11 +274,11 @@ fn counters(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     let mode = [0, RCNT_MD_SC, RCNT_MD_INTR, RCNT_MD_INTR | RCNT_MD_SC, 0x10, 0x10 | RCNT_MD_SC][rng.range(0, 6) as usize];
     call(h, "SetRCnt", &[RCNT | n, target, mode])?;
     call(h, "GetRCnt", &[RCNT | n])?;
-    h.vblanks(1)?;
+    vblanks(h, 1)?;
     call(h, "GetRCnt", &[RCNT | n])?;
     call(h, "ResetRCnt", &[RCNT | n])?;
     call(h, "GetRCnt", &[RCNT | n])?;
-    h.vblanks(1)?;
+    vblanks(h, 1)?;
     call(h, "GetRCnt", &[RCNT | n])?;
     let s = rng.range(0, 7);
     call(h, "StartRCnt", &[RCNT | s])?;
@@ -279,7 +299,7 @@ fn sequence(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     call(h, "VSyncCallback", &[cb])?;
     observe_word(h, "callback word", state);
     for f in 0..4 {
-        h.vblanks(1)?;
+        vblanks(h, 1)?;
         vsync_call(h, -1)?;
         observe_word(h, &format!("frame {f}"), state);
     }
@@ -289,17 +309,17 @@ fn sequence(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
         observe_word(h, &format!("after VSync({mode})"), state);
     }
     call(h, "VSyncCallback", &[0])?;
-    h.vblanks(2)?;
+    vblanks(h, 2)?;
     observe_word(h, "callback removed", state);
     // Vblank masked: libetc counts nothing; unmasked, the pending one.
     call(h, "VSyncCallbacks", &[0, cb])?;
     let mask = call(h, "GetIntrMask", &[])?;
     call(h, "SetIntrMask", &[mask & !1])?;
-    h.vblanks(3)?;
+    vblanks(h, 3)?;
     vsync_call(h, -1)?;
     observe_word(h, "vblank masked", state);
     call(h, "SetIntrMask", &[mask])?;
-    h.vblanks(2)?;
+    vblanks(h, 2)?;
     vsync_call(h, -1)?;
     observe_word(h, "vblank unmasked", state);
     call(h, "VSyncCallbacks", &[0, 0])?;
@@ -307,34 +327,32 @@ fn sequence(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     // DMA: libgpu's GPU transfer, with this callback on its channel.
     let ot = super::SCRATCH;
     call(h, "ResetGraph", &[0])?;
-    h.vblanks(1)?;
+    vblanks(h, 1)?;
     call(h, "DMACallback", &[2, cb])?;
     call(h, "ClearOTagR", &[ot, 8])?;
     call(h, "DrawOTag", &[ot + 4 * 7])?;
     call(h, "DrawSync", &[0])?;
-    h.vblanks(1)?;
+    vblanks(h, 1)?;
     observe_word(h, "GPU DMA callback", state);
     call(h, "DMACallback", &[2, 0])?;
     // Root counter 2 every 0x10000 * 8 cycles, its interrupt to the
     // callback, from a vblank.
-    h.vblanks(1)?;
+    vblanks(h, 1)?;
     call(h, "SetRCnt", &[RCNT | 2, 0xFFFF, RCNT_MD_INTR])?;
     call(h, "InterruptCallback", &[6, cb])?;
     call(h, "GetIntrMask", &[])?;
-    h.vblanks(3)?;
+    vblanks(h, 3)?;
     observe_word(h, "root counter 2 interrupts", state);
-    // Counter 2 runs at the guest's cycle (D66): how far into its period
-    // depends on the loop passes each side's code made since the last
-    // safepoint, so to 0x400 counts (`irq.counters` reads it exactly).
-    let v = h.call("GetRCnt", &[RCNT | 2])?;
-    h.observe("GetRCnt(RCntCNT2) / 0x400", format!("{:#x}", v / 0x400));
+    // Counter 2 runs at the guest's cycle (D66): exact, now that both sides
+    // spend the original's instructions (D71).
+    call(h, "GetRCnt", &[RCNT | 2])?;
     call(h, "InterruptCallback", &[6, 0])?;
     call(h, "ResetRCnt", &[RCNT | 2])?;
     call(h, "StartRCnt", &[RCNT | 2])?;
     call(h, "GetIntrMask", &[])?;
     call(h, "StopRCnt", &[RCNT | 2])?;
     call(h, "GetIntrMask", &[])?;
-    h.vblanks(1)?;
+    vblanks(h, 1)?;
     observe_word(h, "callback word at the end", state);
     vsync_call(h, -1)?;
     Ok(())

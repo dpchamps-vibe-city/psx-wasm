@@ -26,6 +26,13 @@
 //! which DMA doesn't reach (btn's menu; libcd reads sector headers into
 //! its callback's frame).
 //!
+//! **Time** (D71): every adapter spends its original's blocks on the path
+//! it takes, the dispatcher's from where the exception's exit resumes
+//! (`startIntr`'s `setjmp`), with its loop headers' quanta
+//! ([`crate::irq_header`]); `ResetCallback`'s clearing of the context is a
+//! loop that takes safepoints. libapi's stubs count (a syscall's 4, a
+//! vector's 3), `setjmp`'s doesn't: the lift lowers its call to stores.
+//!
 //! **libetc's own handlers are at their own addresses,** which
 //! `InterruptCallback` returns and takes back (libsnd's tick handler takes
 //! line 0 and calls libetc's first). Line 0 is `intr_vb.o`'s vblank handler
@@ -263,6 +270,8 @@ mod step {
     pub const DISPATCH: u32 = 1;
     /// The lines still pending, from one.
     pub const LINE: u32 = 2;
+    /// The same, back from that line's handler.
+    pub const AFTER: u32 = 3;
 
     pub fn make(kind: u32, line: u32, rest: u32) -> u32 {
         kind << 24 | (line & 0xFF) << 16 | (rest & 0xFFFF)
@@ -279,6 +288,7 @@ pub fn irq_step(m: &mut M, s: u32) {
     let r = match s >> 24 {
         step::DISPATCH => dispatch(m),
         step::LINE => line(m, (s >> 16) & 0xFF, s & 0xFFFF),
+        step::AFTER => after_line(m, (s >> 16) & 0xFF, s & 0xFFFF),
         _ => Err(format!("unknown step {s:#x}")),
     };
     if let Err(e) = r {
@@ -316,66 +326,116 @@ fn pending(m: &mut M, l: Lib) -> std::result::Result<u32, String> {
     Ok(l.mask(m) as u32 & stat & reg(m, I_MASK, 2)?)
 }
 
-/// `intr.o`'s dispatcher, at the top of its loop.
+/// `intr.o`'s dispatcher (+26Ch), at the top of its loop: entered from
+/// `startIntr`'s `setjmp` (+1FCh), where the exception's exit resumes, or
+/// looking again after the lines (+35Ch). It spends the original's blocks
+/// on its path (D71), in the exception: a quantum passes only at its loop
+/// headers (+300h, +30Ch).
 fn dispatch(m: &mut M) -> std::result::Result<(), String> {
     let Some(l) = m.sdk.etc.lib else { return Ok(()) };
+    let first = !l.dispatching(m);
+    if first {
+        crate::irq_path(m, &[(0x1FC, 0x208), (0x26C, 0x29C)]);
+    }
     if !l.active(m) {
         // "unexpected interrupt(%04x)\n" with I_STAT; the original returns
         // from the exception.
+        crate::irq_path(m, &[(0x2A0, 0x2B4)]);
         let stat = reg(m, I_STAT, 2)?;
         message(m, l, (0x2B0, 0x2B8, 0x2B4), [stat, 0]);
+        crate::irq_path(m, &[(0x2BC, 0x2C0)]);
+        crate::take(m, crate::VECTOR_STUB);
         return Ok(());
     }
     // The exception's first pass: onto libetc's stack, as the original's
     // exit from the exception (`HookEntryInt`) enters it. The interrupted
     // code's may be the scratchpad, where no DMA reaches (libcd reads
     // sector headers into its callback's frame).
-    if !l.dispatching(m) {
+    if first {
+        crate::irq_path(m, &[(0x2C4, 0x2F4)]);
         m.sdk.etc.saved_sp = m.regs.sp();
         m.regs.set_sp(l.context + ctx::STACK_TOP);
+    } else {
+        crate::irq_path(m, &[(0x35C, 0x388)]);
     }
     m.mem.w16(l.context + ctx::DISPATCHING, 1);
     let p = pending(m, l)?;
     if p != 0 {
+        if first {
+            crate::irq_path(m, &[(0x2F8, 0x2FC)]);
+        }
+        crate::irq_header(m);
+        crate::irq_path(m, &[(0x300, 0x308)]);
         front(m, &[IrqStep::Sdk(step::make(step::LINE, 0, p))]);
         return Ok(());
     }
     // Nothing left for libetc. An unmasked interrupt nobody handles makes
     // the exception come back; after 2048 in a row it gives up on them.
+    crate::irq_path(m, &[(0x38C, 0x3B0)]);
     if reg(m, I_STAT, 2)? & reg(m, I_MASK, 2)? != 0 {
+        crate::irq_path(m, &[(0x3B4, 0x3D4)]);
         let n = m.mem.r32(l.spurious);
         m.mem.w32(l.spurious, n + 1);
         if n > 2048 {
+            crate::irq_path(m, &[(0x3D8, 0x3EC)]);
             let (stat, mask) = (reg(m, I_STAT, 2)?, reg(m, I_MASK, 2)?);
             // "intr timeout(%04x:%04x)\n".
             message(m, l, (0x3D8, 0x3DC, 0x3E8), [stat, mask]);
+            crate::irq_path(m, &[(0x3F0, 0x404)]);
             m.mem.w32(l.spurious, 0);
             set_reg(m, I_STAT, 2, 0)?;
         }
     } else {
+        crate::irq_path(m, &[(0x408, 0x40C)]);
         m.mem.w32(l.spurious, 0);
     }
+    // ReturnFromException, through libapi's stub.
+    crate::irq_path(m, &[(0x410, 0x418)]);
+    crate::take(m, crate::VECTOR_STUB);
     m.regs.set_sp(m.sdk.etc.saved_sp);
     m.mem.w16(l.context + ctx::DISPATCHING, 0);
     Ok(())
 }
 
-/// The dispatcher's pass over the pending lines `rest` from line `i`:
-/// acknowledge the next one and call its handler, then go on.
+/// The dispatcher's pass over the pending lines `rest` from line `i`, at
+/// its loop's header (+30Ch): acknowledge the next one and call its
+/// handler, then go on.
 fn line(m: &mut M, mut i: u32, mut rest: u32) -> std::result::Result<(), String> {
     let Some(l) = m.sdk.etc.lib else { return Ok(()) };
-    while rest != 0 && (i as usize) < LINES {
+    loop {
+        crate::irq_header(m);
+        crate::irq_path(m, &[(0x30C, 0x314)]);
+        if i as usize >= LINES {
+            break;
+        }
+        crate::irq_path(m, &[(0x318, 0x31C)]);
         if rest & 1 != 0 {
+            crate::irq_path(m, &[(0x320, 0x33C)]);
             set_reg(m, I_STAT, 2, !(1u32 << i) & 0xFFFF)?;
             let h = l.line(m, i);
             if h != 0 {
-                let next = IrqStep::Sdk(step::make(step::LINE, i + 1, rest >> 1));
+                crate::irq_path(m, &[(0x340, 0x344)]);
+                let next = IrqStep::Sdk(step::make(step::AFTER, i, rest));
                 front(m, &[IrqStep::Chain(guest(h, m.sdk.etc.stat as u32), None), next]);
                 return Ok(());
             }
         }
+        crate::irq_path(m, &[(0x348, 0x358)]);
         i += 1;
         rest >>= 1;
+        if rest == 0 {
+            break;
+        }
+    }
+    front(m, &[IrqStep::Sdk(step::make(step::DISPATCH, 0, 0))]);
+    Ok(())
+}
+
+/// Back from line `i`'s handler (+348h): the next line, or look again.
+fn after_line(m: &mut M, i: u32, rest: u32) -> std::result::Result<(), String> {
+    crate::irq_path(m, &[(0x348, 0x358)]);
+    if rest >> 1 != 0 {
+        return line(m, i + 1, rest >> 1);
     }
     front(m, &[IrqStep::Sdk(step::make(step::DISPATCH, 0, 0))]);
     Ok(())
@@ -387,34 +447,60 @@ fn line(m: &mut M, mut i: u32, mut rest: u32) -> std::result::Result<(), String>
 /// installed, the handler, libetc's mask and I_MASK (masked meanwhile),
 /// and the kernel's acknowledge flags for the lines its own handlers
 /// share (vblank: the pad and RCntCNT3; root counters 0-2). The previous
-/// handler.
+/// handler. `intr.o` +43Ch's blocks.
 fn set_line(m: &mut M, l: Lib, irq: usize, h: u32) -> std::result::Result<u32, String> {
+    crate::path(m, &[(0x43C, 0x47C)]);
     let at = l.context + ctx::LINES + 4 * irq as u32;
     let prev = m.mem.r32(at);
-    if h != prev && l.active(m) {
-        let mut mask = reg(m, I_MASK, 2)?;
-        set_reg(m, I_MASK, 2, 0)?;
-        let bit = 1u16 << irq;
-        let off = h == 0;
-        m.mem.w32(at, h);
-        let lines = l.mask(m);
-        if off {
-            mask &= !(bit as u32);
-            m.mem.w16(l.context + ctx::MASK, lines & !bit);
-        } else {
-            mask |= bit as u32;
-            m.mem.w16(l.context + ctx::MASK, lines | bit);
-        }
-        let off = off as u32;
-        if irq == 0 {
-            bios(m, 0xB0, 0x5B, [off, 0, 0, 0])?;
-            bios(m, 0xC0, 0x0A, [3, off, 0, 0])?;
-        }
-        if (4..=6).contains(&irq) {
-            bios(m, 0xC0, 0x0A, [irq as u32 - 4, off, 0, 0])?;
-        }
-        set_reg(m, I_MASK, 2, mask)?;
+    if h == prev {
+        crate::path(m, &[(0x564, 0x580)]);
+        return Ok(prev);
     }
+    crate::path(m, &[(0x480, 0x48C)]);
+    if !l.active(m) {
+        crate::path(m, &[(0x560, 0x580)]);
+        return Ok(prev);
+    }
+    crate::path(m, &[(0x490, 0x4A8)]);
+    let mut mask = reg(m, I_MASK, 2)?;
+    set_reg(m, I_MASK, 2, 0)?;
+    let bit = 1u16 << irq;
+    let off = h == 0;
+    m.mem.w32(at, h);
+    let lines = l.mask(m);
+    // +4ACh or +4CCh, the same length.
+    crate::path(m, &[(0x4AC, 0x4C8), (0x4EC, 0x4F0)]);
+    if off {
+        mask &= !(bit as u32);
+        m.mem.w16(l.context + ctx::MASK, lines & !bit);
+    } else {
+        mask |= bit as u32;
+        m.mem.w16(l.context + ctx::MASK, lines | bit);
+    }
+    let off = off as u32;
+    // ChangeClearPAD and ChangeClearRCnt, through libapi's stubs.
+    if irq == 0 {
+        crate::path(m, &[(0x4F4, 0x4FC)]);
+        crate::take(m, crate::VECTOR_STUB);
+        bios(m, 0xB0, 0x5B, [off, 0, 0, 0])?;
+        crate::path(m, &[(0x500, 0x508)]);
+        crate::take(m, crate::VECTOR_STUB);
+        bios(m, 0xC0, 0x0A, [3, off, 0, 0])?;
+        crate::path(m, &[(0x50C, 0x50C)]);
+    }
+    crate::path(m, &[(0x510, 0x514)]);
+    for (n, (a, b)) in [(4, (0x518, 0x524)), (5, (0x530, 0x53C)), (6, (0x548, 0x54C))] {
+        if irq == n {
+            crate::take(m, crate::VECTOR_STUB);
+            bios(m, 0xC0, 0x0A, [n as u32 - 4, off, 0, 0])?;
+            crate::path(m, &[(a, b)]);
+        }
+        if n < 6 {
+            crate::path(m, &[[(0x528, 0x52C), (0x540, 0x544)][n - 4]]);
+        }
+    }
+    crate::path(m, &[(0x550, 0x580)]);
+    set_reg(m, I_MASK, 2, mask)?;
     Ok(prev)
 }
 
@@ -425,43 +511,82 @@ fn set_line(m: &mut M, l: Lib, irq: usize, h: u32) -> std::result::Result<u32, S
 /// vblank handler on line 0, its setter in the driver table) and
 /// `startIntrDMA` (no DMA callbacks, DICR's enables cleared, the DMA
 /// handler on line 3, its setter in the table), and leave the critical
-/// section. The context's address.
+/// section. The context's address. Its blocks are `intr.o`'s
+/// `ResetCallback` and `startIntr` (+194h), whose `setjmp` the lift lowers
+/// to stores (no stub's), `intr_vb.o`'s and `intr_dma.o`'s.
 fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::RESET)?;
+    crate::path(m, &[(0x0, 0x1C), (0x194, 0x1B4)]);
     if l.active(m) {
+        crate::path(m, &[(0x25C, 0x268), (0x20, 0x2C)]);
         return ret(0);
     }
+    crate::path(m, &[(0x1B8, 0x1F0)]);
     set_reg(m, I_MASK, 2, 0)?;
     let v = reg(m, I_MASK, 2)?;
     set_reg(m, I_STAT, 2, v)?;
     set_reg(m, DPCR, 4, 0x3333_3333)?;
+    // Clearing the context, a word a pass (+69Ch).
+    crate::path(m, &[(0x69C, 0x6A4)]);
+    Ok(crate::spin(m, 4, ctx::WORDS as u64, move |m| match start_intr(m, l) {
+        Ok(v) => Flow::ret(v),
+        Err(e) => {
+            m.log(&format!("ResetCallback: {e}"));
+            Flow::ret(0)
+        }
+    }))
+}
+
+/// `startIntr` past its context's clearing (+6B8h on).
+fn start_intr(m: &mut M, l: Lib) -> std::result::Result<u32, String> {
+    crate::path(m, &[(0x6B8, 0x6BC), (0x1F4, 0x200), (0x20C, 0x220)]);
+    crate::take(m, crate::VECTOR_STUB);
     m.mem.write(l.context, &vec![0; 4 * ctx::WORDS as usize]);
     m.mem.w16(l.context + ctx::ACTIVE, 1);
+    // startIntrVSync, its table cleared a word a pass.
+    crate::path(m, &[(0x224, 0x22C), (0x0, 0x2C), (0xF0, 0xF8), (0x10C, 0x110)]);
+    crate::take(m, 8 * 4);
     set_reg(m, RCNT1_MODE, 4, 0x100)?;
     m.mem.w32(l.vcount, 0);
     m.mem.write(l.vb_table, &[0; 32]);
+    crate::path(m, &[(0x30, 0x3C), (0x30, 0x4C)]);
     set_line(m, l, 0, l.vb_handler)?;
+    crate::path(m, &[(0x50, 0x5C), (0x40, 0x54), (0x230, 0x23C)]);
     m.mem.w32(l.driver + driver::VBLANK, l.vb_setter);
+    // startIntrDMA, likewise.
+    crate::path(m, &[(0x0, 0x14), (0x278, 0x280), (0x294, 0x298)]);
+    crate::take(m, 8 * 4);
     m.mem.write(l.dma_table, &[0; 32]);
     set_reg(m, DICR, 4, 0)?;
+    crate::path(m, &[(0x18, 0x30), (0x30, 0x4C)]);
     set_line(m, l, 3, l.dma_handler)?;
+    crate::path(m, &[(0x50, 0x5C), (0x34, 0x48), (0x240, 0x24C)]);
     m.mem.w32(l.driver + driver::DMA, l.dma_setter);
     // _96_remove (the BIOS's CD-ROM driver out, which leaves a critical
     // section entered), then ExitCriticalSection.
+    crate::take(m, crate::VECTOR_STUB);
     bios(m, 0xA0, 0x72, [0; 4])?;
+    crate::path(m, &[(0x250, 0x254)]);
+    crate::take(m, crate::SYSCALL_STUB);
     psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
-    ret(l.context)
+    crate::path(m, &[(0x258, 0x268), (0x20, 0x2C)]);
+    Ok(l.context)
 }
 
 /// `StopCallback`: with the context installed, enter a critical section,
 /// keep I_MASK and DPCR, mask and acknowledge every interrupt, disable
-/// every DMA channel, and take the dispatcher out.
+/// every DMA channel, and take the dispatcher out (`stopIntr`, +584h).
 fn stop_callback(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::STOP)?;
+    crate::path(m, &[(0xF4, 0x110), (0x584, 0x5A4)]);
     if !l.active(m) {
+        crate::path(m, &[(0x614, 0x620), (0x114, 0x120)]);
         return ret(0);
     }
+    crate::path(m, &[(0x5A8, 0x5AC)]);
+    crate::take(m, crate::SYSCALL_STUB);
     psx_bios::bios::syscall(m, [1, 0, 0, 0])?;
+    crate::path(m, &[(0x5B0, 0x608)]);
     let mask = reg(m, I_MASK, 2)?;
     m.mem.w16(l.context + ctx::SAVED_MASK, mask as u16);
     let dpcr = reg(m, DPCR, 4)?;
@@ -471,28 +596,41 @@ fn stop_callback(m: &mut M, _a: [u32; 4]) -> Result {
     set_reg(m, I_STAT, 2, v)?;
     let d = reg(m, DPCR, 4)?;
     set_reg(m, DPCR, 4, d & 0x7777_7777)?;
+    // ResetEntryInt.
+    crate::take(m, crate::VECTOR_STUB);
+    crate::path(m, &[(0x60C, 0x620), (0x114, 0x120)]);
     m.mem.w16(l.context + ctx::ACTIVE, 0);
     ret(l.context)
 }
 
 /// `RestartCallback`: the dispatcher back, I_MASK and DPCR as
-/// `StopCallback` kept them, and the critical section left.
+/// `StopCallback` kept them, and the critical section left
+/// (`restartIntr`, +624h).
 fn restart_callback(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::RESTART)?;
+    crate::path(m, &[(0x124, 0x140), (0x624, 0x644)]);
     if l.active(m) {
+        crate::path(m, &[(0x688, 0x698), (0x144, 0x150)]);
         return ret(0);
     }
+    // HookEntryInt.
+    crate::path(m, &[(0x648, 0x64C)]);
+    crate::take(m, crate::VECTOR_STUB);
+    crate::path(m, &[(0x650, 0x67C)]);
     m.mem.w16(l.context + ctx::ACTIVE, 1);
     let (mask, dpcr) = (m.mem.r16(l.context + ctx::SAVED_MASK), m.mem.r32(l.context + ctx::SAVED_DPCR));
     set_reg(m, I_MASK, 2, mask as u32)?;
     set_reg(m, DPCR, 4, dpcr)?;
+    crate::take(m, crate::SYSCALL_STUB);
     psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
+    crate::path(m, &[(0x680, 0x684), (0x68C, 0x698), (0x144, 0x150)]);
     ret(l.context)
 }
 
 /// `CheckCallback`: whether the dispatcher is running (a callback is).
 fn check_callback(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::CHECK)?;
+    crate::path(m, &[(0x154, 0x160)]);
     ret(l.dispatching(m) as u32)
 }
 
@@ -503,11 +641,14 @@ fn interrupt_callback(m: &mut M, a: [u32; 4]) -> Result {
     if irq >= LINES {
         return Err(format!("InterruptCallback({irq}, …): no such interrupt line"));
     }
-    ret(set_line(m, l, irq, a[1])?)
+    crate::path(m, &[(0x30, 0x4C)]);
+    let prev = set_line(m, l, irq, a[1])?;
+    crate::path(m, &[(0x50, 0x5C)]);
+    ret(prev)
 }
 
-/// `DMACallback(ch, f)` (`intr_dma.o`'s setter): when `f` changes the
-/// channel's callback, DICR's master enable and the channel's enable
+/// `DMACallback(ch, f)` (`intr_dma.o`'s setter, +1CCh): when `f` changes
+/// the channel's callback, DICR's master enable and the channel's enable
 /// follow it. The previous callback.
 fn dma_callback(m: &mut M, a: [u32; 4]) -> Result {
     let l = lib(m, at::DMA)?;
@@ -515,31 +656,44 @@ fn dma_callback(m: &mut M, a: [u32; 4]) -> Result {
     if ch >= 8 {
         return Err(format!("DMACallback({ch}, …): no such DMA channel"));
     }
+    crate::path(m, &[(0x60, 0x7C), (0x1CC, 0x1EC)]);
     let slot = l.dma_table + 4 * ch;
     let old = m.mem.r32(slot);
     if f != old {
+        // +1F8h or +234h, the same length.
+        crate::path(m, &[(0x1F0, 0x1F4), (0x1F8, 0x230)]);
         m.mem.w32(slot, f);
         let d = (reg(m, DICR, 4)? & 0x00FF_FFFF) | 0x0080_0000;
         let bit = 1 << (16 + ch);
         set_reg(m, DICR, 4, if f != 0 { d | bit } else { d & !bit })?;
     }
+    crate::path(m, &[(0x270, 0x274), (0x80, 0x8C)]);
     ret(old)
 }
 
 /// `VSyncCallbacks(ch, f)` (`intr_vb.o`'s setter): the previous callback.
 fn vsync_callbacks(m: &mut M, a: [u32; 4]) -> Result {
     let l = lib(m, at::VSYNC_CALLBACKS)?;
-    set_vsync(m, l, a[0], a[1])
+    crate::path(m, &[(0xC4, 0xE0)]);
+    let old = set_vsync(m, l, a[0], a[1])?;
+    crate::path(m, &[(0xE4, 0xF0)]);
+    ret(old)
 }
 
-fn set_vsync(m: &mut M, l: Lib, ch: u32, f: u32) -> Result {
+/// `intr_vb.o`'s setter (+C4h).
+fn set_vsync(m: &mut M, l: Lib, ch: u32, f: u32) -> std::result::Result<u32, String> {
     if ch >= 8 {
         return Err(format!("VSyncCallbacks({ch}, …): no such channel"));
     }
+    crate::path(m, &[(0xC4, 0xE0)]);
     let slot = l.vb_table + 4 * ch;
     let old = m.mem.r32(slot);
+    if f != old {
+        crate::path(m, &[(0xE4, 0xE4)]);
+    }
+    crate::path(m, &[(0xE8, 0xEC)]);
     m.mem.w32(slot, f);
-    ret(old)
+    Ok(old)
 }
 
 /// `intr_dma.o`'s DMA handler, bound by its place (+4Ch): while DICR
@@ -550,69 +704,121 @@ fn set_vsync(m: &mut M, l: Lib, ch: u32, f: u32) -> Result {
 fn dma_handler(m: &mut M, _a: [u32; 4]) -> Result {
     let d = m.sdk.at.wrapping_sub(0x4C);
     let table = pair(m, d + 4).ok_or_else(|| format!("libetc/intr_dma at {d:#010x}: no DMACallback table where PsyQ 4.7's object has it"))?;
-    Ok(dma_pass(m, d, table, 0, 0))
+    crate::irq_path(m, &[(0x4C, 0x88)]);
+    let rest = (reg(m, DICR, 4)? >> 24) & 0x7F;
+    if rest == 0 {
+        return Ok(dma_end(m, d));
+    }
+    crate::irq_path(m, &[(0x8C, 0x9C)]);
+    Ok(dma_pass(m, d, table, rest))
 }
 
-fn dma_pass(m: &mut M, d: u32, table: u32, mut ch: u32, mut rest: u32) -> Flow<Psyq> {
-    let failed = |m: &mut M, e: String| {
-        m.log(&format!("libetc DMA handler: {e}"));
-        Flow::ret(0)
-    };
-    loop {
-        if rest == 0 {
-            let dicr = match reg(m, DICR, 4) {
-                Ok(v) => v,
-                Err(e) => return failed(m, e),
-            };
-            (ch, rest) = (0, (dicr >> 24) & 0x7F);
-            if rest == 0 {
-                if dicr & 0xFF00_0000 == 0x8000_0000 || dicr & 0x8000 != 0 {
-                    return crate::say(m, (d + 0x160, d + 0x164, d + 0x16C), &[dicr], move |m| bus_error(m, d, 0));
-                }
-                return Flow::ret(0);
-            }
+/// The handler's outer loop (+A0h, a header): the flagged channels in
+/// `rest`, from channel 0. Its blocks are spent in the exception (D71).
+fn dma_pass(m: &mut M, d: u32, table: u32, rest: u32) -> Flow<Psyq> {
+    crate::irq_header(m);
+    crate::irq_path(m, &[(0xA0, 0xA8)]);
+    dma_channel(m, d, table, 0, rest)
+}
+
+fn dma_failed(m: &mut M, e: String) -> Flow<Psyq> {
+    m.log(&format!("libetc DMA handler: {e}"));
+    Flow::ret(0)
+}
+
+/// The inner loop (+ACh, a header): channel `ch`, flagged in `rest`'s
+/// bit 0. A flagged channel's flag is acknowledged (the enables kept) and
+/// its callback called.
+fn dma_channel(m: &mut M, d: u32, table: u32, ch: u32, rest: u32) -> Flow<Psyq> {
+    crate::irq_header(m);
+    crate::irq_path(m, &[(0xAC, 0xB4)]);
+    if ch >= 7 {
+        return dma_again(m, d, table);
+    }
+    crate::irq_path(m, &[(0xB8, 0xBC)]);
+    if rest & 1 != 0 {
+        crate::irq_path(m, &[(0xC0, 0xE8)]);
+        if let Err(e) = reg(m, DICR, 4).and_then(|v| set_reg(m, DICR, 4, v & (1 << (24 + ch) | 0x00FF_FFFF))) {
+            return dma_failed(m, e);
         }
-        while rest != 0 && ch < 7 {
-            let (c, flagged) = (ch, rest & 1 != 0);
-            (ch, rest) = (ch + 1, rest >> 1);
-            if !flagged {
-                continue;
-            }
-            // Acknowledge this channel's flag, keeping the enables.
-            let r = reg(m, DICR, 4).and_then(|v| set_reg(m, DICR, 4, v & (1 << (24 + c) | 0x00FF_FFFF)));
-            if let Err(e) = r {
-                return failed(m, e);
-            }
-            let f = m.mem.r32(table + 4 * c);
-            if f != 0 {
-                return Flow::Call { call: guest(f, DICR), then: Box::new(move |m, _| dma_pass(m, d, table, ch, rest)) };
-            }
+        let f = m.mem.r32(table + 4 * ch);
+        if f != 0 {
+            crate::irq_path(m, &[(0xEC, 0xF0)]);
+            return Flow::Call { call: guest(f, DICR), then: Box::new(move |m, _| dma_next(m, d, table, ch, rest)) };
         }
-        rest = 0;
+    }
+    dma_next(m, d, table, ch, rest)
+}
+
+/// +F4h: the next channel, while any is flagged.
+fn dma_next(m: &mut M, d: u32, table: u32, ch: u32, rest: u32) -> Flow<Psyq> {
+    crate::irq_path(m, &[(0xF4, 0x100)]);
+    if rest >> 1 != 0 {
+        return dma_channel(m, d, table, ch + 1, rest >> 1);
+    }
+    dma_again(m, d, table)
+}
+
+/// +104h: DICR's flags again; the outer loop while any.
+fn dma_again(m: &mut M, d: u32, table: u32) -> Flow<Psyq> {
+    crate::irq_path(m, &[(0x104, 0x124)]);
+    match reg(m, DICR, 4) {
+        Ok(v) if (v >> 24) & 0x7F != 0 => dma_pass(m, d, table, (v >> 24) & 0x7F),
+        Ok(_) => dma_end(m, d),
+        Err(e) => dma_failed(m, e),
     }
 }
 
-/// The bus error's dump: channel `ch`'s MADR, and the rest after it.
-fn bus_error(m: &mut M, d: u32, ch: u32) -> Flow<Psyq> {
-    if ch >= 7 {
+/// +128h: none flagged; with a bus error, its messages through the game's
+/// `printf` (DICR, then each channel's MADR).
+fn dma_end(m: &mut M, d: u32) -> Flow<Psyq> {
+    crate::irq_path(m, &[(0x128, 0x148)]);
+    let dicr = reg(m, DICR, 4).unwrap_or(0);
+    let error = dicr & 0xFF00_0000 == 0x8000_0000 || {
+        crate::irq_path(m, &[(0x14C, 0x15C)]);
+        dicr & 0x8000 != 0
+    };
+    if !error {
+        crate::irq_path(m, &[(0x1A8, 0x1C8)]);
         return Flow::ret(0);
     }
+    crate::irq_path(m, &[(0x160, 0x170)]);
+    crate::say(m, (d + 0x160, d + 0x164, d + 0x16C), &[dicr], move |m| bus_error(m, d, 0))
+}
+
+/// The bus error's dump (+174h, a header): channel `ch`'s MADR, and the
+/// rest after it.
+fn bus_error(m: &mut M, d: u32, ch: u32) -> Flow<Psyq> {
+    if ch >= 7 {
+        crate::irq_path(m, &[(0x1A8, 0x1C8)]);
+        return Flow::ret(0);
+    }
+    crate::irq_header(m);
+    crate::irq_path(m, &[(0x174, 0x194)]);
     let madr = reg(m, 0x1F80_1080 + 16 * ch, 4).unwrap_or(0);
-    crate::say(m, (d + 0x174, d + 0x178, d + 0x194), &[ch, madr], move |m| bus_error(m, d, ch + 1))
+    crate::say(m, (d + 0x174, d + 0x178, d + 0x194), &[ch, madr], move |m| {
+        crate::irq_path(m, &[(0x19C, 0x1A4)]);
+        bus_error(m, d, ch + 1)
+    })
 }
 
 /// `VSyncCallback(f)`: channel 4.
 fn vsync_callback(m: &mut M, a: [u32; 4]) -> Result {
     let l = lib(m, at::VSYNC_CALLBACK)?;
-    set_vsync(m, l, 4, a[0])
+    crate::path(m, &[(0x90, 0xB0)]);
+    let old = set_vsync(m, l, 4, a[0])?;
+    crate::path(m, &[(0xB4, 0xC0)]);
+    ret(old)
 }
 
 fn get_intr_mask(m: &mut M, _a: [u32; 4]) -> Result {
+    crate::path(m, &[(0x164, 0x178)]);
     ret(reg(m, I_MASK, 2)?)
 }
 
 /// `SetIntrMask(mask)`: I_MASK, the previous one.
 fn set_intr_mask(m: &mut M, a: [u32; 4]) -> Result {
+    crate::path(m, &[(0x17C, 0x190)]);
     let old = reg(m, I_MASK, 2)?;
     set_reg(m, I_MASK, 2, a[0] & 0xFFFF)?;
     ret(old)
@@ -633,20 +839,34 @@ fn gpustat(m: &mut M) -> u32 {
 /// returned (root counter 1, 16 bits). Mode < 0: Vcount, no wait. Mode 1:
 /// no wait. Mode 0: until the next vblank. Mode n > 1: until n vblanks
 /// after the last waiting call, and at least the next. Interlaced, the
-/// field must have changed too.
+/// field must have changed too. Root counter 1 is read until two reads
+/// agree, which the device's always do (it moves only at safepoints).
 fn vsync(m: &mut M, a: [u32; 4]) -> Result {
     let mode = a[0] as i32;
     let v = vsync_o(m)?;
+    crate::path(m, &[(0x0, 0x5C)]);
     if mode < 0 {
+        crate::path(m, &[(0x60, 0x6C), (0x164, 0x174)]);
         return ret(m.mem.r32(v.vcount));
     }
     let delta = rcnt1(m).wrapping_sub(m.mem.r32(v.hcount)) & 0xFFFF;
+    crate::path(m, &[(0x70, 0x78)]);
     if mode == 1 {
+        crate::path(m, &[(0x160, 0x174)]);
         return ret(delta);
     }
+    crate::path(m, &[(0x7C, 0x80)]);
     let last = m.mem.r32(v.last);
-    let (target, timeout) = if mode > 0 { (last.wrapping_add(mode as u32 - 1), mode as u32 - 1) } else { (last, 0) };
+    let (target, timeout) = if mode > 0 {
+        crate::path(m, &[(0x84, 0x98), (0xA4, 0xAC)]);
+        (last.wrapping_add(mode as u32 - 1), mode as u32 - 1)
+    } else {
+        crate::path(m, &[(0x9C, 0xA8)]);
+        (last, 0)
+    };
+    crate::path(m, &[(0xB0, 0xB4)]);
     Ok(wait_vcount(m, v, target, timeout, move |m| {
+        crate::path(m, &[(0xB8, 0xD8)]);
         let field = gpustat(m);
         let next = m.mem.r32(v.vcount).wrapping_add(1);
         wait_vcount(m, v, next, 1, move |m| interlace(m, v, field, delta))
@@ -659,47 +879,69 @@ pub(crate) fn quantum(m: &M) -> u64 {
     if m.opts.safepoint_quantum == 0 { 20_000 } else { m.opts.safepoint_quantum as u64 }
 }
 
-/// `vsync.o`'s wait: until Vcount reaches `target`, counting down from
-/// `timeout << 15` meanwhile; when that runs out it says so through the
-/// game's `puts`, has the kernel acknowledge vblank itself, and goes on.
-/// Each look is a pass of 14 instructions ([`crate::poll`]). In NTSC it
-/// only runs out when nothing counts vblanks: inside a handler or a
-/// critical section, libetc stopped, or line 0 taken by a handler that
-/// doesn't call libetc's.
+/// `vsync.o`'s wait (+178h): until Vcount reaches `target`, counting down
+/// from `timeout << 15` meanwhile; when that runs out it says so through
+/// the game's `puts`, has the kernel acknowledge vblank itself, and goes
+/// on. Each look is a pass of 14 instructions ([`crate::poll`]) after the
+/// first. In NTSC it only runs out when nothing counts vblanks: inside a
+/// handler or a critical section, libetc stopped, or line 0 taken by a
+/// handler that doesn't call libetc's.
 fn wait_vcount(m: &mut M, v: VsyncO, target: u32, timeout: u32, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
     let text = v.text;
-    let iterations = ((timeout as u64) << 15) + 1;
-    let reached = std::rc::Rc::new(move |m: &mut M| m.mem.r32(v.vcount) as i32 >= target as i32);
+    let reached = move |m: &mut M| m.mem.r32(v.vcount) as i32 >= target as i32;
+    crate::path(m, &[(0x178, 0x198)]);
+    if reached(m) {
+        crate::path(m, &[(0x200, 0x20C)]);
+        return then(m);
+    }
+    crate::path(m, &[(0x19C, 0x19C)]);
     crate::poll(
         m,
         VCOUNT_PASS,
-        iterations,
-        reached,
+        (timeout as u64) << 15,
+        std::rc::Rc::new(reached),
         Box::new(move |m, reached| {
             if reached {
+                crate::path(m, &[(0x200, 0x20C)]);
                 return then(m);
             }
+            crate::path(m, &[(0x1A0, 0x1C8)]);
             crate::say(m, (text + 0x1C0, text + 0x1C8, text + 0x1C4), &[], move |m| {
+                crate::path(m, &[(0x1CC, 0x1D0)]);
+                crate::take(m, crate::VECTOR_STUB);
                 let _ = bios(m, 0xB0, 0x5B, [0; 4]);
+                crate::path(m, &[(0x1D4, 0x1DC)]);
+                crate::take(m, crate::VECTOR_STUB);
                 let _ = bios(m, 0xC0, 0x0A, [3, 0, 0, 0]);
+                crate::path(m, &[(0x1E0, 0x1E4), (0x200, 0x20C)]);
                 then(m)
             })
         }),
     )
 }
 
-/// The end of a waiting `VSync`: interlaced, while the field is the one it
-/// was before the last wait, spin until it changes; then Vcount and root
-/// counter 1 are this call's.
+/// The end of a waiting `VSync` (+DCh): interlaced, while the field is the
+/// one it was before the last wait, spin until it changes; then Vcount and
+/// root counter 1 are this call's.
 fn interlace(m: &mut M, v: VsyncO, before: u32, delta: u32) -> Flow<Psyq> {
-    let field_changed = move |m: &mut M| before & 0x40_0000 == 0 || (before ^ gpustat(m)) & 0x8000_0000 != 0;
     let then = move |m: &mut M, _| {
+        crate::path(m, &[(0x124, 0x15C)]);
         let vcount = m.mem.r32(v.vcount);
         m.mem.w32(v.last, vcount);
         let h = rcnt1(m);
         m.mem.w32(v.hcount, h);
+        crate::path(m, &[(0x160, 0x174)]);
         Flow::ret(delta)
     };
+    crate::path(m, &[(0xDC, 0xE8)]);
+    if before & 0x40_0000 == 0 {
+        return then(m, true);
+    }
+    let field_changed = move |m: &mut M| (before ^ gpustat(m)) & 0x8000_0000 != 0;
+    crate::path(m, &[(0xEC, 0x108)]);
+    if field_changed(m) {
+        return then(m, true);
+    }
     crate::poll(m, FIELD_PASS, u64::MAX, std::rc::Rc::new(field_changed), Box::new(then))
 }
 
@@ -963,7 +1205,7 @@ mod tests {
         run(&mut m, 0, vsync, [0; 4]);
         assert_eq!(m.mem.r32(VCOUNT), 1);
         let cpi = psxw_abi::guest::CYCLES_PER_INSTRUCTION as u64;
-        assert_eq!((m.clock.now - before) / 20_000, ((1 << 15) + 1) * VCOUNT_PASS as u64 * cpi / 20_000);
+        assert_eq!((m.clock.now - before) / 20_000, (1 << 15) * VCOUNT_PASS as u64 * cpi / 20_000);
     }
 
     #[test]

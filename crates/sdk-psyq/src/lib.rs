@@ -176,6 +176,13 @@ pub(crate) fn poll(
     safepoint(m, move |m| poll(m, per, left, done, k))
 }
 
+/// A loop of the original's that only spends: `passes` passes of `per`
+/// instructions, a safepoint where the budget runs out ([`poll`]), then
+/// `k`.
+pub(crate) fn spin(m: &mut M, per: u32, passes: u64, k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
+    poll(m, per, passes, std::rc::Rc::new(|_: &mut M| false), Box::new(move |m, _| k(m)))
+}
+
 /// A call the replaced code makes to a guest function `f` (the game's
 /// `printf`, `puts`) as its own nested call, then `k`. Arguments past the
 /// fourth go on the stack, in a frame below the caller's, where the
