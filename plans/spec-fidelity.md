@@ -486,7 +486,7 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
 
 ## Phase 5: overlay residency
 
-1. [ ] **Record the decision** (D7).
+1. [x] **Record the decision** (D7). Done: D69.
 2. [ ] **TR4. Dispatch on what's loaded.** Today a stub compares two code
    words, first candidate by name wins, and single-definer, intra-overlay
    and main/overlay-overlap calls aren't checked
@@ -507,7 +507,7 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
 
 ## Phase 6: the memory map
 
-1. [ ] **Record the decision** (D5).
+1. [x] **Record the decision** (D5). Done: D70.
 2. [ ] **TR6. The console's map.** RAM mirrored four times in 8 MB, KSEG0/1
    and KSEG2's cache control, the scratchpad's real extent, the
    expansion regions and the BIOS ROM as their own regions, bus errors
@@ -527,7 +527,7 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
 
 ## Phase 7: time
 
-1. [ ] **Record the decision** (§6, D18, D66).
+1. [x] **Record the decision** (§6, D18, D66). Done: D71.
 2. [ ] **TR5, step 1. Clang stops reshaping loops:** no unrolling,
    vectorising or loop-to-`memory.fill` rewriting
    (`psxw-cc/src/lib.rs:48`, `clang.rs:79, 95`), so pass counts track the
