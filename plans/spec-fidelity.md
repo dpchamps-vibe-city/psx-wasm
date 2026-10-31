@@ -321,7 +321,7 @@ calls (TR1, B19).
    bound by its place in `sys.o`, `libgpu/sys:0x23a8`, which psxw-build now
    supports for static functions). libcd's interrupt handler is still a
    stand-in (`libcd::HANDLER`); the same binding would retire it (Findings).
-5. [ ] **SDK3–5. One wait that spends what the original's loop would.**
+5. [x] **SDK3–5. One wait that spends what the original's loop would.**
    A shared helper that blocks with events delivered and spends the
    guest's budget pass by pass, as `libpad::spend_in_exception`
    (`libpad.rs:261`) accounts, restarting it at each safepoint. Use it in
@@ -329,10 +329,16 @@ calls (TR1, B19).
    `MoveImage2` waits (`libgpu.rs:362-401`), and libpress's syncs
    (`libpress.rs:264-278`). Remove D66's note that these moved bof4's run
    once it no longer holds. **Run:** both games' replays.
-6. [ ] **SDK11. DMA1's busy bit is CHCR1's.** `libpress.rs:33-34,
+   Done `40c5bc5`: `sdk_psyq::poll` (with `budget`, `take`, `safepoint`) in
+   VSync's waits, libgpu's `iterate`, libpress's `spin`; D66's note kept
+   until the human's `conform bof4 --modes` shows the runs agree.
+6. [x] **SDK11. DMA1's busy bit is CHCR1's.** `libpress.rs:33-34,
    240-244, 406`: start DMA1 and poll CHCR1 bit 24 as the original does;
    drop `m.sdk.press.out`. Revise D64's note. **Run:** bof4's FMV.
 
+   Done `7bb1aeb`: DMA0 and DMA1 started through the shared controller's
+   registers as libpress writes them (`Machine::dma_start_held`, completion
+   held per D64); `DecDCToutSync` reads CHCR1. D64 revised.
 ### Exit criteria
 
 1. `cargo test --workspace` passes.
