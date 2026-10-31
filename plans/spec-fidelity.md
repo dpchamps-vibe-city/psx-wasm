@@ -596,10 +596,13 @@ locals, or static translation.
   callbacks), Vcount pair(S+58h), its setter pair(S+40h) (= S+C4h, (ch, f),
   returns the old one). `intr_dma.o` (`startIntrDMA` D): table pair(D+4),
   DICR's pointer pair(D+1Ch), handler pair(D+24h) (= D+4Ch), setter
-  pair(D+34h) (= D+1CCh, updates DICR's enable). Both handlers are guest
-  code in native builds too (no hardware-unbound refusal for libetc), so
-  with the state in RAM the dispatcher can call them and the stand-ins go
-  (SDK6).
+  pair(D+34h) (= D+1CCh, updates DICR's enable). With the state in RAM
+  the dispatcher calls both handlers at their own addresses (SDK6), but
+  only `intr_vb.o`'s runs as guest code: a native chip's guest code has no
+  I/O hooks, so `intr_dma.o`'s DICR reads saw plain memory and no flags
+  (chip irq's `irq.sequence` case failed: no DMA2 callback natively). It
+  is an adapter bound by its place (`libetc/intr_dma:0x4c`), as libgpu's
+  pump is.
 - **Adapters can bind by place** (SDK8): an adapter named
   `<member>:<offset>` binds to the function at that offset in the
   member's text (`psxw-build` `adapter_name`), for static functions the

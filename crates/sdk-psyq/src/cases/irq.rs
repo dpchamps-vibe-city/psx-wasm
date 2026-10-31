@@ -59,7 +59,7 @@ pub fn cases() -> Vec<Case> {
             name: "irq.dma-callback",
             chip: "irq",
             level: 1,
-            covers: &["DMACallback"],
+            covers: &["DMACallback", "libetc/intr_dma:0x4c"],
             needs: &["ResetCallback", "DMACallback"],
             run: dma_callback,
         },

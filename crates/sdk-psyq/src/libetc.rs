@@ -26,13 +26,15 @@
 //! which DMA doesn't reach (btn's menu; libcd reads sector headers into
 //! its callback's frame).
 //!
-//! **libetc's own handlers are its own code.** Line 0 is `intr_vb.o`'s
-//! vblank handler (Vcount, then the eight `VSyncCallbacks` channels), line
-//! 3 `intr_dma.o`'s DMA handler (DICR's flags, acknowledged one by one,
-//! each channel's `DMACallback`): guest code over the state in RAM and the
-//! shared DMA controller, at their own addresses, which `InterruptCallback`
-//! returns and takes back (libsnd's tick handler takes line 0 and calls
-//! libetc's first).
+//! **libetc's own handlers are at their own addresses,** which
+//! `InterruptCallback` returns and takes back (libsnd's tick handler takes
+//! line 0 and calls libetc's first). Line 0 is `intr_vb.o`'s vblank handler
+//! (Vcount, then the eight `VSyncCallbacks` channels), which touches no
+//! hardware and runs as guest code over the state in RAM. Line 3 is
+//! `intr_dma.o`'s DMA handler (DICR's flags, acknowledged one by one, each
+//! channel's `DMACallback`): DICR is the chip's hardware, which a native
+//! chip doesn't run as guest code, so it is an adapter bound by its place
+//! (`libetc/intr_dma:0x4c`).
 //!
 //! Semantics are PsyQ 4.7's objects (`psxw sdk disasm`; psyq-decomp
 //! `libetc/{intr,intr_vb,intr_dma,vsync}`), including what a caller can
@@ -60,6 +62,9 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("GetIntrMask", get_intr_mask),
     ("SetIntrMask", set_intr_mask),
     ("VSync", vsync),
+    // intr_dma.o's handler, static: its DICR accesses are the chip's
+    // hardware, which a native chip doesn't run as guest code.
+    ("libetc/intr_dma:0x4c", dma_handler),
 ];
 
 const I_STAT: u32 = psx_devices::irq::I_STAT;
@@ -535,6 +540,65 @@ fn set_vsync(m: &mut M, l: Lib, ch: u32, f: u32) -> Result {
     ret(old)
 }
 
+/// `intr_dma.o`'s DMA handler, bound by its place (+4Ch): while DICR
+/// flags a channel, acknowledge each flagged one in order and call its
+/// `DMACallback` (a0: DICR's address), and look again; with none flagged
+/// and a bus error, its messages through the game's `printf` (DICR, then
+/// each channel's MADR).
+fn dma_handler(m: &mut M, _a: [u32; 4]) -> Result {
+    let d = m.sdk.at.wrapping_sub(0x4C);
+    let table = pair(m, d + 4).ok_or_else(|| format!("libetc/intr_dma at {d:#010x}: no DMACallback table where PsyQ 4.7's object has it"))?;
+    Ok(dma_pass(m, d, table, 0, 0))
+}
+
+fn dma_pass(m: &mut M, d: u32, table: u32, mut ch: u32, mut rest: u32) -> Flow<Psyq> {
+    let failed = |m: &mut M, e: String| {
+        m.log(&format!("libetc DMA handler: {e}"));
+        Flow::ret(0)
+    };
+    loop {
+        if rest == 0 {
+            let dicr = match reg(m, DICR, 4) {
+                Ok(v) => v,
+                Err(e) => return failed(m, e),
+            };
+            (ch, rest) = (0, (dicr >> 24) & 0x7F);
+            if rest == 0 {
+                if dicr & 0xFF00_0000 == 0x8000_0000 || dicr & 0x8000 != 0 {
+                    return crate::say(m, (d + 0x160, d + 0x164, d + 0x16C), &[dicr], move |m| bus_error(m, d, 0));
+                }
+                return Flow::ret(0);
+            }
+        }
+        while rest != 0 && ch < 7 {
+            let (c, flagged) = (ch, rest & 1 != 0);
+            (ch, rest) = (ch + 1, rest >> 1);
+            if !flagged {
+                continue;
+            }
+            // Acknowledge this channel's flag, keeping the enables.
+            let r = reg(m, DICR, 4).and_then(|v| set_reg(m, DICR, 4, v & (1 << (24 + c) | 0x00FF_FFFF)));
+            if let Err(e) = r {
+                return failed(m, e);
+            }
+            let f = m.mem.r32(table + 4 * c);
+            if f != 0 {
+                return Flow::Call { call: guest(f, DICR), then: Box::new(move |m, _| dma_pass(m, d, table, ch, rest)) };
+            }
+        }
+        rest = 0;
+    }
+}
+
+/// The bus error's dump: channel `ch`'s MADR, and the rest after it.
+fn bus_error(m: &mut M, d: u32, ch: u32) -> Flow<Psyq> {
+    if ch >= 7 {
+        return Flow::ret(0);
+    }
+    let madr = reg(m, 0x1F80_1080 + 16 * ch, 4).unwrap_or(0);
+    crate::say(m, (d + 0x174, d + 0x178, d + 0x194), &[ch, madr], move |m| bus_error(m, d, ch + 1))
+}
+
 /// `VSyncCallback(f)`: channel 4.
 fn vsync_callback(m: &mut M, a: [u32; 4]) -> Result {
     let l = lib(m, at::VSYNC_CALLBACK)?;
@@ -720,23 +784,12 @@ pub(crate) mod fixture {
         }
     }
 
-    /// `intr_dma.o`'s handler: while DICR flags a channel, acknowledge it
-    /// and call its callback.
+    /// `intr_dma.o`'s handler: its adapter, as the game's thunk at its
+    /// address reaches it.
     fn dma_handler(m: &mut M) {
-        loop {
-            let flags = (reg(m, DICR, 4).unwrap() >> 24) & 0x7F;
-            if flags == 0 {
-                return;
-            }
-            for ch in (0..7).filter(|c| flags & 1 << c != 0) {
-                let d = reg(m, DICR, 4).unwrap();
-                set_reg(m, DICR, 4, d & (1 << (24 + ch) | 0x00FF_FFFF)).unwrap();
-                let f = m.mem.r32(DMA_TABLE + 4 * ch);
-                if f != 0 {
-                    crate::testing::guest(m, f);
-                }
-            }
-        }
+        m.sdk.at = DMA_HANDLER;
+        let r = super::dma_handler(m, [0; 4]);
+        crate::testing::finish(m, r);
     }
 }
 
