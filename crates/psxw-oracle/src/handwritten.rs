@@ -28,13 +28,16 @@ pub fn all(store: &Store) -> Result<Vec<Handwritten>> {
 }
 
 /// Store every handwritten vector and make them the `handwritten` set (a
-/// vector that changed leaves it).
+/// vector that changed leaves it), and the disputed BIOS calls
+/// [`DISPUTED_SET`].
 pub fn install(store: &Store) -> Result<Vec<(VectorId, &'static str)>> {
     let mut ids = Vec::new();
     for h in all(store)? {
         ids.push((store.put_vector(&h.vector)?, h.name));
     }
     store.replace_set(SET, ids.iter().map(|(id, _)| *id))?;
+    let disputed = bios_disputed().iter().map(|h| store.put_vector(&h.vector)).collect::<Result<Vec<_>>>()?;
+    store.replace_set(DISPUTED_SET, disputed)?;
     Ok(ids)
 }
 
@@ -208,12 +211,19 @@ fn spu(store: &Store) -> Result<Vec<Handwritten>> {
     ])
 }
 
+fn bios_call(name: &'static str, table: u32, func: u32, args: [u32; 4], setup: Vec<(u32, Vec<u8>)>, captures: Vec<(u32, u32)>) -> Handwritten {
+    Handwritten { name, vector: Vector::BiosCall(BiosCall { table, func, args, setup, captures }) }
+}
+
+/// BIOS calls whose result psx-spx and OpenBIOS agree on. Calls that call
+/// the guest back, take a fifth argument (the runner leaves the stack word
+/// unset), or act on kernel RAM outside the scratch region (the heaps,
+/// events) have no vector; their tests are psx-bios's.
 fn bios() -> Vec<Handwritten> {
     let s = wire::SCRATCH_BASE;
-    let call = |name, func, args: [u32; 4], setup: Vec<(u32, Vec<u8>)>, captures: Vec<(u32, u32)>| Handwritten {
-        name,
-        vector: Vector::BiosCall(BiosCall { table: 0xA0, func, args, setup, captures }),
-    };
+    let call = |name, func, args, setup, captures| bios_call(name, 0xA0, func, args, setup, captures);
+    let timer = |name, func, args| bios_call(name, 0xB0, func, args, vec![], vec![]);
+    let text = |t: &[u8]| vec![(s, t.to_vec()), (s + 0x20, vec![0xEE; 4])];
     vec![
         call("bios_strlen", 0x1B, [s, 0, 0, 0], vec![(s, b"psx-wasm device oracle\0".to_vec())], vec![]),
         call("bios_toupper", 0x25, [b'q' as u32, 0, 0, 0], vec![], vec![]),
@@ -232,6 +242,74 @@ fn bios() -> Vec<Handwritten> {
             vec![(s, (0u8..32).collect()), (s + 64, vec![0xEE; 32])],
             vec![(s + 64, 32)],
         ),
+        // The C library (phase 3 task 9).
+        call("bios_todigit", 0x0A, [b'f' as u32, 0, 0, 0], vec![], vec![]),
+        call("bios_strtol", 0x0D, [s, s + 0x20, 10, 0], text(b"  -123x\0"), vec![(s + 0x20, 4)]),
+        call("bios_strtoul_hex", 0x0C, [s, s + 0x20, 16, 0], text(b"0x1Fg\0"), vec![(s + 0x20, 4)]),
+        call("bios_abs", 0x0E, [(-5i32) as u32, 0, 0, 0], vec![], vec![]),
+        call("bios_atoi", 0x10, [s, 0, 0, 0], text(b"  42\0"), vec![]),
+        call("bios_atob", 0x12, [s, s + 0x20, 0, 0], text(b"123 \0"), vec![(s + 0x20, 4)]),
+        call("bios_strcat", 0x15, [s, s + 16, 0, 0], vec![(s, b"ab\0\xEE\xEE\xEE\xEE\xEE".to_vec()), (s + 16, b"cd\0".to_vec())], vec![(s, 8)]),
+        call("bios_strcmp_signed", 0x17, [s, s + 16, 0, 0], vec![(s, b"\x80\0".to_vec()), (s + 16, b"\x01\0".to_vec())], vec![]),
+        call("bios_strncmp", 0x18, [s, s + 16, 3, 0], vec![(s, b"abcx\0".to_vec()), (s + 16, b"abcy\0".to_vec())], vec![]),
+        call("bios_strncpy_pad", 0x1A, [s + 32, s, 6, 0], vec![(s, b"abc\0".to_vec()), (s + 32, vec![0xEE; 8])], vec![(s + 32, 8)]),
+        call("bios_strchr", 0x1E, [s, b'l' as u32, 0, 0], text(b"hello\0"), vec![]),
+        call("bios_strrchr", 0x1F, [s, b'l' as u32, 0, 0], text(b"hello\0"), vec![]),
+        call("bios_strpbrk", 0x20, [s, s + 16, 0, 0], vec![(s, b"hello\0".to_vec()), (s + 16, b"ol\0".to_vec())], vec![]),
+        call("bios_strstr", 0x24, [s, s + 16, 0, 0], vec![(s, b"hello world\0".to_vec()), (s + 16, b"wor\0".to_vec())], vec![]),
+        call("bios_bcopy", 0x27, [s, s + 64, 8, 0], vec![(s, (0u8..16).collect()), (s + 64, vec![0xEE; 16])], vec![(s + 64, 16)]),
+        call("bios_bzero", 0x28, [s + 4, 8, 0, 0], vec![(s, vec![0x11; 16])], vec![(s, 16)]),
+        call("bios_memmove_down", 0x2C, [s, s + 4, 8, 0], vec![(s, (0u8..16).collect())], vec![(s, 16)]),
+        call("bios_memchr", 0x2E, [s, b'd' as u32, 6, 0], text(b"abcdef\0"), vec![]),
+        // Root counters: the runner captures no registers, so results.
+        timer("bios_init_timer", 0x02, [1, 0x100, 0, 0]),
+        timer("bios_init_timer_vblank", 0x02, [3, 0, 0, 0]),
+        timer("bios_get_timer_vblank", 0x03, [3, 0, 0, 0]),
+        timer("bios_enable_timer_irq", 0x04, [0, 0, 0, 0]),
+        timer("bios_disable_timer_irq", 0x05, [0, 0, 0, 0]),
+        timer("bios_restart_timer_vblank", 0x06, [3, 0, 0, 0]),
+        // The GPU, idle: a NOP word, and the sync.
+        call("bios_gpu_cw", 0x49, [0, 0, 0, 0], vec![], vec![]),
+        call("bios_gpu_sync", 0x4E, [0, 0, 0, 0], vec![], vec![]),
+    ]
+}
+
+/// Where psx-spx documents Sony's BIOS and OpenBIOS (the emulator target's
+/// BIOS) does otherwise, its bugs among it: psx-bios follows psx-spx, so
+/// these are captured like any other but kept out of `check`'s verdicts,
+/// which reports how psx-bios fares on them in a note.
+pub const DISPUTED_SET: &str = "disputed-bios";
+
+fn bios_disputed() -> Vec<Handwritten> {
+    let s = wire::SCRATCH_BASE;
+    let call = |name, func, args, setup, captures| bios_call(name, 0xA0, func, args, setup, captures);
+    let two = |a: &[u8], b: &[u8]| vec![(s, a.to_vec()), (s + 16, b.to_vec())];
+    vec![
+        // todigit: letters past F (OpenBIOS: hex digits only).
+        call("bios_todigit_letter", 0x0A, [b'z' as u32, 0, 0, 0], vec![], vec![]),
+        // strtol's "0b" prefix, whatever the base (OpenBIOS: none).
+        call("bios_strtol_prefix", 0x0D, [s, s + 0x20, 10, 0], vec![(s, b"0b101\0".to_vec()), (s + 0x20, vec![0xEE; 4])], vec![(s + 0x20, 4)]),
+        // atoi: a leading 0 is octal.
+        call("bios_atoi_octal", 0x10, [s, 0, 0, 0], vec![(s, b"017\0".to_vec())], vec![]),
+        // strpbrk's bug: no match returns src.
+        call("bios_strpbrk_none", 0x20, [s, s + 16, 0, 0], two(b"abc\0", b"xyz\0"), vec![]),
+        // strspn and strcspn as psx-spx has them (OpenBIOS: the longest run).
+        call("bios_strspn", 0x21, [s, s + 16, 0, 0], two(b"aab,c\0", b"ab\0"), vec![]),
+        call("bios_strcspn", 0x22, [s, s + 16, 0, 0], two(b"ab,cd\0", b",\0"), vec![]),
+        // strtok works on a copy in the kernel's buffer.
+        call("bios_strtok", 0x23, [s, s + 16, 0, 0], two(b",,TEXT\0", b",\0"), vec![(s, 8)]),
+        // strstr's bug: "aab" isn't found in "aaab".
+        call("bios_strstr_bug", 0x24, [s, s + 16, 0, 0], two(b"aaab\0", b"aab\0"), vec![]),
+        // memcmp's bug: the bytes after the mismatch.
+        call("bios_memcmp_bug", 0x2D, [s, s + 16, 4, 0], two(b"abc\x10", b"abd\x05"), vec![]),
+        // memmove's bug: dst >= src+len copies backwards, len+1 bytes.
+        call("bios_memmove_bug", 0x2C, [s + 16, s, 8, 0], vec![(s, (0u8..32).collect())], vec![(s + 16, 12)]),
+        // memset of nothing returns 0.
+        call("bios_memset_empty", 0x2B, [s, 0x5A, 0, 0], vec![(s, vec![0x11; 4])], vec![(s, 4)]),
+        // GPU_cwp returns 0 and gpu_abort_dma GP1's address (OpenBIOS:
+        // nothing).
+        call("bios_gpu_cwp", 0x4A, [s, 1, 0, 0], vec![(s, vec![0; 4])], vec![]),
+        call("bios_gpu_abort_dma", 0x4C, [0, 0, 0, 0], vec![], vec![]),
     ]
 }
 
@@ -303,7 +381,7 @@ mod tests {
         for k in Kind::ALL.into_iter().filter(|k| !elsewhere.contains(k)) {
             assert!(all.iter().any(|h| h.vector.kind() == k), "no handwritten {k}");
         }
-        for h in &all {
+        for h in all.iter().chain(&bios_disputed()) {
             crate::script::compile(&h.vector, &store).unwrap_or_else(|e| panic!("{}: {e:#}", h.name));
         }
         assert_eq!(adpcm_square().len(), 64);
