@@ -88,7 +88,7 @@ fn guest_passes_and_adapters() {
     assert!(input.protos["func_80012100"].variadic);
     let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
     let linked =
-        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
+        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None, costs: None }, &[input], &[export]).unwrap();
     wasmparser::Validator::new().validate_all(&linked.wasm).unwrap();
     // The format string has no original address: AUX.
     assert_eq!(linked.aux.len(), 1);
@@ -134,7 +134,7 @@ int func_80011000(int a) { return func_80012100("x", a, 0x1122334455667788LL, a,
     let Some((map, input)) = compile("psxw-link-variadic", src) else { return };
     let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
     let linked =
-        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
+        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None, costs: None }, &[input], &[export]).unwrap();
     let fmt = linked.aux[0].2;
     let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
     let f = h.func("c").unwrap();
@@ -156,7 +156,7 @@ void func_80011000(int a, char *p) { func_80012200(a, 0, 8); func_80012200(p, 0,
     let Some((map, input)) = compile("psxw-link-noproto", src) else { return };
     let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
     let linked =
-        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
+        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None, costs: None }, &[input], &[export]).unwrap();
     let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
     let f = h.func("c").unwrap();
     let r = h.run(&f, 1, [5, 0x8001_5000, 0, 0], &[], &[0; 8], 1);
@@ -176,7 +176,7 @@ fn divisions_break_where_the_source_divides() {
     input.gcc = Some(psxw_link::Gcc { division, builtin_memcpy: false, main_calls_main: false });
     let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
     let linked =
-        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
+        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None, costs: None }, &[input], &[export]).unwrap();
     let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
     let f = h.func("c").unwrap();
     for (c, ret) in [(0, 0), (1, 0xFFFF_FFFF)] {
@@ -187,10 +187,11 @@ fn divisions_break_where_the_source_divides() {
     }
 }
 
-/// A bulk copy (a struct assignment) spends the budget, and with an I/O
-/// hook, a copy that reaches the I/O window goes byte by byte through it.
+/// With an I/O hook, a bulk copy (a struct assignment) that reaches the
+/// I/O window goes byte by byte through it. It spends no budget of its own
+/// (D71): the original's instructions that copy are its region's.
 #[test]
-fn bulk_copies_spend_and_reach_the_io_hook() {
+fn bulk_copies_reach_the_io_hook() {
     use psxw_link::object::FuncType;
     use psxw_link::rewrite::{Lowered, Resolver, rewrite};
     use wasm_encoder::Instruction as I;
@@ -227,9 +228,6 @@ fn bulk_copies_spend_and_reach_the_io_hook() {
         fn prologue(&mut self, _: Option<&str>) -> anyhow::Result<Vec<I<'static>>> {
             Ok(Vec::new())
         }
-        fn bulk_spend(&mut self, _: u32) -> Vec<I<'static>> {
-            vec![I::Call(41)]
-        }
         fn io_check(&mut self) -> Option<u32> {
             Some(42)
         }
@@ -247,8 +245,8 @@ fn bulk_copies_spend_and_reach_the_io_hook() {
     let ops: Vec<O> = body.get_operators_reader().unwrap().into_iter().collect::<Result<_, _>>().unwrap();
     let calls = |f: u32| ops.iter().filter(|o| **o == O::Call { function_index: f }).count();
     assert!(ops.iter().any(|o| matches!(o, O::MemoryCopy { .. })), "{ops:?}");
-    // The byte loop's load and store each call the hook; the copy spends.
-    assert_eq!((calls(42), calls(41)), (2, 1), "{ops:?}");
+    // The byte loop's load and store each call the hook.
+    assert_eq!(calls(42), 2, "{ops:?}");
 }
 
 /// A writable static the address map doesn't name has an original address
@@ -259,6 +257,6 @@ fn unnamed_writable_data_fails_the_link() {
     let src = "static int counter;\nint func_80011000(void) { return ++counter; }\n";
     let Some((map, input)) = compile("psxw-link-unnamed", src) else { return };
     let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
-    let err = psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap_err();
+    let err = psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None, costs: None }, &[input], &[export]).unwrap_err();
     assert!(err.to_string().contains("t counter"), "{err}");
 }

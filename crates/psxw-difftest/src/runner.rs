@@ -101,6 +101,8 @@ pub struct Harness {
     memory: Memory,
     snapshot: Vec<u8>,
     sp: wasmtime::Global,
+    /// The safepoint budget guest code spends (D71).
+    budget: Option<wasmtime::Global>,
     fuel: u64,
 }
 
@@ -109,6 +111,8 @@ pub struct Run {
     pub log: Vec<Callout>,
     /// Pages written, plus the setup's pages.
     pub dirty: BTreeSet<usize>,
+    /// The safepoint budget the call spent (psxw-abi `guest::BUDGET_UNIT`s).
+    pub spent: i64,
 }
 
 impl Harness {
@@ -187,6 +191,7 @@ impl Harness {
         let instance = linker.instantiate(&mut store, &module)?;
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| anyhow::anyhow!("no memory export"))?;
         let sp = instance.get_global(&mut store, "__guest_sp").ok_or_else(|| anyhow::anyhow!("no __guest_sp"))?;
+        let budget = instance.get_global(&mut store, psxw_abi::guest::BUDGET_SYMBOL);
         for (addr, bytes) in images {
             let at = (*addr & 0x00FF_FFFF) as usize + WINDOW_BASE;
             memory.data_mut(&mut store)[at..at + bytes.len()].copy_from_slice(bytes);
@@ -194,7 +199,7 @@ impl Harness {
         let guard = ((STACK_TOP - STACK_EXCLUDE - STACK_GUARD) & 0x00FF_FFFF) as usize + WINDOW_BASE;
         memory.data_mut(&mut store)[guard..guard + STACK_GUARD as usize].fill(0xFF);
         let snapshot = memory.data(&store)[WINDOW_BASE..WINDOW_BASE + SNAPSHOT_LEN].to_vec();
-        Ok(Self { store, instance, memory, snapshot, sp, fuel })
+        Ok(Self { store, instance, memory, snapshot, sp, budget, fuel })
     }
 
     pub fn func(&mut self, name: &str) -> anyhow::Result<TypedFunc<(i32, i32, i32, i32), i64>> {
@@ -259,6 +264,9 @@ impl Harness {
         st.seed = seed;
         st.log.clear();
         let _ = self.sp.set(&mut self.store, wasmtime::Val::I32(STACK_TOP as i32));
+        if let Some(b) = self.budget {
+            let _ = b.set(&mut self.store, wasmtime::Val::I32(0));
+        }
         let _ = self.store.set_fuel(self.fuel * fuel_scale);
         let r = f.call(&mut self.store, (args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32));
         let outcome = match r {
@@ -285,6 +293,7 @@ impl Harness {
         // page that is the guard page, which is tracked like the others.
         let next: Vec<usize> = dirty.iter().map(|p| p + 1).filter(|&p| p <= PAGES).collect();
         dirty.extend(next);
-        Run { outcome, log: std::mem::take(&mut self.store.data_mut().log), dirty }
+        let spent = self.budget.and_then(|b| b.get(&mut self.store).i32()).map_or(0, |b| -(b as i64));
+        Run { outcome, log: std::mem::take(&mut self.store.data_mut().log), dirty, spent }
     }
 }

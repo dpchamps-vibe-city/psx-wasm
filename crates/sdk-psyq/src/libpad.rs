@@ -34,14 +34,14 @@
 //!   mode 100; a port with nothing found writes `FF 00` to its buffer
 //!   every vblank, one whose pad went away keeps its buffer for eleven
 //!   more vblanks first.
-//! - **The interrupt takes the original's time** (D60, D66). Its
-//!   busy-waits on SIO0 and root counter 2 poll once a loop-header pass,
-//!   and both see the cycle each pass is made at, so a wait ends at the
-//!   first pass at or after what it waits for ([`Spin`]): about 640
-//!   passes (12,800 cycles) for a poll and an empty port. The adapters
-//!   spend the passes from the guest's budget in the exception, a quantum
-//!   passing (nothing delivered) each time it runs out, as the original's
-//!   loops do. Games see it: bof4's `title-to-field` falls hundreds of
+//! - **The interrupt takes the original's time** (D60, D66, D71). Its
+//!   busy-waits on SIO0 and root counter 2 poll once a pass of the loop's
+//!   instructions, and both see the cycle each pass is made at, so a wait
+//!   ends at the first pass at or after what it waits for ([`Spin`]):
+//!   about 12,800 cycles for a poll and an empty port. The adapters spend
+//!   the passes' instructions from the guest's budget in the exception, a
+//!   quantum passing (nothing delivered) each time it runs out, as the
+//!   original's loops do. Games see it: bof4's `title-to-field` falls hundreds of
 //!   frames behind the device without the time; and when each wait took a
 //!   quantum (half a frame with two pads), btn's CD outran its CPU.
 //!
@@ -321,8 +321,7 @@ pub fn irq_step(m: &mut M, _step: u32) {
     if l.word(m, data::INT_EXEC) == 0 || start > stop {
         return;
     }
-    let budget = crate::libetc::LOOP_BUDGET;
-    let mut spin = Spin { pass: (m.quantum() / budget).max(1), now: 0, passes: 0 };
+    let mut spin = Spin { now: 0, insns: 0 };
     for chan in start.max(0)..=stop.min(1) {
         let chan = chan as u32;
         let p = recs + rec::SIZE * chan;
@@ -335,7 +334,7 @@ pub fn irq_step(m: &mut M, _step: u32) {
             }
         }
     }
-    spend_in_exception(m, spin.passes);
+    spend_in_exception(m, spin.insns);
 }
 
 /// SIO0 at libpad's rate (baud 88h, factor 1): cycles a byte takes, and
@@ -350,48 +349,59 @@ const SELECT_WAIT: u64 = 0x91 * 8;
 const COMMAND_WAIT: u64 = 0x3C * 8;
 const ACK_WAIT: u64 = 0x190 * 8;
 const DATA_ACK_WAIT: u64 = 0x1AE * 8;
+/// The waits' loops (PsyQ 4.7 `pdresres.o`), the original's instructions
+/// a pass (D71), root counter 2 ticking at a cycle in 8 (its mode's bit
+/// 9): on root counter 2 (`_padInitSioMode` +398h..+3A4h, `_padSioRW2`
+/// +A00h..+A0Ch, each with `_padChkRC2wait`'s 24), for a byte's reply
+/// (`_padSioRW` +688h..+698h, `_padSioRW2` +8A0h..+8B0h), for /ACK
+/// after a reply (`_padSioRW2` +94Ch..+9D0h) and for a data byte's
+/// (`_padSioRW` +784h..+7B0h, the check's 24 among them).
+const RC2_PASS: u64 = 4 + 24;
+const RX_PASS: u64 = 5;
+const ACK_PASS: u64 = 20;
+const DATA_ACK_PASS: u64 = 12 + 24;
 
 /// libpad's busy-waits as the runtime runs a guest loop: each poll is a
-/// loop-header pass, and SIO0 and root counter 2 see the cycle it is made
-/// at (D66), so a wait ends at the first pass at or after what it waits
-/// for. `now` counts from the handler's start.
+/// pass of the loop's instructions, and SIO0 and root counter 2 see the
+/// cycle it is made at (D66, D71), so a wait ends at the first pass at or
+/// after what it waits for. `now` counts the cycles from the handler's
+/// start (psxw-abi `guest::CYCLES_PER_INSTRUCTION` an instruction),
+/// `insns` the instructions.
 pub struct Spin {
-    /// Cycles a pass takes.
-    pass: u64,
     now: u64,
-    /// Passes made.
-    passes: u64,
+    insns: u64,
 }
 
 impl Spin {
-    fn until(&mut self, t: u64) {
+    /// Passes of `per` instructions until `t`.
+    fn until(&mut self, t: u64, per: u64) {
         if t > self.now {
-            let k = (t - self.now).div_ceil(self.pass);
-            self.now += k * self.pass;
-            self.passes += k;
+            let cycles = per * psxw_abi::guest::CYCLES_PER_INSTRUCTION as u64;
+            let k = (t - self.now).div_ceil(cycles);
+            self.now += k * cycles;
+            self.insns += k * per;
         }
     }
 }
 
-/// `n` loop-header passes of code running in the exception: the guest's
-/// budget spent as the original's loops spend it, a quantum passing
+/// `n` of the original's instructions running in the exception: the
+/// guest's budget spent as the original spends it, a quantum passing
 /// (nothing delivered) each time it runs out.
 pub(crate) fn spend_in_exception(m: &mut M, n: u64) {
-    let budget = crate::libetc::LOOP_BUDGET;
-    let left = m.regs.budget() as u64;
-    if left == 0 {
-        let t = m.clock.now + n * m.quantum() / budget;
+    let Some(left) = m.regs.budget() else {
+        let t = m.clock.now + n * m.quantum() / (psx_bios::BUDGET / crate::UNIT) as u64;
         m.clock.advance_to(t);
         return;
+    };
+    let mut left = left as i64 - n as i64 * crate::UNIT;
+    let mut quanta = 0;
+    while left <= 0 {
+        left += psx_bios::BUDGET;
+        quanta += 1;
     }
-    if n < left {
-        m.regs.set_budget((left - n) as u32);
-        return;
-    }
-    let r = n - left;
-    let t = m.clock.now + (1 + r / budget) * m.quantum();
+    let t = m.clock.now + quanta * m.quantum();
     m.clock.advance_to(t);
-    m.regs.set_budget((budget - r % budget) as u32);
+    m.regs.set_budget(left as i32);
 }
 
 /// What a slot's device answers, a byte at a time: a digital pad
@@ -444,11 +454,11 @@ fn exchange(m: &mut M, l: Lib, recs: u32, chan: u32, spin: &mut Spin) -> std::re
     send_auto(m, p);
     let rx = m.mem.r32(p + rec::RX);
     m.mem.w8(rx, 0);
-    x.spin.until(start + SELECT_WAIT);
+    x.spin.until(start + SELECT_WAIT, RC2_PASS);
     x.select(m);
     // State 1: the command, after a wait (the reply to select isn't kept).
     x.reply_acknowledged(ACK_WAIT, -2)?;
-    x.spin.until(x.spin.now + COMMAND_WAIT);
+    x.spin.until(x.spin.now + COMMAND_WAIT, RC2_PASS);
     let request = m.mem.r8(p + rec::REQUEST);
     x.next(m, if request != 0 { request } else { POLL });
     // State 2: the ID, which says how many data bytes follow; the TAP
@@ -534,17 +544,18 @@ impl Exchange<'_> {
 
     /// Spin until the byte in flight's reply is in.
     fn received(&mut self) {
-        self.spin.until(self.sent + BYTE);
+        self.spin.until(self.sent + BYTE, RX_PASS);
     }
 
     /// Spin until the byte in flight's /ACK, or until `wait` from `from`
-    /// passes without one: the exchange ends with `code`.
-    fn acknowledge(&mut self, from: u64, wait: u64, code: i32) -> std::result::Result<(), i32> {
+    /// passes without one, `per` instructions a pass: the exchange ends
+    /// with `code`.
+    fn acknowledge(&mut self, from: u64, wait: u64, per: u64, code: i32) -> std::result::Result<(), i32> {
         if self.reply.1 {
-            self.spin.until(self.sent + BYTE + ACK_DELAY);
+            self.spin.until(self.sent + BYTE + ACK_DELAY, per);
             Ok(())
         } else {
-            self.spin.until(from + wait);
+            self.spin.until(from + wait, per);
             Err(code)
         }
     }
@@ -554,7 +565,7 @@ impl Exchange<'_> {
     fn reply_acknowledged(&mut self, wait: u64, code: i32) -> std::result::Result<(), i32> {
         self.received();
         let from = self.spin.now;
-        self.acknowledge(from, wait, code)
+        self.acknowledge(from, wait, ACK_PASS, code)
     }
 
     /// `_padSioRW` (data bytes): the wait is counted from before the
@@ -562,7 +573,7 @@ impl Exchange<'_> {
     fn data_acknowledged(&mut self) -> std::result::Result<(), i32> {
         let from = self.spin.now;
         self.received();
-        self.acknowledge(from, DATA_ACK_WAIT, -0x14)
+        self.acknowledge(from, DATA_ACK_WAIT, DATA_ACK_PASS, -0x14)
     }
 }
 
@@ -988,10 +999,11 @@ mod tests {
         assert_eq!(m.mem.r8(RECORDS + rec::CURRENT), CONFIG, "in port 1's record");
         assert_eq!(m.mem.r32(DATA + data::CALLED), 1);
         // The handler's waits end at the pass that sees what they wait for
-        // (D66): a refused command and nothing connected take 628 passes.
-        // This machine has no guest budget, so the passes are its time.
+        // (D66, D71): a refused command and nothing connected take 12,606
+        // cycles. This machine has no guest budget, so the passes are its
+        // time.
         let spent = |m: &M| m.clock.now - m.clock.video.vblank_at(m.vblanks);
-        assert_eq!(spent(&m), 12_560);
+        assert_eq!(spent(&m), 12_606);
         for _ in 0..11 {
             assert_eq!(state(&mut m, 0), 1);
             vblanks(&mut m, 1);
@@ -999,8 +1011,8 @@ mod tests {
         assert_eq!(m.mem.r8(RECORDS + rec::STATE), STATE_FIND_CTP1);
         vblanks(&mut m, 1);
         assert_eq!(state(&mut m, 0), 1, "the poll's reply is pending");
-        // A poll and nothing connected: 642 passes.
-        assert_eq!(spent(&m), 12_840);
+        // A poll and nothing connected: 12,908 cycles.
+        assert_eq!(spent(&m), 12_908);
         vblanks(&mut m, 1);
         assert_eq!(state(&mut m, 0), 2);
         assert_eq!(info(&mut m, 0, 100), 12);

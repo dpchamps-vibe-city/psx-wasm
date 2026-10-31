@@ -78,16 +78,16 @@ pub trait Regs {
     /// (psxw-abi `guest::BUDGET_RESET`): an adapter that replaces a
     /// busy-wait leaves it as the wait's last safepoint would.
     fn reset_budget(&mut self) {}
-    /// The guest's safepoint budget: loop-header passes left before its
-    /// next safepoint (psxw-abi `guest::BUDGET_GET`), 1 to the link's
-    /// budget; 0 where there is no guest to ask. An adapter that replaces
-    /// code with loops spends what the original's loops would
-    /// (`set_budget`, psxw-abi `guest::BUDGET_SET`), with a safepoint each
-    /// time it runs out.
-    fn budget(&self) -> u32 {
-        0
+    /// The guest's safepoint budget left (psxw-abi `guest::BUDGET_GET`), in
+    /// the original's instructions in fixed point (`guest::BUDGET_UNIT`,
+    /// D71): at or below 0, the next loop header takes a safepoint. `None`
+    /// where there is no guest to ask. An adapter that replaces code spends
+    /// what the original's instructions would (`set_budget`, psxw-abi
+    /// `guest::BUDGET_SET`), with a safepoint each time it runs out.
+    fn budget(&self) -> Option<i32> {
+        None
     }
-    fn set_budget(&mut self, _v: u32) {}
+    fn set_budget(&mut self, _v: i32) {}
 }
 
 /// A guest function to call with o32 arguments.
@@ -232,9 +232,9 @@ pub trait Sdk: Sized + 'static {
     }
 }
 
-/// The link's safepoint budget: loop-header passes per quantum
-/// (psxw-build's, which the link compiles into every loop header).
-pub const LOOP_BUDGET: u64 = 1000;
+/// The link's safepoint budget a quantum gives (psxw-abi `guest::BUDGET`):
+/// the original's instructions in fixed point (`guest::BUDGET_UNIT`, D71).
+pub const BUDGET: i64 = psxw_abi::guest::BUDGET as i64;
 
 pub struct Machine<S> {
     pub mem: Box<dyn Mem>,
@@ -380,25 +380,27 @@ impl<S: Sdk> Machine<S> {
         any
     }
 
-    /// The safepoint quantum: virtual time a guest loop's [`LOOP_BUDGET`]
-    /// header passes take (§6).
+    /// The safepoint quantum: virtual time the guest's [`BUDGET`] takes
+    /// (§6): an original instruction a cycle by default.
     pub fn quantum(&self) -> u64 {
         if self.opts.safepoint_quantum == 0 { 20_000 } else { self.opts.safepoint_quantum as u64 }
     }
 
     /// The cycle the guest is at for SIO0 and root counter 2 (D66):
-    /// virtual time moves a quantum at a safepoint, but the loop passes the
-    /// guest has made since its budget started over took their share of
-    /// that quantum. A busy-wait on a byte, its /ACK or the counter so sees
-    /// the cycle each poll is made at and ends when the hardware's would,
-    /// not at the next safepoint. While events are delivered, or with no
-    /// guest to ask, it is the clock.
+    /// virtual time moves a quantum at a safepoint, but the instructions the
+    /// guest has run since took their share of it (D71), past it where the
+    /// guest overran its budget before its next loop header. A busy-wait on
+    /// a byte, its /ACK or the counter so sees the cycle each poll is made
+    /// at and ends when the hardware's would, not at the next safepoint.
+    /// While events are delivered, or with no guest to ask, it is the clock.
     pub fn guest_now(&self) -> u64 {
-        let left = self.regs.budget() as u64;
-        if self.delivering || left == 0 || left > LOOP_BUDGET {
-            return self.clock.now;
+        match self.regs.budget() {
+            Some(left) if !self.delivering => {
+                let spent = (BUDGET - left as i64).max(0) as u64;
+                self.clock.now + spent * self.quantum() / BUDGET as u64
+            }
+            _ => self.clock.now,
         }
-        self.clock.now + (LOOP_BUDGET - left) * self.quantum() / LOOP_BUDGET
     }
 
     /// Advance to the next event (or `limit`) and deliver it.

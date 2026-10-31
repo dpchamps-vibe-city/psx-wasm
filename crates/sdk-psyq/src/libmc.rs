@@ -39,9 +39,10 @@
 //! card answers.
 //!
 //! **Time.** The wait before the address byte (`_mcxSioRW`'s, on root
-//! counter 2) polls once a loop-header pass, the counter at each pass's
-//! cycle (D66), so it ends after 58 passes inside the vblank interrupt:
-//! the adapter spends them from the guest's budget, as libpad's do (D60). An /ACK raises IRQ7 in the interrupt
+//! counter 2) polls once a pass of 19 instructions, the counter at each
+//! pass's cycle (D66, D71), so it ends after 31 passes inside the vblank
+//! interrupt: the adapter spends them from the guest's budget, as
+//! libpad's do (D60). An /ACK raises IRQ7 in the interrupt
 //! controller at its time, as SIO0's device does, which leaves it pending
 //! until the next interrupt the machine takes walks the chains.
 //!
@@ -130,6 +131,11 @@ const SET_UIFS: u32 = 17;
 /// The wait before the address byte (`_mcxSetRC2wait(0x91)`): ticks of 8
 /// cycles.
 const ADDRESS_WAIT: u64 = 0x91 * 8;
+/// The original's instructions a pass (D71) of `_mcxSioRW`'s wait on root
+/// counter 2 (`mcxmain` +39Ch..+430h, the counter running) and of
+/// `_mcxStepSio`'s for the last byte (+408h..+418h).
+const ADDRESS_PASS: u32 = 19;
+const LAST_PASS: u32 = 5;
 /// SIO0's JOY_BAUD once libmcx has reset the port.
 const BAUD: u16 = 0x88;
 
@@ -304,13 +310,13 @@ fn sio_rw(m: &mut M, b: u8) -> std::result::Result<u8, String> {
     Ok(got)
 }
 
-/// A busy-wait in the interrupt: a loop-header pass per poll, each at the
-/// cycle it is made (D66), so it ends at the first pass at or after `t`;
-/// the passes spend the guest's budget, a quantum passing (nothing
-/// delivered) each time it runs out (D60).
-fn spin(m: &mut M, t: u64) {
-    let pass = (crate::libetc::quantum(m) / crate::libetc::LOOP_BUDGET).max(1);
-    crate::libpad::spend_in_exception(m, t.div_ceil(pass));
+/// A busy-wait in the interrupt: a pass of `per` instructions per poll,
+/// each at the cycle it is made (D66), so it ends at the first pass at or
+/// after `t`; the passes spend the guest's budget, a quantum passing
+/// (nothing delivered) each time it runs out (D60).
+fn spin(m: &mut M, t: u64, per: u32) {
+    let cycles = per as u64 * psxw_abi::guest::CYCLES_PER_INSTRUCTION as u64;
+    crate::libpad::spend_in_exception(m, t.div_ceil(cycles) * per as u64);
 }
 
 /// JOY_CTRL 40h, then mode 0Dh, baud 88h and control 0: the port reset.
@@ -459,7 +465,7 @@ fn step_sio(m: &mut M, l: Lib, k: Then) -> Result {
         put(m, l.at(data::STAT), RUNNING);
         let port = get(m, l.at(data::PORT));
         init_sio_mode(m, ((port as i32) >> 4) as u32)?;
-        spin(m, ADDRESS_WAIT);
+        spin(m, ADDRESS_WAIT, ADDRESS_PASS);
         send(m, (port as u8 & 0xF).wrapping_add(0x81));
         m.mem.w8(l.tx_buf, (port as u8 & 0xF).wrapping_sub(0x7F));
         let n = get(m, l.at(data::TX_LEN));
@@ -504,7 +510,7 @@ fn last(m: &mut M, l: Lib, k: Then) -> Result {
     let f = get(m, l.func_no);
     if !((f == 14 || f == 15) && get(m, l.at(data::RX_LEN)) == get(m, l.data_len) + 4) {
         let t = byte_time(&m.sdk.mc.wire);
-        spin(m, t);
+        spin(m, t, LAST_PASS);
     }
     let seq = get(m, l.at(data::CMD_SEQ)) + 1;
     put(m, l.at(data::CMD_SEQ), seq);
@@ -749,7 +755,7 @@ mod tests {
             assert_eq!(steps[1], IrqStep::Sdk(STEP_START_TAIL));
             let t = m.clock.now;
             adapter(&mut m, dsr_entry, DSR_ENTRY);
-            assert_eq!(m.clock.now - t, 58 * 20, "the address byte's wait: its 58 passes (D66)");
+            assert_eq!(m.clock.now - t, 31 * 19 * 2, "the address byte's wait: its 31 passes (D66, D71)");
             irq_step(&mut m, STEP_START_TAIL);
             assert_eq!((get(&m, DATA + data::STAT), get(&m, DATA + data::TX_LEN), m.mem.r8(TX_BUF)), (RUNNING, 1, 0x81 + (port as u8 & 0xF)));
             assert_eq!(m.chain(1)[0], DATA + data::DSR_ENT, "at the head of priority 1, before the kernel's");

@@ -62,7 +62,11 @@ pub mod replay;
 /// - 15: a function pointer to a BIOS stand-in ([`BIOS_STAND_INS`]) reaches
 ///   its thunk in [`BIOS_THUNKS`], which calls `psx.bios` with the
 ///   stand-in's address.
-pub const ABI_VERSION: u32 = 15;
+/// - 16: the safepoint budget counts the original's instructions in fixed
+///   point ([`guest::BUDGET_UNIT`], D71): guest code spends it per block
+///   and checks it at loop headers; `guest_budget_get`/`set` are in those
+///   units and may be at or below 0 between checks.
+pub const ABI_VERSION: u32 = 16;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -562,12 +566,29 @@ pub mod guest {
     /// adapters that replace a busy-wait (D59, D60): the guest resumes
     /// with the budget the original's last safepoint would have left it.
     pub const BUDGET_RESET: &str = "guest_budget_reset";
-    /// `() -> i32`: the safepoint budget left (loop-header passes before
-    /// the next safepoint). With [`BUDGET_SET`], `(i32) -> ()`, for
-    /// adapters that replace code with loops (D63): they spend what the
-    /// original's loops would.
+    /// `() -> i32`: the safepoint budget left, in [`BUDGET_UNIT`]s: at or
+    /// below 0, the next loop header takes a safepoint. With
+    /// [`BUDGET_SET`], `(i32) -> ()`, for adapters that replace code
+    /// (D63, D71): they spend what the original's instructions would.
     pub const BUDGET_GET: &str = "guest_budget_get";
     pub const BUDGET_SET: &str = "guest_budget_set";
+    /// The safepoint budget's unit (D71): a sixteenth of one of the
+    /// original's instructions. Lifted code spends each MIPS block's
+    /// instructions in it; decompiled C its estimate, which needs the
+    /// fraction.
+    pub const BUDGET_UNIT: i32 = 16;
+    /// What an instruction takes on average (D71): stalls aren't modelled
+    /// one by one, but a main-RAM load takes about five cycles where an
+    /// instruction from the cache takes one (psx-spx). At one cycle, libetc's
+    /// `VSync` countdown (1 << 15 passes of 14 instructions) ran out before
+    /// a frame did.
+    pub const CYCLES_PER_INSTRUCTION: i32 = 2;
+    /// The budget a safepoint quantum gives: the default quantum's 20,000
+    /// cycles of instructions.
+    pub const BUDGET: i32 = 20_000 / CYCLES_PER_INSTRUCTION * BUDGET_UNIT;
+    /// The global lifted code's spends name (psxw-lift's `psxw_rt.h`): every
+    /// link resolves it to its budget.
+    pub const BUDGET_SYMBOL: &str = "psxw_budget";
     /// binaryen Asyncify's control functions (D57): `(data_ptr) -> ()`
     /// start an unwind or a rewind over the data structure at `data_ptr`
     /// (current position, end, then the saved frames); `() -> ()` stop

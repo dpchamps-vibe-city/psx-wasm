@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const SCHEMA_VERSION: u32 = 1;
 const PAIRS_PER_SHARD: usize = 48;
-const FUEL: u64 = 20_000_000;
+/// Twice what it was before the budget's spends (D71), which add a few
+/// operators to each block of the translation and segment of the C.
+const FUEL: u64 = 40_000_000;
 /// Fuel is a termination bound, not semantics: the translation keeps every
 /// guest register in a local and re-reads memory at loop heads, so it may
 /// take a few times the C's wasm instructions for the same work.
@@ -80,6 +82,11 @@ pub struct PairReport {
     /// Seeds where both sides took a bus error.
     #[serde(skip_serializing_if = "is_zero")]
     pub both_fault: u32,
+    /// Per seed both sides returned alike: the safepoint budget each spent
+    /// (psxw-abi `guest::BUDGET_UNIT`s, D71), the C's estimate and the
+    /// translation's exact count of the original's instructions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub time: Vec<[i64; 2]>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -278,6 +285,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                     seed: None,
                     both_fuel: 0,
                     both_fault: 0,
+                    time: vec![],
                 });
                 false
             }
@@ -347,6 +355,9 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             (o.clone(), m)
         })
         .collect();
+    // The original's loops and instructions, which the C spends (D71).
+    let costs: BTreeMap<(String, u32), psxw_link::cost::LoopTree> =
+        translations.iter().map(|t| ((t.func.container.clone(), t.func.addr), t.graph.loop_tree())).collect();
     let base_seed = 0x5053_5857u64;
     let done = AtomicUsize::new(0);
     let nshards = shards.len();
@@ -371,6 +382,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                 &shard_dir,
                 opts,
                 base_seed,
+                &costs,
             );
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 10 == 0 || n == nshards {
@@ -388,6 +400,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                         seed: None,
                         both_fuel: 0,
                         both_fault: 0,
+                        time: vec![],
                     })
                     .collect()
             })
@@ -412,7 +425,34 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     };
     let json = out.join("difftest.json");
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
+    eprintln!("difftest: {}", time_summary(&report.pairs));
     Ok((report, json))
+}
+
+/// How far the C's estimated time is from the translation's exact count
+/// (D71): over every seed both sides ran alike, the error (C - T) / T as
+/// percentiles of its size, and the totals' ratio.
+pub fn time_summary(pairs: &[PairReport]) -> String {
+    let runs: Vec<[i64; 2]> = pairs.iter().flat_map(|p| p.time.iter().copied()).filter(|[_, t]| *t > 0).collect();
+    if runs.is_empty() {
+        return "time: no runs".into();
+    }
+    let mut err: Vec<f64> = runs.iter().map(|[c, t]| (*c - *t) as f64 / *t as f64).collect();
+    err.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+    let at = |q: f64| 100.0 * err[((err.len() - 1) as f64 * q) as usize].abs();
+    let within = |x: f64| 100.0 * err.iter().filter(|e| e.abs() <= x).count() as f64 / err.len() as f64;
+    let (c, t): (i64, i64) = runs.iter().fold((0, 0), |(a, b), [c, t]| (a + c, b + t));
+    format!(
+        "time: {} runs, C/T error |e| p50 {:.1}% p90 {:.1}% p99 {:.1}% max {:.1}%; within 10% {:.1}%, 25% {:.1}%; totals C/T {:.3}",
+        err.len(),
+        at(0.5),
+        at(0.9),
+        at(0.99),
+        at(1.0),
+        within(0.10),
+        within(0.25),
+        c as f64 / t as f64
+    )
 }
 
 /// The division checks the game's own C was assembled with, read from the
@@ -468,6 +508,7 @@ fn run_shard(
     dir: &Path,
     opts: &Options,
     base_seed: u64,
+    costs: &BTreeMap<(String, u32), psxw_link::cost::LoopTree>,
 ) -> Result<Vec<PairReport>> {
     let container = shard[0].container.clone();
     let mut inputs: Vec<Input> = Vec::new();
@@ -506,7 +547,7 @@ fn run_shard(
             o32: false,
         });
     }
-    let mode = Mode::Harness { sp: runner::STACK_TOP, gp, dirty: Some(runner::DIRTY_MAP) };
+    let mode = Mode::Harness { sp: runner::STACK_TOP, gp, dirty: Some(runner::DIRTY_MAP), costs: Some(costs) };
     let linked = psxw_link::link(map, Some(rodata), mode, &inputs, &exports)?;
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::default())
         .validate_all(&linked.wasm)
@@ -589,6 +630,7 @@ fn run_pair(
         seed: None,
         both_fuel: 0,
         both_fault: 0,
+        time: vec![],
     };
     for k in 0..seeds {
         let seed = runner::mix(base_seed ^ ((p.addr as u64) << 16) ^ k as u64);
@@ -611,11 +653,13 @@ fn run_pair(
         // When only one side runs out of fuel the budget, not the code,
         // decided: retry once with RETRY_FUEL_SCALE times as much for both.
         let mut verdict = Err(("fuel", String::new()));
+        let mut spent = [0, 0];
         for scale in [1, RETRY_FUEL_SCALE] {
             let c = h.run(&fc, seed, args, &scratch, &stack, scale);
             let c_pages: BTreeMap<usize, Vec<u8>> = c.dirty.iter().map(|&pg| (pg, h.page(pg).to_vec())).collect();
             h.restore(&c.dirty);
             let t = h.run(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE * scale);
+            spent = [c.spent, t.spent];
             verdict = compare(h, p, &c, &t, &c_pages, masks, same_string);
             let mut all = c.dirty.clone();
             all.extend(t.dirty.iter().copied());
@@ -628,7 +672,7 @@ fn run_pair(
             }
         }
         match verdict {
-            Ok(Agree::Same) => {}
+            Ok(Agree::Same) => report.time.push(spent),
             Ok(Agree::BothFuel) => report.both_fuel += 1,
             Ok(Agree::BothFault) => report.both_fault += 1,
             Err((verdict, detail)) => {

@@ -25,7 +25,8 @@ pub struct Options {
     pub game: String,
     /// Trap on guest accesses to the I/O window.
     pub debug_io: bool,
-    /// Loop iterations between safepoints.
+    /// The safepoint budget a quantum gives, in the original's instructions
+    /// in fixed point (psxw-abi `guest::BUDGET`, D71).
     pub budget: u32,
     /// Compile the C with UBSan in trap mode (`game-ubsan.wasm`).
     pub ubsan: bool,
@@ -71,7 +72,7 @@ impl Options {
         Self {
             game: game.into(),
             debug_io: false,
-            budget: 1000,
+            budget: psxw_abi::guest::BUDGET as u32,
             ubsan: false,
             original: vec![],
             probes: vec![],
@@ -582,6 +583,13 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         // ones the translator expands into its callers.
         slots: opts.moddable.then(|| tiers.keys().filter(|k| !expanded.contains(*k)).cloned().collect()),
         threads: !switches.is_empty(),
+        // Decompiled C spends what its original's instructions take (D71).
+        costs: translations
+            .iter()
+            .map(|t| ((t.func.container.clone(), t.func.addr), t))
+            .filter(|(k, _)| matches!(tiers.get(k), Some(Tier::C { .. })))
+            .map(|(k, t)| (k, t.graph.loop_tree()))
+            .collect(),
         probes: inputs
             .manifest
             .run

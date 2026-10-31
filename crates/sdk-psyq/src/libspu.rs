@@ -270,34 +270,32 @@ fn back(m: &mut M, v: u32) -> F {
 
 use crate::safepoint;
 
-/// `n` passes of the original's loop headers: the guest's safepoint budget
-/// spent as they spend it, a safepoint each time it runs out.
+/// `n` of the original's instructions, up to one of its loop headers or
+/// calls, spent from the guest's budget (D71); a loop header that finds it
+/// run out takes a safepoint ([`header`]).
 pub(crate) fn spend(m: &mut M, n: u32, k: K) -> F {
-    let b = m.regs.budget();
-    if b == 0 || n < b {
-        if b != 0 {
-            m.regs.set_budget(b - n);
-        }
-        return k(m);
-    }
-    safepoint(m, move |m: &mut M| spend(m, n - b, k))
+    crate::take(m, n as u64);
+    header(m, k)
 }
 
-/// `for i in from..n { body(i) }` as the original's loop runs it: one
-/// header pass (budget) before each body.
-pub(crate) fn each(m: &mut M, from: u32, n: u32, body: Rc<dyn Fn(&mut M, u32)>, k: K) -> F {
+/// One of the original's loop headers: a safepoint where the budget has
+/// run out, as the link's check there takes it.
+fn header(m: &mut M, k: K) -> F {
+    if m.regs.budget().is_some_and(|b| b <= 0) {
+        return safepoint(m, move |m: &mut M| header(m, k));
+    }
+    k(m)
+}
+
+/// `for i in from..n { body(i) }` as the original's loop runs it: its
+/// header, then `per` instructions, before each body.
+pub(crate) fn each(m: &mut M, from: u32, n: u32, per: u32, body: Rc<dyn Fn(&mut M, u32)>, k: K) -> F {
     let mut i = from;
     while i < n {
-        let b = m.regs.budget();
-        if b == 1 {
-            return safepoint(m, move |m: &mut M| {
-                body(m, i);
-                each(m, i + 1, n, body, k)
-            });
+        if m.regs.budget().is_some_and(|b| b <= 0) {
+            return safepoint(m, move |m: &mut M| each(m, i, n, per, body, k));
         }
-        if b != 0 {
-            m.regs.set_budget(b - 1);
-        }
+        crate::take(m, per as u64);
         body(m, i);
         i += 1;
     }
@@ -505,6 +503,7 @@ fn init_modes(m: &mut M, o: SpuO, hot: bool) -> F {
                 m,
                 0,
                 PARK_PASSES,
+                1,
                 park,
                 Box::new(move |m| {
                     sp(m, |s| s.set_mask_bits(Mask::KeyOn, 0xFF_FFFF));
@@ -560,6 +559,7 @@ fn manual_chunk(m: &mut M, o: SpuO, src: u32, left: u32, before: u16, k: K) -> F
                 m,
                 0,
                 halves,
+                1,
                 Rc::new(move |m, i| {
                     let h = m.mem.r16(src + 2 * i);
                     sp(m, |s| s.push_transfer(h));
@@ -895,6 +895,7 @@ fn get_all_keys_status(m: &mut M, a: [u32; 4]) -> Result {
         m,
         0,
         24,
+        1,
         Rc::new(move |m, v| {
             let on = m.mem.r32(keystat) & 1 << v != 0;
             let envx = sp(m, |s| s.voice_envelope(v as usize));

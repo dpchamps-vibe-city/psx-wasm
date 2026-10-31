@@ -180,11 +180,11 @@ impl Regs for FfiRegs {
     fn reset_budget(&mut self) {
         unsafe { guest_budget_reset() }
     }
-    fn budget(&self) -> u32 {
-        unsafe { guest_budget_get() as u32 }
+    fn budget(&self) -> Option<i32> {
+        Some(unsafe { guest_budget_get() })
     }
-    fn set_budget(&mut self, v: u32) {
-        unsafe { guest_budget_set(v as i32) }
+    fn set_budget(&mut self, v: i32) {
+        unsafe { guest_budget_set(v) }
     }
 }
 

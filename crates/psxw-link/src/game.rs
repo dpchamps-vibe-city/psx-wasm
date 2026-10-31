@@ -11,7 +11,8 @@
 //!   checks the same when entered (D69).
 //! - C calls C directly when the signatures agree; every other edge goes
 //!   through o32 adapters.
-//! - Every loop header spends the safepoint budget.
+//! - Guest code spends the safepoint budget as it runs the original's
+//!   instructions (D71), and every loop header checks it.
 
 use crate::layout::{Layout, Rodata};
 use crate::link::{Input, Linked};
@@ -51,7 +52,9 @@ pub struct GameSpec {
     /// Overlay residency (D69): each container's code where overlays load
     /// ([`residency`]).
     pub resident: Vec<Residency>,
-    /// Loop iterations between safepoints.
+    /// The safepoint budget a quantum gives (psxw-abi `guest::BUDGET`):
+    /// guest code spends the original's instructions from it (D71), and a
+    /// loop header that finds it run out takes a safepoint.
     pub budget: u32,
     /// Trap on guest accesses to the I/O window.
     pub debug_io: bool,
@@ -80,6 +83,10 @@ pub struct GameSpec {
     /// with Asyncify, which exports the control functions; otherwise the
     /// link exports stubs.
     pub threads: bool,
+    /// Each decompiled C function's original: its instructions by natural
+    /// loop (the lifter's graph), which its wasm spends (D71,
+    /// [`crate::cost`]).
+    pub costs: BTreeMap<(String, u32), crate::cost::LoopTree>,
 }
 
 /// One container's code where overlays load (D69): the guest decides it
@@ -756,6 +763,7 @@ impl Resolver for R<'_, '_> {
         match s.name.as_str() {
             "__stack_pointer" if self.ctx.mod_of[self.input].is_some() => Ok(self.ctx.mod_sp),
             "__stack_pointer" => Ok(self.ctx.sp),
+            guest::BUDGET_SYMBOL => Ok(self.ctx.budget),
             other => bail!("guest code uses global {other}"),
         }
     }
@@ -848,55 +856,36 @@ impl Resolver for R<'_, '_> {
         Ok(out)
     }
 
+    fn costs(&mut self, func_symbol: Option<&str>) -> Option<(u32, crate::cost::LoopTree)> {
+        let inp = &self.ctx.inputs[self.input];
+        if self.ctx.mod_of[self.input].is_some() || inp.generated {
+            return None;
+        }
+        let NameClass::Guest(g) = classify_name(func_symbol?) else { return None };
+        let addr = self.ctx.map.resolve(&inp.container, g)?.addr;
+        let tree = self.ctx.spec.costs.get(&(inp.container.clone(), addr))?;
+        Some((self.ctx.budget, tree.clone()))
+    }
+
     fn loop_entry(&mut self) -> Vec<I<'static>> {
         // A mod's loops don't move the game's virtual time.
         if self.ctx.mod_of[self.input].is_some() {
             return Vec::new();
         }
+        // The budget is spent where the code runs (D71); run out, a
+        // quantum passes and the budget it gives is added, so what was spent
+        // past it carries over.
         let (b, n) = (self.ctx.budget, self.ctx.spec.budget as i32);
         vec![
             I::GlobalGet(b),
             I::I32Const(1),
-            I::I32Sub,
-            I::GlobalSet(b),
-            I::GlobalGet(b),
-            I::I32Eqz,
+            I::I32LtS,
             I::If(BlockType::Empty),
+            I::GlobalGet(b),
             I::I32Const(n),
-            I::GlobalSet(b),
-            I::Call(self.ctx.import(psx::SAFEPOINT)),
-            I::End,
-        ]
-    }
-
-    /// A bulk copy or fill stands for a loop moving a word a pass, as libc's
-    /// `memcpy`/`memset` and GCC's block moves do: it spends a pass per
-    /// word, and every safepoint that many passes reach.
-    fn bulk_spend(&mut self, n: u32) -> Vec<I<'static>> {
-        if self.ctx.mod_of[self.input].is_some() {
-            return Vec::new();
-        }
-        let (b, q) = (self.ctx.budget, self.ctx.spec.budget as i32);
-        vec![
-            I::GlobalGet(b),
-            I::LocalGet(n),
-            I::I32Const(2),
-            I::I32ShrU,
-            I::I32Sub,
-            I::GlobalSet(b),
-            I::Block(BlockType::Empty),
-            I::Loop(BlockType::Empty),
-            I::GlobalGet(b),
-            I::I32Const(0),
-            I::I32GtS,
-            I::BrIf(1),
-            I::GlobalGet(b),
-            I::I32Const(q),
             I::I32Add,
             I::GlobalSet(b),
             I::Call(self.ctx.import(psx::SAFEPOINT)),
-            I::Br(0),
-            I::End,
             I::End,
         ]
     }

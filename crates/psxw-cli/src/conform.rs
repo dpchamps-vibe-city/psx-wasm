@@ -722,7 +722,7 @@ impl sdk_psyq::cases::Harness for ChipSide<'_> {
         Ok(())
     }
 
-    fn budget(&mut self) -> u32 {
+    fn budget(&mut self) -> i32 {
         self.c.budget()
     }
 

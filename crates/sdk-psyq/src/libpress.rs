@@ -34,15 +34,17 @@
 //! enables.
 //!
 //! **Waits spin like libpress's loops** (the MDEC taking input, DMA1
-//! running): each iteration a pass of the guest's budget, a safepoint
-//! (interrupts delivered) each time it runs out, and after 0x100000 iterations the timeout,
+//! running): each iteration the original's 16 instructions from the
+//! guest's budget (D71), a safepoint (interrupts delivered) each time it
+//! runs out, and after 0x100000 iterations the timeout,
 //! which prints libpress's message through the game's `printf` and resets
 //! the MDEC and both channels, as the original does.
 //!
 //! DMA0's and DMA1's address and block registers hold what libpress wrote
 //! and, once a transfer ends, what the controller leaves (the address past
 //! the last word, no blocks left). `DecDCTPutEnv`'s table copies spend the
-//! guest's safepoint budget, 32 passes.
+//! guest's safepoint budget: two loops of 16 iterations, 5 instructions
+//! each.
 
 use crate::{Adapter, M, Psyq, Result, reg, set_reg};
 use psx_bios::{Flow, GuestCall};
@@ -225,6 +227,11 @@ fn busy(m: &mut M, b: Busy) -> bool {
     }
 }
 
+/// The waits' loops (PsyQ 4.7, `libpress:0x4fc..0x518` and
+/// `0x530..0x54c`, the same at `0x590`): the original's instructions an
+/// iteration (D71).
+const WAIT_PASS: u32 = 16;
+
 /// `libpress:0x4cc` (the input) and `0x560` (DMA1): while busy, count
 /// down from 0x100000, timing out past zero. `k` gets 0, or -1 after the
 /// timeout.
@@ -239,11 +246,12 @@ fn wait(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
 /// a quantum (what fell due delivered, interrupts taken, those held
 /// included), and another look.
 fn spin(m: &mut M, o: Obj, b: Busy, left: u32, k: K) -> Flow<Psyq> {
-    let room = crate::budget(m);
-    if left < room {
-        crate::take(m, left);
+    let room = crate::room(m, WAIT_PASS) as u32;
+    if left <= room {
+        crate::take(m, left as u64 * WAIT_PASS as u64);
         return timeout(m, o, b, k);
     }
+    crate::take(m, room as u64 * WAIT_PASS as u64);
     crate::safepoint(m, move |m| if busy(m, b) { spin(m, o, b, left - room, k) } else { k(m, 0) })
 }
 
@@ -341,8 +349,8 @@ fn dct_put_env(m: &mut M, a: [u32; 4]) -> Result {
         m.mem.w32(o.data + data::LUMA + 4 * i, luma);
         m.mem.w32(o.data + data::CHROMA + 4 * i, chroma);
     }
-    // The copy's two loops of 16 passes.
-    Ok(crate::libspu::spend(m, 32, Box::new(move |m| tables(m, o, Box::new(move |_, _| Flow::ret(env))))))
+    // The copy's two loops of 16 iterations (+E0h..+F4h, +10Ch..+120h).
+    Ok(crate::libspu::spend(m, 2 * 16 * 5, Box::new(move |m| tables(m, o, Box::new(move |_, _| Flow::ret(env))))))
 }
 
 /// `DecDCTin(buf, mode)`: the command word's depth (mode bit 0: 24-bit,
@@ -537,11 +545,12 @@ mod tests {
         flat_macroblock(&mut m, IN, 40);
         run(&mut m, at::DCT_OUT, dct_out, [OUT, 256, 0, 0]);
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [1, 0, 0, 0]), 1);
-        // The wait for DMA1 times out after 0x100001 iterations (1,048
-        // quanta and some), prints, and resets: DMA1 takes zeros.
+        // The wait for DMA1 times out after 0x100001 iterations of 16
+        // instructions (1,677 quanta and some), prints, and resets: DMA1
+        // takes zeros.
         let t = m.clock.now;
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [0, 0, 0, 0]), u32::MAX);
-        assert_eq!((m.clock.now - t) / 20_000, 1048);
+        assert_eq!((m.clock.now - t) / 20_000, 1677);
         assert_eq!(irq_calls(), vec![PRINTF]);
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [1, 0, 0, 0]), 0);
         assert_eq!(run(&mut m, at::IN_SYNC, dct_in_sync, [1, 0, 0, 0]), 0);

@@ -976,9 +976,9 @@ impl Conform {
 
     /// The guest's safepoint budget left (psxw-abi `guest::BUDGET_GET`),
     /// 0 for a module without it.
-    pub fn budget(&mut self) -> u32 {
+    pub fn budget(&mut self) -> i32 {
         match self.instance.get_typed_func::<(), i32>(&mut self.store, psxw_abi::guest::BUDGET_GET) {
-            Ok(f) => f.call(&mut self.store, ()).map_or(0, |v| v as u32),
+            Ok(f) => f.call(&mut self.store, ()).unwrap_or(0),
             Err(_) => 0,
         }
     }

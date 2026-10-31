@@ -8,6 +8,8 @@
 //! delay. Loop heads carry a compiler memory barrier, so every iteration
 //! performs its loads as the original does. An access at a constant
 //! address that isn't RAM (a device register) is volatile and fenced.
+//! Each basic block starts by spending its instructions from the
+//! safepoint budget (`PSXW_SPEND`, D71).
 
 use crate::analysis::Facts;
 use crate::decode::{Insn, Op, disasm};
@@ -58,6 +60,8 @@ pub struct Emitter<'a> {
     /// on every path: it dispatches on ra as an inlined `jr ra` does.
     guarded: BTreeSet<u32>,
     preds: BTreeMap<Node, Vec<Node>>,
+    /// Each basic block's first node and its instructions ([`Graph::blocks`]).
+    blocks: BTreeMap<Node, u32>,
     skip: BTreeSet<Node>,
     temps: BTreeSet<String>,
     pub externs: BTreeSet<String>,
@@ -85,6 +89,7 @@ impl<'a> Emitter<'a> {
             reads_chain: false,
             guarded: BTreeSet::new(),
             preds,
+            blocks: g.blocks(),
             skip: BTreeSet::new(),
             temps: BTreeSet::new(),
             externs: BTreeSet::new(),
@@ -190,6 +195,9 @@ impl<'a> Emitter<'a> {
             let head = self.preds.get(&n).is_some_and(|ps| ps.iter().any(|p| p.pc() >= pc));
             let barrier = if head { " __asm__ __volatile__(\"\" ::: \"memory\");" } else { "" };
             let _ = writeln!(self.body, "L_{pc:08X}:;{barrier}");
+        }
+        if let Some(&len) = self.blocks.get(&n) {
+            self.line(&format!("PSXW_SPEND({});", len as i32 * psxw_abi::guest::BUDGET_UNIT));
         }
         if insn.op.has_delay_slot() {
             return self.group(pc, &ov);

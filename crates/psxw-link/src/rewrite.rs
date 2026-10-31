@@ -8,11 +8,16 @@
 //!    the window's base (`WINDOW_BASE`, or a debug build's): RAM through
 //!    KUSEG and KSEG0 inline, anything else through `psx.map_access`
 //!    ([`Window`]). A bulk copy or fill reaches the I/O hook as its bytes
-//!    would, and spends the safepoint budget (`Resolver::bulk_spend`).
+//!    would.
 //! 2. **Guest SP.** `__stack_pointer` becomes the guest's `$sp` global.
-//! 3. **Calls** are resolved by the linker, which may lower intrinsics to
+//!    Lifted code's budget global (psxw-abi `guest::BUDGET_SYMBOL`)
+//!    becomes the link's budget.
+//! 3. **Virtual time** for decompiled C: each straight-line segment spends
+//!    the original's instructions it stands for ([`crate::cost`], D71);
+//!    every loop header checks the budget ([`Resolver::loop_entry`]).
+//! 4. **Calls** are resolved by the linker, which may lower intrinsics to
 //!    plain instructions.
-//! 4. **`call_indirect`** sites call an o32 helper for their signature,
+//! 5. **`call_indirect`** sites call an o32 helper for their signature,
 //!    because function pointers are MIPS addresses.
 
 use crate::object::{FuncType, WasmObject};
@@ -60,14 +65,17 @@ pub trait Resolver {
     /// Instructions to run at the start of a function (GCC's `main` calls
     /// `__main`).
     fn prologue(&mut self, func_symbol: Option<&str>) -> Result<Vec<I<'static>>>;
-    /// Instructions at the top of every loop body: the safepoint budget.
+    /// Instructions at the top of every loop body: the safepoint budget's
+    /// check.
     fn loop_entry(&mut self) -> Vec<I<'static>> {
         Vec::new()
     }
-    /// Instructions after a bulk copy or fill of the bytes counted in local
-    /// `n`: the safepoint budget the loop that moves them spends.
-    fn bulk_spend(&mut self, _n: u32) -> Vec<I<'static>> {
-        Vec::new()
+    /// For decompiled C: the budget global and the original's loops and
+    /// instructions of the function `func_symbol` names, so its segments
+    /// spend the original's time (D71). `None`: they spend nothing (lifted
+    /// code spends its own; mods move no time).
+    fn costs(&mut self, _func_symbol: Option<&str>) -> Option<(u32, crate::cost::LoopTree)> {
+        None
     }
     /// When set, the function (`(window offset, kind) -> ()`) every access
     /// to the I/O window calls: a load before reading (so a device model
@@ -238,9 +246,19 @@ pub fn rewrite_mapped<R: Resolver>(
     locals.extend([(2, ValType::I32), (1, ValType::I64), (1, ValType::F32), (1, ValType::F64), (4, ValType::I32)]);
     let mut out = Function::new(locals);
     let index = func as u32 + obj.num_imported_funcs();
-    for i in r.prologue(obj.func_symbol(index).map(|s| s.name.as_str()))? {
+    let symbol = obj.func_symbol(index).map(|s| s.name.as_str());
+    for i in r.prologue(symbol)? {
         out.instruction(&i);
     }
+    // Decompiled C's spends, by operator index (D71).
+    let (budget, mut spends) = match r.costs(symbol) {
+        Some((g, tree)) => {
+            let ops = body.get_operators_reader()?.into_iter().collect::<Result<Vec<_>, _>>()?;
+            (g, crate::cost::spends(&ops, &tree, psxw_abi::guest::BUDGET_UNIT as u64).into_iter().peekable())
+        }
+        None => (0, Vec::new().into_iter().peekable()),
+    };
+    let mut op_index = 0;
 
     let relocs = obj.relocs_for(&f.body);
     let mut ri = 0;
@@ -255,6 +273,13 @@ pub fn rewrite_mapped<R: Resolver>(
         if let Some(v) = offsets.as_deref_mut() {
             v.push((pos - f.body.start as u32, out.byte_len() as u32));
         }
+        if let Some((_, units)) = spends.next_if(|&(at, _)| at == op_index) {
+            out.instruction(&I::GlobalGet(budget));
+            out.instruction(&I::I32Const(units as i32));
+            out.instruction(&I::I32Sub);
+            out.instruction(&I::GlobalSet(budget));
+        }
+        op_index += 1;
         let op = ops.read()?;
         let end = ops.original_position() as u32;
         let base = obj.code_start as u32;
@@ -593,10 +618,12 @@ struct Bulk {
 impl Bulk {
     /// A bulk copy (`[dst, src, n]` on the stack) or fill (`[dst, value,
     /// n]`): each side's `n` bytes mapped into the window (all in one
-    /// region), the destination's pages marked dirty, and the budget spent
-    /// ([`Resolver::bulk_spend`]). With an I/O hook, one whose bytes reach
-    /// the I/O ports moves them one at a time through it, as the loads and
-    /// stores it stands for would.
+    /// region) and the destination's pages marked dirty. With an I/O hook,
+    /// one whose bytes reach the I/O ports moves them one at a time through
+    /// it, as the loads and stores it stands for would. It spends nothing
+    /// of its own (D71): the original's instructions that move the bytes
+    /// are its blocks' (lifted code) or its region's (decompiled C), and
+    /// clang's zero-fills of locals (D27) the original doesn't have.
     fn emit<R: Resolver>(self, out: &mut Function, r: &mut R, copy: bool, io: Option<u32>, dirty: Option<u32>) -> Result<()> {
         out.instruction(&I::LocalSet(self.n));
         out.instruction(&I::LocalSet(self.from));
@@ -627,9 +654,6 @@ impl Bulk {
         }
         if io.is_some() {
             out.instruction(&I::End);
-        }
-        for i in r.bulk_spend(self.n) {
-            out.instruction(&i);
         }
         Ok(())
     }

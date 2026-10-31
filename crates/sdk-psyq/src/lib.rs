@@ -63,48 +63,74 @@ pub(crate) fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result
     }
 }
 
-/// Loop-header passes left before the guest's next safepoint: its
-/// budget, or the link's when the host keeps none (tests).
-pub(crate) fn budget(m: &M) -> u32 {
-    match m.regs.budget() {
-        0 => libetc::LOOP_BUDGET as u32,
-        b => b,
+/// The budget an original instruction takes (psxw-abi `guest::BUDGET_UNIT`,
+/// D71): the unit of what adapters spend for the code they replace.
+pub(crate) const UNIT: i64 = psxw_abi::guest::BUDGET_UNIT as i64;
+
+/// The guest's safepoint budget left (D71): at or below 0, its next loop
+/// header takes a safepoint. The link's whole budget where the host keeps
+/// none (tests).
+pub(crate) fn budget(m: &M) -> i64 {
+    m.regs.budget().map_or(psx_bios::BUDGET, i64::from)
+}
+
+/// `n` of the original's instructions spent from the guest's budget.
+pub(crate) fn take(m: &mut M, n: u64) {
+    if let Some(b) = m.regs.budget() {
+        m.regs.set_budget((b as i64 - n as i64 * UNIT) as i32);
     }
 }
 
-/// `n` passes, fewer than [`budget`]'s, spent from the guest's budget.
-pub(crate) fn take(m: &mut M, n: u32) {
-    let b = m.regs.budget();
-    if b != 0 {
-        m.regs.set_budget(b - n);
+/// Passes of a loop of `per` instructions an iteration until the budget
+/// runs out: the next pass's loop header takes a safepoint.
+pub(crate) fn room(m: &M, per: u32) -> u64 {
+    match budget(m) {
+        b if b <= 0 => 0,
+        b => (b as u64).div_ceil(per as u64 * UNIT as u64),
     }
 }
 
-/// A safepoint in the code an adapter replaces: the budget starts over, a
-/// quantum passes, what fell due is delivered and its callbacks run.
+/// A safepoint in the code an adapter replaces: the budget a quantum gives
+/// is added (what was spent past the last carries over), a quantum
+/// passes, what fell due is delivered and its callbacks run.
 pub(crate) fn safepoint(m: &mut M, k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
     m.release_irq();
-    m.regs.reset_budget();
+    if let Some(b) = m.regs.budget() {
+        m.regs.set_budget(b + psx_bios::BUDGET as i32);
+    }
     let until = m.clock.now + libetc::quantum(m);
     m.run_until(until);
     Flow::Block { until: psx_bios::Wait::Cycle(until), then: Box::new(k) }
 }
 
-/// A guest loop an adapter replaces, which looks at `done` once a pass for
-/// at most `limit` passes (SDK3-5): the passes spend the guest's budget as
-/// the original's loop headers do, a safepoint each time it runs out. What
-/// `done` reads changes only at a safepoint, so the passes between are
-/// spent at once. `k(true)` once it holds, `k(false)` past the limit.
-pub(crate) fn poll(m: &mut M, limit: u64, done: std::rc::Rc<dyn Fn(&mut M) -> bool>, k: Box<dyn FnOnce(&mut M, bool) -> Flow<Psyq>>) -> Flow<Psyq> {
+/// A guest loop an adapter replaces, of `per` instructions an iteration
+/// (the original's, D71), which looks at `done` once a pass for at most
+/// `limit` passes (SDK3-5): each pass spends its instructions from the
+/// guest's budget, and the pass after the budget runs out comes after a
+/// safepoint, as the original's loop header takes it. What `done` reads
+/// changes only at a safepoint, so the passes between are spent at once.
+/// `k(true)` once it holds, `k(false)` past the limit.
+pub(crate) fn poll(
+    m: &mut M,
+    per: u32,
+    limit: u64,
+    done: std::rc::Rc<dyn Fn(&mut M) -> bool>,
+    k: Box<dyn FnOnce(&mut M, bool) -> Flow<Psyq>>,
+) -> Flow<Psyq> {
+    if limit == 0 {
+        return k(m, false);
+    }
+    take(m, per as u64);
     if done(m) {
         return k(m, true);
     }
-    let room = budget(m) as u64;
-    if limit < room {
-        take(m, limit as u32);
+    let more = room(m, per).min(limit - 1);
+    take(m, more * per as u64);
+    let left = limit - 1 - more;
+    if left == 0 {
         return k(m, false);
     }
-    safepoint(m, move |m| poll(m, limit - room, done, k))
+    safepoint(m, move |m| poll(m, per, left, done, k))
 }
 
 /// A call the replaced code makes to a guest function `f` (the game's

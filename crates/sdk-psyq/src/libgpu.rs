@@ -39,9 +39,10 @@
 //! adapter bound by its place in `sys.o` (`libgpu/sys:0x23a8`, a static
 //! function with no name), at its own address, and `_GPU_ResetCallback` an
 //! adapter. Waits (`DrawSync(0)`, a full queue, the `*2` functions) spin
-//! as libgpu's loops do, each iteration a pass of the guest's budget,
-//! counting toward libgpu's timeout (0xF0000 iterations or 240 vblanks),
-//! which resets the queue and the GPU as libgpu does.
+//! as libgpu's loops do, each iteration the original's instructions from
+//! the guest's budget (D71; the pump's own left out), counting toward
+//! libgpu's timeout (0xF0000 iterations or 240 vblanks), which resets the
+//! queue and the GPU as libgpu does.
 //!
 //! **What isn't reproduced.** Debug output (`SetGraphDebug(n)`, n > 0):
 //! libgpu's rectangle checks and `GPU_printf` traces. Waits for GPUSTAT's
@@ -177,6 +178,15 @@ const READY: u32 = 1 << 26;
 /// libgpu's timeout: iterations (its counter passing this), and vblanks.
 const TIMEOUT_ITERATIONS: u32 = 0xF0000;
 const TIMEOUT_VBLANKS: u32 = 0xF0;
+
+/// The waits' iterations (PsyQ 4.7 `sys.o`), the original's instructions
+/// each (D71), the timeout check's 25 (`sys:0x28b4`, not timing out)
+/// among them: a full queue's (`sys:0x212c..0x2160`), `DrawSync(0)`'s
+/// first loop (`sys:0x2764..0x279c`) and its second's, the `*2`
+/// functions' alike (`sys:0x27a0..0x27cc`, DMA2 busy).
+const QUEUE_FULL_PASS: u32 = 14 + 25;
+const SYNC_QUEUE_PASS: u32 = 15 + 25;
+const IDLE_PASS: u32 = 12 + 25;
 
 /// Where `libgpu/sys` is in this game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,10 +378,11 @@ fn reset_after_timeout(m: &mut M, s: Sys) -> std::result::Result<(), String> {
     unmask(m, s, data::MASK_RESET)
 }
 
-/// `n` iterations of one of libgpu's wait loops, each a timeout check;
-/// at a thousand a safepoint quantum passes. `k(false)` once the timeout
-/// ran out (libgpu's reset done), else `k(true)`.
-fn iterate(m: &mut M, s: Sys, n: u32, k: KOk) -> Flow<Psyq> {
+/// `n` iterations of one of libgpu's wait loops of `per` instructions,
+/// each a timeout check; where they run the budget out, a safepoint.
+/// `k(false)` once the timeout ran out (libgpu's reset done), else
+/// `k(true)`.
+fn iterate(m: &mut M, s: Sys, per: u32, n: u32, k: KOk) -> Flow<Psyq> {
     let deadline = m.mem.r32(s.data + data::DEADLINE);
     let count = m.mem.r32(s.data + data::COUNT);
     // An iteration fails when Vcount is past the deadline, or when the
@@ -383,18 +394,18 @@ fn iterate(m: &mut M, s: Sys, n: u32, k: KOk) -> Flow<Psyq> {
         return timeout(m, s, k);
     }
     m.mem.w32(s.data + data::COUNT, count + n);
-    let room = crate::budget(m);
-    if n < room {
-        crate::take(m, n);
+    let room = crate::room(m, per);
+    crate::take(m, n as u64 * per as u64);
+    if (n as u64) < room {
         return k(m, true);
     }
     crate::safepoint(m, move |m| k(m, true))
 }
 
-/// Iterations until the next safepoint: what a loop that can't make
-/// progress spins through before anything can change.
-fn to_safepoint(m: &M) -> u32 {
-    crate::budget(m)
+/// Iterations of `per` instructions until the next safepoint: what a loop
+/// that can't make progress spins through before anything can change.
+fn to_safepoint(m: &M, per: u32) -> u32 {
+    crate::room(m, per).max(1) as u32
 }
 
 /// `while (DMA2 busy || GPU not ready) if (timeout) fail;` (the `*2`
@@ -403,8 +414,8 @@ fn wait_idle(m: &mut M, s: Sys, k: KOk) -> Flow<Psyq> {
     if !busy(m) && ready(m) {
         return k(m, true);
     }
-    let n = to_safepoint(m);
-    iterate(m, s, n, Box::new(move |m, ok| if ok { wait_idle(m, s, k) } else { k(m, false) }))
+    let n = to_safepoint(m, IDLE_PASS);
+    iterate(m, s, IDLE_PASS, n, Box::new(move |m, ok| if ok { wait_idle(m, s, k) } else { k(m, false) }))
 }
 
 /// An error inside a continuation: the runtime traps with it.
@@ -437,14 +448,14 @@ fn enqueue(m: &mut M, s: Sys, func: u32, p: u32, len: u32, arg: u32, k: K) -> Fl
 fn enqueue_room(m: &mut M, s: Sys, func: u32, p: u32, len: u32, arg: u32, k: K) -> Flow<Psyq> {
     if (qin(m, s) + 1) & (QUEUE_LEN - 1) == qout(m, s) {
         // Full: `if (timeout) fail; pump();` until there's room.
-        let n = if busy(m) { to_safepoint(m) } else { 1 };
+        let n = if busy(m) { to_safepoint(m, QUEUE_FULL_PASS) } else { 1 };
         let again = move |m: &mut M, ok: bool| {
             if !ok {
                 return k(m, u32::MAX);
             }
             pump(m, s, Box::new(move |m, _| enqueue_room(m, s, func, p, len, arg, k)))
         };
-        return iterate(m, s, n, Box::new(again));
+        return iterate(m, s, QUEUE_FULL_PASS, n, Box::new(again));
     }
     let r = (|| -> std::result::Result<Option<u32>, String> {
         mask(m, s, data::MASK_QUEUE)?;
@@ -600,8 +611,8 @@ fn sync_queue(m: &mut M, s: Sys, k: K) -> Flow<Psyq> {
     if queued(m, s) == 0 {
         return wait_idle(m, s, Box::new(move |m, ok| k(m, if ok { 0 } else { u32::MAX })));
     }
-    let n = if busy(m) { to_safepoint(m) } else { 1 };
-    pump(m, s, Box::new(move |m, _| iterate(m, s, n, Box::new(move |m, ok| if ok { sync_queue(m, s, k) } else { k(m, u32::MAX) }))))
+    let n = if busy(m) { to_safepoint(m, SYNC_QUEUE_PASS) } else { 1 };
+    pump(m, s, Box::new(move |m, _| iterate(m, s, SYNC_QUEUE_PASS, n, Box::new(move |m, ok| if ok { sync_queue(m, s, k) } else { k(m, u32::MAX) }))))
 }
 
 // --- The work functions --------------------------------------------------
@@ -1323,8 +1334,9 @@ mod tests {
         assert_eq!(run(&mut m, at::DRAW_SYNC, draw_sync, [1, 0, 0, 0]), 1, "busy");
         let before = m.clock.now;
         assert_eq!(run(&mut m, at::DRAW_SYNC, draw_sync, [0; 4]), u32::MAX);
+        // 0xF0001 iterations of 37 instructions, 2 cycles each.
         let quanta = (m.clock.now - before) / 20_000;
-        assert!((982..=984).contains(&quanta), "{quanta} quanta");
+        assert!((3626..=3628).contains(&quanta), "{quanta} quanta");
         assert_eq!(m.mem.r32(DATA + data::COUNT), TIMEOUT_ITERATIONS + 2);
         assert_ne!(m.io.as_ref().unwrap().dma.dpcr & 0x800, 0, "the timeout enables DMA2");
         assert_eq!(run(&mut m, at::DRAW_SYNC, draw_sync, [1, 0, 0, 0]), 0);

@@ -17,7 +17,7 @@ pub mod machine;
 pub mod tables;
 pub mod threads;
 
-pub use machine::{Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, StandIn, Wait};
+pub use machine::{BUDGET, Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, StandIn, Wait};
 
 #[cfg(test)]
 pub mod testing {

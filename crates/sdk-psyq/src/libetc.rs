@@ -76,10 +76,11 @@ const RCNT1_MODE: u32 = 0x1F80_1114;
 const GPUSTAT: u32 = 0x1F80_1814;
 /// Interrupt lines (I_STAT bits 0-10).
 const LINES: usize = 11;
-/// The link's safepoint budget (psxw-build): guest loop iterations per
-/// safepoint, each of which moves virtual time by the boot options'
-/// quantum. A spin loop's iteration costs quantum / budget cycles.
-pub(crate) const LOOP_BUDGET: u64 = 1000;
+/// `vsync.o`'s waits (PsyQ 4.7), the original's instructions an iteration
+/// (D71): the Vcount wait's countdown (+1A0h..+1BCh and +1E8h..+1FCh)
+/// and the interlaced field's (+10Ch..+120h).
+const VCOUNT_PASS: u32 = 14;
+const FIELD_PASS: u32 = 6;
 
 /// libetc's adapter state: where the objects are, and what the dispatcher
 /// needs between its steps. Everything libetc itself keeps is in RAM.
@@ -652,8 +653,8 @@ fn vsync(m: &mut M, a: [u32; 4]) -> Result {
     }))
 }
 
-/// The safepoint quantum: virtual time a guest loop's thousand iterations
-/// take ([`LOOP_BUDGET`]).
+/// The safepoint quantum: virtual time the guest's budget takes
+/// (`psx_bios::BUDGET`).
 pub(crate) fn quantum(m: &M) -> u64 {
     if m.opts.safepoint_quantum == 0 { 20_000 } else { m.opts.safepoint_quantum as u64 }
 }
@@ -661,7 +662,7 @@ pub(crate) fn quantum(m: &M) -> u64 {
 /// `vsync.o`'s wait: until Vcount reaches `target`, counting down from
 /// `timeout << 15` meanwhile; when that runs out it says so through the
 /// game's `puts`, has the kernel acknowledge vblank itself, and goes on.
-/// Each look is a pass of the guest's budget ([`crate::poll`]). In NTSC it
+/// Each look is a pass of 14 instructions ([`crate::poll`]). In NTSC it
 /// only runs out when nothing counts vblanks: inside a handler or a
 /// critical section, libetc stopped, or line 0 taken by a handler that
 /// doesn't call libetc's.
@@ -671,6 +672,7 @@ fn wait_vcount(m: &mut M, v: VsyncO, target: u32, timeout: u32, then: impl FnOnc
     let reached = std::rc::Rc::new(move |m: &mut M| m.mem.r32(v.vcount) as i32 >= target as i32);
     crate::poll(
         m,
+        VCOUNT_PASS,
         iterations,
         reached,
         Box::new(move |m, reached| {
@@ -698,7 +700,7 @@ fn interlace(m: &mut M, v: VsyncO, before: u32, delta: u32) -> Flow<Psyq> {
         m.mem.w32(v.hcount, h);
         Flow::ret(delta)
     };
-    crate::poll(m, u64::MAX, std::rc::Rc::new(field_changed), Box::new(then))
+    crate::poll(m, FIELD_PASS, u64::MAX, std::rc::Rc::new(field_changed), Box::new(then))
 }
 
 /// btn's libetc as its code addresses it, for the tests: `intr.o`'s and
@@ -954,12 +956,14 @@ mod tests {
         assert_eq!(m.mem.r32(VCOUNT), 1);
         assert_eq!(irq_calls(), vec![0x8001_0002]);
         // Line 0 taken by a handler that never calls libetc's: VSync's
-        // countdown (1 << 15 passes) runs out, a quantum per budget's worth
-        // of them; the rest come off the guest's budget.
+        // countdown (1 << 15 passes of 14 instructions, 2 cycles each)
+        // runs out, a quantum per budget's worth of them; the rest come off
+        // the guest's budget.
         let before = m.clock.now;
         run(&mut m, 0, vsync, [0; 4]);
         assert_eq!(m.mem.r32(VCOUNT), 1);
-        assert_eq!((m.clock.now - before) / 20_000, (1 << 15) / LOOP_BUDGET);
+        let cpi = psxw_abi::guest::CYCLES_PER_INSTRUCTION as u64;
+        assert_eq!((m.clock.now - before) / 20_000, ((1 << 15) + 1) * VCOUNT_PASS as u64 * cpi / 20_000);
     }
 
     #[test]

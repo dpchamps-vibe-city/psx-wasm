@@ -105,10 +105,13 @@ pub struct Division {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Mode {
+pub enum Mode<'a> {
     /// Differential harness: every call is a call-out. With `dirty`, stores
-    /// mark their page in a byte map at that wasm address.
-    Harness { sp: u32, gp: u32, dirty: Option<u32> },
+    /// mark their page in a byte map at that wasm address. Lifted code
+    /// spends the budget global it exports (psxw-abi
+    /// `guest::BUDGET_SYMBOL`, D71), and so do C functions `costs` has the
+    /// original's loops of, by (container, address); nothing checks it.
+    Harness { sp: u32, gp: u32, dirty: Option<u32>, costs: Option<&'a BTreeMap<(String, u32), crate::cost::LoopTree>> },
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +161,7 @@ struct Ctx<'a> {
     inputs: &'a [Input],
     view: Vec<(&'a str, &'a WasmObject)>,
     layout: Layout,
-    mode: Mode,
+    mode: Mode<'a>,
     types: Vec<FuncType>,
     type_ix: HashMap<FuncType, u32>,
     nimports: u32,
@@ -171,6 +174,8 @@ struct Ctx<'a> {
     gp: u32,
     /// GCC's static chain between lifted functions (psxw_rt.h).
     chain: u32,
+    /// The safepoint budget guest code spends (D71).
+    budget: u32,
 }
 
 const CALLOUT_IMPORT: u32 = 0;
@@ -296,8 +301,20 @@ impl Resolver for InputResolver<'_, '_> {
         let s = &self.ctx.inputs[self.input].obj.symbols[symbol as usize];
         match s.name.as_str() {
             "__stack_pointer" => Ok(self.ctx.sp),
+            psxw_abi::guest::BUDGET_SYMBOL => Ok(self.ctx.budget),
             other => bail!("guest code uses global {other}"),
         }
+    }
+
+    fn costs(&mut self, func_symbol: Option<&str>) -> Option<(u32, crate::cost::LoopTree)> {
+        let Mode::Harness { costs, .. } = self.ctx.mode;
+        let inp = &self.ctx.inputs[self.input];
+        let NameClass::Guest(g) = classify_name(func_symbol?) else { return None };
+        if inp.generated {
+            return None;
+        }
+        let addr = self.ctx.guest_addr(self.input, g)?;
+        Some((self.ctx.budget, costs?.get(&(inp.container.clone(), addr))?.clone()))
     }
 
     fn data_addr(&mut self, symbol: u32) -> Result<u32> {
@@ -395,6 +412,7 @@ pub fn link(
         sp: 0,
         gp: 1,
         chain: 2,
+        budget: 3,
     };
     let map_ty = ctx.intern(&FuncType { params: vec![wasmparser::ValType::I32; 3], results: vec![wasmparser::ValType::I32] });
     let callout_ty = ctx.intern(&FuncType {
@@ -487,7 +505,7 @@ pub fn link(
     module.section(&memory);
     let Mode::Harness { sp, gp, .. } = ctx.mode;
     let mut globals = GlobalSection::new();
-    for init in [sp, gp, 0] {
+    for init in [sp, gp, 0, 0] {
         globals.global(
             GlobalType { val_type: ValType::I32, mutable: true, shared: false },
             &ConstExpr::i32_const(init as i32),
@@ -498,6 +516,7 @@ pub fn link(
     ex.export("memory", ExportKind::Memory, 0);
     ex.export("__guest_sp", ExportKind::Global, ctx.sp);
     ex.export("__guest_gp", ExportKind::Global, ctx.gp);
+    ex.export(psxw_abi::guest::BUDGET_SYMBOL, ExportKind::Global, ctx.budget);
     for (n, i) in &export_list {
         ex.export(n, ExportKind::Func, *i);
     }

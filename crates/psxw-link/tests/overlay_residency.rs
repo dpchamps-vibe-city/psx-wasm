@@ -93,6 +93,7 @@ fn calls_go_to_the_overlay_the_disc_wrote() {
         mods: None,
         slots: None,
         threads: false,
+        costs: Default::default(),
     };
     let linked = link(&map, None, &spec, &inputs).unwrap();
     wasmparser::Validator::new().validate_all(&linked.wasm).unwrap();

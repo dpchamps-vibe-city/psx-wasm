@@ -61,10 +61,10 @@ pub trait Harness {
     fn plug_port2(&mut self, _plugged: bool) -> Result<(), String> {
         Err("this harness can't change the pads".into())
     }
-    /// The guest's safepoint budget left (loop-header passes before the
-    /// next safepoint): what the original's loops spend, observable as
-    /// time (D60, D63). 0 where the build has none.
-    fn budget(&mut self) -> u32 {
+    /// The guest's safepoint budget left (psxw-abi `guest::BUDGET_GET`):
+    /// what the original's instructions spend, observable as time (D60,
+    /// D63, D71). 0 where the build has none.
+    fn budget(&mut self) -> i32 {
         0
     }
     /// A data symbol's address in the game, where its symbols name it.

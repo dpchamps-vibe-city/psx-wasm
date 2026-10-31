@@ -40,6 +40,16 @@ typedef struct { uint32_t v; } __attribute__((packed, aligned(1))) psxw_u32;
 #define PSXW_SWV(a, x) (((volatile psxw_u32 *)(uint32_t)(a))->v = (uint32_t)(x))
 #define PSXW_FENCE() __asm__ __volatile__("" ::: "memory")
 
+/* Virtual time (D71): each MIPS block spends its instructions from the
+ * safepoint budget as it starts, in the budget's fixed point (psxw-abi
+ * BUDGET_UNIT; the lifter writes the product). Volatile, so clang keeps
+ * each where it is and as often as it runs; no memory clobber, so memory
+ * is optimised around it. The link resolves the global to its budget and
+ * checks it at loop headers. */
+__asm__(".globaltype psxw_budget, i32\n");
+#define PSXW_SPEND(n) \
+    __asm__ __volatile__("global.get psxw_budget\n\ti32.const " #n "\n\ti32.sub\n\tglobal.set psxw_budget")
+
 /* Lowered by the linker to the shared guest-register globals. */
 uint32_t psxw_sp_get(void);
 void psxw_sp_set(uint32_t sp);

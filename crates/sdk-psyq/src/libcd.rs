@@ -37,16 +37,17 @@
 //! (`CdDataCallback`, the ring's frame callback) arrives as on the device.
 //! XA audio is the controller's (its decoder, into the SPU's CD input).
 //!
-//! **Waits spin,** as the original's loops do: a safepoint quantum at a
-//! time, interrupts taken between quanta (D59's rule for adapters that
-//! replace a loop). Inside a callback, where no interrupt is taken, a wait
-//! polls the controller and calls the callbacks itself, as the original
-//! does when `CheckCallback()` says so. Past 0x3C0000 passes a wait gives
-//! up as the original does ("CD timeout", `CD_flush`, -1).
+//! **Waits spin,** as the original's loops do: each pass its instructions
+//! from the guest's budget (D71), a safepoint each time it runs out,
+//! interrupts taken there (D59's rule for adapters that replace a loop).
+//! Inside a callback, where no interrupt is taken, a wait polls the
+//! controller and calls the callbacks itself, as the original does when
+//! `CheckCallback()` says so. Past 0x3C0000 passes a wait gives up as the
+//! original does ("CD timeout", `CD_flush`, -1).
 //!
 //! **Not reproduced:** the debug printouts (`CD_debug`).
 
-use crate::libetc::{LOOP_BUDGET, quantum};
+use crate::libetc::quantum;
 use crate::{Adapter, M, Psyq, Result, reg, ret, set_reg};
 use psx_bios::{Flow, GuestCall, Wait};
 use psx_devices::cdc::Cdc;
@@ -130,12 +131,16 @@ mod d {
 struct Site {
     name: u32,
     puts: u32,
+    /// The loop's instructions a pass, not timing out and not in a
+    /// callback (D71): `CD_sync` +5E4h..+7B0h, `CD_ready` +864h..+A78h,
+    /// `CD_cw` +CC0h..+E3Ch, `CD_datasync` +1398h..+1474h.
+    pass: u32,
 }
 
-const SYNC: Site = Site { name: 0x5CC, puts: 0x634 };
-const READY: Site = Site { name: 0x84C, puts: 0x8B4 };
-const CW: Site = Site { name: 0xC90, puts: 0xD10 };
-const DATASYNC: Site = Site { name: 0x1380, puts: 0x13E0 };
+const SYNC: Site = Site { name: 0x5CC, puts: 0x634, pass: 35 };
+const READY: Site = Site { name: 0x84C, puts: 0x8B4, pass: 38 };
+const CW: Site = Site { name: 0xC90, puts: 0xD10, pass: 30 };
+const DATASYNC: Site = Site { name: 0x1380, puts: 0x13E0, pass: 30 };
 
 /// `bios_1`'s `.bss`: the result buffers the callbacks get.
 mod bs {
@@ -421,16 +426,14 @@ fn poll(m: &mut M, b: Bios1, then: Next) -> Flow<Psyq> {
 
 type Done = fn(&mut M, Bios1) -> Option<u32>;
 
-/// One of the drive layer's wait loops (`CD_sync`, `CD_ready`, `CD_cw`):
-/// until `done` gives the result, or with `once` after one look (0). A
-/// thousand passes per safepoint quantum, interrupts taken between quanta;
-/// inside a callback each quantum polls the controller instead. After
-/// [`TIMEOUT_PASSES`]: "CD timeout", `CD_flush`, -1. A wait that spun
-/// leaves the guest's safepoint budget as the loop's last safepoint did:
-/// full (D60).
+/// One of the drive layer's wait loops (`CD_sync`, `CD_ready`, `CD_cw`,
+/// `CD_datasync`): until `done` gives the result, or with `once` after one
+/// look (0). Each pass spends the loop's instructions; the passes until
+/// the guest's budget runs out see the same, then a safepoint takes the
+/// interrupts (inside a callback the controller is polled instead). After
+/// [`TIMEOUT_PASSES`]: "CD timeout", `CD_flush`, -1.
 fn wait(m: &mut M, b: Bios1, site: Site, once: bool, done: Done, then: Then) -> Flow<Psyq> {
-    let deadline = m.clock.now + (TIMEOUT_PASSES + 1) * quantum(m) / LOOP_BUDGET;
-    pass(m, b, site, once, deadline, false, done, then)
+    pass(m, b, site, once, TIMEOUT_PASSES + 1, done, then)
 }
 
 /// "CD timeout: " through the game's `puts`, then "%s:(%s) Sync=%s,
@@ -445,30 +448,35 @@ fn timeout_message(m: &mut M, b: Bios1, site: Site, k: impl FnOnce(&mut M) -> Fl
     crate::say(m, (p - 4, p + 4, p), &[], move |m| crate::say(m, (p + 0x48, p + 0x50, p + 0x4C), &args, k))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn pass(m: &mut M, b: Bios1, site: Site, once: bool, deadline: u64, spun: bool, done: Done, then: Then) -> Flow<Psyq> {
-    let end = move |m: &mut M, v: u32, then: Then| {
-        if spun {
-            m.regs.reset_budget();
-        }
-        then(m, v)
-    };
-    if m.clock.now >= deadline {
+/// A pass of the wait, `left` before its timeout.
+fn pass(m: &mut M, b: Bios1, site: Site, once: bool, left: u64, done: Done, then: Then) -> Flow<Psyq> {
+    if left == 0 {
         return timeout_message(m, b, site, move |m| {
             flush(m, b);
-            end(m, u32::MAX, then)
+            then(m, u32::MAX)
         });
     }
     let rest: Next = Box::new(move |m: &mut M| {
+        crate::take(m, site.pass as u64);
         if let Some(v) = done(m, b) {
-            return end(m, v, then);
+            return then(m, v);
         }
         if once {
-            return end(m, 0, then);
+            return then(m, 0);
+        }
+        let more = crate::room(m, site.pass).min(left - 1);
+        crate::take(m, more * site.pass as u64);
+        let left = left - 1 - more;
+        if left == 0 {
+            return pass(m, b, site, once, 0, done, then);
+        }
+        // The next pass's loop header takes a safepoint.
+        if let Some(v) = m.regs.budget() {
+            m.regs.set_budget(v + psx_bios::BUDGET as i32);
         }
         let until = m.clock.now + quantum(m);
         m.run_until(until);
-        Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, site, once, deadline, true, done, then)) }
+        Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| pass(m, b, site, once, left, done, then)) }
     });
     // In a callback (libetc's dispatcher, or any exception) no interrupt
     // is taken: the loop polls the controller itself.

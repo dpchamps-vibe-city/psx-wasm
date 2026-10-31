@@ -157,10 +157,11 @@ fn element_verifier(m: &mut M, _a: [u32; 4]) -> Result {
 }
 
 /// The element's handler: SIO0's control register cleared, then a
-/// countdown of 11 passes.
+/// countdown from 10: the original's 98 instructions (D71; `pad:0x1e4`,
+/// 18 around ten passes of the loop's 8).
 fn element_handler(m: &mut M, _a: [u32; 4]) -> Result {
     set_reg(m, 0x1F80_104A, 2, 0)?;
-    crate::libpad::spend_in_exception(m, 11);
+    crate::libpad::spend_in_exception(m, 98);
     ret(0)
 }
 
