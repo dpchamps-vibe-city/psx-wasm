@@ -185,7 +185,7 @@ impl Sdk for Psyq {
     }
 
     fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
-        libgpu::stand_in(m, addr, state).or_else(|| libcd::stand_in(m, addr, state))
+        libcd::stand_in(m, addr, state)
     }
 }
 

@@ -25,7 +25,7 @@ pub fn cases() -> Vec<Case> {
     vec![
         Case { name: "gpu.reset-graph", chip: "gpu", level: 1, covers: &["ResetGraph"], needs: &["ResetGraph", "DrawSync", "GetDrawEnv", "GetDispEnv"], run: reset_graph },
         Case { name: "gpu.disp-mask", chip: "gpu", level: 1, covers: &["SetDispMask"], needs: &["ResetGraph", "SetDispMask", "GetDispEnv", "PutDispEnv"], run: disp_mask },
-        Case { name: "gpu.draw-sync", chip: "gpu", level: 1, covers: &["DrawSync"], needs: &["ResetGraph", "DrawSync", "DrawSyncCallback", "ClearOTagR", "DrawOTag"], run: draw_sync },
+        Case { name: "gpu.draw-sync", chip: "gpu", level: 1, covers: &["DrawSync", "libgpu/sys:0x23a8"], needs: &["ResetGraph", "DrawSync", "DrawSyncCallback", "ClearOTagR", "DrawOTag"], run: draw_sync },
         Case { name: "gpu.clear-image", chip: "gpu", level: 1, covers: &["ClearImage"], needs: &["ResetGraph", "DrawSync", "ClearImage"], run: clear_image },
         Case { name: "gpu.load-image", chip: "gpu", level: 1, covers: &["LoadImage"], needs: &["ResetGraph", "DrawSync", "LoadImage"], run: load_image },
         Case { name: "gpu.store-image", chip: "gpu", level: 1, covers: &["StoreImage"], needs: &["ResetGraph", "DrawSync", "StoreImage"], run: store_image },

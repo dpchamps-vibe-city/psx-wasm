@@ -35,8 +35,9 @@
 //! when a DrawSync callback is set or the GPU is busy; its pump runs the
 //! queue and calls the callback when the queue drains (with `a0` the
 //! callback's own address, as libgpu leaves it). The pump is also DMA2's
-//! completion callback, which the queue registers with `DMACallback`; it
-//! is a stand-in function here ([`PUMP`]), and `_GPU_ResetCallback` an
+//! completion callback, which the queue registers with `DMACallback`: an
+//! adapter bound by its place in `sys.o` (`libgpu/sys:0x23a8`, a static
+//! function with no name), at its own address, and `_GPU_ResetCallback` an
 //! adapter. Waits (`DrawSync(0)`, a full queue, the `*2` functions) spin
 //! as libgpu's loops do, a safepoint quantum per thousand iterations,
 //! counting toward libgpu's timeout (0xF0000 iterations or 240 vblanks),
@@ -45,12 +46,11 @@
 //! **What isn't reproduced.** Debug output (`SetGraphDebug(n)`, n > 0):
 //! libgpu's rectangle checks and `GPU_printf` traces. Waits for GPUSTAT's
 //! ready bits outside `DrawSync` (the GPU core is always ready between
-//! commands). The stand-in pump's address, which `DMACallback(2, …)`
-//! returns while it is registered.
+//! commands).
 
 use crate::{Adapter, M, Psyq, Result, reg, set_reg};
 use crate::layout::{dispenv, drawenv, rect};
-use psx_bios::{Flow, GuestCall, StandIn, Wait};
+use psx_bios::{Flow, GuestCall, Wait};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("ResetGraph", reset_graph),
@@ -68,11 +68,9 @@ pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("PutDispEnv", put_disp_env),
     ("GetODE", get_ode),
     ("_GPU_ResetCallback", gpu_reset_callback),
+    // The queue pump, DMA2's completion callback: static, bound by place.
+    ("libgpu/sys:0x23a8", pump_callback),
 ];
-
-/// libgpu's queue pump as DMA2's completion callback: a stand-in at an
-/// address no game code has (beside libetc's, [`crate::libetc`]).
-pub const PUMP: u32 = 0xBFC7_0100;
 
 /// `libgpu/sys` (PsyQ 4.7): offsets in its text.
 mod at {
@@ -91,6 +89,8 @@ mod at {
     pub const GET_ODE: u32 = 0x10d8;
     pub const MOVE_IMAGE2: u32 = 0x2c70;
     pub const GPU_RESET_CALLBACK: u32 = 0x2eb0;
+    /// The queue pump (static).
+    pub const PUMP: u32 = 0x23a8;
     /// The queue's work functions, what `_que` entries name: ClearImage's,
     /// LoadImage's and StoreImage's, and an ordering table's DMA.
     pub const CLEAR: u32 = 0x1914;
@@ -472,7 +472,7 @@ fn enqueue_room(m: &mut M, s: Sys, func: u32, p: u32, len: u32, arg: u32, k: K) 
     match r {
         Ok(Some(v)) => k(m, v),
         Ok(None) => Flow::Call {
-            call: dma_callback(s, PUMP),
+            call: dma_callback(s, s.text + at::PUMP),
             then: Box::new(move |m, _| {
                 let i = qin(m, s);
                 let e = s.que + i * ENTRY;
@@ -579,23 +579,10 @@ fn pump_from(m: &mut M, s: Sys, state: u32, k: K) -> Flow<Psyq> {
     }
 }
 
-/// The pump as DMA2's completion callback, called through [`PUMP`].
-pub fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<StandIn> {
-    if addr != PUMP {
-        return None;
-    }
-    let Some(s) = m.sdk.gpu.sys else {
-        m.log("libgpu: the queue pump ran before any libgpu adapter");
-        return Some(StandIn::Return(0));
-    };
-    Some(match pump_step(m, s, state) {
-        Ok(Step::Done(v)) => StandIn::Return(v as u64),
-        Ok(Step::Call(c, next)) => StandIn::Call(c, next),
-        Err(e) => {
-            m.log(&format!("libgpu pump: {e}"));
-            StandIn::Return(0)
-        }
-    })
+/// The pump as DMA2's completion callback (`DMACallback(2, …)`).
+fn pump_callback(m: &mut M, _a: [u32; 4]) -> Result {
+    let s = sys(m, at::PUMP)?;
+    Ok(pump(m, s, k_ret()))
 }
 
 /// `sys:0x2744`: `DrawSync(mode)`.
@@ -1014,7 +1001,7 @@ fn move_image2(m: &mut M, a: [u32; 4]) -> Result {
 /// `_GPU_ResetCallback()`: the pump DMA2's callback again.
 fn gpu_reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     let s = sys(m, at::GPU_RESET_CALLBACK)?;
-    Ok(Flow::Call { call: dma_callback(s, PUMP), then: Box::new(|_, v| Flow::Return(v)) })
+    Ok(Flow::Call { call: dma_callback(s, s.text + at::PUMP), then: Box::new(|_, v| Flow::Return(v)) })
 }
 
 /// `ClearOTagR(ot, n)`: the table cleared backwards by DMA6, then its

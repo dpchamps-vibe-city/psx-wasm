@@ -297,12 +297,15 @@ calls (TR1, B19).
 
 1. [x] **Record the decision** (table above, phase 2). D67, `c3aa557`;
    decided without the human under the /goal (the plan proposes it).
-2. [ ] **SDK2. libetc's state into its own data.** `Vcount`, `Hcount`,
+2. [x] **SDK2. libetc's state into its own data.** `Vcount`, `Hcount`,
    the handler, callback and DMA tables, the dispatcher's flags:
    `sdk-psyq/src/libetc.rs:4-7, 125-158, 303, 528-530`. Find them through
    the validated objects' code, as libgpu's adapters do (D61). The
    adapters read and write them there; nothing of libetc's stays in
    `m.sdk.etc` that the original keeps in RAM.
+   Done `b92f582` (with SDK6's libetc half): `Lib`/`VsyncO` found through
+   `intr.o`'s and `vsync.o`'s code (layout in Findings); only the
+   dispatcher's I_STAT and the interrupted sp stay in the runtime.
 3. [ ] **SDK1. libpad's state into its own data.** Port records, receive
    buffers, pending results: `sdk-psyq/src/libpad.rs:48-52, 146-161`.
    Same way as task 2. **Run:** both games' replays.
