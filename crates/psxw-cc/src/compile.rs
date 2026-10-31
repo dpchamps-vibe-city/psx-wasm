@@ -386,6 +386,21 @@ mod tests {
         got.sort();
         assert_eq!(got, [("bare".into(), "return-type".into()), ("falls".into(), "return-type".into())]);
     }
+
+    /// Under `-msoft-float`, every float operation lifts its function: the
+    /// 64-bit conversions, copysign and min/max too.
+    #[test]
+    fn soft_float_finds_every_float_operation() {
+        let c = "unsigned long long tou(float f) { return f; }\n\
+                 float fromu(unsigned long long x) { return x; }\n\
+                 float cs(float a, float b) { return __builtin_copysignf(a, b); }\n\
+                 double mx(double a, double b) { return __builtin_elementwise_maximum(a, b); }\n\
+                 float moved(float *p) { return *p; }\n";
+        let Some(mut got) = lifted(c, true) else { return eprintln!("skipped: run `psxw toolchain fetch`") };
+        got.sort();
+        let want: Vec<(String, String)> = ["cs", "fromu", "mx", "tou"].map(|f| (f.into(), "soft-float".into())).into();
+        assert_eq!(got, want);
+    }
 }
 
 /// Names of the functions in a wasm object whose code does floating-point
@@ -410,15 +425,21 @@ fn float_functions(obj: &Path) -> Result<BTreeSet<String>> {
                 let mut ops = body.get_operators_reader()?;
                 let mut uses = false;
                 while !ops.eof() {
+                    // Every float operation but loads, stores, constants
+                    // and reinterpretations, which only move bits.
                     uses |= matches!(
                         ops.read()?,
                         O::F32Add | O::F32Sub | O::F32Mul | O::F32Div | O::F64Add | O::F64Sub | O::F64Mul | O::F64Div
                             | O::F32Sqrt | O::F64Sqrt | O::F32Lt | O::F32Gt | O::F32Le | O::F32Ge | O::F32Eq | O::F32Ne
                             | O::F64Lt | O::F64Gt | O::F64Le | O::F64Ge | O::F64Eq | O::F64Ne
+                            | O::F32Min | O::F32Max | O::F64Min | O::F64Max | O::F32Copysign | O::F64Copysign
                             | O::F32ConvertI32S | O::F32ConvertI32U | O::F64ConvertI32S | O::F64ConvertI32U
-                            | O::F32ConvertI64S | O::F64ConvertI64S | O::F32DemoteF64 | O::F64PromoteF32
+                            | O::F32ConvertI64S | O::F32ConvertI64U | O::F64ConvertI64S | O::F64ConvertI64U
+                            | O::F32DemoteF64 | O::F64PromoteF32
                             | O::I32TruncF32S | O::I32TruncF64S | O::I32TruncF32U | O::I32TruncF64U
                             | O::I32TruncSatF32S | O::I32TruncSatF64S | O::I32TruncSatF32U | O::I32TruncSatF64U
+                            | O::I64TruncF32S | O::I64TruncF64S | O::I64TruncF32U | O::I64TruncF64U
+                            | O::I64TruncSatF32S | O::I64TruncSatF64S | O::I64TruncSatF32U | O::I64TruncSatF64U
                             | O::F32Neg | O::F64Neg | O::F32Abs | O::F64Abs | O::F32Floor | O::F64Floor
                             | O::F32Ceil | O::F64Ceil | O::F32Trunc | O::F64Trunc | O::F32Nearest | O::F64Nearest
                     );
