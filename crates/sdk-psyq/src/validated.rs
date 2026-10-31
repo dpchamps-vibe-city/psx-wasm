@@ -25,6 +25,7 @@ pub const VALIDATED: &[(&str, &str)] = &[
     ("libcd/c_003", "dd7223578f0a19736d3f37d70d070e8834816e8679219a6e655be23b358e35cf"),
     ("libcd/c_011", "b32c02a2f0d941f45e346ad1873bf59a88dd4f53d2bbdcc66fabef75de0862d8"),
     ("libetc/intr", "09b0feea2c632554bb610534332bc10cf1708c337d9cfd65247ac9400a35799e"),
+    ("libetc/intr_dma", "479a3d80051fe7ecd6d7f6b2b1465954486870a5ee3a155fa6cb5f4dfa411dc0"),
     ("libetc/vsync", "5ced3e577ea12a54481e823fd26a28b831c29d427c4728d4c35233f3c46095a8"),
     ("libgpu/sys", "02b22171147b3ca173f009f2cd944c513074ba6db33d956ed051c67cdba18e04"),
     ("libsnd/ssinit", "98ab21ea28fd556d6ceaa0d5b4ee9c24a45f3a991042375aa7ee2fd62a9bb831"),
