@@ -346,8 +346,11 @@ pub mod map {
     /// The window offset of a load (or a store) of `len` bytes at `addr`,
     /// all in one region; `None`: a bus error. An expansion region's load
     /// finds its byte at [`phys::OPEN_BUS`] only once the caller puts it
-    /// there.
+    /// there. No bytes (a bulk copy of 0) reach nothing, wherever `addr` is.
     pub fn access(addr: u32, len: u32, store: bool) -> Option<u32> {
+        if len == 0 {
+            return Some(phys::OPEN_BUS.start);
+        }
         let p = place(addr)?;
         let room = match p.region {
             Region::Expansion(_) => p.len.min(phys::OPEN_BUS.end - phys::OPEN_BUS.start),
@@ -414,6 +417,7 @@ pub mod map {
             assert_eq!(access(0xBFC0_0000, 4, true), Some(phys::OPEN_BUS.start));
             assert_eq!(access(0x1F00_0000, 4, false), Some(phys::OPEN_BUS.start));
             assert_eq!(access(0x1F00_0000, 0x100, false), None);
+            assert!(access(0x0080_0000, 0, true).is_some());
             assert_eq!(code_index(0xA001_0000), Some(0x4000));
             assert_eq!(code_index(0x8021_0000), Some(0x4000));
             assert_eq!(code_index(super::super::SYNTHETIC_CODE.start), Some(0x8_0000));
