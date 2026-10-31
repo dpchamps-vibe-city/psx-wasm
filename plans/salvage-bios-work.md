@@ -763,6 +763,26 @@ preserve the verified SDK helper's write/dequeue/enqueue ordering, and retain
 its own operand addresses across nested adapters. Other SDK families and all
 runtime/ABI architecture remain outside its contract; no subdelegation.
 
+That lane's `9ea994e` is reviewed and integrated as `b121b7d`: libapi now uses
+patchable dispatch/Flow, captures its original operands before callbacks, and
+sets the init flag only after the BIOS call returns. Its two regression tests
+cover patched ordering/reentry and firstfile's returned value. Parent also
+converted libetc's InterruptCallback/ResetCallback and VSync timeout BIOS calls:
+I_MASK restoration and subsequent setup/timeout continuations wait for guest
+patches, while existing clock/IRQ behavior and original object addresses remain.
+The combined SDK 39/runtime 8 tests and wasm32 runtime check pass. These are
+source gates, not a fresh game/replay or original-SDK conformance result.
+
+Resume `aca5bd30-9fcd-4232-a592-8ed276a12afc` owns only libpad's five analogous
+PadStartCom/PadStopCom calls in the same isolated SDK worktree. Libmc's synchronous
+BIOS bypasses (including its void IRQ-step path) and libgpu's direct GPU_cw call
+remain partial; no global helper or IRQ/runtime redesign is authorized.
+Read-only DeepSeek run `008e4a9a-fd2e-4f8a-9117-34759266ba0f` investigates only
+A(52h)/C(09h) evidence at parent `55d2c2e`, with a four-reference bound and no
+implementation authority. Console research was steered a second time after a
+completed 200-revision grep; it must implement available evidence-backed software
+or report unresolved circular-buffer/host-input/ioabort behavior, not invent it.
+
 ## Progress log
 
 - 2026-10-31: callable kernel functions and callback ordering integrated as

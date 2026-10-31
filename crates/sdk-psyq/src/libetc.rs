@@ -52,7 +52,8 @@
 //! locals). A callback that leaves with ReturnFromException from inside
 //! libetc's own handler isn't supported.
 
-use crate::{Adapter, M, Psyq, Result, bios, reg, ret, set_reg};
+use crate::{Adapter, M, Psyq, Result, reg, ret, set_reg};
+use psx_bios::machine::seq;
 use psx_bios::{Flow, GuestCall, IrqStep, StandIn, Wait};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
@@ -444,17 +445,17 @@ fn dma_channel(m: &mut M, table: u32, ch: u32, rest: u32) -> Flow<Psyq> {
 /// and the kernel's acknowledge flags for the lines its own handlers
 /// share (vblank: the pad and RCntCNT3; root counters 0-2). The previous
 /// handler.
-fn set_line(m: &mut M, l: Lib, irq: usize, h: u32) -> std::result::Result<u32, String> {
+fn set_line(m: &mut M, l: Lib, irq: usize, h: u32) -> Result {
     if l.context == 0 {
-        return Ok(0);
+        return ret(0);
     }
     let at = l.context + ctx::LINES + 4 * irq as u32;
     let prev = m.mem.r32(at);
     if h == prev {
-        return Ok(prev);
+        return ret(prev);
     }
     if !l.active(m) {
-        return Ok(prev);
+        return ret(prev);
     }
     let mut mask = reg(m, I_MASK, 2)?;
     set_reg(m, I_MASK, 2, 0)?;
@@ -470,15 +471,22 @@ fn set_line(m: &mut M, l: Lib, irq: usize, h: u32) -> std::result::Result<u32, S
         m.mem.w16(l.context + ctx::MASK, lines | bit);
     }
     let off = off as u32;
-    if irq == 0 {
-        bios(m, 0xB0, 0x5B, [off, 0, 0, 0])?;
-        bios(m, 0xC0, 0x0A, [3, off, 0, 0])?;
-    }
-    if (4..=6).contains(&irq) {
-        bios(m, 0xC0, 0x0A, [irq as u32 - 4, off, 0, 0])?;
-    }
-    set_reg(m, I_MASK, 2, mask)?;
-    Ok(prev)
+    // Keep I_MASK disabled across guest patches, and restore this call's
+    // saved mask only after both BIOS calls have returned.
+    let flow = if irq == 0 {
+        let flow = psx_bios::bios::dispatch(m, 0xB0, 0x5B, [off, 0, 0, 0])?;
+        seq(m, flow, move |m, _| {
+            psx_bios::bios::dispatch(m, 0xC0, 0x0A, [3, off, 0, 0]).unwrap_or_else(|e| panic!("InterruptCallback: {e}"))
+        })
+    } else if (4..=6).contains(&irq) {
+        psx_bios::bios::dispatch(m, 0xC0, 0x0A, [irq as u32 - 4, off, 0, 0])?
+    } else {
+        Flow::ret(0)
+    };
+    Ok(seq(m, flow, move |m, _| {
+        set_reg(m, I_MASK, 2, mask).unwrap_or_else(|e| panic!("InterruptCallback: {e}"));
+        Flow::ret(prev)
+    }))
 }
 
 /// `ResetCallback`: once (until `StopCallback`), mask and acknowledge every
@@ -506,16 +514,21 @@ fn reset_callback(m: &mut M, _a: [u32; 4]) -> Result {
     set_reg(m, RCNT1_MODE, 4, 0x100)?;
     m.mem.w32(l.vcount, 0);
     m.mem.write(l.vb_table, &[0; 32]);
-    set_line(m, l, 0, l.vb_handler)?;
-    m.mem.write(l.dma_table, &[0; 32]);
-    set_reg(m, DICR, 4, 0)?;
-    set_line(m, l, 3, l.dma_handler)?;
-    // _96_remove, then ExitCriticalSection. Keep the BIOS table patchable
-    // and allow its guest callback to return through the normal Flow.
-    let flow = psx_bios::bios::dispatch(m, 0xA0, 0x56, [0; 4])?;
-    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
-        m.crit = false;
-        psx_bios::Flow::ret(l.context)
+    let flow = set_line(m, l, 0, l.vb_handler)?;
+    Ok(seq(m, flow, move |m, _| {
+        // `l` belongs to the original object, even if a guest BIOS patch
+        // entered a different adapter and changed sdk.at in the meantime.
+        m.mem.write(l.dma_table, &[0; 32]);
+        set_reg(m, DICR, 4, 0).unwrap_or_else(|e| panic!("ResetCallback: {e}"));
+        let flow = set_line(m, l, 3, l.dma_handler).unwrap_or_else(|e| panic!("ResetCallback: {e}"));
+        seq(m, flow, move |m, _| {
+            // _96_remove, then ExitCriticalSection.
+            let flow = psx_bios::bios::dispatch(m, 0xA0, 0x56, [0; 4]).unwrap_or_else(|e| panic!("ResetCallback: {e}"));
+            seq(m, flow, move |m, _| {
+                m.crit = false;
+                Flow::ret(l.context)
+            })
+        })
     }))
 }
 
@@ -568,7 +581,7 @@ fn interrupt_callback(m: &mut M, a: [u32; 4]) -> Result {
     if irq >= LINES {
         return Err(format!("InterruptCallback({irq}, …): no such interrupt line"));
     }
-    ret(set_line(m, l, irq, a[1])?)
+    set_line(m, l, irq, a[1])
 }
 
 /// `DMACallback(ch, f)` (`intr_dma.o`'s setter): when `f` changes the
@@ -695,8 +708,11 @@ fn wait_vcount(m: &mut M, v: VsyncO, target: u32, timeout: u32, then: impl FnOnc
     let then = move |m: &mut M| {
         if !reached(m) {
             m.log("VSync: timeout");
-            let _ = bios(m, 0xB0, 0x5B, [0; 4]);
-            let _ = bios(m, 0xC0, 0x0A, [3, 0, 0, 0]);
+            let flow = psx_bios::bios::dispatch(m, 0xB0, 0x5B, [0; 4]).unwrap_or_else(|e| panic!("VSync: {e}"));
+            return seq(m, flow, move |m, _| {
+                let flow = psx_bios::bios::dispatch(m, 0xC0, 0x0A, [3, 0, 0, 0]).unwrap_or_else(|e| panic!("VSync: {e}"));
+                seq(m, flow, move |m, _| then(m))
+            });
         }
         then(m)
     };
@@ -890,6 +906,71 @@ mod tests {
         assert_eq!(line(&m, 0), fixture::VB_HANDLER);
         assert_eq!(fixture::interrupt(&mut m, 3, 0x8001_0000), fixture::DMA_HANDLER);
         assert_eq!(line(&m, 3), 0x8001_0000);
+    }
+
+    #[test]
+    fn patched_bios_calls_finish_before_masks_and_callback_tails() {
+        const PAD: u32 = 0x8006_0000;
+        const RCNT: u32 = 0x8006_0004;
+        const REMOVE: u32 = 0x8006_0008;
+        fn resume(m: &mut M, flow: Flow<Psyq>, addr: u32, args: [u32; 4]) -> Flow<Psyq> {
+            let Flow::Call { call, then } = flow else { panic!("expected a guest BIOS patch") };
+            assert_eq!(call, GuestCall { addr, args });
+            then(m, 0xBAD) // these BIOS results are ignored by the object
+        }
+        let mut m = machine();
+        for (t, f, p) in [(0xB0, 0x5B, PAD), (0xC0, 0x0A, RCNT), (0xA0, 0x56, REMOVE)] {
+            m.mem.w32(psx_bios::tables::entry(t, f).unwrap(), p);
+        }
+        m.mem.w32(fixture::DMA_TABLE, 0xCCCC_CCCC);
+        m.kernel.clear_pad = 7;
+        m.kernel.clear_rcnt[3] = 7;
+        m.crit = true;
+        m.sdk.at = fixture::INTR;
+        let flow = reset_callback(&mut m, [0; 4]).unwrap();
+        assert_eq!(i_mask(&m), 0);
+        assert_eq!(line(&m, 0), fixture::VB_HANDLER);
+        assert_eq!(m.mem.r32(fixture::DMA_TABLE), 0xCCCC_CCCC, "DMA setup waits for vblank setup");
+        // Reentry into another adapter changes sdk.at. The captured object
+        // still supplies all subsequent context, DMA and return addresses.
+        m.sdk.at = 0x8007_0000;
+        let flow = resume(&mut m, flow, PAD, [0; 4]);
+        assert_eq!(i_mask(&m), 0);
+        let flow = resume(&mut m, flow, RCNT, [3, 0, 0, 0]);
+        assert_eq!(i_mask(&m), 9);
+        assert_eq!(m.mem.r32(fixture::DMA_TABLE), 0);
+        assert!(m.crit, "ExitCriticalSection waits for _96_remove");
+        let flow = resume(&mut m, flow, REMOVE, [0; 4]);
+        assert!(matches!(flow, Flow::Return(v) if v == fixture::CONTEXT as u64));
+        assert!(!m.crit);
+        assert_eq!((m.kernel.clear_pad, m.kernel.clear_rcnt[3]), (7, 7), "native BIOS entries were not run too");
+
+        m.sdk.at = fixture::INTR + at::INTERRUPT;
+        let flow = interrupt_callback(&mut m, [4, 0x8007_0010, 0, 0]).unwrap();
+        assert_eq!(i_mask(&m), 0);
+        let flow = resume(&mut m, flow, RCNT, [0; 4]);
+        assert!(matches!(flow, Flow::Return(0)), "return the previous handler, not the patch's result");
+        assert_eq!(i_mask(&m), 0x19);
+
+        // A timeout follows the same patched calls before its continuation.
+        m.sdk.at = fixture::VSYNC;
+        let v = vsync_o(&mut m).unwrap();
+        m.crit = true;
+        let flow = wait_vcount(&mut m, v, 1, 0, |m| {
+            m.mem.w32(fixture::LAST, 99);
+            Flow::ret(123)
+        });
+        let Flow::Block { until, then } = flow else { panic!("timeout must still wait") };
+        while !m.holds(until) {
+            let next = m.clock.next_time().unwrap();
+            m.step(next);
+        }
+        let flow = then(&mut m);
+        let flow = resume(&mut m, flow, PAD, [0; 4]);
+        assert_eq!(m.mem.r32(fixture::LAST), 0, "VSync tail did not run early");
+        let flow = resume(&mut m, flow, RCNT, [3, 0, 0, 0]);
+        assert!(matches!(flow, Flow::Return(123)));
+        assert_eq!(m.mem.r32(fixture::LAST), 99);
     }
 
     #[test]
