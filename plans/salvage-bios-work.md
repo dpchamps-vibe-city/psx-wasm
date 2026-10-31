@@ -492,7 +492,40 @@ Source checkpoint `4cce9e3`, in this recovery checkout, not main's outputs:
 - `oracle check btn --device bios`: command prints PASS but compares **zero
   vectors** in the fresh store. Not accepted as oracle validation. Images and
   goldens still need provisioning; no capture/re-record performed.
-- Full `psxw ci btn` / `psxw ci bof4` and browser disc isolation remain pending.
+
+### Full foundation CI classification (ABI 17 only)
+
+The isolated `salvage/foundation-validation` checkout at `a74f832` ran both
+commands to completion, each exiting **2**. Parent reviewed its handoff and
+`out/ci/{btn,bof4}/ci.json`. This is evidence for source `4cce9e3`, not the later
+ABI-18 implementation.
+
+- Both: build, boot (11 checks), UBSan, SDK/chip conformance, SDK reach and
+  native/all-device fallback gates pass; workspace release tests report 308
+  passes, with optional compiler/Docker skips still applying. BOF4's configured
+  replay passes (9 checks); its difftest/browser/mod gates skip by manifest.
+- Both oracle gates fail on missing `.oracle/images.json`; BTN web-GPU also
+  lacks vectors/goldens. These are absent prerequisites, not oracle passes.
+- BTN difftest: 2620 pass, 3 excluded, **2 mismatches**: `DrawTextSlotImage`
+  (`exe:80019E80`) and `Ovl28DrawSequenceGradientRect` (`ovl_28:800B8E9C`).
+  A bounded diagnostic reproduced the first. Root cause/regression attribution
+  is unknown: there is no comparable baseline gate result. Do not label these
+  pre-existing source defects merely because this was the first full run.
+- BTN mods reaches phase 3, then fails because previous-decomp census objects
+  `out/census/btn/3a15992/obj` are absent. The suggested plain `census btn`
+  command only builds the current pin, so its hint cannot provision that input.
+- BTN Chromium and Firefox conformance, card storage, and title-to-gameplay
+  (6000 frames plus recording replay) pass. Web-game imports the disc through
+  this bundle's new per-game OPFS path and matches native RAM/VRAM/audio.
+  This does **not** test two bundles sharing one origin or the locked-disc
+  diagnostic; cross-bundle isolation remains unvalidated. Pacing is informational
+  because the local machine classification is unset.
+- Full and bounded-diagnostic reports/logs are retained in the validation tree
+  and the `692606a4-f7a9-48cd-80a1-f62952fc09fb` subagent artifacts. No source,
+  replay, expectation, user card or input snapshot was changed.
+
+Next: provision missing oracle/previous-decomp prerequisites and triage the two
+mismatches separately. Neither game CI nor full BIOS completion is green.
 
 ## Current kernel-call batch (ABI 18)
 
@@ -555,7 +588,8 @@ APIs; the latter owns the missing BIOS CD APIs over existing native cores,
 not the rejected register driver. Each must report disputed behaviour or a
 required architecture change rather than invent it. Parent retains IRQ enqueue,
 exception/non-local/thread control flow and integration. No subdelegation.
-The separate ABI-17 foundation CI remains active and pinned to its own source.
+The separate ABI-17 foundation CI has completed; its failures and passing gates
+are classified above, separately from these newer source changes.
 
 Native-CD's initial `0aac185` is **not accepted or integrated**. Parent review
 found that a blocking multi-sector read wakes after its first sector, normal
