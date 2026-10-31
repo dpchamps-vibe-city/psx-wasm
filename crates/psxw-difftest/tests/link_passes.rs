@@ -114,6 +114,27 @@ fn guest_passes_and_adapters() {
     assert_eq!(c2.args[..2], [5, 3]);
 }
 
+/// A variadic call passes every word, a 64-bit argument after an odd
+/// number of fixed words at an even word, as o32 lays them out.
+#[test]
+fn variadic_words() {
+    let src = r#"
+extern int func_80012100(const char *fmt, ...);
+int func_80011000(int a) { return func_80012100("x", a, 0x1122334455667788LL, a, a, a, a, a, a, a, a); }
+"#;
+    let Some((map, input)) = compile("psxw-link-variadic", src) else { return };
+    let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
+    let linked =
+        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
+    let fmt = linked.aux[0].2;
+    let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
+    let f = h.func("c").unwrap();
+    let r = h.run(&f, 1, [5, 0, 0, 0], &[], &[0; 8], 1);
+    let c = &r.log[0];
+    assert_eq!(c.args, [fmt, 5, 0x5566_7788, 0x1122_3344], "{c:?}");
+    assert_eq!(c.stack, [5; 8]);
+}
+
 /// A writable static the address map doesn't name has an original address
 /// the link can't know: it fails naming it, rather than placing a second
 /// copy in AUX.

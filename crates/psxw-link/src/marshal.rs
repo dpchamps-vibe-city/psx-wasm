@@ -3,16 +3,19 @@
 //!
 //! Arguments become o32 words: 64-bit values (and doubles, soft-float) take
 //! an even-aligned pair, structs passed by value are copied word by word,
-//! words past the fourth live on the guest stack at `sp + 4k`. Variadic
-//! calls copy a fixed number of words out of clang's va-buffer; the callee
-//! reads only what its format asks for.
+//! words past the fourth live on the guest stack at `sp + 4k`. A variadic
+//! call from C copies the words of clang's va-buffer that the object's
+//! calls pass, each where o32 puts it ([`call_words`]); otherwise a fixed
+//! number of words, as they lie.
 
 use crate::object::FuncType;
+use anyhow::{Result, bail};
 use psxw_abi::WINDOW_MASK;
 use psxw_cc::protos::{Kind, Proto};
 use wasm_encoder::{Function, Instruction as I, MemArg, ValType};
 
-/// Words copied from a va-buffer after the fixed arguments.
+/// Words copied from a va-buffer after the fixed arguments when the
+/// variadic calls' arguments aren't known.
 pub const VARIADIC_WORDS: u32 = 8;
 
 /// Where one o32 argument word comes from (C→o32) or goes (o32→C).
@@ -100,6 +103,64 @@ pub fn words(kinds: &[Kind], variadic: bool) -> (Vec<Word>, u32) {
         }
     }
     (w, fixed)
+}
+
+/// o32 words for a C call to a function of these kinds: [`words`], with
+/// variadic arguments where o32 puts them. clang's va-buffer keeps each
+/// argument at its natural alignment from the buffer's start; o32 aligns a
+/// 64-bit one to an even word of the whole argument list. The two agree
+/// after an even number of fixed words; after an odd number, a 64-bit
+/// argument moves. `calls` are the variadic arguments' kinds at each call
+/// the object makes (the prototype facts): every word any of them passes is
+/// copied, and they must agree on where 64-bit ones go, for one adapter
+/// serves them all. With none known, [`VARIADIC_WORDS`] words are copied as
+/// they lie.
+pub fn call_words(kinds: &[Kind], variadic: bool, calls: &[Vec<Kind>]) -> Result<(Vec<Word>, u32)> {
+    if !variadic || calls.is_empty() {
+        return Ok(words(kinds, variadic));
+    }
+    let (mut w, fixed) = words(kinds, false);
+    let mut map: Vec<Option<u32>> = Vec::new();
+    for call in calls {
+        // Per argument word: the va-buffer word it comes from, or padding.
+        let (mut p, mut q, mut m) = (fixed, 0u32, Vec::new());
+        for k in call {
+            let n = match k {
+                Kind::I64 | Kind::F64 => 2,
+                Kind::ByVal { .. } | Kind::Sret { .. } => bail!("a struct passed by value as a variadic argument"),
+                _ => 1,
+            };
+            // Padding before a 64-bit argument: on both sides (the same
+            // word), or on one.
+            if n == 2 {
+                match (p % 2, q % 2) {
+                    (1, 1) => {
+                        m.push(Some(q));
+                        (p, q) = (p + 1, q + 1);
+                    }
+                    (1, _) => {
+                        m.push(None);
+                        p += 1;
+                    }
+                    (_, 1) => q += 1,
+                    _ => {}
+                }
+            }
+            m.extend((q..q + n).map(Some));
+            p += n;
+            q += n;
+        }
+        let common = m.len().min(map.len());
+        if m[..common] != map[..common] {
+            bail!("calls with 64-bit variadic arguments in different places after {fixed} fixed words can't share one adapter");
+        }
+        if m.len() > map.len() {
+            map = m;
+        }
+    }
+    let va = kinds.len() as u32;
+    w.extend(map.into_iter().map(|q| q.map_or(Word::Pad, |q| Word::Mem(va, 4 * q))));
+    Ok((w, fixed))
 }
 
 fn memarg(window: u32, align: u32) -> MemArg {
@@ -632,6 +693,21 @@ mod tests {
         assert_eq!(w[1], Word::Mem(1, 0));
     }
 
+    /// After an odd number of fixed words a 64-bit variadic argument moves
+    /// to an even word, and every word the calls pass is copied; after an
+    /// even number the va-buffer's words are o32's. Calls that put 64-bit
+    /// arguments in different places can't share an adapter.
+    #[test]
+    fn variadic_call_layout() {
+        let m = |o: u32| Word::Mem(1, o);
+        let (w, _) = call_words(&[Kind::Ptr], true, &[vec![Kind::I32, Kind::F64], vec![Kind::I32]]).unwrap();
+        assert_eq!(w, vec![Word::Param(0), m(0), m(8), m(12)]);
+        assert!(call_words(&[Kind::Ptr], true, &[vec![Kind::I32, Kind::F64], vec![Kind::I32; 3]]).is_err());
+        let m = |o: u32| Word::Mem(2, o);
+        let (w, _) = call_words(&[Kind::Ptr; 2], true, &[vec![Kind::I32, Kind::F64], vec![Kind::I32; 9]]).unwrap();
+        assert_eq!(w[2..], (0..9).map(|k| m(4 * k)).collect::<Vec<_>>()[..]);
+    }
+
     /// An o32 caller's words reach 8- and 16-bit parameters extended as
     /// their C types are.
     #[test]
@@ -639,7 +715,7 @@ mod tests {
         use wasmparser::{BinaryReader, FunctionBody, Operator as O, ValType::I32};
         let narrow = [Kind::I8 { signed: true }, Kind::I8 { signed: false }, Kind::I16 { signed: true }, Kind::I16 { signed: false }];
         let sig = FuncType { params: vec![I32; 4], results: vec![] };
-        let proto = Proto { name: "f".into(), defined: true, ret: Kind::Void, params: narrow.to_vec(), variadic: false };
+        let proto = Proto { name: "f".into(), defined: true, ret: Kind::Void, params: narrow.to_vec(), variadic: false, va_calls: Vec::new() };
         let bytes = o32_to_c(&sig, Some(&proto), 0, 0, 0).into_raw_body();
         let body = FunctionBody::new(BinaryReader::new(&bytes, 0));
         let ops: Vec<O> = body.get_operators_reader().unwrap().into_iter().collect::<Result<_, _>>().unwrap();
