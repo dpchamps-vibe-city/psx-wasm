@@ -280,8 +280,8 @@ Renderer, SDK, translator, runtime:
 4. **Human:** `psxw ci btn` and `psxw ci bof4` pass.
 
 **Status (2026-10-30): done but for the human's runs.** Every item is
-ticked except B15 (blocked: needs hardware) and TR1's second half (needs a
-decision, Findings). 1: `cargo test --workspace` passes. 2: both games
+ticked except B15 (blocked: needs hardware); TR1's second half was built
+on 2026-10-31 (`be7288c`). 1: `cargo test --workspace` passes. 2: both games
 build, every chip native (`out/sf-p1-build-*.log`). 3: passes since
 `7e748f0` added psx-wasm's `bios` device under test (5 vectors,
 provisional against OpenBIOS). 4: **waiting on the human:**
