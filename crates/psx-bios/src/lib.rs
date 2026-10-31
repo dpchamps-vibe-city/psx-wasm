@@ -10,6 +10,7 @@ pub mod bios;
 pub mod card;
 pub mod io;
 pub mod kernel;
+pub mod libc;
 pub mod machine;
 pub mod threads;
 
@@ -185,8 +186,16 @@ mod tests {
         let mut m = machine();
         m.mem.write(0x8001_0000, b"%s=%04x %d%%\0");
         m.mem.write(0x8001_0100, b"val\0");
-        let text = bios::printf(&m, [0x8001_0000, 0x8001_0100, 0xBEEF, (-5i32) as u32]);
+        let text = bios::printf(&mut m, [0x8001_0000, 0x8001_0100, 0xBEEF, (-5i32) as u32]);
         assert_eq!(text, "val=beef -5%");
+        // Sign before zero padding; +, space, # and %n (psx-spx A(3Fh)).
+        m.mem.write(0x8001_0000, b"%05d|%+d|% d|%#x|%#o|%-4u|%.3d%n\0");
+        for (k, v) in [0x0A, 8, 8, 3, 0x8001_0200u32].iter().enumerate() {
+            m.mem.w32(0x801F_F010 + 4 * k as u32, *v);
+        }
+        let a = [0x8001_0000, (-5i32) as u32, 7, 7];
+        assert_eq!(bios::printf(&mut m, a), "-0005|+7| 7|0xa|010|8   |003");
+        assert_eq!(m.mem.r32(0x8001_0200), 28);
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x1B, [0x8001_0100, 0, 0, 0])), 3);
         m.mem.write(0x8001_0200, b"vam\0");
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x17, [0x8001_0100, 0x8001_0200, 0, 0])) as i32, -1);

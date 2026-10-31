@@ -4,15 +4,24 @@
 //! loudly instead of returning garbage.
 
 use crate::kernel::{self, File};
+use crate::libc;
 use crate::machine::{Flow, Machine, Sdk, Wait};
 use psx_devices::cd;
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
 /// wild argument can't spin for minutes.
-const MAX_LEN: u32 = 0x0020_0000;
+pub(crate) const MAX_LEN: u32 = 0x0020_0000;
 
 pub fn name(table: u32, func: u32) -> &'static str {
     match (table, func) {
+        (0xA0, 0x0A) => "todigit",
+        (0xA0, 0x0C) => "strtoul",
+        (0xA0, 0x0D) => "strtol",
+        (0xA0, 0x0E) => "abs",
+        (0xA0, 0x0F) => "labs",
+        (0xA0, 0x10) => "atoi",
+        (0xA0, 0x11) => "atol",
+        (0xA0, 0x12) => "atob",
         (0xA0, 0x13) => "setjmp",
         (0xA0, 0x14) => "longjmp",
         (0xA0, 0x15) => "strcat",
@@ -24,6 +33,13 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x1B) => "strlen",
         (0xA0, 0x1C) => "index",
         (0xA0, 0x1D) => "rindex",
+        (0xA0, 0x1E) => "strchr",
+        (0xA0, 0x1F) => "strrchr",
+        (0xA0, 0x20) => "strpbrk",
+        (0xA0, 0x21) => "strspn",
+        (0xA0, 0x22) => "strcspn",
+        (0xA0, 0x23) => "strtok",
+        (0xA0, 0x24) => "strstr",
         (0xA0, 0x25) => "toupper",
         (0xA0, 0x26) => "tolower",
         (0xA0, 0x27) => "bcopy",
@@ -36,6 +52,13 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x2E) => "memchr",
         (0xA0, 0x2F) => "rand",
         (0xA0, 0x30) => "srand",
+        (0xA0, 0x31) => "qsort",
+        (0xA0, 0x33) => "malloc",
+        (0xA0, 0x34) => "free",
+        (0xA0, 0x35) => "lsearch",
+        (0xA0, 0x36) => "bsearch",
+        (0xA0, 0x37) => "calloc",
+        (0xA0, 0x38) => "realloc",
         (0xA0, 0x39) => "InitHeap",
         (0xA0, 0x3F) => "printf",
         (0xA0, 0x43) => "Exec",
@@ -122,7 +145,27 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
     let r = |v: u32| Ok(Flow::ret(v));
     let mem = &mut *m.mem;
     match (table, func) {
-        // --- A0h: C library ---------------------------------------------
+        // --- A0h: C library (psx-spx's behaviour, its bugs included) -----
+        (0xA0, 0x0A) => r(libc::todigit(a[0])),
+        (0xA0, 0x0C) | (0xA0, 0x0D) => {
+            // strtoul, strtol: [src_end] the end, unless src is 0.
+            if a[0] == 0 {
+                return r(0);
+            }
+            let (v, end) = libc::strtol(mem, a[0], a[2], func == 0x0D, false);
+            if a[1] != 0 {
+                mem.w32(a[1], end);
+            }
+            r(v)
+        }
+        (0xA0, 0x0E) | (0xA0, 0x0F) => r((a[0] as i32).wrapping_abs() as u32),
+        (0xA0, 0x10) | (0xA0, 0x11) => r(if a[0] == 0 { 0 } else { libc::strtol(mem, a[0], 10, true, true).0 }),
+        (0xA0, 0x12) => {
+            // atob: strtol(src, &end, 10), its two results exchanged.
+            let (v, end) = if a[0] == 0 { (0, 0) } else { libc::strtol(mem, a[0], 10, true, false) };
+            mem.w32(a[1], v);
+            r(end)
+        }
         (0xA0, 0x13) => {
             // setjmp: a translated caller keeps its registers in wasm
             // locals, so only the first return (0) is representable;
@@ -130,97 +173,128 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xA0, 0x14) => Err(format!("{label}: longjmp across translated frames is not supported")),
-        (0xA0, 0x15) => {
-            let dst = a[0];
-            let d = mem.cstr(dst, MAX_LEN as usize);
-            let s = mem.cstr(a[1], MAX_LEN as usize);
-            let mut out = s;
-            out.push(0);
-            mem.write(dst + d.len() as u32, &out);
-            r(dst)
-        }
-        (0xA0, 0x16) => {
-            let dst = a[0];
-            let d = mem.cstr(dst, MAX_LEN as usize);
-            let mut s = mem.cstr(a[1], len(a[2]) as usize);
+        (0xA0, 0x43) => Err(format!("{label}: loading and running another executable is not supported")),
+        (0xA0, 0x15) | (0xA0, 0x16) => {
+            // strcat, strncat (at most maxlen characters, none for a
+            // negative maxlen); 0 for a null pointer.
+            if a[0] == 0 || a[1] == 0 {
+                return r(0);
+            }
+            let n = match func {
+                0x15 => MAX_LEN,
+                _ if (a[2] as i32) < 0 => 0,
+                _ => len(a[2]),
+            };
+            let d = mem.cstr(a[0], MAX_LEN as usize);
+            let mut s = mem.cstr(a[1], n as usize);
             s.push(0);
-            mem.write(dst + d.len() as u32, &s);
-            r(dst)
+            mem.write(a[0] + d.len() as u32, &s);
+            r(a[0])
         }
         (0xA0, 0x17) | (0xA0, 0x18) => {
+            // strcmp, strncmp: the bytes sign-extended; a null pointer
+            // compares below a string.
             let n = if func == 0x18 { len(a[2]) } else { MAX_LEN };
-            let (mut i, mut d) = (0u32, 0i32);
-            while i < n {
-                let (x, y) = (mem.r8(a[0] + i), mem.r8(a[1] + i));
-                if x != y {
-                    d = x as i32 - y as i32;
-                    break;
-                }
-                if x == 0 {
-                    break;
-                }
-                i += 1;
-            }
+            let d = match (a[0], a[1]) {
+                (0, 0) => 0,
+                (0, _) => -1,
+                (_, 0) => 1,
+                _ => (0..n)
+                    .map(|i| (mem.r8(a[0] + i) as i8 as i32, mem.r8(a[1] + i) as i8 as i32))
+                    .find(|&(x, y)| x != y || x == 0)
+                    .map_or(0, |(x, y)| x - y),
+            };
             r(d as u32)
         }
-        (0xA0, 0x19) => {
-            let mut s = mem.cstr(a[1], MAX_LEN as usize);
-            s.push(0);
+        (0xA0, 0x19) | (0xA0, 0x1A) => {
+            // strcpy, strncpy (exactly maxlen bytes: no terminator for a
+            // string as long, zeros after a shorter one); 0 for a null
+            // pointer.
+            if a[0] == 0 || a[1] == 0 {
+                return r(0);
+            }
+            let s = if func == 0x19 {
+                let mut s = mem.cstr(a[1], MAX_LEN as usize);
+                s.push(0);
+                s
+            } else {
+                let mut s = mem.cstr(a[1], len(a[2]) as usize);
+                s.resize(len(a[2]) as usize, 0);
+                s
+            };
             mem.write(a[0], &s);
             r(a[0])
         }
-        (0xA0, 0x1A) => {
-            // strncpy pads with zeros up to n.
-            let n = len(a[2]) as usize;
-            let mut s = mem.cstr(a[1], n);
-            s.resize(n, 0);
-            mem.write(a[0], &s);
-            r(a[0])
-        }
-        (0xA0, 0x1B) => r(mem.cstr(a[0], MAX_LEN as usize).len() as u32),
-        (0xA0, 0x1C) | (0xA0, 0x1D) => {
+        (0xA0, 0x1B) => r(if a[0] == 0 { 0 } else { mem.cstr(a[0], MAX_LEN as usize).len() as u32 }),
+        (0xA0, 0x1C..=0x1F) => {
+            // index and strchr, rindex and strrchr: 0 for a null string;
+            // char 0 finds the terminator.
+            if a[0] == 0 {
+                return r(0);
+            }
             let s = mem.cstr(a[0], MAX_LEN as usize);
             let c = a[1] as u8;
-            let hit = if func == 0x1C { s.iter().position(|&b| b == c) } else { s.iter().rposition(|&b| b == c) };
+            let hit = if func & 1 == 0 { s.iter().position(|&b| b == c) } else { s.iter().rposition(|&b| b == c) };
             let hit = hit.or((c == 0).then_some(s.len()));
             r(hit.map_or(0, |i| a[0] + i as u32))
         }
+        (0xA0, 0x20) => r(libc::strpbrk(mem, a[0], a[1])),
+        (0xA0, 0x21) | (0xA0, 0x22) => r(libc::span(mem, a[0], a[1], func == 0x21)),
+        (0xA0, 0x23) => r(libc::strtok(m, a[0], a[1])),
+        (0xA0, 0x24) => r(libc::strstr(mem, a[0], a[1])),
         (0xA0, 0x25) => r((a[0] as u8).to_ascii_uppercase() as u32),
         (0xA0, 0x26) => r((a[0] as u8).to_ascii_lowercase() as u32),
-        (0xA0, 0x27) => {
-            // bcopy(src, dst, len)
-            let b = mem.bytes(a[0], len(a[2]) as usize);
-            mem.write(a[1], &b);
-            r(a[1])
+        (0xA0, 0x27) | (0xA0, 0x2A) => {
+            // bcopy(src, dst, len), memcpy(dst, src, len): nothing copied
+            // when the first argument is 0 or len is over 7FFFFFFFh; that
+            // argument returned.
+            let (dst, src) = if func == 0x27 { (a[1], a[0]) } else { (a[0], a[1]) };
+            if a[0] != 0 && (a[2] as i32) >= 0 {
+                libc::copy(mem, dst, src, len(a[2]));
+            }
+            r(a[0])
         }
-        (0xA0, 0x28) => {
-            mem.write(a[0], &vec![0; len(a[1]) as usize]);
+        (0xA0, 0x28) | (0xA0, 0x2B) => {
+            // bzero(dst, len), memset(dst, c, len): dst, or 0 when nothing
+            // is filled (dst 0, len 0 or over 7FFFFFFFh).
+            let (n, c) = if func == 0x28 { (a[1], 0) } else { (a[2], a[1] as u8) };
+            if a[0] == 0 || n == 0 || (n as i32) < 0 {
+                return r(0);
+            }
+            mem.write(a[0], &vec![c; len(n) as usize]);
             r(a[0])
         }
         (0xA0, 0x29) | (0xA0, 0x2D) => {
-            let n = len(a[2]);
-            let mut d = 0i32;
-            for i in 0..n {
-                let (x, y) = (mem.r8(a[0] + i), mem.r8(a[1] + i));
-                if x != y {
-                    d = x as i32 - y as i32;
-                    break;
+            // bcmp, memcmp: psx-spx's bug, the difference of the bytes
+            // after the first mismatch; 0 for a null pointer.
+            if a[0] == 0 || a[1] == 0 {
+                return r(0);
+            }
+            let hit = (0..len(a[2])).find(|&i| mem.r8(a[0] + i) != mem.r8(a[1] + i));
+            r(hit.map_or(0, |i| (mem.r8(a[0] + i + 1) as i32 - mem.r8(a[1] + i + 1) as i32) as u32))
+        }
+        (0xA0, 0x2C) => {
+            // memmove: as memcpy, but backwards when src < dst and (psx-
+            // spx's condition) dst >= src+len; psx-spx's bug: the
+            // backwards copy moves len+1 bytes.
+            let (dst, src) = (a[0], a[1]);
+            if dst != 0 && (a[2] as i32) >= 0 {
+                let n = len(a[2]);
+                if src < dst && dst >= src.wrapping_add(n) {
+                    let b = mem.bytes(src, n as usize + 1);
+                    mem.write(dst, &b);
+                } else {
+                    libc::copy(mem, dst, src, n);
                 }
             }
-            r(d as u32)
-        }
-        (0xA0, 0x2A) | (0xA0, 0x2C) => {
-            let b = mem.bytes(a[1], len(a[2]) as usize);
-            mem.write(a[0], &b);
-            r(a[0])
-        }
-        (0xA0, 0x2B) => {
-            mem.write(a[0], &vec![a[1] as u8; len(a[2]) as usize]);
-            r(a[0])
+            r(dst)
         }
         (0xA0, 0x2E) => {
-            let n = len(a[2]);
-            let hit = (0..n).find(|&i| mem.r8(a[0] + i) == a[1] as u8);
+            // memchr: 0 for a null pointer or len over 7FFFFFFFh.
+            if a[0] == 0 || (a[2] as i32) < 0 {
+                return r(0);
+            }
+            let hit = (0..len(a[2])).find(|&i| mem.r8(a[0] + i) == a[1] as u8);
             r(hit.map_or(0, |i| a[0] + i))
         }
         (0xA0, 0x2F) => {
@@ -232,9 +306,15 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.rand = a[0];
             r(0)
         }
-        (0xA0, 0x43) => Err(format!("{label}: loading and running another executable is not supported")),
+        (0xA0, 0x31) => Ok(libc::qsort(m, a)),
+        (0xA0, 0x33) => r(libc::malloc(mem, m.kernel.heap, a[0])),
+        (0xA0, 0x34) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x35) => Ok(libc::lsearch(m, a)),
+        (0xA0, 0x36) => Ok(libc::bsearch(m, a)),
+        (0xA0, 0x37) => r(libc::calloc(mem, m.kernel.heap, a[0], a[1])),
+        (0xA0, 0x38) => libc::realloc(mem, m.kernel.heap, a[0], a[1]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xA0, 0x39) => {
-            m.kernel.heap = (a[0], a[1]);
+            m.kernel.heap = libc::heap_init(mem, a[0], a[1]);
             r(0)
         }
         (0xA0, 0x3F) => {
@@ -532,21 +612,37 @@ impl cd::Disc for HostDisc<'_> {
 
 /// The BIOS printf: `%d %i %u %x %X %o %c %s %p %%`, with flags, width and
 /// precision. Arguments come from a1..a3, then the guest stack.
-pub fn printf<S: Sdk>(m: &Machine<S>, a: [u32; 4]) -> String {
+pub fn printf<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> String {
     let mut k = 1;
-    format(m, a[0], &mut || {
+    let mut counts = Vec::new();
+    let text = format(m, a[0], &mut counts, &mut || {
         let v = m.arg(&a, k);
         k += 1;
         v
-    })
+    });
+    for (addr, n, half) in counts {
+        if half { m.mem.w16(addr, n as u16) } else { m.mem.w32(addr, n) }
+    }
+    text
 }
 
 /// [`printf`]'s formatting of the string at guest address `fmt`, each
-/// argument word from `next`.
-pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, next: &mut dyn FnMut() -> u32) -> String {
+/// argument word from `next`: psx-spx's conversions (`c s d i D u U o O p
+/// x X n`) and prefixes (`+`, space, `-`, `#`, `0`, a width or `*`, a
+/// precision or `.*`, `h`, `l`, `L`), with C's meaning. `%n`'s writes
+/// (address, length, 16-bit) go to `counts`.
+pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool)>, next: &mut dyn FnMut() -> u32) -> String {
     let fmt = m.mem.cstr(fmt, 1024);
     let mut out = String::new();
     let mut i = 0;
+    let digits = |fmt: &[u8], i: &mut usize| {
+        let mut n = 0usize;
+        while *i < fmt.len() && fmt[*i].is_ascii_digit() {
+            n = n * 10 + (fmt[*i] - b'0') as usize;
+            *i += 1;
+        }
+        n
+    };
     while i < fmt.len() {
         let c = fmt[i];
         i += 1;
@@ -559,50 +655,93 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, next: &mut dyn FnMut() -> u32) -
             flags.push(fmt[i] as char);
             i += 1;
         }
-        let mut width = 0usize;
-        while i < fmt.len() && fmt[i].is_ascii_digit() {
-            width = width * 10 + (fmt[i] - b'0') as usize;
+        let mut left = flags.contains('-');
+        let width = if fmt.get(i) == Some(&b'*') {
             i += 1;
-        }
+            let w = next() as i32;
+            left |= w < 0;
+            w.unsigned_abs() as usize
+        } else {
+            digits(&fmt, &mut i)
+        };
         let mut prec: Option<usize> = None;
-        if i < fmt.len() && fmt[i] == b'.' {
+        if fmt.get(i) == Some(&b'.') {
             i += 1;
-            let mut p = 0;
-            while i < fmt.len() && fmt[i].is_ascii_digit() {
-                p = p * 10 + (fmt[i] - b'0') as usize;
+            prec = Some(if fmt.get(i) == Some(&b'*') {
                 i += 1;
-            }
-            prec = Some(p);
+                (next() as i32).max(0) as usize
+            } else {
+                digits(&fmt, &mut i)
+            });
         }
-        while i < fmt.len() && (fmt[i] == b'l' || fmt[i] == b'h') {
+        let mut half = false;
+        while i < fmt.len() && b"hlL".contains(&fmt[i]) {
+            half = fmt[i] == b'h';
             i += 1;
         }
         let Some(&conv) = fmt.get(i) else { break };
         i += 1;
-        let body = match conv {
-            b'd' | b'i' => (next() as i32).to_string(),
-            b'u' => next().to_string(),
-            b'x' | b'p' => format!("{:x}", next()),
-            b'X' => format!("{:X}", next()),
-            b'o' => format!("{:o}", next()),
-            b'c' => ((next() as u8) as char).to_string(),
+        // h: the argument sign-extended from 16 bits, for every conversion
+        // (psx-spx: unsigned ones too).
+        let mut arg = || {
+            let v = next();
+            if half { v as i16 as i32 as u32 } else { v }
+        };
+        let (sign, prefix, mut body) = match conv {
+            b'd' | b'i' | b'D' => {
+                let v = arg() as i32;
+                let sign = if v < 0 {
+                    "-"
+                } else if flags.contains('+') {
+                    "+"
+                } else if flags.contains(' ') {
+                    " "
+                } else {
+                    ""
+                };
+                (sign, "", v.unsigned_abs().to_string())
+            }
+            b'u' | b'U' => ("", "", arg().to_string()),
+            b'o' | b'O' => ("", if flags.contains('#') { "0" } else { "" }, format!("{:o}", arg())),
+            b'x' | b'X' | b'p' => {
+                let v = arg();
+                let prefix = match (flags.contains('#') && v != 0 && conv != b'p', conv) {
+                    (true, b'X') => "0X",
+                    (true, _) => "0x",
+                    _ => "",
+                };
+                ("", prefix, if conv == b'X' { format!("{v:X}") } else { format!("{v:x}") })
+            }
+            b'c' => ("", "", ((arg() as u8) as char).to_string()),
             b's' => {
                 let s = m.mem.cstr(next(), prec.unwrap_or(1024));
-                String::from_utf8_lossy(&s).into_owned()
+                ("", "", String::from_utf8_lossy(&s).into_owned())
             }
-            b'%' => "%".into(),
-            other => format!("%{}", other as char),
+            b'n' => {
+                counts.push((next(), out.len() as u32, half));
+                continue;
+            }
+            b'%' => ("", "", "%".into()),
+            other => ("", "", format!("%{}", other as char)),
         };
-        let pad = width.saturating_sub(body.len());
-        if flags.contains('-') {
-            out.push_str(&body);
-            out.push_str(&" ".repeat(pad));
-        } else if flags.contains('0') && conv != b's' {
-            out.push_str(&"0".repeat(pad));
-            out.push_str(&body);
+        let numeric = b"diDuUoOxXp".contains(&conv);
+        if numeric {
+            if let Some(p) = prec {
+                if body.len() < p {
+                    body = "0".repeat(p - body.len()) + &body;
+                }
+            }
+            if prefix == "0" && body.starts_with('0') {
+                body.remove(0);
+            }
+        }
+        let pad = width.saturating_sub(sign.len() + prefix.len() + body.len());
+        if left {
+            out.push_str(&format!("{sign}{prefix}{body}{}", " ".repeat(pad)));
+        } else if flags.contains('0') && numeric && prec.is_none() {
+            out.push_str(&format!("{sign}{prefix}{}{body}", "0".repeat(pad)));
         } else {
-            out.push_str(&" ".repeat(pad));
-            out.push_str(&body);
+            out.push_str(&format!("{}{sign}{prefix}{body}", " ".repeat(pad)));
         }
     }
     out

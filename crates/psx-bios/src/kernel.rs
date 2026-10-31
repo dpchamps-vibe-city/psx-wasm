@@ -39,6 +39,8 @@ pub struct Kernel {
     pub pad_bufs: Option<[(u32, u32); 2]>,
     pub pad_started: bool,
     pub heap: (u32, u32),
+    /// Where `strtok`'s next fragment starts (0: none).
+    pub strtok: u32,
     pub files: BTreeMap<u32, File>,
     /// `ChangeClearRCnt` / `ChangeClearPad` flags.
     pub clear_rcnt: [u32; 4],
