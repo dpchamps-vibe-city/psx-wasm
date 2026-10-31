@@ -10,6 +10,7 @@ pub mod bios;
 pub mod card;
 pub mod io;
 pub mod kernel;
+pub mod libc;
 pub mod machine;
 pub mod threads;
 

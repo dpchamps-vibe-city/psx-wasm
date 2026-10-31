@@ -15,8 +15,7 @@ pub const EV_DISABLED: u32 = 0x1000;
 pub const EV_ENABLED: u32 = 0x2000;
 pub const EV_READY: u32 = 0x4000;
 /// Event mode: call the handler from the interrupt.
-pub const EV_MODE_INTR: u32 = 0x1000;
-pub const EV_HANDLE: u32 = 0xF100_0000;
+pub const EV_MODE_INTR: u32 = 0x1000;pub const EV_HANDLE: u32 = 0xF100_0000;
 /// Default number of event control blocks (SYSTEM.CNF `EVENT=`).
 pub const EVENTS: usize = 16;
 /// `PAD_init2`'s own buffers (B0:15h), in the kernel's data: psx-spx has
@@ -56,7 +55,10 @@ pub struct Kernel {
     /// `PAD_init2`'s `button_dest`: where `PAD_dr` stores its result; the
     /// handler calls it at each vblank when nonzero.
     pub pad_dest: u32,
+    /// The `InitHeap` heap, (base, end) (`crate::libc`); none until then.
     pub heap: (u32, u32),
+    /// Where `strtok`'s next fragment starts (0: none).
+    pub strtok: u32,
     pub files: BTreeMap<u32, File>,
     /// Whether the kernel's handlers acknowledge what they handle: root
     /// counters 0-2 and vblank (`ChangeClearRCnt`), the pad handler's vblank

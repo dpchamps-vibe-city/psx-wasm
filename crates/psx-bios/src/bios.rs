@@ -4,15 +4,24 @@
 //! loudly instead of returning garbage.
 
 use crate::kernel::{self, File};
+use crate::libc;
 use crate::machine::{Flow, Machine, Sdk, Wait};
 use psx_devices::cd;
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
 /// wild argument can't spin for minutes.
-const MAX_LEN: u32 = 0x0020_0000;
+pub(crate) const MAX_LEN: u32 = 0x0020_0000;
 
 pub fn name(table: u32, func: u32) -> &'static str {
     match (table, func) {
+        (0xA0, 0x0A) => "todigit",
+        (0xA0, 0x0C) => "strtoul",
+        (0xA0, 0x0D) => "strtol",
+        (0xA0, 0x0E) => "abs",
+        (0xA0, 0x0F) => "labs",
+        (0xA0, 0x10) => "atoi",
+        (0xA0, 0x11) => "atol",
+        (0xA0, 0x12) => "atob",
         (0xA0, 0x13) => "setjmp",
         (0xA0, 0x14) => "longjmp",
         (0xA0, 0x15) => "strcat",
@@ -24,6 +33,13 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x1B) => "strlen",
         (0xA0, 0x1C) => "index",
         (0xA0, 0x1D) => "rindex",
+        (0xA0, 0x1E) => "strchr",
+        (0xA0, 0x1F) => "strrchr",
+        (0xA0, 0x20) => "strpbrk",
+        (0xA0, 0x21) => "strspn",
+        (0xA0, 0x22) => "strcspn",
+        (0xA0, 0x23) => "strtok",
+        (0xA0, 0x24) => "strstr",
         (0xA0, 0x25) => "toupper",
         (0xA0, 0x26) => "tolower",
         (0xA0, 0x27) => "bcopy",
@@ -36,6 +52,13 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x2E) => "memchr",
         (0xA0, 0x2F) => "rand",
         (0xA0, 0x30) => "srand",
+        (0xA0, 0x31) => "qsort",
+        (0xA0, 0x33) => "malloc",
+        (0xA0, 0x34) => "free",
+        (0xA0, 0x35) => "lsearch",
+        (0xA0, 0x36) => "bsearch",
+        (0xA0, 0x37) => "calloc",
+        (0xA0, 0x38) => "realloc",
         (0xA0, 0x39) => "InitHeap",
         (0xA0, 0x3F) => "printf",
         (0xA0, 0x43) => "Exec",
@@ -134,7 +157,27 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
     let r = |v: u32| Ok(Flow::ret(v));
     let mem = &mut *m.mem;
     match (table, func) {
-        // --- A0h: C library ---------------------------------------------
+        // --- A0h: C library (psx-spx's behaviour, its bugs included) -----
+        (0xA0, 0x0A) => r(libc::todigit(a[0])),
+        (0xA0, 0x0C) | (0xA0, 0x0D) => {
+            // strtoul, strtol: [src_end] the end, unless src is 0.
+            if a[0] == 0 {
+                return r(0);
+            }
+            let (v, end) = libc::strtol(mem, a[0], a[2], func == 0x0D, false);
+            if a[1] != 0 {
+                mem.w32(a[1], end);
+            }
+            r(v)
+        }
+        (0xA0, 0x0E) | (0xA0, 0x0F) => r((a[0] as i32).wrapping_abs() as u32),
+        (0xA0, 0x10) | (0xA0, 0x11) => r(if a[0] == 0 { 0 } else { libc::strtol(mem, a[0], 10, true, true).0 }),
+        (0xA0, 0x12) => {
+            // atob: strtol(src, &end, 10), its two results exchanged.
+            let (v, end) = if a[0] == 0 { (0, 0) } else { libc::strtol(mem, a[0], 10, true, false) };
+            mem.w32(a[1], v);
+            r(end)
+        }
         (0xA0, 0x13) => {
             // setjmp: a translated caller keeps its registers in wasm
             // locals, so only the first return (0) is representable;
@@ -142,97 +185,127 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xA0, 0x14) | (0xA0, 0x43) => Err(format!("{label}: {}", unsupported(table, func).unwrap_or_default())),
-        (0xA0, 0x15) => {
-            let dst = a[0];
-            let d = mem.cstr(dst, MAX_LEN as usize);
-            let s = mem.cstr(a[1], MAX_LEN as usize);
-            let mut out = s;
-            out.push(0);
-            mem.write(dst + d.len() as u32, &out);
-            r(dst)
-        }
-        (0xA0, 0x16) => {
-            let dst = a[0];
-            let d = mem.cstr(dst, MAX_LEN as usize);
-            let mut s = mem.cstr(a[1], len(a[2]) as usize);
+        (0xA0, 0x15) | (0xA0, 0x16) => {
+            // strcat, strncat (at most maxlen characters, none for a
+            // negative maxlen); 0 for a null pointer.
+            if a[0] == 0 || a[1] == 0 {
+                return r(0);
+            }
+            let n = match func {
+                0x15 => MAX_LEN,
+                _ if (a[2] as i32) < 0 => 0,
+                _ => len(a[2]),
+            };
+            let d = mem.cstr(a[0], MAX_LEN as usize);
+            let mut s = mem.cstr(a[1], n as usize);
             s.push(0);
-            mem.write(dst + d.len() as u32, &s);
-            r(dst)
+            mem.write(a[0] + d.len() as u32, &s);
+            r(a[0])
         }
         (0xA0, 0x17) | (0xA0, 0x18) => {
+            // strcmp, strncmp: the bytes sign-extended; a null pointer
+            // compares below a string.
             let n = if func == 0x18 { len(a[2]) } else { MAX_LEN };
-            let (mut i, mut d) = (0u32, 0i32);
-            while i < n {
-                let (x, y) = (mem.r8(a[0] + i), mem.r8(a[1] + i));
-                if x != y {
-                    d = x as i32 - y as i32;
-                    break;
-                }
-                if x == 0 {
-                    break;
-                }
-                i += 1;
-            }
+            let d = match (a[0], a[1]) {
+                (0, 0) => 0,
+                (0, _) => -1,
+                (_, 0) => 1,
+                _ => (0..n)
+                    .map(|i| (mem.r8(a[0] + i) as i8 as i32, mem.r8(a[1] + i) as i8 as i32))
+                    .find(|&(x, y)| x != y || x == 0)
+                    .map_or(0, |(x, y)| x - y),
+            };
             r(d as u32)
         }
-        (0xA0, 0x19) => {
-            let mut s = mem.cstr(a[1], MAX_LEN as usize);
-            s.push(0);
+        (0xA0, 0x19) | (0xA0, 0x1A) => {
+            // strcpy, strncpy (exactly maxlen bytes: no terminator for a
+            // string as long, zeros after a shorter one); 0 for a null
+            // pointer.
+            if a[0] == 0 || a[1] == 0 {
+                return r(0);
+            }
+            let s = if func == 0x19 {
+                let mut s = mem.cstr(a[1], MAX_LEN as usize);
+                s.push(0);
+                s
+            } else {
+                let mut s = mem.cstr(a[1], len(a[2]) as usize);
+                s.resize(len(a[2]) as usize, 0);
+                s
+            };
             mem.write(a[0], &s);
             r(a[0])
         }
-        (0xA0, 0x1A) => {
-            // strncpy pads with zeros up to n.
-            let n = len(a[2]) as usize;
-            let mut s = mem.cstr(a[1], n);
-            s.resize(n, 0);
-            mem.write(a[0], &s);
-            r(a[0])
-        }
-        (0xA0, 0x1B) => r(mem.cstr(a[0], MAX_LEN as usize).len() as u32),
-        (0xA0, 0x1C) | (0xA0, 0x1D) => {
+        (0xA0, 0x1B) => r(if a[0] == 0 { 0 } else { mem.cstr(a[0], MAX_LEN as usize).len() as u32 }),
+        (0xA0, 0x1C..=0x1F) => {
+            // index and strchr, rindex and strrchr: 0 for a null string;
+            // char 0 finds the terminator.
+            if a[0] == 0 {
+                return r(0);
+            }
             let s = mem.cstr(a[0], MAX_LEN as usize);
             let c = a[1] as u8;
-            let hit = if func == 0x1C { s.iter().position(|&b| b == c) } else { s.iter().rposition(|&b| b == c) };
+            let hit = if func & 1 == 0 { s.iter().position(|&b| b == c) } else { s.iter().rposition(|&b| b == c) };
             let hit = hit.or((c == 0).then_some(s.len()));
             r(hit.map_or(0, |i| a[0] + i as u32))
         }
+        (0xA0, 0x20) => r(libc::strpbrk(mem, a[0], a[1])),
+        (0xA0, 0x21) | (0xA0, 0x22) => r(libc::span(mem, a[0], a[1], func == 0x21)),
+        (0xA0, 0x23) => r(libc::strtok(m, a[0], a[1])),
+        (0xA0, 0x24) => r(libc::strstr(mem, a[0], a[1])),
         (0xA0, 0x25) => r((a[0] as u8).to_ascii_uppercase() as u32),
         (0xA0, 0x26) => r((a[0] as u8).to_ascii_lowercase() as u32),
-        (0xA0, 0x27) => {
-            // bcopy(src, dst, len)
-            let b = mem.bytes(a[0], len(a[2]) as usize);
-            mem.write(a[1], &b);
-            r(a[1])
+        (0xA0, 0x27) | (0xA0, 0x2A) => {
+            // bcopy(src, dst, len), memcpy(dst, src, len): nothing copied
+            // when the first argument is 0 or len is over 7FFFFFFFh; that
+            // argument returned.
+            let (dst, src) = if func == 0x27 { (a[1], a[0]) } else { (a[0], a[1]) };
+            if a[0] != 0 && (a[2] as i32) >= 0 {
+                libc::copy(mem, dst, src, len(a[2]));
+            }
+            r(a[0])
         }
-        (0xA0, 0x28) => {
-            mem.write(a[0], &vec![0; len(a[1]) as usize]);
+        (0xA0, 0x28) | (0xA0, 0x2B) => {
+            // bzero(dst, len), memset(dst, c, len): dst, or 0 when nothing
+            // is filled (dst 0, len 0 or over 7FFFFFFFh).
+            let (n, c) = if func == 0x28 { (a[1], 0) } else { (a[2], a[1] as u8) };
+            if a[0] == 0 || n == 0 || (n as i32) < 0 {
+                return r(0);
+            }
+            mem.write(a[0], &vec![c; len(n) as usize]);
             r(a[0])
         }
         (0xA0, 0x29) | (0xA0, 0x2D) => {
-            let n = len(a[2]);
-            let mut d = 0i32;
-            for i in 0..n {
-                let (x, y) = (mem.r8(a[0] + i), mem.r8(a[1] + i));
-                if x != y {
-                    d = x as i32 - y as i32;
-                    break;
+            // bcmp, memcmp: psx-spx's bug, the difference of the bytes
+            // after the first mismatch; 0 for a null pointer.
+            if a[0] == 0 || a[1] == 0 {
+                return r(0);
+            }
+            let hit = (0..len(a[2])).find(|&i| mem.r8(a[0] + i) != mem.r8(a[1] + i));
+            r(hit.map_or(0, |i| (mem.r8(a[0] + i + 1) as i32 - mem.r8(a[1] + i + 1) as i32) as u32))
+        }
+        (0xA0, 0x2C) => {
+            // memmove: as memcpy, but backwards when src < dst and (psx-
+            // spx's condition) dst >= src+len; psx-spx's bug: the
+            // backwards copy moves len+1 bytes.
+            let (dst, src) = (a[0], a[1]);
+            if dst != 0 && (a[2] as i32) >= 0 {
+                let n = len(a[2]);
+                if src < dst && dst >= src.wrapping_add(n) {
+                    let b = mem.bytes(src, n as usize + 1);
+                    mem.write(dst, &b);
+                } else {
+                    libc::copy(mem, dst, src, n);
                 }
             }
-            r(d as u32)
-        }
-        (0xA0, 0x2A) | (0xA0, 0x2C) => {
-            let b = mem.bytes(a[1], len(a[2]) as usize);
-            mem.write(a[0], &b);
-            r(a[0])
-        }
-        (0xA0, 0x2B) => {
-            mem.write(a[0], &vec![a[1] as u8; len(a[2]) as usize]);
-            r(a[0])
+            r(dst)
         }
         (0xA0, 0x2E) => {
-            let n = len(a[2]);
-            let hit = (0..n).find(|&i| mem.r8(a[0] + i) == a[1] as u8);
+            // memchr: 0 for a null pointer or len over 7FFFFFFFh.
+            if a[0] == 0 || (a[2] as i32) < 0 {
+                return r(0);
+            }
+            let hit = (0..len(a[2])).find(|&i| mem.r8(a[0] + i) == a[1] as u8);
             r(hit.map_or(0, |i| a[0] + i))
         }
         (0xA0, 0x2F) => {
@@ -244,8 +317,15 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.rand = a[0];
             r(0)
         }
+        (0xA0, 0x31) => Ok(libc::qsort(m, a)),
+        (0xA0, 0x33) => r(libc::malloc(mem, m.kernel.heap, a[0])),
+        (0xA0, 0x34) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x35) => Ok(libc::lsearch(m, a)),
+        (0xA0, 0x36) => Ok(libc::bsearch(m, a)),
+        (0xA0, 0x37) => r(libc::calloc(mem, m.kernel.heap, a[0], a[1])),
+        (0xA0, 0x38) => libc::realloc(mem, m.kernel.heap, a[0], a[1]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
         (0xA0, 0x39) => {
-            m.kernel.heap = (a[0], a[1]);
+            m.kernel.heap = libc::heap_init(mem, a[0], a[1]);
             r(0)
         }
         (0xA0, 0x3F) => {

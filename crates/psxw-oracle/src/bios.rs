@@ -1,6 +1,8 @@
 //! psx-bios as the oracle's `bios` device: a `BIOS_CALL` vector's call on
 //! a machine with nothing else running, as the runner makes it on the
-//! target's BIOS (its scratch set up, the call, v0 and the captures).
+//! target's BIOS (its scratch set up, the call, v0 and the captures). A
+//! call that calls the guest back (`qsort`, `lsearch`, `bsearch`) has no
+//! guest here, so it is no vector.
 
 use crate::commands::DeviceUnderTest;
 use crate::store::Store;
