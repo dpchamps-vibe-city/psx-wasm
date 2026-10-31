@@ -130,6 +130,9 @@ pub struct Etc {
     pub active: bool,
     /// The dispatcher is running (`CheckCallback`).
     pub dispatching: bool,
+    /// I_STAT as the dispatcher's pass read it, which the original leaves
+    /// in a0 for the handlers and the vblank handler's callbacks.
+    pub stat: u16,
     /// Each line's handler, and the lines with one (libetc's mask, which
     /// the dispatcher ANDs with I_STAT and I_MASK).
     pub lines: [Handler; LINES],
@@ -212,12 +215,16 @@ fn front(m: &mut M, steps: &[IrqStep]) {
     }
 }
 
-fn guest(f: u32) -> GuestCall {
-    GuestCall { addr: f, args: [0; 4] }
+/// A call of `f` with the a0 the original leaves; the other argument
+/// registers hold whatever it last put there, which nothing reads.
+fn guest(f: u32, a0: u32) -> GuestCall {
+    GuestCall { addr: f, args: [a0, 0, 0, 0] }
 }
 
 fn pending(m: &mut M) -> std::result::Result<u32, String> {
-    Ok(m.sdk.etc.mask as u32 & reg(m, I_STAT, 2)? & reg(m, I_MASK, 2)?)
+    let stat = reg(m, I_STAT, 2)?;
+    m.sdk.etc.stat = stat as u16;
+    Ok(m.sdk.etc.mask as u32 & stat & reg(m, I_MASK, 2)?)
 }
 
 /// `intr.o`'s dispatcher, at the top of its loop.
@@ -271,7 +278,7 @@ fn line(m: &mut M, mut i: u32, mut rest: u32) -> std::result::Result<(), String>
             let h = m.sdk.etc.lines[i as usize];
             if h != Handler::None {
                 let next = IrqStep::Sdk(step::make(step::LINE, i + 1, rest >> 1));
-                front(m, &[IrqStep::Chain(guest(h.word()), None), next]);
+                front(m, &[IrqStep::Chain(guest(h.word(), m.sdk.etc.stat as u32), None), next]);
                 return Ok(());
             }
         }
@@ -304,7 +311,7 @@ fn vblank_handler(m: &mut M, state: u32) -> StandIn {
     }
     let from = state.saturating_sub(1) as usize;
     match (from..8).find(|&c| m.sdk.etc.vsync[c] != 0) {
-        Some(c) => StandIn::Call(guest(m.sdk.etc.vsync[c]), c as u32 + 2),
+        Some(c) => StandIn::Call(guest(m.sdk.etc.vsync[c], m.sdk.etc.stat as u32), c as u32 + 2),
         None => StandIn::Return(0),
     }
 }
@@ -335,7 +342,8 @@ fn dma_handler(m: &mut M, mut state: u32) -> std::result::Result<StandIn, String
                 set_reg(m, DICR, 4, d & (1 << (24 + ch) | 0x00FF_FFFF))?;
                 let f = m.sdk.etc.dma[ch as usize];
                 if f != 0 {
-                    return Ok(StandIn::Call(guest(f), 1 + ((ch + 1) << 8 | rest >> 1)));
+                    // a0: `intr_dma.o`'s pointer to DICR.
+                    return Ok(StandIn::Call(guest(f, DICR), 1 + ((ch + 1) << 8 | rest >> 1)));
                 }
             }
             ch += 1;
@@ -697,6 +705,7 @@ mod tests {
                 IrqStep::Sdk(s) => Psyq::irq_step(&mut m, s),
                 IrqStep::Chain(c, _) => {
                     sps.push(m.regs.sp());
+                    assert_eq!(c.args[0] & 1, 1, "a0: I_STAT as the dispatcher read it");
                     crate::testing::guest(&mut m, c.addr);
                 }
                 IrqStep::Exit => {}
