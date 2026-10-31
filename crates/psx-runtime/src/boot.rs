@@ -30,6 +30,15 @@ fn le(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
+/// The BOOT line's argument, after the executable name. The kernel's
+/// buffer has 80h bytes including its terminator.
+fn boot_argument(text: &str) -> Vec<u8> {
+    let line = text.lines().find_map(|l| l.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("BOOT")).map(|(_, v)| v));
+    let v = line.unwrap_or("").trim_start();
+    let arg = v.split_once([' ', '\t']).map_or("", |(_, arg)| arg).trim_end_matches(['\r', '\n']);
+    arg.bytes().take(0x7F).chain([0]).collect()
+}
+
 /// `KEY = VALUE` lines.
 fn cnf(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|l| {
@@ -71,6 +80,7 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
     let sp = stack.filter(|&s| s != 0).unwrap_or(0x801F_FF00);
     m.regs.set_sp(sp);
     m.regs.set_gp(gp0);
+    m.mem.write(psxw_abi::kernel::BOOT_ARGUMENT, &boot_argument(&text));
     // The kernel's event blocks live in its RAM (D68).
     m.lay_out_events(events);
     // The kernel's thread tables live in guest RAM (D57).

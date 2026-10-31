@@ -476,7 +476,15 @@ pub extern "C" fn bios(table: u32, func: u32, a0: u32, a1: u32, a2: u32, a3: u32
         return 1;
     }
     let v = with(|rt| {
-        let flow = psx_bios::bios::call(&mut rt.m.borrow_mut(), table, func, [a0, a1, a2, a3]);
+        // Release the borrow before executing a flow: patches and native
+        // callbacks may reenter the runtime.
+        let flow = {
+            let m = &mut rt.m.borrow_mut();
+            match psx_bios::tables::stand_in_fn(table) {
+                Some((t, f)) => psx_bios::bios::call(m, t, f, [a0, a1, a2, a3]),
+                None => psx_bios::bios::dispatch(m, table, func, [a0, a1, a2, a3]),
+            }
+        };
         match flow {
             Ok(f) => driver::run(&rt.m, &mut Guest, f),
             Err(e) => fatal(5, &e),

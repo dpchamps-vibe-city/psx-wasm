@@ -86,6 +86,26 @@ pub const RUNTIME_BASE: u32 = 0x0200_0000;
 /// physical; the BIOS points at them through KSEG1, as the console's does.
 pub mod kernel {
     use core::ops::Range;
+    /// Fixed BIOS variables and vector bytes exposed as guest data. The
+    /// runtime implements their operations in Rust, not by executing them.
+    pub const GARBAGE: u32 = 0;
+    pub const RAM_SIZE: u32 = 0x60;
+    pub const EXCEPTION_VECTOR: u32 = 0x80;
+    pub const A0_VECTOR: u32 = 0xA0;
+    pub const B0_VECTOR: u32 = 0xB0;
+    pub const C0_VECTOR: u32 = 0xC0;
+    pub const DISPATCHERS: u32 = 0x5C0;
+    /// The SYSTEM.CNF BOOT line's argument (80h bytes).
+    pub const BOOT_ARGUMENT: u32 = 0x180;
+    /// Callable tables. C(80h..) shares B0h's table immediately after C0h.
+    pub const A0_TABLE: u32 = 0x200;
+    pub const A0_LEN: u32 = 0xC0;
+    pub const C0_TABLE: u32 = 0x674;
+    pub const C0_LEN: u32 = 0x80;
+    pub const B0_TABLE: u32 = 0x874;
+    pub const B0_LEN: u32 = 0x100;
+    /// Native kernel data: pad buffers, handler elements and strtok buffer.
+    pub const DATA: Range<u32> = 0x7000..0x7300;
     /// The table of tables: a (pointer, size) pair per table from 0x100.
     /// These four entries are filled: the exception control blocks, the
     /// process control block, the thread control blocks and the event
@@ -122,7 +142,8 @@ pub mod kernel {
     pub const MAX_EVENTS: u32 = 64;
     /// Kernel RAM a game may read and write at constant addresses: the
     /// lift's kernel rule accepts these and still fails on the rest.
-    pub const RAM_BACKED: [Range<u32>; 2] = [EXCB_ENTRY..EVCB_ENTRY + 8, EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE];
+    pub const RAM_BACKED: [Range<u32>; 4] =
+        [0..EVCB_ENTRY + 8, BOOT_ARGUMENT..B0_TABLE + 4 * B0_LEN, DATA, EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE];
 
     /// Whether physical address `addr` lies in [`RAM_BACKED`].
     pub fn ram_backed(addr: u32) -> bool {

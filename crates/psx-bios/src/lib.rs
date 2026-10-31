@@ -12,6 +12,7 @@ pub mod io;
 pub mod kernel;
 pub mod libc;
 pub mod machine;
+pub mod tables;
 pub mod threads;
 
 pub use machine::{Event, Flow, GuestCall, Host, IrqStep, Machine, Regs, Sdk, StandIn, Wait};

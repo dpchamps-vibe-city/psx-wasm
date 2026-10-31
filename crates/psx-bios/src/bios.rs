@@ -5,7 +5,8 @@
 
 use crate::kernel::{self, File};
 use crate::libc;
-use crate::machine::{Flow, Machine, Sdk, Wait};
+use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait};
+use crate::tables;
 use psx_devices::cd;
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
@@ -63,9 +64,10 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x3F) => "printf",
         (0xA0, 0x43) => "Exec",
         (0xA0, 0x44) => "FlushCache",
+        (0xA0, 0x45) => "init_a0_b0_c0_vectors",
         (0xA0, 0x49) => "GPU_cw",
-        (0xA0, 0x55) | (0xA0, 0x70) => "_bu_init",
-        (0xA0, 0x72) => "_96_remove",
+        (0xA0, 0x55) => "_bu_init",
+        (0xA0, 0x56) => "_96_remove",
         (0xA0, 0x9F) => "SetMemSize",
         (0xA0, 0xA1) => "SystemError",
         (0xA0, 0xAB) => "_card_info",
@@ -126,6 +128,8 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x5D) => "_card_wait",
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
+        (0xC0, 0x07) => "InstallExceptionHandlers",
+        (0xC0, 0x1C) => "AdjustA0Table",
         (0xC0, 0x0A) => "ChangeClearRCnt",
         (0xC0, 0x0D) => "SetIrqAutoAck",
         (0xC0, 0x1A) => "set_card_find_mode",
@@ -137,7 +141,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
 /// Whether [`call`] implements `(table, func)` (every implemented call is
 /// named, and only those).
 pub fn implemented(table: u32, func: u32) -> bool {
-    let (table, func) = if table == 0xA0 && func <= 4 { (0xB0, 0x32 + func) } else { (table, func) };
+    let (table, func) = tables::canonical(table, func);
     name(table, func) != "?"
 }
 
@@ -145,11 +149,23 @@ fn len(n: u32) -> u32 {
     n.min(MAX_LEN)
 }
 
+/// A vector call consults its guest-visible table. A saved native entry
+/// still calls its original service; a guest patch receives the same o32
+/// arguments and returns through the existing guest-call continuation.
+pub fn dispatch<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> Result<Flow<S>, String> {
+    let Some(at) = tables::entry(table, func) else { return call(m, table, func, a) };
+    let entry = m.mem.r32(at);
+    if let Some((t, f)) = tables::stand_in_fn(entry) {
+        return call(m, t, f, a);
+    }
+    m.count(&format!("bios.{table:02X}h:{func:02X}h patched"));
+    Ok(Flow::Call { call: GuestCall { addr: entry, args: a }, then: Box::new(|_, v| Flow::Return(v)) })
+}
+
 /// A0h/B0h/C0h function `func` with o32 arguments `a` (more on the guest
 /// stack). Errors name a function the BIOS doesn't implement.
 pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> Result<Flow<S>, String> {
-    // A(00h)..A(04h) are the B(32h)..B(36h) file functions.
-    let (table, func) = if table == 0xA0 && func <= 4 { (0xB0, 0x32 + func) } else { (table, func) };
+    let (table, func) = tables::canonical(table, func);
     let label = format!("bios.{:02X}h:{:02X}h {}", table, func, name(table, func));
     m.count(&label);
     let r = |v: u32| Ok(Flow::ret(v));
@@ -332,8 +348,12 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.host.log(2, text.trim_end_matches('\n'));
             r(text.len() as u32)
         }
-        (0xA0, 0x44) | (0xA0, 0x72) | (0xA0, 0x9F) => r(0),
-        (0xA0, 0x55) | (0xA0, 0x70) => {
+        (0xA0, 0x44) | (0xA0, 0x56) | (0xA0, 0x9F) => r(0),
+        (0xA0, 0x45) => {
+            m.install_vectors();
+            r(0)
+        }
+        (0xA0, 0x55) => {
             m.cards_ready();
             r(0)
         }
@@ -565,8 +585,8 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         // No BIOS ROM, so no ROM kanji font.
         (0xB0, 0x51) => r(u32::MAX),
         // Kernel tables: addresses in kernel RAM, as the Sony BIOS has them.
-        (0xB0, 0x56) => r(0x0000_0674),
-        (0xB0, 0x57) => r(0x0000_0874),
+        (0xB0, 0x56) => r(psxw_abi::kernel::C0_TABLE),
+        (0xB0, 0x57) => r(psxw_abi::kernel::B0_TABLE),
         // ChangeClearPad: whether the pad handler acknowledges vblank; the
         // old setting (OpenBIOS `setSIO0AutoAck`).
         (0xB0, 0x5B) => r(std::mem::replace(&mut m.kernel.clear_pad, a[0])),
@@ -577,6 +597,14 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             r(0)
         }
         (0xC0, 0x03) => r(m.deq_int_rp(a[0], a[1])),
+        (0xC0, 0x07) => {
+            m.install_exception_handlers();
+            r(0)
+        }
+        (0xC0, 0x1C) => {
+            m.adjust_a0_table();
+            r(0)
+        }
         (0xC0, 0x1A) => {
             m.kernel.cards.find_mode = a[0];
             r(0)
