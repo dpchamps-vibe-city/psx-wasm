@@ -515,9 +515,6 @@ impl Gpu {
         s |= d.dma << 29;
         s |= (self.field as u32) << 31;
         s |= (!self.field as u32) << 13;
-        if d.dma & 2 != 0 {
-            s |= 1 << 25;
-        }
         s |= (self.irq as u32) << 24;
         s |= (d.off as u32) << 23;
         let reading = matches!(self.in_cmd, InCmd::Read { .. });
@@ -530,6 +527,15 @@ impl Gpu {
         if !matches!(self.in_cmd, InCmd::Quad { .. } | InCmd::Polyline { .. }) {
             s |= 1 << 28;
         }
+        // The DMA request, by direction (psx-spx): the write FIFO not full
+        // (it takes each word as it comes), bit 28, bit 27.
+        let dreq = match d.dma {
+            1 => true,
+            2 => s & 1 << 28 != 0,
+            3 => s & 1 << 27 != 0,
+            _ => false,
+        };
+        s |= (dreq as u32) << 25;
         let p = &self.page;
         s |= p.x64 | p.y256 << 4 | p.abr << 5 | p.mode << 7;
         s |= (self.dither as u32) << 9 | (self.draw_to_display as u32) << 10;
@@ -1797,6 +1803,26 @@ mod tests {
         assert_eq!(g.read(), 0x0000_3333);
         assert_eq!(g.pending_readback(), None);
         assert_eq!(draws(&decode(&cmds(&mut g))).len(), 1, "the queued rectangle ran after the read");
+    }
+
+    /// GPUSTAT bit 25 by DMA direction (psx-spx): 0 off, the write FIFO
+    /// not full, bit 28, bit 27.
+    #[test]
+    fn dma_request_by_direction() {
+        let mut g = gpu();
+        let dreq = |g: &Gpu| g.status() >> 25 & 1;
+        assert_eq!(dreq(&g), 0);
+        g.gp1(0x0400_0001);
+        assert_eq!(dreq(&g), 1);
+        g.gp1(0x0400_0002);
+        assert_eq!(dreq(&g), 1);
+        g.gp0_words(&[0x2800_00FF, 0, 1, 2]);
+        assert_eq!(dreq(&g), 0, "a quad waits for its fourth vertex");
+        g.gp0(3);
+        g.gp1(0x0400_0003);
+        assert_eq!(dreq(&g), 0);
+        g.gp0_words(&[0xC000_0000, 0, 1 << 16 | 2]);
+        assert_eq!(dreq(&g), 1, "VRAM data to read");
     }
 
     #[test]
