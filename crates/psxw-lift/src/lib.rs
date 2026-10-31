@@ -631,6 +631,25 @@ mod tests {
         translate_all(&mut program, &originals, &["test".into()])
     }
 
+    /// `bltzal ra` tests ra as it was before the link overwrites it.
+    #[test]
+    fn link_branch_tests_ra_before_linking() {
+        let words = [
+            0x07F0_0003, // bltzal ra, callee
+            0,           // nop
+            0x03E0_0008, // jr ra
+            0,           // nop
+            0x03E0_0008, // callee: jr ra
+            0,           // nop
+        ];
+        let out = lift_words(&words, &[(BASE, 0x10), (BASE + 0x10, 8)]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let c = &out.ok.iter().find(|t| t.func.addr == BASE).expect("translated").c;
+        let test = c.find("c_ = (int32_t)r31 < 0;").expect(c);
+        let link = c.find(&format!("r31 = 0x{:08X}u;", BASE + 8)).expect(c);
+        assert!(test < link && c.contains("if (c_) {"), "{c}");
+    }
+
     /// A BIOS trampoline sets its function number with `addiu` or `ori`.
     #[test]
     fn bios_call_numbers() {
