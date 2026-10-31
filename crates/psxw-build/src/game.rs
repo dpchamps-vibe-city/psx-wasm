@@ -1094,26 +1094,37 @@ fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
     struct Call {
         name: &'static str,
         implemented: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unsupported: Option<&'static str>,
         sites: Vec<String>,
     }
     let mut calls: BTreeMap<String, Call> = BTreeMap::new();
     for t in lifted {
         for c in psxw_lift::bios_calls(t) {
             let site = format!("{} 0x{:08X}", t.func.name, c.pc);
-            let (key, name, ok) = match c.func {
-                Some(f) => (format!("{:02X}h:{f:02X}h", c.table), psx_bios::bios::name(c.table as u32, f), psx_bios::bios::implemented(c.table as u32, f)),
-                None => (format!("{:02X}h:?", c.table), "(function number not constant)", false),
+            let (key, name, ok, unsupported) = match c.func {
+                Some(f) => {
+                    let (t, f) = (c.table as u32, f);
+                    (format!("{:02X}h:{f:02X}h", c.table), psx_bios::bios::name(t, f), psx_bios::bios::implemented(t, f), psx_bios::bios::unsupported(t, f))
+                }
+                None => (format!("{:02X}h:?", c.table), "(function number not constant)", false, None),
             };
-            let e = calls.entry(key).or_insert_with(|| Call { name, implemented: ok, sites: vec![] });
+            let e = calls.entry(key).or_insert_with(|| Call { name, implemented: ok, unsupported, sites: vec![] });
             e.sites.push(site);
         }
     }
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("bios-calls.json"), serde_json::to_string_pretty(&calls)?)?;
-    let missing: Vec<String> =
-        calls.iter().filter(|(_, c)| !c.implemented).map(|(k, c)| format!("{k} {} at {}", c.name, c.sites.join(", "))).collect();
+    let site = |(k, c): (&String, &Call)| format!("{k} {} at {}", c.name, c.sites.join(", "));
+    let missing: Vec<String> = calls.iter().filter(|(_, c)| !c.implemented && c.unsupported.is_none()).map(site).collect();
     ensure!(missing.is_empty(), "translated code makes BIOS calls the runtime doesn't implement:\n  {}", missing.join("\n  "));
-    eprintln!("build: {} BIOS calls, all implemented", calls.len());
+    // Calls that can't be carried out without a CPU fail if they run; the
+    // build names them.
+    let failing: Vec<String> = calls.iter().filter(|(_, c)| c.unsupported.is_some()).map(|(k, c)| format!("{} ({})", site((k, c)), c.unsupported.unwrap_or_default())).collect();
+    if !failing.is_empty() {
+        eprintln!("build: BIOS calls that fail if they run:\n  {}", failing.join("\n  "));
+    }
+    eprintln!("build: {} BIOS calls, {} implemented", calls.len(), calls.len() - failing.len());
     Ok(())
 }
 

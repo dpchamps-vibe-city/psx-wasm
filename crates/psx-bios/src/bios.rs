@@ -102,11 +102,21 @@ pub fn name(table: u32, func: u32) -> &'static str {
     }
 }
 
-/// Whether [`call`] implements `(table, func)` (every implemented call is
-/// named, and only those).
+/// Whether [`call`] implements `(table, func)`: it is named and can
+/// succeed.
 pub fn implemented(table: u32, func: u32) -> bool {
     let (table, func) = if table == 0xA0 && func <= 4 { (0xB0, 0x32 + func) } else { (table, func) };
-    name(table, func) != "?"
+    name(table, func) != "?" && unsupported(table, func).is_none()
+}
+
+/// Why a call the BIOS names always fails here: what having no CPU to run
+/// it on rules out (plans/spec-fidelity.md, Forced).
+pub fn unsupported(table: u32, func: u32) -> Option<&'static str> {
+    match (table, func) {
+        (0xA0, 0x14) => Some("longjmp across translated frames is not supported"),
+        (0xA0, 0x43) => Some("loading and running another executable is not supported"),
+        _ => None,
+    }
 }
 
 fn len(n: u32) -> u32 {
@@ -130,7 +140,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             // longjmp traps.
             r(0)
         }
-        (0xA0, 0x14) => Err(format!("{label}: longjmp across translated frames is not supported")),
+        (0xA0, 0x14) | (0xA0, 0x43) => Err(format!("{label}: {}", unsupported(table, func).unwrap_or_default())),
         (0xA0, 0x15) => {
             let dst = a[0];
             let d = mem.cstr(dst, MAX_LEN as usize);
@@ -233,7 +243,6 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.rand = a[0];
             r(0)
         }
-        (0xA0, 0x43) => Err(format!("{label}: loading and running another executable is not supported")),
         (0xA0, 0x39) => {
             m.kernel.heap = (a[0], a[1]);
             r(0)
