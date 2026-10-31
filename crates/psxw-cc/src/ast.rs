@@ -264,6 +264,19 @@ mod tests {
         assert_eq!(text.lines().count(), src.lines().count());
     }
 
+    /// Divisions by a non-literal are rewritten in place, nested ones
+    /// inside their operands, on the lines they took; a literal divisor
+    /// and a compound assignment whose left side has side effects stay.
+    #[test]
+    fn divisions() {
+        let src = "int f(int a, int b, int *p) {\n  a /= b;\n  *p++ /= b;\n  return a\n    / b + a / 4 + (a / b) % b;\n}\n";
+        let text = crate::edit::apply(src, super::divisions(&super::parse(src)));
+        assert_eq!(text.lines().count(), src.lines().count());
+        assert!(text.contains("  a = __builtin_choose_expr(__builtin_constant_p(b)"), "{text}");
+        assert!(text.contains("*p++ /= b;") && text.contains(" + a / 4 + "), "{text}");
+        assert!(text.contains("__psxw_rem_s(((__builtin_choose_expr(") && !text.contains("a / b"), "{text}");
+    }
+
     #[test]
     fn nested_definitions() {
         let src = "int outer(int a) {\n  auto int bound(int) __asm__(\"Elsewhere\");\n  auto void inner(int r) __asm__(\"Original\");\n  int plain(int x) { return x; }\n  void inner(int r) { }\n  return plain(a) + bound(a);\n}\n";
@@ -384,6 +397,101 @@ pub fn loop_barriers(ast: &Ast) -> Vec<crate::edit::Edit> {
             if gotos.iter().any(|(g, from)| *g == name && *from > at) {
                 out.push(Edit::insert(stmt, format!("{BARRIER} ")));
             }
+        }
+    }
+    out
+}
+
+/// Edits making every `/`, `%`, `/=` and `%=` in the TU's functions whose
+/// divisor is not a literal call [`crate::DIVISIONS`] when clang finds it
+/// a 32-bit integer division by a non-constant (D36). Division by zero is
+/// undefined in C, so clang may sink a division into the branch that uses
+/// it or drop an unused one, and the original's `break` on a zero divisor
+/// moves or goes; a call it can neither move nor drop, and the link lowers
+/// it to the R3000's division. `__builtin_choose_expr` keeps constant
+/// divisors, floating-point and 64-bit divisions as they are, so constant
+/// expressions stay constant. The operands appear several times (all but
+/// one unevaluated), on one line; the lines they took follow, so the TU
+/// keeps its line count. A compound assignment whose left side has side
+/// effects is left as it is.
+pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
+    use crate::edit::Edit;
+    /// No identifier outside `sizeof`: a literal, a cast of one, and so on.
+    fn literal(n: Node) -> bool {
+        match n.kind() {
+            "identifier" | "call_expression" => false,
+            "sizeof_expression" | "alignof_expression" | "type_descriptor" => true,
+            _ => {
+                let mut c = n.walk();
+                n.named_children(&mut c).all(literal)
+            }
+        }
+    }
+    fn side_effects(n: Node) -> bool {
+        matches!(n.kind(), "call_expression" | "update_expression" | "assignment_expression") || {
+            let mut c = n.walk();
+            n.named_children(&mut c).any(side_effects)
+        }
+    }
+    /// `n` as C with its divisions rewritten, on one line.
+    fn text(ast: &Ast, n: Node) -> String {
+        fn splice(ast: &Ast, n: Node, s: &mut String, pos: &mut usize) {
+            let mut c = n.walk();
+            for k in n.named_children(&mut c) {
+                match division(ast, k) {
+                    Some(t) => {
+                        s.push_str(&ast.src[*pos..k.start_byte()]);
+                        s.push_str(&t);
+                        *pos = k.end_byte();
+                    }
+                    None => splice(ast, k, s, pos),
+                }
+            }
+        }
+        let (mut s, mut pos) = (String::new(), n.start_byte());
+        splice(ast, n, &mut s, &mut pos);
+        s.push_str(&ast.src[pos..n.end_byte()]);
+        s.replace('\n', " ")
+    }
+    fn division(ast: &Ast, n: Node) -> Option<String> {
+        let compound = n.kind() == "assignment_expression";
+        if !compound && n.kind() != "binary_expression" {
+            return None;
+        }
+        let (l, r) = (n.child_by_field_name("left")?, n.child_by_field_name("right")?);
+        let op = ast.text(n.child_by_field_name("operator")?).trim_end_matches('=');
+        let name = match op {
+            "/" => "div",
+            "%" => "rem",
+            _ => return None,
+        };
+        if literal(r) || (compound && side_effects(l)) {
+            return None;
+        }
+        let (a, b) = (text(ast, l), text(ast, r));
+        let both = format!("({a}) + ({b})");
+        let call = format!(
+            "__builtin_choose_expr(__builtin_constant_p({b}) || !_Generic({both}, int: 1, long: 1, unsigned int: 1, unsigned long: 1, default: 0), ({a}) {op} ({b}), (__typeof__({both}))__builtin_choose_expr(_Generic({both}, unsigned int: 1, unsigned long: 1, default: 0), __psxw_{name}_u(({a}), ({b})), __psxw_{name}_s(({a}), ({b}))))"
+        );
+        Some(if compound { format!("{a} = {call}") } else { call })
+    }
+    fn walk(ast: &Ast, n: Node, out: &mut Vec<Edit>) {
+        if let Some(t) = division(ast, n) {
+            let lines = ast.text(n).matches('\n').count();
+            out.push(Edit::replace(n.byte_range(), t + &"\n".repeat(lines)));
+            return;
+        }
+        let mut c = n.walk();
+        for k in n.named_children(&mut c) {
+            walk(ast, k, out);
+        }
+    }
+    let mut out = Vec::new();
+    let root = ast.tree.root_node();
+    let mut cursor = root.walk();
+    for f in root.named_children(&mut cursor).filter(|n| n.kind() == "function_definition") {
+        if let Some(body) = f.child_by_field_name("body") {
+            walk(ast, body, &mut out);
         }
     }
     out

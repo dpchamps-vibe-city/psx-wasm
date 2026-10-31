@@ -272,7 +272,9 @@ How each tier is produced:
   (the `Gcc` conventions): divisions give the R3000's results and the
   original assembler's `break` checks instead of trapping; `memcpy` with a
   constant size is expanded inline (builtins were on); `main` starts with a
-  call to `__main`.
+  call to `__main`. A division by a non-constant stays where the source
+  puts it: the normalizer makes it a call clang can neither move nor drop,
+  and the link lowers the call to the R3000's division (D36).
 - **Lift tier: generated C.** The translator works one function at a time.
   For a game, it reads the **original container images** directly: the
   address space is kept exactly, so absolute addresses in placed code are
@@ -1601,6 +1603,19 @@ rules, not pins. (design §4)
 - **Divisions** give the R3000's results with the original assembler's
   `break` checks. The convention is measured from the translations: ASPSX
   checks zero with code 7; GNU as also checks INT_MIN / -1, with 6 << 10.
+- **A division by a non-constant stays where the source puts it.** The
+  C tier makes each 32-bit `/`, `%`, `/=` and `%=` by a non-constant a call
+  clang can neither move nor drop (`__psxw_div_s`, `__psxw_div_u`,
+  `__psxw_rem_s`, `__psxw_rem_u`; `psxw_cc::ast::divisions`), and the
+  link lowers the call to the division above. Constant divisors stay C
+  divisions, which clang strength-reduces (a division it leaves is lowered
+  the same way), so constant expressions stay constant.
+  *Why:* division by zero is undefined in C, so clang may sink a division
+  into the branch that uses its result, or drop one whose result goes
+  unused, and the original's `break` moves or goes (spec fidelity phase 4,
+  TR13's difftest). Cost: btn's game.wasm +93 instructions (0.01%); bof4's
+  C has no such division. Decided without the human's input under the
+  /goal (2026-10-31).
 - **Constant-size `memcpy`** is expanded inline, as GCC's builtin did,
   unless the reference flags say `-fno-builtin`.
 - **`main` calls `__main` first.**

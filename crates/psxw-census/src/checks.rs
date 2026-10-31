@@ -128,6 +128,10 @@ pub(crate) fn references(ctx: &Context, tus: &[TuReport]) -> ReferenceReport {
                 *r.resolved.entry("runtime".into()).or_default() += 1;
                 continue;
             }
+            if psxw_cc::DIVISIONS.iter().any(|(n, _)| *n == s.name) {
+                *r.resolved.entry("link".into()).or_default() += 1;
+                continue;
+            }
             if HOST_SUPPORT.contains(&s.name.as_str()) && ctx.map.resolve(&tu.container, &s.name).is_none() {
                 *r.resolved.entry("host-support".into()).or_default() += 1;
                 continue;

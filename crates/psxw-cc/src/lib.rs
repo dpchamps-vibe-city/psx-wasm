@@ -40,6 +40,12 @@ pub const LIFT_MARKER_PREFIX: &str = "__psxw_lift_";
 /// supplies them.
 pub const HOST_SUPPORT: &[&str] = &["abs", "labs", "fabs"];
 
+/// The calls a 32-bit division or remainder by a non-constant becomes in
+/// decompiled C ([`ast::divisions`]), and the R3000 operation the linker
+/// lowers each to (D36).
+pub const DIVISIONS: &[(&str, &str)] =
+    &[("__psxw_div_s", "div_s"), ("__psxw_div_u", "div_u"), ("__psxw_rem_s", "rem_s"), ("__psxw_rem_u", "rem_u")];
+
 /// The instruction selector every C → wasm compile uses (D53): FastISel.
 /// The default, SelectionDAG, drops later variable assignments from the
 /// DWARF (a lifted register shows a constant zero). Still `-O2`: only

@@ -33,6 +33,11 @@ int func_80011000(int a, int b) {
 /// Compile `src` as container `t` (text at 8001_0000..8002_0000), in its
 /// own temp directory `name`. None without the pinned toolchain.
 fn compile(name: &str, src: &str) -> Option<(AddressMap, Input)> {
+    compile_with(name, src, false)
+}
+
+/// [`compile`], through the C tier's normalization when `normalize`.
+fn compile_with(name: &str, src: &str, normalize: bool) -> Option<(AddressMap, Input)> {
     let Ok(ws) = Workspace::discover() else { return None };
     let Ok(clang_path) = ws.clang() else {
         eprintln!("skipping: run `psxw toolchain fetch`");
@@ -44,7 +49,11 @@ fn compile(name: &str, src: &str) -> Option<(AddressMap, Input)> {
     std::fs::write(&src_path, src).unwrap();
     let clang = psxw_cc::Clang::new(clang_path, dir.clone(), vec![], vec![], &dir).unwrap();
     let obj_path = dir.join("t.o");
-    clang.compile_variant(&src_path, &obj_path, &[]).unwrap();
+    if normalize {
+        assert!(psxw_cc::compile(&clang, &src_path, &dir, "t", &[], None).unwrap().ok);
+    } else {
+        clang.compile_variant(&src_path, &obj_path, &[]).unwrap();
+    }
     let protos: BTreeMap<String, psxw_cc::protos::Proto> =
         psxw_cc::protos::for_tu(&clang, &src_path).unwrap().into_iter().map(|p| (p.name.clone(), p)).collect();
     let text = 0x8001_0000..0x8002_0000;
@@ -153,6 +162,29 @@ void func_80011000(int a, char *p) { func_80012200(a, 0, 8); func_80012200(p, 0,
     let r = h.run(&f, 1, [5, 0x8001_5000, 0, 0], &[], &[0; 8], 1);
     let calls: Vec<_> = r.log.iter().map(|c| (c.kind, c.target, c.args[0])).collect();
     assert_eq!(calls, [(callout::CALL, 0x8001_2200, 5), (callout::CALL, 0x8001_2200, 0x8001_5000)]);
+}
+
+/// A division by a variable stays where the C puts it (D36): a zero
+/// divisor breaks as the original's assembler checks, and gives the
+/// R3000's quotient, though only one path uses the result (clang would
+/// sink a plain division into that path).
+#[test]
+fn divisions_break_where_the_source_divides() {
+    let src = "int func_80011000(int a, int b, int c) { int q = a / b; if (c) return q; return 0; }\n";
+    let Some((map, mut input)) = compile_with("psxw-link-division", src, true) else { return };
+    let division = psxw_link::Division { zero: 7, overflow: None };
+    input.gcc = Some(psxw_link::Gcc { division, builtin_memcpy: false, main_calls_main: false });
+    let export = ExportSpec { name: "c".into(), input: 0, function: "func_80011000".into(), o32: true };
+    let linked =
+        psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export]).unwrap();
+    let mut h = Harness::new(&linked.wasm, &[], BTreeMap::new(), 1_000_000).unwrap();
+    let f = h.func("c").unwrap();
+    for (c, ret) in [(0, 0), (1, 0xFFFF_FFFF)] {
+        let r = h.run(&f, 1, [5, 0, c, 0], &[], &[0; 8], 1);
+        let breaks: Vec<_> = r.log.iter().map(|e| (e.kind, e.target)).collect();
+        assert_eq!(breaks, [(callout::BREAK, 7)], "c = {c}");
+        assert!(matches!(r.outcome, Outcome::Returned(v) if v as u32 == ret), "{:?}", r.outcome);
+    }
 }
 
 /// A bulk copy (a struct assignment) spends the budget, and with an I/O

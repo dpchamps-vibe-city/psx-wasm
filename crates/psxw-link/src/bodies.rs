@@ -73,12 +73,17 @@ pub fn division(op: &str, conv: Division, brk: u32) -> Function {
     }
     f.instruction(&I::LocalGet(0));
     f.instruction(&I::LocalGet(1));
-    f.instruction(match op {
-        "div_s" => &I::I32DivS,
-        "div_u" => &I::I32DivU,
-        "rem_s" => &I::I32RemS,
-        _ => &I::I32RemU,
-    });
+    f.instruction(&wasm_division(op));
     f.instruction(&I::End);
     f
+}
+
+/// wasm's instruction for `div_s`, `div_u`, `rem_s` or `rem_u`.
+pub fn wasm_division(op: &str) -> I<'static> {
+    match op {
+        "div_s" => I::I32DivS,
+        "div_u" => I::I32DivU,
+        "rem_s" => I::I32RemS,
+        _ => I::I32RemU,
+    }
 }
