@@ -893,12 +893,20 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// A(5Fh) `dev_cd_open(fcb, name, mode)`: the native disc's file, its
-    /// first sector, size and offset in the FCB; 0, or -1.
+    /// first sector, size and offset in the FCB; 0, or -1. OpenBIOS
+    /// `dev_cd_open` uppercases the filename and adds `;1` only if no
+    /// version was supplied. `?`, but not `*`, matches in the file part.
     pub fn dev_cd_open(&mut self, f: u32, name: u32) -> u32 {
-        let name = self.cd_resolve(&String::from_utf8_lossy(&self.mem.cstr(name, 128)));
-        let mut disc = HostDisc(&mut *self.host);
-        match cd::find(&mut disc, &name) {
-            Some(e) if !e.dir => {
+        let raw = String::from_utf8_lossy(&self.mem.cstr(name, 128)).into_owned();
+        let (dir, mut pattern) = self.cd_search_path(&raw.to_ascii_uppercase());
+        if !pattern.contains(';') {
+            pattern.push_str(";1");
+        }
+        let entry = self.cd_entries(&dir).and_then(|entries| {
+            entries.into_iter().find(|e| !e.dir && cd_matches(&pattern, &e.name, false))
+        });
+        match entry {
+            Some(e) => {
                 for (o, v) in [(fcb::LBA, e.lba), (fcb::LENGTH, e.size), (fcb::OFFSET, 0), (fcb::ERRNO, 0)] {
                     self.mem.w32(f + o, v);
                 }
@@ -1032,7 +1040,7 @@ impl<S: Sdk> Machine<S> {
         let Some(entries) = self.cd_entries(&where_) else { return 0 };
         while let Some(e) = entries.get(next) {
             next += 1;
-            if e.dir || !glob(&pattern, &e.name) {
+            if e.dir || !cd_matches(&pattern, &e.name, true) {
                 continue;
             }
             let mut out = vec![0u8; 0x28];
@@ -1159,21 +1167,22 @@ impl<S: Sdk> Machine<S> {
     }
 }
 
-/// BIOS CD search, not a shell glob: `*` discards the rest of the pattern,
-/// and `?` matching the name's terminator accepts the rest too (psx-spx;
-/// OpenBIOS `dev_cd_firstFile` / `patternMatches`). Unlike open, directory
-/// searches compare the ISO version suffix as part of the name.
-fn glob(pattern: &str, name: &str) -> bool {
+/// BIOS CD matching, not a shell glob: `?` matching the name's terminator
+/// accepts the rest too (psx-spx; OpenBIOS `patternMatches`). Directory
+/// searches additionally allow `*` to discard the rest of the pattern;
+/// open treats it literally. Both compare the ISO version suffix.
+fn cd_matches(pattern: &str, name: &str, allow_star: bool) -> bool {
     let p = pattern.as_bytes();
     for (i, c) in name.bytes().enumerate() {
         match p.get(i) {
-            Some(b'*') => return true,
+            Some(b'*') if allow_star => return true,
             Some(b'?') => {}
             Some(&cp) if cp == c.to_ascii_uppercase() => {}
             _ => return false,
         }
     }
-    matches!(p.get(name.len()), None | Some(b'?' | b'*'))
+    matches!(p.get(name.len()), None | Some(b'?'))
+        || (allow_star && p.get(name.len()) == Some(&b'*'))
 }
 
 #[cfg(test)]
@@ -1405,7 +1414,7 @@ mod tests {
     /// directory.
     #[test]
     fn native_cdrom_files_through_the_device_table() {
-        let mut sectors = vec![[0u8; cd::RAW]; 24];
+        let mut sectors = vec![[0u8; cd::RAW]; 25];
         let mut pvd = vec![0u8; cd::USER];
         pvd[0] = 1;
         pvd[1..6].copy_from_slice(b"CD001");
@@ -1425,8 +1434,10 @@ mod tests {
         sub.extend(iso_record("\0", 20, 2048, true));
         sub.extend(iso_record("\x01", 18, 2048, true));
         sub.extend(iso_record("B.BIN;1", 21, 3, false));
+        sub.extend(iso_record("B.BIN;2", 24, 7, false));
         sectors[20] = iso_sector(20, &sub);
         sectors[21] = iso_sector(21, b"bye");
+        sectors[24] = iso_sector(24, b"version");
         let mut m = crate::testing::machine_with_disc(sectors);
         let returns = |_: &mut Machine<NoSdk>, _: GuestCall| 0;
         m.mem.write(0x8001_0000, b"cdrom:\\A.BIN;1\0");
@@ -1481,6 +1492,10 @@ mod tests {
         assert_eq!(m.mem.cstr(0x8004_0000, 32), b"B.BIN;1", "relative to DATA");
         assert_eq!(m.mem.r32(0x8004_0020), 21);
         let v = crate::bios::call(&mut m, 0xB0, 0x43, [0x8004_0000, 0, 0, 0]);
+        assert_eq!(ret(&mut m, v, &returns), 0x8004_0000);
+        assert_eq!(m.mem.cstr(0x8004_0000, 32), b"B.BIN;2");
+        assert_eq!(m.mem.r32(0x8004_0020), 24);
+        let v = crate::bios::call(&mut m, 0xB0, 0x43, [0x8004_0000, 0, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 0);
         m.mem.write(0x8003_0000, b"cdrom:\\*.BIN\0");
         let v = crate::bios::call(&mut m, 0xB0, 0x42, [0x8003_0000, 0x8004_0000, 0, 0]);
@@ -1498,6 +1513,37 @@ mod tests {
         assert_eq!(ret(&mut m, v, &returns), 2, "relative open after clearing cwd");
         let v = crate::bios::call(&mut m, 0xB0, 0x36, [2, 0, 0, 0]);
         assert_eq!(ret(&mut m, v, &returns), 2);
+
+        // Open defaults to ;1, but does not ignore an explicit version.
+        // Only the file part accepts '?'; '*' is for directory searches.
+        for (path, expected) in [
+            ("a.bin", Some((19, 5))),
+            ("?.bin;1", Some((19, 5))),
+            ("a?.dat", Some((22, 1))),
+            ("a?.absent", Some((23, 1))), // '?' at the name's NUL
+            ("data\\?.bin", Some((21, 3))),
+            ("data\\b.bin;2", Some((24, 7))),
+            ("data\\?.bin;?", Some((21, 3))),
+            ("a.bin;2", None),
+            ("a.bin;", None),
+            ("a*.bin", None),
+            ("d?ta\\b.bin", None),
+        ] {
+            m.mem.write(0x8001_0000, format!("cdrom:{path}\0").as_bytes());
+            let v = crate::bios::call(&mut m, 0xB0, 0x32, [0x8001_0000, READ, 0, 0]);
+            let fd = ret(&mut m, v, &returns);
+            if let Some((lba, size)) = expected {
+                assert_eq!(fd, 2, "open {path}");
+                assert_eq!((m.mem.r32(f + fcb::LBA), m.mem.r32(f + fcb::LENGTH)), (lba, size), "open {path}");
+                assert_eq!((m.mem.r32(f + fcb::OFFSET), m.mem.r32(f + fcb::ERRNO)), (0, 0));
+                let v = crate::bios::call(&mut m, 0xB0, 0x36, [fd, 0, 0, 0]);
+                assert_eq!(ret(&mut m, v, &returns), fd);
+            } else {
+                assert_eq!(fd, u32::MAX, "open {path}");
+                assert_eq!(m.kernel.files.errno, E_NOT_FOUND);
+                assert_eq!(m.mem.r32(f + fcb::FLAGS), 0, "failed open releases its FCB");
+            }
+        }
 
         // Search matches the on-disc name, including its version. A star
         // ignores the suffix after it; a question mark at NUL accepts the

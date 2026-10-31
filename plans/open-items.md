@@ -34,10 +34,14 @@ retain their provenance; the active recovery status is recorded separately.
 - **Partial software services:** card helpers A7..AA/AE, built-in console input
   and circular helpers, CD internal calls/event waits/filesystem details, and
   non-main SetConf. Recent card Info/Load callback and guest-device console-scan
-  fixes do not complete these whole families. A52/C09 contracts remain unresolved.
+  fixes do not complete these whole families. BIOS CD opens now honor explicit
+  ISO versions, default to `;1`, and support `?` filename matching without star
+  expansion; shared disc lookup and CdGetLbn are unchanged. A52/C09 contracts
+  remain unresolved.
 - **Resources/policy:** legally usable font data/mapping and GetSystemInfo's
   BIOS date/version identity remain undecided; no fabricated values or pointers.
-- **Validation:** CD-directory/search source `bbdeb39` passes focused
+- **Validation:** the latest CD-open correction passes BIOS 51 / runtime 8 /
+  SDK 42 tests and wasm32 runtime check. CD-directory/search source `bbdeb39` passes focused
   BIOS/runtime/SDK tests, wasm32 check, both game builds and all four unchanged
   replays. Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
