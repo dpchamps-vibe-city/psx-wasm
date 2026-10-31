@@ -394,8 +394,13 @@ mod tests {
         // The TCB array pointer and the TCBs themselves (D57).
         assert!(!super::is_kernel(0x0000_0110));
         assert!(!super::is_kernel(0xA000_E010 + 0xC0 + 0x94));
-        // Tables the BIOS doesn't lay out, and its patch area, are.
-        assert!(super::is_kernel(0x0000_0150));
+        // File/device table pointers and their RAM-backed control blocks.
+        for addr in [0x140, 0x150, psxw_abi::kernel::FCBS, psxw_abi::kernel::DCBS] {
+            assert!(!super::is_kernel(addr));
+            assert!(!super::is_kernel(0xA000_0000 | addr));
+        }
+        // Unprovided tables and the BIOS patch area still require an adaptor.
+        assert!(super::is_kernel(0x0000_0160));
         assert!(super::is_kernel(0xA000_DF80));
         assert!(!super::is_kernel(0));
     }
