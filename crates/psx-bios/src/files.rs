@@ -442,6 +442,100 @@ impl<S: Sdk> Machine<S> {
         Ok(seq(self, flow, move |m, _| Flow::ret(m.mem.r8(tmp) as u32 & 0x7F)))
     }
 
+    /// B(3Eh) `gets(s)`: read a line through `getchar`, echoing each accepted
+    /// character through `putchar` (OpenBIOS `psxgets`): backspace/7F erases
+    /// the previous byte, TAB becomes a space, 16h quotes the next character
+    /// verbatim, CR or LF ends the line, and the buffer holds at most 125
+    /// bytes plus its terminator. Control characters and a full buffer ring
+    /// the bell (7). The next read waits for any echo to finish.
+    pub fn gets(&mut self, s: u32) -> Result<Flow<S>, String> {
+        self.gets_loop(s, s, s.wrapping_add(125), false)
+    }
+
+    fn gets_loop(&mut self, s: u32, mut ptr: u32, end: u32, mut quoted: bool) -> Result<Flow<S>, String> {
+        loop {
+            let flow = self.getchar()?;
+            let c = match flow {
+                Flow::Return(v) => v as u8,
+                flow => {
+                    return Ok(seq(self, flow, move |m, v| {
+                        m.gets_after(s, ptr, end, quoted, v as u8).unwrap_or_else(|e| panic!("gets: {e}"))
+                    }))
+                }
+            };
+            if !quoted && c == 0x16 {
+                quoted = true;
+                continue;
+            }
+            let was_quoted = quoted;
+            quoted = false;
+            if !was_quoted && (c == b'\n' || c == b'\r') {
+                self.mem.w8(ptr, 0);
+                let echo = self.putchars(vec![b'\n'])?;
+                return Ok(match echo {
+                    Flow::Return(_) => Flow::ret(s),
+                    flow => seq(self, flow, move |_, _| Flow::ret(s)),
+                });
+            }
+            let (next, echo) = self.gets_echo(s, ptr, end, c, was_quoted)?;
+            match echo {
+                Some(flow) => return Ok(flow),
+                None => ptr = next,
+            }
+        }
+    }
+
+    fn gets_after(&mut self, s: u32, ptr: u32, end: u32, quoted: bool, c: u8) -> Result<Flow<S>, String> {
+        if !quoted && c == 0x16 {
+            return self.gets_loop(s, ptr, end, true);
+        }
+        if !quoted && (c == b'\n' || c == b'\r') {
+            self.mem.w8(ptr, 0);
+            let echo = self.putchars(vec![b'\n'])?;
+            return Ok(match echo {
+                Flow::Return(_) => Flow::ret(s),
+                flow => seq(self, flow, move |_, _| Flow::ret(s)),
+            });
+        }
+        let (next, echo) = self.gets_echo(s, ptr, end, c, quoted)?;
+        match echo {
+            Some(flow) => Ok(flow),
+            None => self.gets_loop(s, next, end, false),
+        }
+    }
+
+    /// Apply one input byte and echo it; the new insert position and the
+    /// echo's flow when it did not return at once.
+    fn gets_echo(&mut self, s: u32, ptr: u32, end: u32, c: u8, quoted: bool) -> Result<(u32, Option<Flow<S>>), String> {
+        let bell = vec![7];
+        let (next, echo) = if quoted {
+            if ptr < end {
+                self.mem.w8(ptr, c);
+                (ptr + 1, vec![c])
+            } else {
+                (ptr, bell)
+            }
+        } else {
+            match c {
+                b'\x08' | b'\x7f' if ptr > s => (ptr - 1, vec![b'\x08', b' ', b'\x08']),
+                b'\t' if ptr < end => {
+                    self.mem.w8(ptr, b' ');
+                    (ptr + 1, vec![b' '])
+                }
+                c if c < 0x20 || c == 0x7f || ptr >= end => (ptr, bell),
+                c => {
+                    self.mem.w8(ptr, c);
+                    (ptr + 1, vec![c])
+                }
+            }
+        };
+        let flow = self.putchars(echo)?;
+        Ok(match flow {
+            Flow::Return(_) => (next, None),
+            flow => (next, Some(seq(self, flow, move |m, _| m.gets_loop(s, next, end, false).unwrap_or_else(|e| panic!("gets: {e}"))))),
+        })
+    }
+
     /// A(3Ch)/B(3Dh) `putchar(char)`, and the characters of `puts` and
     /// `printf`: TAB to the next multiple of 8, LF as CR LF, each through
     /// `write(1, tmp, 1)`.
@@ -1262,6 +1356,113 @@ mod tests {
         assert_eq!(ret(&mut m, v, &returns), 0x8004_0000);
         assert_eq!(m.mem.cstr(0x8004_0000, 32), b"A.BIN;1", "an absolute pattern ignores the cwd");
         assert_eq!(m.mem.r32(0x8004_0020), 19);
+    }
+
+    /// `gets` uses the installed console's file callbacks for both read
+    /// and echo, in order; editing, quoting and the 125-byte limit follow
+    /// OpenBIOS `psxgets`.
+    #[test]
+    fn gets_reads_and_echoes_through_a_guest_tty() {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use std::rc::Rc;
+
+        let mut m = machine();
+        let name = 0x8001_0000;
+        let info = 0x8002_0000;
+        let func = 0x8003_0000;
+        m.mem.write(name, b"tty\0");
+        let v = m.del_drv(name);
+        assert_eq!(ret(&mut m, v, &|_, _| 0), 1);
+        m.mem.write(name, b"tty\0");
+        m.mem.w32(info, name);
+        m.mem.w32(info + dcb::FLAGS, CHAR | CONS);
+        m.mem.w32(info + dcb::BLOCK, 1);
+        for o in (dcb::INIT..=dcb::CHECK).step_by(4) {
+            m.mem.w32(info + o, func + o);
+        }
+        m.mem.w32(info + dcb::IN_OUT, func + dcb::IN_OUT);
+        let v = m.add_drv(info);
+        assert_eq!(ret(&mut m, v, &|_, _| 0), 1);
+        let dcb = m.find_device(b"tty").expect("the guest console");
+        for (fd, mode) in [(0, READ), (1, WRITE)] {
+            let f = fcb_at(fd);
+            m.mem.w32(f + fcb::FLAGS, mode);
+            m.mem.w32(f + fcb::DCB, dcb);
+            m.mem.w32(f + fcb::DEVICE_FLAGS, CHAR | CONS);
+        }
+
+        let input = Rc::new(RefCell::new(VecDeque::new()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (queue, seen) = (input.clone(), events.clone());
+        let returns = move |m: &mut Machine<NoSdk>, call: GuestCall| {
+            if call.addr != func + dcb::IN_OUT {
+                return 0;
+            }
+            let f = call.args[0];
+            match call.args[1] {
+                1 => match queue.borrow_mut().pop_front() {
+                    Some(c) => {
+                        seen.borrow_mut().push((1, c));
+                        let at = m.mem.r32(f + fcb::BUFFER);
+                        m.mem.w8(at, c);
+                        1
+                    }
+                    None => u32::MAX,
+                },
+                2 => {
+                    let (at, n) = (m.mem.r32(f + fcb::BUFFER), m.mem.r32(f + fcb::COUNT));
+                    let bytes = m.mem.bytes(at, n as usize);
+                    seen.borrow_mut().extend(bytes.into_iter().map(|c| (2, c)));
+                    n
+                }
+                _ => 0,
+            }
+        };
+
+        input.borrow_mut().extend(b"\x7fab\x08c\t\x16\nQ\r");
+        let line = 0x8004_0000;
+        let v = m.gets(line);
+        assert_eq!(ret(&mut m, v, &returns), line);
+        assert_eq!(m.mem.bytes(line, 6), b"ac \nQ\0");
+        let expected = vec![
+            (1, 0x7f),
+            (2, 7),
+            (1, b'a'),
+            (2, b'a'),
+            (1, b'b'),
+            (2, b'b'),
+            (1, 0x08),
+            (2, 0x08),
+            (2, b' '),
+            (2, 0x08),
+            (1, b'c'),
+            (2, b'c'),
+            (1, b'\t'),
+            (2, b' '),
+            (1, 0x16),
+            (1, b'\n'),
+            (2, b'\r'),
+            (2, b'\n'),
+            (1, b'Q'),
+            (2, b'Q'),
+            (1, b'\r'),
+            (2, b'\r'),
+            (2, b'\n'),
+        ];
+        assert_eq!(*events.borrow(), expected, "each read precedes its echo");
+
+        events.borrow_mut().clear();
+        input.borrow_mut().extend(std::iter::repeat(b'x').take(125));
+        input.borrow_mut().extend(b"y\r");
+        let full = 0x8005_0000;
+        let v = m.gets(full);
+        assert_eq!(ret(&mut m, v, &returns), full);
+        assert_eq!(m.mem.bytes(full, 125), vec![b'x'; 125]);
+        assert_eq!(m.mem.r8(full + 125), 0, "the terminator still fits");
+        let events = events.borrow();
+        assert_eq!(events.len(), 255, "125 characters, then a bell and the newline");
+        assert_eq!(&events[248..], &[(1, b'x'), (2, b'x'), (1, b'y'), (2, 7), (1, b'\r'), (2, b'\r'), (2, b'\n')]);
     }
 
     /// The console is the host's log: TAB and LF are expanded through the

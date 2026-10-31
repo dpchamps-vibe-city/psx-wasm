@@ -787,7 +787,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x3B) => m.putc(a[0], a[1]),
         (0xB0, 0x3C) => m.getchar(),
         (0xB0, 0x3D) => m.putchars(vec![a[0] as u8]),
-        (0xB0, 0x3E) => Err(format!("{label}: pending host console input for gets")),
+        (0xB0, 0x3E) => m.gets(a[0]).map_err(|e| format!("{label}: {e}")),
         (0xB0, 0x3F) => {
             // puts: "<NULL>" for a null pointer (psx-spx).
             let s = if a[0] == 0 { b"<NULL>".to_vec() } else { mem.cstr(a[0], MAX_LEN as usize) };
