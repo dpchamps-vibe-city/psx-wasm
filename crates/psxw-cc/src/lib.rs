@@ -51,7 +51,18 @@ pub const DIVISIONS: &[(&str, &str)] =
 /// DWARF (a lifted register shows a constant zero). Still `-O2`: only
 /// instruction selection changes. FastISel's code changes with `-g`, so a
 /// game's objects are compiled once, with `-g`, for release and debug.
-pub const CODEGEN_FLAGS: &[&str] = &["-mllvm", "-fast-isel=true"];
+/// Loops keep the source's shape (D71, TR5): no unrolling, vectorising, or
+/// loops rewritten as `memset`/`memcpy`, so the budget a loop spends
+/// follows its iterations.
+pub const CODEGEN_FLAGS: &[&str] = &[
+    "-mllvm",
+    "-fast-isel=true",
+    "-fno-unroll-loops",
+    "-fno-vectorize",
+    "-fno-slp-vectorize",
+    "-mllvm",
+    "-disable-loop-idiom-all",
+];
 
 /// Delete the objects under `dir` unless they were compiled with
 /// [`CODEGEN_FLAGS`] plus `flags`, then record those. Objects are otherwise

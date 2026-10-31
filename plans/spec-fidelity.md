@@ -623,10 +623,15 @@ anything else.
 ## Phase 7: time
 
 1. [x] **Record the decision** (§6, D18, D66). Done: D71.
-2. [ ] **TR5, step 1. Clang stops reshaping loops:** no unrolling,
+2. [x] **TR5, step 1. Clang stops reshaping loops:** no unrolling,
    vectorising or loop-to-`memory.fill` rewriting
    (`psxw-cc/src/lib.rs:48`, `clang.rs:79, 95`), so pass counts track the
    source's loops.
+   Done `TR5S1`: `CODEGEN_FLAGS` adds `-fno-unroll-loops -fno-vectorize
+   -fno-slp-vectorize -mllvm -disable-loop-idiom-all` (every C → wasm
+   compile: lifted, decompiled, mods, difftest). game.wasm: btn
+   2,914,801 → 2,753,059 bytes (−5.5%), bof4 16,571,334 → 15,918,085
+   (−3.9%).
 3. [ ] **TR5, step 2. Lifted code spends the original's instruction
    counts,** per basic block, instead of a pass per loop header
    (`psxw-link/src/rewrite.rs:356-363`, `game.rs:689-708`;
