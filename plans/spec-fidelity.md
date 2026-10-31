@@ -98,21 +98,25 @@ Nothing here needs a design decision.
 ### Bugs
 
 BIOS:
-- [ ] **B1. `SetDefaultExitFromException` (B0:18h) does nothing.**
+- [x] **B1. `SetDefaultExitFromException` (B0:18h) does nothing.**
   `psx-bios/src/bios.rs:339`. The exception handler keeps entering the old
   custom exit (`psx-runtime/src/driver.rs:51, 85`) after libetc's
   `StopCallback`. Fix: clear `kernel.custom_exit`.
-- [ ] **B2. `EnableEvent`/`DisableEvent` change closed event slots.**
+  Done `c484570`.
+- [x] **B2. `EnableEvent`/`DisableEvent` change closed event slots.**
   `psx-bios/src/bios.rs:303-316`: enabling a closed handle revives it;
   disabling one leaks it (`OpenEvent` reuses only unused slots,
   `kernel.rs:70`). Fix: change only slots in use.
-- [ ] **B3. Memory card sector 1024 is accepted as 1023.**
+  Done `3ead229`: as OpenBIOS's `events.c`, enabling a ready event also makes it busy again.
+- [x] **B3. Memory card sector 1024 is accepted as 1023.**
   `psx-bios/src/card.rs:178, 186`. Fix: `>=`, and drop the clamp.
-- [ ] **B4. B0:15h and libapi's `PAD_init` disagree on their arguments.**
+  Done `dc7dc05`: the spec differs from the fix above. OpenBIOS accepts sectors up to 400h (`> 0x400`); the card answers 400h with FFFFh and the driver fails it (flags 21h, event 8000h). Sector 400h now fails that way, with no clamp.
+- [x] **B4. B0:15h and libapi's `PAD_init` disagree on their arguments.**
   `psx-bios/src/bios.rs:332` vs `sdk-psyq/src/libapi.rs:105`. Fix: settle
   against psx-spx (`OutdatedPadInitAndStart(type, button_dest, …)`) and
   the original `pad.o`; make both agree (BIOS1 then routes `PAD_init`
   through B0:15h).
+  Done `9ed5377`: B0:15h is `PAD_init2(type, button_dest)` (psx-spx, OpenBIOS `initPadHighLevel`): types 20000000h/20000001h only, the kernel's own buffers, `PAD_dr` (B0:16h) storing at `button_dest` each vblank; libapi's `PAD_init` passes its arguments through. `InitPAD2` zero-fills; the handler stores up to 22h bytes whatever the size.
 - [ ] **B5. `open` on `cdrom:` hands out descriptor 16 when all are
   taken.** `psx-bios/src/bios.rs:362`. Fix: fail as the card path does.
 - [ ] **B6. `bios::implemented()` counts calls that always error**
@@ -122,8 +126,9 @@ BIOS:
 - [ ] **B7. BIOS `printf` zero-pads negatives as `000-5`** and ignores
   `+`, space and `#`. `psx-bios/src/bios.rs:597-607`. Fix: sign before
   padding; the flags.
-- [ ] **B8. Stale doc on `card_queue`.** `psx-bios/src/card.rs:162`: it
+- [x] **B8. Stale doc on `card_queue`.** `psx-bios/src/card.rs:162`: it
   always returns true.
+  Done `decdde9`: `card_queue` now refuses while the port's last operation runs (OpenBIOS: flags bit 0), so the doc holds.
 - [ ] **B9. The vblank counter event ignores I_MASK.**
   `psx-bios/src/machine.rs:392`; counters 0–2 are gated
   (`machine.rs:410`), and libapi's `StartRCnt(RCntCNT3)` sets bit 0
@@ -131,25 +136,31 @@ BIOS:
   with the kernel's handler).
 
 Devices (out of scope otherwise):
-- [ ] **B10. `GetlocP` loses a minute.** `psx-devices/src/cdc.rs:389-397`:
+- [x] **B10. `GetlocP` loses a minute.** `psx-devices/src/cdc.rs:389-397`:
   the pregap is subtracted from BCD seconds with no borrow (00:58 reads
   01:00); index fixed at 1; reports the head, not the current sector.
   Fix: work in LBAs, convert once.
-- [ ] **B11. GPUSTAT bits 31 and 13 follow a per-vblank field.**
+  Done `7716465` (agent). The index stays 1: `DiscInfo` carries only each track's index-1 start; index 0 and the pregap countdown need INDEX 00 through psxw-abi and host-native's cue parser.
+- [x] **B11. GPUSTAT bits 31 and 13 follow a per-vblank field.**
   `psx-devices/src/gpu.rs:516-517`. Fix: psx-spx (bit 31 per scanline in
   240-line modes, 0 in vblank; bit 13 is 1 when not interlaced).
-- [ ] **B12. GPUSTAT bit 25 is wrong for DMA directions 1–3.**
+  Done `28f4a57` (agent). Bit 31 is 0 in vblank per psx-spx; Beetle gives `YStart & 1` there.
+- [x] **B12. GPUSTAT bit 25 is wrong for DMA directions 1–3.**
   `psx-devices/src/gpu.rs:518-520`. Fix: 1 = FIFO not full, 2 = bit 28,
   3 = bit 27.
-- [ ] **B13. Timer 0's dot clock runs 4–10× too fast.**
+  Done `c14c58d` (agent). Beetle differs (sets the bit for directions 2 and 3 regardless).
+- [x] **B13. Timer 0's dot clock runs 4–10× too fast.**
   `psx-devices/src/timers.rs:31`, `clock.rs:56-58`. Fix: divide the video
   clock by the horizontal resolution's 10/8/7/5/4.
-- [ ] **B14. Muting or disabling the SPU silences CD audio.**
+  Done `8736711` (agent): 10/8/7/5/4 per psx-spx (Beetle ignores bit 6). Needed a hook after each GP1 write (`psx-bios/src/io.rs`, libgpu's `gp1()`) so the timers learn the display mode.
+- [x] **B14. Muting or disabling the SPU silences CD audio.**
   `psx-spu/src/lib.rs:722-724`. Fix: SPUCNT bits 14–15 don't affect the CD
   input (psx-spx).
+  Done `8a91a38` (agent): muting zeroes the voices (dry and reverb send) before the CD input is added.
 - [ ] **B15. SPU manual-transfer writes past 32 are dropped.**
   `psx-spu/src/lib.rs:349-354`. Fix: settle with the oracle what overflow
   and late DATA writes do.
+  *Blocked (2026-10-30):* the oracle can't settle it. Beetle has no FIFO (each DATA write goes to SPU RAM; its header calls the FIFO "more trouble than it's worth"), and psx-spx says only "max 32 halfwords". Needs a hardware test (M10's rig); left as is.
 
 Renderer, SDK, translator, runtime:
 - [ ] **B16. 15-bit colour is shifted, not expanded.**
@@ -179,17 +190,21 @@ Renderer, SDK, translator, runtime:
 
 ### Small shortcuts
 
-- [ ] **BIOS1. libapi's pad adapters write the BIOS's pad state.**
+- [x] **BIOS1. libapi's pad adapters write the BIOS's pad state.**
   `sdk-psyq/src/libapi.rs:95-109`. Fix: call B0:12h, 13h and 15h.
-- [ ] **BIOS2. libcard's wrappers never call the BIOS.**
+  Done `1860277`, `cc49071`: `InitPAD`/`StartPAD` call B0:12h/13h with the original's `ChangeClearPAD(0)` and set pad.o's init flag (found through its `lui`/`sw` pair); `SetInitPadFlag`/`ReadInitPadFlag` run as original code. Not reproduced: pad.o's priority-1 vblank element (its handler zeroes SIO0 CTRL), see Findings.
+- [x] **BIOS2. libcard's wrappers never call the BIOS.**
   `sdk-psyq/src/libmc.rs:60-66`. Fix: call B0:4Ah–4Ch, A0:55h/70h and
   return what they return.
-- [ ] **BIOS3. libpad reads the BIOS's chain list** to see whether its
+  Done `7e89d5e`: `InitCARD`/`StartCARD`/`StopCARD` run as original code into the BIOS; only the functions that patch the Sony BIOS (`_patch_card`, `_patch_card2`, `_patch_card_info`, `_copy_memcard_patch`, `_ExitCard`) are adapters. B0:4Ah–4Ch follow OpenBIOS (`InitCARD2(pad_enable)`, the shared handler in or out). D43 updated.
+- [x] **BIOS3. libpad reads the BIOS's chain list** to see whether its
   element is installed. `sdk-psyq/src/libpad.rs:183`. Fix: keep that in
   libpad's own state (`PadStartCom`, `PadStopCom`).
-- [ ] **SDK7. libetc calls handlers and callbacks with a0–a3 = 0.**
+  Done `4886ad3`.
+- [x] **SDK7. libetc calls handlers and callbacks with a0–a3 = 0.**
   `sdk-psyq/src/libetc.rs:215-217`. Fix: pass what the original leaves
   (I_STAT; DICR's address).
+  Done `9b210b6`: a0 = the I_STAT the dispatcher read (handlers, VSync callbacks), DICR's address (DMA callbacks).
 - [ ] **SDK9. Messages go to the host log, not the game's `printf`.**
   `sdk-psyq/src/libgpu.rs:343, 869`; `libetc.rs:250, 578`;
   `libcd.rs:427, 638`. Fix: print through the game's `printf`, as
@@ -478,3 +493,17 @@ locals, or static translation.
   open-items) and the BIOS rework.
 
 ## Findings
+
+- **libapi's pad.o installs its own vblank element** (2026-10-30, BIOS1).
+  `InitPAD` and `PAD_init` call a local helper that queues a priority-1
+  element: its verifier checks vblank pending and unmasked, its handler
+  zeroes SIO0 CTRL (through a register pointer in libapi's `.data`) and
+  spins briefly, before the BIOS's pad handler at priority 2. The adapters
+  don't queue it; it matters once the BIOS's pad driver drives SIO0
+  (phase 3, BIOS5). Likewise `EnablePAD`/`DisablePAD` jump into code
+  `_patch_pad` finds in the Sony BIOS (B0:5Bh's address + 884h/894h,
+  probably psx-spx's `pad_enable_flag`); the adapters are nops. Settle
+  both in BIOS5.
+- **OpenBIOS is the reference where psx-spx is silent, and sometimes the
+  plan's fix was wrong** (B2, B3): check OpenBIOS's source (pcsx-redux's
+  `src/mips/openbios`, the oracle's `8a86b7e`) before each BIOS fix.
