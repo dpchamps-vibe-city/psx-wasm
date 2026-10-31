@@ -453,28 +453,35 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
 
 ## Phase 4: translator correctness
 
-1. [ ] **TR2. Registers passed outside o32 fail the lift** instead of
+1. [x] **TR2. Registers passed outside o32 fail the lift** instead of
    arriving as 0 (`psxw-lift/src/emit.rs:128-141`). Inlining evidence
    crosses branches and joins, and counts s0–s7, fp and HI/LO
    (`analysis.rs:16-17, 109-129, 326-327`; `lib.rs:291-297, 363-382`).
    Each case that then fails gets a proper fix; open-items "Lifted SDK asm
    that reads temporaries on entry" folds in here. Update D33.
-2. [ ] **TR3. A return address other than the caller's fails the lift.**
+   Done `f71a5d1`, `1ba3f0e` (agent): evidence crosses branches and joins, both ways (a caller setting registers before, reading them after), with hi/lo and s0–s7/fp; a call that can't carry them (an unexpanded `jalr`/`bgezal`, a C caller, an address-taken callee, a read after a pointer, BIOS or kernel call) fails the lift; a register no caller sets is uninitialised and reads 0 (D27). btn expands 17 functions, bof4 25; nothing fails. The open item closes: `_spu_pitch2note` has no callers (uninitialised case), the msc02 helpers and `func_8003A2A4` are expanded into their callers. D33 reworded.
+2. [x] **TR3. A return address other than the caller's fails the lift.**
    `la ra,L; j f`, an edited saved-ra slot, a game's own setjmp/longjmp
    (`psxw-lift/src/graph.rs:345`; `emit.rs:138, 279-282, 323-324`).
-3. [ ] **TR7. Variadic marshalling copies every argument** and realigns
+   Done `3400afe`, `5efaa23` (agent): ra tracked through moves, the frame, constant-address words and calls; a `jr ra` (or tail jump) with ra known not the caller's fails the lift, and where only some paths restore it the return checks at run time and traps. btn: `DrawCulledProjectedPrimitives` returns early with sp still on the scratchpad stack (a game bug; now the checked kind); libmcx's handler's `jr k0; rfe` lowers as ReturnFromException. bof4: none.
+3. [x] **TR7. Variadic marshalling copies every argument** and realigns
    64-bit ones to even slots (`psxw-link/src/marshal.rs:16, 96-101`).
-4. [ ] **TR8. Writable data goes to its original address.** Statics the
+   Done `1209426` (agent): the census records each variadic call's argument types (`protos2.json`); C→o32 copies every word any call in the object passes, 64-bit ones at even words, and fails the link where an object's calls disagree. o32→variadic C still copies 8 words as they lie (the o32 caller's types aren't known).
+4. [x] **TR8. Writable data goes to its original address.** Statics the
    address map doesn't name (`psxw-link/src/layout.rs:147-167`) are
    placed from the decomp's layout, or fail the link naming them.
-5. [ ] **TR9. `memory.copy`/`memory.fill` reach the I/O hook and spend
+   Done `8f25be0` (agent): the second — the link fails naming them. Both games put only read-only data in AUX (lift markers, switch tables).
+5. [x] **TR9. `memory.copy`/`memory.fill` reach the I/O hook and spend
    the budget** (`psxw-link/src/rewrite.rs:304-328`; `game.rs:487-489`;
    `bodies.rs:89-109`).
-6. [ ] **TR13. Decompiled C loops get a compiler barrier,** as lifted
+   Done `aa3f649` (agent): a pass per word, safepoints included; in functions with an I/O hook a copy or fill touching the I/O window goes byte by byte through it; GCC's builtin `memcpy` the same path. btn game.wasm +0.4% instructions; bof4 unchanged.
+6. [x] **TR13. Decompiled C loops get a compiler barrier,** as lifted
    loops do (`psxw-lift/src/emit.rs:167-173`), so clang can't hoist a load
    an interrupt changes.
-7. [ ] **TR15. GTE lowering keeps the load delay**
+   Done `4c144c8`, `328bbb0` (agent): every `for`/`while`/`do` body and every backward `goto` label starts with an empty asm memory barrier (`do { } while (0)` excepted). btn −0.8% instructions (clang stops unrolling those loops); bof4's C has no loops. Census `.i` files change: re-run `psxw census` before `ci`.
+7. [x] **TR15. GTE lowering keeps the load delay**
    (`psxw-cc/src/gte.rs:317-324`).
+   Done `706eaf0` (agent): the instruction after a load, `mfc2` or `cfc2` reads the old value; the template's `nop`s count. PsyQ's macros always put a `nop` there, so neither game's code changes.
 
 ### Exit criteria
 
@@ -483,6 +490,16 @@ The BIOS implemented properly. Phase 1 fixed its bugs.
    pass.
 3. `psxw build btn` and `psxw build bof4` succeed.
 4. **Human:** `psxw ci btn` and `psxw ci bof4`.
+
+Status (2026-10-31): 1 passes (merged at `1ba3f0e`); 2's lifts pass (3387
+of 3387, 14823 of 14823) but `psxw difftest btn` has 10 mismatches of
+2625: nine on main before phase 4 (seven unprototyped calls to `FntPrint`
+and `memset` that clang lowers to `call_indirect`; byte differences in
+`DrawTextSlotImage` and `Ovl28DrawSequenceGradientRect`; the 2026-10-29
+report had none) and one from TR13 (`AnimateMessageWindowRect`: after
+the barrier clang sinks a division into the branch that uses it, so the
+original's `break 7` on a zero divisor doesn't happen; see Findings). 3
+holds. 4 waits for the human, after `psxw census` for both games.
 
 ## Phase 5: overlay residency
 
@@ -610,6 +627,25 @@ locals, or static translation.
   criteria). D67 recorded for phase 2 (`c3aa557`).
 
 ## Findings
+
+- **Phase 4's limits** (2026-10-31). D33: a value a function passes on
+  without setting it is no evidence for its callee; calls through
+  pointers carry only o32 registers; GCC's large-frame prologue saves
+  s-registers through t5, so the kprintf helper looks like it reads s0–s3
+  and is expanded (harmless). Dead "functions" reading registers on
+  entry: split symbols (bof4 `func_80142A40`, the tail of
+  `func_80142978`), data decoded as code at subsegment starts (`mfhi t6`
+  at libgte msc00, libc a63, libapi c114), fragments found through
+  pointers (bof4 `ovl_1936` 801B1534, `ovl_846` 801EDFA4); nothing calls
+  them, function discovery could drop them. TR9 charges a pass per word,
+  including clang's zero-fills of locals (D27) that the original doesn't
+  have: phase 7 revisits it.
+- **Clang moves divisions the source places** (TR13's difftest mismatch).
+  Division by zero is undefined in C, so clang may sink a division into
+  the branch that uses it; D36's R3000 division and `break` check are
+  applied after clang has optimised. Decided (2026-10-31, under the
+  /goal): a division by a non-constant in decompiled C stays where the
+  source puts it (opaque to clang until the link lowers it as D36 says).
 
 - **libapi's pad.o installs its own vblank element** (2026-10-30, BIOS1).
   `InitPAD` and `PAD_init` call a local helper that queues a priority-1
