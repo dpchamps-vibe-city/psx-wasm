@@ -621,8 +621,21 @@ error call and a returning patch, not an unconditional nonfatal error policy.
 Integrated tests: BIOS 36, devices 63, runtime 8 and SDK 36 plus wasm32 runtime
 check pass. They use handcrafted sectors, include core/native handover, no-bus
 head movement, multi-sector waits, zero-time seek, callback reentry, returning
-SystemError patches and event cleanup. Game rebuild/replay gates are recorded
-separately below when run; no fresh BIOS oracle comparison is claimed.
+SystemError patches and event cleanup. No fresh BIOS oracle comparison is claimed.
+
+Fresh gates at integrated source `e2fb21b`, ABI 18: release CLI and both game
+builds pass, all six chip groups native. BTN wasm is 2,500,066 bytes; BOF4 is
+10,112,698 bytes. `title-to-gameplay` (6,000 frames, all three state expectations),
+`card-load` (3,000 frames, no state expectations), `title-to-field` (26,000 frames,
+all five state expectations) and the supplied name-select crash replay (694
+frames) pass no-trap. Both games' loaded text matches disc and EDC error counts
+are zero. BTN's GPU timeout at frame 64 and resets at 65/83 persist unchanged;
+not claimed resolved or classified. These use fresh disposable run-card storage;
+previous disposable storage was retained in the session scratchpad. They are not
+a new persistence certification. BTN libetc conformance passes all 60 steps,
+including original-vs-adaptor ResetCallback with installed BIOS CD events.
+Reports/logs are retained in the session scratchpad as `cd-*`; this is not a
+full fresh CI/browser/oracle gate, and earlier ABI-17 CI failures remain open.
 
 **Still unfinished:** A(90h..93h), A(9Eh), A(A2h/A3h) callable handler services;
 controller INT5 production/error retries (A94 currently exposes the zero initial
@@ -657,6 +670,21 @@ hazards, incomplete callback state transitions/error fields, and an extra read
 completion vblank. Corrective run `15ef11e6-62fc-4b78-9fc6-442d57c0e63c` resumes
 the same isolated worker with these findings, two disposable-card lifecycle
 coverage, and public-reference verification of helper/channel semantics.
+
+After the user flagged unnecessary serialization, workflow
+`810c2b90-9237-4898-bca6-953b1a8efeff` adds four parallel DeepSeek lanes alongside
+that correction (no Qwen active; only Qwen has the one-at-a-time limit):
+
+| Lane | Isolation and boundary |
+|---|---|
+| LoadTest/Load | `../psx-wasm-salvage-lanes/load-services`, `salvage/load-services`, base `e2fb21b`; file/device Flow only, no Exec/runtime/nonlocal redesign |
+| Console helpers | `../psx-wasm-salvage-lanes/console-services`, `salvage/console-services`, base `e2fb21b`; circular buffers/input software/gets where existing seams suffice; missing host input and ioabort control flow require explicit blocker/decision |
+| BIOS coverage reporting | `../psx-wasm-salvage-lanes/bios-coverage`, `salvage/bios-coverage`, base `e2fb21b`; distinguish working/partial/unsupported/documented fatal/noop, no new framework or runtime ABI |
+| BTN difftest triage | Existing isolated `../psx-wasm-salvage-validation` at `a74f832`/ABI 17, source-read-only; bounded analysis of the two recorded mismatches, no exclusions/domain weakening or assumed baseline attribution |
+
+Parent retains difficult runtime/control-flow work, source acceptance and
+integration. No child may subdelegate, write input snapshots or real cards, or
+expand architecture unilaterally.
 
 ## Progress log
 
