@@ -173,6 +173,23 @@ mod tests {
     }
 
     #[test]
+    fn pad_init2_and_pad_dr() {
+        let mut m = machine();
+        let dest = 0x8001_0000;
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x15, [0x1000_0001, dest, 0, 0])), 0);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x15, [0x2000_0000, dest, 0, 0])), 2);
+        m.kernel.pad_vblank(&mut *m.mem, &mut *m.host);
+        assert_eq!(m.mem.bytes(kernel::PAD_INIT2_BUFS[0], 4), [0x00, 0x41, 0xFF, 0xFF]);
+        assert_eq!(m.mem.r32(dest), 0xFFFF_FFFF);
+        // A digital pad on port 1; on port 2 a 23h device, its first
+        // analogue input past 10h.
+        m.mem.write(kernel::PAD_INIT2_BUFS[0], &[0x00, 0x41, 0x12, 0x34]);
+        m.mem.write(kernel::PAD_INIT2_BUFS[1], &[0x00, 0x23, 0xFF, 0xFF, 0, 0x11, 0x05]);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x16, [0; 4])), 0xFFBF_1234);
+        assert_eq!(m.mem.r32(dest), 0xFFBF_1234);
+    }
+
+    #[test]
     fn reset_entry_int_drops_the_hook() {
         let mut m = machine();
         ret(bios::call(&mut m, 0xB0, 0x19, [0x8001_0000, 0, 0, 0]));

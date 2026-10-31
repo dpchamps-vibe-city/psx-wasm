@@ -64,7 +64,7 @@
 //! waits' times leave out the original's wait for /ACK to fall after
 //! each byte (the pulse lasts 32 cycles, a pass or two).
 
-use crate::{Adapter, M, Result, reg, ret, set_reg};
+use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("PadInitDirect", pad_init_direct),
@@ -171,10 +171,6 @@ fn index(port: u32) -> usize {
     (port & 0xF0 != 0) as usize
 }
 
-/// A BIOS call that returns at once.
-fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result::Result<(), String> {
-    psx_bios::bios::call(m, table, func, a).map(|_| ())
-}
 
 // --- The vblank engine -----------------------------------------------------
 

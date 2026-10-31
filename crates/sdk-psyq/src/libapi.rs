@@ -10,7 +10,7 @@
 //! I_MASK (its table: counters 0-2, then RCntCNT3, vblank), which the
 //! kernel's root counter handler and libetc's dispatcher both go by.
 
-use crate::{Adapter, M, Result, reg, ret, set_reg};
+use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
 
 /// The root-counter adapters (`counter.o`): chip irq (D59).
 pub const COUNTERS: &[&str] = &["SetRCnt", "GetRCnt", "StartRCnt", "StopRCnt", "ResetRCnt"];
@@ -102,10 +102,11 @@ fn start_pad(m: &mut M, _a: [u32; 4]) -> Result {
     ret(1)
 }
 
+/// `PAD_init(type, button_dest, …)`: `ChangeClearPAD(0)`, then the BIOS's
+/// `PAD_init2` (B0:15h) with the same arguments; 1.
 fn pad_init(m: &mut M, a: [u32; 4]) -> Result {
-    // PAD_init(type, buf): a two-port buffer of 0x22 bytes each.
-    m.kernel.pad_bufs = Some([(a[1], 0x22), (a[1] + 0x22, 0x22)]);
-    m.kernel.pad_started = true;
+    bios(m, 0xB0, 0x5B, [0; 4])?;
+    bios(m, 0xB0, 0x15, a)?;
     ret(1)
 }
 

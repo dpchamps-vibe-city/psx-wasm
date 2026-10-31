@@ -52,7 +52,7 @@
 //! interrupt flag, the received byte and the baud (for the /ACK's time)
 //! are kept.
 
-use crate::{Adapter, M, Result, reg, ret, set_reg};
+use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
 use psx_bios::{Event, Flow, GuestCall, IrqStep};
 use psx_devices::memcard::Responder;
 
@@ -339,9 +339,6 @@ fn chk_rsrv(m: &mut M, l: Lib, port: u32) -> bool {
     true
 }
 
-fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result::Result<(), String> {
-    psx_bios::bios::call(m, table, func, a).map(|_| ())
-}
 
 /// A transfer's end: the port deselected, IRQ7 acknowledged and masked.
 fn quiet(m: &mut M) -> std::result::Result<(), String> {
