@@ -627,8 +627,9 @@ fn pacing(ws: &Workspace, game: &str, args: &[&str]) -> Result<bool> {
     Ok(pass || machine.is_none())
 }
 
-/// Memory-card import and export and the Worker's save path, through OPFS
-/// in each browser: every check in `web/test/storage.js` must pass.
+/// Memory-card import and export, the Worker's save path and two same-origin
+/// bundles' disc storage, through OPFS in each browser: every check in
+/// `web/test/storage.js` must pass.
 fn storage(ws: &Workspace, args: &[&str]) -> Result<bool> {
     let mut browsers = vec!["chromium".to_string(), "firefox".to_string()];
     let mut timeout = 120u32;
@@ -644,10 +645,42 @@ fn storage(ws: &Workspace, args: &[&str]) -> Result<bool> {
     let bundle = ws.out_dir().join("web").join("test-storage");
     let _ = std::fs::remove_dir_all(&bundle);
     std::fs::create_dir_all(&bundle)?;
-    std::fs::copy(ws.root.join("web/cards.js"), bundle.join("cards.js"))?;
+    for f in ["cards.js", "disc.js"] {
+        std::fs::copy(ws.root.join("web").join(f), bundle.join(f))?;
+    }
     for f in ["storage.html", "storage.js", "storage-worker.js"] {
         std::fs::copy(ws.root.join("web/test").join(f), bundle.join(f))?;
     }
+    // Two minimal bundles on one origin: the page as `psxw build-web` lays it
+    // out, each with its own game.json id, so main.js keeps its disc in its
+    // own OPFS directory and localStorage key. Both cues name the same files;
+    // only the bytes differ. The game's Worker is never started, so nothing
+    // else from a bundle is needed.
+    let cue = |id: &str| format!("REM {id}\nFILE \"track01.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
+    for (id, seed) in [("test-a", 1u8), ("test-b", 2u8)] {
+        let dir = bundle.join(id);
+        std::fs::create_dir_all(dir.join("disc"))?;
+        for e in std::fs::read_dir(ws.root.join("web"))? {
+            let p = e?.path();
+            if p.is_file() {
+                std::fs::copy(&p, dir.join(p.file_name().unwrap_or_default()))?;
+            }
+        }
+        std::fs::write(dir.join("game.json"), format!("{{\"id\":\"{id}\"}}"))?;
+        std::fs::write(dir.join("disc/test.cue"), cue(id))?;
+        // Four raw 2352-byte sectors; the bytes only have to differ between
+        // the bundles and survive the import unchanged.
+        let bin: Vec<u8> = (0..4 * 2352u32).map(|i| (i & 0xff) as u8 ^ seed).collect();
+        std::fs::write(dir.join("disc/track01.bin"), bin)?;
+    }
+    // A second image for bundle test-a, with the same file names but a
+    // different cue and sectors: importing it over a locked disc must leave
+    // the first image intact.
+    let replacement = bundle.join("test-a").join("replacement");
+    std::fs::create_dir_all(&replacement)?;
+    std::fs::write(replacement.join("test.cue"), cue("replacement"))?;
+    let bin: Vec<u8> = (0..4 * 2352u32).map(|i| (i & 0xff) as u8 ^ 9).collect();
+    std::fs::write(replacement.join("track01.bin"), bin)?;
     let results = ws.out_dir().join("web").join("test-storage-results");
     let _ = std::fs::remove_dir_all(&results);
     std::fs::create_dir_all(&results)?;
