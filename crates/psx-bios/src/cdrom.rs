@@ -122,24 +122,60 @@ fn sector_bytes(raw: &[u8; cd::RAW], mode: u8) -> &[u8] {
     }
 }
 
-/// Poll and consume the live TestEvent flags, not the operation's result.
-/// The caller's status byte lives in its guest stack frame across re-entry.
-/// Cancellation remains a separate native failure, not an invented INT5 event.
-/// Like TestEvent polling, an unready/closed flag can wait indefinitely: no
-/// pending drive operation does not exclude a later guest DeliverEvent.
+/// Poll the live B0B table, not the operation's result. Only TestEvent (or
+/// its patch) consumes flags. Cancellation is a separate native failure.
 fn cd_wait<S: Sdk>(m: &mut Machine<S>, done: Rc<Cell<Option<u64>>>, read: bool) -> Flow<S> {
-    if done.get() == Some(ERR as u64) {
-        m.cd_take(ERR, &done);
-        return Flow::ret(ERR);
-    }
-    if let Some((h, spec)) = m.cd_wait_event(read) {
-        m.set_ev_status(h, kernel::EV_ENABLED);
-        let status = done.get().unwrap_or(0) & 0xFFFF_FFFF_0000_0000;
-        return Flow::Return(status | spec as u64);
-    }
-    Flow::Block {
-        until: Wait::Cd { done: done.clone(), read },
-        then: Box::new(move |m| cd_wait(m, done, read)),
+    cd_poll(m, done, read, 0, false, crate::machine::LOOP_BUDGET)
+}
+
+fn cd_poll<S: Sdk>(m: &mut Machine<S>, done: Rc<Cell<Option<u64>>>, read: bool,
+    mut index: usize, mut patched: bool, mut left: u64) -> Flow<S>
+{
+    loop {
+        // A false-returning patch can cancel native work. Observe that before
+        // another probe (which may now have a closed handle) or a quantum yield.
+        if done.get() == Some(ERR as u64) {
+            m.cd_take(ERR, &done);
+            return Flow::ret(ERR);
+        }
+        if index == if read { 3 } else { 2 } {
+            if !patched {
+                // The native TestEvent has no other effects. Sleep until a
+                // live flag, cancellation or table patch can change its result.
+                // No pending drive operation does not exclude a later event.
+                return Flow::Block {
+                    until: Wait::Cd { done: done.clone(), read },
+                    then: Box::new(move |m| cd_wait(m, done, read)),
+                };
+            }
+            left -= 1;
+            if left == 0 {
+                // A guest wrapper may always return false without containing
+                // a loop/safepoint of its own. Yield using the existing loop
+                // quantum, not instruction costs or a new polling timeout.
+                m.regs.reset_budget();
+                return Flow::Block {
+                    until: Wait::Cycle(m.clock.now + m.quantum()),
+                    then: Box::new(move |m| cd_wait(m, done, read)),
+                };
+            }
+            index = 0;
+            patched = false;
+        }
+        let (slot, spec) = [(1, DNE), (4, ERR), (3, END)][index];
+        let handle = m.kernel.cd.events[slot];
+        patched |= !m.cd_native_test_event();
+        let flow = crate::bios::dispatch(m, 0xB0, 0x0B, [handle, 0, 0, 0])
+            .unwrap_or_else(|e| panic!("CD TestEvent: {e}"));
+        index += 1;
+        match flow {
+            Flow::Return(v) if v as u32 == 0 => {}
+            Flow::Return(_) => return Flow::ret(spec),
+            flow => return crate::machine::seq(m, flow, move |m, v| {
+                if v as u32 != 0 { Flow::ret(spec) }
+                else { cd_poll(m, done, read, index, patched, left) }
+            }),
+        }
     }
 }
 
@@ -359,8 +395,12 @@ impl<S: Sdk> Machine<S> {
             .find(|&(h, _)| self.event_ready(h))
     }
 
+    fn cd_native_test_event(&self) -> bool {
+        self.mem.r32(crate::tables::entry(0xB0, 0x0B).unwrap()) == crate::tables::stand_in(0xB0, 0x0B)
+    }
+
     pub(crate) fn cd_wait_ready(&self, done: &Rc<Cell<Option<u64>>>, read: bool) -> bool {
-        done.get() == Some(ERR as u64) || self.cd_wait_event(read).is_some()
+        done.get() == Some(ERR as u64) || !self.cd_native_test_event() || self.cd_wait_event(read).is_some()
     }
 
     /// Cancellation can also leave an ERR flag to consume, but must not take
@@ -1090,6 +1130,146 @@ mod tests {
             assert!(m.kernel.cd.op.is_some(), "software delivery does not finish the drive");
             assert_eq!(m.clock.now, now);
         }
+    }
+
+    /// B0B patches decide readiness without an implicit native TestEvent;
+    /// each probe reloads the table/handle and awaits its own Call or Block.
+    #[test]
+    fn blocking_cd_calls_honor_patched_test_event() {
+        const POLL: u32 = 0x8001_1000;
+        const POLL2: u32 = 0x8001_2000;
+        const ERROR: u32 = 0x8001_3000;
+        let entry = crate::tables::entry(0xB0, 0x0B).unwrap();
+        for (func, code) in [(0xA5, 0x0C), (0xA6, 0x20)] {
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            let sp = m.regs.sp();
+            let events = m.kernel.cd.events;
+            m.mem.w32(entry, POLL);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+            let flow = bios::dispatch(&mut m, 0xA0, func, [1, 4000, 0x8002_0000, 0]).unwrap();
+            let Flow::Call { call, then } = flow else { panic!("DNE probe before any wait") };
+            assert_eq!((call.addr, call.args), (POLL, [events[1], 0, 0, 0]));
+            assert_eq!(m.regs.sp(), sp - 24);
+            // Even READY is not success if the patch says false. Re-entry can
+            // replace the table and the next probe's handle (e.g. CD re-init).
+            for spec in [DNE, ERR, END] { m.deliver_event(EV_CD, spec); }
+            let replacement = m.open_event(0x1234, ERR, EV_MODE_NOINTR, 0);
+            m.set_ev_status(replacement, kernel::EV_DISABLED);
+            m.kernel.cd.events[4] = replacement;
+            m.mem.w32(entry, POLL2);
+            let Flow::Call { call, then } = then(&mut m, 1 << 32) else { panic!("ERR probe") };
+            assert_eq!((call.addr, call.args), (POLL2, [replacement, 0, 0, 0]));
+            assert!(m.event_ready(events[1]), "no implicit native DNE poll");
+            let Flow::Call { call, then } = then(&mut m, u32::MAX as u64) else { panic!("SystemError") };
+            assert_eq!((call.addr, call.args), (ERROR, [0x44, code, 0, 0]));
+            assert_eq!(m.ev(replacement).unwrap().status, kernel::EV_DISABLED,
+                "synthetic success must not consume or enable the patch's slot");
+            for i in [1, 3, 4] { assert!(m.event_ready(events[i]), "no implicit consumption"); }
+            let flow = then(&mut m, 123);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert_eq!(m.regs.sp(), sp);
+            assert_eq!(m.clock.now, 0);
+            assert!(m.kernel.cd.op.is_some(), "software result does not cancel native work");
+        }
+
+        for winner in [DNE, ERR, END] {
+            let mut m = machine_with_disc(vec![]);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let sp = m.regs.sp();
+            let saved = m.mem.r32(entry);
+            let events = m.kernel.cd.events;
+            m.mem.w32(entry, POLL);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+            let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 0, 0x8002_0000, 0]).unwrap();
+            let Flow::Call { call, then } = flow else { panic!("seek DNE") };
+            assert_eq!((call.addr, call.args), (POLL, [events[1], 0, 0, 0]));
+            m.step(m.cd_due());
+            let (t, f) = crate::tables::stand_in_fn(saved).unwrap();
+            let result = ret(bios::call(&mut m, t, f, call.args));
+            assert_eq!(result, 1, "saved TestEvent remains callable");
+            let mut flow = then(&mut m, result as u64);
+            assert!(!m.event_ready(events[1]));
+            for spec in [DNE, ERR, END] { m.deliver_event(EV_CD, spec); }
+            for (i, spec) in [(1, DNE), (4, ERR), (3, END)] {
+                let Flow::Call { call, then } = flow else { panic!("read probe {spec:x}") };
+                assert_eq!((call.addr, call.args), (POLL, [events[i], 0, 0, 0]));
+                flow = then(&mut m, if spec == winner { 7 } else { 1 << 32 });
+                if spec == winner { break; }
+            }
+            if winner != DNE {
+                let Flow::Call { call, then } = flow else { panic!("read error") };
+                assert_eq!((call.addr, call.args), (ERROR, [0x44, if winner == ERR { 0x16 } else { 0x17 }, 0, 0]));
+                flow = then(&mut m, 123);
+                if winner == ERR {
+                    let Flow::Call { call, then } = flow else { panic!("returning ERR retries busy seek") };
+                    assert_eq!((call.addr, call.args), (ERROR, [0x44, 0x0B, 0, 0]));
+                    flow = then(&mut m, 456);
+                }
+            }
+            assert_eq!(run(&mut m, flow), if winner == DNE { 2 } else { u32::MAX as u64 });
+            for i in [1, 3, 4] { assert!(m.event_ready(events[i]), "patch owns consumption"); }
+            assert_eq!(m.regs.sp(), sp);
+            assert_eq!(m.clock.now, 0);
+            assert!(m.kernel.cd.op.is_some());
+        }
+
+        // A false-returning probe can remove/reset CD work. Cancellation is
+        // observed before the next probe or yield, even with all handles closed.
+        for cancel_after in [1, 2] {
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            let sp = m.regs.sp();
+            m.mem.w32(entry, POLL);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+            let mut flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+            for probe in 1..=cancel_after {
+                let Flow::Call { call, then } = flow else { panic!("TestEvent probe") };
+                assert_eq!(call.addr, POLL);
+                if probe == cancel_after {
+                    ret(bios::dispatch(&mut m, 0xA0, 0x56, [0; 4]));
+                    assert_eq!(m.kernel.cd.events, [0; 5]);
+                }
+                flow = then(&mut m, 0);
+            }
+            let Flow::Call { call, then } = flow else { panic!("cancellation before another poll") };
+            assert_eq!((call.addr, call.args), (ERROR, [0x44, 0x20, 0, 0]));
+            let flow = then(&mut m, 123);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert_eq!(m.regs.sp(), sp);
+            assert_eq!(m.clock.now, 0);
+            assert!(m.kernel.cd.op.is_none());
+        }
+
+        // Redirecting to a native blocking service still awaits that flow;
+        // do not poll ERR or read the local status until WaitEvent returns.
+        let mut m = machine_with_disc(vec![]);
+        m.cd_init();
+        let sp = m.regs.sp();
+        m.mem.w32(entry, crate::tables::stand_in(0xB0, 0x0A));
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        let Flow::Block { until, then } = flow else { panic!("patched WaitEvent") };
+        assert_eq!(until, Wait::Event(m.kernel.cd.events[1]));
+        assert!(!m.holds(&until));
+        m.step(m.cd_due());
+        assert!(m.holds(&until));
+        let flow = then(&mut m);
+        assert_eq!(run(&mut m, flow), 2);
+        assert_eq!(m.regs.sp(), sp);
+        assert!(!m.event_ready(m.kernel.cd.events[1]));
+
+        // A redirected immediate zero must yield too, without Rust recursion
+        // or consuming a ready flag behind the patch's back.
+        m.mem.w32(entry, crate::tables::stand_in(0xC0, 0x14));
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        let Flow::Block { until, then } = flow else { panic!("zero-return polling yields") };
+        assert_eq!(until, Wait::Cycle(m.clock.now + m.quantum()));
+        let zeros = m.counts["bios.C0h:14h return 0"];
+        assert_eq!(zeros, 2 * crate::machine::LOOP_BUDGET);
+        m.mem.w32(entry, crate::tables::stand_in(0xB0, 0x0B));
+        assert_eq!(run(&mut m, Flow::Block { until, then }), 2);
+        assert_eq!(m.regs.sp(), sp);
     }
 
     /// Terminal failures call the patchable SystemError and return -1 if it returns.

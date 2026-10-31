@@ -190,8 +190,9 @@ pub enum Wait {
     Sdk(u32),
     /// A BIOS event becomes ready.
     Event(u32),
-    /// A blocking CD call's live events, or cancellation of its own native
-    /// operation. Normal completion alone does not satisfy the wait.
+    /// A blocking CD call's live events, cancellation of its own native
+    /// operation, or a changed TestEvent entry that must be called again.
+    /// Normal completion alone does not satisfy the wait.
     Cd { done: Rc<Cell<Option<u64>>>, read: bool },
 }
 

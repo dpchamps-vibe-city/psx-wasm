@@ -46,8 +46,11 @@ retain their provenance; the active recovery status is recorded separately.
   preserving arguments and awaiting patched continuations. MSF/status locals
   use per-call guest stack frames; status reads the actual byte after DNE.
   Software completion after a rejected/cancelled attempt does not inherit that
-  stale native cancellation. Patched TestEvent polling, native busy progress
-  and INT5 production remain unfinished.
+  stale native cancellation. Completion probes now call patched B0B TestEvent
+  in order, honoring Call/Block and synthetic results without implicit flag
+  consumption. Native waits wake on table changes; patched polling yields on
+  the existing loop budget/quantum so wrappers cannot starve scheduled work.
+  Native busy-command progress and INT5/chain services remain unfinished.
   An early read ERR can still encounter busy SeekL after the patch returns;
   no silent native-read cancellation is added.
   A52/C09 contracts remain unresolved.
@@ -56,13 +59,15 @@ retain their provenance; the active recovery status is recorded separately.
   B53's offset calculation itself needs no glyph resource, but the proposed
   OpenBIOS original-font lookup aliases valid 899Eh/899Fh codes. Parent rejected
   that mapping; reliable algorithm/vector evidence remains a separate gap.
-- **Validation:** the CD seek/status follow-up passes BIOS 55 / runtime 9 /
-  SDK 42 tests and wasm32 runtime check. Fresh release/runtime/both game builds
-  and all four unchanged replays pass for this source, including the prior A7E
-  follow-up. All six chip groups remain native; ABI 18 and coverage classifications
-  are unchanged. Logs, replay/check JSON and prior disposable run cards are in
-  session scratch under `cd-command-*`; builds used the checkout's ignored
-  `out/tmp-cd-live-wait` as TMPDIR. Inputs and user saves were untouched.
+- **Validation:** the CD TestEvent follow-up passes BIOS 56 / runtime 10 /
+  SDK 42 tests and wasm32 runtime check; logs are in session scratch under
+  `cd-testevent-*`. Release/runtime/both game builds and four unchanged replays
+  remain passing at `5ac49b3`, before this TestEvent follow-up, not freshly
+  rebuilt claims. All six chip groups were native; ABI 18 and coverage
+  classifications are unchanged. Those build/replay/check logs and prior
+  disposable run cards are in session scratch under `cd-command-*`; tests/builds
+  use the checkout's ignored `out/tmp-cd-live-wait` as TMPDIR. Inputs and user
+  saves were untouched.
   Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
   remain open. Two-bundle browser disc isolation, locked-import refusal,

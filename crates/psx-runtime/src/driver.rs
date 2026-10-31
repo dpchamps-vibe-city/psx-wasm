@@ -301,6 +301,109 @@ mod tests {
         }
     }
 
+    /// A callback can patch TestEvent while a native CD wait is asleep.
+    /// Synthetic replies need no flags/time; a wrapper around the original
+    /// must let scheduled work progress even when the wrapper has no loop.
+    #[test]
+    fn cd_testevent_patch_wakes_and_yields_through_the_driver() {
+        use psx_bios::{bios, tables};
+        use std::{cell::Cell, rc::Rc};
+        const INSTALL: u32 = 0x8001_1000;
+        const POLL: u32 = 0x8001_2000;
+        const SP: u32 = 0x801F_F000;
+        struct PollRegs {
+            sp: u32,
+            budget: Rc<Cell<u32>>,
+            resets: Rc<Cell<u32>>,
+        }
+        impl psx_bios::Regs for PollRegs {
+            fn sp(&self) -> u32 { self.sp }
+            fn set_sp(&mut self, sp: u32) { self.sp = sp; }
+            fn gp(&self) -> u32 { 0 }
+            fn set_gp(&mut self, _: u32) {}
+            fn budget(&self) -> u32 { self.budget.get() }
+            fn reset_budget(&mut self) {
+                self.budget.set(psx_bios::machine::LOOP_BUDGET as u32);
+                self.resets.set(self.resets.get() + 1);
+            }
+        }
+        struct PollGuest<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            wrap: bool,
+            saved: u32,
+            polls: usize,
+            expected: usize,
+        }
+        impl Invoke for PollGuest<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                let mut m = self.rt.borrow_mut();
+                assert_eq!(m.regs.sp(), SP - 24);
+                if call.addr == INSTALL {
+                    assert!(m.in_irq);
+                    assert!(!m.event_ready(m.kernel.cd.events[1]));
+                    m.mem.w8(SP - 8, 0xA5);
+                    m.mem.w32(tables::entry(0xB0, 0x0B).unwrap(), POLL);
+                    return 0;
+                }
+                assert_eq!(call.addr, POLL);
+                assert!(!m.in_irq, "TestEvent is an ordinary call, not a callback");
+                assert_eq!(m.regs.budget(), if m.clock.now == 0 { 7 } else { psx_bios::machine::LOOP_BUDGET as u32 });
+                let slot = if self.polls % 2 == 0 { 1 } else { 4 };
+                assert_eq!(call.args, [m.kernel.cd.events[slot], 0, 0, 0]);
+                self.polls += 1;
+                if !self.wrap {
+                    assert_eq!(m.clock.now, 0, "success on the second round needs no yield");
+                    return if self.polls == 3 { u32::MAX as u64 } else { 1 << 32 };
+                }
+                // No loop or safepoint in this guest wrapper. The outer BIOS
+                // polling loop, not this callback, must yield to the drive.
+                assert!(self.polls <= self.expected);
+                let (t, f) = tables::stand_in_fn(self.saved).unwrap();
+                match bios::call(&mut m, t, f, call.args).unwrap() {
+                    Flow::Return(v) => v,
+                    _ => panic!("native TestEvent is nonblocking"),
+                }
+            }
+        }
+        for wrap in [false, true] {
+            let rt = machine();
+            let budget = Rc::new(Cell::new(7));
+            let resets = Rc::new(Cell::new(0));
+            let (flow, saved, due) = {
+                let mut m = rt.borrow_mut();
+                m.regs = Box::new(PollRegs { sp: SP, budget: budget.clone(), resets: resets.clone() });
+                m.cd_init();
+                let saved = m.mem.r32(tables::entry(0xB0, 0x0B).unwrap());
+                let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+                let Flow::Block { ref until, .. } = flow else { panic!("native CD wait") };
+                assert!(!m.holds(until));
+                m.calls.push_back(GuestCall { addr: INSTALL, args: [0; 4] });
+                (flow, saved, m.cd_due())
+            };
+            let yields = due.div_ceil(rt.borrow().quantum());
+            let expected = (2 * yields * psx_bios::machine::LOOP_BUDGET + 1) as usize;
+            let mut guest = PollGuest { rt: &rt, wrap, saved, polls: 0, expected };
+            assert_eq!(run(&rt, &mut guest, flow), if wrap { 2 } else { 0xA5 });
+            let m = rt.borrow();
+            assert_eq!(m.regs.sp(), SP);
+            assert!(!m.event_ready(m.kernel.cd.events[1]));
+            if wrap {
+                assert!(m.clock.now >= due);
+                assert!(m.clock.now < due + m.quantum());
+                assert_eq!(guest.polls, expected);
+                assert_eq!(resets.get() as u64, yields);
+                assert_eq!(budget.get() as u64, psx_bios::machine::LOOP_BUDGET);
+                assert!(m.clock.pending(|e| *e == psx_bios::Event::Cd).is_none());
+            } else {
+                assert_eq!(guest.polls, 3);
+                assert_eq!(resets.get(), 0);
+                assert_eq!(budget.get(), 7);
+                assert_eq!(m.clock.now, 0);
+                assert_eq!(m.clock.pending(|e| *e == psx_bios::Event::Cd), Some(due));
+            }
+        }
+    }
+
     /// The ABI 10 host: `vblank` at every delivered vblank, `wait_vblank`
     /// through the runtime's hold.
     struct Paced {
