@@ -21,7 +21,7 @@
 //! before the next command.
 
 use crate::kernel::{self, EV_MODE_NOINTR};
-use crate::machine::{Event, Flow, GuestCall, Machine, Sdk, Wait};
+use crate::machine::{Event, Flow, GuestCall, Machine, Sdk, Wait, LOOP_BUDGET};
 use psx_devices::cd::{self, Drive};
 use std::{cell::Cell, rc::Rc};
 
@@ -593,7 +593,7 @@ impl<S: Sdk> Machine<S> {
         // from `sector`. OpenBIOS helpers.c documents but fixes that bug.
         let sector = sector % 4500;
         self.mem.write(msf_addr, &msf);
-        let accept = self.cd_accept(0x78, [msf_addr, 0, 0, 0], 99999);
+        let accept = self.cd_accept(0x78, [msf_addr, 0, 0, 0], 99999, LOOP_BUDGET);
         crate::machine::seq(self, accept, move |m, accepted| {
             if accepted as u32 == 0 {
                 return system_error(m, 0x0B);
@@ -603,7 +603,7 @@ impl<S: Sdk> Machine<S> {
                 if result as u32 != DNE {
                     return system_error(m, 0x0C);
                 }
-                let accept = m.cd_accept(0x7E, [count, dst, 0x80, 0], 99999);
+                let accept = m.cd_accept(0x7E, [count, dst, 0x80, 0], 99999, LOOP_BUDGET);
                 crate::machine::seq(m, accept, move |m, accepted| {
                     if accepted as u32 == 0 {
                         return system_error(m, 0x0C);
@@ -635,18 +635,30 @@ impl<S: Sdk> Machine<S> {
 
     /// helpers.c/cdrom.c retry the patchable command with a bounded count.
     /// Immediate rejections loop without Rust recursion; guest calls/blocks
-    /// resume before re-reading the table. These are software attempts, not
-    /// instruction-cost timing or an excuse to cancel the drive's pending work.
-    fn cd_accept(&mut self, func: u32, args: [u32; 4], mut tries: u32) -> Flow<S> {
+    /// resume before re-reading the table. Long rejection loops yield with the
+    /// same loop budget/quantum as CD polling, so scheduled work can progress.
+    /// These are software attempts, not instruction costs; never cancel busy
+    /// work or yield after success/exhaustion. This local counter resets, but
+    /// does not spend, the guest budget per attempt (as in cd_poll). The short
+    /// status loop can exhaust before reaching this local yield threshold.
+    fn cd_accept(&mut self, func: u32, args: [u32; 4], mut tries: u32, mut left: u64) -> Flow<S> {
         while tries != 0 {
+            if left == 0 {
+                self.regs.reset_budget();
+                return Flow::Block {
+                    until: Wait::Cycle(self.clock.now + self.quantum()),
+                    then: Box::new(move |m| m.cd_accept(func, args, tries, LOOP_BUDGET)),
+                };
+            }
             tries -= 1;
+            left -= 1;
             let flow = crate::bios::dispatch(self, 0xA0, func, args)
                 .unwrap_or_else(|e| panic!("CD command: {e}"));
             match flow {
                 Flow::Return(v) if v as u32 == 0 => {}
                 Flow::Return(v) => return Flow::Return(v),
                 flow => return crate::machine::seq(self, flow, move |m, v| {
-                    if v as u32 == 0 { m.cd_accept(func, args, tries) }
+                    if v as u32 == 0 { m.cd_accept(func, args, tries, left) }
                     else { Flow::Return(v) }
                 }),
             }
@@ -662,7 +674,7 @@ impl<S: Sdk> Machine<S> {
         let frame = sp.wrapping_sub(24); // o32 argument area plus the local byte
         let status = frame.wrapping_add(16);
         self.regs.set_sp(frame);
-        let accept = self.cd_accept(0x7C, [status, 0, 0, 0], 9);
+        let accept = self.cd_accept(0x7C, [status, 0, 0, 0], 9, LOOP_BUDGET);
         let flow = crate::machine::seq(self, accept, move |m, accepted| {
             if accepted as u32 == 0 {
                 return system_error(m, 0x1F);
@@ -713,6 +725,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Resume acceptance safepoints, but leave command/event waits to the test.
+    fn accept_yields(m: &mut Machine<crate::testing::NoSdk>, mut flow: Flow<crate::testing::NoSdk>) -> Flow<crate::testing::NoSdk> {
+        while let Flow::Block { until: Wait::Cycle(at), then } = flow {
+            assert_eq!(at, m.clock.now + m.quantum());
+            while m.clock.now < at { m.step(at); }
+            flow = then(m);
+        }
+        flow
     }
 
     fn wait(m: &mut Machine<crate::testing::NoSdk>, at: u64) {
@@ -1114,13 +1136,13 @@ mod tests {
                 let Flow::Call { call, then } = flow else { panic!("SystemError") };
                 assert_eq!((call.addr, call.args), (error, [0x44, if winner == ERR { 0x16 } else { 0x17 }, 0, 0]));
                 if winner == ERR {
-                    // Busy command acceptance remains partial: the returning
-                    // patch retries SeekL, which rejects the still-active read.
-                    // Do not silently cancel that read to make a retry succeed.
-                    let Flow::Call { call, then } = then(&mut m, 123) else { panic!("busy SeekL") };
-                    assert_eq!((call.addr, call.args), (error, [0x44, 0x0B, 0, 0]));
-                    let flow = then(&mut m, 456);
-                    assert_eq!(run(&mut m, flow), u32::MAX as u64);
+                    // The returning error handler retries SeekL. Busy work is
+                    // neither cancelled nor advanced before the first yield.
+                    let done = m.kernel.cd.done.clone();
+                    let flow = then(&mut m, 123);
+                    assert!(matches!(flow, Flow::Block { until: Wait::Cycle(_), .. }));
+                    assert!(Rc::ptr_eq(&done, &m.kernel.cd.done));
+                    assert_eq!(m.counts["bios.A0h:78h CdAsyncSeekL"], 1 + LOOP_BUDGET);
                 }
             }
             for &spec in specs {
@@ -1201,9 +1223,12 @@ mod tests {
             if winner != DNE {
                 let Flow::Call { call, then } = flow else { panic!("read error") };
                 assert_eq!((call.addr, call.args), (ERROR, [0x44, if winner == ERR { 0x16 } else { 0x17 }, 0, 0]));
+                // With interrupts masked, returning ERR still exhausts the
+                // busy seek rather than cancelling the active native read.
+                if winner == ERR { m.crit = true; }
                 flow = then(&mut m, 123);
                 if winner == ERR {
-                    let Flow::Call { call, then } = flow else { panic!("returning ERR retries busy seek") };
+                    let Flow::Call { call, then } = accept_yields(&mut m, flow) else { panic!("returning ERR retries busy seek") };
                     assert_eq!((call.addr, call.args), (ERROR, [0x44, 0x0B, 0, 0]));
                     flow = then(&mut m, 456);
                 }
@@ -1211,7 +1236,7 @@ mod tests {
             assert_eq!(run(&mut m, flow), if winner == DNE { 2 } else { u32::MAX as u64 });
             for i in [1, 3, 4] { assert!(m.event_ready(events[i]), "patch owns consumption"); }
             assert_eq!(m.regs.sp(), sp);
-            assert_eq!(m.clock.now, 0);
+            assert_eq!(m.clock.now, if winner == ERR { 99998 / LOOP_BUDGET * m.quantum() } else { 0 });
             assert!(m.kernel.cd.op.is_some());
         }
 
@@ -1379,7 +1404,8 @@ mod tests {
     #[test]
     fn blocking_seek_and_status_honor_patched_acceptance() {
         for (outer, command, bound, code) in [(0xA5, 0x78, 99999, 0x0B), (0xA6, 0x7C, 9, 0x1F)] {
-            for (accept_at, software) in [(2, true), (bound, false), (0, false)] {
+            for (accept_at, software) in [(2, true), (1000, true), (1001, true), (bound, false), (0, false)] {
+                if accept_at > bound { continue; }
                 let mut sectors = vec![[0u8; cd::RAW]; 5];
                 sectors[3] = sector(3, b"edited");
                 let mut m = machine_with_disc(sectors);
@@ -1400,10 +1426,11 @@ mod tests {
                 let frame = sp - 24;
                 let local = frame + 16;
                 for attempt in 1..=bound {
+                    flow = accept_yields(&mut m, flow);
                     let Flow::Call { call, then } = flow else { panic!("command {command:x}, attempt {attempt}") };
                     assert_eq!(call, GuestCall { addr: patch + (attempt - 1) * 4, args: [local, 0, 0, 0] });
                     assert_eq!(m.regs.sp(), frame);
-                    assert_eq!(m.clock.now, 0, "no instruction-cost timing");
+                    assert_eq!(m.clock.now, (attempt - 1) as u64 / LOOP_BUDGET * m.quantum(), "only whole loop quanta");
                     assert!(m.kernel.cd.op.is_none(), "no unsolicited native command");
                     // A callee may spill all four arguments into its incoming
                     // o32 home area. The pointed-to local must survive.
@@ -1454,7 +1481,7 @@ mod tests {
                     assert_eq!(m.regs.sp(), frame, "frame lives through the error callback");
                     flow = then(&mut m, 123);
                     assert_eq!(run(&mut m, flow), u32::MAX as u64);
-                    assert_eq!(m.clock.now, 0);
+                    assert_eq!(m.clock.now, (bound - 1) as u64 / LOOP_BUDGET * m.quantum());
                 } else if software {
                     if command == 0x78 {
                         let Flow::Call { call, then } = flow else { panic!("read after software seek") };
@@ -1465,7 +1492,7 @@ mod tests {
                     assert_eq!(run(&mut m, flow), if command == 0x78 { 1 } else { 0xA5 });
                     assert_eq!(m.mem.bytes(dst, 4), b"keep");
                     assert!(m.kernel.cd.op.is_none());
-                    assert_eq!(m.clock.now, 0);
+                    assert_eq!(m.clock.now, (accept_at - 1) as u64 / LOOP_BUDGET * m.quantum());
                 } else {
                     assert!(matches!(flow, Flow::Block { .. }));
                     assert_eq!(m.regs.sp(), frame, "frame lives through native completion");
@@ -1475,21 +1502,22 @@ mod tests {
                 assert_eq!(m.regs.sp(), sp);
             }
 
-            // Native immediate busy rejections use the same exact bound;
-            // neither advancing virtual time nor cancelling the pending job.
+            // With interrupts disabled the pending work cannot complete, even
+            // across yields. Keep the exact bound without cancelling that job.
             let mut m = machine_with_disc(vec![]);
             m.cd_init();
             assert_eq!(m.cd_get_status(0x8002_1000), 1);
+            m.crit = true;
             let done = m.kernel.cd.done.clone();
             let sp = m.regs.sp();
             let error = 0x8001_2000;
             m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
             let flow = bios::dispatch(&mut m, 0xA0, outer, [1, 2, 0x8002_0000, 0]).unwrap();
-            let Flow::Call { call, then } = flow else { panic!("busy command exhaustion") };
+            let Flow::Call { call, then } = accept_yields(&mut m, flow) else { panic!("busy command exhaustion") };
             assert_eq!(call, GuestCall { addr: error, args: [0x44, code, 0, 0] });
             let name = format!("bios.A0h:{command:02X}h {}", bios::name(0xA0, command));
             assert_eq!(m.counts[&name], bound as u64);
-            assert_eq!(m.clock.now, 0);
+            assert_eq!(m.clock.now, (bound - 1) as u64 / LOOP_BUDGET * m.quantum());
             assert!(Rc::ptr_eq(&done, &m.kernel.cd.done));
             assert!(m.kernel.cd.op.is_some());
             let flow = then(&mut m, 0);
@@ -1539,11 +1567,12 @@ mod tests {
             let mut flow = then(&mut m);
             let now = m.clock.now;
             for attempt in 1..=99999 {
+                flow = accept_yields(&mut m, flow);
                 let Flow::Call { call, then } = flow else { panic!("read attempt {attempt}") };
                 assert_eq!(call, GuestCall { addr: patch + (attempt - 1) * 4, args: [2, dst, 0x80, 0] });
                 assert!(m.kernel.cd.op.is_none(), "no native read before the patch returns");
                 assert_eq!(m.mem.bytes(dst, 4), b"keep");
-                assert_eq!(m.clock.now, now, "no fabricated instruction time");
+                assert_eq!(m.clock.now, now + (attempt - 1) as u64 / LOOP_BUDGET * m.quantum());
                 if attempt == accept_at {
                     if software {
                         assert_eq!(m.kernel.cd.done.get(), Some(ERR as u64));
@@ -1574,7 +1603,7 @@ mod tests {
                 let Flow::Call { call, then } = flow else { panic!("acceptance exhausted") };
                 assert_eq!(call, GuestCall { addr: error, args: [0x44, 0x0C, 0, 0] });
                 assert!(m.kernel.cd.op.is_none());
-                assert_eq!(m.clock.now, now, "99999 calls, not instruction costs");
+                assert_eq!(m.clock.now, now + 99998 / LOOP_BUDGET * m.quantum(), "bounded whole-quanta yields");
                 let flow = then(&mut m, 123);
                 assert_eq!(run(&mut m, flow), u32::MAX as u64);
             } else if software {
@@ -1602,10 +1631,11 @@ mod tests {
         let Flow::Block { then, .. } = flow else { panic!("seek") };
         m.step(m.cd_due());
         let now = m.clock.now;
-        let Flow::Call { call, then } = then(&mut m) else { panic!("invalid read count") };
+        let flow = then(&mut m);
+        let Flow::Call { call, then } = accept_yields(&mut m, flow) else { panic!("invalid read count") };
         assert_eq!(call, GuestCall { addr: error, args: [0x44, 0x0C, 0, 0] });
         assert_eq!(m.counts["bios.A0h:7Eh CdAsyncReadSector"], 99999);
-        assert_eq!(m.clock.now, now);
+        assert_eq!(m.clock.now, now + 99998 / LOOP_BUDGET * m.quantum());
         assert!(m.kernel.cd.op.is_none());
         let flow = then(&mut m, 0);
         assert_eq!(run(&mut m, flow), u32::MAX as u64);

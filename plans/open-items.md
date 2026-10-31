@@ -32,7 +32,7 @@ retain their provenance; the active recovery status is recorded separately.
   count-only. Do not replace existing Asyncify threading or infer approval for
   a runtime redesign from the recovery work.
 - **Partial software services:** card helpers A7..AA/AE, built-in console input
-  and circular helpers, CD internal calls/busy-command acceptance/filesystem details, and
+  and circular helpers, CD internal calls/filesystem details, and
   non-main SetConf. Recent card Info/Load callback and guest-device console-scan
   fixes do not complete these whole families. AF write-test notifications remain
   unverified: OpenBIOS's missing body does not justify adding or removing them.
@@ -50,24 +50,30 @@ retain their provenance; the active recovery status is recorded separately.
   in order, honoring Call/Block and synthetic results without implicit flag
   consumption. Native waits wake on table changes; patched polling yields on
   the existing loop budget/quantum so wrappers cannot starve scheduled work.
-  Native busy-command progress and INT5/chain services remain unfinished.
-  An early read ERR can still encounter busy SeekL after the patch returns;
-  no silent native-read cancellation is added.
+  Long command-acceptance loops now use the same local budget/quantum yields,
+  letting busy native work complete before retrying the live command table.
+  The 99999/99999/9 bounds remain exact, with no yield after success or final
+  exhaustion; nine status attempts can still exhaust without a yield. This
+  resets, but does not spend, the guest budget per attempt or claim retail
+  timing parity. INT5/chain services remain unfinished. An early read ERR can
+  still encounter busy SeekL after the patch returns, but long retries now
+  allow scheduled progress; no silent native-read cancellation is added.
   A52/C09 contracts remain unresolved.
 - **Resources/policy:** legally usable font data and GetSystemInfo's BIOS
   date/version identity remain undecided; no fabricated values or pointers.
   B53's offset calculation itself needs no glyph resource, but the proposed
   OpenBIOS original-font lookup aliases valid 899Eh/899Fh codes. Parent rejected
   that mapping; reliable algorithm/vector evidence remains a separate gap.
-- **Validation:** the CD TestEvent follow-up passes BIOS 56 / runtime 10 /
-  SDK 42 tests and wasm32 runtime check; logs are in session scratch under
-  `cd-testevent-*`. Release/runtime/both game builds and four unchanged replays
-  remain passing at `5ac49b3`, before this TestEvent follow-up, not freshly
-  rebuilt claims. All six chip groups were native; ABI 18 and coverage
-  classifications are unchanged. Those build/replay/check logs and prior
-  disposable run cards are in session scratch under `cd-command-*`; tests/builds
-  use the checkout's ignored `out/tmp-cd-live-wait` as TMPDIR. Inputs and user
-  saves were untouched.
+- **Validation:** the CD acceptance-progress follow-up passes BIOS 56 /
+  runtime 11 / SDK 42 tests and wasm32 runtime check. Fresh release/runtime/both
+  game builds and four unchanged replays pass for this batch, including the
+  prior TestEvent dispatch. All six chip groups are native; ABI 18 and coverage
+  classifications are unchanged. Logs, run/check JSON and preserved prior
+  disposable run cards are in session scratch under `cd-accept-progress-*`;
+  tests/builds use the checkout's ignored `out/tmp-cd-live-wait` as TMPDIR.
+  Inputs and user saves were untouched. Independent code review is accepted;
+  the active plan records its qualifications and the initial corrected test
+  expectation. BTN's existing GPU timeout/reset logs remain unclassified.
   Latest memcard conformance remains at `99fa333`. Non-empty oracle
   validation, unresolved full-CI failures and save/persistence certification
   remain open. Two-bundle browser disc isolation, locked-import refusal,

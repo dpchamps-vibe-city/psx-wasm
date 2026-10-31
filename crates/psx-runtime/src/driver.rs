@@ -404,6 +404,143 @@ mod tests {
         }
     }
 
+    /// Long command-acceptance loops yield through the ordinary driver. Busy
+    /// work can finish, and callbacks can patch/cancel it without losing the
+    /// next attempt's live table, arguments or per-call guest stack frame.
+    #[test]
+    fn cd_busy_acceptance_progresses_and_rereads_patches_after_yields() {
+        use psx_bios::{bios, cdrom, tables, machine::LOOP_BUDGET};
+        use psx_devices::cd;
+        use std::{cell::Cell, rc::Rc};
+        const INSTALL: u32 = 0x8001_1000;
+        const COMMAND: u32 = 0x8001_2000;
+        const SEEK: u32 = 0x8001_3000;
+        const SP: u32 = 0x801F_F000;
+        const OLD_STATUS: u32 = 0x8002_1000;
+        const DST: u32 = 0x8003_0000;
+        struct Disc(Rc<Cell<u32>>);
+        impl psx_bios::Host for Disc {
+            fn log(&mut self, _: u32, _: &str) {}
+            fn wait_vblank(&mut self, _: u64) {}
+            fn disc_read(&mut self, lba: u32, raw: &mut [u8; cd::RAW]) -> bool {
+                self.0.set(self.0.get() + 1);
+                assert!(lba < 2);
+                *raw = [0; cd::RAW];
+                raw[1..11].fill(0xFF);
+                raw[12..15].copy_from_slice(&cd::lba_to_msf(lba));
+                raw[15] = 2;
+                raw[0x18..0x818].fill(0x5A + lba as u8);
+                let edc = cd::edc(&raw[0x10..0x818]);
+                raw[0x818..0x81C].copy_from_slice(&edc.to_le_bytes());
+                true
+            }
+            fn has_disc(&mut self) -> bool { true }
+            fn pad_state(&mut self, _: u32) -> Vec<u8> { vec![] }
+            fn storage_read(&mut self, _: &str) -> Option<Vec<u8>> { None }
+            fn storage_write(&mut self, _: &str, _: &[u8]) -> bool { false }
+            fn report(&mut self, _: &str) {}
+        }
+        struct AcceptRegs { sp: u32, budget: u32, resets: Rc<Cell<u32>> }
+        impl psx_bios::Regs for AcceptRegs {
+            fn sp(&self) -> u32 { self.sp }
+            fn set_sp(&mut self, sp: u32) { self.sp = sp; }
+            fn gp(&self) -> u32 { 0 }
+            fn set_gp(&mut self, _: u32) {}
+            fn budget(&self) -> u32 { self.budget }
+            fn reset_budget(&mut self) {
+                self.budget = LOOP_BUDGET as u32;
+                self.resets.set(self.resets.get() + 1);
+            }
+        }
+        struct AcceptGuest<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            command: u32,
+            mode: u32,
+            saved: u32,
+            installs: u32,
+            commands: u64,
+        }
+        impl Invoke for AcceptGuest<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                let mut m = self.rt.borrow_mut();
+                assert_eq!(m.regs.sp(), SP - 24);
+                if call.addr == SEEK {
+                    assert!(!m.in_irq);
+                    assert_eq!(call.args, [SP - 8, 0, 0, 0]);
+                    assert_eq!(m.mem.bytes(SP - 8, 3), [0, 2, 0]);
+                    // Software seek completion leaves the initial native status
+                    // busy, so A7E must retry before it can start a real read.
+                    assert!(matches!(bios::dispatch(&mut m, 0xB0, 0x07,
+                        [cdrom::EV_CD, cdrom::DNE, 0, 0]).unwrap(), Flow::Return(_)));
+                    return 1;
+                }
+                if call.addr == INSTALL {
+                    assert!(m.in_irq);
+                    assert_eq!(m.clock.now, 0, "callback runs at the first yield");
+                    assert_eq!(m.regs.budget() as u64, LOOP_BUDGET);
+                    assert_eq!(m.mem.r8(OLD_STATUS), 0xEE, "pending work was not forced to finish");
+                    self.installs += 1;
+                    m.mem.w32(tables::entry(0xA0, self.command).unwrap(), COMMAND);
+                    if self.mode == 2 {
+                        assert!(matches!(bios::dispatch(&mut m, 0xA0, 0x95, [0; 4]).unwrap(), Flow::Return(1)));
+                        assert!(!m.event_ready(m.kernel.cd.events[4]), "reset is not an INT5");
+                    }
+                    return 0;
+                }
+                assert_eq!(call.addr, COMMAND);
+                assert!(!m.in_irq, "command is an ordinary call");
+                assert_eq!(call.args, if self.command == 0x78 { [SP - 8, 0, 0, 0] } else { [2, DST, 0x80, 0] });
+                assert_eq!(m.regs.budget() as u64, LOOP_BUDGET);
+                self.commands += 1;
+                let (t, f) = tables::stand_in_fn(self.saved).unwrap();
+                match bios::call(&mut m, t, f, call.args).unwrap() {
+                    Flow::Return(v) => v,
+                    _ => panic!("async command must not block"),
+                }
+            }
+        }
+        for command in [0x78, 0x7E] {
+            for mode in 0..3 { // native, patch at yield, patch plus native reset
+                let rt = machine();
+                let resets = Rc::new(Cell::new(0));
+                let reads = Rc::new(Cell::new(0));
+                let (flow, saved, due) = {
+                    let mut m = rt.borrow_mut();
+                    m.host = Box::new(Disc(reads.clone()));
+                    m.regs = Box::new(AcceptRegs { sp: SP, budget: 7, resets: resets.clone() });
+                    m.opts.safepoint_quantum = 13_000; // not the default quantum
+                    m.cd_init();
+                    m.mem.w8(OLD_STATUS, 0xEE);
+                    assert!(matches!(bios::dispatch(&mut m, 0xA0, 0x7C,
+                        [OLD_STATUS, 0, 0, 0]).unwrap(), Flow::Return(1)));
+                    let due = m.cd_due();
+                    let saved = m.mem.r32(tables::entry(0xA0, command).unwrap());
+                    if command == 0x7E { m.mem.w32(tables::entry(0xA0, 0x78).unwrap(), SEEK); }
+                    let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 0, DST, 0]).unwrap();
+                    if mode != 0 { m.calls.push_back(GuestCall { addr: INSTALL, args: [0; 4] }); }
+                    (flow, saved, due)
+                };
+                let yields = if mode == 2 { 1 } else { due.div_ceil(rt.borrow().quantum()) };
+                let attempts = yields * LOOP_BUDGET + 1;
+                assert!(attempts < 99999);
+                let mut guest = AcceptGuest { rt: &rt, command, mode, saved, installs: 0, commands: 0 };
+                assert_eq!(run(&rt, &mut guest, flow), 2);
+                let m = rt.borrow();
+                assert_eq!(m.regs.sp(), SP);
+                assert_eq!(m.mem.r8(OLD_STATUS), if mode == 2 { 0xEE } else { 2 });
+                assert_eq!(m.mem.bytes(DST, 16), [0x5A; 16]);
+                assert_eq!(m.mem.bytes(DST + 0x800, 16), [0x5B; 16]);
+                assert_eq!(reads.get(), 2, "one read, not a duplicate native start");
+                assert_eq!(m.counts[&format!("bios.A0h:{command:02X}h {}", bios::name(0xA0, command))], attempts);
+                assert_eq!(resets.get() as u64, yields);
+                assert_eq!(guest.installs, if mode == 0 { 0 } else { 1 });
+                assert_eq!(guest.commands, if mode == 0 { 0 } else { attempts - LOOP_BUDGET });
+                assert!(!m.event_ready(m.kernel.cd.events[1]));
+                assert!(m.clock.pending(|e| *e == psx_bios::Event::Cd).is_none());
+            }
+        }
+    }
+
     /// The ABI 10 host: `vblank` at every delivered vblank, `wait_vblank`
     /// through the runtime's hold.
     struct Paced {
