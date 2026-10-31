@@ -2866,22 +2866,23 @@ closer to the oracle's (plans/spec-fidelity.md, phase 7 step 5).
   at one of the original's loop headers once the budget has run out; an
   element's verifier spends on every walk of the chains. Conformance
   checks it: chips spu, sio0, memcard and mdec observe the budget after
-  every call or frame, chip irq after every call and vblank wait. Done:
-  libapi's counter functions and pad element, every libspu adapter and
-  libsnd's `_SsInit`, every libpad adapter and its interrupt
+  every call or frame, chips irq, gpu and cd after every call and vblank
+  wait. Every adapter does: libapi's counter functions and pad element,
+  libspu's and libsnd's `_SsInit`, libpad's and its interrupt
   (`_padIntPad` and its callees, block by block), libmcx's
-  `McxStartCom`, elements and `_mcxDsrEntry`, every libpress adapter,
-  every libetc adapter and its dispatcher (from where the exception's
-  exit resumes, `startIntr`'s `setjmp`, to `ReturnFromException`'s
-  stub; the lift lowers `setjmp`'s call to stores, so no stub of its
-  is spent on either side). Elsewhere waits and loops
-  spend a pass at the
-  loop's own count (the timeout checks and calls each iteration makes
-  among them): libetc's `VSync` waits (14 and 6), libgpu's (40, 41, 38),
-  libcd's (35, 38, 30, 30); waits that spin through quanta carry the
-  budget as the original's loop does, instead of starting it over. Not
-  yet: the straight-line code of libgpu's, libcd's and libetc's adapters,
-  libetc's dispatcher among them (plans/spec-fidelity.md, Findings).
+  `McxStartCom`, elements and `_mcxDsrEntry`, libpress's, libetc's and
+  its dispatcher (from where the exception's exit resumes, `startIntr`'s
+  `setjmp`, to `ReturnFromException`'s stub; the lift lowers `setjmp`'s
+  call to stores, so no stub of its is spent on either side), libcd's
+  drive layer, handler and ring interrupt, libgpu's with its pump, queue
+  and work functions. What an adapter's original calls inline in
+  another library spends that library's adapter's count (libgpu's
+  `VSync(-1)` 33). A wait's pass is the original loop's, the timeout
+  checks and calls each iteration makes among them: libetc's `VSync`
+  waits 14 and 6, libgpu's 71 to 90 (its timeout check 59), libcd's 72,
+  75, 67 and 63; waits that spin through quanta carry the budget as the
+  original's loop does, instead of starting it over
+  (plans/spec-fidelity.md, Findings, "Adapters' straight-line time").
 - **The check** (difftest, btn @ c77a66f, 64 seeds): every pair spends
   exact counts as lift and the estimate as C over the same seeds. Over
   160,119 runs where both sides returned alike, the error (C − T) / T

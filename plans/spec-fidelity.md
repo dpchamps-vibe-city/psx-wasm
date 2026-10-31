@@ -652,7 +652,8 @@ anything else.
    order, a spend per straight-line segment). btn: 2,460 of 2,541 C
    functions pair. The check's distribution is in Findings and D71.
    Adapters spend their originals' instructions (`38bf58e`; the pad and
-   card handlers `368670a`, `0b2c55d`), but not all yet: Findings,
+   card handlers `368670a`, `0b2c55d`; libpress `df365f7`; libetc,
+   libcd and libgpu `a1e5cea`, `3d2e6e9`, `b72ee4f`): Findings,
    "Adapters' straight-line time".
 5. [ ] **Re-record baselines once:** replays, golden frames, `ramdiff`
    baselines, each after showing the new timing is closer to the oracle's
@@ -675,11 +676,19 @@ and spu in bof4, sio0 and memcard now observing the budget at every
 look. Both games boot to their main loops and run 1,200 frames without
 a trap (`psxw run <game> --check boot --check no-trap`, before the
 handlers' time). libpress's time is done too (`df365f7`, chip mdec
-observing the budget). Left before step 5: the straight-line code of
-libgpu's, libcd's and libetc's adapters, libetc's dispatcher among
-them, and first why the budget doesn't move across a vblank on chip
-irq's device side (Findings). Step 5 and exit criterion 3 are the
-human's.
+observing the budget). Then libetc's, libcd's and libgpu's (`a1e5cea`,
+`3d2e6e9`, `b72ee4f`; Findings): the budget does move across a vblank
+on chip irq's device side, by the dispatcher's 85 instructions, which
+the native dispatcher now spends too. Every adapter spends its
+original's path; chips irq, gpu and cd observe the budget after every
+call and vblank wait, irq also `VSync`'s hblanks and root counter 2
+exactly. Conformance passes for chips irq, gpu, cd, sio0, memcard and
+spu in btn, and irq, gpu, cd, mdec, sio0 and spu in bof4, the two sides
+agreeing at every observation; `cargo test --workspace` passes and both
+games build. Nothing is left before step 5. libgpu's timeout should now
+end on its 240-vblank deadline (Findings): btn's boot is expected to
+wait about 4 s of virtual time there, not 2.2. Step 5 and exit
+criterion 3 are the human's.
 
 Step 5, the human's (each game; btn's replay `title-to-gameplay`,
 bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
@@ -754,6 +763,14 @@ locals, or static translation.
 
 ## Progress log
 
+- **2026-10-31:** phase 7, the adapters' straight-line time (agent and
+  two sub-agents, `a1e5cea`..`d02f4c5`): libetc's, libcd's and libgpu's
+  adapters spend their originals' paths, libetc's dispatcher among
+  them; chips irq, gpu and cd observe the budget at every call and
+  vblank wait (`cases::timed`, `cases::vblanks`). Chip irq's "budget
+  that doesn't move" was a reading that mixed a vblank into `VSync(-1)`
+  (Findings). Every chip passes in both games; tests pass, both games
+  build. Human: step 5.
 - **2026-10-31:** phase 7, steps 2 and 3 (agent, `dee627e`..`38bf58e`):
   lifted code spends each MIPS block's instructions, decompiled C its
   loops' estimate, loop headers check (D71, ABI 16); adapters' waits and
@@ -887,10 +904,59 @@ locals, or static translation.
     `VSync`'s hblanks and root counter 2 exactly (they were rounded to
     frames and to 0x400 counts): both games' sides agree at all of them
     (450 budget observations in each).
-  - Left: the straight-line code of libgpu's and libcd's adapters. The
-    way to do each library: its chip's cases observe the budget (as
-    irq's, sio0's, memcard's and mdec's now do), and its adapters spend
-    their originals' blocks until the sides agree at every observation.
+  - libgpu done (`b72ee4f`, agent): every adapter block by block, the
+    pump (+23A8h, its header +2420h, in the exception when it is DMA2's
+    callback), the queue (+20F8h), the work functions, the reset
+    (+2608h), the timeout's start and check, `dr_env`. What libgpu calls
+    inline in libetc spends what libetc's adapters do (`SetIntrMask` 6,
+    `VSync(-1)` 33, `GPU_cw` a stub's 3); the game's `memcpy`, found
+    through its `jal`, is libapi's A0h:2Ah stub in btn (3, the copy
+    native), else a guest call (untested). So the timeout check is 59,
+    not 26, and the waits' passes are `DrawSync(0)`'s first loop 90, its
+    second 71 (DMA2 busy) or 79 (GPU not ready), a full queue's 89,
+    `MoveImage2`'s 71 or 79. `ResetGraph(0)` is about 25,700 (three
+    `memset`s, `_que`'s 24,581 at 4 a byte; the earlier "5,700 more" hid
+    two safepoints), mode 1 93. Expected, not checked: at two cycles an
+    instruction 0xF0001 passes of 71 outlast 240 NTSC frames, so
+    libgpu's timeout now ends on its Vcount deadline, and btn's boot's
+    `DrawSync(0)` before `ResetGraph` waits about 4 s of virtual time,
+    not 2.2 (step 5 shows it). DMA2's completion is taken at different
+    places: on the device when libetc's `SetIntrMask` adapter returns
+    inside libgpu's pump or queue, natively when the libgpu adapter
+    returns, so the DrawSync callback runs from the interrupt's pump on
+    one side and the outer pump on the other. The same blocks run once
+    each, so the totals agree at every observation; a quantum falling in
+    that window could split differently (never seen). Not reproduced:
+    debug levels 1 and up (level 0's path only), GPUSTAT's ready waits
+    past their first look (the core is always ready between commands),
+    ClearOTagR's DMA6 wait (done at once). Chip gpu observes the budget
+    at every call and vblank wait: 579 observations in each game.
+  - libcd done (`3d2e6e9`, agent): the waits (`CD_sync`, `CD_ready`,
+    `CD_cw`'s, `CD_datasync`) spend their prologue and passes of 72, 75,
+    67 and 63 (D71 had 35, 38, 30, 30, without `VSync(-1)`'s 33 and
+    `CheckCallback`'s 4), 40 more a pass polled inside a callback, and
+    each exit (done, the result copy, the time-out's messages and
+    `CD_flush`); `CD_cw`'s every step, `CD_flush` and `CD_init`'s copy of
+    it a pass per interrupt presented, `CD_init`, `CD_initintr`, `CD_vol`
+    (34), `CD_initvol` (52, 55, 60), `CD_getsector` (58), `CD_getsector2`
+    (54); the handler (+14A4h) and `getintr` in the exception, quanta at
+    their headers; `StCdInterrupt` every branch; `StUnSetRing`. Not
+    reproduced: the waits' 960-vblank deadline (in NTSC it would end a
+    wait about 4% before the 0x3C0000-pass time-out does); waits the
+    models answer at once are one pass (DMA3 idle, the FIFO holding the
+    sector); `StCdInterrupt`'s memory-controller delay writes. Not
+    confirmed: that any case runs a wait inside a callback (the 40).
+    Chip cd observes the budget at every call and vblank wait: 280
+    observations in btn, 971 in bof4.
+  - Next, not done: a normal-context loop header that takes a safepoint
+    now exists three times (`libgpu::header` and `passes`, libcd's
+    `header` and `passes`, `libspu::header` and `each`); libcd's doesn't
+    `release_irq` where `crate::safepoint` and libspu's do, which needs
+    deciding before they become one helper in lib.rs. And both agents
+    checked every `path` range against the disassembly's blocks with a
+    scratch script (a range ends at a delay slot or before a branch
+    target), which caught their delay-slot slips; that check could be a
+    test or a `psxw sdk` subcommand.
   - How the handlers do it (2026-10-31, `368670a`, `0b2c55d`): a
     transliteration of the original's control flow, block by block
     (`sdk_psyq::irq_path`, offsets from `psxw sdk disasm`, checked
