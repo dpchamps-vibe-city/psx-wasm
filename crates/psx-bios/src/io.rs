@@ -358,6 +358,69 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
+    /// A GP1 command to the GPU core (the BIOS's `SendGP1Command`,
+    /// A0h:48h). The GPU is reached only when the device bus is present.
+    pub fn gp1(&mut self, word: u32) -> Result<(), String> {
+        let io = self.io.as_mut().ok_or_else(no_gpu)?;
+        io.gpu.gp1(word);
+        Ok(())
+    }
+
+    /// GPUSTAT from the GPU core (`GetGPUStatus`, A0h:4Dh), as far as the
+    /// front end knows it (no field timing).
+    pub fn gpu_status(&mut self) -> Result<u32, String> {
+        Ok(self.io.as_mut().ok_or_else(no_gpu)?.gpu.status())
+    }
+
+    /// GPU DMA channel 2 for the BIOS's `gpu_send_dma` and
+    /// `send_gpu_linked_list` (A0h:47h, 4Bh): the channel programmed and
+    /// run through the shared controller, so its completion (DICR's flag,
+    /// IRQ3) is the device's. Transfers complete at once in virtual time.
+    pub fn gpu_dma(&mut self, src: u32, bcr: u32, chcr: u32, clear_dicr: bool) -> Result<(), String> {
+        let io = self.io.as_mut().ok_or_else(no_gpu)?;
+        io.dma.madr[dma::GPU] = src & 0x00FF_FFFF;
+        io.dma.bcr[dma::GPU] = bcr;
+        io.dma.chcr[dma::GPU] = chcr;
+        // GPU's nibble in DPCR: bit 3 enables channel 2.
+        io.dma.dpcr |= 0x800;
+        if clear_dicr {
+            io.dma.dicr = 0;
+        }
+        self.run_dma()
+    }
+
+    /// `gpu_abort_dma` (A0h:4Ch): channel 2 stopped, then GP1(04h),
+    /// (02h) and (01h).
+    pub fn gpu_abort_dma(&mut self) -> Result<(), String> {
+        let io = self.io.as_mut().ok_or_else(no_gpu)?;
+        // 401h: from RAM, linked-list mode, stopped (psx-spx's write).
+        io.dma.chcr[dma::GPU] = 0x401;
+        io.gpu.gp1(0x0400_0000);
+        io.gpu.gp1(0x0200_0000);
+        io.gpu.gp1(0x0100_0000);
+        Ok(())
+    }
+
+    /// `gpu_sync` (A0h:4Eh): wait for the GPU (and GPU DMA) to be ready,
+    /// then turn DMA direction off. The front end takes words at once and
+    /// GPU DMA ends at once, so each wait holds already or never ends:
+    /// the BIOS's timeout (-1) where it has one, an error where it hasn't.
+    pub fn gpu_sync(&mut self) -> Result<u32, String> {
+        let s = self.gpu_status()?;
+        if s & 0x6000_0000 == 0 {
+            return Ok(if s & 1 << 28 != 0 { 0 } else { u32::MAX });
+        }
+        let busy = self.io.as_ref().is_some_and(|io| io.dma.chcr[dma::GPU] & dma::CHCR_BUSY != 0);
+        if busy {
+            return Ok(u32::MAX);
+        }
+        if s & 1 << 28 == 0 {
+            return Err("GPUSTAT bit 28 stays clear (a polygon or line is half sent): gpu_sync waits forever".into());
+        }
+        self.gp1(0x0400_0000)?;
+        Ok(0)
+    }
+
     /// Run every DMA channel that is ready, and whose device can serve it:
     /// MDEC output waits (as its request line does) while a decode is
     /// still taking input and hasn't produced the words asked for.
@@ -823,6 +886,10 @@ fn mask(size: u32) -> u32 {
 
 fn no_bus(addr: u32) -> String {
     format!("guest access to I/O register {addr:#010x}; this function needs an adapter")
+}
+
+fn no_gpu() -> String {
+    "the GPU is not on the bus; this function needs an adapter".into()
 }
 
 #[cfg(test)]

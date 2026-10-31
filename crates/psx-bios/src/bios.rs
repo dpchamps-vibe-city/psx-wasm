@@ -65,7 +65,15 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x43) => "Exec",
         (0xA0, 0x44) => "FlushCache",
         (0xA0, 0x45) => "init_a0_b0_c0_vectors",
+        (0xA0, 0x46) => "GPU_dw",
+        (0xA0, 0x47) => "gpu_send_dma",
+        (0xA0, 0x48) => "SendGP1Command",
         (0xA0, 0x49) => "GPU_cw",
+        (0xA0, 0x4A) => "GPU_cwp",
+        (0xA0, 0x4B) => "send_gpu_linked_list",
+        (0xA0, 0x4C) => "gpu_abort_dma",
+        (0xA0, 0x4D) => "GetGPUStatus",
+        (0xA0, 0x4E) => "gpu_sync",
         (0xA0, 0x55) => "_bu_init",
         (0xA0, 0x56) => "_96_remove",
         (0xA0, 0x9F) => "SetMemSize",
@@ -363,6 +371,69 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.gp0(a[0]);
             r(0)
         }
+        (0xA0, 0x46) | (0xA0, 0x47) => {
+            // GPU_dw, gpu_send_dma: GP0(A0h) and w*h/2 pixel words, by
+            // software or by channel 2. Both leave their arguments in the
+            // caller's stack frame; GPU_dw returns the end address (and
+            // leaves it in [sp+10h]), gpu_send_dma GP0's address.
+            let dma = func == 0x47;
+            if dma {
+                m.gpu_sync()?;
+            } else if m.gpu_status()? & 1 << 26 == 0 {
+                return Err(format!("{label}: GPUSTAT bit 26 stays clear (a GP0 command is half sent)"));
+            }
+            let (src, words) = (m.arg(&a, 4), len(a[2].wrapping_mul(a[3]) / 2));
+            for w in [0xA000_0000, a[1] << 16 | a[0] & 0xFFFF, a[3] << 16 | a[2] & 0xFFFF] {
+                m.gp0(w);
+            }
+            let sp = m.regs.sp();
+            for (k, v) in [a[1], a[2], a[3]].into_iter().enumerate() {
+                m.mem.w32(sp + 4 * (k as u32 + 1), v);
+            }
+            if dma {
+                m.gp1(0x0400_0002)?;
+                let blocks = words / 16;
+                m.gpu_dma(src, blocks << 16 | 0x10, 0x0100_0201, false)?;
+                return r(0x1F80_1810);
+            }
+            for i in 0..words {
+                let w = m.mem.r32(src.wrapping_add(4 * i));
+                m.gp0(w);
+            }
+            let end = src.wrapping_add(4 * words);
+            m.mem.w32(sp + 0x10, end);
+            r(end)
+        }
+        (0xA0, 0x48) => {
+            // SendGP1Command: a GP1 word, nothing returned.
+            m.gp1(a[0])?;
+            r(0)
+        }
+        (0xA0, 0x4A) => {
+            // GPU_cwp: GPU words from memory, after a sync.
+            m.gpu_sync()?;
+            for i in 0..len(a[1]) {
+                let w = m.mem.r32(a[0].wrapping_add(4 * i));
+                m.gp0(w);
+            }
+            r(0)
+        }
+        (0xA0, 0x4B) => {
+            // send_gpu_linked_list: channel 2 walks the list; DICR is
+            // cleared first as psx-spx gives it.
+            m.gpu_sync()?;
+            m.gp1(0x0400_0002)?;
+            m.gpu_dma(a[0], 0, 0x0100_0401, true)?;
+            r(0)
+        }
+        (0xA0, 0x4C) => {
+            // gpu_abort_dma: the channel stopped; its result is GP1's
+            // address.
+            m.gpu_abort_dma()?;
+            r(0x1F80_1814)
+        }
+        (0xA0, 0x4D) => r(m.gpu_status()?),
+        (0xA0, 0x4E) => r(m.gpu_sync()?),
         (0xA0, 0xA1) => Err(format!("{label}: SystemError({:#x}, {:#x})", a[0], a[1])),
         (0xA0, 0xAB) => r(m.card_info(a[0])),
         (0xA0, 0xAC) => r(m.card_load(a[0])),

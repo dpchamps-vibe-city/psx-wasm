@@ -230,6 +230,73 @@ mod tests {
         assert_eq!(m.mem.r32(dest), 0xFFBF_1234);
     }
 
+    /// The A0h GPU calls the device libraries use: GP0/GP1 words reach the
+    /// GPU core, GPUSTAT comes back from it, and GP1's register address is
+    /// what `gpu_abort_dma` returns.
+    #[test]
+    fn gpu_control_calls_reach_the_core() {
+        let mut m = machine();
+        m.io = Some(Default::default());
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x49, [0, 0, 0, 0])), 0, "GPU_cw: a GP0 NOP");
+        assert_eq!(m.io.as_ref().unwrap().gp0_words, 1);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x48, [0x0300_0001, 0, 0, 0])), 0, "SendGP1Command");
+        assert!(m.io.as_ref().unwrap().gpu.display().off);
+        let status = m.io.as_ref().unwrap().gpu.status();
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4D, [0, 0, 0, 0])), status, "GetGPUStatus");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4E, [0, 0, 0, 0])), 0, "gpu_sync");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4C, [0, 0, 0, 0])), 0x1F80_1814, "gpu_abort_dma");
+        assert_eq!(m.io.as_ref().unwrap().gpu.display().dma, 0);
+    }
+
+    /// GPU_dw and gpu_send_dma send GP0(A0h) and the image words, in order,
+    /// and leave the BIOS's arguments and result on the caller's stack;
+    /// send_gpu_linked_list walks the list through channel 2.
+    #[test]
+    fn gpu_image_transfers_reach_the_core() {
+        use psxw_abi::render::{self, Command};
+        let mut m = machine();
+        m.io = Some(Default::default());
+        let (src, sp) = (0x8001_0000, m.regs.sp());
+        m.mem.write(src, &[0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00]);
+        m.mem.w32(sp + 16, src);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x46, [0x100, 0x20, 2, 2])), src + 8, "GPU_dw");
+        let io = m.io.as_mut().unwrap();
+        assert_eq!(io.gp0_words, 5, "header and two pixel words");
+        let words = io.gpu.take_commands();
+        assert!(matches!(
+            render::commands(&words).next(),
+            Some(Ok(Command::Upload { mask: 0, pixels, .. })) if pixels == [0x0002_0001, 0x0004_0003]
+        ));
+        assert_eq!(m.mem.bytes(sp + 4, 12), [0x20, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0], "arguments left on the stack");
+        assert_eq!(m.mem.r32(sp + 16), src + 8, "end address left on the stack");
+
+        // gpu_send_dma: 8x8 pixels, 32 words in 2 blocks of 16.
+        let (dst, n) = (0x8002_0000, 32);
+        for i in 0..n {
+            m.mem.w32(dst + 4 * i as u32, i);
+        }
+        m.mem.w32(sp + 16, dst);
+        let before = m.io.as_ref().unwrap().gp0_words;
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x47, [0x40, 0x80, 8, 8])), 0x1F80_1810, "gpu_send_dma");
+        let io = m.io.as_mut().unwrap();
+        assert_eq!(io.gp0_words - before, 35);
+        assert_eq!(io.dma.madr[2], (dst & 0x1F_FFFC) + 4 * n, "the channel ran to the end of the image");
+        assert_eq!(io.dma.chcr[2] & psx_devices::dma::CHCR_BUSY, 0);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4E, [0, 0, 0, 0])), 0);
+        assert_eq!(m.io.as_ref().unwrap().gpu.display().dma, 0, "gpu_sync turns DMA direction off");
+
+        // send_gpu_linked_list: two words, end bit set.
+        let list = 0x8003_0000;
+        m.mem.w32(list, 2 << 24 | 0x80_0000);
+        m.mem.w32(list + 4, 0);
+        m.mem.w32(list + 8, 0);
+        let before = m.io.as_ref().unwrap().gp0_words;
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x4B, [list, 0, 0, 0])), 0, "send_gpu_linked_list");
+        let io = m.io.as_ref().unwrap();
+        assert_eq!(io.gp0_words - before, 2);
+        assert_eq!(io.dma.madr[2], 0x00FF_FFFF);
+    }
+
     #[test]
     fn init_card_selects_the_pads() {
         let mut m = machine();
