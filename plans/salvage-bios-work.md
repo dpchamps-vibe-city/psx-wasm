@@ -435,8 +435,52 @@ Parent retains BIOS pointer thunks, ABI/linker/runtime control flow, executable
 and exception work, and final review. Shared-file conflicts are integrated by
 the parent, not by workers modifying one another's trees.
 
+### Follow-up lanes and dispositions
+
+Wave three is complete. Oracle and SDK pads are integrated after parent review.
+The files lane (`cd7589c`) is **not yet integrated**: parent found missing
+C(12h/13h/1Bh) dispatch arms, discarded console guest-callback flows, and
+inconsistent CD current-directory handling. The same isolated worker is fixing
+these and strengthening its existing integration tests.
+
+A separate DeepSeek fallback lane starts at `bb68c6f` in
+`../psx-wasm-salvage-lanes/fallback`, branch `salvage/fallback`, recovering
+`7716465`, `c14c58d`, `28f4a57`, `8736711`, `8a91a38` in order. It owns only the
+shared CDC/GPU/timer/SPU corrections and necessary BIOS/SDK call sites. No new
+map, instruction timing or BIOS hardware driver is authorised.
+
+Unrelated source-backed dispositions:
+- **Keep separately:** renderer error propagation `f664edd` (not yet applied).
+- **Keep with small rework:** browser per-bundle disc storage `280b9e2`, including
+  its message-shape documentation and browser check (not yet applied).
+- **Keep/rework:** the fallback batch above; no game-level result yet.
+- **Defer:** overlay residency `474fb20` and prerequisite `4a92c4c`, pending a
+  separate architecture decision; not needed for BIOS completion. Do not import
+  archived ABI 13 or its phase-6 follow-ups.
+
 ## Progress log
 
+- 2026-10-31: parent integrated saved BIOS entry thunks in `bfc37c8`, with
+  **ABI 17** in runtime/link/worker/conform contracts. Baseline masked dispatch
+  is retained; low-kernel slot collisions are rejected. An actual game-mode
+  wasm test covers saved and constant pointers, a lifted direct call, table
+  replacement, four arguments, 64-bit return and RFE unwinding. Link-pass tests
+  6, linker 9, BIOS 23 pass; wasm32 runtime check passes. The ignored threaded
+  Docker/DWARF test was not run.
+- 2026-10-31: oracle backend/vectors integrated as `dc03017` after source
+  review: 42 unit tests and CLI check pass. Docker tests skip without the
+  configured images; no emulator comparisons or new captures were run. Sony/
+  OpenBIOS disputed cases retain their existing separate verdict treatment.
+- 2026-10-31: `bb68c6f` recovers ResetEntryInt's default native RFE buffer and
+  syscall >=4 exception-event delivery. BIOS 24 tests pass. The existing
+  syscall seam still cannot preserve incoming v0; that remains a limitation.
+- 2026-10-31: SDK pad RAM state/own elements integrated as `f8f015a`, `ae58f54`;
+  SDK 36 and runtime 7 tests plus wasm32 runtime check pass. Worker inspected
+  real PsyQ 4.7 objects; parent verified libapi's helper write/dequeue order
+  against the actual object too. This is static object evidence, **not** SDK
+  conformance or a game gate. Digital-pad-only behaviour and baseline wait
+  accounting remain; no BIOS serial driver was added. Full workspace, release
+  CLI, game builds, conformance and replay gates are still pending.
 - 2026-10-31: integrated wave two: division `d8ef9df` (parent additionally
   fixed unparenthesized nested operands), native GPU APIs `466fba9`, SDK IRQ
   RAM state and object-static binding `2bb22aa`. Integrated gates: C 20,
@@ -457,10 +501,10 @@ the parent, not by workers modifying one another's trees.
   underflow. Recovered guest-visible call tables, aliases, patched dispatch,
   vector compatibility data and BOOT arguments in `9cf627d` (adapted
   `4ec0ec4`). Vector bytes are data, not executed BIOS code. BIOS/runtime/lift
-  tests pass: 21/7/17. **Saved-entry pointer thunks and the accompanying ABI
-  version change remain pending** until the division worker hands back the
-  linker seam. SDK calls through patched entries also remain pending. No
-  game/workspace gate or full-BIOS completion is claimed.
+  tests pass: 21/7/17. Saved-entry pointer thunks and the accompanying ABI
+  version change were pending at this checkpoint; now recovered in `bfc37c8`.
+  SDK calls through patched entries remain pending. No game/workspace gate or
+  full-BIOS completion is claimed.
 - 2026-10-31: integrated the reviewed DeepSeek lanes: compiler lowering
   (`864002e`..`030497a`), lifter correctness (`052b01f`..`f381c11`) and native
   BIOS libc/heap/printf (`8fcc9d4`). No map/timing or TR2/TR3 rules recovered.
