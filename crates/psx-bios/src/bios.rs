@@ -125,6 +125,11 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0xAB) => "_card_info",
         (0xA0, 0xAC) => "_card_load",
         (0xA0, 0xAD) => "_card_auto",
+        (0xA0, 0xA7) => "bufs_cb_0",
+        (0xA0, 0xA8) => "bufs_cb_1",
+        (0xA0, 0xA9) => "bufs_cb_2",
+        (0xA0, 0xAA) => "bufs_cb_3",
+        (0xA0, 0xAE) => "bufs_cb_4",
         (0xA0, 0xAF) => "card_write_test",
         (0xB0, 0x00) => "alloc_kernel_memory",
         (0xB0, 0x01) => "free_kernel_memory",
@@ -187,6 +192,8 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x54) => "_get_errno",
         (0xB0, 0x55) => "_get_error",
         (0xB0, 0x5B) => "ChangeClearPad",
+        (0xB0, 0x4D) => "_card_info_subfunc",
+        (0xB0, 0x58) => "_card_chan",
         (0xB0, 0x5C) => "_card_status",
         (0xB0, 0x5D) => "_card_wait",
         (0xB0, 0x59) => "testdevice",
@@ -273,16 +280,16 @@ pub fn support(table: u32, func: u32) -> Support {
         // wrappers inherit these gaps; a working happy path is not completeness.
         (0xA0, 0x13)
         | (0xA0, 0x41 | 0x42)
-        | (0xA0, 0x5D..=0x5F)
-        | (0xA0, 0x60 | 0x62..=0x67)
+        | (0xA0, 0x55 | 0x5D..=0x5F)
+        | (0xA0, 0x60 | 0x62..=0x68)
         | (0xA0, 0x78 | 0x7C | 0x7E | 0x81)
         | (0xA0, 0x94 | 0x95 | 0x9C)
-        | (0xA0, 0xA4..=0xA6)
-        | (0xA0, 0xAB..=0xAF)
+        | (0xA0, 0xA4..=0xAC)
+        | (0xA0, 0xAE | 0xAF)
         | (0xA0, 0xB4)
         | (0xB0, 0x0E..=0x10)
-        | (0xB0, 0x32 | 0x34 | 0x35 | 0x3A | 0x3C | 0x40 | 0x42 | 0x43)
-        | (0xB0, 0x4E | 0x4F | 0x5C | 0x5D) => Support::Partial,
+        | (0xB0, 0x32 | 0x34..=0x36 | 0x3A | 0x3C | 0x40 | 0x42 | 0x43)
+        | (0xB0, 0x4D..=0x4F | 0x5C | 0x5D) => Support::Partial,
         _ => Support::Working,
     }
 }
@@ -566,6 +573,9 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0x55) => {
             m.cards_ready();
+            // `_bu_init` starts with auto format off (psx-spx, OpenBIOS
+            // `buClear`).
+            m.kernel.cards.auto_format = 0;
             r(0)
         }
         (0xA0, 0x49) => {
@@ -673,9 +683,16 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xA0, 0xAB) => r(m.card_info(a[0])),
         (0xA0, 0xAC) => r(m.card_load(a[0])),
         (0xA0, 0xAD) => {
-            m.kernel.cards.auto_format = a[0] != 0;
-            r(0)
+            // Returns the old setting (OpenBIOS `buSetAutoFormat`).
+            let old = m.kernel.cards.auto_format;
+            m.kernel.cards.auto_format = a[0];
+            r(old)
         }
+        (0xA0, 0xA7) => r(m.card_bufs_cb(0)),
+        (0xA0, 0xA8) => r(m.card_bufs_cb(1)),
+        (0xA0, 0xA9) => r(m.card_bufs_cb(2)),
+        (0xA0, 0xAA) => r(m.card_bufs_cb(3)),
+        (0xA0, 0xAE) => r(m.card_bufs_cb(4)),
         (0xA0, 0xAF) => r(m.card_write_test(a[0])),
 
         // --- B0h: kernel memory, timers, events, pads, files, cards -----
@@ -804,11 +821,13 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xB0, 0x54) => r(m.kernel.files.errno),
         (0xB0, 0x55) => r(m.get_error(a[0])),
+        (0xB0, 0x4D) => r(m.card_info_subfunc(a[0])),
+        (0xB0, 0x58) => r(m.card_chan()),
         (0xB0, 0x5C) => {
             m.cards_ready();
             r(m.kernel.cards.status[(a[0] & 1) as usize])
         }
-        (0xB0, 0x5D) => r(m.card_wait(a[0])),
+        (0xB0, 0x5D) => Ok(m.card_wait(a[0])),
         // No BIOS ROM, so no ROM kanji font.
         (0xB0, 0x51) => r(u32::MAX),
         // Kernel tables: addresses in kernel RAM, as the Sony BIOS has them.

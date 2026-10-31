@@ -202,9 +202,9 @@ Five are documented no-ops, and A(52h)'s meaning needs verification.
 | [ ] | A(AEh) | `bufs_cb_4` |
 | [ ] | A(B2h) | `ioabort_raw` |
 | [ ] | A(B4h) | `GetSystemInfo`: size/flags implemented; date/version identity unresolved |
-| [ ] | B(4Dh) | `_card_info_subfunc` |
+| [x] | B(4Dh) | `_card_info_subfunc`: native queued info, low event only |
 | [ ] | B(53h) | `Krom2Offset` |
-| [ ] | B(58h) | `_card_chan` |
+| [x] | B(58h) | `_card_chan`: last requested device ID, not slot index |
 | [x] | C(04h) | `get_free_EvCB_slot` |
 | [x] | C(05h) | `get_free_TCB_slot` |
 | [x] | C(08h) | `SysInitMemory` |
@@ -240,13 +240,15 @@ handoff's missing-call list.
 - [x] **`SetMem`, A(9Fh).** Updates the guest-visible RAM-size variable for
   retail's 2/8 MB choices, also reported by GetSystemInfo(5). No host memory
   resizing or console-wide bus map.
-- [ ] **Card auto-format, A(ADh).** The flag is written but never read. Implement
-  the documented opt-in behaviour and its initialisation/reset, with tests using
-  disposable card images. Never test destructive formatting on user saves.
-- [ ] **Card waiting/completion.** `_card_wait` drains operations immediately;
-  asynchronous file I/O moves all bytes before queuing completion notifications.
-  Resolve buffer visibility, busy state and event/wait ordering using scheduled
-  native operations. Do not restore serial exchanges or instruction timing.
+- [x] **Card auto-format, A(ADh).** Opt-in formatting of an invalid MC header,
+  exact previous setting return and `_bu_init` flag reset are implemented;
+  missing and valid cards are untouched. Tests use disposable in-memory cards.
+- [ ] **Card waiting/completion.** `_card_wait` now blocks on scheduled vblanks;
+  async file frames become visible at completion, with busy/error state and
+  read/write-specific event order. Generic close releases its FCB even on error;
+  native cleanup cancels old queued work to protect descriptor reuse. Explicit
+  A(A7h..AAh/AEh) callbacks remain partial, notably Info/Load/write-test effects
+  and unspecified returns. No serial exchanges or instruction timing added.
 - [ ] **Console input/control.** `gets` always errors; built-in blocking TTY
   reads error; low-level TTY `ioctl` is a zero-return stub. `getc`/`getchar` and
   output wrappers already exist. Complete the missing software and host-input
@@ -694,7 +696,22 @@ high then fd then low, while write-info orders fd then high then low in OpenBIOS
 Run `cf4f986e-fce2-4feb-a403-99d0b460f196` resumes the same worker with those exact
 corrections, mid-operation error/new-card checks and auto-format event ordering.
 Native close cancellation must protect a reused descriptor without changing the
-generic close contract; callback coverage remains partial until accepted.
+generic close contract; callback coverage remains partial.
+
+Final corrective `1510055` is now source-reviewed and integrated together with
+its two predecessors. `_card_wait` uses existing Flow/vblank waits, async file
+I/O moves one frame at completion, writes retain their separate info stage, and
+new-card/removal failures preserve the partial offset without success events.
+Generic close still clears flags unconditionally. Native close cancellation is
+an explicit safety policy, not a claim about retail cancellation semantics;
+it prevents the old open from modifying a reused fd (including other devices).
+B(58h) returns the exact device ID. Parent removed a debug print, corrected the
+close comment, preserved non-boolean auto-format values per `buSetAutoFormat`,
+and strengthened the close/reopen test to cancel after one completed frame.
+A(A7h..AAh/AEh) stay classified partial: native scheduling owns advancement,
+Info/Load/write-test callback effects and exact return semantics are unresolved.
+Integrated BIOS 47/runtime 8/SDK 36 tests and wasm32 runtime check pass. No user
+cards, protocol driver, ABI change or new game artifacts in this batch.
 
 After the user flagged unnecessary serialization, workflow
 `810c2b90-9237-4898-bca6-953b1a8efeff` adds four parallel DeepSeek lanes alongside

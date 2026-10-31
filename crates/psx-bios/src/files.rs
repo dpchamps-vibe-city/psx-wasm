@@ -380,7 +380,10 @@ impl<S: Sdk> Machine<S> {
         let Some(f) = self.open_fcb(fd) else { return Ok(self.fail(E_BAD_FD, u32::MAX)) };
         let d = self.mem.r32(f + fcb::DCB);
         self.device(d, dcb::CLOSE, [f, 0, 0, 0], move |m, v| {
+            // psxclose clears the flags before checking the device result;
+            // the native card state is invalidated for the released fd.
             m.mem.w32(f + fcb::FLAGS, 0);
+            m.card_file_closed(fd);
             if v != 0 {
                 m.kernel.files.errno = m.mem.r32(f + fcb::ERRNO);
                 return Flow::ret(u32::MAX);
@@ -705,9 +708,16 @@ impl<S: Sdk> Machine<S> {
         v
     }
 
-    /// A(68h) `dev_bu_close(fcb)`: the native card file closed.
+    /// A(68h) `dev_bu_close(fcb)`: refuse an active asynchronous operation
+    /// with device result 1. Generic close nevertheless releases the FCB;
+    /// its native cleanup then cancels work belonging to the old open.
     pub fn dev_bu_close(&mut self, f: u32) -> u32 {
-        self.kernel.cards.files.remove(&self.mem.r32(f + fcb::FD));
+        let fd = self.mem.r32(f + fcb::FD);
+        if self.card_file_pending(fd) {
+            self.mem.w32(f + fcb::ERRNO, E_GENERAL);
+            return 1;
+        }
+        self.kernel.cards.files.remove(&fd);
         0
     }
 
