@@ -112,6 +112,11 @@ pub mod kernel {
     /// Native kernel data: pad buffers, handler elements, strtok/file
     /// storage and the default exception exit buffer at 7940h.
     pub const DATA: Range<u32> = 0x7000..0x7970;
+    /// A(41h)/A(42h)'s internal executable-header sector buffer (800h),
+    /// guest-readable so a guest device callback can fill it. It starts
+    /// after the native callable slots at 8000h..8030h.
+    pub const LOAD_BUFFER: u32 = 0x8040;
+    pub const LOAD_BUFFER_LEN: u32 = 0x800;
     /// The table of tables: a (pointer, size) pair per table from 0x100.
     /// These four entries are filled: the exception control blocks, the
     /// process control block, the thread control blocks and the event
@@ -160,10 +165,11 @@ pub mod kernel {
     pub const DEVICES: u32 = 10;
     /// Kernel RAM a game may read and write at constant addresses: the
     /// lift's kernel rule accepts these and still fails on the rest.
-    pub const RAM_BACKED: [Range<u32>; 5] = [
+    pub const RAM_BACKED: [Range<u32>; 6] = [
         0..DCB_ENTRY + 8,
         BOOT_ARGUMENT..B0_TABLE + 4 * B0_LEN,
         DATA,
+        LOAD_BUFFER..LOAD_BUFFER + LOAD_BUFFER_LEN,
         FCBS..DCBS + DEVICES * DCB_SIZE + 0x100,
         EXCB..EVCBS + MAX_EVENTS * EVCB_SIZE,
     ];

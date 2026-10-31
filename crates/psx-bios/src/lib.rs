@@ -13,6 +13,7 @@ pub mod files;
 pub mod io;
 pub mod kernel;
 pub mod libc;
+pub mod loader;
 pub mod machine;
 pub mod tables;
 pub mod threads;

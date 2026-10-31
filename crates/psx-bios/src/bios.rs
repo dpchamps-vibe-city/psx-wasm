@@ -6,7 +6,7 @@
 use crate::kernel;
 use crate::libc;
 use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait};
-use crate::{files, tables, threads};
+use crate::{files, loader, tables, threads};
 use psx_devices::cd;
 use psxw_abi::kernel as k;
 
@@ -66,6 +66,8 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x38) => "realloc",
         (0xA0, 0x39) => "InitHeap",
         (0xA0, 0x3F) => "printf",
+        (0xA0, 0x41) => "LoadTest",
+        (0xA0, 0x42) => "Load",
         (0xA0, 0x43) => "Exec",
         (0xA0, 0x44) => "FlushCache",
         (0xA0, 0x45) => "init_a0_b0_c0_vectors",
@@ -339,6 +341,8 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0x0B) | (0xA0, 0x32) => Err(format!("{label}: it uses COP1, which the console does not have (the call locks up on hardware)")),
         (0xA0, 0x14) => Err(format!("{label}: longjmp across translated frames is not supported")),
+        (0xA0, 0x41) => loader::load_test(m, a[0], a[1]),
+        (0xA0, 0x42) => loader::load(m, a[0], a[1]),
         (0xA0, 0x43) => Err(format!("{label}: loading and running another executable is not supported")),
         (0xA0, 0x15) | (0xA0, 0x16) => {
             // strcat, strncat (at most maxlen characters, none for a
