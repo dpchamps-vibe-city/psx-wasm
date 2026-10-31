@@ -2213,8 +2213,11 @@ font functions. So libgpu's adapters keep that state where libgpu keeps it
   the call that drained the queue, with the callback's own address in
   `a0` as libgpu leaves it. Callbacks and
   libetc's state land where the original puts them, whichever way chip
-  irq runs. libgpu's pump, which it makes DMA2's callback, is a stand-in
-  function (`libgpu::PUMP`), like libetc's own handlers.
+  irq runs. libgpu's pump, which it makes DMA2's callback, is an adapter
+  at its own address: a static function with no name, bound by its place
+  in the object (`libgpu/sys:0x23a8`; an adapter named
+  `<member>:<offset>` binds to the function placed there, spec fidelity
+  SDK8).
 - **Shared devices stay shared.** The GPU's transfers are DMA2 and DMA6 on
   the DMA controller, programmed as libgpu programs them and with the
   controller's semantics (as chip irq uses I_MASK and DICR): DPCR gates

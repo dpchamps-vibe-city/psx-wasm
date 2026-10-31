@@ -309,13 +309,18 @@ calls (TR1, B19).
 3. [ ] **SDK1. libpad's state into its own data.** Port records, receive
    buffers, pending results: `sdk-psyq/src/libpad.rs:48-52, 146-161`.
    Same way as task 2. **Run:** both games' replays.
-4. [ ] **SDK6, SDK8. The real addresses.** `ResetCallback`,
+4. [x] **SDK6, SDK8. The real addresses.** `ResetCallback`,
    `StopCallback`, `RestartCallback`, `InterruptCallback(0/3)`
    (`libetc.rs:69-75, 417, 436, 450`) and `DMACallback(2, …)`
    (`libgpu.rs:73-75`) return libetc's context, its handlers and libgpu's
    pump. A guest call to one reaches the adapter bound at that address or
    the original over the state now in RAM. Retire the stand-ins that
    become unused.
+   Done `b92f582` (libetc: the context, intr_vb's and intr_dma's own
+   handlers) and the commit after `dbda488` (libgpu's pump: an adapter
+   bound by its place in `sys.o`, `libgpu/sys:0x23a8`, which psxw-build now
+   supports for static functions). libcd's interrupt handler is still a
+   stand-in (`libcd::HANDLER`); the same binding would retire it (Findings).
 5. [ ] **SDK3–5. One wait that spends what the original's loop would.**
    A shared helper that blocks with events delivered and spends the
    guest's budget pass by pass, as `libpad::spend_in_exception`
@@ -589,3 +594,9 @@ locals, or static translation.
   code in native builds too (no hardware-unbound refusal for libetc), so
   with the state in RAM the dispatcher can call them and the stand-ins go
   (SDK6).
+- **Adapters can bind by place** (SDK8): an adapter named
+  `<member>:<offset>` binds to the function at that offset in the
+  member's text (`psxw-build` `adapter_name`), for static functions the
+  SDK doesn't name. libcd's interrupt handler (`bios_1`'s, passed to
+  `InterruptCallback(2, …)` by `CD_init`; +14A4h in btn) is the last
+  stand-in in BIOS ROM space (`libcd::HANDLER`) and could go the same way.
