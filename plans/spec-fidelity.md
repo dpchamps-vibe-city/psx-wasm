@@ -571,6 +571,10 @@ locals, or static translation.
 - **2026-10-30:** plan created from the shortcuts audit
   (`plans/shortcuts.md`, `3eff117`–`0bae88a`), its bugs (moved from
   open-items) and the BIOS rework.
+- **2026-10-31:** phase 3: BIOS7 (`6155844`), BIOS4 (`053035d`). After
+  BIOS4 every chip each game places passes conformance (irq, sio0, gpu,
+  cd, spu in both; memcard in btn; mdec in bof4; `out/sf-p3-conform-*`),
+  and both games build with every chip native.
 - **2026-10-31:** phase 2: SDK2, SDK6/SDK8, SDK3–5, SDK11 done (`b92f582`..
   `8e04a5b`); SDK1 with an agent. Adapters can bind by place
   (`libgpu/sys:0x23a8`, `libetc/intr_dma:0x4c`, `libcd/bios_1:0x14a4`):
