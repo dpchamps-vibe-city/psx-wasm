@@ -73,7 +73,7 @@
 //! waits' times leave out the original's wait for /ACK to fall after each
 //! byte (the pulse lasts 32 cycles, a pass or two).
 
-use crate::{Adapter, M, Result, bios, reg, ret, set_reg};
+use crate::{Adapter, M, Result, reg, ret, set_reg};
 use psx_bios::Flow;
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
@@ -758,34 +758,52 @@ fn pad_init_direct(m: &mut M, a: [u32; 4]) -> Result {
 /// acknowledged and unmasked, the kernel's vblank acknowledge of root
 /// counter 3 off (ChangeClearRCnt(3, 0)), the critical section left, both
 /// ports forgotten, their rests over. The original leaves 1 in v0.
+///
+/// Its BIOS calls are the entry's own, so a patched table runs the guest's
+/// function there and the rest waits for it (`psx_bios::machine::seq`).
+/// [`lib`] is read here, before those calls: a callback that enters another
+/// adapter moves `sdk.at` (D61).
 fn pad_start_com(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::ELEMENT, data::VSYNC_PARAM)?;
     m.mem.w32(l.data + data::INT_EXEC, 0);
-    bios(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])?;
-    bios(m, 0xC0, 0x02, [PRIORITY, l.element(), 0, 0])?;
-    set_reg(m, I_STAT, 4, !1)?;
-    let mask = reg(m, I_MASK, 4)?;
-    set_reg(m, I_MASK, 4, mask | 1)?;
-    bios(m, 0xC0, 0x0A, [3, 0, 0, 0])?;
-    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
-    if let Some(recs) = l.records(m) {
-        clear_info(m, recs);
-        clear_info(m, recs + rec::SIZE);
-    }
-    m.mem.write(l.rest, &[0; 8]);
-    m.mem.w32(l.data + data::INT_EXEC, 1);
-    ret(1)
+    let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])?;
+    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+        let flow = psx_bios::bios::dispatch(m, 0xC0, 0x02, [PRIORITY, l.element(), 0, 0])
+            .unwrap_or_else(|e| panic!("PadStartCom: {e}"));
+        psx_bios::machine::seq(m, flow, move |m, _| {
+            set_reg(m, I_STAT, 4, !1).unwrap_or_else(|e| panic!("PadStartCom: {e}"));
+            let mask = reg(m, I_MASK, 4).unwrap_or_else(|e| panic!("PadStartCom: {e}"));
+            set_reg(m, I_MASK, 4, mask | 1).unwrap_or_else(|e| panic!("PadStartCom: {e}"));
+            let flow = psx_bios::bios::dispatch(m, 0xC0, 0x0A, [3, 0, 0, 0]).unwrap_or_else(|e| panic!("PadStartCom: {e}"));
+            psx_bios::machine::seq(m, flow, move |m, _| {
+                psx_bios::bios::syscall(m, [2, 0, 0, 0]).unwrap_or_else(|e| panic!("PadStartCom: {e}"));
+                if let Some(recs) = l.records(m) {
+                    clear_info(m, recs);
+                    clear_info(m, recs + rec::SIZE);
+                }
+                m.mem.write(l.rest, &[0; 8]);
+                m.mem.w32(l.data + data::INT_EXEC, 1);
+                Flow::ret(1)
+            })
+        })
+    }))
 }
 
 /// `PadStopCom()`: the kernel acknowledges root counter 3 again, the
 /// element leaves the chain, the critical section is left (v0: 0, from
-/// ExitCriticalSection).
+/// ExitCriticalSection). Its BIOS calls are the entry's own, as
+/// [`pad_start_com`]'s are.
 fn pad_stop_com(m: &mut M, _a: [u32; 4]) -> Result {
     let l = lib(m, at::ELEMENT, data::VSYNC_PARAM)?;
-    bios(m, 0xC0, 0x0A, [3, 1, 0, 0])?;
-    bios(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])?;
-    psx_bios::bios::syscall(m, [2, 0, 0, 0])?;
-    ret(0)
+    let flow = psx_bios::bios::dispatch(m, 0xC0, 0x0A, [3, 1, 0, 0])?;
+    Ok(psx_bios::machine::seq(m, flow, move |m, _| {
+        let flow = psx_bios::bios::dispatch(m, 0xC0, 0x03, [PRIORITY, l.element(), 0, 0])
+            .unwrap_or_else(|e| panic!("PadStopCom: {e}"));
+        psx_bios::machine::seq(m, flow, move |m, _| {
+            psx_bios::bios::syscall(m, [2, 0, 0, 0]).unwrap_or_else(|e| panic!("PadStopCom: {e}"));
+            Flow::ret(0)
+        })
+    }))
 }
 
 /// `PadGetState(port)`: the port's state; with a command in flight or a
@@ -929,7 +947,7 @@ pub(crate) mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{DATA, RECORDS, install, run};
+    use super::fixture::{DATA, RECORDS, REST, install, run};
     use super::*;
     use crate::testing::{machine_with_bus, vblanks};
 
@@ -1053,5 +1071,127 @@ mod tests {
         set_reg(&mut m, I_MASK, 4, mask & !1).unwrap();
         vblanks(&mut m, 3);
         assert_eq!(info(&mut m, 0x10, 100), 0);
+    }
+
+    /// Where the guest's patched functions note their turn.
+    const LOG: u32 = 0x8010_0200;
+    const START_DEQUEUE: u32 = 0x8010_0100;
+    const START_ENQUEUE: u32 = 0x8010_0104;
+    const START_CHANGE_CLEAR: u32 = 0x8010_0108;
+    const STOP_CHANGE_CLEAR: u32 = 0x8010_010C;
+    const STOP_DEQUEUE: u32 = 0x8010_0110;
+
+    fn note(m: &mut M, v: u32) {
+        let n = m.mem.r32(LOG);
+        m.mem.w32(LOG + 4 + 4 * n, v);
+        m.mem.w32(LOG, n + 1);
+    }
+
+    fn notes(m: &M) -> Vec<u32> {
+        let n = m.mem.r32(LOG);
+        (0..n).map(|i| m.mem.r32(LOG + 4 + 4 * i)).collect()
+    }
+
+    /// The arguments the guest call being served got.
+    fn args() -> [u32; 4] {
+        *crate::testing::irq_args().last().expect("a guest call's arguments")
+    }
+
+    fn unmasked(m: &M) -> u32 {
+        m.io.as_ref().unwrap().irq.mask & 1
+    }
+
+    fn patch(m: &mut M, func: u32, addr: u32) {
+        m.mem.w32(psx_bios::tables::entry(0xC0, func).expect("a C0h table entry"), addr);
+    }
+
+    /// A patch of `PadStartCom`'s `SysDeqIntRP`: nothing after the call has
+    /// run yet.
+    fn start_dequeue(m: &mut M) {
+        note(m, 0x03);
+        assert_eq!(args(), [PRIORITY, ELEMENT, 0, 0]);
+        assert!(m.crit, "the caller's critical section is still held");
+        assert_eq!(m.mem.r32(DATA + data::INT_EXEC), 0, "_padIntExec cleared before the call");
+        assert_eq!(m.mem.r8(RECORDS + rec::STATE), 7, "the ports are not forgotten yet");
+    }
+
+    /// A patch of `PadStartCom`'s `SysEnqIntRP`: guest code that enters
+    /// another adapter (the runtime points `sdk.at` at it) and leaves it
+    /// there.
+    fn start_enqueue(m: &mut M) {
+        note(m, 0x02);
+        assert_eq!(args(), [PRIORITY, ELEMENT, 0, 0]);
+        assert_eq!(unmasked(m), 0, "vblank is unmasked only after the enqueue");
+        assert_eq!(m.mem.r32(DATA + data::INT_EXEC), 0);
+        run(m, "PadGetState", [0, 0, 0, 0]);
+    }
+
+    /// A patch of `PadStartCom`'s `ChangeClearRCnt(3, 0)`: vblank already
+    /// acknowledged and unmasked (the original writes `I_MASK` in this
+    /// call's delay slot), the ports and the engine's flag not yet touched.
+    fn start_change_clear(m: &mut M) {
+        note(m, 0x0A);
+        assert_eq!(args(), [3, 0, 0, 0]);
+        assert_eq!(unmasked(m), 1);
+        assert_eq!(m.io.as_ref().unwrap().irq.stat & 1, 0, "vblank acknowledged");
+        assert_eq!(m.mem.r32(DATA + data::INT_EXEC), 0, "the engine restarts after the call");
+        assert_eq!(m.mem.r8(RECORDS + rec::STATE), 7);
+        assert!(m.crit);
+    }
+
+    /// `PadStopCom`'s calls: `ChangeClearRCnt(3, 1)`, then the dequeue.
+    fn stop_change_clear(m: &mut M) {
+        note(m, 0x0A);
+        assert_eq!(args(), [3, 1, 0, 0]);
+        assert_eq!(unmasked(m), 1);
+        assert!(m.crit);
+    }
+
+    fn stop_dequeue(m: &mut M) {
+        note(m, 0x03);
+        assert_eq!(args(), [PRIORITY, ELEMENT, 0, 0]);
+        assert!(m.crit, "the critical section is left after the dequeue");
+    }
+
+    /// The patched entries run where the original calls them: each guest
+    /// function finishes before the state that follows it, a callback that
+    /// enters another adapter does not move the engine's addresses, and the
+    /// native enqueue/dequeue do not also run.
+    #[test]
+    fn patched_start_and_stop_finish_their_calls_first() {
+        let mut m = machine_with_bus();
+        install(&mut m);
+        m.mem.write(B0, &[0xAA; 0x80]);
+        assert_eq!(run(&mut m, "PadInitDirect", [B0, B1, 0, 0]), 1);
+        let chain = m.chain(2);
+        m.mem.w8(RECORDS + rec::STATE, 7);
+        m.mem.write(REST, &[9; 8]);
+        crate::testing::double(START_DEQUEUE, start_dequeue);
+        crate::testing::double(START_ENQUEUE, start_enqueue);
+        crate::testing::double(START_CHANGE_CLEAR, start_change_clear);
+        patch(&mut m, 0x03, START_DEQUEUE);
+        patch(&mut m, 0x02, START_ENQUEUE);
+        patch(&mut m, 0x0A, START_CHANGE_CLEAR);
+        psx_bios::bios::syscall(&mut m, [1, 0, 0, 0]).unwrap();
+        assert_eq!(run(&mut m, "PadStartCom", [0; 4]), 1);
+        assert_eq!(notes(&m), [0x03, 0x02, 0x0A], "the original's order");
+        assert!(!m.crit, "the critical section is left after the last call");
+        assert_eq!(m.mem.r32(DATA + data::INT_EXEC), 1, "the engine restarts at the end");
+        assert_eq!(m.mem.r8(RECORDS + rec::STATE), 0, "the ports forgotten at the end");
+        assert_eq!(m.mem.bytes(REST, 8), [0; 8], "the rests over at the end");
+        assert_eq!(m.chain(2), chain, "the guest's enqueue runs, not the native service");
+
+        // The stop side: ChangeClearRCnt(3, 1) then the dequeue, the
+        // critical section left after both.
+        m.mem.w32(LOG, 0);
+        crate::testing::double(STOP_CHANGE_CLEAR, stop_change_clear);
+        crate::testing::double(STOP_DEQUEUE, stop_dequeue);
+        patch(&mut m, 0x0A, STOP_CHANGE_CLEAR);
+        patch(&mut m, 0x03, STOP_DEQUEUE);
+        psx_bios::bios::syscall(&mut m, [1, 0, 0, 0]).unwrap();
+        assert_eq!(run(&mut m, "PadStopCom", [0; 4]), 0);
+        assert_eq!(notes(&m), [0x0A, 0x03]);
+        assert!(!m.crit, "ExitCriticalSection's 0, after the dequeue");
+        assert_eq!(m.chain(2), chain, "the guest's dequeue runs, not the native service");
     }
 }
