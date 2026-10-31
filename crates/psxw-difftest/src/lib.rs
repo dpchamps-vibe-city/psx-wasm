@@ -164,7 +164,10 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     // Prototype facts for every census TU.
     let out = ws.out_dir().join("difftest").join(&opts.game).join(&commit[..7]);
     std::fs::create_dir_all(&out)?;
-    let clang = psxw_cc::Clang::new(ws.clang()?, out.clone(), Vec::new(), Vec::new(), &out)?;
+    let mut clang = psxw_cc::Clang::new(ws.clang()?, out.clone(), Vec::new(), Vec::new(), &out)?;
+    // Plain `char` as the reference compiler had it, as the census and the
+    // build compile.
+    clang.reference(&inputs.manifest.reference.cc1flags);
     let mut tus: Vec<(String, PathBuf)> = Vec::new();
     for c in &inputs.map.containers {
         let dir = inputs.census_obj.join(&c.id);
@@ -191,8 +194,9 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             let h = dir.join(o.file_name().unwrap_or_default());
             let variant = h.with_extension("i");
             let text = format!(
-                "/* psxw harness variant: {HARNESS_FLAGS:?} {:?} */\n{}",
+                "/* psxw harness variant: {HARNESS_FLAGS:?} {:?} unsigned char: {} */\n{}",
                 psxw_cc::CODEGEN_FLAGS,
+                clang.unsigned_char,
                 psxw_cc::ast::harness_variant(&std::fs::read_to_string(&i)?)
             );
             let same = std::fs::read_to_string(&variant).is_ok_and(|old| old == text);
