@@ -668,13 +668,13 @@ anything else.
 Status (2026-10-31): 1 and 2 pass on `worktree-agent-a91665ec38f961809`
 (`dee627e`..). `psxw difftest btn`: 2,620 pass, 3 excluded, the known
 `AlignPadActuators` mismatch and `Ovl11ProbeActorBounds` trap, as
-before. Conformance: chips irq, gpu and cd pass in btn; irq, gpu, cd and
-mdec in bof4; sio0 (both), memcard (btn) and spu (both; btn 20 of 47
-cases, bof4 20 of 47) fail on time where adapters don't yet spend their originals'
-straight-line instructions (Findings). Both games boot to their main
-loops and run 1,200 frames without a trap (`psxw run <game> --check boot
---check no-trap`). Step 5 and 3 wait for the human, and, before them,
-the rest of the adapters' time.
+before. Conformance: chips irq, gpu, cd and spu pass in both games, mdec
+in bof4; sio0 (both) and memcard (btn) fail on time: their interrupt
+handlers' adapters don't yet spend their originals' straight-line
+instructions (Findings, "Adapters' straight-line time"). Both games boot
+to their main loops and run 1,200 frames without a trap (`psxw run
+<game> --check boot --check no-trap`). Step 5 and 3 wait for the human,
+and, before them, those handlers' time.
 
 Step 5, the human's (each game; btn's replay `title-to-gameplay`,
 bof4's `title-to-field`). Run `psxw census btn` and `psxw census bof4
@@ -755,9 +755,10 @@ locals, or static translation.
   loops in instruction units, and some adapters' whole paths. A BIOS
   call panicked since `77ee6fd` (every conformance device side and any
   run): fixed, `dee627e`. Tests pass, both games build, difftest's
-  verdicts are as before. Conformance fails on time for chips sio0,
-  memcard and spu (Findings). Human: step 5 and `ci`, after the rest of
-  the adapters' time.
+  verdicts are as before. Then libspu's and libsnd's adapters whole
+  (`69ebfa8`): chip spu passes in both games. Conformance fails on time
+  for chips sio0 and memcard (Findings). Human: step 5 and `ci`, after
+  those handlers' time.
 
 - **2026-10-30:** plan created from the shortcuts audit
   (`plans/shortcuts.md`, `3eff117`–`0bae88a`), its bugs (moved from
@@ -837,22 +838,32 @@ locals, or static translation.
   interrupts (`sio0.interrupt-time`'s hblanks, `memcard.session`). So an
   adapter spends its original's blocks on the path it takes
   (`sdk_psyq::path`, offsets from `psxw sdk disasm`), each before what
-  the block does that time can see. Done and passing: libapi's counter
-  functions (chip irq passes in btn), libgpu's timeout check (26
-  instructions, chip gpu passes), libspu's `_spu_init` and FIFO writer,
-  `_spu_Fw`, `_spu_t`, `_spu_FiDMA`, `_spu_FsetRXX(a)`, the voice volume
-  and envelope functions, the noise clock, the any-voice functions,
-  `SpuSetCommonAttr` (btn's chip spu: 4 of 47 cases to 20). Left, and
-  failing: libpad's interrupt (`_padIntPad` and its callees: the pad
-  state machine's paths) for chip sio0; libmcx's DSR and vblank element
-  for chip memcard; libspu's `SpuSetVoiceAttr`, `SpuSetReverbModeParam`,
-  `SpuClearReverbWorkArea`, `SpuSetKey`, the key status and reverb
-  functions and libsnd's `_SsInit` for chip spu. libgpu's, libcd's,
-  libetc's and libpress's adapters don't spend their straight-line code
-  either; their chips' cases don't see it yet. Each is the same
-  mechanical work (the disassembly's blocks on each branch), checked by
-  the chip's cases. Until it is done, replays with those chips native
-  run a little fast against their originals.
+  the block does that time can see: a root counter 2 or SIO0 access, a
+  loop header (where a safepoint can fall), a guest call.
+  - Done, and their chips pass: libapi's counter functions (irq);
+    libgpu's timeout check (26 instructions, gpu); every libspu adapter
+    and libsnd's `_SsInit` (spu, `38bf58e`, `69ebfa8`).
+  - Left: libpad's interrupt (`_padIntPad` and its callees) for chip
+    sio0, libmcx's elements and `_mcxDsrEntry` for chip memcard, and the
+    straight-line code of libgpu's, libcd's, libetc's dispatcher's and
+    libpress's adapters, which no case sees yet but games run natively.
+  - What the handlers need, beyond the blocks: (1) each element's
+    verifier spends on every interrupt the kernel walks the chain for,
+    not only when it says yes (`mcxresi` +0h and +40h, 10 to 16
+    instructions; libpad's `_padIsVsync` likewise); (2) a quantum passes
+    inside the handler only at a loop header there, so the handler's
+    tail after its last wait spends without one
+    (`libpad::spend_in_exception` takes them wherever the budget runs
+    out); (3) a wait ends at the pass whose poll sees what it waits for,
+    and the poll is read at the time after its whole block: libmcx's
+    root counter 2 wait can poll the counter itself through `guest_now`
+    pass by pass; libpad's waits are on its own wire model, so its
+    `Spin` must count every instruction between the handler's start and
+    each poll (2 cycles each), not only the waits'. Each is the same
+    mechanical work as libspu's, checked by `sio0.interrupt-time`,
+    `memcard.session` and the chips' other cases. Until it is done,
+    replays with those chips native run a little fast against their
+    originals.
 - **A BIOS call panicked** (2026-10-31): `77ee6fd` kept the machine
   borrowed through `driver::run` in the runtime's `bios` import, so
   every BIOS call from guest code trapped ("RefCell already borrowed"),

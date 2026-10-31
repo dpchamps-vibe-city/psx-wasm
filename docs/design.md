@@ -2860,21 +2860,18 @@ closer to the oracle's (plans/spec-fidelity.md, phase 7 step 5).
   safepoint can fall), a guest call. Conformance checks it: chip spu
   observes the budget after every call, chip irq root counter 2, chip
   sio0 and memcard where a quantum falls in the pad and card interrupts.
-  Done: libapi's counter functions; libspu's `_spu_init` and its FIFO
-  writer, `_spu_Fw`, `_spu_t`, `_spu_FiDMA`, `_spu_FsetRXX(a)`, the voice
-  volume and envelope functions, the noise clock, the any-voice
-  functions, `SpuSetCommonAttr`. Waits and loops spend a pass at the
+  Done: libapi's counter functions, every libspu adapter and libsnd's
+  `_SsInit`. Waits and loops spend a pass at the
   loop's own count (the timeout checks and calls each iteration makes
   among them): libetc's `VSync` waits (14 and 6), libgpu's (40, 41, 38),
   libcd's (35, 38, 30, 30), libpress's (16; `DecDCTPutEnv`'s copies 160),
   libpad's handler waits (RC2 28, a reply 5, /ACK 20 and 36), libmcx's
   (19 and 5), libapi's pad element (its whole 98); waits that spin
   through quanta carry the budget as the original's loop does, instead
-  of starting it over. Not yet: the straight-line code of the other
-  adapters (libpad's interrupt handler, libmcx's, the rest of libspu and
-  libsnd's `_SsInit`, libgpu's, libcd's, libetc's dispatcher, libpress's),
-  so chip sio0, memcard and spu conformance fail on time
-  (plans/spec-fidelity.md, Findings).
+  of starting it over. Not yet: the straight-line code of libpad's and
+  libmcx's interrupt handlers (chip sio0 and memcard conformance fail on
+  time) and of libgpu's, libcd's, libetc's dispatcher's and libpress's
+  adapters (plans/spec-fidelity.md, Findings).
 - **The check** (difftest, btn @ c77a66f, 64 seeds): every pair spends
   exact counts as lift and the estimate as C over the same seeds. Over
   160,119 runs where both sides returned alike, the error (C − T) / T
