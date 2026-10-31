@@ -487,10 +487,12 @@ pub extern "C" fn bios(table: u32, func: u32, a0: u32, a1: u32, a2: u32, a3: u32
         // Through the table in kernel RAM: a game's patched entry is called
         // as guest code (D68). A call through a pointer to a stand-in runs
         // its function.
-        let m = &mut rt.m.borrow_mut();
-        let flow = match psx_bios::tables::stand_in_fn(table) {
-            Some((t, f)) => psx_bios::bios::call(m, t, f, [a0, a1, a2, a3]),
-            None => psx_bios::bios::dispatch(m, table, func, [a0, a1, a2, a3]),
+        let flow = {
+            let m = &mut rt.m.borrow_mut();
+            match psx_bios::tables::stand_in_fn(table) {
+                Some((t, f)) => psx_bios::bios::call(m, t, f, [a0, a1, a2, a3]),
+                None => psx_bios::bios::dispatch(m, table, func, [a0, a1, a2, a3]),
+            }
         };
         match flow {
             Ok(f) => driver::run(&rt.m, &mut Guest, f),
