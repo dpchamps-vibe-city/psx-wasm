@@ -105,6 +105,8 @@ mod at {
     pub const JAL_RESET_CALLBACK: u32 = 0x80;
     pub const JAL_GET_VIDEO_MODE: u32 = 0xca4;
     pub const JAL_DMA_CALLBACK: u32 = 0x2224;
+    /// The timeout's `VSync(-1)`.
+    pub const JAL_VSYNC: u32 = 0x2888;
 }
 
 /// `.data` offsets.
@@ -189,6 +191,8 @@ pub struct Sys {
     pub reset_callback: u32,
     pub get_video_mode: u32,
     pub dma_callback: u32,
+    /// libetc's `Vcount`, where `VSync(-1)` reads it.
+    pub vcount: u32,
 }
 
 impl Sys {
@@ -234,6 +238,8 @@ fn sys(m: &mut M, off: u32) -> std::result::Result<Sys, String> {
         reset_callback: find("ResetCallback", jal(m, text + at::JAL_RESET_CALLBACK))?,
         get_video_mode: find("GetVideoMode", jal(m, text + at::JAL_GET_VIDEO_MODE))?,
         dma_callback: find("DMACallback", jal(m, text + at::JAL_DMA_CALLBACK))?,
+        // VSync(-1): `lui`/`lw` of Vcount at 60h in libetc's vsync.o.
+        vcount: find("Vcount", jal(m, text + at::JAL_VSYNC).and_then(|v| hi_lo(m, v + 0x60)))?,
     };
     m.sdk.gpu.sys = Some(s);
     Ok(s)
@@ -326,14 +332,14 @@ type K = Box<dyn FnOnce(&mut M, u32) -> Flow<Psyq>>;
 type KOk = Box<dyn FnOnce(&mut M, bool) -> Flow<Psyq>>;
 
 /// libgpu's Vcount (`VSync(-1)`): libetc's adapters' count when they run,
-/// else the vblanks so far.
-fn vcount(m: &M) -> u32 {
-    if m.sdk.etc.active { m.sdk.etc.vcount } else { m.vblanks as u32 }
+/// else libetc's own.
+fn vcount(m: &M, s: Sys) -> u32 {
+    if m.sdk.etc.active { m.sdk.etc.vcount } else { m.mem.r32(s.vcount) }
 }
 
 /// `sys:0x2880`: the timeout starts.
 fn timeout_start(m: &mut M, s: Sys) {
-    let v = vcount(m).wrapping_add(TIMEOUT_VBLANKS);
+    let v = vcount(m, s).wrapping_add(TIMEOUT_VBLANKS);
     m.mem.w32(s.data + data::DEADLINE, v);
     m.mem.w32(s.data + data::COUNT, 0);
 }
@@ -381,8 +387,8 @@ fn iterate(m: &mut M, s: Sys, n: u32, k: KOk) -> Flow<Psyq> {
     // An iteration fails when Vcount is past the deadline, or when the
     // counter, before its increment, is past the limit.
     let room = (TIMEOUT_ITERATIONS + 1).saturating_sub(count);
-    if (deadline as i32) < vcount(m) as i32 || room < n {
-        let done = if (deadline as i32) < vcount(m) as i32 { 0 } else { room + 1 };
+    if (deadline as i32) < vcount(m, s) as i32 || room < n {
+        let done = if (deadline as i32) < vcount(m, s) as i32 { 0 } else { room + 1 };
         m.mem.w32(s.data + data::COUNT, count + done);
         return timeout(m, s, k);
     }
@@ -1217,6 +1223,8 @@ mod tests {
     const GET_VIDEO_MODE: u32 = 0x8001_0010;
     const DMA_CALLBACK: u32 = 0x8001_0020;
     const CALLBACK: u32 = 0x8001_0030;
+    const VSYNC: u32 = 0x8001_0040;
+    const VCOUNT: u32 = 0x8005_75D4;
     const RECT: u32 = 0x8010_0000;
     const BUF: u32 = 0x8010_1000;
 
@@ -1238,6 +1246,8 @@ mod tests {
         jal_to(&mut m, TEXT + at::JAL_RESET_CALLBACK, RESET_CALLBACK);
         jal_to(&mut m, TEXT + at::JAL_GET_VIDEO_MODE, GET_VIDEO_MODE);
         jal_to(&mut m, TEXT + at::JAL_DMA_CALLBACK, DMA_CALLBACK);
+        jal_to(&mut m, TEXT + at::JAL_VSYNC, VSYNC);
+        pair(&mut m, VSYNC + 0x60, VCOUNT);
         m.mem.w32(DATA + data::TABLE, DATA + 8);
         for (t, h) in [512, 512, 1024].iter().enumerate() {
             m.mem.w32(DATA + data::WIDTHS + 4 * t as u32, 1024);
