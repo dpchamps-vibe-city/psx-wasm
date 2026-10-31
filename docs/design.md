@@ -2224,8 +2224,8 @@ font functions. So libgpu's adapters keep that state where libgpu keeps it
   them, DICR and IRQ3 reach whatever DMA callbacks are set, a transfer
   DPCR doesn't enable waits for it, and the GPU recording hook still sees
   linked lists. GP0/GP1 words go to the front end directly.
-- **Waits spin like libgpu's loops,** a safepoint quantum per thousand
-  iterations, counted toward libgpu's timeout (0xF0000 iterations or 240
+- **Waits spin like libgpu's loops,** each iteration a pass of the
+  guest's safepoint budget (spec fidelity SDK3-5), counted toward libgpu's timeout (0xF0000 iterations or 240
   vblanks), which resets the queue and the GPU as libgpu does: btn's boot
   draws before `ResetGraph`, with DMA2 off, and times out at the same
   frame natively as on the device.
@@ -2386,8 +2386,8 @@ loading each slice).
   own return. The runtime's adapter export queues held interrupts as the
   adapter returns (`release_irq`), and a wait releases them before its
   quantum.
-- **Waits spin like libpress's loops** (a quantum per thousand
-  iterations), to its timeout after 0x100001, which prints through the
+- **Waits spin like libpress's loops** (each iteration a pass of the
+  guest's budget), to its timeout after 0x100001, which prints through the
   game's `printf` and resets the MDEC and both channels.
 
 *Why:* bof4's player goes on decoding the next frame's run-length codes
@@ -2502,7 +2502,10 @@ stalls" was this.
   budget, and the adapters that replace a loop without spending the
   original's passes (`VSync`'s spin, libgpu's waits) moved bof4's native
   run off its runs with chip gpu and chip irq on their devices (from
-  frames 102 and 735).
+  frames 102 and 735). Since spec fidelity SDK3-5 (2026-10-30) those
+  waits spend the guest's budget pass by pass (`sdk_psyq::poll`); whether
+  that brings the runs back together is for `psxw conform bof4 --modes`
+  to show, and this note goes when it does.
   Counter 2 is what libpad's and libmcx's waits read. Counters 0 and 1,
   the CD controller, the SPU, the GPU, the MDEC and DMA keep the clock.
 

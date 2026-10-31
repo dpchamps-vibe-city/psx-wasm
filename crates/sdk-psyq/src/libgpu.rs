@@ -39,7 +39,7 @@
 //! adapter bound by its place in `sys.o` (`libgpu/sys:0x23a8`, a static
 //! function with no name), at its own address, and `_GPU_ResetCallback` an
 //! adapter. Waits (`DrawSync(0)`, a full queue, the `*2` functions) spin
-//! as libgpu's loops do, a safepoint quantum per thousand iterations,
+//! as libgpu's loops do, each iteration a pass of the guest's budget,
 //! counting toward libgpu's timeout (0xF0000 iterations or 240 vblanks),
 //! which resets the queue and the GPU as libgpu does.
 //!
@@ -50,7 +50,7 @@
 
 use crate::{Adapter, M, Psyq, Result, reg, set_reg};
 use crate::layout::{dispenv, drawenv, rect};
-use psx_bios::{Flow, GuestCall, Wait};
+use psx_bios::{Flow, GuestCall};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("ResetGraph", reset_graph),
@@ -174,9 +174,6 @@ const BUSY: u32 = psx_devices::dma::CHCR_BUSY;
 /// GPUSTAT bit 26: ready for a command word.
 const READY: u32 = 1 << 26;
 
-/// Guest loop iterations per safepoint (psxw-build's budget): libgpu's
-/// spins pass a quantum of virtual time per thousand.
-const LOOP_BUDGET: u32 = 1000;
 /// libgpu's timeout: iterations (its counter passing this), and vblanks.
 const TIMEOUT_ITERATIONS: u32 = 0xF0000;
 const TIMEOUT_VBLANKS: u32 = 0xF0;
@@ -201,12 +198,10 @@ impl Sys {
     }
 }
 
-/// The chip's adapter state: where the object is, and the phase of
-/// libgpu's spin loops within a safepoint quantum.
+/// The chip's adapter state: where the object is.
 #[derive(Debug, Default)]
 pub struct Gpu {
     pub sys: Option<Sys>,
-    pub phase: u32,
 }
 
 /// The address a `lui`/`lo16` pair at `pc` makes (the `lo16`
@@ -373,10 +368,6 @@ fn reset_after_timeout(m: &mut M, s: Sys) -> std::result::Result<(), String> {
     unmask(m, s, data::MASK_RESET)
 }
 
-fn quantum(m: &M) -> u64 {
-    if m.opts.safepoint_quantum == 0 { 20_000 } else { m.opts.safepoint_quantum as u64 }
-}
-
 /// `n` iterations of one of libgpu's wait loops, each a timeout check;
 /// at a thousand a safepoint quantum passes. `k(false)` once the timeout
 /// ran out (libgpu's reset done), else `k(true)`.
@@ -392,20 +383,18 @@ fn iterate(m: &mut M, s: Sys, n: u32, k: KOk) -> Flow<Psyq> {
         return timeout(m, s, k);
     }
     m.mem.w32(s.data + data::COUNT, count + n);
-    m.sdk.gpu.phase += n;
-    if m.sdk.gpu.phase < LOOP_BUDGET {
+    let room = crate::budget(m);
+    if n < room {
+        crate::take(m, n);
         return k(m, true);
     }
-    m.sdk.gpu.phase -= LOOP_BUDGET;
-    let until = m.clock.now + quantum(m);
-    m.run_until(until);
-    Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| k(m, true)) }
+    crate::safepoint(m, move |m| k(m, true))
 }
 
 /// Iterations until the next safepoint: what a loop that can't make
 /// progress spins through before anything can change.
 fn to_safepoint(m: &M) -> u32 {
-    LOOP_BUDGET - m.sdk.gpu.phase.min(LOOP_BUDGET - 1)
+    crate::budget(m)
 }
 
 /// `while (DMA2 busy || GPU not ready) if (timeout) fail;` (the `*2`

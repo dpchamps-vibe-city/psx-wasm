@@ -60,7 +60,7 @@
 //! original's where the code makes them plain.
 
 use crate::{Adapter, M, Psyq, Result, reg, set_reg};
-use psx_bios::{Flow, GuestCall, Wait};
+use psx_bios::{Flow, GuestCall};
 use psx_spu::Spu;
 use psx_spu::mixer::{Mask, Volume};
 use std::rc::Rc;
@@ -268,15 +268,7 @@ fn back(m: &mut M, v: u32) -> F {
     Flow::ret(v)
 }
 
-/// A safepoint in the code an adapter replaces: the budget starts over, a
-/// quantum passes, what fell due is delivered and its callbacks run.
-fn safepoint(m: &mut M, k: K) -> F {
-    m.release_irq();
-    m.regs.reset_budget();
-    let until = m.clock.now + crate::libetc::quantum(m);
-    m.run_until(until);
-    Flow::Block { until: Wait::Cycle(until), then: k }
-}
+use crate::safepoint;
 
 /// `n` passes of the original's loop headers: the guest's safepoint budget
 /// spent as they spend it, a safepoint each time it runs out.
@@ -288,7 +280,7 @@ pub(crate) fn spend(m: &mut M, n: u32, k: K) -> F {
         }
         return k(m);
     }
-    safepoint(m, Box::new(move |m| spend(m, n - b, k)))
+    safepoint(m, move |m: &mut M| spend(m, n - b, k))
 }
 
 /// `for i in from..n { body(i) }` as the original's loop runs it: one
@@ -298,13 +290,10 @@ pub(crate) fn each(m: &mut M, from: u32, n: u32, body: Rc<dyn Fn(&mut M, u32)>, 
     while i < n {
         let b = m.regs.budget();
         if b == 1 {
-            return safepoint(
-                m,
-                Box::new(move |m| {
-                    body(m, i);
-                    each(m, i + 1, n, body, k)
-                }),
-            );
+            return safepoint(m, move |m: &mut M| {
+                body(m, i);
+                each(m, i + 1, n, body, k)
+            });
         }
         if b != 0 {
             m.regs.set_budget(b - 1);

@@ -34,8 +34,8 @@
 //! enables.
 //!
 //! **Waits spin like libpress's loops** (the MDEC taking input, DMA1
-//! running): a safepoint quantum per thousand iterations, interrupts
-//! delivered between quanta, and after 0x100000 iterations the timeout,
+//! running): each iteration a pass of the guest's budget, a safepoint
+//! (interrupts delivered) each time it runs out, and after 0x100000 iterations the timeout,
 //! which prints libpress's message through the game's `printf` and resets
 //! the MDEC and both channels, as the original does.
 //!
@@ -45,7 +45,7 @@
 //! guest's safepoint budget, 32 passes.
 
 use crate::{Adapter, M, Psyq, Result, reg, set_reg};
-use psx_bios::{Flow, GuestCall, Wait};
+use psx_bios::{Flow, GuestCall};
 use psx_devices::mdec::Mdec;
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
@@ -118,8 +118,6 @@ const REQUESTS: u32 = 0x6000_0000;
 /// libpress's wait loops count down from this; one more iteration is the
 /// timeout.
 const TIMEOUT: u32 = 0x10_0000;
-/// Guest loop iterations per safepoint (psxw-build's budget).
-const LOOP_BUDGET: u32 = 1000;
 
 /// Where `libpress/libpress` is in this game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +133,6 @@ pub struct Obj {
 #[derive(Debug, Default)]
 pub struct Press {
     pub obj: Option<Obj>,
-    /// The phase of libpress's wait loops within a safepoint quantum.
-    pub phase: u32,
 }
 
 /// The address a `lui` at `hi` and an immediate at `lo` with the `lui`'s
@@ -229,10 +225,6 @@ fn busy(m: &mut M, b: Busy) -> bool {
     }
 }
 
-fn quantum(m: &M) -> u64 {
-    if m.opts.safepoint_quantum == 0 { 20_000 } else { m.opts.safepoint_quantum as u64 }
-}
-
 /// `libpress:0x4cc` (the input) and `0x560` (DMA1): while busy, count
 /// down from 0x100000, timing out past zero. `k` gets 0, or -1 after the
 /// timeout.
@@ -247,19 +239,12 @@ fn wait(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
 /// a quantum (what fell due delivered, interrupts taken, those held
 /// included), and another look.
 fn spin(m: &mut M, o: Obj, b: Busy, left: u32, k: K) -> Flow<Psyq> {
-    let room = LOOP_BUDGET - m.sdk.press.phase.min(LOOP_BUDGET - 1);
+    let room = crate::budget(m);
     if left < room {
-        m.sdk.press.phase += left;
+        crate::take(m, left);
         return timeout(m, o, b, k);
     }
-    m.sdk.press.phase = 0;
-    m.release_irq();
-    let until = m.clock.now + quantum(m);
-    m.run_until(until);
-    Flow::Block {
-        until: Wait::Cycle(until),
-        then: Box::new(move |m| if busy(m, b) { spin(m, o, b, left - room, k) } else { k(m, 0) }),
-    }
+    crate::safepoint(m, move |m| if busy(m, b) { spin(m, o, b, left - room, k) } else { k(m, 0) })
 }
 
 /// `libpress:0x60c`: "<what> timeout:" through `printf`, then the MDEC and

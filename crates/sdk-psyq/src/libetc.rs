@@ -46,7 +46,7 @@
 //! libetc's own handler isn't supported.
 
 use crate::{Adapter, M, Psyq, Result, bios, reg, ret, set_reg};
-use psx_bios::{Flow, GuestCall, IrqStep, Wait};
+use psx_bios::{Flow, GuestCall, IrqStep};
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
     ("ResetCallback", reset_callback),
@@ -593,45 +593,32 @@ pub(crate) fn quantum(m: &M) -> u64 {
     if m.opts.safepoint_quantum == 0 { 20_000 } else { m.opts.safepoint_quantum as u64 }
 }
 
-/// `vsync.o`'s spin, one safepoint at a time, while `done` doesn't hold:
-/// what fell due in the quantum is delivered, then the interrupt handlers
-/// run (the driver drains before resuming), as at the spinning loop's
-/// safepoints (§6). Waiting event by event instead would take interrupts
-/// at once where the original takes them a quantum late, and devices see
-/// that: bof4's CD streaming takes another path.
-fn spin(m: &mut M, done: Box<dyn Fn(&mut M) -> bool>, then: Box<dyn FnOnce(&mut M) -> Flow<Psyq>>) -> Flow<Psyq> {
-    if done(m) {
-        return then(m);
-    }
-    let until = m.clock.now + quantum(m);
-    m.run_until(until);
-    Flow::Block { until: Wait::Cycle(until), then: Box::new(move |m| spin(m, done, then)) }
-}
-
 /// `vsync.o`'s wait: until Vcount reaches `target`, counting down from
-/// `timeout << 15` meanwhile; when that runs out it says so, has the
-/// kernel acknowledge vblank itself, and goes on. A spin iteration costs a
-/// quantum per [`LOOP_BUDGET`] in virtual time, so the countdown is a
-/// deadline. In NTSC it only runs out when nothing counts vblanks: inside
-/// a handler or a critical section, libetc stopped, or line 0 taken by a
-/// handler that doesn't call libetc's.
-/// Its "VSync: timeout\n" goes through the game's `puts`.
+/// `timeout << 15` meanwhile; when that runs out it says so through the
+/// game's `puts`, has the kernel acknowledge vblank itself, and goes on.
+/// Each look is a pass of the guest's budget ([`crate::poll`]). In NTSC it
+/// only runs out when nothing counts vblanks: inside a handler or a
+/// critical section, libetc stopped, or line 0 taken by a handler that
+/// doesn't call libetc's.
 fn wait_vcount(m: &mut M, v: VsyncO, target: u32, timeout: u32, then: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
     let text = v.text;
     let iterations = ((timeout as u64) << 15) + 1;
-    let deadline = m.clock.now + iterations * quantum(m) / LOOP_BUDGET;
-    let reached = move |m: &M| m.mem.r32(v.vcount) as i32 >= target as i32;
-    let then = move |m: &mut M| {
-        if reached(m) {
-            return then(m);
-        }
-        crate::say(m, (text + 0x1C0, text + 0x1C8, text + 0x1C4), &[], move |m| {
-            let _ = bios(m, 0xB0, 0x5B, [0; 4]);
-            let _ = bios(m, 0xC0, 0x0A, [3, 0, 0, 0]);
-            then(m)
-        })
-    };
-    spin(m, Box::new(move |m| reached(m) || m.clock.now >= deadline), Box::new(then))
+    let reached = std::rc::Rc::new(move |m: &mut M| m.mem.r32(v.vcount) as i32 >= target as i32);
+    crate::poll(
+        m,
+        iterations,
+        reached,
+        Box::new(move |m, reached| {
+            if reached {
+                return then(m);
+            }
+            crate::say(m, (text + 0x1C0, text + 0x1C8, text + 0x1C4), &[], move |m| {
+                let _ = bios(m, 0xB0, 0x5B, [0; 4]);
+                let _ = bios(m, 0xC0, 0x0A, [3, 0, 0, 0]);
+                then(m)
+            })
+        }),
+    )
 }
 
 /// The end of a waiting `VSync`: interlaced, while the field is the one it
@@ -639,14 +626,14 @@ fn wait_vcount(m: &mut M, v: VsyncO, target: u32, timeout: u32, then: impl FnOnc
 /// counter 1 are this call's.
 fn interlace(m: &mut M, v: VsyncO, before: u32, delta: u32) -> Flow<Psyq> {
     let field_changed = move |m: &mut M| before & 0x40_0000 == 0 || (before ^ gpustat(m)) & 0x8000_0000 != 0;
-    let then = move |m: &mut M| {
+    let then = move |m: &mut M, _| {
         let vcount = m.mem.r32(v.vcount);
         m.mem.w32(v.last, vcount);
         let h = rcnt1(m);
         m.mem.w32(v.hcount, h);
         Flow::ret(delta)
     };
-    spin(m, Box::new(field_changed), Box::new(then))
+    crate::poll(m, u64::MAX, std::rc::Rc::new(field_changed), Box::new(then))
 }
 
 /// btn's libetc as its code addresses it, for the tests: `intr.o`'s and
@@ -908,11 +895,12 @@ mod tests {
         assert_eq!(m.mem.r32(VCOUNT), 1);
         assert_eq!(irq_calls(), vec![0x8001_0002]);
         // Line 0 taken by a handler that never calls libetc's: VSync's
-        // countdown runs out.
+        // countdown (1 << 15 passes) runs out, a quantum per budget's worth
+        // of them; the rest come off the guest's budget.
         let before = m.clock.now;
         run(&mut m, 0, vsync, [0; 4]);
         assert_eq!(m.mem.r32(VCOUNT), 1);
-        assert!(m.clock.now - before >= (1 << 15) * 20);
+        assert_eq!((m.clock.now - before) / 20_000, (1 << 15) / LOOP_BUDGET);
     }
 
     #[test]
