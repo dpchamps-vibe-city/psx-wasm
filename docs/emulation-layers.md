@@ -3,8 +3,8 @@
 The build modes in the [unified adaptor layer plan](../plans/unified-adaptor-layer/README.md):
 prefer native software interfaces, then fall back to hardware registers
 one chip at a time. These are architectural configurations, not snapshots
-of btn or bof4. See [status-btn-vs-bof4.md](status-btn-vs-bof4.md) for the
-earlier boundary and function counts.
+of btn or bof4. See [adaptor-layer-status.md](adaptor-layer-status.md) for
+current game coverage, function counts, and remaining work.
 
 | Colour | Meaning |
 |---|---|

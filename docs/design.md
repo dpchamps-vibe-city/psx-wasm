@@ -49,7 +49,8 @@ library by library, because the original library code then decides
 everything a game can observe, exactly and for any SDK version. Adapters
 remain where a library's policy keeps them (§5).
 [`emulation-layers.md`](emulation-layers.md) draws the layers, and
-[`status-btn-vs-bof4.md`](status-btn-vs-bof4.md) compares the two games.
+[`adaptor-layer-status.md`](adaptor-layer-status.md) covers the current game
+builds and remaining adapter work.
 D59 moves each chip back to native adapters, degrading to its device
 model where the adapters don't cover a game
 ([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):

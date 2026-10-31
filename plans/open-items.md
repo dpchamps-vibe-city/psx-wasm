@@ -410,7 +410,7 @@ after a resume, statement rows, the Docker builder.
 - The runtime ignores `BootOptions::safepoint_budget`; the budget is set
   at link time (`psxw-build`, 1,000).
 - D57 says Asyncify instruments about 13% of functions; M13's Findings
-  and `docs/status-btn-vs-bof4.md` say 21% (3,693 of 17,774 in bof4).
+  still give the older 21% figure (3,693 of 17,774 in bof4).
 
 *From:* the plan consolidation (2026-10-29).
 

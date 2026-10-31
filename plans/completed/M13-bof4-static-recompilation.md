@@ -561,11 +561,11 @@ census and lift)
     pictures comes from another picture.
 - **Also open:** bof4 with a second pad; older tests that embed btn facts
   (both in [`open-items.md`](../open-items.md)).
-- **The native-port claim** (discussed 2026-10-29,
-  `docs/status-btn-vs-bof4.md`): the CPU isn't emulated, but D40–D58
-  moved the hardware boundary below the SDK, so both games run on
-  register-level device models. Where the shipped boundary should be is
-  the human's open decision.
+- **The native-port claim** (discussed 2026-10-29): at that point, the
+  CPU wasn't emulated, but D40–D58 had moved the hardware boundary below
+  the SDK, so both games ran on register-level device models. The later
+  adapter work changed that boundary; see the
+  [current adaptor layer status](../../docs/adaptor-layer-status.md).
 
 - **Generality review (exit criterion 7).** An independent review of
   psx-wasm (`0ebd944`..) and the harness branch (`86749e4..m13-bof4`)

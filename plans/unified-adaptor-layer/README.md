@@ -6,7 +6,7 @@ and [phase 2](phase2.md) (the rest of PsyQ 4.7).
 **Design refs:** [docs/design.md](../../docs/design.md) §5 (the SDK
 boundary), §6 (time, interrupts); decisions D4, D40–D42, D45, D47, D58.
 Background: [docs/emulation-layers.md](../../docs/emulation-layers.md),
-[docs/status-btn-vs-bof4.md](../../docs/status-btn-vs-bof4.md).
+[docs/adaptor-layer-status.md](../../docs/adaptor-layer-status.md).
 
 ## Goal
 
