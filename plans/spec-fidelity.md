@@ -551,8 +551,9 @@ locals, or static translation.
   open-items) and the BIOS rework.
 - **2026-10-31:** phase 2: SDK2, SDK6/SDK8, SDK3–5, SDK11 done (`b92f582`..
   `8e04a5b`); SDK1 with an agent. Adapters can bind by place
-  (`libgpu/sys:0x23a8`, `libetc/intr_dma:0x4c`). Chip irq conformance (both
-  games) and chip mdec (bof4) pass. Phase 3: D68, BIOS8 (`5e52ad2`), the
+  (`libgpu/sys:0x23a8`, `libetc/intr_dma:0x4c`, `libcd/bios_1:0x14a4`):
+  no adapter stand-ins remain. Conformance passes: chip irq, cd and gpu in
+  both games, chip mdec in bof4 (chip sio0 waits for SDK1). Phase 3: D68, BIOS8 (`5e52ad2`), the
   oracle's `bios` device (`7e748f0`; phase 1's exit criterion 3 passes);
   task 9's C library, events, timers, memory and GPU groups with an agent.
   Phase 4 with an agent.
