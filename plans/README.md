@@ -11,7 +11,7 @@ where the last one stopped.
 | [`conventions.md`](conventions.md) | Repo layout, commands, file formats, data hygiene, commit rules |
 | [`unified-adaptor-layer/`](unified-adaptor-layer/) | **The active plan:** native adapters per chip, with graceful degradation to the device models. A README for shared context, then phase 1 (btn and bof4) and phase 2 (the rest of PsyQ 4.7). |
 | [`open-items.md`](open-items.md) | Every unfinished task, blocked item, human-needed input and erratum, in one place |
-| [`shortcuts.md`](shortcuts.md) | Every corner cut in the runtime, BIOS, devices, adapters and translator, as tasks to redo the spec's way |
+| [`spec-fidelity.md`](spec-fidelity.md) | The plan to remove every shortcut in the BIOS, adapters, renderer, translator and runtime, fix the audit's bugs, and implement the BIOS properly |
 | [`completed/`](completed/) | Everything implemented: milestones M0–M13 (M9 never started) and the btn bug follow-ups, kept as history |
 
 ## What psx-wasm is, in one screen
@@ -79,6 +79,7 @@ Nothing in code may be specific to either.
 | [Unified adapter layer, phase 1](unified-adaptor-layer/phase1.md): every adapter btn and bof4 need; both games native except the GTE | in progress | M13 |
 | [Unified adapter layer, phase 2](unified-adaptor-layer/phase2.md): the rest of PsyQ 4.7 | not started | phase 1 |
 | [Debug builds of threaded games](debug-builds-threaded-games.md): `--debug` is refused for games that switch threads (bof4) | problem statement only | — |
+| [Spec fidelity](spec-fidelity.md): no shortcuts in the BIOS, adapters, renderer, translator and runtime; the BIOS implemented properly | not started | unified adapter layer phase 1 |
 
 ## Completed
 

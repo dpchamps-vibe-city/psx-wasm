@@ -8,8 +8,8 @@ Each item says what it is, why it's open, and where it came from.
   (M12). `psxw ci bof4` hasn't run at the current pin (M13 task 22).
 - **The hardware boundary** (native adapters vs emulated devices) is
   planned in [`unified-adaptor-layer/`](unified-adaptor-layer/).
-- **Shortcuts** (42, 2026-10-30 audit) are tracked in
-  [`shortcuts.md`](shortcuts.md); the audit's bugs are under *Bugs* below.
+- **Shortcuts, the audit's bugs and the BIOS rework** (2026-10-30) are
+  planned in [`spec-fidelity.md`](spec-fidelity.md).
 
 ## Needs the human
 
@@ -351,79 +351,8 @@ after a resume, statement rows, the Docker builder.
   Audit each. M13 expects more at bof4's scale. *From:* bug-follows §4;
   follow-up tasks; M13 Risks.
 
-Found by the shortcuts audit (2026-10-30; [`shortcuts.md`](shortcuts.md)).
-Paths are relative to `crates/`. *Unchecked* means the audit's reading
-hasn't been re-read against the code.
-
-- **`SetDefaultExitFromException` (B0:18h) does nothing.**
-  `psx-bios/src/bios.rs:339` doesn't clear `kernel.custom_exit`, so the
-  exception handler keeps entering the old custom exit
-  (`psx-runtime/src/driver.rs:51, 85`) after libetc's `StopCallback`.
-- **`EnableEvent`/`DisableEvent` change closed event slots.**
-  `psx-bios/src/bios.rs:303-316`: enabling a closed handle revives it;
-  disabling one leaks it, since `OpenEvent` reuses only unused slots
-  (`kernel.rs:70`).
-- **Memory card sector 1024 is accepted** as 1023
-  (`psx-bios/src/card.rs:178, 186`: `>` should be `>=`).
-- **B0:15h and libapi's `PAD_init` disagree on their arguments**
-  (`psx-bios/src/bios.rs:332`, `sdk-psyq/src/libapi.rs:105`). psx-spx has
-  `OutdatedPadInitAndStart(type, button_dest, …)`.
-- **`open` on `cdrom:` hands out descriptor 16 when all are taken**
-  (`psx-bios/src/bios.rs:362`); a second overflow replaces the first file.
-- **`bios::implemented()` counts calls that always error** (`longjmp`,
-  `Exec`, `ReturnFromException`, `SystemError`), which the build's
-  coverage check trusts (`psx-bios/src/bios.rs:104`).
-- **BIOS `printf` zero-pads negatives as `000-5`** and ignores `+`, space
-  and `#` (`psx-bios/src/bios.rs:597-607`).
-- **Stale doc on `card_queue`** (`psx-bios/src/card.rs:162`): it always
-  returns true.
-- **The vblank counter event ignores I_MASK.**
-  `psx-bios/src/machine.rs:392` delivers RCntCNT3 every vblank, while
-  counters 0–2 are gated on I_MASK (`machine.rs:410`) and libapi's
-  `StartRCnt(RCntCNT3)` sets bit 0 expecting the same gate.
-- **`GetlocP` loses a minute** (`psx-devices/src/cdc.rs:394`): the pregap
-  is subtracted from BCD seconds with no borrow, so 00:58 reads 01:00.
-- **GPUSTAT bits 31 and 13 follow a per-vblank field**
-  (`psx-devices/src/gpu.rs:516-517`). psx-spx: bit 31 toggles per
-  scanline in 240-line modes and is 0 in vblank; bit 13 is 1 when not
-  interlaced. *Unchecked* against hardware.
-- **GPUSTAT bit 25 is wrong for DMA directions 1–3**
-  (`psx-devices/src/gpu.rs:518-520`). psx-spx: 1 = FIFO not full,
-  2 = bit 28, 3 = bit 27.
-- **Timer 0's dot clock runs 4–10× too fast**
-  (`psx-devices/src/timers.rs:31`, `clock.rs:56-58`): it counts the
-  53.69 MHz video clock without dividing by the horizontal resolution's
-  10/8/7/5/4.
-- **Muting or disabling the SPU silences CD audio**
-  (`psx-spu/src/lib.rs:722-724`). psx-spx SPUCNT bits 14–15: "Don't care
-  for CD Audio".
-- **SPU manual-transfer writes past 32 are dropped**
-  (`psx-spu/src/lib.rs:349-354`); later DATA writes wait for the next
-  SPUCNT write.
-- **15-bit colour is shifted, not expanded, at presentation**
-  (`psx-render-gl/src/shaders.rs:341-344`): white shows as F8F8F8.
-  *Unchecked.*
-- **libgpu's timeout counts every vblank** when libetc's adapters aren't
-  running (`sdk-psyq/src/libgpu.rs:324-328`); the original calls
-  `VSync(-1)`.
-- **libmcx's last-byte wait is ~20 cycles, not a byte's ~1,000**
-  (`sdk-psyq/src/libmc.rs:498-505`). The comment predates D66; probably
-  a regression from it.
-- **A tail transfer out of an inlined callee exits the whole caller**
-  (`psxw-lift/src/graph.rs:231-237, 260-264`; `emit.rs:198-201, 255-258,
-  306-314`). *Unchecked.*
-- **`bltzal`/`bgezal` with rs = ra test the new link value**
-  (`psxw-lift/src/emit.rs:213-234`). Restricted on MIPS; GCC doesn't emit
-  it.
-- **`psxw_lift::bios_calls()` recognises only `addiu t1`**
-  (`lib.rs:524-528`), not `ori` as `t1_after_slot` does, so an `ori t1`
-  ChangeThread trampoline misses the Asyncify scope
-  (`psxw-build/src/game.rs:527`). *Unchecked.*
-- **GTE operands parse shifts tighter than `+`**, the reverse of C
-  (`psxw-cc/src/gte.rs:236-259`).
-- **The EXE header's stack beats `SYSTEM.CNF`'s `STACK=`**
-  (`psx-runtime/src/boot.rs:68`). On a real BIOS `LoadExec` writes
-  `STACK` into the header (from memory, *unchecked*).
+The 23 bugs the 2026-10-30 shortcuts audit found are tasks B1–B23 in
+[`spec-fidelity.md`](spec-fidelity.md), phase 1.
 
 ## Gaps found along the way
 
