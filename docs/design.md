@@ -39,7 +39,7 @@ manifest, without changes to the toolchain's code.
 | Pad | **Native** (D59, D60). libpad's adapters run its direct-connection engine (btn and bof4): at each vblank interrupt, one exchange per port with a digital-pad model fed by the host's buttons, the detection steps and the buffers as libpad's own state machine makes them, and the time its busy-waits take. As the fallback, libpad is original code over SIO0 (`psx-devices::sio`, D40). |
 | Memory card | **Native, per chip** (D59, D65), for libmcx, the PocketStation library (btn): its adapters run its card-port driver without SIO0's registers, a slot's card being the BIOS's image answering as a standard card does (`psx-devices::memcard`), libmcx's state where libmcx keeps it. As the fallback, libmcx is original code over SIO0, whose cards are the same images. The cards themselves are the BIOS's (D43). |
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
-| BIOS/kernel | A Rust implementation of the A0/B0/C0 services the SDK calls, including threads (D57) and the memory card functions (D43). |
+| BIOS/kernel | **Native Rust, partial coverage.** The A0/B0/C0 tables and `syscall` name native stand-ins for the services the games need: events, critical sections, the heap, files and devices, memory cards (D43), threads (D57), exception hooks and kernel configuration, over the existing native backends. The guest-visible RAM tables hold those stand-ins or guest patches, and callable thunks keep saved native pointers working. Coverage is reported per call as working, partial, unsupported, fatal or no-op; public services remain partial and some remain unsupported. There is no Sony BIOS ROM and no CPU interpreter. |
 
 So the CPU is not emulated: all code is compiled ahead of time. The
 hardware below the device libraries is emulated, at register level.
@@ -488,7 +488,7 @@ The PsyQ policy (`boundary/psyq.toml`):
 | libspu | `adapter-or-device`, chip spu. Native (btn, bof4; D63): adapters where libspu touches the SPU: `spu.o`'s `_spu_init`, `_spu_FsetRXX`, `_spu_FsetRXXa`, `_spu_Fw` (SPU RAM by DMA4 or the FIFO) and `_spu_FiDMA` (DMA4's callback), and the functions that program it themselves (`SpuSetKey`, `SpuSetVoiceAttr`, `SpuSetCommonAttr`, `_SpuSetAnyVoice`, the reverb functions, `SpuClearReverbWorkArea`, the key and envelope readers), over the mixer API (`psx_spu::mixer`). libspu's state stays in its `.data`, found through the objects' code (D61), so `SpuInit`, `SpuStart`, `SpuWritePartly`, `SpuSetTransferStartAddr`, `SpuIsTransferCompleted`, the allocator and the voice-mask wrappers stay guest code over them. On the device: original code over the register-level SPU and DMA4 (D41, D47). |
 | libsnd | `adapter-or-device`, chip spu. Original code (D14): the sequencer *is* the game's music. Only `_SsInit` touches the SPU itself (16 registers from its table); natively it is an adapter (D63) that calls the original `_SsVmInit` and writes libsnd's globals where libsnd keeps them; the rest of libsnd reaches the SPU through libspu's adapters. On the device those writes reach the SPU (D47). |
 | libpad | `adapter-or-device`, chip sio0. Its state machine is the behaviour games observe (D40). Native (btn, bof4; D60): adapters for `PadInitDirect`, `PadStartCom`, `PadStopCom`, `PadGetState`, `PadInfoMode`, `PadSetAct` and `PadSetActAlign` run its direct-connection engine (`pddirres.o`, `pdresres.o`), with records, buffers and pending replies in the library's guest RAM, found through its relocated operands. `PadInitDirect` calls the guest `_padInitDirPort`; `PadStartCom` queues the library's own `_padVsyncParam`, which the kernel runs as an adapter step. Only the host pad's latched buttons remain adapter-owned. On the device: original code over SIO0 (D40), a port of the oracle's. |
-| libmcrd | `guest`, over the HLE BIOS card functions (D43). |
+| libmcrd | `guest`, over the native Rust BIOS card functions (D43). |
 | libcard | `adapter`. The functions that patch Sony BIOS code in kernel RAM (`_patch_card` and its kin) are adapters with nothing to patch; the wrappers run as original code into the BIOS (D43). |
 | libmcx | `adapter-or-device`, chip memcard (D65): the PocketStation library, which drives the card slots on SIO0 itself. Native (btn): adapters for `McxStartCom` (vblank in I_STAT/I_MASK, its element appended to the kernel's priority-2 chain through the table of tables) and `_mcxDsrEntry` (each byte of a transfer, the card answering as a standard card does), with the vblank handler and both elements' verifiers run as adapter steps in their places; libmcx's state stays where libmcx keeps it (D61's way), so the command functions, `McxSync` and `McxStopCom` are guest code over it. On the device: original code over SIO0, its cards the BIOS's images, its element in the kernel's RAM chain. |
 | libgs | `guest`. It only writes packets into RAM; libgpu's `DrawOTag` is the device step. |
@@ -579,16 +579,20 @@ its buffer. `ReturnFromException` leaves from any depth.
   in the same queue: for each pending line libetc handles, in line order,
   acknowledge I_STAT and queue the line's handler as a guest call at the
   front, then look again until none is left, as `intr.o`'s loop does.
-  libetc's own vblank and DMA handlers are stand-in functions at addresses
-  no game code has: libsnd takes line 0 and calls the handler it replaced,
-  so a guest call to one runs it in the runtime (`untranslated`), its
-  callbacks as nested guest calls. The interrupt controller, DMA
+  libetc's own vblank handler is a stand-in at its own object's address
+  (`intr_vb.o`), which `InterruptCallback` returns; libsnd takes line 0 and
+  calls the handler it replaced, so a guest call reaches the runtime
+  (`Sdk::stand_in`), which makes its calls as nested guest calls.
+  `intr_dma.o`'s DMA handler is an adapter bound at its place
+  (`libetc/intr_dma:0x4c`), and its callbacks are nested guest calls.
+  libetc's `Vcount`, tables and flags live in its `.data`, found through the
+  objects' code (D67). The interrupt controller, DMA
   controller and root counters stay the devices' registers, which the
   adapters change with the devices' own semantics; the emulated chips'
   devices raise their interrupts there as before.
 - **Elements the adapters own** (`Sdk::chain_element`, D60): libpad's
-  `PadStartCom` queues an element at an address no game code has, and the
-  kernel's walk runs it as an adapter step in its place in the chain
+  `PadStartCom` queues the library's own `_padVsyncParam`, in its `.data`,
+  and the kernel's walk runs it as an adapter step in its place in the chain
   (libpad's vblank poll, when vblank is unmasked and pending).
   libmcx's `McxStartCom` instead appends its element to priority 2's
   chain itself, through the table of tables at 100h: the kernel keeps
@@ -596,12 +600,19 @@ its buffer. `ReturnFromException` leaves from any depth.
   linked there after its own chain's (D65). With chip memcard native,
   libmcx's two elements run as adapter steps in their places.
 - **Translated code follows this** through wasm exceptions:
-  - a `setjmp` (A0h:13h) caller saves its registers inline;
+  - a recognised `setjmp` (A0h:13h) caller saves its registers inline;
   - the return address is a continuation entry that reloads them;
   - B0h:17h throws;
   - the guest export `guest_invoke_irq` catches the throw and restores
     `$sp`/`$gp`.
 - **So the SDK's own interrupt code runs unchanged.**
+
+This covers the interrupt path libetc uses. General `longjmp` (A0h:14h)
+across translated frames is not implemented: the continuation is entered
+as an ordinary guest call, so the frames between the `longjmp` and its
+`setjmp` are not unwound. The BIOS reports A(14h) as unsupported, and the
+dependent `ioabort` entries (C(19h) and A(B2h)) are blocked on it. That
+work is deferred for a later decision, not approved by its presence here.
 
 Drawing is synchronous inside the runtime: a GPU DMA completes instantly
 in virtual time, sets DICR and raises IRQ3 (D42). Its completion callback
@@ -773,9 +784,10 @@ a call into guest code.
 - **BIOS.** The A0/B0/C0 call tables and `syscall`: events (`OpenEvent`,
   `EnableEvent`, `TestEvent`, `WaitEvent`, `DeliverEvent`), the callback
   registry, critical sections, the heap, the file API on top of the CD,
-  the memory card functions (D43), exception hooks, and `setjmp` support
-  (guest `setjmp`/`longjmp` use wasm exception handling, D45). The pure
-  parts now run in Rust over guest memory. The guest-visible A0/B0/C0
+  the memory card functions (D43), exception hooks, and recognised
+  A(13h) `setjmp` sites for the exception path (D45). General
+  `longjmp` across translated frames is not implemented; see §6. The
+  service implementations run in Rust over guest memory. The guest-visible A0/B0/C0
   tables hold native stand-in pointers, or guest patches. Saved native
   pointers call linker-generated o32 thunks independently of later table
   edits; B(17h)'s thunk uses the existing exception-exit tag. ABI 18 retains
@@ -792,7 +804,10 @@ a call into guest code.
   the main thread's configuration and reinstalls native chains; GetConf, SetMem,
   SysInitMemory and free-slot queries expose the resulting state. Resetting from
   a live non-main thread remains unsupported. GetSystemInfo date/version identity,
-  the disputed A(52h), and post-boot C(09h) remain unresolved.
+  the disputed A(52h), and post-boot C(09h) remain unresolved. Public
+  service coverage is partial; unsupported entries such as Exec (A(43h))
+  and font access (B(51h)) are named in the build's BIOS-call report, not
+  completed services. This is not full BIOS coverage.
 - **clock.** The virtual timeline: vblank (NTSC 59.94 Hz, PAL 50 Hz), a
   queue of pending device events, and the safepoint quantum. It delivers
   events in a fixed order by calling guest callbacks.
@@ -1601,7 +1616,7 @@ binaryen in the toolchain pins, which M0 already has.
   psx-wasm runs once to trace it and pick values (by default the counter
   at every 600th frame), then both sides dump RAM at the first frame the
   counter holds each value.
-- **Always excluded:** kernel RAM (`0x0`–`0xFFFF`: the HLE BIOS and
+- **Always excluded:** kernel RAM (`0x0`–`0xFFFF`: the native Rust BIOS and
   OpenBIOS keep different state there by construction) and the stack (64
   KiB below the initial `sp` unless `[oracle] stack_size` says otherwise).
   Manifest exclusions name a symbol and a reason.
@@ -1663,8 +1678,8 @@ decides every word. `psxw conform btn --lib libgpu --render server`
 draws a background fill and a tile through the original library, and
 reads both back exactly.
 
-**D43. Memory cards: libmcrd runs as guest code over an HLE BIOS card
-subsystem** (M7). The BIOS's card functions are documented in full
+**D43. Memory cards: libmcrd runs as guest code over the native Rust
+BIOS card subsystem** (M7). The BIOS's card functions are documented in full
 (psx-spx: `bu00:` file functions, raw sector I/O, events and their pacing).
 libmcrd's own state machine (asynchronous commands, `MemCardSync`, the
 new-card handshake) is what games observe. As with D40/D42, an adapter
@@ -2435,8 +2450,8 @@ and nothing after it (McxErrInvalid), an empty slot nothing (McxErrNoCard).
   `McxStartCom` appends to priority 2's chain through the table of tables
   at 100h, not with `SysEnqIntRP`, and a patch of the exception vector
   for a bulk transfer's fast path, which it takes only when called from
-  the vector (never under the HLE BIOS; called from C it returns
-  normally). So the HLE kernel keeps its exception control blocks in RAM
+  the vector (never under the native Rust BIOS; called from C it returns
+  normally). So the native kernel keeps its exception control blocks in RAM
   where the table of tables points (psxw-abi `kernel::EXCB`), walks the
   elements linked there after its own chain, and unlinks them in
   `SysDeqIntRP`; then original libmcx runs, over SIO0. Its chip is
@@ -2540,3 +2555,34 @@ cost of more safepoints. bof4 feels it: its pad interrupt is shorter, and
 replay was authored (counter 12390 at frame 25,138, was 24,768; the
 replay now runs 26,000 frames). Decided without the human's input
 (plans/unified-adaptor-layer, phase 1 findings).
+
+### Salvage dispositions: D67–D71
+
+The spec-fidelity branch recorded D67–D71 without the human's input. The
+recovery keeps only the parts that were source-reviewed and integrated here;
+these are partial dispositions of useful work, not approval of the archived
+decisions as a whole. The rejected architecture below is absent from this
+design. [plans/salvage-bios-work.md](../plans/salvage-bios-work.md) records the
+review.
+
+- **D67 (SDK state in the library's own data): partially salvaged.** The
+  reviewed libetc and libpad portions are in: libetc's state and handlers are
+  bound through its objects, and libpad queues its own `_padVsyncParam`, as §5
+  and §6 describe. This is not approval of the archived decision's scope for
+  other libraries.
+- **D68 (kernel state in kernel RAM): partially salvaged.** The A0/B0/C0
+  tables with native stand-ins, RAM event control blocks and chains, file and
+  device control blocks, kernel configuration/allocation over those tables,
+  and callable RAM slots/thunks are in ABI 18. Not adopted: the retail `cdrom`
+  driver over the controller's registers (CD services use the native drive
+  core). The archived decision's note that pointer-called kernel element
+  functions have no code is only partly addressed by the callable slots; that
+  is not a complete-coverage claim.
+- **D69 (overlay residency): deferred, not imported.** Overlay dispatch remains
+  D7's stub. The residency change and its prerequisite need a separate
+  architecture decision.
+- **D70 (console memory map): not adopted.** The masked 16 MiB window (D5, D6)
+  remains; no console-wide `map`/bus-error model was added.
+- **D71 (instruction-count time): not adopted.** Virtual time remains the
+  safepoint quantum (D18), with D66's SIO0 and root-counter-2 view. No
+  per-block instruction spending or decompiled-C cost regions were added.

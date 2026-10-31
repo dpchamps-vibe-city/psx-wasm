@@ -15,6 +15,8 @@ Current capability set:
 
  - Compile decompiled playstation games into wasm binaries
  - Statically recompile MIPS machine code into c functions
+ - Native Rust BIOS services over the existing native backends, with guest-visible RAM call tables and callable thunks
+   - public service coverage is partial; some services remain unsupported and general non-local returns are unfinished
  - Provide C source debugging via DWARF for playstation games
    - debug in real time in browser requires [requires C/C++ DevTools Support (DWARF) extension](https://chromewebstore.google.com/detail/cc++-devtools-support-dwa/pdcpmagijalfljmkmjngeonclgbbannb)
    - works for games that leverage playstation thread primitives
@@ -40,6 +42,10 @@ See a demo here, if you want to hear me yap for 15 minutes: [https://youtu.be/6q
 This is early days, no apis are stable or guaranteed. It's built around the Back To Nature Decomp, static recompilation is demonstrated
 with Breath of Fire IV. There are rough edges. Integration into other projects not guaranteed but certainly will
 be as project expands. Mileage will vary.
+
+Full BIOS coverage and full CI are not complete; remaining gaps and unresolved
+prerequisites are tracked in [plans/open-items.md](plans/open-items.md) and
+[plans/salvage-bios-work.md](plans/salvage-bios-work.md).
 
 ## Contributing
 
