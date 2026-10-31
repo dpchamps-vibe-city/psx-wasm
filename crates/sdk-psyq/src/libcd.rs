@@ -1060,10 +1060,6 @@ mod tests {
             .collect()
     }
 
-    fn adapter(name: &str) -> Adapter {
-        crate::adapters().into_iter().find(|(n, _)| *n == name).map(|(_, f)| f).unwrap()
-    }
-
     /// A machine with a bus and a disc, bios_1 at TEXT with PsyQ 4.7's
     /// tables for the commands used here, libetc's dispatcher running.
     fn bios1_machine() -> M {
@@ -1090,8 +1086,9 @@ mod tests {
         }
         // The guest calls CD_init makes do nothing here: the handler goes
         // on line 2 as libetc's InterruptCallback would put it.
-        run(&mut m, adapter("ResetCallback"), [0; 4]);
-        run(&mut m, adapter("InterruptCallback"), [2, HANDLER, 0, 0]);
+        crate::libetc::fixture::install(&mut m);
+        crate::libetc::fixture::reset(&mut m);
+        crate::libetc::fixture::interrupt(&mut m, 2, HANDLER);
         m
     }
 
@@ -1155,7 +1152,7 @@ mod tests {
         assert_eq!(run(&mut m, cd_ready, [0, 0x8001_0300, 0, 0]), 1);
         assert!(irq_calls().contains(&0x8002_0000), "the ready callback ran");
         // The sector by DMA3, its callback through libetc's DMA handler.
-        run(&mut m, adapter("DMACallback"), [3, 0x8002_1000, 0, 0]);
+        crate::libetc::fixture::dma_callback(&mut m, 3, 0x8002_1000);
         run(&mut m, cd_getsector, [0x8010_0000, 512, 0, 0]);
         assert_eq!(m.mem.r8(0x8010_0000), 20);
         assert_eq!(m.mem.r8(0x8010_07FF), 20);

@@ -263,6 +263,14 @@ pub mod testing {
 
     std::thread_local! {
         static IRQ_CALLS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static IRQ_ARGS: std::cell::RefCell<Vec<[u32; 4]>> = const { std::cell::RefCell::new(Vec::new()) };
+        static DOUBLES: std::cell::RefCell<std::collections::BTreeMap<u32, fn(&mut M)>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+
+    /// Guest code at `addr` the tests need run (an SDK object's own
+    /// function, which only the real game has): `f` stands in for it.
+    pub fn double(addr: u32, f: fn(&mut M)) {
+        DOUBLES.with(|d| d.borrow_mut().insert(addr, f));
     }
 
     /// Run the exception handler's queued steps as the runtime's driver
@@ -282,20 +290,30 @@ pub mod testing {
                         while m.irq_calls.pop_front().is_some_and(|s| s != IrqStep::Exit) {}
                     }
                 }
-                IrqStep::Chain(c, _) => guest(m, c.addr),
+                IrqStep::Chain(c, _) => guest_with_args(m, c),
                 IrqStep::Exit => {}
             }
         }
     }
 
-    /// A guest call: a stand-in runs (as the runtime's `untranslated`
-    /// does), anything else is logged.
+    /// A guest call: a test double or a stand-in runs (as the runtime's
+    /// `untranslated` does), anything else is logged.
     pub fn guest(m: &mut M, addr: u32) {
+        guest_with_args(m, psx_bios::GuestCall { addr, args: [0; 4] });
+    }
+
+    /// A guest call with the arguments the original leaves.
+    pub fn guest_with_args(m: &mut M, call: psx_bios::GuestCall) {
+        let addr = call.addr;
+        IRQ_ARGS.with(|v| v.borrow_mut().push(call.args));
+        if let Some(f) = DOUBLES.with(|d| d.borrow().get(&addr).copied()) {
+            return f(m);
+        }
         let mut state = 0;
         while let Some(step) = Psyq::stand_in(m, addr, state) {
             match step {
                 psx_bios::StandIn::Call(c, next) => {
-                    guest(m, c.addr);
+                    guest_with_args(m, c);
                     state = next;
                 }
                 psx_bios::StandIn::Return(_) => return,
@@ -307,6 +325,11 @@ pub mod testing {
     /// The guest functions interrupts called since the last look.
     pub fn irq_calls() -> Vec<u32> {
         IRQ_CALLS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+
+    /// The argument registers those calls got, since the last look.
+    pub fn irq_args() -> Vec<[u32; 4]> {
+        IRQ_ARGS.with(|v| std::mem::take(&mut *v.borrow_mut()))
     }
 
     /// Run a flow to completion the way the runtime's driver does (kernel
@@ -329,7 +352,7 @@ pub mod testing {
                     f = then(m);
                 }
                 Flow::Call { call, then } => {
-                    guest(m, call.addr);
+                    guest_with_args(m, call);
                     f = then(m, 0);
                 }
             }

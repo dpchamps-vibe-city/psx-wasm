@@ -3,10 +3,9 @@
 //!
 //! Observation notes, beyond the module's specs:
 //! - **libetc's own addresses.** `ResetCallback`, `StopCallback` and
-//!   `RestartCallback` return a pointer to libetc's context, which the
-//!   adapters don't have (`libetc::CONTEXT`): observed as zero or not.
-//!   Cases leave lines 0 and 3 (libetc's own vblank and DMA handlers) to
-//!   libetc.
+//!   `RestartCallback` return libetc's context, the same address on both
+//!   sides (D67). Cases leave lines 0 and 3 (libetc's own vblank and DMA
+//!   handlers) to libetc.
 //! - **Hblanks are time.** `VSync(n >= 0)` returns the hblanks since the
 //!   last waiting call. The original over the devices spends virtual time
 //!   in its loops (a safepoint quantum per thousand iterations), the
@@ -60,7 +59,7 @@ pub fn cases() -> Vec<Case> {
             name: "irq.dma-callback",
             chip: "irq",
             level: 1,
-            covers: &["DMACallback"],
+            covers: &["DMACallback", "libetc/intr_dma:0x4c"],
             needs: &["ResetCallback", "DMACallback"],
             run: dma_callback,
         },
@@ -107,10 +106,10 @@ pub fn cases() -> Vec<Case> {
     ]
 }
 
-/// A call whose result is libetc's context pointer: zero or not.
+/// A call whose result is libetc's context pointer (or 0).
 fn call_context(h: &mut dyn Harness, name: &str) -> Result<u32, String> {
     let v = h.call(name, &[])?;
-    h.observe(&format!("{name}() is a pointer"), (v != 0).to_string());
+    h.observe(&format!("{name}()"), format!("{v:#010x}"));
     Ok(v)
 }
 

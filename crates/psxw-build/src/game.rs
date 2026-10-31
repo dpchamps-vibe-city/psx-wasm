@@ -494,7 +494,8 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         let member = inputs.map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
         let original = member.is_some_and(is_device);
         let policy = member.map(policy_of);
-        let adapter = adapter_id.get(t.func.name.as_str()).filter(|_| policy == Some(Policy::Adapter) && !original);
+        let name = adapter_name(&inputs.map, t, &adapter_names);
+        let adapter = adapter_id.get(name.as_str()).filter(|_| policy == Some(Policy::Adapter) && !original);
         let object_ok = member.is_some_and(|m| keys.get(m).is_some_and(|k| validated.contains(&(m, *k))));
         if let (Some(_), Some(m), false) = (adapter, member, object_ok) {
             unvalidated.insert(format!("{m} ({})", keys.get(m).unwrap_or(&"no identity key")));
@@ -869,6 +870,19 @@ fn check_abi(wasm: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The name an adapter binds `t` by: its own, or, for a function the SDK's
+/// object doesn't name (a static one), its place in the object's text
+/// (`libetc/intr_dma:0x4c`).
+fn adapter_name(map: &psxw_inputs::AddressMap, t: &psxw_lift::Translation, adapter_names: &BTreeSet<&str>) -> String {
+    if adapter_names.contains(t.func.name.as_str()) {
+        return t.func.name.clone();
+    }
+    match map.sdk_at(&t.func.container, t.func.addr).filter(|p| p.is_text()) {
+        Some(p) => format!("{}:{:#x}", p.member, t.func.addr - p.vram.start),
+        None => t.func.name.clone(),
+    }
+}
+
 /// An SDK function that accesses I/O or kernel RAM itself but runs as
 /// guest code in an adapter-policy library.
 struct Unbound {
@@ -993,13 +1007,13 @@ fn chip_decision(
     let inside = |t: &psxw_lift::Translation| member(t).is_some_and(in_chip);
     let unvalidated: BTreeSet<&str> = translations
         .iter()
-        .filter(|t| adapter_names.contains(t.func.name.as_str()) && inside(t))
-        .filter_map(|t| member(t).filter(|m| !bound(m, &t.func.name)))
+        .filter(|t| adapter_names.contains(adapter_name(map, t, adapter_names).as_str()) && inside(t))
+        .filter_map(|t| member(t).filter(|m| !bound(m, &adapter_name(map, t, adapter_names))))
         .collect();
     if !unvalidated.is_empty() {
         return Some(format!("unvalidated objects with adapters: {}", unvalidated.into_iter().collect::<Vec<_>>().join(", ")));
     }
-    let adapted = |t: &psxw_lift::Translation| inside(t) && member(t).is_some_and(|m| bound(m, &t.func.name));
+    let adapted = |t: &psxw_lift::Translation| inside(t) && member(t).is_some_and(|m| bound(m, &adapter_name(map, t, adapter_names)));
     if !translations.iter().any(adapted) {
         return Some("no adapters for it".into());
     }
