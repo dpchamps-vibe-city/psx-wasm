@@ -1,4 +1,4 @@
-//! Shared native/15-bit-colour-plane presentation. Other visual renderers may
+//! Shared native/visual-integer-colour-plane presentation. Other visual renderers may
 //! provide their own presentation and return any RGBA8 VisualFrame instead.
 
 use anyhow::{Context as _, Result};
@@ -12,6 +12,7 @@ pub(crate) struct Presenter {
     vao: glow::VertexArray,
     area: Option<glow::UniformLocation>,
     depth24: Option<glow::UniformLocation>,
+    high_precision: Option<glow::UniformLocation>,
     scale: Option<glow::UniformLocation>,
     out: Option<(glow::Texture, VisualFrame)>,
 }
@@ -35,6 +36,7 @@ impl Presenter {
                 vao,
                 area: gl.get_uniform_location(p, "u_area"),
                 depth24: gl.get_uniform_location(p, "u_depth24"),
+                high_precision: gl.get_uniform_location(p, "u_high_precision"),
                 scale: gl.get_uniform_location(p, "u_scale"),
                 out: None,
             })
@@ -47,6 +49,17 @@ impl Presenter {
         source: glow::Texture,
         scale: u32,
         desc: &PresentDesc,
+    ) -> Result<VisualFrame> {
+        self.present_with_precision(gl, source, scale, desc, false)
+    }
+
+    pub fn present_with_precision(
+        &mut self,
+        gl: &glow::Context,
+        source: glow::Texture,
+        scale: u32,
+        desc: &PresentDesc,
+        high_precision: bool,
     ) -> Result<VisualFrame> {
         crate::raster::prepare_draw(gl);
         let (nw, nh) = (desc.width.clamp(1, 1024), desc.height.clamp(1, 512));
@@ -79,6 +92,7 @@ impl Presenter {
                 gl.bind_texture(glow::TEXTURE_2D, Some(source));
                 gl.uniform_4_i32(self.area.as_ref(), desc.x as i32, desc.y as i32, nw as i32, nh as i32);
                 gl.uniform_1_i32(self.depth24.as_ref(), (desc.flags & PresentDesc::DEPTH24 != 0) as i32);
+                gl.uniform_1_i32(self.high_precision.as_ref(), high_precision as i32);
                 gl.uniform_1_i32(self.scale.as_ref(), scale as i32);
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }

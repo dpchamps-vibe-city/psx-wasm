@@ -12,11 +12,13 @@ use crate::{
     setup::{self, Clip, WORDS},
     shaders::{self, DrawShader},
     texture,
-    visual::{VisualContext, VisualFrame, VisualRenderer},
+    visual::{ColourPrecision, TextureFilter, VisualContext, VisualFrame, VisualRenderer},
 };
 
 pub(crate) struct Enhanced {
     scale: i32,
+    dithering: bool,
+    high_precision: bool,
     draw: glow::Texture,
     read: glow::Texture,
     fbo_draw: glow::Framebuffer,
@@ -32,8 +34,10 @@ pub(crate) struct Enhanced {
 }
 
 impl Enhanced {
-    pub fn new(ctx: &VisualContext<'_>, scale: i32) -> Result<Self> {
+    pub fn new(ctx: &VisualContext<'_>, scale: i32, filter: TextureFilter, dithering: bool, precision: ColourPrecision) -> Result<Self> {
         let gl = ctx.gl;
+        let high_precision = precision == ColourPrecision::High;
+        let format = if high_precision { glow::R32UI } else { glow::R16UI };
         unsafe {
             let limit = gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE);
             let mut viewport = [0; 2];
@@ -44,9 +48,9 @@ impl Enhanced {
             );
             let (mut textures, mut fbos) = (Vec::new(), Vec::new());
             let result = (|| {
-                let draw = texture(gl, glow::R16UI, 1024 * scale, 512 * scale)?;
+                let draw = texture(gl, format, 1024 * scale, 512 * scale)?;
                 textures.push(draw);
-                let read = texture(gl, glow::R16UI, 1024 * scale, 512 * scale)?;
+                let read = texture(gl, format, 1024 * scale, 512 * scale)?;
                 textures.push(read);
                 let fbo_draw = framebuffer(gl, draw)?;
                 fbos.push(fbo_draw);
@@ -54,8 +58,10 @@ impl Enhanced {
                 fbos.push(fbo_read);
                 let stage = texture(gl, glow::R16UI, 1024, 512)?;
                 textures.push(stage);
+                let triangle = format!("const bool SMOOTH_3D = {};\n{TEXTURE_FILTER}\n{TRIANGLE}", filter == TextureFilter::Smooth3D);
                 let fragment = shaders::draw_fs_with(&DrawShader {
-                    triangle: TRIANGLE,
+                    colour: if high_precision { HIGH_COLOUR } else { shaders::NATIVE_COLOUR },
+                    triangle: &triangle,
                     triangle_fn: "enhanced_triangle",
                     position: "int px = hp.x / u_scale, py = hp.y / u_scale;",
                     destination: "texelFetch(u_dest, hp, 0).r",
@@ -70,7 +76,20 @@ impl Enhanced {
                     }
                 };
                 for f in [fbo_draw, fbo_read] {
-                    ctx.vram.seed(gl, f, scale);
+                    if high_precision {
+                        // A blit cannot expand RGB5/mask into RGB8/mask. Import
+                        // canonical words through this renderer's colour shader,
+                        // without CPU readback or binding an output as a source.
+                        let mut rec = vec![0; WORDS];
+                        setup::upload(0, 0, 1024, 512, 0, 0, 0, &mut rec);
+                        raster.bind(gl, ctx.vram, ctx.vram.draw, ctx.state, RasterTarget {
+                            framebuffer: f, scale, destination: Some(ctx.vram.draw),
+                        });
+                        raster.upload(gl, &mut rec, 0, 1);
+                        raster.draw(gl, 0, 1);
+                    } else {
+                        ctx.vram.seed(gl, f, scale);
+                    }
                 }
                 if gl.get_error() != glow::NO_ERROR {
                     raster.destroy(gl);
@@ -79,6 +98,8 @@ impl Enhanced {
                 }
                 Ok(Self {
                     scale,
+                    dithering,
+                    high_precision,
                     draw,
                     read,
                     fbo_draw,
@@ -197,6 +218,9 @@ impl VisualRenderer for Enhanced {
                 scratch.resize(n * WORDS, 0);
                 for (i, rec) in recs.chunks_exact(PRIM_WORDS).enumerate() {
                     primitive(rec, &ctx.state.clip, &mut scratch[i * WORDS..(i + 1) * WORDS]);
+                    if !self.dithering {
+                        scratch[i * WORDS] &= !prim::DITHER;
+                    }
                 }
                 self.draw_records(ctx, &mut scratch, n);
                 self.scratch = scratch;
@@ -250,7 +274,7 @@ impl VisualRenderer for Enhanced {
         // Packed 24-bit video is byte-addressed, not polygon colour data.
         let (source, scale) =
             if desc.flags & PresentDesc::DEPTH24 != 0 { (ctx.vram.draw, 1) } else { (self.draw, self.scale as u32) };
-        self.presenter.present(ctx.gl, source, scale, desc)
+        self.presenter.present_with_precision(ctx.gl, source, scale, desc, self.high_precision && desc.flags & PresentDesc::DEPTH24 == 0)
     }
 
     fn take_stats(&mut self) -> Stats {
@@ -278,6 +302,42 @@ fn primitive(rec: &[u32], clip: &Clip, out: &mut [u32]) {
     if kind != prim::TRIANGLE && kind != prim::QUAD {
         return;
     }
+    // Sprite quads often end their UVs just past an atlas tile. Native draws
+    // never sample that endpoint, but subpixel interpolation can. Preserve the
+    // native texel footprint for axis-aligned screen/UV rectangles, including
+    // flipped or rotated UV axes. Read coefficients before replacing the setup.
+    let sprite_bounds = if kind == prim::QUAD && rec[0] & prim::TEXTURED != 0 {
+        let xy: [_; 4] = std::array::from_fn(|n| unpack_xy(rec[3 + 3 * n]));
+        let uv: [_; 4] = std::array::from_fn(|n| {
+            let t = rec[5 + 3 * n];
+            ((t & 255) as i32, ((t >> 8) & 255) as i32)
+        });
+        let rectangle = |p: [(i32, i32); 4]| {
+            let a = (p[1].0 - p[0].0, p[1].1 - p[0].1);
+            let b = (p[2].0 - p[0].0, p[2].1 - p[0].1);
+            ((a.0 == 0 && b.1 == 0) || (a.1 == 0 && b.0 == 0))
+                && p[3] == (p[1].0 + p[2].0 - p[0].0, p[1].1 + p[2].1 - p[0].1)
+        };
+        if rectangle(xy) && rectangle(uv) {
+            let x0 = xy.iter().map(|p| p.0).min().unwrap();
+            let x1 = xy.iter().map(|p| p.0).max().unwrap() - 1;
+            let y0 = xy.iter().map(|p| p.1).min().unwrap();
+            let y1 = xy.iter().map(|p| p.1).max().unwrap() - 1;
+            let mut bounds = [255, 255, 0, 0];
+            for at in [3 * 4, 14 * 4] {
+                for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                    for axis in 0..2 {
+                        let t = out[at + 28 + axis]
+                            .wrapping_add(out[at + 33 + axis].wrapping_mul(x as u32))
+                            .wrapping_add(out[at + 38 + axis].wrapping_mul(y as u32)) >> 24;
+                        bounds[axis] = bounds[axis].min(t);
+                        bounds[axis + 2] = bounds[axis + 2].max(t);
+                    }
+                }
+            }
+            Some(bounds)
+        } else { None }
+    } else { None };
     for (t, indices) in [[0, 1, 2], [1, 2, 3]].into_iter().enumerate() {
         if t == 1 && kind != prim::QUAD {
             break;
@@ -293,7 +353,76 @@ fn primitive(rec: &[u32], clip: &Clip, out: &mut [u32]) {
             out[at + 4 * i..at + 4 * i + 4].copy_from_slice(&[x as u32, y as u32, rec[4 + 3 * n], rec[5 + 3 * n]]);
         }
     }
+    // T(6) is unused only when both triangles use enhanced vertex records.
+    // Leave unusual/wrapping native fallbacks completely intact.
+    if out[2] & 3 == 3 && let Some(bounds) = sprite_bounds {
+        out[2] |= 4;
+        out[6 * 4..7 * 4].copy_from_slice(&bounds);
+    }
 }
+
+// A packed RGB8 visual plane, with a separate mask bit. Native textures and
+// uploads expand exactly (31 -> 248), but new shading/filtering/blending keeps
+// eight bits per channel rather than repeatedly rounding back to RGB5.
+const HIGH_COLOUR: &str = r#"
+const uint PIXEL_MASK = 0x80000000u;
+vec3 rgb8(uint p) { return vec3(p & 255u, (p >> 8) & 255u, (p >> 16) & 255u); }
+uint colour_pixel(vec3 c, uint mask) {
+    uvec3 v = uvec3(clamp(floor(c + 0.5), 0.0, 255.0));
+    return mask | v.r | (v.g << 8) | (v.b << 16);
+}
+uint native_pixel(uint p) {
+    return colour_pixel(vec3(p & 31u, (p >> 5) & 31u, (p >> 10) & 31u) * 8.0,
+                        (p & 0x8000u) != 0u ? PIXEL_MASK : 0u);
+}
+uint blend(uint bg, uint fg, uint abr) {
+    vec3 b = rgb8(bg), f = rgb8(fg);
+    vec3 c = abr == 0u ? (b + f) * 0.5 : abr == 1u ? b + f : abr == 2u ? b - f : b + f * 0.25;
+    return colour_pixel(c, fg & PIXEL_MASK);
+}
+uint modulate(uint t, uint r, uint g, uint b, int d) {
+    return colour_pixel(rgb8(t) * vec3(r, g, b) / 128.0 + float(d), t & PIXEL_MASK);
+}
+uint shade(uint r, uint g, uint b, bool dither, int d) {
+    return colour_pixel(vec3(r, g, b) + float(dither ? d : 0), PIXEL_MASK);
+}
+"#;
+
+// Filter decoded colours, never palette indices or the mask bit. A nearest
+// sample controls transparency/blend classification; incompatible neighbours
+// are excluded and weights renormalized, avoiding black fringes and new holes.
+const TEXTURE_FILTER: &str = r#"
+vec3 rgb5(uint t) { return vec3(t & 31u, (t >> 5) & 31u, (t >> 10) & 31u); }
+void polygon_surface(vec2 at, vec2 lo, vec2 hi, uvec3 color, uint flags, uvec4 h0, uvec4 tw, int d,
+                     inout uint dst, inout bool wrote) {
+    ivec2 nearest = ivec2(floor(at + 0.5));
+    if (!SMOOTH_3D || (flags & TEXTURED) == 0u) {
+        surface(uint(nearest.x) & 255u, uint(nearest.y) & 255u, color.r, color.g, color.b, flags, h0, tw, d, dst, wrote);
+        return;
+    }
+    uint t = texel(uint(nearest.x) & 255u, uint(nearest.y) & 255u, flags, tw, h0.y >> 16);
+    if (t == 0u) return;
+    vec2 base = floor(at), f = fract(at);
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int y = 0; y < 2; y++) {
+        for (int x = 0; x < 2; x++) {
+            // Conservative atlas guard: never fetch outside this triangle's UV
+            // bounds. Texture windows/page wrapping still apply in texel().
+            ivec2 p = ivec2(clamp(base + vec2(x, y), lo, hi));
+            uint n = texel(uint(p.x) & 255u, uint(p.y) & 255u, flags, tw, h0.y >> 16);
+            if (n == 0u || ((n ^ t) & 0x8000u) != 0u) continue;
+            float w = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y);
+            sum += rgb5(n) * w;
+            weight += w;
+        }
+    }
+    uint mask = native_pixel(t) & PIXEL_MASK;
+    t = weight > 0.0 ? colour_pixel(sum / weight * 8.0, mask) : native_pixel(t);
+    if ((flags & RAW) == 0u) t = modulate(t, color.r, color.g, color.b, (flags & DITHER) != 0u ? d : 0);
+    plot(t, true, flags, dst, wrote);
+}
+"#;
 
 const TRIANGLE: &str = r#"
 float edge(vec2 a, vec2 b, vec2 p) {
@@ -327,7 +456,18 @@ void enhanced_triangle(int b, int px, int py, uint flags, uvec4 h0, uvec4 tw, in
     if (!inside_edge(ea, bb, c) || !inside_edge(eb, c, a) || !inside_edge(ec, a, bb)) return;
     vec3 w = vec3(ea, eb, ec) / area;
     vec3 color = clamp(floor(rgb(va.z) * w.x + rgb(vb.z) * w.y + rgb(vc.z) * w.z + 0.5), 0.0, 255.0);
-    ivec2 t = ivec2(floor(uv(va.w) * w.x + uv(vb.w) * w.y + uv(vc.w) * w.z + 0.5));
-    surface(uint(t.x) & 255u, uint(t.y) & 255u, uint(color.r), uint(color.g), uint(color.b), flags, h0, tw, dither_at(px, py), dst, wrote);
+    vec2 ta = uv(va.w), tb = uv(vb.w), tc = uv(vc.w);
+    vec2 t = ta * w.x + tb * w.y + tc * w.z;
+    vec2 lo = min(ta, min(tb, tc)), hi = max(ta, max(tb, tc));
+    if ((h0.z & 4u) != 0u) {
+        // Centre the subpixel samples around the native sprite pixel, rather
+        // than shifting texel boundaries halfway into the preceding pixel.
+        vec2 q = p + vec2(0.5 / float(u_scale) - 0.5);
+        vec3 tex_w = vec3(edge(bb, c, q), edge(c, a, q), edge(a, bb, q)) / area;
+        uvec4 bounds = T(6);
+        lo = vec2(bounds.xy); hi = vec2(bounds.zw);
+        t = clamp(ta * tex_w.x + tb * tex_w.y + tc * tex_w.z, lo, hi);
+    }
+    polygon_surface(t, lo, hi, uvec3(color), flags, h0, tw, dither_at(px, py), dst, wrote);
 }
 "#;

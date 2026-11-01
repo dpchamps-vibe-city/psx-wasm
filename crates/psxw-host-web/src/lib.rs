@@ -5,7 +5,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod web {
-    use psx_render_gl::Renderer;
+    use psx_render_gl::{Renderer, visual::{ColourPrecision, TextureFilter, VisualPreset}};
     use psxw_abi::render::{PresentDesc, Rect, op};
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -52,6 +52,34 @@ mod web {
 
         pub fn resolution_scale(&self) -> u32 {
             self.r.resolution_scale()
+        }
+
+        /// Built-in host style (0 = Original, 1 = Clean Polygons), with its
+        /// resolution, textures (0 = nearest, 1 = smooth), dithering (0 = original,
+        /// 1 = off), and colour precision (0 = native RGB5, 1 = visual RGB8).
+        pub fn set_visual_options(&mut self, style: u32, scale: u32, textures: u32, dithering: u32, precision: u32) -> Result<(), JsValue> {
+            let textures = match textures {
+                0 => TextureFilter::Nearest,
+                1 => TextureFilter::Smooth3D,
+                _ => return Err(js("unknown texture filter")),
+            };
+            let dithering = match dithering {
+                0 => true,
+                1 => false,
+                _ => return Err(js("unknown dithering mode")),
+            };
+            let precision = match precision {
+                0 => ColourPrecision::Native,
+                1 => ColourPrecision::High,
+                _ => return Err(js("unknown colour precision")),
+            };
+            let preset = match style {
+                0 if scale == 1 && textures == TextureFilter::Nearest && dithering && precision == ColourPrecision::Native => VisualPreset::Native,
+                0 => return Err(js("Original rendering has no visual enhancements")),
+                1 => VisualPreset::CleanPolygons { scale, textures, dithering, precision },
+                _ => return Err(js("unknown visual renderer")),
+            };
+            self.r.set_visual_preset(preset).map_err(js)
         }
 
         /// Zero VRAM and the colour-table slots (tests).

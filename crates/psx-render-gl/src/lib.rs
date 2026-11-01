@@ -32,7 +32,7 @@ use glow::HasContext;
 use psxw_abi::render::{self, Command, PRIM_WORDS, PresentDesc};
 use setup::{Clip, WORDS};
 use raster::{PER_DRAW, RasterPass, RasterTarget, UploadBatch};
-use visual::{CanonicalVram, DrawState, VisualContext, VisualFrame, VisualRenderer};
+use visual::{CanonicalVram, ColourPrecision, DrawState, TextureFilter, VisualContext, VisualFrame, VisualPreset, VisualRenderer};
 
 /// Version of this backend, for reports.
 pub const BACKEND_VERSION: &str = concat!("psx-render-gl ", env!("CARGO_PKG_VERSION"), " render-v1");
@@ -66,7 +66,7 @@ pub struct Renderer {
     stage: glow::Texture,
     raster: RasterPass,
     visual: Box<dyn VisualRenderer>,
-    preset_scale: Option<u32>,
+    preset: Option<VisualPreset>,
     last_frame: Option<VisualFrame>,
     read_format: (u32, u32, usize),
     clip: Clip,
@@ -195,7 +195,7 @@ impl Renderer {
                 gl: &gl,
                 vram: CanonicalVram { draw: vram_w, read: vram_r, clut, framebuffer: fbo_w },
                 state: DrawState { clip: Clip { x0: 0, y0: 0, x1: 0, y1: 0 }, skip: -1 },
-            }, 1)?;
+            }, VisualPreset::Native)?;
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             gl.disable(glow::BLEND);
@@ -221,7 +221,7 @@ impl Renderer {
                 stage,
                 raster,
                 visual,
-                preset_scale: Some(1),
+                preset: Some(VisualPreset::Native),
                 last_frame: None,
                 read_format,
                 clip: Clip { x0: 0, y0: 0, x1: 0, y1: 0 },
@@ -244,11 +244,24 @@ impl Renderer {
     /// plane from native VRAM; detail returns as the game redraws it.
     pub fn set_resolution_scale(&mut self, scale: u32) -> Result<()> {
         ensure!(matches!(scale, 1 | 2 | 4), "resolution scale must be 1, 2 or 4");
-        if self.preset_scale == Some(scale) { return Ok(()); }
-        self.set_visual_renderer(|ctx| visual::create(ctx, scale))?;
-        self.preset_scale = Some(scale);
+        self.set_visual_preset(if scale == 1 {
+            VisualPreset::Native
+        } else {
+            VisualPreset::CleanPolygons { scale, textures: TextureFilter::Nearest, dithering: true, precision: ColourPrecision::Native }
+        })
+    }
+
+    /// Select a built-in style with its host-only options. Failed configuration
+    /// retains the previous renderer, frame and settings, just like a factory.
+    pub fn set_visual_preset(&mut self, preset: VisualPreset) -> Result<()> {
+        if self.preset == Some(preset) { return Ok(()); }
+        self.set_visual_renderer(|ctx| visual::create(ctx, preset))?;
+        self.preset = Some(preset);
         Ok(())
     }
+
+    /// Current built-in selection, or None for a custom visual renderer.
+    pub fn visual_preset(&self) -> Option<VisualPreset> { self.preset }
 
     /// Install a host-local visual renderer without changing the exact engine.
     /// Build transactionally from read-only canonical inputs; failure retains
@@ -261,12 +274,12 @@ impl Renderer {
         self.stats.include(old.take_stats());
         old.destroy(&self.gl);
         self.last_frame = None;
-        self.preset_scale = None;
+        self.preset = None;
         Ok(())
     }
 
     /// Built-in scale selection; custom visual renderers report 1.
-    pub fn resolution_scale(&self) -> u32 { self.preset_scale.unwrap_or(1) }
+    pub fn resolution_scale(&self) -> u32 { self.preset.map_or(1, VisualPreset::resolution_scale) }
 
     /// The last presentation's backing resolution, not the native VRAM size.
     pub fn output_size(&self) -> Option<(u32, u32)> {

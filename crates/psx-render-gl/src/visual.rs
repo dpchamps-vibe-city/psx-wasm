@@ -6,11 +6,42 @@
 //! hazards and output. They must not modify canonical VRAM or answer game reads.
 //! This is a WebGL2/GLES extension point, not a cross-graphics-API abstraction.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use glow::HasContext;
 use psxw_abi::render::{Command, PresentDesc};
 
 use crate::{Stats, enhanced::Enhanced, presentation::Presenter, setup::Clip};
+
+/// Texture sampling in the Clean Polygons renderer. Rectangles stay nearest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureFilter {
+    Nearest,
+    Smooth3D,
+}
+
+/// Colour storage/arithmetic in the visual renderer, never canonical VRAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColourPrecision {
+    Native,
+    High,
+}
+
+/// Host-only built-in styles and their own configuration. Custom implementations
+/// still install a factory directly; this is not part of the guest render ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualPreset {
+    Native,
+    CleanPolygons { scale: u32, textures: TextureFilter, dithering: bool, precision: ColourPrecision },
+}
+
+impl VisualPreset {
+    pub fn resolution_scale(self) -> u32 {
+        match self {
+            Self::Native => 1,
+            Self::CleanPolygons { scale, .. } => scale,
+        }
+    }
+}
 
 /// Current effective drawing state. Feedback primitives are delivered as
 /// clipped row draws, so use this state rather than caching SET_STATE yourself.
@@ -99,10 +130,13 @@ pub trait VisualRenderer {
 
 /// Host-only factory for the built-in presets. Custom renderers need no entry
 /// here: install their factory directly with Renderer::set_visual_renderer.
-pub(crate) fn create(ctx: &VisualContext<'_>, scale: u32) -> Result<Box<dyn VisualRenderer>> {
-    match scale {
-        1 => Ok(Box::new(Native { presenter: Presenter::new(ctx.gl)? })),
-        _ => Ok(Box::new(Enhanced::new(ctx, scale as i32)?)),
+pub(crate) fn create(ctx: &VisualContext<'_>, preset: VisualPreset) -> Result<Box<dyn VisualRenderer>> {
+    match preset {
+        VisualPreset::Native => Ok(Box::new(Native { presenter: Presenter::new(ctx.gl)? })),
+        VisualPreset::CleanPolygons { scale, textures, dithering, precision } => {
+            ensure!(matches!(scale, 1 | 2 | 4), "resolution scale must be 1, 2 or 4");
+            Ok(Box::new(Enhanced::new(ctx, scale as i32, textures, dithering, precision)?))
+        }
     }
 }
 

@@ -62,6 +62,7 @@ import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, savesDir } from "./cards.js";
 import { ModLoader, takeMod } from "./mods.js";
 import { Calls, ScriptHost, mod } from "./script.js";
+import { NATIVE_RENDER_SETTINGS, unpackRenderSettings } from "./rendering.js";
 
 const ABI_VERSION = 12;
 const NOTHING_PRESSED = 0xffff;
@@ -231,21 +232,22 @@ async function run({ cue, padBuffer, audioRing, modBuffer, renderBuffer, options
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
   const renderSettings = new Int32Array(renderBuffer || new SharedArrayBuffer(4));
-  let appliedScale = 1;
-  const applyResolutionScale = () => {
-    const requested = Atomics.load(renderSettings, 0) || 1;
-    if (requested === appliedScale) return;
+  let appliedSettings = NATIVE_RENDER_SETTINGS;
+  const applyRenderSettings = () => {
+    const requested = Atomics.load(renderSettings, 0) || NATIVE_RENDER_SETTINGS;
+    if (requested === appliedSettings) return;
     let error;
     try {
-      renderer.set_resolution_scale(requested);
+      const { style, scale, textures, dithering, precision } = unpackRenderSettings(requested);
+      renderer.set_visual_options(style, scale, textures, dithering, precision);
+      appliedSettings = requested;
     } catch (e) {
-      error = `resolution change failed: ${e.message || e}`;
-      Atomics.store(renderSettings, 0, renderer.resolution_scale());
+      error = `rendering change failed: ${e.message || e}`;
+      Atomics.compareExchange(renderSettings, 0, requested, appliedSettings);
     }
-    appliedScale = renderer.resolution_scale();
-    postMessage({ type: "resolution-scale", scale: appliedScale, error });
+    postMessage({ type: "render-settings", settings: appliedSettings, error });
   };
-  applyResolutionScale();
+  applyRenderSettings();
   let lost = false;
   let shadow = null;
   canvas.addEventListener("webglcontextlost", (e) => {
@@ -256,8 +258,8 @@ async function run({ cue, padBuffer, audioRing, modBuffer, renderBuffer, options
   canvas.addEventListener("webglcontextrestored", () => {
     renderer = new WebRenderer(canvas);
     if (shadow) renderer.upload_vram(shadow);
-    appliedScale = 1;
-    applyResolutionScale();
+    appliedSettings = NATIVE_RENDER_SETTINGS;
+    applyRenderSettings();
     lost = false;
     postMessage({ type: "status", text: "WebGL context restored" });
   });
@@ -538,18 +540,18 @@ async function run({ cue, padBuffer, audioRing, modBuffer, renderBuffer, options
     present(p) {
       if (lost) return;
       timed("present", () => {
-        applyResolutionScale();
+        applyRenderSettings();
         const desc = new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20));
         try {
           renderer.present(desc);
         } catch (e) {
           // The colour plane can fit while a larger output frame cannot.
           // Drop enhancements rather than stopping a game on a smaller GPU.
-          if (appliedScale === 1) throw e;
+          if (appliedSettings === NATIVE_RENDER_SETTINGS) throw e;
           renderer.set_resolution_scale(1);
-          appliedScale = 1;
-          Atomics.store(renderSettings, 0, 1);
-          postMessage({ type: "resolution-scale", scale: 1, error: `upscaled presentation failed; using native: ${e.message || e}` });
+          Atomics.compareExchange(renderSettings, 0, appliedSettings, NATIVE_RENDER_SETTINGS);
+          appliedSettings = NATIVE_RENDER_SETTINGS;
+          postMessage({ type: "render-settings", settings: appliedSettings, error: `enhanced presentation failed; using Original: ${e.message || e}` });
           renderer.present(desc);
         }
         // A page that falls behind misses frames rather than queueing them.

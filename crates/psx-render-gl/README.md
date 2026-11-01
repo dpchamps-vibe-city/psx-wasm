@@ -11,8 +11,12 @@ renderer command stream
           │ decoded commands + canonical texture/CLUT inputs
           ▼
    selected VisualRenderer ────────→ RGBA output → canvas/frame dump
-      Native | Upscaled | custom
+      Native | Clean Polygons | custom
 ```
+
+For the game/host ABI, host startup and browser/native wiring, see
+[Implementing a host](../../docs/host-implementation.md). The visual-renderer
+interface below is internal to the host, separate from that ABI.
 
 ## Add a visual renderer
 
@@ -29,7 +33,23 @@ No adaptor, runtime, packet decoder, guest ABI, or exact rasterizer changes are
 needed. A new implementation is not required to use the built-ins' packed setup
 records, shaders, output dimensions, or internal-resolution model. Add a host UI
 option/factory selection if users should be able to select it. The existing
-`set_resolution_scale(1 | 2 | 4)` API selects the built-in presets.
+`set_resolution_scale(1 | 2 | 4)` API selects Native at 1× or Clean Polygons
+with nearest sampling at 2×/4×. For separate style and texture options:
+
+```rust,ignore
+use psx_render_gl::visual::{ColourPrecision, TextureFilter, VisualPreset};
+renderer.set_visual_preset(VisualPreset::CleanPolygons {
+    scale: 4,
+    textures: TextureFilter::Smooth3D,
+    dithering: false,
+    precision: ColourPrecision::High,
+})?;
+```
+
+Clean Polygons also supports 1× independently of the Native renderer. Its
+configuration is host-local; custom factories still define their own options.
+The browser's `web/rendering.js` registers built-in names and option controls;
+`WebRenderer.set_visual_options` selects their factories.
 
 The interface:
 
@@ -73,9 +93,29 @@ point**, not a dynamic plugin loader or cross-graphics-API interface.
 - `presentation.rs`: optional shared 15/24-bit-to-RGBA presentation helper.
 - `setup.rs` / `shaders.rs`: exact PS1 setup and reusable pixel arithmetic.
 
-The upscaler samples native textures/CLUTs and owns its own enhanced destination
-and COPY planes. Other visual renderers may use different representations without
-altering exact execution.
+Clean Polygons samples native textures/CLUTs and owns its own enhanced destination
+and COPY planes. Nearest sampling preserves the original upscaler's appearance.
+Smooth 3D bilinearly filters decoded 4/8/15-bit polygon texture colours before
+modulation and blending. A nearest sample retains transparency and mask/blend
+classification; incompatible neighbours are excluded and weights renormalized.
+Samples are clamped to each triangle's UV bounds as a conservative atlas guard,
+not full asset identification. Axis-aligned screen/UV quads additionally use
+pixel-centred sampling and the native covered texel range, avoiding seams at
+sprite-atlas gutters and half-pixel shifts in cutouts. This handles flipped and
+rotated UV axes without changing polygon coverage or native/wrapping fallbacks. Rectangles, lines, unusual wrapping polygons and
+24-bit video retain their previous behaviour. UI drawn with polygons is filtered
+as well: the command stream does not identify whether a polygon is world or UI.
+Dithering is an independent option: Original keeps the native 4×4 offsets on
+primitives requesting dithering, while Off clears them only in visual setup.
+Native precision uses R16UI RGB5/mask planes. High precision uses R32UI packed
+RGB8 plus a separate mask bit, retaining eight bits/channel through shading,
+texture filtering, blending and COPY. Native texels/uploads expand 31 to 248,
+without inventing texture detail. R32UI initialization converts canonical words
+on the GPU; it cannot use a raw R16UI blit. Packed 24-bit video still reads native
+VRAM directly. Original dithering in High mode keeps the offsets but quantizes
+to eight bits instead of five; High + Off is the cleanest combination. This is
+colour precision, not higher-precision GTE coordinates. Other visual renderers
+may use different representations without altering exact execution.
 
 ## Tests
 
@@ -87,5 +127,11 @@ LIBGL_ALWAYS_SOFTWARE=1 cargo test -p psx-render-gl --features headless
 `tests/visual.rs` installs an external-style custom renderer with independent
 output, exercises command/feedback delivery and lifecycle/factory failures, and
 checks exact readbacks despite different GL pipeline state. `tests/upscale.rs`
-checks the built-in scales, subpixel coverage/interpolation, transfers and masks.
-The browser suite checks golden vectors, upscaling and context recovery.
+checks the built-in scales, subpixel coverage/interpolation, transfers, masks,
+and filtering across texture depths, palettes, windows and transparency without
+changing sprites or canonical VRAM. Colour tests cover independent dithering and
+precision controls, GPU seeding, non-RGB5 gradients, and both colour-plane formats'
+blending, masks, uploads and copies. Tiled sprite tests cover transparent/coloured
+atlas gutters, pixel-centred cutouts, mirrored/rotated UVs and every scale/filter/
+precision combination. The browser suite checks golden vectors,
+upscaling, both texture modes and context recovery.

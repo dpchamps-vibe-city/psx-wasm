@@ -50,6 +50,7 @@ void main() {{
 /// Optional hooks for GL renderers reusing the PS1 pixel pipeline. Visual
 /// renderers are not required to use this shader or its packed setup layout.
 pub(crate) struct DrawShader<'a> {
+    pub colour: &'a str,
     pub triangle: &'a str,
     pub triangle_fn: &'a str,
     pub position: &'a str,
@@ -59,6 +60,7 @@ pub(crate) struct DrawShader<'a> {
 
 pub fn draw_fs() -> String {
     draw_fs_with(&DrawShader {
+        colour: NATIVE_COLOUR,
         triangle: "",
         triangle_fn: "triangle",
         position: "int px = hp.x, py = hp.y;",
@@ -123,32 +125,13 @@ uint dlut(uint v, int d) {{ return uint(clamp((int(v) + d) >> 3, 0, 31)); }}
 
 bool skipped(int y) {{ return u_skip >= 0 && (y & 1) == u_skip; }}
 
-// The four semi-transparency modes on 15-bit pixels (blargg's
-// formulas, as the GPU's arithmetic gives them).
-uint blend(uint bg, uint fg, uint abr) {{
-    if (abr == 0u) {{
-        bg |= 0x8000u;
-        return (((fg + bg) - ((fg ^ bg) & 0x0421u)) >> 1) & 0xFFFFu;
-    }}
-    if (abr == 2u) {{
-        bg |= 0x8000u;
-        fg &= 0x7FFFu;
-        uint diff = bg - fg + 0x108420u;
-        uint borrow = (diff - ((bg ^ fg) & 0x108420u)) & 0x108420u;
-        return ((diff - borrow) & (borrow - (borrow >> 5))) & 0xFFFFu;
-    }}
-    bg &= 0x7FFFu;
-    if (abr == 3u) fg = ((fg >> 2) & 0x1CE7u) | 0x8000u;
-    uint sum = fg + bg;
-    uint carry = (sum - ((fg ^ bg) & 0x8421u)) & 0x8420u;
-    return ((sum - carry) | (carry - (carry >> 5))) & 0xFFFFu;
-}}
+{colour}
 
 // Plot `fore` over `dst`: blend, mask check, mask set.
 void plot(uint fore, bool textured, uint flags, inout uint dst, inout bool wrote) {{
-    if ((flags & SEMI) != 0u && (fore & 0x8000u) != 0u) fore = blend(dst, fore, (flags >> 7) & 3u);
-    if ((flags & MASK_CHECK) != 0u && (dst & 0x8000u) != 0u) return;
-    dst = (textured ? fore : (fore & 0x7FFFu)) | ((flags & MASK_SET) != 0u ? 0x8000u : 0u);
+    if ((flags & SEMI) != 0u && (fore & PIXEL_MASK) != 0u) fore = blend(dst, fore, (flags >> 7) & 3u);
+    if ((flags & MASK_CHECK) != 0u && (dst & PIXEL_MASK) != 0u) return;
+    dst = (textured ? fore : (fore & ~PIXEL_MASK)) | ((flags & MASK_SET) != 0u ? PIXEL_MASK : 0u);
     wrote = true;
 }}
 
@@ -170,24 +153,13 @@ uint texel(uint u, uint v, uint flags, uvec4 tw, uint slot) {{
     return word;
 }}
 
-uint modulate(uint t, uint r, uint g, uint b, int d) {{
-    uint mr = ((t & 0x1Fu) * r) >> 4;
-    uint mg = (((t >> 5) & 0x1Fu) * g) >> 4;
-    uint mb = (((t >> 10) & 0x1Fu) * b) >> 4;
-    return (t & 0x8000u) | dlut(mr, d) | (dlut(mg, d) << 5) | (dlut(mb, d) << 10);
-}}
-
-uint shade(uint r, uint g, uint b, bool dither, int d) {{
-    if (dither) return 0x8000u | dlut(r, d) | (dlut(g, d) << 5) | (dlut(b, d) << 10);
-    return 0x8000u | (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10);
-}}
-
 // The textured or shaded pixel of a polygon or rectangle.
 void surface(uint u, uint v, uint r, uint g, uint b, uint flags, uvec4 h0, uvec4 tw, int d,
              inout uint dst, inout bool wrote) {{
     if ((flags & TEXTURED) != 0u) {{
         uint t = texel(u, v, flags, tw, h0.y >> 16);
         if (t == 0u) return;
+        t = native_pixel(t);
         if ((flags & RAW) == 0u) t = modulate(t, r, g, b, (flags & DITHER) != 0u ? d : 0);
         plot(t, true, flags, dst, wrote);
     }} else {{
@@ -307,14 +279,14 @@ void main() {{
         if (i >= int(a.z) || j >= int(a.w)) discard;
         if (kind == FILL) {{
             if (skipped(py)) discard;
-            dst = m.x;
+            dst = native_pixel(m.x);
             wrote = true;
         }} else {{
             uint src = kind == UPLOAD
-                ? texelFetch(u_stage, ivec2(int(m.x) + i, int(m.y) + j), 0).r
+                ? native_pixel(texelFetch(u_stage, ivec2(int(m.x) + i, int(m.y) + j), 0).r)
                 : {copy_source};
-            if ((m.z & 2u) == 0u || (dst & 0x8000u) == 0u) {{
-                dst = src | ((m.z & 1u) != 0u ? 0x8000u : 0u);
+            if ((m.z & 2u) == 0u || (dst & PIXEL_MASK) == 0u) {{
+                dst = src | ((m.z & 1u) != 0u ? PIXEL_MASK : 0u);
                 wrote = true;
             }}
         }}
@@ -325,6 +297,7 @@ void main() {{
 "#,
         mask = PRIM_TEX_WIDTH - 1,
         shift = PRIM_TEX_WIDTH.trailing_zeros(),
+        colour = shader.colour,
         triangle = shader.triangle,
         triangle_fn = shader.triangle_fn,
         position = shader.position,
@@ -332,6 +305,46 @@ void main() {{
         copy_source = shader.copy_source,
     )
 }
+
+// Kept integer-exact for canonical rendering. The floating-point pack helper
+// is used only by the optional enhanced texture filter.
+pub(crate) const NATIVE_COLOUR: &str = r#"
+const uint PIXEL_MASK = 0x8000u;
+uint native_pixel(uint p) { return p; }
+uint colour_pixel(vec3 c, uint mask) {
+    uvec3 v = uvec3(clamp(floor(c / 8.0 + 0.5), 0.0, 31.0));
+    return mask | v.r | (v.g << 5) | (v.b << 10);
+}
+// The four semi-transparency modes on 15-bit pixels (blargg's formulas).
+uint blend(uint bg, uint fg, uint abr) {
+    if (abr == 0u) {
+        bg |= 0x8000u;
+        return (((fg + bg) - ((fg ^ bg) & 0x0421u)) >> 1) & 0xFFFFu;
+    }
+    if (abr == 2u) {
+        bg |= 0x8000u;
+        fg &= 0x7FFFu;
+        uint diff = bg - fg + 0x108420u;
+        uint borrow = (diff - ((bg ^ fg) & 0x108420u)) & 0x108420u;
+        return ((diff - borrow) & (borrow - (borrow >> 5))) & 0xFFFFu;
+    }
+    bg &= 0x7FFFu;
+    if (abr == 3u) fg = ((fg >> 2) & 0x1CE7u) | 0x8000u;
+    uint sum = fg + bg;
+    uint carry = (sum - ((fg ^ bg) & 0x8421u)) & 0x8420u;
+    return ((sum - carry) | (carry - (carry >> 5))) & 0xFFFFu;
+}
+uint modulate(uint t, uint r, uint g, uint b, int d) {
+    uint mr = ((t & 0x1Fu) * r) >> 4;
+    uint mg = (((t >> 5) & 0x1Fu) * g) >> 4;
+    uint mb = (((t >> 10) & 0x1Fu) * b) >> 4;
+    return (t & 0x8000u) | dlut(mr, d) | (dlut(mg, d) << 5) | (dlut(mb, d) << 10);
+}
+uint shade(uint r, uint g, uint b, bool dither, int d) {
+    if (dither) return 0x8000u | dlut(r, d) | (dlut(g, d) << 5) | (dlut(b, d) << 10);
+    return 0x8000u | (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10);
+}
+"#;
 
 /// Present: the display area to RGBA8, 15-bit or 24-bit.
 pub fn present_vs() -> String {
@@ -351,6 +364,7 @@ pub fn present_fs() -> String {
 uniform usampler2D u_vram;
 uniform ivec4 u_area;   // x, y, width, height
 uniform int u_depth24;
+uniform int u_high_precision; // visual R32UI: RGB8 + mask, never packed video
 uniform int u_flip;     // 1: output row 0 is the picture's bottom row
 uniform int u_scale;    // 24-bit packed display always uses 1
 out vec4 o_color;
@@ -373,9 +387,15 @@ void main() {{
         ivec2 size = ivec2(1024, 512) * u_scale;
         ivec2 at = ivec2(u_area.x, u_area.y) * u_scale + ivec2(ox, row);
         uint p = texelFetch(u_vram, at & (size - 1), 0).r;
-        r = (p & 0x1Fu) << 3;
-        g = ((p >> 5) & 0x1Fu) << 3;
-        b = ((p >> 10) & 0x1Fu) << 3;
+        if (u_high_precision != 0) {{
+            r = p & 255u;
+            g = (p >> 8) & 255u;
+            b = (p >> 16) & 255u;
+        }} else {{
+            r = (p & 0x1Fu) << 3;
+            g = ((p >> 5) & 0x1Fu) << 3;
+            b = ((p >> 10) & 0x1Fu) << 3;
+        }}
     }}
     o_color = vec4(float(r), float(g), float(b), 255.0) / 255.0;
 }}
