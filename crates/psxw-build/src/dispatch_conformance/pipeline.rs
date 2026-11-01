@@ -116,9 +116,13 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
     let calls = dir.join("calls");
     std::fs::create_dir_all(&calls)?;
     psxw_cc::objects_compiled_with(&calls, &["-g"])?;
+    let boundaries = crate::binding::boundaries(section.as_ref());
     let mut link_inputs: Vec<Input> = census
         .iter()
-        .map(|(c, obj)| c_input(&clang, c, obj, &calls.join(c), &["-g"], None, gcc))
+        .map(|(c, obj)| {
+            let ops = boundaries.get(c.as_str()).cloned().unwrap_or_default();
+            c_input(&clang, c, obj, &calls.join(c), &["-g"], None, gcc, &ops)
+        })
         .collect::<Result<_>>()?;
     let mut c_defs: BTreeMap<(String, u32), (usize, u32)> = BTreeMap::new();
     for (i, inp) in link_inputs.iter().enumerate() {

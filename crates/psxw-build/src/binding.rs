@@ -15,7 +15,7 @@ use psxw_inputs::dispatch::{self as facts, DispatchSection, Effect, Event, HEADE
 use psxw_link::binding as link;
 use psxw_link::game::Tier;
 use psxw_link::marshal;
-use psxw_link::object::{NameClass, SymbolKind, classify_name};
+use psxw_link::object::{NameClass, classify_name};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -85,6 +85,19 @@ pub(crate) fn dispatch(
     }
     classify(&mut report, map, tiers, binding.as_ref(), &overlays, mod_residency);
     Ok((binding, overlays, report))
+}
+
+/// Per container, the functions declared rules instrument: their call
+/// boundary must survive C optimization (an inlined call would skip the
+/// operation's wrapper).
+pub(crate) fn boundaries(section: Option<&DispatchSection>) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for r in section.iter().flat_map(|s| &s.rules) {
+        if let (Some(c), Some(f)) = (&r.container, &r.function) {
+            out.entry(c.clone()).or_default().insert(f.clone());
+        }
+    }
+    out
 }
 
 fn window(r: &Range<u32>) -> Range<u32> {
@@ -247,8 +260,8 @@ pub(crate) fn plan(
                 ensure!(r.event == Event::AfterWrite, "binding.invalid_fact: {what}: an instruction-address site takes event `after-write`");
                 let t = function_at(c, *pc).with_context(|| format!("binding.unknown_site: {what}: no compiled function of {c} holds 0x{pc:08X}"))?;
                 let key = (c.clone(), t.func.addr);
-                let input = match tiers.get(&key) {
-                    Some(&Tier::C { input, .. }) => input,
+                let (input, func) = match tiers.get(&key) {
+                    Some(&Tier::C { input, func }) => (input, func),
                     Some(Tier::Lift { .. }) => return Err(unimplemented("instruments a lifted write at an instruction address")),
                     _ => return Err(unimplemented("names a write inside an adapter")),
                 };
@@ -260,10 +273,20 @@ pub(crate) fn plan(
                         t.func.name
                     )
                 })?;
+                // The call must be in the function holding the write, not
+                // merely somewhere in its object.
                 let symbol = format!("{SITE_PREFIX}{m}");
+                let o = &inputs[input].obj;
+                let body = &o.funcs[func as usize].body;
+                let body = (body.start - o.code_start) as u32..(body.end - o.code_start) as u32;
+                let calls = o.code_relocs.iter().any(|rel| {
+                    rel.ty == wasmparser::RelocationType::FunctionIndexLeb
+                        && body.contains(&rel.offset)
+                        && o.symbols.get(rel.symbol as usize).is_some_and(|s| s.name == symbol)
+                });
                 ensure!(
-                    inputs[input].obj.symbols.iter().any(|s| s.kind == SymbolKind::Function && !s.defined && s.name == symbol),
-                    "binding.missing_c_write_site: {what}: {} ({}) never calls {symbol}; call it right after the write",
+                    calls,
+                    "binding.missing_c_write_site: {what}: {} ({}) never calls {symbol}; call it there, right after the write",
                     t.func.name,
                     inputs[input].label
                 );
@@ -303,6 +326,23 @@ pub(crate) fn plan(
             (Effect::Begin | Effect::End, _) => return Err(unimplemented("begins or ends a request")),
             (Effect::Publish, None) => bail!("validated: a publication has a placement"),
         };
+        // At a c_marker, what the rule states literally (a constant, or a
+        // global read at the call) constrains the C's value for that word.
+        let mut checks = Vec::new();
+        if marker.is_some() {
+            let mut declared = vec![(0, r.destination.as_ref()), (1, r.length.as_ref())];
+            if let Some(facts::Offset::Value(v)) = &r.source_offset {
+                declared.push((2, Some(v)));
+            }
+            if let Some(facts::Target::Selector { value: v, .. }) = &r.target {
+                declared.push((3, Some(v)));
+            }
+            for (word, v) in declared {
+                if let Some(v @ (facts::Value::Const(_) | facts::Value::Global { .. })) = v {
+                    checks.push((word, value(v, &what)?));
+                }
+            }
+        }
         let rule = link::Rule {
             id: r.id.clone(),
             event,
@@ -314,6 +354,7 @@ pub(crate) fn plan(
                 facts::Success::Zero => link::Success::Zero,
                 facts::Success::Nonzero => link::Success::Nonzero,
             },
+            checks,
         };
         if let Some(m) = marker {
             rule_lines.push(format!("#{} {} at {}: {:?} {:?} through {SITE_PREFIX}{m} in authored C", rules.len(), r.id, r.site, r.event, r.effect));

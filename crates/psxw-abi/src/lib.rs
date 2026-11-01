@@ -312,11 +312,14 @@ pub mod binding_cause {
     /// The destination, length or source offset is outside the selected
     /// placement's layout.
     pub const BAD_DESTINATION: u32 = 2;
+    /// A `c_marker` call passed a value its rule declares otherwise.
+    pub const MARKER_MISMATCH: u32 = 3;
 
     pub fn name(cause: u32) -> &'static str {
         match cause {
             UNKNOWN_SELECTOR => "binding.unknown_selector",
             BAD_DESTINATION => "binding.bad_destination",
+            MARKER_MISMATCH => "binding.marker_mismatch",
             _ => "binding.fault",
         }
     }

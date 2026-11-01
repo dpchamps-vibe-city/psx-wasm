@@ -319,6 +319,35 @@ for the required CLI/reference run.
     fails all four positive explicit variants, the `c_marker` one included.
   - `psxw build btn` (no `[dispatch]`) still links and merges at 2,604,657 bytes, and `psxw run btn --frames 300 --check no-trap` passes.
 
+- 2026-11-01, review fixes. An independent review reproduced five defects. Each
+  now has a regression fixture, and each fixture fails when its fix is reverted
+  (scratchpad mutations, restored):
+  1. A declared operation written `inline` was inlined into its C callers, which
+     skipped its wrapper. Declared operations now keep their call boundary:
+     `hook_variant` drops `inline` and makes them weak and noinline like other
+     functions. The C variants' loader is `inline` and called from C `load_c`;
+     reverting fails the mixed and edited-C variants.
+  2. A C operation's by-value struct words were read after its body ran. Every
+     C argument word a rule reads is now captured at entry. The C loader takes
+     its request by value and the edited C overwrites it; reverting fails the
+     edited-C variant.
+  3. A `c_marker` call ignored the rule's literal values. Values a rule
+     declares as `const` or `global` must now equal the call's
+     (`binding.marker_mismatch`). Reverting fails `explicit-binding-marker-mismatch`.
+  4. A marker call anywhere in the object satisfied the site check. It must
+     now be in the function holding the write. Reverting fails
+     `explicit-binding-marker-elsewhere`.
+  5. An empty invalidation inside a footprint unbound it. Empty updates now
+     change nothing; the positive variants clear zero bytes inside A, and
+     `explicit-binding-cleared` checks a real clear unbinds. Reverting fails
+     all four positive variants.
+- Review-fix evidence: `psxw-cc` 21, `psxw-inputs` 17, `psxw-build` 4 and
+  `link_passes` 8 tests pass. `psxw conform dispatch --case
+  D05/explicit-binding`: 13 variants, 4 execution and 9 safety, 0 failed, 0
+  unresolved, with the live reference agreeing on the 6 it runs. Full corpus:
+  64 variants: 38 execution, 11 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved variant being the legacy baseline
+  set. `psxw build btn` links at 2,604,703 bytes (the runtime gained the new fault cause's name) and `psxw run btn --frames 300 --check no-trap` passes.
+
 ## Findings
 
 ### A1 reference inventory

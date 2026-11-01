@@ -56,6 +56,10 @@ pub struct Rule {
     pub destination: Value,
     pub length: Value,
     pub success: Success,
+    /// At a `c_marker` call: argument words the rule declares literally
+    /// (`const`, or a `global` read at the call), which the C's values must
+    /// equal.
+    pub checks: Vec<(u32, Value)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,9 +172,14 @@ fn end_local(f: &mut Function) {
 }
 
 /// `(offset, len) -> ()`: unbind every slot whose bound candidate depends
-/// on a byte in the range.
+/// on a byte in the range. An empty range changes nothing.
 pub(crate) fn invalidate(r: &Refs) -> Function {
     let mut f = Function::new([(1, ValType::I32)]);
+    f.instruction(&I::LocalGet(1));
+    f.instruction(&I::I32Eqz);
+    f.instruction(&I::If(BlockType::Empty));
+    f.instruction(&I::Return);
+    f.instruction(&I::End);
     end_local(&mut f);
     for (addr, cands) in &r.binding.slots {
         let g = r.globals[addr];
@@ -262,8 +271,9 @@ struct Locals {
     sel: u32,
     ok: u32,
     rel: u32,
-    /// Stack argument words captured at entry (o32).
-    stack: BTreeMap<u32, u32>,
+    /// Argument words captured at entry, before the body can change them:
+    /// o32 stack words, and a C function's (a struct copy is memory).
+    captured: BTreeMap<u32, u32>,
 }
 
 /// An instrumented operation: `inner` with the same signature, the rules'
@@ -305,24 +315,24 @@ pub(crate) fn operation(
         next - 1
     });
     let first = next;
-    let mut l = Locals { params, res, sp0: first, dst: first + 1, len: first + 2, so: first + 3, sel: first + 4, ok: first + 5, rel: first + 6, stack: BTreeMap::new() };
+    let mut l = Locals { params, res, sp0: first, dst: first + 1, len: first + 2, so: first + 3, sel: first + 4, ok: first + 5, rel: first + 6, captured: BTreeMap::new() };
     next = first + 7;
     for v in &used {
         let arg = match v {
             Value::Arg(a) | Value::Field { arg: a, .. } => *a,
             _ => continue,
         };
-        match shape {
-            Shape::O32 if arg >= 4 && !l.stack.contains_key(&arg) => {
-                l.stack.insert(arg, next);
-                next += 1;
-            }
-            Shape::C { words, .. } => anyhow::ensure!(
+        if let Shape::C { words, .. } = shape {
+            anyhow::ensure!(
                 (arg as usize) < words.len(),
                 "binding.invalid_fact: {name} has {} argument words; a rule reads arg:{arg}",
                 words.len()
-            ),
-            _ => {}
+            );
+        }
+        let capture = matches!(shape, Shape::C { .. }) || arg >= 4;
+        if capture && !l.captured.contains_key(&arg) {
+            l.captured.insert(arg, next);
+            next += 1;
         }
         if matches!(v, Value::Return) {
             anyhow::ensure!(result_ty.is_some(), "binding.invalid_fact: {name} returns nothing; a rule reads `return`");
@@ -341,11 +351,14 @@ pub(crate) fn operation(
     }
     groups.push((next - first, ValType::I32));
     let mut f = Function::new(groups);
-    // Capture stack arguments before the call can change them.
+    // Capture argument words before the call can change them.
     f.instruction(&I::GlobalGet(sp_global));
     f.instruction(&I::LocalSet(l.sp0));
-    for (&arg, &local) in &l.stack {
-        marshal::load_word(&mut f, r.window, l.sp0, 16 + 4 * (arg - 4));
+    for (&arg, &local) in &l.captured {
+        match shape {
+            Shape::O32 => marshal::load_word(&mut f, r.window, l.sp0, 16 + 4 * (arg - 4)),
+            Shape::C { words, .. } => c_word(&mut f, r.window, words, arg),
+        }
         f.instruction(&I::LocalSet(local));
     }
     for &(i, rule) in rules.iter().filter(|(_, r)| r.event == Event::Enter) {
@@ -385,10 +398,20 @@ pub(crate) fn marker(r: &Refs, rule: usize, publish: &dyn Fn(usize) -> u32, inva
         sel: first + 4,
         ok: first + 5,
         rel: first + 6,
-        stack: BTreeMap::new(),
+        captured: BTreeMap::new(),
     };
     let mut f = Function::new([(7, ValType::I32)]);
-    apply(&mut f, r, &shape, &l, rule, &r.binding.rules[rule], publish, invalidate);
+    let rule_ = &r.binding.rules[rule];
+    // What the rule declares literally, the C must pass.
+    for (word, expected) in &rule_.checks {
+        f.instruction(&I::LocalGet(*word));
+        value(&mut f, r.window, &shape, &l, expected);
+        f.instruction(&I::I32Ne);
+        f.instruction(&I::If(BlockType::Empty));
+        fault(&mut f, r, rule, binding_cause::MARKER_MISMATCH, *word);
+        f.instruction(&I::End);
+    }
+    apply(&mut f, r, &shape, &l, rule, rule_, publish, invalidate);
     f.instruction(&I::End);
     f
 }
@@ -417,16 +440,25 @@ fn return_word(f: &mut Function, shape: &Shape, l: &Locals) {
     }
 }
 
-/// Push o32 argument word `k`.
+/// Push o32 argument word `k`: as captured at entry, else from the
+/// parameters (o32 `a0..a3`, or a `c_marker`'s values).
 fn arg_word(f: &mut Function, window: u32, shape: &Shape, l: &Locals, k: u32) {
+    if let Some(&local) = l.captured.get(&k) {
+        f.instruction(&I::LocalGet(local));
+        return;
+    }
     match shape {
-        Shape::O32 if k < 4 => {
+        Shape::O32 => {
             f.instruction(&I::LocalGet(k));
         }
-        Shape::O32 => {
-            f.instruction(&I::LocalGet(l.stack[&k]));
-        }
-        Shape::C { words, .. } => match words[k as usize] {
+        Shape::C { words, .. } => c_word(f, window, words, k),
+    }
+}
+
+/// Push a C function's o32 argument word `k` from its parameters.
+fn c_word(f: &mut Function, window: u32, words: &[Word], k: u32) {
+    {
+        match words[k as usize] {
             Word::Param(n) => {
                 f.instruction(&I::LocalGet(n));
             }
@@ -457,7 +489,7 @@ fn arg_word(f: &mut Function, window: u32, shape: &Shape, l: &Locals, k: u32) {
             Word::Pad => {
                 f.instruction(&I::I32Const(0));
             }
-        },
+        }
     }
 }
 

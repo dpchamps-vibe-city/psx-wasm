@@ -496,35 +496,59 @@ pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
 /// GCC 2.95 at `-O2` left every call to a non-inline function. A `static`
 /// one loses `static` (a weak definition can't be internal) on every
 /// file-scope declaration. `inline` functions are left alone: GCC inlined
-/// them too, so the original program has no such calls.
-pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>) -> String {
+/// them too, so the original program has no such calls. A function in
+/// `boundaries` (a declared binding operation, plans/dispatch-binding)
+/// keeps its call boundary even when written `inline`: it loses `inline`
+/// and becomes weak and noinline like the rest, so every call reaches its
+/// instrumentation.
+pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>, boundaries: &std::collections::BTreeSet<String>) -> String {
     let ast = parse(text);
     let mut edits: Vec<crate::edit::Edit> = Vec::new();
     let words = |s: &str| -> Vec<String> { s.split(|c: char| !c.is_alphanumeric() && c != '_').map(str::to_string).collect() };
     let mut made_extern: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let is_inline = |s: &str| matches!(s, "inline" | "__inline" | "__inline__");
     for f in ast.functions() {
-        if !names.contains(&f.name) {
+        let boundary = boundaries.contains(&f.name);
+        if !names.contains(&f.name) && !boundary {
             continue;
         }
         let head = &ast.src[f.range.start..f.decl_end];
         let specifiers = head.split(&f.name).next().unwrap_or("");
         let w = words(specifiers);
-        if w.iter().any(|w| matches!(w.as_str(), "inline" | "__inline" | "__inline__")) {
-            continue;
+        let node = ast.top_level_at(f.range.start).filter(|n| n.kind() == "function_definition");
+        // A boundary's `inline` specifiers go; the first takes the attribute
+        // when there's no `static` to.
+        let mut inline_specs = Vec::new();
+        if w.iter().any(|w| is_inline(w)) {
+            if !boundary {
+                continue;
+            }
+            let mut c = node.map(|n| n.walk());
+            inline_specs = node
+                .zip(c.as_mut())
+                .into_iter()
+                .flat_map(|(n, c)| n.named_children(c).collect::<Vec<_>>())
+                .filter(|s| s.kind() == "storage_class_specifier" && is_inline(ast.text(*s)))
+                .map(|s| s.byte_range())
+                .collect();
         }
         const ATTR: &str = "__attribute__((weak, noinline))";
-        let node = ast.top_level_at(f.range.start).filter(|n| n.kind() == "function_definition");
         let mut c2 = node.map(|n| n.walk());
         let stat = node.zip(c2.as_mut()).and_then(|(n, c)| {
             n.named_children(c).find(|s| s.kind() == "storage_class_specifier" && ast.text(*s) == "static")
         });
+        let mut inline_specs = inline_specs.into_iter();
         match stat {
             Some(st) => {
                 made_extern.insert(f.name.clone());
                 edits.push(crate::edit::Edit::replace(st.byte_range(), ATTR));
             }
-            None => edits.push(crate::edit::Edit::insert(f.range.start, format!("{ATTR} "))),
+            None => match inline_specs.next() {
+                Some(r) => edits.push(crate::edit::Edit::replace(r, ATTR)),
+                None => edits.push(crate::edit::Edit::insert(f.range.start, format!("{ATTR} "))),
+            },
         }
+        edits.extend(inline_specs.map(|r| crate::edit::Edit::replace(r, "")));
     }
     // `static` off every file-scope declaration of those functions.
     let root = ast.tree.root_node();
@@ -554,10 +578,21 @@ mod hook_tests {
     fn hooked_functions_become_weak() {
         let src = "static int g(int);\nint f(int a) { return g(a) + 1; }\nstatic int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n";
         let names = ["f", "g", "h"].iter().map(|s| s.to_string()).collect();
-        let out = super::hook_variant(src, &names);
+        let out = super::hook_variant(src, &names, &Default::default());
         assert_eq!(
             out,
             " int g(int);\n__attribute__((weak, noinline)) int f(int a) { return g(a) + 1; }\n__attribute__((weak, noinline)) int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n"
         );
+    }
+
+    #[test]
+    fn declared_operations_keep_their_boundary() {
+        let src = "static inline int h(int a) { return a; }\ninline int k(int a) { return a; }\nint f(int a) { return h(a) + k(a); }\n";
+        let names = ["f"].iter().map(|s| s.to_string()).collect();
+        let ops = ["h", "k"].iter().map(|s| s.to_string()).collect();
+        let out = super::hook_variant(src, &names, &ops);
+        assert!(!out.contains("inline int"), "{out}");
+        assert!(out.contains("__attribute__((weak, noinline))  int h(int a)"), "{out}");
+        assert!(out.contains("__attribute__((weak, noinline)) int k(int a)"), "{out}");
     }
 }
