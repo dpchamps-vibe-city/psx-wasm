@@ -202,9 +202,9 @@ canonical GPU execution ───────────────→ game-vi
        │ decoded commands + read-only canonical VRAM/CLUT
        ▼
 selected VisualRenderer
-  Original:       present canonical VRAM
-  Clean Polygons: redraw into independent enhanced visual surfaces
-  custom:         implementation-owned visual rendering
+  Original:  present canonical VRAM
+  PSXRevamp: redraw into independent enhanced visual surfaces
+  custom:    implementation-owned visual rendering
        │
        ▼
 RGBA output → browser canvas or native frame readout

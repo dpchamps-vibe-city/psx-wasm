@@ -11,14 +11,16 @@ use crate::{
     raster::{PER_DRAW, RasterPass, RasterTarget, UploadBatch},
     setup::{self, Clip, WORDS},
     shaders::{self, DrawShader},
-    texture,
-    visual::{ColourPrecision, TextureFilter, VisualContext, VisualFrame, VisualRenderer},
+    texture, super_xbr,
+    visual::{ColourPrecision, SpriteReconstruction, TextureFilter, VisualContext, VisualFrame, VisualRenderer},
 };
 
 pub(crate) struct Enhanced {
     scale: i32,
     dithering: bool,
     high_precision: bool,
+    reconstruct_sprites: bool,
+    super_xbr: Option<super_xbr::Pipeline>,
     draw: glow::Texture,
     read: glow::Texture,
     fbo_draw: glow::Framebuffer,
@@ -31,12 +33,19 @@ pub(crate) struct Enhanced {
     stats: Stats,
     // Inclusive native-coordinate bounds not yet in the enhanced read plane.
     dirty: Option<[i32; 4]>,
+    // Conservative written rectangles. Keep disjoint tile rows separate rather
+    // than treating the empty space in their combined bounds as a dependency.
+    dirty_regions: Vec<[i32; 4]>,
 }
 
 impl Enhanced {
-    pub fn new(ctx: &VisualContext<'_>, scale: i32, filter: TextureFilter, dithering: bool, precision: ColourPrecision) -> Result<Self> {
+    pub fn new(ctx: &VisualContext<'_>, scale: i32, filter: TextureFilter, sprites: SpriteReconstruction, dithering: bool, precision: ColourPrecision) -> Result<Self> {
         let gl = ctx.gl;
         let high_precision = precision == ColourPrecision::High;
+        let reconstruct_sprites = sprites != SpriteReconstruction::Original;
+        let mmpx_sprites = sprites == SpriteReconstruction::Mmpx;
+        let bicubic_sprites = sprites == SpriteReconstruction::Bicubic;
+        let super_sprites = sprites == SpriteReconstruction::SuperXbr3p;
         let format = if high_precision { glow::R32UI } else { glow::R16UI };
         unsafe {
             let limit = gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE);
@@ -58,11 +67,15 @@ impl Enhanced {
                 fbos.push(fbo_read);
                 let stage = texture(gl, glow::R16UI, 1024, 512)?;
                 textures.push(stage);
-                let triangle = format!("const bool SMOOTH_3D = {};\n{TEXTURE_FILTER}\n{TRIANGLE}", filter == TextureFilter::Smooth3D);
+                let triangle = format!(
+                    "const bool SMOOTH_3D = {};\nconst bool RECONSTRUCT_SPRITES = {reconstruct_sprites};\nconst bool MMPX_SPRITES = {mmpx_sprites};\nconst bool BICUBIC_SPRITES = {bicubic_sprites};\nconst bool SUPER_SPRITES = {super_sprites};\nconst bool HIGH_PRECISION = {high_precision};\n{TEXTURE_FILTER}\n{SPRITE_MMPX}\n{SPRITE_BICUBIC}\n{SPRITE_SUPER}\n{SPRITE_XBR}\n{TRIANGLE}",
+                    filter == TextureFilter::Smooth3D,
+                );
                 let fragment = shaders::draw_fs_with(&DrawShader {
                     colour: if high_precision { HIGH_COLOUR } else { shaders::NATIVE_COLOUR },
                     triangle: &triangle,
                     triangle_fn: "enhanced_triangle",
+                    rect_fn: "enhanced_rect",
                     position: "int px = hp.x / u_scale, py = hp.y / u_scale;",
                     destination: "texelFetch(u_dest, hp, 0).r",
                     copy_source: "texelFetch(u_dest, ivec2((int(m.x) + i) & 1023, (int(m.y) + j) & 511) * u_scale + hp % u_scale, 0).r",
@@ -75,6 +88,12 @@ impl Enhanced {
                         return Err(e);
                     }
                 };
+                let mut super_xbr = if super_sprites {
+                    match super_xbr::Pipeline::new(gl) {
+                        Ok(p) => Some(p),
+                        Err(e) => { raster.destroy(gl); presenter.destroy(gl); return Err(e); }
+                    }
+                } else { None };
                 for f in [fbo_draw, fbo_read] {
                     if high_precision {
                         // A blit cannot expand RGB5/mask into RGB8/mask. Import
@@ -94,12 +113,15 @@ impl Enhanced {
                 if gl.get_error() != glow::NO_ERROR {
                     raster.destroy(gl);
                     presenter.destroy(gl);
+                    if let Some(p) = super_xbr.take() { p.destroy(gl); }
                     anyhow::bail!("allocating {scale}× rendering failed");
                 }
                 Ok(Self {
                     scale,
                     dithering,
                     high_precision,
+                    reconstruct_sprites,
+                    super_xbr,
                     draw,
                     read,
                     fbo_draw,
@@ -111,6 +133,7 @@ impl Enhanced {
                     scratch: Vec::new(),
                     stats: Stats::default(),
                     dirty: None,
+                    dirty_regions: Vec::new(),
                 })
             })();
             if result.is_err() {
@@ -125,7 +148,12 @@ impl Enhanced {
         }
     }
 
-    fn draw_records(&mut self, ctx: &VisualContext<'_>, words: &mut Vec<u32>, n: usize) {
+    fn draw_records(&mut self, ctx: &VisualContext<'_>, words: &mut Vec<u32>, n: usize) -> Result<()> {
+        if self.super_xbr.is_some() { return self.draw_super_records(ctx, words, n); }
+        self.draw_batched_records(ctx, words, 0..n, None)
+    }
+
+    fn draw_batched_records(&mut self, ctx: &VisualContext<'_>, words: &mut Vec<u32>, range: std::ops::Range<usize>, source: Option<glow::Texture>) -> Result<()> {
         let gl = ctx.gl;
         self.raster.bind(
             gl,
@@ -134,9 +162,10 @@ impl Enhanced {
             ctx.state,
             RasterTarget { framebuffer: self.fbo_draw, scale: self.scale, destination: Some(self.read) },
         );
-        let mut start = 0;
-        while start < n {
-            let m = PER_DRAW.min(n - start);
+        if let Some(source) = source { self.super_xbr.as_ref().unwrap().bind(gl, source); }
+        let mut start = range.start;
+        while start < range.end {
+            let m = PER_DRAW.min(range.end - start);
             self.raster.upload(gl, words, start, m);
             let mut run = 0;
             for i in 0..m {
@@ -155,6 +184,30 @@ impl Enhanced {
             self.stats.draws += 1;
             start += m;
         }
+        Ok(())
+    }
+
+    fn draw_super_records(&mut self, ctx: &VisualContext<'_>, words: &mut Vec<u32>, n: usize) -> Result<()> {
+        fn key(rec: &[u32]) -> Option<[u32;10]> {
+            (rec[2]&4 != 0 && rec[8]<=rec[10] && rec[9]<=rec[11]).then(|| super_xbr::Pipeline::key(rec))
+        }
+        let mut start = 0;
+        while start < n {
+            let rec = &words[start*WORDS..(start+1)*WORDS];
+            let selected = key(rec);
+            let source = {
+                let p = self.super_xbr.as_mut().unwrap();
+                if selected.is_some() { p.prepare(ctx, rec)? } else { p.dummy() }
+            };
+            let mut end = start+1;
+            while end < n && key(&words[end*WORDS..(end+1)*WORDS]) == selected { end += 1; }
+            // Restore full batching for ordinary geometry and adjacent sprites
+            // sharing a processed source. The existing hazard splitter remains
+            // authoritative when a primitive reads the visual destination.
+            self.draw_batched_records(ctx, words, start..end, Some(source))?;
+            start = end;
+        }
+        Ok(())
     }
 
     fn needs_sync(&self, rec: &[u32]) -> bool {
@@ -163,7 +216,10 @@ impl Enhanced {
         if kind == setup::COPY {
             return true;
         }
-        let reads_dest =
+        // Reconstructed cutout edges read the visual background even for
+        // otherwise opaque primitives. Keep their coverage composites ordered.
+        let sprite_coverage = self.reconstruct_sprites && rec[2] & 4 != 0;
+        let reads_dest = sprite_coverage ||
             if kind == setup::UPLOAD { rec[18] & 2 != 0 } else { rec[0] & (prim::SEMI | prim::MASK_CHECK) != 0 };
         let b = &rec[8..12];
         reads_dest
@@ -173,6 +229,10 @@ impl Enhanced {
             && d[2] >= b[0] as i32
             && d[1] <= b[3] as i32
             && d[3] >= b[1] as i32
+            && self.dirty_regions.iter().any(|r| {
+                r[0] <= b[2] as i32 && r[2] >= b[0] as i32
+                    && r[1] <= b[3] as i32 && r[3] >= b[1] as i32
+            })
     }
 
     fn written(&mut self, rec: &[u32]) {
@@ -182,10 +242,30 @@ impl Enhanced {
         }
         let b = [b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32];
         self.dirty = Some(self.dirty.map_or(b, |d| [d[0].min(b[0]), d[1].min(b[1]), d[2].max(b[2]), d[3].max(b[3])]));
+        let mut region = b;
+        while let Some(&last) = self.dirty_regions.last() {
+            let contains = (last[0] <= region[0] && last[1] <= region[1] && last[2] >= region[2] && last[3] >= region[3])
+                || (region[0] <= last[0] && region[1] <= last[1] && region[2] >= last[2] && region[3] >= last[3]);
+            let same_rows = last[1] == region[1] && last[3] == region[3]
+                && last[0] <= region[2]+1 && region[0] <= last[2]+1;
+            let same_columns = last[0] == region[0] && last[2] == region[2]
+                && last[1] <= region[3]+1 && region[1] <= last[3]+1;
+            if !(contains || same_rows || same_columns) { break; }
+            self.dirty_regions.pop();
+            region = [last[0].min(region[0]),last[1].min(region[1]),last[2].max(region[2]),last[3].max(region[3])];
+        }
+        if self.dirty_regions.len() == 64 {
+            // Bound tracking cost on fragmented workloads. Falling back to the
+            // old union can add copies, but never misses a required dependency.
+            self.dirty_regions.clear();
+            region = self.dirty.unwrap();
+        }
+        self.dirty_regions.push(region);
     }
 
     fn sync(&mut self, gl: &glow::Context) {
         let Some([x0, y0, x1, y1]) = self.dirty.take() else { return };
+        self.dirty_regions.clear();
         let s = self.scale;
         unsafe {
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_draw));
@@ -212,6 +292,10 @@ impl VisualRenderer for Enhanced {
     fn execute(&mut self, ctx: &VisualContext<'_>, command: Command<'_>) -> Result<()> {
         match command {
             Command::Draw(recs) => {
+                // Internal serial feedback updates canonical read VRAM between
+                // clipped-row callbacks without an explicit visual SYNC event.
+                let row = ctx.state.clip.y0 == ctx.state.clip.y1;
+                if row { if let Some(p) = &mut self.super_xbr { p.invalidate_all(); } }
                 let n = recs.len() / PRIM_WORDS;
                 let mut scratch = std::mem::take(&mut self.scratch);
                 scratch.clear();
@@ -222,13 +306,14 @@ impl VisualRenderer for Enhanced {
                         scratch[i * WORDS] &= !prim::DITHER;
                     }
                 }
-                self.draw_records(ctx, &mut scratch, n);
+                self.draw_records(ctx, &mut scratch, n)?;
+                if row { if let Some(p) = &mut self.super_xbr { p.invalidate_all(); } }
                 self.scratch = scratch;
             }
             Command::Fill { rect, color } => {
                 let mut rec = vec![0; WORDS];
                 setup::fill(rect.x, rect.y, rect.w, rect.h, color, &mut rec);
-                self.draw_records(ctx, &mut rec, 1);
+                self.draw_records(ctx, &mut rec, 1)?;
             }
             Command::Upload { rect, mask, pixels } => {
                 if !self.staged.fits(rect) {
@@ -240,8 +325,10 @@ impl VisualRenderer for Enhanced {
             Command::Copy { src_x, src_y, dst_x, dst_y, w, h, mask } => {
                 let mut rec = vec![0; WORDS];
                 setup::copy((src_x, src_y), (dst_x, dst_y), w, h, mask, &mut rec);
-                self.draw_records(ctx, &mut rec, 1);
+                self.draw_records(ctx, &mut rec, 1)?;
             }
+            Command::Sync(rects) => { if let Some(p) = &mut self.super_xbr { p.sync(rects); } }
+            Command::ClutLoad { slot, x, y, count } => { if let Some(p) = &mut self.super_xbr { p.load_clut(slot,x,y,count); } }
             _ => {}
         }
         Ok(())
@@ -251,7 +338,7 @@ impl VisualRenderer for Enhanced {
         if self.staged.count != 0 {
             let mut staged = std::mem::take(&mut self.staged);
             staged.upload(ctx.gl, self.stage);
-            self.draw_records(ctx, &mut staged.records, staged.count);
+            self.draw_records(ctx, &mut staged.records, staged.count)?;
             staged.clear();
             self.staged = staged;
         }
@@ -266,6 +353,8 @@ impl VisualRenderer for Enhanced {
             }
         }
         self.dirty = None;
+        self.dirty_regions.clear();
+        if let Some(p) = &mut self.super_xbr { p.reset(); }
         self.staged.clear();
         self.presenter.reset(ctx.gl);
     }
@@ -278,10 +367,12 @@ impl VisualRenderer for Enhanced {
     }
 
     fn take_stats(&mut self) -> Stats {
+        if let Some(p) = &mut self.super_xbr { self.stats.include(p.take_stats()); }
         std::mem::take(&mut self.stats)
     }
 
     fn destroy(&mut self, gl: &glow::Context) {
+        if let Some(p) = self.super_xbr.take() { p.destroy(gl); }
         self.raster.destroy(gl);
         self.presenter.destroy(gl);
         unsafe {
@@ -299,6 +390,20 @@ impl VisualRenderer for Enhanced {
 fn primitive(rec: &[u32], clip: &Clip, out: &mut [u32]) {
     setup::primitive(rec, clip, out);
     let kind = rec[0] & prim::KIND_MASK;
+    if kind == prim::RECT && rec[0] & prim::TEXTURED != 0 {
+        // A non-wrapping rectangle has a known texel footprint, independent
+        // of drawing-area clipping. Reuse the quad bounds slot for xBR.
+        let (w, h) = ((rec[4] & 0xffff) as i32, (rec[4] >> 16) as i32);
+        let mut u = (rec[6] & 255) as i32;
+        let v = ((rec[6] >> 8) & 255) as i32;
+        let du = if rec[0] & prim::FLIP_X != 0 { u |= 1; -1 } else { 1 };
+        let dv = if rec[0] & prim::FLIP_Y != 0 { -1 } else { 1 };
+        let (ue, ve) = (u + (w - 1) * du, v + (h - 1) * dv);
+        if w > 0 && h > 0 && (0..256).contains(&ue) && (0..256).contains(&ve) {
+            out[2] |= 4;
+            out[24..28].copy_from_slice(&[u.min(ue) as u32, v.min(ve) as u32, u.max(ue) as u32, v.max(ve) as u32]);
+        }
+    }
     if kind != prim::TRIANGLE && kind != prim::QUAD {
         return;
     }
@@ -393,6 +498,13 @@ uint shade(uint r, uint g, uint b, bool dither, int d) {
 // are excluded and weights renormalized, avoiding black fringes and new holes.
 const TEXTURE_FILTER: &str = r#"
 vec3 rgb5(uint t) { return vec3(t & 31u, (t >> 5) & 31u, (t >> 10) & 31u); }
+uint sprite_texel(ivec2 p, vec2 lo, vec2 hi, uint flags, uvec4 h0, uvec4 tw) {
+    p = ivec2(clamp(vec2(p), lo, hi));
+    return texel(uint(p.x) & 255u, uint(p.y) & 255u, flags, tw, h0.y >> 16);
+}
+vec3 visual_rgb(uint p) {
+    return HIGH_PRECISION ? vec3(p & 255u, (p >> 8) & 255u, (p >> 16) & 255u) : rgb5(p)*8.0;
+}
 void polygon_surface(vec2 at, vec2 lo, vec2 hi, uvec3 color, uint flags, uvec4 h0, uvec4 tw, int d,
                      inout uint dst, inout bool wrote) {
     ivec2 nearest = ivec2(floor(at + 0.5));
@@ -423,6 +535,11 @@ void polygon_surface(vec2 at, vec2 lo, vec2 hi, uvec3 color, uint flags, uvec4 h
     plot(t, true, flags, dst, wrote);
 }
 "#;
+
+const SPRITE_MMPX: &str = include_str!("sprite_mmpx.glsl");
+const SPRITE_BICUBIC: &str = include_str!("sprite_bicubic.glsl");
+const SPRITE_SUPER: &str = include_str!("super_xbr/jinc.glsl");
+const SPRITE_XBR: &str = include_str!("sprite_xbr.glsl");
 
 const TRIANGLE: &str = r#"
 float edge(vec2 a, vec2 b, vec2 p) {
@@ -458,16 +575,28 @@ void enhanced_triangle(int b, int px, int py, uint flags, uvec4 h0, uvec4 tw, in
     vec3 color = clamp(floor(rgb(va.z) * w.x + rgb(vb.z) * w.y + rgb(vc.z) * w.z + 0.5), 0.0, 255.0);
     vec2 ta = uv(va.w), tb = uv(vb.w), tc = uv(vc.w);
     vec2 t = ta * w.x + tb * w.y + tc * w.z;
+    vec2 dx = (ta * (bb.y - c.y) + tb * (c.y - a.y) + tc * (a.y - bb.y)) / area;
+    vec2 dy = (ta * (c.x - bb.x) + tb * (a.x - c.x) + tc * (bb.x - a.x)) / area;
     vec2 lo = min(ta, min(tb, tc)), hi = max(ta, max(tb, tc));
     if ((h0.z & 4u) != 0u) {
         // Centre the subpixel samples around the native sprite pixel, rather
         // than shifting texel boundaries halfway into the preceding pixel.
-        vec2 q = p + vec2(0.5 / float(u_scale) - 0.5);
+        vec2 q = p + vec2(0.5 / float(u_scale) - (RECONSTRUCT_SPRITES ? 0.0 : 0.5));
         vec3 tex_w = vec3(edge(bb, c, q), edge(c, a, q), edge(a, bb, q)) / area;
         uvec4 bounds = T(6);
         lo = vec2(bounds.xy); hi = vec2(bounds.zw);
-        t = clamp(ta * tex_w.x + tb * tex_w.y + tc * tex_w.z, lo, hi);
+        t = ta * tex_w.x + tb * tex_w.y + tc * tex_w.z;
+        // Sprite filters' half-texel offset is in texture space, not screen space.
+        // Scaling it by a billboard's screen/UV ratio shifts tiny features.
+        // Clamp taps rather than the fractional phase at the footprint edges.
+        if (RECONSTRUCT_SPRITES) t -= 0.5 * sign(dx + dy);
+        else t = clamp(t, lo, hi);
     }
-    polygon_surface(t, lo, hi, uvec3(color), flags, h0, tw, dither_at(px, py), dst, wrote);
+    if (RECONSTRUCT_SPRITES && (h0.z & 4u) != 0u) {
+        vec2 footprint_xy = (abs(dx) + abs(dy)) / float(u_scale);
+        sprite_surface(t, lo, hi, max(footprint_xy.x, footprint_xy.y), uvec3(color), flags, h0, tw, dither_at(px, py), dst, wrote);
+    } else {
+        polygon_surface(t, lo, hi, uvec3(color), flags, h0, tw, dither_at(px, py), dst, wrote);
+    }
 }
 "#;

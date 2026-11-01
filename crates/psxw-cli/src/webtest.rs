@@ -832,6 +832,7 @@ pub fn run(ws: &Workspace, args: &[&str]) -> Result<bool> {
     for f in ["gpu.html", "gpu.js"] {
         std::fs::copy(ws.root.join("web/test").join(f), bundle.join(f))?;
     }
+    std::fs::copy(ws.root.join("web/rendering.js"), bundle.join("rendering.js"))?;
     std::fs::write(bundle.join("vectors.bin"), encode(&vs))?;
     let results = ws.out_dir().join("web").join("test-gpu-results");
     let _ = std::fs::remove_dir_all(&results);

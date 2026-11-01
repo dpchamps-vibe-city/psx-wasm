@@ -5,7 +5,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod web {
-    use psx_render_gl::{Renderer, visual::{ColourPrecision, TextureFilter, VisualPreset}};
+    use psx_render_gl::{Renderer, visual::{ColourPrecision, SpriteReconstruction, TextureFilter, VisualPreset}};
     use psxw_abi::render::{PresentDesc, Rect, op};
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -54,10 +54,12 @@ mod web {
             self.r.resolution_scale()
         }
 
-        /// Built-in host style (0 = Original, 1 = Clean Polygons), with its
+        /// Built-in host style (0 = Original, 1 = PSXRevamp), with its
         /// resolution, textures (0 = nearest, 1 = smooth), dithering (0 = original,
-        /// 1 = off), and colour precision (0 = native RGB5, 1 = visual RGB8).
-        pub fn set_visual_options(&mut self, style: u32, scale: u32, textures: u32, dithering: u32, precision: u32) -> Result<(), JsValue> {
+        /// 1 = off), colour precision (0 = native RGB5, 1 = visual RGB8), and
+        /// optional sprite reconstruction (0 = original, 1 = xBR, 2 = MMPX,
+        /// 3 = bicubic Catmull–Rom, 4 = Super-xBR 3p + Jinc2-sharper).
+        pub fn set_visual_options(&mut self, style: u32, scale: u32, textures: u32, dithering: u32, precision: u32, sprites: Option<u32>) -> Result<(), JsValue> {
             let textures = match textures {
                 0 => TextureFilter::Nearest,
                 1 => TextureFilter::Smooth3D,
@@ -73,10 +75,18 @@ mod web {
                 1 => ColourPrecision::High,
                 _ => return Err(js("unknown colour precision")),
             };
+            let sprites = match sprites.unwrap_or(0) {
+                0 => SpriteReconstruction::Original,
+                1 => SpriteReconstruction::Xbr,
+                2 => SpriteReconstruction::Mmpx,
+                3 => SpriteReconstruction::Bicubic,
+                4 => SpriteReconstruction::SuperXbr3p,
+                _ => return Err(js("unknown sprite reconstruction")),
+            };
             let preset = match style {
-                0 if scale == 1 && textures == TextureFilter::Nearest && dithering && precision == ColourPrecision::Native => VisualPreset::Native,
+                0 if scale == 1 && textures == TextureFilter::Nearest && dithering && precision == ColourPrecision::Native && sprites == SpriteReconstruction::Original => VisualPreset::Native,
                 0 => return Err(js("Original rendering has no visual enhancements")),
-                1 => VisualPreset::CleanPolygons { scale, textures, dithering, precision },
+                1 => VisualPreset::PsxRevamp { scale, textures, sprites, dithering, precision },
                 _ => return Err(js("unknown visual renderer")),
             };
             self.r.set_visual_preset(preset).map_err(js)

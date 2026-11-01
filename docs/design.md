@@ -883,7 +883,7 @@ a call into guest code.
       synchronous `readPixels`, which is fine in the worker. `MoveImage` (13
       sites) is a GPU-side copy.
     - **Exactness.** Game-visible VRAM is always the exact 1× engine. An
-      optional host-only visual renderer (Clean Polygons, up to 4×) draws
+      optional host-only visual renderer (PSXRevamp, up to 4×) draws
       presentation separately and never answers game reads. The
       remaining inexactness is 1-pixel rasterization differences on edges,
       which only presentation sees.

@@ -17,6 +17,7 @@
 //! VRAM engine alone supplies game readbacks and canonical texture/CLUT data.
 
 mod enhanced;
+mod super_xbr;
 mod presentation;
 mod raster;
 pub mod visual;
@@ -32,7 +33,7 @@ use glow::HasContext;
 use psxw_abi::render::{self, Command, PRIM_WORDS, PresentDesc};
 use setup::{Clip, WORDS};
 use raster::{PER_DRAW, RasterPass, RasterTarget, UploadBatch};
-use visual::{CanonicalVram, ColourPrecision, DrawState, TextureFilter, VisualContext, VisualFrame, VisualPreset, VisualRenderer};
+use visual::{CanonicalVram, ColourPrecision, DrawState, SpriteReconstruction, TextureFilter, VisualContext, VisualFrame, VisualPreset, VisualRenderer};
 
 /// Version of this backend, for reports.
 pub const BACKEND_VERSION: &str = concat!("psx-render-gl ", env!("CARGO_PKG_VERSION"), " render-v1");
@@ -247,7 +248,7 @@ impl Renderer {
         self.set_visual_preset(if scale == 1 {
             VisualPreset::Native
         } else {
-            VisualPreset::CleanPolygons { scale, textures: TextureFilter::Nearest, dithering: true, precision: ColourPrecision::Native }
+            VisualPreset::PsxRevamp { scale, textures: TextureFilter::Nearest, sprites: SpriteReconstruction::Original, dithering: true, precision: ColourPrecision::Native }
         })
     }
 

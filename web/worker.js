@@ -239,8 +239,8 @@ async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, re
     if (requested === appliedSettings) return;
     let error;
     try {
-      const { style, scale, textures, dithering, precision } = unpackRenderSettings(requested);
-      renderer.set_visual_options(style, scale, textures, dithering, precision);
+      const { style, scale, textures, dithering, precision, sprites } = unpackRenderSettings(requested);
+      renderer.set_visual_options(style, scale, textures, dithering, precision, sprites);
       appliedSettings = requested;
     } catch (e) {
       error = `rendering change failed: ${e.message || e}`;

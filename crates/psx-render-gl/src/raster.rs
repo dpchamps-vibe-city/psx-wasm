@@ -99,7 +99,7 @@ impl RasterPass {
                 }
             };
             gl.use_program(Some(p));
-            for (name, unit) in [("u_vram", 0), ("u_prims", 1), ("u_clut", 2), ("u_stage", 3), ("u_dest", 4)] {
+            for (name, unit) in [("u_vram", 0), ("u_prims", 1), ("u_clut", 2), ("u_stage", 3), ("u_dest", 4), ("u_super", 5)] {
                 gl.uniform_1_i32(gl.get_uniform_location(p, name).as_ref(), unit);
             }
             Ok(Self {

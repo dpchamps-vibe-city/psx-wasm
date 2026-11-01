@@ -12,11 +12,24 @@ use psxw_abi::render::{Command, PresentDesc};
 
 use crate::{Stats, enhanced::Enhanced, presentation::Presenter, setup::Clip};
 
-/// Texture sampling in the Clean Polygons renderer. Rectangles stay nearest.
+/// General polygon texture sampling in PSXRevamp. Sprite reconstruction is independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureFilter {
     Nearest,
     Smooth3D,
+}
+
+/// Reconstruction of textured rectangles and axis-aligned screen/UV quads.
+/// This is a geometry-based selection, not semantic character/UI detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteReconstruction {
+    Original,
+    Xbr,
+    Mmpx,
+    /// Catmull–Rom colour/coverage interpolation with local anti-ringing bounds.
+    Bicubic,
+    /// Three offscreen Super-xBR stages followed by Jinc2-sharper resampling.
+    SuperXbr3p,
 }
 
 /// Colour storage/arithmetic in the visual renderer, never canonical VRAM.
@@ -31,14 +44,14 @@ pub enum ColourPrecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisualPreset {
     Native,
-    CleanPolygons { scale: u32, textures: TextureFilter, dithering: bool, precision: ColourPrecision },
+    PsxRevamp { scale: u32, textures: TextureFilter, sprites: SpriteReconstruction, dithering: bool, precision: ColourPrecision },
 }
 
 impl VisualPreset {
     pub fn resolution_scale(self) -> u32 {
         match self {
             Self::Native => 1,
-            Self::CleanPolygons { scale, .. } => scale,
+            Self::PsxRevamp { scale, .. } => scale,
         }
     }
 }
@@ -133,9 +146,9 @@ pub trait VisualRenderer {
 pub(crate) fn create(ctx: &VisualContext<'_>, preset: VisualPreset) -> Result<Box<dyn VisualRenderer>> {
     match preset {
         VisualPreset::Native => Ok(Box::new(Native { presenter: Presenter::new(ctx.gl)? })),
-        VisualPreset::CleanPolygons { scale, textures, dithering, precision } => {
+        VisualPreset::PsxRevamp { scale, textures, sprites, dithering, precision } => {
             ensure!(matches!(scale, 1 | 2 | 4), "resolution scale must be 1, 2 or 4");
-            Ok(Box::new(Enhanced::new(ctx, scale as i32, textures, dithering, precision)?))
+            Ok(Box::new(Enhanced::new(ctx, scale as i32, textures, sprites, dithering, precision)?))
         }
     }
 }

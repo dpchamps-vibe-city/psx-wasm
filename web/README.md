@@ -29,10 +29,11 @@ The **Rendering** panel selects a visual renderer and groups each renderer's own
 configuration. Settings change live and are remembered in this browser:
 
 - **Original:** native PS1 pixels, without visual enhancements.
-- **Clean Polygons:** subpixel polygon coverage and colour/UV interpolation,
+- **PSXRevamp:** subpixel polygon coverage and colour/UV interpolation,
   with independent **1× / 2× / 4× internal resolution**, **Nearest / Smooth 3D
-  texture sampling**, **Original / Off dithering**, and **Native (15-bit) / High
-  (24-bit) colour precision** controls. Defaults retain the previous appearance.
+  texture sampling**, **Original / xBR / MMPX / Bicubic / Super-xBR 3p sprite reconstruction**, **Original / Off
+  dithering**, and **Native (15-bit) / High (24-bit) colour precision** controls.
+  Defaults retain the previous appearance. Previously named Clean Polygons.
 
 Smooth 3D bilinearly filters polygon textures after decoding their palette colours.
 Nearest sampling still controls transparent holes and mask/blend classification;
@@ -43,6 +44,41 @@ sprite-tile seams and shifted transparent cutouts at 2×/4×, including mirrored
 and rotated UVs. Rectangles and lines stay crisp. Some games draw UI or sprites using polygons; those are filtered too,
 since the renderer commands cannot distinguish their purpose.
 
+**Sprite reconstruction xBR** replaces ordinary sampling for magnified textured
+rectangles and axis-aligned screen/UV quads. It reconstructs internal colour
+transitions and transparent silhouettes using xBR-lv2's conservative corner C
+and small-detail preservation. Fractional coverage composites over the enhanced
+scene without black fringes; masks and PSX semitransparency remain independent.
+Other polygons keep the Texture sampling setting. Original retains the existing
+behaviour, and unmagnified sprites stay crisp. This is geometry-based selection,
+not character detection: it can affect text, UI and tiled artwork too. xBR remains
+a stylistic reconstruction, not recovery of missing detail.
+
+**Sprite reconstruction MMPX** is a separate alternative: it preserves palette
+colours, transparency and small features without interpolating new colours. A
+single 2× MMPX result is nearest-scaled to the selected output size (not repeated
+MMPX passes at 4×). It uses the same geometry selection as xBR and leaves other
+polygon texture sampling unchanged. Expect a more pixel-art-like result rather
+than xBR's smooth colour reconstruction; visual preference still depends on the
+artwork.
+
+**Sprite reconstruction Bicubic** uses Catmull–Rom interpolation for smoothly
+varying colours and transparent edges without pattern-based shape reconstruction.
+It filters premultiplied colour/coverage and bounds the result to nearby samples
+to suppress ringing and black fringes. It applies to the same sprite-like geometry,
+independently of the polygon Texture sampling setting. Original, xBR and MMPX
+remain available for direct visual comparison.
+
+**Sprite reconstruction Super-xBR 3p** uses the complete three-stage reconstruction/
+smoothing pipeline followed by Jinc2-sharper resampling, applied to sprite textures,
+not the finished frame. Processed tiles are retained across draws and frames until
+native source changes invalidate them. Palette snapshot identities allow reuse
+across rotating CLUT slots and unchanged reloads; canonical table loads still run.
+The cache is bounded
+to 16 MiB, plus reusable intermediates; ordinary polygons retain batching and their
+Texture sampling setting. This is a higher-cost option, not a guaranteed frame-time
+improvement. Its Jinc component is GPL-2.0-or-later; see the [source notices](../crates/psx-render-gl/src/super_xbr/README.md).
+
 **Dithering Off + High colour precision** is recommended for a cleaner image.
 Off removes the renderer's native 4×4 colour stippling, not dithering already
 baked into texture artwork. High stores eight bits per channel through visual
@@ -52,12 +88,13 @@ contents expand exactly (31 to 248). Original dithering remains independently
 available in High mode, applying the same offsets before eight-bit quantization.
 This is colour precision, not a higher-precision GTE or replacement texture pack.
 
-Query overrides: `?renderer=native` or `?renderer=clean-polygons`, `?scale=1|2|4`,
-`?textures=nearest|smooth`, `?dithering=original|off`, and `?precision=native|high`.
-Without an explicit renderer, `?scale=1` selects Original, while `?scale=2|4`,
-`?textures=smooth`, `?dithering=off` or `?precision=high` select Clean Polygons.
-The old dropdown preference is migrated automatically; existing panel preferences
-keep Original dithering and Native precision until changed.
+Query overrides: `?renderer=native` or `?renderer=psx-revamp`, `?scale=1|2|4`,
+`?textures=nearest|smooth`, `?sprites=original|xbr|mmpx|bicubic|super-xbr-3p`, `?dithering=original|off`, and
+`?precision=native|high`. Without an explicit renderer, `?scale=1` selects Original,
+while `?scale=2|4`, `?textures=smooth`, `?sprites=xbr|mmpx|bicubic|super-xbr-3p`, `?dithering=off` or
+`?precision=high` select PSXRevamp. The `clean-polygons` renderer query remains an
+alias and saved preferences migrate automatically. Existing preferences default
+to Original sprite reconstruction until changed.
 
 These are host-only visual effects, not a screen blur or guest GPU setting.
 Native VRAM, CPU readbacks and hashes remain unchanged. The visual colour plane

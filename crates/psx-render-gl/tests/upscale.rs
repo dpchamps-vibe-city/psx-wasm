@@ -1,6 +1,6 @@
 #![cfg(feature = "headless")]
 
-use psx_render_gl::{Frame, Renderer, headless::Headless, visual::{ColourPrecision, TextureFilter, VisualPreset}};
+use psx_render_gl::{Frame, Renderer, headless::Headless, visual::{ColourPrecision, SpriteReconstruction, TextureFilter, VisualPreset}};
 use psxw_abi::render::{self, PresentDesc, header, op, pack_xy, prim};
 
 fn command(out: &mut Vec<u32>, opcode: u8, payload: &[u32]) {
@@ -150,7 +150,7 @@ fn enhanced_hazards_copies_masks_video_and_switching_are_host_local() {
         (1, ColourPrecision::Native), (2, ColourPrecision::Native), (4, ColourPrecision::Native),
         (1, ColourPrecision::High), (2, ColourPrecision::High), (4, ColourPrecision::High),
     ] {
-        r.set_visual_preset(VisualPreset::CleanPolygons { scale, textures: TextureFilter::Nearest, dithering: true, precision }).unwrap();
+        r.set_visual_preset(VisualPreset::PsxRevamp { scale, textures: TextureFilter::Nearest, sprites: SpriteReconstruction::Original, dithering: true, precision }).unwrap();
         r.reset_vram();
         r.execute(&stream).unwrap();
         let native = r.read_vram(0, 0, 1024, 512);
@@ -241,7 +241,7 @@ fn smooth_polygon_textures_decode_palettes_preserve_transparency_and_leave_sprit
                 for scale in [1, 2, 4] {
                     let mut nearest = None;
                     for textures in [TextureFilter::Nearest, TextureFilter::Smooth3D] {
-                        let preset = VisualPreset::CleanPolygons { scale, textures, dithering: true, precision: ColourPrecision::Native };
+                        let preset = VisualPreset::PsxRevamp { scale, textures, sprites: SpriteReconstruction::Original, dithering: true, precision: ColourPrecision::Native };
                         r.set_visual_preset(preset).unwrap();
                         assert_eq!(r.visual_preset(), Some(preset));
                         // Reconfiguration must not reset native memory.
@@ -263,7 +263,7 @@ fn smooth_polygon_textures_decode_palettes_preserve_transparency_and_leave_sprit
                         } else {
                             nearest = Some(f);
                         }
-                        assert!(r.set_visual_preset(VisualPreset::CleanPolygons { scale: 3, textures, dithering: true, precision: ColourPrecision::Native }).is_err());
+                        assert!(r.set_visual_preset(VisualPreset::PsxRevamp { scale: 3, textures, sprites: SpriteReconstruction::Original, dithering: true, precision: ColourPrecision::Native }).is_err());
                         assert_eq!(r.visual_preset(), Some(preset));
                     }
                 }
@@ -295,7 +295,7 @@ fn dithering_and_colour_precision_are_independent_visual_options() {
     let native = r.read_vram(0, 0, 32, 32);
     for precision in [ColourPrecision::Native, ColourPrecision::High] {
         for dithering in [true, false] {
-            r.set_visual_preset(VisualPreset::CleanPolygons { scale: 4, textures: TextureFilter::Nearest, dithering, precision }).unwrap();
+            r.set_visual_preset(VisualPreset::PsxRevamp { scale: 4, textures: TextureFilter::Nearest, sprites: SpriteReconstruction::Original, dithering, precision }).unwrap();
             // R32UI seeding must expand native words rather than blit their bits.
             let seeded = present(&mut r, PresentDesc::ENABLED);
             for (x, y) in [(4, 4), (5, 4), (19, 3)] {
@@ -359,7 +359,7 @@ fn tiled_sprite_quads_keep_pixel_centres_and_never_sample_atlas_gutters() {
         for scale in [1, 2, 4] {
             for textures in [TextureFilter::Nearest, TextureFilter::Smooth3D] {
                 for precision in [ColourPrecision::Native, ColourPrecision::High] {
-                    r.set_visual_preset(VisualPreset::CleanPolygons { scale, textures, dithering: false, precision }).unwrap();
+                    r.set_visual_preset(VisualPreset::PsxRevamp { scale, textures, sprites: SpriteReconstruction::Original, dithering: false, precision }).unwrap();
                     r.reset_vram();
                     r.execute(&stream).unwrap();
                     assert_eq!(r.read_vram(0, 0, 32, 32), native);

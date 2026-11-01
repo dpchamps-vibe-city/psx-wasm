@@ -3,14 +3,17 @@
 const STYLES = [
   { id: "native", wire: 0, name: "Original", note: "Native PS1 pixels, without visual enhancements.", options: [] },
   {
-    id: "clean-polygons", wire: 1, name: "Clean Polygons",
-    note: "Sharper polygon edges and subpixel colour/UV interpolation. Game-visible VRAM stays native.",
+    id: "psx-revamp", wire: 1, name: "PSXRevamp",
+    note: "Sharper polygons, smoother textures and optional sprite reconstruction. Game-visible VRAM stays native.",
     options: [
       { key: "scale", id: "resolution-scale", name: "Internal resolution", initial: 2,
         choices: [[1, "1×"], [2, "2×"], [4, "4×"]] },
       { key: "textures", id: "texture-filter", name: "Texture sampling", initial: 0,
         choices: [[0, "Nearest"], [1, "Smooth 3D"]],
-        note: "Smooth filters polygon textures; rectangles stay crisp. UI drawn with polygons is filtered too." },
+        note: "Smooth filters polygon textures. Sprite reconstruction overrides sampling on qualifying primitives; otherwise rectangles stay crisp. Includes polygon-drawn UI." },
+      { key: "sprites", id: "sprite-reconstruction", name: "Sprite reconstruction", initial: 0,
+        choices: [[0, "Original"], [1, "xBR"], [2, "MMPX"], [3, "Bicubic"], [4, "Super-xBR 3p"]],
+        note: "Filters magnified textured rectangles and axis-aligned quads, including UI. xBR reconstructs shapes; MMPX preserves palette colours with a 2× pattern; Bicubic blends colours using Catmull–Rom; Super-xBR 3p uses three smoothing/reconstruction stages plus Jinc2-sharper resampling." },
       { key: "dithering", id: "colour-dithering", name: "Dithering", initial: 0,
         choices: [[0, "Original"], [1, "Off"]],
         note: "Off removes renderer-generated stippling, not patterns baked into texture artwork." },
@@ -27,7 +30,7 @@ export const NATIVE_RENDER_SETTINGS = 1;
 // edits. These are host settings, not renderer commands or a guest ABI.
 export function unpackRenderSettings(word) {
   return { style: (word >>> 8) & 255, scale: word & 255, textures: (word >>> 16) & 255,
-    dithering: (word >>> 24) & 1, precision: (word >>> 25) & 1 };
+    dithering: (word >>> 24) & 1, precision: (word >>> 25) & 1, sprites: (word >>> 26) & 7 };
 }
 
 export function createRenderingPanel(panel, params) {
@@ -37,6 +40,10 @@ export function createRenderingPanel(panel, params) {
   let selected = "native";
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (saved?.renderer === "clean-polygons") saved.renderer = "psx-revamp";
+    if (saved?.options?.["clean-polygons"] && !saved.options["psx-revamp"]) {
+      saved.options["psx-revamp"] = saved.options["clean-polygons"];
+    }
     if (saved && STYLES.some((s) => s.id === saved.renderer)) {
       selected = saved.renderer;
       for (const style of STYLES) {
@@ -49,29 +56,30 @@ export function createRenderingPanel(panel, params) {
       // Keep the old single-dropdown preference when upgrading an existing tab.
       const scale = Number(localStorage.getItem("psxw.resolutionScale"));
       if ([2, 4].includes(scale)) {
-        selected = "clean-polygons";
+        selected = "psx-revamp";
         choices[selected].scale = scale;
       }
     }
   } catch {}
   const scale = Number(params.get("scale"));
   if (params.has("scale") && [1, 2, 4].includes(scale)) {
-    choices["clean-polygons"].scale = scale;
-    selected = scale === 1 ? "native" : "clean-polygons";
+    choices["psx-revamp"].scale = scale;
+    selected = scale === 1 ? "native" : "psx-revamp";
   }
   const textures = params.get("textures");
   if (["nearest", "smooth"].includes(textures)) {
-    choices["clean-polygons"].textures = textures === "smooth" ? 1 : 0;
-    if (textures === "smooth") selected = "clean-polygons";
+    choices["psx-revamp"].textures = textures === "smooth" ? 1 : 0;
+    if (textures === "smooth") selected = "psx-revamp";
   }
-  for (const [key, values] of [["dithering", ["original", "off"]], ["precision", ["native", "high"]]]) {
+  for (const [key, values] of [["dithering", ["original", "off"]], ["precision", ["native", "high"]], ["sprites", ["original", "xbr", "mmpx", "bicubic", "super-xbr-3p"]]]) {
     const value = values.indexOf(params.get(key));
     if (value >= 0) {
-      choices["clean-polygons"][key] = value;
-      if (value === 1) selected = "clean-polygons";
+      choices["psx-revamp"][key] = value;
+      if (value > 0) selected = "psx-revamp";
     }
   }
-  if (STYLES.some((s) => s.id === params.get("renderer"))) selected = params.get("renderer");
+  const requestedStyle = params.get("renderer") === "clean-polygons" ? "psx-revamp" : params.get("renderer");
+  if (STYLES.some((s) => s.id === requestedStyle)) selected = requestedStyle;
 
   const heading = document.createElement("h2");
   heading.textContent = "Rendering";
@@ -94,7 +102,7 @@ export function createRenderingPanel(panel, params) {
     const style = STYLES.find((s) => s.id === selected);
     const config = choices[selected];
     Atomics.store(shared, 0, (config.scale || 1) | (style.wire << 8) | ((config.textures || 0) << 16)
-      | ((config.dithering || 0) << 24) | ((config.precision || 0) << 25));
+      | ((config.dithering || 0) << 24) | ((config.precision || 0) << 25) | ((config.sprites || 0) << 26));
     persist();
   }
   function render() {
@@ -150,7 +158,7 @@ export function createRenderingPanel(panel, params) {
       const changedStyle = selected !== style.id;
       selected = style.id;
       if (style.options.length) Object.assign(choices[selected], {
-        scale: config.scale, textures: config.textures, dithering: config.dithering, precision: config.precision,
+        scale: config.scale, textures: config.textures, dithering: config.dithering, precision: config.precision, sprites: config.sprites,
       });
       if (changedStyle) render();
       else for (const option of style.options) document.getElementById(option.id).value = String(choices[selected][option.key]);

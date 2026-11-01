@@ -53,6 +53,7 @@ pub(crate) struct DrawShader<'a> {
     pub colour: &'a str,
     pub triangle: &'a str,
     pub triangle_fn: &'a str,
+    pub rect_fn: &'a str,
     pub position: &'a str,
     pub destination: &'a str,
     pub copy_source: &'a str,
@@ -63,6 +64,7 @@ pub fn draw_fs() -> String {
         colour: NATIVE_COLOUR,
         triangle: "",
         triangle_fn: "triangle",
+        rect_fn: "rect",
         position: "int px = hp.x, py = hp.y;",
         destination: "vram(px, py)",
         copy_source: "vram((int(m.x) + i) & 1023, (int(m.y) + j) & 511)",
@@ -202,8 +204,6 @@ void triangle(int b, int px, int py, uint flags, uvec4 h0, uvec4 tw, inout uint 
     surface(u, v, r, g, bl, flags, h0, tw, dither_at(px, py), dst, wrote);
 }}
 
-{triangle}
-
 void rect(int px, int py, uint flags, uvec4 h0, uvec4 tw, inout uint dst, inout bool wrote) {{
     uvec4 a = T(3), t = T(4), c = T(5);
     int xs = int(a.x), xb = int(a.y), ys = int(a.z), yb = int(a.w);
@@ -215,6 +215,8 @@ void rect(int px, int py, uint flags, uvec4 h0, uvec4 tw, inout uint dst, inout 
     // Rectangles never dither.
     surface(u, v, c.x & 0xFFu, (c.x >> 8) & 0xFFu, (c.x >> 16) & 0xFFu, flags & ~DITHER, h0, tw, 0, dst, wrote);
 }}
+
+{triangle}
 
 void line(int px, int py, uint flags, inout uint dst, inout bool wrote) {{
     if (px < u_clip.x || px > u_clip.z) return;
@@ -270,7 +272,7 @@ void main() {{
         {triangle_fn}(3, px, py, flags, h0, tw, dst, wrote);
         if (kind == QUAD) {triangle_fn}(14, px, py, flags, h0, tw, dst, wrote);
     }} else if (kind == RECT) {{
-        rect(px, py, flags, h0, T(1), dst, wrote);
+        {rect_fn}(px, py, flags, h0, T(1), dst, wrote);
     }} else if (kind == LINE) {{
         line(px, py, flags, dst, wrote);
     }} else {{
@@ -300,6 +302,7 @@ void main() {{
         colour = shader.colour,
         triangle = shader.triangle,
         triangle_fn = shader.triangle_fn,
+        rect_fn = shader.rect_fn,
         position = shader.position,
         destination = shader.destination,
         copy_source = shader.copy_source,
