@@ -53,7 +53,7 @@
 //   run's log lines; they come back in the `hashes` message, in the
 //   native host's shapes.
 //
-// Messages in: {type: "start", cue, discDir, padBuffer, audioRing, modBuffer, options},
+// Messages in: {type: "start", cue, discDir, padBuffer, audioRing, modBuffer, renderBuffer, options},
 // {type: "execute", id, address, args} (one call, at a borrow-free boundary),
 // {type: "cmd", id, name, args}, {type: "load", id, url, reload}.
 // Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"mods"|"scripting-ready"|"execute-result"|"cmd-result"|"load-result"|"stopped", ...}.
@@ -63,6 +63,7 @@ import { Disc, SECTOR, userData } from "./disc.js";
 import { loadSaves, savesDir } from "./cards.js";
 import { ModLoader, takeMod } from "./mods.js";
 import { Calls, ScriptHost, mod } from "./script.js";
+import { NATIVE_RENDER_SETTINGS, unpackRenderSettings } from "./rendering.js";
 
 const ABI_VERSION = 18;
 const NOTHING_PRESSED = 0xffff;
@@ -227,10 +228,27 @@ async function opfsMods() {
   return out;
 }
 
-async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, options }) {
+async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, renderBuffer, options }) {
   const canvas = new OffscreenCanvas(options.width || 640, options.height || 480);
   await init({ module_or_path: new URL("./pkg/psxw_host_web_bg.wasm", import.meta.url) });
   let renderer = new WebRenderer(canvas);
+  const renderSettings = new Int32Array(renderBuffer || new SharedArrayBuffer(4));
+  let appliedSettings = NATIVE_RENDER_SETTINGS;
+  const applyRenderSettings = () => {
+    const requested = Atomics.load(renderSettings, 0) || NATIVE_RENDER_SETTINGS;
+    if (requested === appliedSettings) return;
+    let error;
+    try {
+      const { style, scale, textures, dithering, precision } = unpackRenderSettings(requested);
+      renderer.set_visual_options(style, scale, textures, dithering, precision);
+      appliedSettings = requested;
+    } catch (e) {
+      error = `rendering change failed: ${e.message || e}`;
+      Atomics.compareExchange(renderSettings, 0, requested, appliedSettings);
+    }
+    postMessage({ type: "render-settings", settings: appliedSettings, error });
+  };
+  applyRenderSettings();
   let lost = false;
   let shadow = null;
   canvas.addEventListener("webglcontextlost", (e) => {
@@ -241,6 +259,8 @@ async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, op
   canvas.addEventListener("webglcontextrestored", () => {
     renderer = new WebRenderer(canvas);
     if (shadow) renderer.upload_vram(shadow);
+    appliedSettings = NATIVE_RENDER_SETTINGS;
+    applyRenderSettings();
     lost = false;
     postMessage({ type: "status", text: "WebGL context restored" });
   });
@@ -521,7 +541,20 @@ async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, op
     present(p) {
       if (lost) return;
       timed("present", () => {
-        renderer.present(new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20)));
+        applyRenderSettings();
+        const desc = new Uint32Array(mem().slice(p >>> 0, (p >>> 0) + 20));
+        try {
+          renderer.present(desc);
+        } catch (e) {
+          // The colour plane can fit while a larger output frame cannot.
+          // Drop enhancements rather than stopping a game on a smaller GPU.
+          if (appliedSettings === NATIVE_RENDER_SETTINGS) throw e;
+          renderer.set_resolution_scale(1);
+          Atomics.compareExchange(renderSettings, 0, appliedSettings, NATIVE_RENDER_SETTINGS);
+          appliedSettings = NATIVE_RENDER_SETTINGS;
+          postMessage({ type: "render-settings", settings: appliedSettings, error: `enhanced presentation failed; using Original: ${e.message || e}` });
+          renderer.present(desc);
+        }
         // A page that falls behind misses frames rather than queueing them.
         if (framesPosted - Atomics.load(pad, 4) < 2) {
           const bitmap = canvas.transferToImageBitmap();

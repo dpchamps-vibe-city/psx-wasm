@@ -22,7 +22,8 @@ Cleanup removed **25 extra worktrees** and pruned one stale registration; only
 `main` at the original checkout remains. Existing branch references are retained,
 including `archive/spec-fidelity-b8a0683`. Detached heads have archive references.
 Unrelated renderer/web WIP from `main-wt-2` was committed separately as `633225b`
-on `archive/main-wt-2-wip-20261031`, **not merged into main**. Local oracle data,
+on `archive/main-wt-2-wip-20261031`, initially excluded from the recovery merge.
+It is now integrated at the operator's request (see the follow-up below). Local oracle data,
 reports, outputs, configs and untracked files were preserved under ignored
 `out/worktree-cleanup-20261031/`; disposable build caches were removed with the
 worktrees. Main's inputs, local config, run storage, `.pi/` and supplied crash
@@ -43,6 +44,24 @@ approximately 2,700 documentation additions). This includes recovered/reworked
 commits, not 109 new features. Native architecture, substantial BIOS/kernel/file/
 card/CD services, patched SDK call flows and browser storage corrections are
 integrated. ABI remains 18.
+
+### Renderer/web follow-up merge
+
+At the operator's subsequent request, `archive/main-wt-2-wip-20261031` is merged
+into main, including its two earlier commits `fb05948` and `259a544`. These
+branch from the shared `0bae88ac` baseline and do not restore spec-fidelity BIOS
+code. The visual-renderer extension, upscaling/filtering/colour controls, browser
+panel, tests, host guide and geometry-addon proposal are preserved. Conflicts
+retain ABI 18, per-game disc storage and presentation error propagation. BIOS,
+runtime, SDK and ABI source are unchanged by this follow-up.
+
+Fresh validation: **15 native renderer tests**, **2,592 GPU golden comparisons
+per browser**, visual-option checks, and **25 storage checks per browser** pass
+in Chromium and Firefox. Firefox context restoration passes; Chromium's existing
+unrestorable-context limitation remains. The browser renderer Wasm was rebuilt.
+Logs and browser JSON results are preserved in `out/main-wt-2-merge-validation/`.
+This is focused renderer/web validation, not a new game replay or full-CI run.
+No extra worktree was created and no remote push was performed.
 
 ### Remaining full-BIOS work
 

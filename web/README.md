@@ -1,6 +1,10 @@
 # web
 
-The browser host (M5), plain ES modules with no build step:
+The browser host (M5), plain ES modules with no build step.
+See [Implementing a host](../docs/host-implementation.md) for the game/host ABI,
+startup and memory conventions, and the browser/native rendering boundaries.
+
+Components:
 
 - `index.html`, `main.js`: the page. It imports a disc (.cue and .bin) into OPFS, polls the keyboard and gamepads into a SharedArrayBuffer, sets up audio (an AudioWorklet playing silence until M6), and starts the Worker.
 - `worker.js`: runs `game.wasm` and implements its host interface (ABI 10: `vblank` for everything the guest sees, `wait_vblank` for pacing): pacing with `Atomics.wait`, disc reads from OPFS, pads, saves, and the renderer (`pkg/`, built from `crates/psxw-host-web`). Where the browser has JSPI (`WebAssembly.Suspending`), the game suspends once a vblank and gives the Worker's event loop a turn. Chromium frees the frames the Worker hands the page only there: without it the tab's memory grows by a frame a vblank (gigabytes a minute) until the GPU process dies and the screen goes black. Dev mode can't suspend (its JS trampolines sit between the game and `wait_vblank`) and warns in the console.
@@ -18,6 +22,69 @@ To try it:
 Test hooks (query): `?cue=NAME&autostart&frames=N&verify&hash=60,300&replay=URL&record`.
 
 At the end of a run the Worker posts frame times (the wall time between vblanks, after pacing): `frameMs` with p50, p95, p99 and max, next to `lagFrames` (frames more than a period late). They are reported, not gated.
+
+## Rendering settings
+
+The **Rendering** panel selects a visual renderer and groups each renderer's own
+configuration. Settings change live and are remembered in this browser:
+
+- **Original:** native PS1 pixels, without visual enhancements.
+- **Clean Polygons:** subpixel polygon coverage and colour/UV interpolation,
+  with independent **1× / 2× / 4× internal resolution**, **Nearest / Smooth 3D
+  texture sampling**, **Original / Off dithering**, and **Native (15-bit) / High
+  (24-bit) colour precision** controls. Defaults retain the previous appearance.
+
+Smooth 3D bilinearly filters polygon textures after decoding their palette colours.
+Nearest sampling still controls transparent holes and mask/blend classification;
+incompatible neighbours are excluded to avoid dark fringes. Sampling is clamped
+to each triangle's UV bounds as a conservative atlas guard. Axis-aligned textured
+quads use pixel-centred samples clamped to their native texel footprint, preventing
+sprite-tile seams and shifted transparent cutouts at 2×/4×, including mirrored
+and rotated UVs. Rectangles and lines stay crisp. Some games draw UI or sprites using polygons; those are filtered too,
+since the renderer commands cannot distinguish their purpose.
+
+**Dithering Off + High colour precision** is recommended for a cleaner image.
+Off removes the renderer's native 4×4 colour stippling, not dithering already
+baked into texture artwork. High stores eight bits per channel through visual
+shading, filtering, blending and copies, reducing banding without reinstating
+the stipple. Native texture colours remain native; uploads/initial colour-plane
+contents expand exactly (31 to 248). Original dithering remains independently
+available in High mode, applying the same offsets before eight-bit quantization.
+This is colour precision, not a higher-precision GTE or replacement texture pack.
+
+Query overrides: `?renderer=native` or `?renderer=clean-polygons`, `?scale=1|2|4`,
+`?textures=nearest|smooth`, `?dithering=original|off`, and `?precision=native|high`.
+Without an explicit renderer, `?scale=1` selects Original, while `?scale=2|4`,
+`?textures=smooth`, `?dithering=off` or `?precision=high` select Clean Polygons.
+The old dropdown preference is migrated automatically; existing panel preferences
+keep Original dithering and Native precision until changed.
+
+These are host-only visual effects, not a screen blur or guest GPU setting.
+Native VRAM, CPU readbacks and hashes remain unchanged. The visual colour plane
+handles blending, masks and VRAM copies independently. Packed 24-bit video is
+presented at native resolution; unusual coordinate-wrapping polygons also retain
+their previous native rendering. Texture sources/framebuffer feedback remain
+native-resolution. There is no higher-precision GTE or perspective correction.
+
+Changes take effect at presentation boundaries without restarting the game.
+A new colour plane is initialized from native VRAM, so detail returns as content
+redraws. Context restoration reapplies the complete configuration. Failed changes
+retain the previous renderer/settings and report an error; output-frame allocation
+failure falls back to Original. Inactive styles remain configurable, so you can
+lower a rejected resolution before selecting that renderer again.
+
+`web/rendering.js` registers style names and their option controls. The host APIs
+are `Renderer::set_visual_preset` and `WebRenderer.set_visual_options`; the old
+`set_resolution_scale` convenience API remains available. One atomic shared word
+publishes the whole configuration, so live changes work even without JSPI and
+cannot mix settings from different edits. Worker/page backing sizes follow the
+presentation resolution; CSS keeps the same 4:3 display size. The additional
+draw/read planes cost 2 MiB at 1×, 8 MiB at 2× or 32 MiB at 4× in Native
+precision. High uses R32UI and doubles those costs to 4/16/64 MiB, plus staging,
+setup records, output and rendering/synchronization work. All styles
+implement the host-local `VisualRenderer` interface; see the
+[renderer extension guide](../crates/psx-render-gl/README.md) for adding another
+visual renderer without changing exact VRAM execution.
 
 ## Recording a replay
 

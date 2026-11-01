@@ -9,9 +9,10 @@ retain their provenance; the active recovery status is recorded separately.
   unfinished milestone**. Its recovery checkpoint groups the remaining executable,
   control-flow, CD/card, console, resource and validation work. The provisional
   4–8 engineer-week allowance is low-confidence, not a delivery commitment.
-  Extra worktrees are removed; archived history, unrelated renderer/web WIP
-  (`archive/main-wt-2-wip-20261031`) and local artifacts are preserved. Details
-  and artifact locations are in the plan's recovery merge checkpoint.
+  Extra worktrees are removed; archived history and local artifacts are
+  preserved. The renderer/web work from `archive/main-wt-2-wip-20261031` is now
+  merged at the operator's request, with native renderer and browser GPU/storage
+  checks passing. Details and artifact locations are in the plan's merge checkpoints.
   Checkpointed results supersede older coverage/gate claims below.
 - **Last full gate runs:** both `psxw ci btn` and `psxw ci bof4` completed at the
   ABI-17 recovery foundation (`a74f832`, code `4cce9e3`) and exited 2. Missing

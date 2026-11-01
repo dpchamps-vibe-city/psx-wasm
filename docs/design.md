@@ -667,6 +667,9 @@ can't see any of it.
   replays and profiling. Tests therefore run exactly the wasm that ships.
   The browser is the product, not the debugging environment.
 
+For the current import contract, memory conventions, startup sequence and
+browser/native rendering paths, see [Implementing a host](host-implementation.md).
+
 ### 8. psx-wasm owns the final link
 
 Most of the job is *placement*: data at fixed addresses, function addresses

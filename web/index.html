@@ -16,6 +16,14 @@
     #mod-list li { display: flex; gap: 8px; align-items: center; padding: 2px 0; }
     #mod-list li span { flex: 1; font-family: ui-monospace, monospace; font-size: 13px; overflow-wrap: anywhere; }
     #mods-note { color: var(--muted); font-size: 13px; }
+    select { font: inherit; padding: 4px; background: var(--bg); color: var(--fg); }
+    #rendering-panel h2 { width: 100%; margin: 0; font-size: 16px; }
+    #rendering-note { width: 100%; margin: 0; color: var(--muted); font-size: 13px; }
+    .render-options { width: 100%; }
+    .render-options fieldset { min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 6px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .render-options legend { padding: 0 6px; font-size: 13px; color: var(--muted); }
+    .render-options label { display: grid; align-content: start; gap: 6px; }
+    .render-options small { color: var(--muted); }
     button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
   </style>
 </head>
@@ -29,6 +37,7 @@
       <button id="start" disabled>Start</button>
       <button id="save-replay" disabled>Save replay</button>
     </section>
+    <section id="rendering-panel" aria-label="Rendering settings"></section>
     <section>
       <label>Card 1 (.mcr) <input id="card0" type="file" accept=".mcr,.mcd"></label>
       <button id="export0">Export card 1</button>

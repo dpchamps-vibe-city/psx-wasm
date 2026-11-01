@@ -12,8 +12,14 @@
 //! as the PS1 GPU does at 1× (see [`setup`] and [`shaders`]).
 //!
 //! The backend is a pure function from commands and VRAM to VRAM; the
-//! front end (`psx_devices::gpu`) owns all PS1 state and hazard policy.
+//! front end (`psx_devices::gpu`) owns all PS1 state and native hazards.
+//! Visual rendering is delegated through [`visual::VisualRenderer`]; the exact
+//! VRAM engine alone supplies game readbacks and canonical texture/CLUT data.
 
+mod enhanced;
+mod presentation;
+mod raster;
+pub mod visual;
 pub mod server;
 pub mod setup;
 pub mod shaders;
@@ -24,13 +30,9 @@ pub mod headless;
 use anyhow::{Context as _, Result, bail, ensure};
 use glow::HasContext;
 use psxw_abi::render::{self, Command, PRIM_WORDS, PresentDesc};
-use setup::{Clip, STRIDE, WORDS};
-use shaders::PRIM_TEX_WIDTH;
-
-/// Rows of the setup-record texture; a larger batch is drawn in pieces.
-const PRIM_TEX_ROWS: usize = 64;
-/// Records per draw call.
-const PER_DRAW: usize = PRIM_TEX_WIDTH * PRIM_TEX_ROWS / STRIDE;
+use setup::{Clip, WORDS};
+use raster::{PER_DRAW, RasterPass, RasterTarget, UploadBatch};
+use visual::{CanonicalVram, ColourPrecision, DrawState, TextureFilter, VisualContext, VisualFrame, VisualPreset, VisualRenderer};
 
 /// Version of this backend, for reports.
 pub const BACKEND_VERSION: &str = concat!("psx-render-gl ", env!("CARGO_PKG_VERSION"), " render-v1");
@@ -42,15 +44,6 @@ pub struct GlInfo {
     pub renderer: String,
     pub version: String,
     pub glsl: String,
-}
-
-struct Uniforms {
-    first: Option<glow::UniformLocation>,
-    clip: Option<glow::UniformLocation>,
-    skip: Option<glow::UniformLocation>,
-    present_area: Option<glow::UniformLocation>,
-    present_depth24: Option<glow::UniformLocation>,
-    present_flip: Option<glow::UniformLocation>,
 }
 
 /// A rendered frame, RGBA8, row 0 at the top.
@@ -71,35 +64,19 @@ pub struct Renderer {
     clut: glow::Texture,
     fbo_clut: glow::Framebuffer,
     stage: glow::Texture,
-    prims: glow::Texture,
-    out: Option<(glow::Texture, glow::Framebuffer, u32, u32)>,
-    draw: glow::Program,
-    present: glow::Program,
-    vao: glow::VertexArray,
-    uni: Uniforms,
+    raster: RasterPass,
+    visual: Box<dyn VisualRenderer>,
+    preset: Option<VisualPreset>,
+    last_frame: Option<VisualFrame>,
     read_format: (u32, u32, usize),
     clip: Clip,
     skip: i32,
     readbacks: Vec<u16>,
     scratch: Vec<u32>,
-    staged: Staged,
+    staged: UploadBatch,
     last_present: Option<PresentDesc>,
     /// GL work since [`Renderer::take_stats`].
     stats: Stats,
-}
-
-/// Uploads waiting to draw as one batch: their pixels where they sit in the
-/// staging texture (rows of 1024), the next free spot on the current shelf
-/// of rows and its height, the width used, and their records.
-#[derive(Default)]
-struct Staged {
-    px: Vec<u16>,
-    x: u32,
-    y: u32,
-    row_h: u32,
-    w: u32,
-    recs: Vec<u32>,
-    n: usize,
 }
 
 /// What the backend did, for hosts that report where a frame's time went:
@@ -112,6 +89,16 @@ pub struct Stats {
     pub serial_rows: u32,
     pub uploads: u32,
     pub clut_loads: u32,
+}
+
+impl Stats {
+    fn include(&mut self, other: Self) {
+        self.draws += other.draws;
+        self.syncs += other.syncs;
+        self.serial_rows += other.serial_rows;
+        self.uploads += other.uploads;
+        self.clut_loads += other.clut_loads;
+    }
 }
 
 fn gl_err(e: String) -> anyhow::Error {
@@ -128,6 +115,11 @@ unsafe fn texture(gl: &glow::Context, internal: u32, w: i32, h: i32) -> Result<g
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        let error = gl.get_error();
+        if error != glow::NO_ERROR {
+            gl.delete_texture(t);
+            bail!("allocating {w}×{h} texture failed: GL error {error:#x}");
+        }
         Ok(t)
     }
 }
@@ -138,7 +130,11 @@ unsafe fn framebuffer(gl: &glow::Context, tex: glow::Texture) -> Result<glow::Fr
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
         gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
         let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-        ensure!(status == glow::FRAMEBUFFER_COMPLETE, "framebuffer incomplete: {status:#x}");
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            gl.delete_framebuffer(f);
+            gl.get_error();
+            bail!("framebuffer incomplete: {status:#x}");
+        }
         Ok(f)
     }
 }
@@ -191,27 +187,15 @@ impl Renderer {
             let vram_r = texture(&gl, glow::R16UI, 1024, 512)?;
             let clut = texture(&gl, glow::R16UI, 256, render::CLUT_SLOTS as i32)?;
             let stage = texture(&gl, glow::R16UI, 1024, 512)?;
-            let prims = texture(&gl, glow::RGBA32UI, PRIM_TEX_WIDTH as i32, PRIM_TEX_ROWS as i32)?;
             let fbo_w = framebuffer(&gl, vram_w)?;
             let fbo_r = framebuffer(&gl, vram_r)?;
             let fbo_clut = framebuffer(&gl, clut)?;
-            let draw = program(&gl, &shaders::draw_vs(), &shaders::draw_fs())?;
-            let present = program(&gl, &shaders::present_vs(), &shaders::present_fs())?;
-            gl.use_program(Some(draw));
-            for (name, unit) in [("u_vram", 0), ("u_prims", 1), ("u_clut", 2), ("u_stage", 3)] {
-                gl.uniform_1_i32(gl.get_uniform_location(draw, name).as_ref(), unit);
-            }
-            gl.use_program(Some(present));
-            gl.uniform_1_i32(gl.get_uniform_location(present, "u_vram").as_ref(), 0);
-            let uni = Uniforms {
-                first: gl.get_uniform_location(draw, "u_first"),
-                clip: gl.get_uniform_location(draw, "u_clip"),
-                skip: gl.get_uniform_location(draw, "u_skip"),
-                present_area: gl.get_uniform_location(present, "u_area"),
-                present_depth24: gl.get_uniform_location(present, "u_depth24"),
-                present_flip: gl.get_uniform_location(present, "u_flip"),
-            };
-            let vao = gl.create_vertex_array().map_err(gl_err)?;
+            let raster = RasterPass::new(&gl, &shaders::draw_fs())?;
+            let visual = visual::create(&VisualContext {
+                gl: &gl,
+                vram: CanonicalVram { draw: vram_w, read: vram_r, clut, framebuffer: fbo_w },
+                state: DrawState { clip: Clip { x0: 0, y0: 0, x1: 0, y1: 0 }, skip: -1 },
+            }, VisualPreset::Native)?;
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             gl.disable(glow::BLEND);
@@ -235,18 +219,16 @@ impl Renderer {
                 clut,
                 fbo_clut,
                 stage,
-                prims,
-                out: None,
-                draw,
-                present,
-                vao,
-                uni,
+                raster,
+                visual,
+                preset: Some(VisualPreset::Native),
+                last_frame: None,
                 read_format,
                 clip: Clip { x0: 0, y0: 0, x1: 0, y1: 0 },
                 skip: -1,
                 readbacks: Vec::new(),
                 scratch: Vec::new(),
-                staged: Staged::default(),
+                staged: UploadBatch::default(),
                 last_present: None,
                 stats: Stats::default(),
             };
@@ -255,6 +237,69 @@ impl Renderer {
             ensure!(err == glow::NO_ERROR, "GL error {err:#x} during setup");
             Ok(r)
         }
+    }
+
+    /// Host-local internal resolution. This never changes the command ABI or
+    /// the native VRAM returned to the game. Changing scale seeds the new colour
+    /// plane from native VRAM; detail returns as the game redraws it.
+    pub fn set_resolution_scale(&mut self, scale: u32) -> Result<()> {
+        ensure!(matches!(scale, 1 | 2 | 4), "resolution scale must be 1, 2 or 4");
+        self.set_visual_preset(if scale == 1 {
+            VisualPreset::Native
+        } else {
+            VisualPreset::CleanPolygons { scale, textures: TextureFilter::Nearest, dithering: true, precision: ColourPrecision::Native }
+        })
+    }
+
+    /// Select a built-in style with its host-only options. Failed configuration
+    /// retains the previous renderer, frame and settings, just like a factory.
+    pub fn set_visual_preset(&mut self, preset: VisualPreset) -> Result<()> {
+        if self.preset == Some(preset) { return Ok(()); }
+        self.set_visual_renderer(|ctx| visual::create(ctx, preset))?;
+        self.preset = Some(preset);
+        Ok(())
+    }
+
+    /// Current built-in selection, or None for a custom visual renderer.
+    pub fn visual_preset(&self) -> Option<VisualPreset> { self.preset }
+
+    /// Install a host-local visual renderer without changing the exact engine.
+    /// Build transactionally from read-only canonical inputs; failure retains
+    /// the old visual renderer and output. Recreate the factory after context loss.
+    pub fn set_visual_renderer(&mut self, factory: impl FnOnce(&VisualContext<'_>) -> Result<Box<dyn VisualRenderer>>) -> Result<()> {
+        self.draw_staged();
+        self.flush_visual()?;
+        let next = factory(&VisualContext { gl: &self.gl, vram: self.canonical_vram(), state: self.draw_state() })?;
+        let mut old = std::mem::replace(&mut self.visual, next);
+        self.stats.include(old.take_stats());
+        old.destroy(&self.gl);
+        self.last_frame = None;
+        self.preset = None;
+        Ok(())
+    }
+
+    /// Built-in scale selection; custom visual renderers report 1.
+    pub fn resolution_scale(&self) -> u32 { self.preset.map_or(1, VisualPreset::resolution_scale) }
+
+    /// The last presentation's backing resolution, not the native VRAM size.
+    pub fn output_size(&self) -> Option<(u32, u32)> {
+        self.last_frame.map(|f| (f.width, f.height))
+    }
+
+    fn canonical_vram(&self) -> CanonicalVram {
+        CanonicalVram { draw: self.vram_w, read: self.vram_r, clut: self.clut, framebuffer: self.fbo_w }
+    }
+
+    fn draw_state(&self) -> DrawState { DrawState { clip: self.clip, skip: self.skip } }
+
+    fn visual_command(&mut self, command: Command<'_>) -> Result<()> {
+        let (vram, state) = (self.canonical_vram(), self.draw_state());
+        self.visual.execute(&VisualContext { gl: &self.gl, vram, state }, command)
+    }
+
+    fn flush_visual(&mut self) -> Result<()> {
+        let (vram, state) = (self.canonical_vram(), self.draw_state());
+        self.visual.flush(&VisualContext { gl: &self.gl, vram, state })
     }
 
     /// What the GL implementation says it is.
@@ -272,15 +317,21 @@ impl Renderer {
     /// Zero VRAM (both copies) and the colour-table slots, and forget the
     /// batch state.
     pub fn reset_vram(&mut self) {
+        raster::prepare_draw(&self.gl);
         unsafe {
             for f in [self.fbo_w, self.fbo_r, self.fbo_clut] {
                 self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+                self.gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
                 self.gl.clear_buffer_u32_slice(glow::COLOR, 0, &[0, 0, 0, 0]);
             }
         }
         self.clip = Clip { x0: 0, y0: 0, x1: 0, y1: 0 };
         self.skip = -1;
+        self.staged.clear();
         self.readbacks.clear();
+        let (vram, state) = (self.canonical_vram(), self.draw_state());
+        self.visual.reset(&VisualContext { gl: &self.gl, vram, state });
+        self.last_frame = None;
     }
 
     /// Execute a command stream. READBACK results accumulate for
@@ -291,6 +342,7 @@ impl Renderer {
             // Uploads in a row draw as one batch.
             if !matches!(cmd, Command::Upload { .. }) {
                 self.draw_staged();
+                self.flush_visual()?;
             }
             match cmd {
                 Command::SetState { clip, flags } => {
@@ -305,15 +357,14 @@ impl Renderer {
                     // Runs of ordinary records draw as one batch; a serial
                     // record draws alone, row by row.
                     let mut run_start = 0;
-                    let all: Vec<&[u32]> = recs.chunks_exact(PRIM_WORDS).collect();
-                    for (i, rec) in all.iter().enumerate() {
+                    for (i, rec) in recs.chunks_exact(PRIM_WORDS).enumerate() {
                         if rec[0] & render::prim::SERIAL != 0 {
-                            self.draw_batch(&all[run_start..i]);
-                            self.draw_serial(rec);
+                            self.draw_batch(&recs[run_start * PRIM_WORDS..i * PRIM_WORDS])?;
+                            self.draw_serial(rec)?;
                             run_start = i + 1;
                         }
                     }
-                    self.draw_batch(&all[run_start..]);
+                    self.draw_batch(&recs[run_start * PRIM_WORDS..])?;
                 }
                 Command::Fill { rect, color } => {
                     let mut rec = vec![0u32; WORDS];
@@ -351,8 +402,11 @@ impl Renderer {
                 }
                 Command::ClutLoad { slot, x, y, count } => unsafe {
                     self.stats.clut_loads += 1;
+                    self.gl.disable(glow::SCISSOR_TEST);
                     self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_r));
+                    self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
                     self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_clut));
+                    self.gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
                     for (px, py, w, h, ox, _) in pieces(x, y, count, 1) {
                         let (dx, dy) = (ox as i32, slot as i32);
                         self.gl.blit_framebuffer(
@@ -370,8 +424,12 @@ impl Renderer {
                     }
                 },
             }
+            if !matches!(cmd, Command::Draw(_) | Command::Present(_)) {
+                self.visual_command(cmd)?;
+            }
         }
         self.draw_staged();
+        self.flush_visual()?;
         let err = unsafe { self.gl.get_error() };
         ensure!(err == glow::NO_ERROR, "GL error {err:#x}");
         Ok(())
@@ -385,80 +443,39 @@ impl Renderer {
     /// Pack an upload's pixels into the staging texture's next free space,
     /// in shelves of rows, drawing what is staged first when it doesn't fit.
     fn stage(&mut self, rect: render::Rect, mask: u32, pixels: &[u32]) {
-        let s = &mut self.staged;
-        if s.x + rect.w > 1024 {
-            (s.x, s.y, s.row_h) = (0, s.y + s.row_h, 0);
-        }
-        if s.y + rect.h > 512 {
-            self.draw_staged();
-        }
-        let s = &mut self.staged;
-        s.px.resize(1024 * 512, 0);
-        let (sx, sy) = (s.x, s.y);
-        for j in 0..rect.h {
-            let row = ((sy + j) * 1024 + sx) as usize;
-            for i in 0..rect.w as usize {
-                let k = (j * rect.w) as usize + i;
-                s.px[row + i] = (pixels[k / 2] >> (16 * (k % 2))) as u16;
-            }
-        }
-        s.x += rect.w;
-        s.row_h = s.row_h.max(rect.h);
-        s.w = s.w.max(s.x);
-        let at = s.recs.len();
-        s.recs.resize(at + WORDS, 0);
-        setup::upload(rect.x, rect.y, rect.w, rect.h, sx, sy, mask, &mut s.recs[at..]);
-        s.n += 1;
+        if !self.staged.fits(rect) { self.draw_staged(); }
+        self.staged.push(rect, mask, pixels);
     }
 
     /// Draw the staged uploads: one texture upload, one batch.
     fn draw_staged(&mut self) {
-        if self.staged.n == 0 {
-            return;
-        }
-        let mut s = std::mem::take(&mut self.staged);
-        let rows = s.y + s.row_h;
-        unsafe {
-            let bytes = std::slice::from_raw_parts(s.px.as_ptr() as *const u8, rows as usize * 1024 * 2);
-            self.gl.bind_texture(glow::TEXTURE_2D, Some(self.stage));
-            self.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 1024);
-            self.gl.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                s.w as i32,
-                rows as i32,
-                glow::RED_INTEGER,
-                glow::UNSIGNED_SHORT,
-                glow::PixelUnpackData::Slice(Some(bytes)),
-            );
-            self.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
-        }
-        self.draw_records(&mut s.recs, s.n);
-        s.recs.clear();
-        self.staged = Staged { px: s.px, recs: s.recs, ..Staged::default() };
+        if self.staged.count == 0 { return; }
+        let mut staged = std::mem::take(&mut self.staged);
+        staged.upload(&self.gl, self.stage);
+        self.draw_records(&mut staged.records, staged.count);
+        staged.clear();
+        self.staged = staged;
     }
 
     /// Set up and draw primitive records as one batch.
-    fn draw_batch(&mut self, recs: &[&[u32]]) {
-        if recs.is_empty() {
-            return;
-        }
+    fn draw_batch(&mut self, recs: &[u32]) -> Result<()> {
+        if recs.is_empty() { return Ok(()); }
+        let n = recs.len() / PRIM_WORDS;
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
-        scratch.resize(recs.len() * WORDS, 0);
-        for (i, rec) in recs.iter().enumerate() {
+        scratch.resize(n * WORDS, 0);
+        for (i, rec) in recs.chunks_exact(PRIM_WORDS).enumerate() {
             setup::primitive(rec, &self.clip, &mut scratch[i * WORDS..(i + 1) * WORDS]);
         }
-        self.draw_records(&mut scratch, recs.len());
+        self.draw_records(&mut scratch, n);
         self.scratch = scratch;
+        self.visual_command(Command::Draw(recs))
     }
 
     /// A primitive that samples where it draws, row by row in the GPU's
     /// raster order, each row's pixels synced to the read copy before the
     /// next row samples ([`render::prim::SERIAL`]).
-    fn draw_serial(&mut self, rec: &[u32]) {
+    fn draw_serial(&mut self, rec: &[u32]) -> Result<()> {
         let mut one = [0u32; PRIM_WORDS];
         one.copy_from_slice(&rec[..PRIM_WORDS]);
         one[0] &= !render::prim::SERIAL;
@@ -469,7 +486,7 @@ impl Renderer {
                 let (ys, yb) = (w[14] as i32, w[15] as i32);
                 if w[8] <= w[10] {
                     for y in ys..yb {
-                        self.draw_row(&one, y);
+                        self.draw_row(&one, y)?;
                     }
                 }
             }
@@ -486,37 +503,41 @@ impl Renderer {
                 }
                 for t in tris {
                     for y in setup::triangle_rows(&t) {
-                        self.draw_row(&t, y);
+                        self.draw_row(&t, y)?;
                     }
                 }
             }
-            _ => self.draw_batch(&[&one]),
+            _ => self.draw_batch(&one)?,
         }
+        Ok(())
     }
 
     /// Draw one row of a primitive (`y` as the drawing-area test sees it),
     /// then sync that row.
-    fn draw_row(&mut self, rec: &[u32], y: i32) {
+    fn draw_row(&mut self, rec: &[u32], y: i32) -> Result<()> {
         self.stats.serial_rows += 1;
         let saved = self.clip;
-        if y < saved.y0 || y > saved.y1 {
-            return;
-        }
+        if y < saved.y0 || y > saved.y1 { return Ok(()); }
         self.clip.y0 = y;
         self.clip.y1 = y;
-        self.draw_batch(&[rec]);
+        let result = self.draw_batch(rec);
         self.clip = saved;
+        result?;
         if saved.x1 >= saved.x0 {
             self.sync(saved.x0 as u32, (y & 511) as u32, (saved.x1 - saved.x0 + 1) as u32, 1);
         }
+        Ok(())
     }
 
     /// Copy draw-copy regions to the read copy.
     fn sync(&mut self, x: u32, y: u32, w: u32, h: u32) {
         self.stats.syncs += 1;
         unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
             self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_w));
+            self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
             self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_r));
+            self.gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
             for (px, py, pw, ph, _, _) in pieces(x, y, w, h) {
                 let (x0, y0, x1, y1) = (px as i32, py as i32, (px + pw) as i32, (py + ph) as i32);
                 self.gl.blit_framebuffer(x0, y0, x1, y1, x0, y0, x1, y1, glow::COLOR_BUFFER_BIT, glow::NEAREST);
@@ -527,51 +548,22 @@ impl Renderer {
     /// Draw `n` setup records (`words` is `n * WORDS` long; it is padded
     /// in place to whole texture rows).
     fn draw_records(&mut self, words: &mut Vec<u32>, n: usize) {
-        let gl = &self.gl;
-        unsafe {
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_w));
-            gl.viewport(0, 0, 1024, 512);
-            gl.use_program(Some(self.draw));
-            gl.bind_vertex_array(Some(self.vao));
-            gl.uniform_4_i32(self.uni.clip.as_ref(), self.clip.x0, self.clip.y0, self.clip.x1, self.clip.y1);
-            gl.uniform_1_i32(self.uni.skip.as_ref(), self.skip);
-            gl.uniform_1_i32(self.uni.first.as_ref(), 0);
-            for (unit, tex) in [(0, self.vram_r), (1, self.prims), (2, self.clut), (3, self.stage)] {
-                gl.active_texture(glow::TEXTURE0 + unit);
-                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            }
-            let mut start = 0;
-            while start < n {
-                let m = PER_DRAW.min(n - start);
-                let texels = m * STRIDE;
-                let rows = texels.div_ceil(PRIM_TEX_WIDTH);
-                let chunk_words = rows * PRIM_TEX_WIDTH * 4;
-                let from = start * WORDS;
-                if words.len() < from + chunk_words {
-                    words.resize(from + chunk_words, 0);
-                }
-                let bytes: &[u8] = std::slice::from_raw_parts(words[from..].as_ptr() as *const u8, chunk_words * 4);
-                gl.active_texture(glow::TEXTURE1);
-                gl.tex_sub_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    PRIM_TEX_WIDTH as i32,
-                    rows as i32,
-                    glow::RGBA_INTEGER,
-                    glow::UNSIGNED_INT,
-                    glow::PixelUnpackData::Slice(Some(bytes)),
-                );
-                gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, m as i32);
-                self.stats.draws += 1;
-                start += m;
-            }
+        self.raster.bind(&self.gl, self.canonical_vram(), self.stage, self.draw_state(), RasterTarget {
+            framebuffer: self.fbo_w, scale: 1, destination: None,
+        });
+        let mut start = 0;
+        while start < n {
+            let m = PER_DRAW.min(n - start);
+            self.raster.upload(&self.gl, words, start, m);
+            self.raster.draw(&self.gl, 0, m);
+            self.stats.draws += 1;
+            start += m;
         }
     }
 
     /// What the backend did since the last call.
     pub fn take_stats(&mut self) -> Stats {
+        self.stats.include(self.visual.take_stats());
         std::mem::take(&mut self.stats)
     }
 
@@ -580,8 +572,10 @@ impl Renderer {
     pub fn read_vram(&mut self, x: u32, y: u32, w: u32, h: u32) -> Vec<u16> {
         let mut out = vec![0u16; (w * h) as usize];
         let (format, ty, bpp) = self.read_format;
+        raster::prepare_pack(&self.gl);
         unsafe {
             self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_w));
+            self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
             for (px, py, pw, ph, ox, oy) in pieces(x, y, w, h) {
                 let mut buf = vec![0u8; (pw * ph) as usize * bpp];
                 self.gl.read_pixels(
@@ -608,46 +602,20 @@ impl Renderer {
     /// Render the display area into the RGBA8 output (row 0 at the top).
     fn present_frame(&mut self, desc: &PresentDesc) -> Result<()> {
         self.last_present = Some(*desc);
-        let (w, h) = (desc.width.clamp(1, 1024), desc.height.clamp(1, 512));
-        unsafe {
-            let gl = &self.gl;
-            let reuse = matches!(self.out, Some((_, _, ow, oh)) if ow == w && oh == h);
-            if !reuse {
-                if let Some((t, f, _, _)) = self.out.take() {
-                    gl.delete_framebuffer(f);
-                    gl.delete_texture(t);
-                }
-                let t = texture(gl, glow::RGBA8, w as i32, h as i32).context("present: output texture")?;
-                let f = framebuffer(gl, t).context("present: output framebuffer")?;
-                self.out = Some((t, f, w, h));
-            }
-            let Some((_, fbo, _, _)) = self.out else { bail!("present: no output framebuffer") };
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
-            gl.viewport(0, 0, w as i32, h as i32);
-            if desc.flags & PresentDesc::ENABLED == 0 {
-                gl.clear_color(0.0, 0.0, 0.0, 1.0);
-                gl.clear(glow::COLOR_BUFFER_BIT);
-                return Ok(());
-            }
-            gl.use_program(Some(self.present));
-            gl.bind_vertex_array(Some(self.vao));
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.vram_w));
-            gl.uniform_4_i32(self.uni.present_area.as_ref(), desc.x as i32, desc.y as i32, w as i32, h as i32);
-            gl.uniform_1_i32(self.uni.present_depth24.as_ref(), (desc.flags & PresentDesc::DEPTH24 != 0) as i32);
-            gl.uniform_1_i32(self.uni.present_flip.as_ref(), 1);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-        }
+        let (vram, state) = (self.canonical_vram(), self.draw_state());
+        self.last_frame = Some(self.visual.present(&VisualContext { gl: &self.gl, vram, state }, desc)?);
         Ok(())
     }
 
     /// The last presented frame, RGBA8 with row 0 at the top (frame
     /// dumps, tests).
     pub fn frame(&mut self) -> Option<Frame> {
-        let (_, fbo, w, h) = self.out?;
+        let VisualFrame { framebuffer: fbo, width: w, height: h } = self.last_frame?;
         let mut rgba = vec![0u8; (w * h * 4) as usize];
+        raster::prepare_pack(&self.gl);
         unsafe {
             self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+            self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
             self.gl.read_pixels(0, 0, w as i32, h as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut rgba)));
         }
         // The output's row 0 is the picture's bottom row; flip to top-first.
@@ -662,10 +630,12 @@ impl Renderer {
     /// Scale the last presented frame into the default framebuffer (a
     /// window's or a canvas's) of `w`×`h`; false before the first frame.
     pub fn blit_to_screen(&mut self, w: u32, h: u32) -> bool {
-        let Some((_, fbo, fw, fh)) = self.out else { return false };
+        let Some(VisualFrame { framebuffer: fbo, width: fw, height: fh }) = self.last_frame else { return false };
         unsafe {
             let gl = &self.gl;
+            gl.disable(glow::SCISSOR_TEST);
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+            gl.read_buffer(glow::COLOR_ATTACHMENT0);
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
             gl.viewport(0, 0, w as i32, h as i32);
             gl.blit_framebuffer(0, 0, fw as i32, fh as i32, 0, 0, w as i32, h as i32, glow::COLOR_BUFFER_BIT, glow::NEAREST);
@@ -689,17 +659,12 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let gl = &self.gl;
-            gl.delete_program(self.draw);
-            gl.delete_program(self.present);
-            gl.delete_vertex_array(self.vao);
+            self.visual.destroy(gl);
+            self.raster.destroy(gl);
             for f in [self.fbo_w, self.fbo_r, self.fbo_clut] {
                 gl.delete_framebuffer(f);
             }
-            for t in [self.vram_w, self.vram_r, self.clut, self.stage, self.prims] {
-                gl.delete_texture(t);
-            }
-            if let Some((t, f, _, _)) = self.out.take() {
-                gl.delete_framebuffer(f);
+            for t in [self.vram_w, self.vram_r, self.clut, self.stage] {
                 gl.delete_texture(t);
             }
         }
@@ -727,6 +692,6 @@ mod tests {
 
     #[test]
     fn shaders_name_the_stride() {
-        assert!(shaders::draw_fs().contains(&format!("* {STRIDE} +")));
+        assert!(shaders::draw_fs().contains(&format!("* {} +", setup::STRIDE)));
     }
 }
