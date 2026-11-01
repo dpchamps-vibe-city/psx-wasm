@@ -46,16 +46,16 @@ fn checksum(frame: &[u8]) -> u8 {
     frame[..FRAME - 1].iter().fold(0, |a, b| a ^ b)
 }
 
-/// `?` matches one character; `*` matches everything after it (the BIOS
-/// accepts nothing after `*`).
+/// `?` matches one character; matching the name's terminator accepts the
+/// rest of the pattern too (a BIOS bug). `*` ignores the rest of the pattern.
 pub fn name_matches(pattern: &str, name: &str) -> bool {
     let (p, n) = (pattern.as_bytes(), name.as_bytes());
     for (i, &c) in p.iter().enumerate() {
         match c {
             b'*' => return true,
             b'?' => {
-                if i > n.len() {
-                    return false;
+                if i >= n.len() {
+                    return i == n.len();
                 }
             }
             _ => {
@@ -509,5 +509,9 @@ mod tests {
         assert!(!name_matches("ABC", "ABCD"));
         assert!(!name_matches("ABCD", "ABC"));
         assert!(name_matches("FILE?", "FILE"), "psx-spx: ? matching the end ignores the rest");
+        assert!(name_matches("FILE?.DAT", "FILE"));
+        assert!(name_matches("FILE??.DAT", "FILE"));
+        assert!(!name_matches("FILEX?.DAT", "FILE"));
+        assert!(!name_matches("FIL?.DAT", "FILE"));
     }
 }

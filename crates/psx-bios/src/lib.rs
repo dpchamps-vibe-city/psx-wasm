@@ -538,24 +538,57 @@ mod tests {
     }
 
     #[test]
+    fn printf_preserves_guest_bytes_and_counts() {
+        let mut m = machine();
+        let (fmt, src, count, half_count) = (0x8001_0000, 0x8001_0100, 0x8001_0200, 0x8001_0204);
+        m.mem.write(fmt, b"\x81|%3c|%.2s%n%hn\0");
+        m.mem.write(src, b"\x82\xA0\xFF\0");
+        m.mem.w32(half_count, 0xFFFF_0000);
+        m.mem.w32(0x801F_F010, half_count);
+        let a = [fmt, 0xA9, src, count];
+        assert_eq!(bios::printf(&mut m, a), b"\x81|  \xA9|\x82\xA0");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x3F, a)), 8);
+        assert_eq!(m.mem.r32(count), 8);
+        assert_eq!(m.mem.r32(half_count), 0xFFFF_0008);
+    }
+
+    #[test]
+    fn printf_accepts_long_strings_and_formats() {
+        let mut m = machine();
+        let (fmt, src, count) = (0x8001_0000, 0x8001_2000, 0x8001_3000);
+        let mut text = vec![b'x'; 1500];
+        text.push(0);
+        m.mem.write(src, &text);
+        m.mem.write(fmt, b"%s%n\0");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x3F, [fmt, src, count, 0])), 1500);
+        assert_eq!(m.mem.r32(count), 1500);
+        text.pop();
+        text.extend_from_slice(b"%n\0");
+        m.mem.write(fmt, &text);
+        m.mem.w32(count, 0);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x3F, [fmt, count, 0, 0])), 1500);
+        assert_eq!(m.mem.r32(count), 1500);
+    }
+
+    #[test]
     fn strings_and_printf() {
         let mut m = machine();
         m.mem.write(0x8001_0000, b"%s=%04x %d%%\0");
         m.mem.write(0x8001_0100, b"val\0");
         let text = bios::printf(&mut m, [0x8001_0000, 0x8001_0100, 0xBEEF, (-5i32) as u32]);
-        assert_eq!(text, "val=beef -5%");
+        assert_eq!(text, b"val=beef -5%");
         // Sign before zero padding; +, space, # and %n (psx-spx A(3Fh)).
         m.mem.write(0x8001_0000, b"%05d|%+d|% d|%#x|%#o|%-4u|%.3d%n\0");
         for (k, v) in [0x0A, 8, 8, 3, 0x8001_0200u32].iter().enumerate() {
             m.mem.w32(0x801F_F010 + 4 * k as u32, *v);
         }
         let a = [0x8001_0000, (-5i32) as u32, 7, 7];
-        assert_eq!(bios::printf(&mut m, a), "-0005|+7| 7|0xa|010|8   |003");
+        assert_eq!(bios::printf(&mut m, a), b"-0005|+7| 7|0xa|010|8   |003");
         assert_eq!(m.mem.r32(0x8001_0200), 28);
         // Each conversion finishes before the next: %s sees %n's write.
         m.mem.write(0x8001_0000, b"%n%s\0");
         m.mem.write(0x8001_0200, b"old\0");
-        assert_eq!(bios::printf(&mut m, [0x8001_0000, 0x8001_0200, 0x8001_0200, 0]), "");
+        assert_eq!(bios::printf(&mut m, [0x8001_0000, 0x8001_0200, 0x8001_0200, 0]), b"");
         assert_eq!(m.mem.r32(0x8001_0200), 0);
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x1B, [0x8001_0100, 0, 0, 0])), 3);
         m.mem.write(0x8001_0200, b"vam\0");

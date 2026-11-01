@@ -229,6 +229,7 @@ impl<S: Sdk> Machine<S> {
                     }
                 }
                 self.kernel.cd.events = [0; 5];
+                let _ = crate::bios::syscall(self, [2, 0, 0, 0]);
                 return u32::MAX;
             }
             self.set_ev_status(h, kernel::EV_ENABLED);
@@ -1733,8 +1734,8 @@ mod tests {
         }
     }
 
-    /// A partial `_96_init` leaves no event open, and `_96_remove` does not
-    /// close a slot the guest reused for a different event.
+    /// A partial `_96_init` leaves no event open or interrupts masked, and
+    /// `_96_remove` does not close a slot the guest reused for a different event.
     #[test]
     fn cd_event_ownership_is_exact() {
         let mut m = crate::testing::machine();
@@ -1746,6 +1747,10 @@ mod tests {
         );
         assert!(!m.cd_installed());
         assert!(m.events().iter().all(|e| e.status == kernel::EV_UNUSED));
+        assert!(!m.crit, "failed init leaves the critical section too");
+        let next = m.clock.next_time().expect("a scheduled vblank");
+        m.step(next);
+        assert_eq!(m.vblanks, 1, "scheduled work still runs after failure");
 
         let mut m = crate::testing::machine();
         assert_eq!(ret(bios::call(&mut m, 0xA0, 0x54, [0; 4])), 0);

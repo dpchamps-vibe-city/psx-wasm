@@ -699,7 +699,7 @@ pub extern "C" fn mod_log(fmt: u32, va: u32) {
             k += 1;
             v
         });
-        m.host.log(1, &format!("mod: {text}"));
+        m.host.log(1, &format!("mod: {}", String::from_utf8_lossy(&text)));
     });
 }
 

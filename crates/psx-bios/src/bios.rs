@@ -517,7 +517,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             // Through putchar, to the console (psx-spx).
             let text = printf(m, a);
             let n = text.len() as u32;
-            let flow = m.putchars(text.into_bytes())?;
+            let flow = m.putchars(text)?;
             Ok(crate::machine::seq(m, flow, move |_, _| Flow::ret(n)))
         }
         (0xA0, 0x44) => r(0),
@@ -1001,7 +1001,7 @@ impl cd::Disc for HostDisc<'_> {
 
 /// The BIOS printf: `%d %i %u %x %X %o %c %s %p %%`, with flags, width and
 /// precision. Arguments come from a1..a3, then the guest stack.
-pub fn printf<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> String {
+pub fn printf<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Vec<u8> {
     let mut k = 1;
     format(m, a[0], &mut |m| {
         let v = m.arg(&a, k);
@@ -1015,9 +1015,10 @@ pub fn printf<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> String {
 /// x X n`) and prefixes (`+`, space, `-`, `#`, `0`, a width or `*`, a
 /// precision or `.*`, `h`, `l`, `L`), with C's meaning. `%n` writes at
 /// its conversion, before later conversions or stack arguments are read.
-pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machine<S>) -> u32) -> String {
-    let fmt = m.mem.cstr(fmt, 1024);
-    let mut out = String::new();
+/// Output stays in guest bytes; text encoding belongs at the host log boundary.
+pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machine<S>) -> u32) -> Vec<u8> {
+    let fmt = m.mem.cstr(fmt, MAX_LEN as usize);
+    let mut out = Vec::new();
     let mut i = 0;
     let digits = |fmt: &[u8], i: &mut usize| {
         let mut n = 0usize;
@@ -1031,7 +1032,7 @@ pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machin
         let c = fmt[i];
         i += 1;
         if c != b'%' {
-            out.push(c as char);
+            out.push(c);
             continue;
         }
         let mut flags = String::new();
@@ -1083,10 +1084,10 @@ pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machin
                 } else {
                     ""
                 };
-                (sign, "", v.unsigned_abs().to_string())
+                (sign, "", v.unsigned_abs().to_string().into_bytes())
             }
-            b'u' | b'U' => ("", "", arg().to_string()),
-            b'o' | b'O' => ("", if flags.contains('#') { "0" } else { "" }, format!("{:o}", arg())),
+            b'u' | b'U' => ("", "", arg().to_string().into_bytes()),
+            b'o' | b'O' => ("", if flags.contains('#') { "0" } else { "" }, format!("{:o}", arg()).into_bytes()),
             b'x' | b'X' | b'p' => {
                 let v = arg();
                 let prefix = match (flags.contains('#') && v != 0 && conv != b'p', conv) {
@@ -1094,39 +1095,48 @@ pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machin
                     (true, _) => "0x",
                     _ => "",
                 };
-                ("", prefix, if conv == b'X' { format!("{v:X}") } else { format!("{v:x}") })
+                let body = if conv == b'X' { format!("{v:X}") } else { format!("{v:x}") };
+                ("", prefix, body.into_bytes())
             }
-            b'c' => ("", "", ((arg() as u8) as char).to_string()),
+            b'c' => ("", "", vec![arg() as u8]),
             b's' => {
-                let s = m.mem.cstr(next(m), prec.unwrap_or(1024));
-                ("", "", String::from_utf8_lossy(&s).into_owned())
+                let s = m.mem.cstr(next(m), prec.unwrap_or(MAX_LEN as usize).min(MAX_LEN as usize));
+                ("", "", s)
             }
             b'n' => {
                 let addr = next(m);
                 if half { m.mem.w16(addr, out.len() as u16) } else { m.mem.w32(addr, out.len() as u32) }
                 continue;
             }
-            b'%' => ("", "", "%".into()),
-            other => ("", "", format!("%{}", other as char)),
+            b'%' => ("", "", vec![b'%']),
+            other => ("", "", vec![b'%', other]),
         };
         let numeric = b"diDuUoOxXp".contains(&conv);
         if numeric {
             if let Some(p) = prec {
                 if body.len() < p {
-                    body = "0".repeat(p - body.len()) + &body;
+                    let mut padded = vec![b'0'; p - body.len()];
+                    padded.extend_from_slice(&body);
+                    body = padded;
                 }
             }
-            if prefix == "0" && body.starts_with('0') {
+            if prefix == "0" && body.starts_with(b"0") {
                 body.remove(0);
             }
         }
         let pad = width.saturating_sub(sign.len() + prefix.len() + body.len());
+        let zero_pad = !left && flags.contains('0') && numeric && prec.is_none();
+        if !left && !zero_pad {
+            out.extend(std::iter::repeat_n(b' ', pad));
+        }
+        out.extend_from_slice(sign.as_bytes());
+        out.extend_from_slice(prefix.as_bytes());
+        if zero_pad {
+            out.extend(std::iter::repeat_n(b'0', pad));
+        }
+        out.extend_from_slice(&body);
         if left {
-            out.push_str(&format!("{sign}{prefix}{body}{}", " ".repeat(pad)));
-        } else if flags.contains('0') && numeric && prec.is_none() {
-            out.push_str(&format!("{sign}{prefix}{}{body}", "0".repeat(pad)));
-        } else {
-            out.push_str(&format!("{}{sign}{prefix}{body}", " ".repeat(pad)));
+            out.extend(std::iter::repeat_n(b' ', pad));
         }
     }
     out

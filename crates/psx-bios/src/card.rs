@@ -652,7 +652,8 @@ impl<S: Sdk> Machine<S> {
         };
         let mut e = vec![0u8; 0x28];
         let n = f.name.as_bytes();
-        e[..n.len().min(0x13)].copy_from_slice(&n[..n.len().min(0x13)]);
+        // The fixed-width name field may use all 20 bytes without a NUL.
+        e[..n.len().min(0x14)].copy_from_slice(&n[..n.len().min(0x14)]);
         e[0x14..0x18].copy_from_slice(&(if f.deleted { 0xA0u32 } else { 0x50 }).to_le_bytes());
         e[0x18..0x1C].copy_from_slice(&f.size.to_le_bytes());
         e[0x20..0x24].copy_from_slice(&((f.blocks[0] * 64) as u32).to_le_bytes());
@@ -676,7 +677,10 @@ impl<S: Sdk> Machine<S> {
         let Some(card) = self.kernel.cards.slots[slot].as_mut() else { return 0 };
         let ok = if undelete { card.undelete(&name) } else { card.delete(&name) };
         if !ok {
-            self.kernel.cards.errno = E_NOT_FOUND;
+            let collision = undelete && card.files().iter()
+                .find(|f| f.deleted && memcard::name_matches(&name, &f.name))
+                .is_some_and(|f| card.find(&f.name).is_some());
+            self.kernel.cards.errno = if collision { E_EXISTS } else { E_NOT_FOUND };
         }
         ok as u32
     }
@@ -697,7 +701,11 @@ impl<S: Sdk> Machine<S> {
             return 0;
         }
         let Some(card) = self.kernel.cards.slots[slot].as_mut() else { return 0 };
-        card.rename(&a, &b) as u32
+        let ok = card.rename(&a, &b);
+        if !ok {
+            self.kernel.cards.errno = if card.find(&b).is_some() { E_EXISTS } else { E_NOT_FOUND };
+        }
+        ok as u32
     }
 
     pub fn card_format(&mut self, path: &str) -> u32 {
@@ -808,6 +816,55 @@ mod tests {
         assert_eq!(m.card_erase(name, false), 1);
         assert_eq!(m.card_open(name, 1, 5), u32::MAX);
         assert!(m.kernel.cards.slots[0].as_ref().unwrap().valid());
+    }
+
+    #[test]
+    fn rename_and_undelete_report_their_own_errors() {
+        let mut m = machine();
+        let (a, b, missing, new) = (0x8001_0000, 0x8001_0100, 0x8001_0200, 0x8001_0300);
+        for (path, name) in [(a, b"bu00:A\0"), (b, b"bu00:B\0")] {
+            m.mem.write(path, name);
+            let fd = ret(bios::call(&mut m, 0xB0, 0x32, [path, 0x10203, 0, 0]));
+            assert_ne!(fd, u32::MAX);
+            assert_eq!(ret(bios::call(&mut m, 0xB0, 0x36, [fd, 0, 0, 0])), fd);
+        }
+        m.mem.write(missing, b"bu00:MISSING\0");
+        m.mem.write(new, b"bu00:NEW\0");
+        for (from, to, errno) in [(a, b, super::E_EXISTS), (missing, new, super::E_NOT_FOUND)] {
+            assert_eq!(ret(bios::call(&mut m, 0xB0, 0x44, [from, to, 0, 0])), 0);
+            assert_eq!(ret(bios::call(&mut m, 0xB0, 0x54, [0; 4])), errno);
+        }
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x45, [a, 0, 0, 0])), 1);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x44, [b, a, 0, 0])), 1);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x54, [0; 4])), super::E_NOT_FOUND, "success leaves errno unchanged");
+        for (path, errno) in [(a, super::E_EXISTS), (missing, super::E_NOT_FOUND)] {
+            assert_eq!(ret(bios::call(&mut m, 0xB0, 0x46, [path, 0, 0, 0])), 0);
+            assert_eq!(ret(bios::call(&mut m, 0xB0, 0x54, [0; 4])), errno);
+        }
+    }
+
+    #[test]
+    fn directory_preserves_twenty_byte_filenames() {
+        let mut m = machine();
+        let (path, dir) = (0x8001_0000, 0x8003_0000);
+        let names = ["BASLUS-01324BOF400US", "BASLUS-01324BOF401US"];
+        for name in names {
+            m.mem.write(path, format!("bu00:{name}\0").as_bytes());
+            let fd = ret(bios::call(&mut m, 0xB0, 0x32, [path, 0x10203, 0, 0]));
+            assert_ne!(fd, u32::MAX);
+            assert_eq!(ret(bios::call(&mut m, 0xB0, 0x36, [fd, 0, 0, 0])), fd);
+        }
+        m.mem.write(path, b"bu00:BASLUS*\0");
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x42, [path, dir, 0, 0])), dir);
+        for (i, name) in names.iter().enumerate() {
+            let mut returned = [0u8; 20];
+            m.mem.read(dir, &mut returned);
+            assert_eq!(&returned, name.as_bytes());
+            assert_eq!(m.mem.r32(dir + 0x14), 0x50, "attributes follow the name");
+            assert_eq!(m.mem.r32(dir + 0x18), 0x2000);
+            let next = ret(bios::call(&mut m, 0xB0, 0x43, [dir, 0, 0, 0]));
+            assert_eq!(next, if i + 1 < names.len() { dir } else { 0 });
+        }
     }
 
     /// Ready-mode events for each card spec on `class`, by spec.
