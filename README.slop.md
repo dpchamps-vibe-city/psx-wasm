@@ -51,6 +51,15 @@ cargo build --release -p psxw-cli
 | `web/` | The browser host: page, Worker, OPFS disc, AudioWorklet |
 | `oracle/` | Emulator host, runner, Docker images |
 
+`psxw build <game>` (including `build-web` and mod builds) runs a full census
+before translation and linking, and stops if it fails. No separate `census`
+or `lift` command is needed before building.
+
+`psxw census <game>` follows the manifest's `[ci] census_no_probe` default,
+just like `psxw ci`. Use `--probe` to force the layout probe (requires the
+decomp's matching compiler), or `--no-probe` to skip it. Skipped probes are
+reported explicitly.
+
 The layout probe's end-to-end test runs the real reference compiler when
 both variables are set:
 

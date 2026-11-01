@@ -117,7 +117,7 @@ pub fn dwarf_view(ws: &Workspace, game: &str) -> Result<crate::dwarf::DwarfView>
 }
 
 /// The game's snapshots at another commit of its decomp (plans/M12 phase
-/// 3): psx-wasm's pins with that commit (its census objects must exist).
+/// 3): psx-wasm's pins with that commit; build preparation runs its census.
 pub fn snapshots_at(ws: &Workspace, game: &str, commit: &str) -> Result<(crate::snapshot::Snapshot, crate::snapshot::Snapshot)> {
     let manifest = ws.game(game)?;
     let mut other = ws.clone();

@@ -112,11 +112,14 @@ fn run() -> Result<()> {
             }
         }
         ["census", game, rest @ ..] => {
-            let mut opts = psxw_census::Options { game: game.to_string(), only: None, probe: true, only_header: None };
+            let mut opts = psxw_census::Options {
+                game: game.to_string(), only: None, probe: !ws.game(game)?.ci.census_no_probe, only_header: None,
+            };
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match *a {
                     "--only" => opts.only = it.next().map(|s| s.to_string()),
+                    "--probe" => opts.probe = true,
                     "--no-probe" => opts.probe = false,
                     "--only-header" => opts.only_header = it.next().map(|s| s.to_string()),
                     other => bail!("unknown census option {other}"),

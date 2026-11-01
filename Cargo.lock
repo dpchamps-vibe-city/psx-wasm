@@ -829,6 +829,7 @@ dependencies = [
  "psx-bios",
  "psxw-abi",
  "psxw-cc",
+ "psxw-census",
  "psxw-difftest",
  "psxw-inputs",
  "psxw-lift",

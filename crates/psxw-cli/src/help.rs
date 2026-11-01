@@ -100,7 +100,10 @@ fn render(topic: &[&str]) -> Result<String> {
                 ("--mod <dir>", "Link a mod directory; repeat for multiple mods."),
                 ("--mods <dir,...>", "Link a comma-separated list of mod directories."),
             ]),
-            ("Notes", &[("With --mod / --mods", "Other build options cannot be combined with mods yet.")]),
+            ("Notes", &[
+                ("Prerequisites", "Runs the full census before translation and linking."),
+                ("With --mod / --mods", "Other build options cannot be combined with mods yet."),
+            ]),
         ]),
         ["build-web", ..] => page("build-web <game> [options]", "Build a browser-ready game bundle.", &[
             ("Options", &[
@@ -159,7 +162,8 @@ fn render(topic: &[&str]) -> Result<String> {
             ("Options", &[
                 ("--only <filter>", "Only compile translation units whose paths match."),
                 ("--only-header <header>", "Limit the census to a header."),
-                ("--no-probe", "Skip the layout probe."),
+                ("--probe", "Run the layout probe (overrides [ci] census_no_probe)."),
+                ("--no-probe", "Skip the layout probe; default follows [ci] census_no_probe."),
             ]),
         ]),
         ["lift", ..] => page("lift <game> [options]", "Translate original MIPS functions to C.", &[

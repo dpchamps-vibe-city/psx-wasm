@@ -23,8 +23,8 @@ include = ["include"]
 defines = ["__GNUC__=2", "_LANGUAGE_C", "INCLUDE_ASM_USE_MACRO_INC=1"]
 
 [probe]
-# No game types are recovered yet; run the census with --no-probe until
-# headers declare some.
+# No game types are recovered yet; [ci] census_no_probe skips the layout
+# probe by default until headers declare some.
 include_dirs = ["include"]
 prelude = ["common.h"]
 
@@ -66,7 +66,7 @@ native = ["cd", "gpu", "irq", "mdec", "sio0", "spu"]
 # The layout probe compares game struct layouts under the matching
 # compiler and clang. bof4-decomp's headers declare no game types yet, and
 # its matching cc1 is provisioned by the harness at build time, not kept in
-# the checkout.
+# the checkout. Both `psxw census` and `psxw ci` use this default.
 census_no_probe = true
 # Title to the first field scene (M13), with its reached-state checks.
 replay = "title-to-field"

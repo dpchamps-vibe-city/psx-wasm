@@ -244,6 +244,8 @@ impl Report {
             list(&mut s, "MISMATCH", &l.mismatches);
             list(&mut s, "clang-only failure", &l.clang_only_failures);
             list(&mut s, "clang failed on header", &l.headers_clang_failed);
+        } else {
+            let _ = writeln!(s, "\nLayout probe: skipped");
         }
 
         if !self.warnings.is_empty() {

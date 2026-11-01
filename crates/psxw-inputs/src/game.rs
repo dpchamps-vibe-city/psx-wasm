@@ -62,7 +62,8 @@ pub struct CiSection {
     /// A replay (`replays/<name>.toml`) gated natively: its `expect` lines,
     /// determinism, no trap, no shadow I/O.
     pub replay: Option<String>,
-    /// Run the census without the layout probe (no game types to probe yet).
+    /// Default to no layout probe in both `psxw census` and `psxw ci`
+    /// (no game types to probe yet). `census --probe` overrides this.
     #[serde(default)]
     pub census_no_probe: bool,
 }

@@ -245,6 +245,15 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     // A debug build can be a moddable base (script mods, D56); mods linked
     // in would need building for its window.
     ensure!(!opts.debug || (!opts.ubsan && opts.mods.is_none()), "a debug build doesn't combine with --ubsan or linked-in mods yet");
+    // Compile and check all C inputs before the lift tier consumes them.
+    // Run the full census: an existing obj directory may be only a partial run.
+    let census = psxw_census::Options {
+        game: opts.game.clone(), only: None, probe: !ws.game(&opts.game)?.ci.census_no_probe, only_header: None,
+    };
+    let (report, json) = psxw_census::run(ws, &census)?;
+    ensure!(report.verdict.pass, "census failed: {}; see {}", report.verdict.failures.join("; "), json.display());
+    eprintln!("build: census passed ({})", json.display());
+
     // Incremental: cheap when the runtime hasn't changed.
     let runtime_path = crate::runtime::build(ws)?;
     let runtime = std::fs::read(&runtime_path)?;
