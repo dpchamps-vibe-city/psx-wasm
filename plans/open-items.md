@@ -5,8 +5,11 @@ Milestone history is in [`completed/`](completed/). Older audit findings below
 retain their provenance; the active recovery status is recorded separately.
 
 - **Active plan:** [`salvage-bios-work.md`](salvage-bios-work.md), native recovery
-  integrated with BIOS completion still in progress. Its checkpointed results
-  supersede older coverage/gate claims below.
+  accepted for merge to main; **full BIOS completion remains a separate,
+  unfinished milestone**. Its recovery checkpoint groups the remaining executable,
+  control-flow, CD/card, console, resource and validation work. The provisional
+  4–8 engineer-week allowance is low-confidence, not a delivery commitment.
+  Checkpointed results supersede older coverage/gate claims below.
 - **Last full gate runs:** both `psxw ci btn` and `psxw ci bof4` completed at the
   ABI-17 recovery foundation (`a74f832`, code `4cce9e3`) and exited 2. Missing
   oracle prerequisites, BTN mods census inputs and two BTN difftest mismatches

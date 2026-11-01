@@ -1,11 +1,50 @@
 # Salvage the BIOS work
 
-**Status:** in progress; recovery foundation integrated, BIOS completion and validation still open. General non-local returns are deferred by the user.
+**Status:** recovery milestone accepted for merge to `main`; full BIOS completion and validation remain open. General non-local returns are deferred by the user.
 **Goal:** preserve the working native-port architecture, recover useful work from
 spec-fidelity, and finish the missing BIOS functionality in Rust.
 **Supersedes:** `plans/spec-fidelity.md` on `archive/spec-fidelity-b8a0683`
 as the execution direction for this recovery and BIOS completion. That archived
 plan remains historical evidence, not a checklist to resume.
+
+## Recovery merge checkpoint
+
+The operator approved merging the recovered native foundation into `main` and
+cleaning up the worktrees. This closes the recovery delivery milestone, **not
+full BIOS implementation or full-CI certification**. Do not automatically reopen
+small follow-up lanes during merge/cleanup. Earlier checkout paths and validation
+sections below are historical provenance, not instructions to recreate worktrees.
+
+At source checkpoint `7ba449e`, the recovery branch contains 109 commits since
+`0bae88ac`, with 81 files changed (+15,037/-1,576 lines, including tests and
+approximately 2,700 documentation additions). This includes recovered/reworked
+commits, not 109 new features. Native architecture, substantial BIOS/kernel/file/
+card/CD services, patched SDK call flows and browser storage corrections are
+integrated. ABI remains 18.
+
+### Remaining full-BIOS work
+
+| Work package | Remaining scope |
+|---|---|
+| Executable lifecycle | Build-known Exec/LoadExec, executable identity and register/stack/return behavior; warm boot |
+| Control flow/kernel | General non-local returns and dependent ioabort (user-deferred); exception entry/hook paths, callback/IRQ thread switching, non-main SetConf; unresolved A52/C09 contracts |
+| CD/card software | Remaining internal CD/chain/INT5 services, filesystem path-table/disc identity and other status contracts; unresolved card helper effects/returns |
+| Console | Built-in host input and circular-buffer helpers |
+| Resources/identity | Verified font offset mapping, legally usable glyph resources and BIOS date/version policy |
+| Validation | Non-empty oracle inputs, current full CI, BTN mod prerequisites/difftest failures, game-level save/reload assertions |
+
+Provisional planning allowance: **4–8 engineer-weeks**, low confidence, not a
+completion promise or an estimate of agent wall-clock time. Control-flow design,
+reference evidence and validation prerequisites dominate uncertainty. Significant
+new architecture still requires approval; merging does not lift the longjmp
+deferral or authorize a redesign. Required unfinished services prevent a full-BIOS
+claim even when recovery is accepted.
+
+Latest focused validation is BIOS **59** / runtime **11** / SDK **42** tests and
+wasm32 runtime check at `7ba449e`. Native builds and four passing replays remain
+at `15d15f3`; they do not exercise A60. Browser and conformance epochs are listed
+below. Earlier full CI is **not green**. No fresh game/browser/oracle result is
+implied by the merge.
 
 ## Read first
 
@@ -131,7 +170,7 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 
 | Area | Current disposition / next action |
 |---|---|
-| Native recovery | Integrated; original main and archived work preserved. Remaining service gaps are listed in section 3, not hidden under recovery. |
+| Native recovery | Accepted for merge to main; spec-fidelity history remains archived. Remaining service gaps are listed above and in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
 | Card, console and CD | Partial; CD blocking calls wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts. Seek/read/status honor patched A78/A7E/A7C commands and bounded acceptance retries, with per-call guest stack locals. Completion probes dispatch patched B0B TestEvent; long command-acceptance loops now yield through the existing loop budget so busy native work can progress. Remaining CD internals stay incomplete. CD opens preserve ISO versions and accept `?` filename matching. CD file reads enforce sector alignment/EOF and now use the existing native blocking helper, including patched commands/events/errors and scheduled completion. They check status through the existing blocking helper before seeking, then transfer the full requested sectors and clip using live FCB metadata after success. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
@@ -397,8 +436,9 @@ and the full-BIOS goal are not "done" while required functionality is blocked.
   native-BIOS open items. Full BIOS/CI remain unfinished; older audit entries
   are labelled historical rather than silently treated as current bugs. This
   does not claim every unrelated historical finding was re-audited.
-- [ ] Present the recovery branch and remaining limitations for review before
-  merging into main. Do not delete the archived work.
+- [x] Present the recovery branch and remaining limitations; operator approved
+  merging the recovery milestone into main and cleaning up worktrees. Preserve
+  archived history and unrelated work. Full BIOS/CI completion is not claimed.
 
 ## Validation discipline
 

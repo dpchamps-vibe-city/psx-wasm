@@ -10,7 +10,7 @@ where the last one stopped.
 | [`../docs/design.md`](../docs/design.md) | The source of truth for *what* we build and *why*, ending in the decision log (D1–D66, then the D67–D71 salvage dispositions). Plans say *how* and *in what order*. |
 | [`conventions.md`](conventions.md) | Repo layout, commands, file formats, data hygiene, commit rules |
 | [`unified-adaptor-layer/`](unified-adaptor-layer/) | Native adapters per chip, with graceful degradation to the device models. Phase 1 (btn and bof4) is done; phase 2 (the rest of PsyQ 4.7) is not started. |
-| [`salvage-bios-work.md`](salvage-bios-work.md) | **The active plan:** preserve the native-port architecture, recover reviewed spec-fidelity work and finish the native Rust BIOS. Public service coverage is partial; its unresolved CI and prerequisites stay open. |
+| [`salvage-bios-work.md`](salvage-bios-work.md) | **Recovery accepted for main; full BIOS remains unfinished.** Records the native recovery, remaining work packages, deferred non-local returns and checkpoint-specific validation. |
 | [`open-items.md`](open-items.md) | Every unfinished task, blocked item, human-needed input and erratum, in one place |
 | [`shortcuts.md`](shortcuts.md) | Every corner cut in the runtime, BIOS, devices, adapters and translator, as tasks to redo the spec's way |
 | [`completed/`](completed/) | Everything implemented: milestones M0–M13 (M9 never started) and the btn bug follow-ups, kept as history |
@@ -77,7 +77,7 @@ Nothing in code may be specific to either.
 
 | Plan | Status | Depends on |
 |---|---|---|
-| [Salvage the BIOS work](salvage-bios-work.md): preserve the native-port architecture, recover reviewed work and finish the native Rust BIOS | **in progress; the active plan** | — |
+| [Salvage the BIOS work](salvage-bios-work.md): preserve the native-port architecture, recover reviewed work and finish the native Rust BIOS | **recovery accepted for merge; BIOS completion open** | — |
 | [Unified adapter layer, phase 1](unified-adaptor-layer/phase1.md): every adapter btn and bof4 need; both games native except the GTE | done | M13 |
 | [Unified adapter layer, phase 2](unified-adaptor-layer/phase2.md): the rest of PsyQ 4.7 | not started | phase 1 |
 | [Debug builds of threaded games](debug-builds-threaded-games.md): `--debug` is refused for games that switch threads (bof4) | problem statement only | — |
