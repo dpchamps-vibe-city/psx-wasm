@@ -200,6 +200,8 @@ enum Synth {
     Publish(usize),
     /// Unbind implementations depending on an invalidated range.
     Invalidate,
+    /// A `c_marker` site authored C calls: rule `rule`'s effect.
+    Marker(usize),
     /// C `call_indirect` with a signature (the MIPS address trails).
     ICall(FuncType),
     /// `psxw_call_indirect(addr, a0..a3)` and `guest_invoke`.
@@ -557,6 +559,16 @@ impl Resolver for R<'_, '_> {
         }
         if let Some(imp) = service(&name) {
             return Ok(Lowered::Call(self.ctx.import(imp)));
+        }
+        if let Some(m) = name.strip_prefix(psxw_inputs::dispatch::SITE_PREFIX).filter(|_| !s.defined) {
+            let rule = self.ctx.spec.binding.as_ref().and_then(|b| b.markers.get(m).copied());
+            let rule = rule.with_context(|| format!("binding.invalid_fact: {} calls {name}, which no rule declares as its c_marker", inp.label))?;
+            ensure!(
+                sig.params == [V::I32; 5] && sig.results.is_empty(),
+                "binding.invalid_fact: {} calls {name} as {sig:?}; include psxw_binding.h for its declaration",
+                inp.label
+            );
+            return Ok(Lowered::Call(self.ctx.synth(Synth::Marker(rule))));
         }
         if ["abs", "labs", "fabs"].contains(&name.as_str()) && !s.defined {
             return Ok(Lowered::Call(self.ctx.synth(Synth::Support(name, sig.clone()))));
@@ -1009,6 +1021,14 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let refs = binding_refs(ctx);
             let f = crate::binding::publish(&refs, p, invalidate, &mut |_, a| entries[&a]);
             (FuncType { params: vec![V::I32; 2], results: vec![] }, f, format!("binding_publish:{}", b.placements[p].id))
+        }
+        Synth::Marker(rule) => {
+            let b = ctx.spec.binding.as_ref().context("a c_marker without a binding plan")?;
+            let invalidate = ctx.synth(Synth::Invalidate);
+            let publishes: Vec<u32> = (0..b.placements.len()).map(|p| ctx.synth(Synth::Publish(p))).collect();
+            let refs = binding_refs(ctx);
+            let f = crate::binding::marker(&refs, rule, &|p| publishes[p], invalidate);
+            (FuncType { params: vec![V::I32; 5], results: vec![] }, f, format!("binding_site:{}", b.rules[rule].id))
         }
         Synth::Operation { container, addr, inner } => {
             let b = ctx.spec.binding.as_ref().context("an operation without a binding plan")?;

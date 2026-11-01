@@ -308,8 +308,8 @@ not dispatch inference and need not be deleted.
   authored C continuation/state interfaces and source-debugging acceptance instead.
 - 2026-11-01: A implemented: `[dispatch]` schema, binding plan, generated
   publication/invalidation and operation wrappers, `psx.binding_fault` (ABI 19),
-  versioned reports, and seven `D05/explicit-binding-*` variants passing against
-  the live reference. The full corpus remains red on the legacy baseline set.
+  versioned reports, writer-bound inference, `c_marker` write sites, and ten
+  `D05/explicit-binding-*` variants passing against the live reference. The full corpus remains red on the legacy baseline set.
   Evidence: [A's progress log](01-explicit-activation.md#progress-log).
 
 ## Findings

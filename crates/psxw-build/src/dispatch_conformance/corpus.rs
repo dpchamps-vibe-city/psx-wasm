@@ -744,6 +744,8 @@ fn d05_unpack(lay: &Layout, n: &Names) -> Fixture {
 const STAGED: u32 = 3;
 /// The edited C's extra log entry: an effect the original binary lacks.
 const EDIT_MARK: u32 = 0xED17;
+/// `load_module`'s store into the destination, from its entry.
+const LM_STORE: u32 = 0x2C;
 
 /// How the executable's loader and drivers are implemented.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -754,19 +756,23 @@ enum Loader {
     MatchingC,
     /// The loader's C deliberately logs [`EDIT_MARK`] after loading.
     EditedC,
+    /// Matching C that calls its `c_marker` site after the copy.
+    MarkerC,
 }
 
 /// The executable: a resident loader, `load_module(sel, dst, len)`, that
-/// copies staged module `sel` to `dst` and returns 0, or returns 1 before
-/// writing anything when `sel` names no staged module; a saved function
-/// pointer; drivers into both regions.
+/// copies staged module `sel` to `dst` (its store at [`LM_STORE`]) and
+/// returns 0, or returns 1 before writing anything when `sel` names no
+/// staged module; a saved function pointer; drivers into both regions.
 fn explicit_main(lay: &Layout, loader: Loader) -> Image {
     let saved = lay.stage + 0x1000;
     let mut main = main_image(lay, |u| {
         let a = u.func("load_module");
         a.addiu(SP, SP, -24).sw(RA, 16, SP).sltiu(T0, A0, STAGED as i32).beq(T0, ZERO, "lm_fail").nop();
-        a.sll(T0, A0, 10).li(T1, lay.stage).addu(T1, T1, T0).mov(A0, A1).mov(A1, T1).jal("copy").nop();
-        a.lw(RA, 16, SP).ori(V0, ZERO, 0).jr(RA).addiu(SP, SP, 24);
+        a.sll(T0, A0, 10).li(T1, lay.stage).addu(T1, T1, T0);
+        a.label("lm_loop");
+        a.lw(T0, 0, T1).addiu(T1, T1, 4).sw(T0, 0, A1).addiu(A2, A2, -4).bne(A2, ZERO, "lm_loop").addiu(A1, A1, 4);
+        a.jal("flush").nop().lw(RA, 16, SP).ori(V0, ZERO, 0).jr(RA).addiu(SP, SP, 24);
         a.label("lm_fail");
         a.lw(RA, 16, SP).ori(V0, ZERO, 1).jr(RA).addiu(SP, SP, 24);
         // save_ptr(p): a function pointer kept in data.
@@ -782,21 +788,23 @@ fn explicit_main(lay: &Layout, loader: Loader) -> Image {
         u.a.lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
     });
     if loader != Loader::Lifted {
-        let edit = if loader == Loader::EditedC {
-            format!("    {{ unsigned **log = (unsigned **)0x{:08X}u; *(*log)++ = 0x{EDIT_MARK:X}u; }}\n", lay.log)
-        } else {
-            String::new()
+        let edit = match loader {
+            Loader::EditedC => format!("    {{ unsigned **log = (unsigned **)0x{:08X}u; *(*log)++ = 0x{EDIT_MARK:X}u; }}\n", lay.log),
+            Loader::MarkerC => "    psxw_binding_site_module_written((unsigned)dst, (unsigned)len, 0u, sel, 0u);\n".to_string(),
+            _ => String::new(),
         };
+        let include = if loader == Loader::MarkerC { "#include \"psxw_binding.h\"\n" } else { "" };
         main.c = Some(format!(
-            "void flush(void);\n\
+            "{include}void flush(void);\n\
              int func_{slot:08X}(int a);\n\
              int load_module(unsigned sel, unsigned *dst, int len) {{\n\
-             \x20   unsigned *src;\n\
+             \x20   unsigned *src, *to = dst;\n\
+             \x20   int n = len;\n\
              \x20   if (sel >= {STAGED}u) return 1;\n\
              \x20   src = (unsigned *)(0x{stage:08X}u + sel * 0x400u);\n\
-             \x20   do {{ *dst++ = *src++; len -= 4; }} while (len != 0);\n\
-             \x20   flush();\n\
-             {edit}    return 0;\n\
+             \x20   do {{ *to++ = *src++; n -= 4; }} while (n != 0);\n\
+             {edit}    flush();\n\
+             \x20   return 0;\n\
              }}\n\
              int drive_c(int a) {{ return func_{slot:08X}(a); }}\n\
              int drive_cp(int (*f)(int), int a) {{ return f(a); }}\n",
@@ -807,11 +815,43 @@ fn explicit_main(lay: &Layout, loader: Loader) -> Image {
     main
 }
 
-/// The facts a game would state: three placements, writer summaries, and
-/// the loader's completed return publishing the selected module where it
+/// The loader's completed return publishes the selected module where it
 /// was loaded.
-fn explicit_facts(n: &Names, lay: &Layout) -> String {
-    let saved = lay.stage + 0x1000;
+const RETURN_RULE: &str = r#"[[dispatch.rules]]
+id = "load-completed"
+container = "main"
+function = "load_module"
+event = "return"
+effect = "publish"
+placement = "selector"
+selector = "arg:0"
+cases = { "0" = "slot-a", "1" = "slot-b", "2" = "region-c" }
+destination = "arg:1"
+length = "arg:2"
+source_offset = "const:0"
+success = "zero"
+request = "call"
+"#;
+
+/// The loader's write, at its original store: authored C states its
+/// completed range at a `c_marker` call (`marker`), or the build asks for
+/// one.
+fn write_rule(main: &Image, marker: Option<&str>) -> String {
+    let at = main.addr("load_module") + LM_STORE;
+    let word = main.bytes[(at - main.base) as usize..][..4].try_into().map(u32::from_le_bytes).unwrap_or_default();
+    assert_eq!(word >> 26, 0x2B, "LM_STORE names load_module's sw");
+    let marker = marker.map_or(String::new(), |m| format!("c_marker = \"{m}\"\n"));
+    format!(
+        "[[dispatch.rules]]\nid = \"module-written\"\ncontainer = \"main\"\npc = 0x{at:08X}\nevent = \"after-write\"\n{marker}\
+         effect = \"publish\"\nplacement = \"selector\"\nselector = \"arg:0\"\n\
+         cases = {{ \"0\" = \"slot-a\", \"1\" = \"slot-b\", \"2\" = \"region-c\" }}\n\
+         destination = \"write-address\"\nlength = \"write-size\"\nsource_offset = \"placement\"\n"
+    )
+}
+
+/// The facts a game would state: three placements, writer summaries (the
+/// loader's declared, the pointer store's inferred), and `rule`.
+fn explicit_facts(n: &Names, lay: &Layout, rule: &str) -> String {
     format!(
         r#"[dispatch]
 schema_version = 1
@@ -839,23 +879,8 @@ destinations = [{{ start = 0x{s1:08X}, end = 0x{e1:08X} }}, {{ start = 0x{s2:08X
 id = "pointer-store"
 container = "main"
 function = "save_ptr"
-destinations = [{{ start = 0x{saved:08X}, end = 0x{saved_end:08X} }}]
 
-[[dispatch.rules]]
-id = "load-completed"
-container = "main"
-function = "load_module"
-event = "return"
-effect = "publish"
-placement = "selector"
-selector = "arg:0"
-cases = {{ "0" = "slot-a", "1" = "slot-b", "2" = "region-c" }}
-destination = "arg:1"
-length = "arg:2"
-source_offset = "const:0"
-success = "zero"
-request = "call"
-"#,
+{rule}"#,
         a = n.of("a"),
         b = n.of("b"),
         c = n.of("c"),
@@ -863,7 +888,6 @@ request = "call"
         e1 = lay.slot + SLOT_BYTES,
         s2 = lay.slot2,
         e2 = lay.slot2 + SLOT_BYTES,
-        saved_end = saved + 4,
     )
 }
 
@@ -919,9 +943,10 @@ fn d05_explicit(lay: &Layout, n: &Names, loader: Loader) -> Fixture {
         }
     }
     let init = vec![(lay.stage, a.bytes.clone()), (lay.stage + 0x400, b.bytes.clone()), (lay.stage + 0x800, c.bytes.clone())];
+    let rule = if loader == Loader::MarkerC { write_rule(&main, Some("module_written")) } else { RETURN_RULE.to_string() };
     let mut f = Fixture::new(vec![main, a, b, c], s);
     f.init = init;
-    f.dispatch = Some(explicit_facts(n, lay));
+    f.dispatch = Some(explicit_facts(n, lay, &rule));
     f
 }
 
@@ -933,6 +958,30 @@ fn d05_explicit_mixed(lay: &Layout, n: &Names) -> Fixture {
 }
 fn d05_explicit_edited(lay: &Layout, n: &Names) -> Fixture {
     d05_explicit(lay, n, Loader::EditedC)
+}
+fn d05_explicit_marker(lay: &Layout, n: &Names) -> Fixture {
+    d05_explicit(lay, n, Loader::MarkerC)
+}
+
+/// A write rule inside supplied C with no c_marker: no verified mapping
+/// exists, so the build asks for the marker instead of lifting the C.
+fn d05_explicit_missing_c_site(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MatchingC);
+    f.dispatch = Some(explicit_facts(n, lay, &write_rule(&f.images[0], None)));
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.missing_c_write_site: rule `module-written`".into());
+    f
+}
+
+/// A declared writer bound its known store falls outside.
+fn d05_explicit_wrong_writer(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let facts = f.dispatch.take().unwrap_or_default();
+    let wrong = format!("function = \"save_ptr\"\ndestinations = [{{ start = 0x{:08X}, end = 0x{:08X} }}]\n", lay.stage + 0x1008, lay.stage + 0x100C);
+    f.dispatch = Some(facts.replace("function = \"save_ptr\"\n", &wrong));
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.invalid_fact: writer `pointer-store` declares".into());
+    f
 }
 
 /// Facts that leave module b without a placement: its arrival would leave
@@ -1425,6 +1474,9 @@ fn defs() -> Vec<Def> {
             Evidence::ClosedForm("authored C edit: its log entry is absent from the original binary"),
             d05_explicit_edited,
         ),
+        d("D05", "explicit-binding-c-marker", "supported: explicit binding from authored C's c_marker write site", REF, d05_explicit_marker),
+        d("D05", "explicit-binding-missing-c-site", "rejected facts: a C write site without its c_marker", REF, d05_explicit_missing_c_site),
+        d("D05", "explicit-binding-wrong-writer", "rejected facts: a declared writer bound contradicts a known write", REF, d05_explicit_wrong_writer),
         d("D05", "explicit-binding-unknown-selector", "port rejection: a completed load names no placement", REF, d05_explicit_unknown_selector),
         d("D05", "explicit-binding-bad-destination", "port rejection: a load outside its placement's layout", REF, d05_explicit_bad_destination),
         d("D05", "explicit-binding-missing-placement", "rejected facts: an image overlapping a placement has none", REF, d05_explicit_missing_placement),

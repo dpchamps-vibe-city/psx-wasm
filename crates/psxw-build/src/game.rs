@@ -508,6 +508,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         &inputs.originals,
         &translations,
         &tiers,
+        &link_inputs,
         mod_residency,
     )?;
 

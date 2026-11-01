@@ -269,7 +269,7 @@ for the required CLI/reference run.
     rules, writers, slots, entry and reference classifications, legacy
     consumers and the unfinished C obligations; each conformance variant names
     its `explicit` or `legacy` path.
-- Evidence (worktree `main-wt-5`, with uncommitted A changes):
+- First-pass evidence (superseded by the completion entry below):
   - `cargo test -p psxw-inputs --lib`: 16 passed. `cargo test -p psxw-build
     --lib`: 4 passed. `cargo test -p psxw-difftest --test link_passes`: 8 passed.
   - `PSXW_DISPATCH_CASE=D05/explicit-binding cargo test -p psxw-build --test
@@ -285,6 +285,39 @@ for the required CLI/reference run.
     `D05/explicit-binding-lifted` from step 10; the saved pointer returns
     0x103 (stale A) instead of 0x203.
   - `psxw build btn` (no `[dispatch]`, so the legacy path) links and merges with ABI 19: 2,604,657 bytes against the recorded 2,604,299, the difference being the new import and its runtime export. Its `build.json` reports 17 sampled-word addresses and 2,178 overlay entries with no residency check. `psxw run btn --frames 300 --check no-trap` passes.
+
+- 2026-11-01, completing A. The first pass marked A done without four of its
+  requirements; they are added here:
+  - Writer bounds are inferred first. The planner walks the writer's call tree
+    for stores at constant addresses, reports bounds as inferred or declared,
+    and fails a declaration that leaves out a known write. `destinations` is
+    now optional: a writer analysis bounds needs none.
+  - `c_marker` sites: the census (and the fixture pipeline) generates
+    `psxw_binding.h` on the C include path. Authored C calls
+    `psxw_binding_site_<marker>(destination, length, source_offset, selector,
+    request_key)` after its write; the linker binds it to a generated
+    `binding_site:<rule>` that checks the values like any publication. A write
+    rule in supplied C without a marker, or whose C never calls it, fails with
+    `binding.missing_c_write_site`.
+  - Argument words, `return` and success predicates are checked against each
+    operation's signature in the planner, before code generation.
+  - A debug link of every explicit fixture with C checks that each C
+    subprogram's DWARF starts in its own body, never in a generated wrapper.
+- Completion evidence (worktree `main-wt-5`):
+  - `cargo test -p psxw-inputs --lib`: 17 passed. `cargo test -p psxw-build
+    --lib`: 4 passed. `cargo test -p psxw-difftest --test link_passes`: 8 passed.
+  - `PSXW_DISPATCH_CASE=D05 cargo test -p psxw-build --test dispatch`: 14
+    variants (4 legacy, 10 explicit), 0 failed.
+  - `psxw conform dispatch --case D05/explicit-binding`: pass, 4 execution and
+    6 safety, 0 failed, 0 unresolved; the live reference ran the lifted, mixed,
+    `c_marker` and unknown-selector variants' supported checkpoints, and all
+    agree. Kept in `out/conform/dispatch/a-subset/`.
+  - `psxw conform dispatch` (full): 61 variants: 38 execution, 8 safety, 14 failed, 1 unresolved (exit 2). The failures and the unresolved
+    variant are the recorded legacy baseline set. Kept in
+    `out/conform/dispatch/a-full/`.
+  - Mutation re-run (scratchpad, restored): skipping `slot-b`'s publication
+    fails all four positive explicit variants, the `c_marker` one included.
+  - `psxw build btn` (no `[dispatch]`) still links and merges at 2,604,657 bytes, and `psxw run btn --frames 300 --check no-trap` passes.
 
 ## Findings
 
@@ -331,6 +364,25 @@ at covered addresses. Uncovered regions keep them and report them as
   candidates. The runtime has no in-place reset; a reset re-instantiates.
 - No game declares `[dispatch]` yet. Games keep the legacy path; `build.json`
   2 reports their classification.
+- Writer inference uses the lifter's register constants. A `$sp`-relative store
+  is the writer's own stack frame and is reported as such. A store through any
+  other register, a pointer, BIOS or kernel call, or supplied C leaves the writer
+  unbounded, so its bounds must be declared. Every store at a constant address
+  must lie inside a declaration.
+- `psxw_binding.h` types its parameters `unsigned int`: the reference cpp the C
+  tier preprocesses with has neither `<stdint.h>` nor `__UINT32_TYPE__`, and the
+  type is 32 bits on both MIPS and wasm32.
+- A write at a lifted instruction address stays `binding.unimplemented_rule`;
+  C1 adds that original-PC path for the same rules. Supplied C's write sites
+  already work through their markers.
+- Contract 2's provenance in A is per slot: the bound candidate names the
+  module, its footprint the range, and the placement's segments the source
+  range. Load instances and records for parts of a footprint come with C's
+  requests and range composition.
+- Contract 3 says not to inline across replaceable dependencies. A fails the
+  build where a translation does (`binding.replaceable_dependency`,
+  `binding.expanded_operation`): removing such an expansion needs C's
+  continuation mechanism for register-sharing transfers.
 - Disc-write notifications carry ranges, not a universal activation identity.
   The schema supplies identity from software operations and input facts.
 - Reusing the address table is an implementation step, not a commitment to retain

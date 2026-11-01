@@ -23,6 +23,10 @@ pub struct Binding {
     pub rules: Vec<Rule>,
     /// Instrumented operations: (container, address) → indices of `rules`.
     pub operations: BTreeMap<(String, u32), Vec<usize>>,
+    /// `c_marker` sites authored C calls (`psxw_binding_site_<marker>`):
+    /// marker → its rule, whose values are the call's arguments
+    /// (destination, length, source offset, selector).
+    pub markers: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,8 @@ pub struct Rule {
 pub enum Event {
     Enter,
     Return,
+    /// At a `c_marker` call, right after the write it describes.
+    AfterWrite,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +366,31 @@ pub(crate) fn operation(
     }
     f.instruction(&I::End);
     Ok(f)
+}
+
+/// `psxw_binding_site_<marker>(destination, length, source_offset,
+/// selector, request_key)`: the rule's effect with the authored C's
+/// normalized values, checked against the placement's layout and the
+/// rule's cases like any other publication.
+pub(crate) fn marker(r: &Refs, rule: usize, publish: &dyn Fn(usize) -> u32, invalidate: u32) -> Function {
+    let shape = Shape::C { params: 5, words: (0..5).map(Word::Param).collect(), result: None };
+    let first = 5;
+    let l = Locals {
+        params: 5,
+        res: None,
+        sp0: first,
+        dst: first + 1,
+        len: first + 2,
+        so: first + 3,
+        sel: first + 4,
+        ok: first + 5,
+        rel: first + 6,
+        stack: BTreeMap::new(),
+    };
+    let mut f = Function::new([(7, ValType::I32)]);
+    apply(&mut f, r, &shape, &l, rule, &r.binding.rules[rule], publish, invalidate);
+    f.instruction(&I::End);
+    f
 }
 
 /// Push the first return word.

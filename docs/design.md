@@ -258,10 +258,16 @@ replaces the stub for the regions it covers:
   supplied C stays the implementation. A selector no case names, or a
   destination outside the placement's layout, calls `psx.binding_fault`
   (ABI 19) instead of publishing a guess.
+- A write inside supplied C is stated by the C itself: the rule names a
+  `c_marker`, and the C calls `psxw_binding_site_<marker>` from the
+  generated `psxw_binding.h` after the write. Writer summaries are inferred
+  from constant-address stores first; declared bounds cover what analysis
+  can't and must contain every known write.
 - Facts the build can't honour fail it with a `binding.*` diagnostic:
   unknown fields, an overlapping image without a placement, a translation
   embedding replaceable code, an expanded operation, a code-changing writer
-  without a rule, or a rule milestone C implements.
+  without a rule, a declared writer bound a known write falls outside, a
+  write in supplied C without its marker, or a rule milestone C implements.
 
 Regions without a placement keep the sampled stub; `build.json` lists them
 as legacy, with every reference's class. Partial composition, active
@@ -2691,7 +2697,8 @@ and are reported as legacy. *Why:* the stub's sampled words can't
 establish which compiled implementation the program's loading made current
 (plans/dispatch-identity-and-binding). The dispatch-binding plan prescribes
 this contract, so no further approval was needed. Milestone A implements
-synchronous function-return publication and invalidation. Partial
+synchronous function-return publication and invalidation, and writes in
+supplied C stated through `c_marker` calls. Partial
 composition, request lifecycles, continuations, native loaders, mod
 residency and the callable namespace are milestones B and C. (design §3;
 plans/dispatch-binding/01-explicit-activation)

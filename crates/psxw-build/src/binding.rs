@@ -11,9 +11,11 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use psxw_abi::WINDOW_MASK;
 use psxw_inputs::AddressMap;
-use psxw_inputs::dispatch::{self as facts, DispatchSection, Effect, Event, Site};
+use psxw_inputs::dispatch::{self as facts, DispatchSection, Effect, Event, HEADER, SITE_PREFIX, Site};
 use psxw_link::binding as link;
 use psxw_link::game::Tier;
+use psxw_link::marshal;
+use psxw_link::object::{NameClass, SymbolKind, classify_name};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -52,7 +54,7 @@ pub struct Report {
 /// Milestone C obligations, reported with every explicit build.
 const UNFINISHED: &[&str] = &[
     "partial writes: an implementation whose bytes span two publications stays unbound until C composes them",
-    "after-write, begin/end, keyed requests, instruction-address and native-boundary sites, c_marker sites",
+    "after-write at lifted instruction addresses, begin/end, keyed requests, native-boundary sites",
     "active continuations: suspended lifted code and explicit C continuation handlers",
     "runtime merge: native loaders and host reads publish nothing yet",
     "mod residency: hooks at covered addresses and overlay data patches",
@@ -67,11 +69,12 @@ pub(crate) fn dispatch(
     originals: &psxw_inputs::originals::Originals,
     translations: &[psxw_lift::Translation],
     tiers: &BTreeMap<(String, u32), Tier>,
+    inputs: &[psxw_link::Input],
     mod_residency: bool,
 ) -> Result<(Option<link::Binding>, Overlays, Report)> {
     let (binding, mut report) = match section {
         Some(s) => {
-            let (b, r) = plan(s, map, translations, tiers)?;
+            let (b, r) = plan(s, map, translations, tiers, inputs)?;
             (Some(b), r)
         }
         None => (None, Report::default()),
@@ -103,6 +106,7 @@ pub(crate) fn plan(
     map: &AddressMap,
     translations: &[psxw_lift::Translation],
     tiers: &BTreeMap<(String, u32), Tier>,
+    inputs: &[psxw_link::Input],
 ) -> Result<(link::Binding, Report)> {
     let f = section.check()?;
     ensure!(!f.require_explicit, "binding.unimplemented: require_explicit = true (strict builds) is milestone C");
@@ -172,7 +176,31 @@ pub(crate) fn plan(
         }
     }
 
-    // Rules: what A implements, resolved.
+    // Each compiled function's o32 shape, to validate what rules read
+    // before code generation: its argument words, and whether it returns.
+    let shape = |key: &(String, u32)| -> (u32, bool) {
+        match tiers.get(key) {
+            Some(&Tier::C { input, func }) => {
+                let o = &inputs[input].obj;
+                let sig = &o.types[o.funcs[func as usize].ty as usize];
+                let name = o.func_symbol(func + o.num_imported_funcs()).map(|s| s.name.clone()).unwrap_or_default();
+                let guest = match classify_name(&name) {
+                    NameClass::Guest(n) => n.to_string(),
+                    _ => name,
+                };
+                let (kinds, variadic) = marshal::param_kinds(sig, inputs[input].protos.get(&guest));
+                (marshal::words(&kinds, variadic).0.len() as u32, !sig.results.is_empty())
+            }
+            _ => (facts::MAX_ARG, true),
+        }
+    };
+    // The function whose extent holds an instruction.
+    let function_at = |c: &str, pc: u32| {
+        translations
+            .iter()
+            .filter(|t| t.func.container == c && t.func.interior_of.is_none() && (t.func.addr..t.func.end).contains(&pc))
+            .max_by_key(|t| t.func.addr)
+    };
     let site_key = |site: &Site, what: &str| -> Result<(String, u32)> {
         let Site::Function { container: c, function } = site else { unreachable!("function sites only") };
         container(c, what)?;
@@ -191,30 +219,67 @@ pub(crate) fn plan(
                 container(c, what)?;
                 link::Value::Load(map.resolve(c, symbol).with_context(|| format!("binding.invalid_fact: {what}: {c} has no symbol `{symbol}`"))?.addr)
             }
-            facts::Value::WriteAddress | facts::Value::WriteSize => bail!("binding.unimplemented_rule: {what} reads a write (after-write is milestone C)"),
+            facts::Value::WriteAddress | facts::Value::WriteSize => {
+                bail!("binding.unimplemented_rule: {what} reads a lifted write (instruction-address after-write is milestone C)")
+            }
         })
     };
     let mut rules = Vec::new();
     let mut operations: BTreeMap<(String, u32), Vec<usize>> = BTreeMap::new();
+    let mut markers: BTreeMap<String, usize> = BTreeMap::new();
     let mut rule_lines = Vec::new();
     for r in &f.rules {
         let what = format!("rule `{}`", r.id);
         let unimplemented = |why: &str| anyhow::anyhow!("binding.unimplemented_rule: {what} {why}; milestone C implements it");
-        match &r.site {
-            Site::Function { .. } => {}
-            Site::Pc { .. } => return Err(unimplemented("names an instruction address")),
-            Site::Boundary(_) => return Err(unimplemented("names a native software boundary")),
-        }
-        if r.c_marker.is_some() {
-            return Err(unimplemented("declares a c_marker source site"));
-        }
         if matches!(r.request, Some(facts::Request::Keyed { .. })) {
             return Err(unimplemented("uses a keyed request"));
         }
+        // Where the rule applies: an operation's wrapper, or a c_marker
+        // call in authored C after the write it describes.
+        let (key, marker) = match &r.site {
+            Site::Boundary(_) => return Err(unimplemented("names a native software boundary")),
+            Site::Function { .. } => {
+                ensure!(r.event != Event::AfterWrite, "binding.invalid_fact: {what}: after-write names its write's instruction address (`pc`)");
+                (site_key(&r.site, &what)?, None)
+            }
+            Site::Pc { container: c, pc } => {
+                container(c, &what)?;
+                ensure!(r.event == Event::AfterWrite, "binding.invalid_fact: {what}: an instruction-address site takes event `after-write`");
+                let t = function_at(c, *pc).with_context(|| format!("binding.unknown_site: {what}: no compiled function of {c} holds 0x{pc:08X}"))?;
+                let key = (c.clone(), t.func.addr);
+                let input = match tiers.get(&key) {
+                    Some(&Tier::C { input, .. }) => input,
+                    Some(Tier::Lift { .. }) => return Err(unimplemented("instruments a lifted write at an instruction address")),
+                    _ => return Err(unimplemented("names a write inside an adapter")),
+                };
+                let m = r.c_marker.as_deref().with_context(|| {
+                    format!(
+                        "binding.missing_c_write_site: {what}: 0x{pc:08X} is in {}, supplied C with no verified mapping of its writes; \
+                         declare c_marker = \"<name>\" and call {SITE_PREFIX}<name>(destination, length, source_offset, selector, \
+                         request_key) from {HEADER} right after the write",
+                        t.func.name
+                    )
+                })?;
+                let symbol = format!("{SITE_PREFIX}{m}");
+                ensure!(
+                    inputs[input].obj.symbols.iter().any(|s| s.kind == SymbolKind::Function && !s.defined && s.name == symbol),
+                    "binding.missing_c_write_site: {what}: {} ({}) never calls {symbol}; call it right after the write",
+                    t.func.name,
+                    inputs[input].label
+                );
+                ensure!(!markers.contains_key(m), "binding.invalid_fact: two rules declare c_marker `{m}`");
+                (key, Some(m.to_string()))
+            }
+        };
+        // At a c_marker the authored C passes the normalized values:
+        // destination, length, source offset, selector.
+        let val = |v: &facts::Value, word: u32| -> Result<link::Value> {
+            if marker.is_some() { Ok(link::Value::Arg(word)) } else { value(v, &what) }
+        };
         let event = match r.event {
             Event::Enter => link::Event::Enter,
             Event::Return => link::Event::Return,
-            Event::AfterWrite => return Err(unimplemented("is an after-write event")),
+            Event::AfterWrite => link::Event::AfterWrite,
         };
         let effect = match (r.effect, &r.target) {
             (Effect::Invalidate, _) => link::Effect::Invalidate,
@@ -224,21 +289,59 @@ pub(crate) fn plan(
                 let target = match t {
                     facts::Target::Literal(p) => link::Target::Placement(placement_of[p.as_str()]),
                     facts::Target::Selector { value: v, cases } => link::Target::Selector {
-                        value: value(v, &what)?,
+                        value: val(v, 3)?,
                         cases: cases.iter().map(|(k, p)| (*k, placement_of[p.as_str()])).collect(),
                     },
                     facts::Target::Request => return Err(unimplemented("publishes a request's placement")),
                 };
                 let source_offset = match r.source_offset.as_ref().context("validated: source_offset")? {
                     facts::Offset::Placement => link::Offset::Derive,
-                    facts::Offset::Value(v) => link::Offset::Value(value(v, &what)?),
+                    facts::Offset::Value(v) => link::Offset::Value(val(v, 2)?),
                 };
                 link::Effect::Publish { target, source_offset }
             }
             (Effect::Begin | Effect::End, _) => return Err(unimplemented("begins or ends a request")),
             (Effect::Publish, None) => bail!("validated: a publication has a placement"),
         };
-        let key = site_key(&r.site, &what)?;
+        let rule = link::Rule {
+            id: r.id.clone(),
+            event,
+            effect,
+            destination: val(r.destination.as_ref().context("validated: destination")?, 0)?,
+            length: val(r.length.as_ref().context("validated: length")?, 1)?,
+            success: match r.success {
+                facts::Success::Always => link::Success::Always,
+                facts::Success::Zero => link::Success::Zero,
+                facts::Success::Nonzero => link::Success::Nonzero,
+            },
+        };
+        if let Some(m) = marker {
+            rule_lines.push(format!("#{} {} at {}: {:?} {:?} through {SITE_PREFIX}{m} in authored C", rules.len(), r.id, r.site, r.event, r.effect));
+            markers.insert(m, rules.len());
+            rules.push(rule);
+            continue;
+        }
+        // What the rule reads must exist in the operation's signature.
+        let (words, returns) = shape(&key);
+        for v in reads(&rule) {
+            match v {
+                link::Value::Arg(a) | link::Value::Field { arg: a, .. } => ensure!(
+                    *a < words,
+                    "binding.invalid_fact: {what}: {} {:#010x} has {words} argument words; the rule reads arg:{a}",
+                    key.0,
+                    key.1
+                ),
+                link::Value::Return => ensure!(returns, "binding.invalid_fact: {what}: {} {:#010x} returns nothing; the rule reads `return`", key.0, key.1),
+                _ => {}
+            }
+        }
+        ensure!(
+            rule.success == link::Success::Always || returns,
+            "binding.invalid_fact: {what}: success = {:?} tests a result {} {:#010x} doesn't return",
+            r.success,
+            key.0,
+            key.1
+        );
         // The translator expands some callees into their callers: the
         // operation's boundary would disappear there.
         let expanded: Vec<String> = translations
@@ -254,50 +357,88 @@ pub(crate) fn plan(
             key.1,
             expanded.join(", ")
         );
-        let rule = link::Rule {
-            id: r.id.clone(),
-            event,
-            effect,
-            destination: value(r.destination.as_ref().context("validated: destination")?, &what)?,
-            length: value(r.length.as_ref().context("validated: length")?, &what)?,
-            success: match r.success {
-                facts::Success::Always => link::Success::Always,
-                facts::Success::Zero => link::Success::Zero,
-                facts::Success::Nonzero => link::Success::Nonzero,
-            },
-        };
         rule_lines.push(format!("#{} {} at {} ({:#010x}): {:?} {:?}", rules.len(), r.id, r.site, key.1, r.event, r.effect));
         operations.entry(key).or_default().push(rules.len());
         rules.push(rule);
     }
 
-    // Writer summaries: a writer that can change a placement's code needs
-    // a rule at its site.
+    // Writer summaries: bounds inferred first, declared where analysis
+    // can't establish them, and every known write inside the declaration.
+    // A writer that can change a placement's code needs a rule.
+    let by_key: BTreeMap<(&str, u32), &psxw_lift::Translation> =
+        translations.iter().map(|t| ((t.func.container.as_str(), t.func.addr), t)).collect();
     let mut writers = Vec::new();
     for w in &f.writers {
         let what = format!("writer `{}`", w.id);
-        if let Site::Function { .. } = &w.site {
-            site_key(&w.site, &what)?;
+        let (analysed, extent) = match &w.site {
+            Site::Function { .. } => {
+                let key = site_key(&w.site, &what)?;
+                let t = by_key[&(key.0.as_str(), key.1)];
+                (writes(&key, &by_key, tiers, &map.main), Some((key.0.clone(), t.func.addr..t.func.end)))
+            }
+            Site::Pc { container: c, pc } => {
+                container(c, &what)?;
+                let t = function_at(c, *pc).with_context(|| format!("binding.unknown_site: {what}: no compiled function of {c} holds 0x{pc:08X}"))?;
+                let node = t.graph.nodes.iter().find(|(n, d)| n.pc() == *pc && d.insn.op.is_store());
+                let (node, _) = node.with_context(|| format!("binding.invalid_fact: {what}: 0x{pc:08X} is not a store"))?;
+                let mut one = Writes::default();
+                if matches!(tiers.get(&(c.clone(), t.func.addr)), Some(Tier::Lift { .. })) {
+                    store(&mut one, t, *node);
+                } else {
+                    one.unbounded = Some(format!("{} is supplied C", t.func.name));
+                }
+                (one, None)
+            }
+            Site::Boundary(b) => (Writes { unbounded: Some(format!("{b} is a native boundary")), ..Writes::default() }, None),
+        };
+        let declared: Vec<Range<u32>> = w.destinations.iter().map(|d| d.start..d.end).collect();
+        if !declared.is_empty() {
+            for (pc, r) in &analysed.known {
+                ensure!(
+                    declared.iter().any(|d| d.start <= r.start && r.end <= d.end),
+                    "binding.invalid_fact: {what} declares {} but writes {} at 0x{pc:08X}",
+                    declared.iter().map(hex).collect::<Vec<_>>().join(", "),
+                    hex(r)
+                );
+            }
         }
-        let code: Vec<String> =
-            w.destinations.iter().map(|d| d.start..d.end).filter(|d| covered.iter().any(|k| overlaps(k, &window(d)))).map(|d| hex(&d)).collect();
-        let by: Vec<&str> = f.rules.iter().filter(|r| r.site == w.site).map(|r| r.id.as_str()).collect();
+        let (bounds, how) = match &analysed.unbounded {
+            None => (analysed.known.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>(), "inferred".to_string()),
+            Some(why) if !declared.is_empty() => (declared.clone(), format!("declared (analysis can't bound it: {why})")),
+            Some(why) => bail!("binding.invalid_fact: {what}: analysis can't bound its writes ({why}); declare `destinations`"),
+        };
+        let code: Vec<String> = bounds.iter().filter(|d| covered.iter().any(|k| overlaps(k, &window(d)))).map(hex).collect();
+        // A rule at its site, or at a write inside its function.
+        let by: Vec<&str> = f
+            .rules
+            .iter()
+            .filter(|r| {
+                r.site == w.site
+                    || matches!((&r.site, &extent), (Site::Pc { container: c, pc }, Some((wc, e))) if c == wc && e.contains(pc))
+            })
+            .map(|r| r.id.as_str())
+            .collect();
         ensure!(
             code.is_empty() || !by.is_empty(),
             "binding.uncovered_writer: {what} at {} can write placement code at {}; add a rule for its code-changing effect",
             w.site,
             code.join(", ")
         );
+        let mut known: BTreeSet<String> = analysed.known.iter().map(|(_, r)| hex(r)).collect();
+        if analysed.stack {
+            known.insert("its stack frames".into());
+        }
         writers.push(format!(
-            "{} at {}: declared bounds {}; {}",
+            "{} at {}: {how} bounds {}; known writes {}; {}",
             w.id,
             w.site,
-            w.destinations.iter().map(|d| hex(&(d.start..d.end))).collect::<Vec<_>>().join(", "),
+            if bounds.is_empty() { "none".to_string() } else { bounds.iter().map(hex).collect::<Vec<_>>().join(", ") },
+            if known.is_empty() { "none".to_string() } else { known.into_iter().collect::<Vec<_>>().join(", ") },
             if code.is_empty() { "disjoint from placement code".to_string() } else { format!("changes code, covered by {}", by.join(", ")) }
         ));
     }
 
-    let binding = link::Binding { slots, placements, rules, operations };
+    let binding = link::Binding { slots, placements, rules, operations, markers };
     let report = Report {
         explicit: true,
         placements: binding
@@ -328,6 +469,128 @@ pub(crate) fn plan(
         ..Report::default()
     };
     Ok((binding, report))
+}
+
+/// What analysis establishes about an operation's writes, its callees'
+/// included: stores at constant addresses (pc, bytes), whether it writes
+/// its stack frames (`$sp`-relative), and the first write it can't bound.
+#[derive(Debug, Default)]
+struct Writes {
+    known: Vec<(u32, Range<u32>)>,
+    stack: bool,
+    unbounded: Option<String>,
+}
+
+/// One store of a lifted function, by the register constants on entry to
+/// its node.
+fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::Node) {
+    use psxw_lift::decode::Op;
+    let insn = &t.graph.nodes[&node].insn;
+    if insn.rs == 29 {
+        out.stack = true;
+        return;
+    }
+    match t.facts.consts.get(&node).and_then(|c| c[insn.rs as usize]) {
+        Some(base) => {
+            let at = base.wrapping_add(insn.simm as u32);
+            let bytes = match insn.op {
+                Op::Sb => at..at + 1,
+                Op::Sh => at..at + 2,
+                Op::Swl | Op::Swr => (at & !3)..(at & !3) + 4,
+                _ => at..at + 4,
+            };
+            out.known.push((node.pc(), bytes));
+        }
+        None => {
+            out.unbounded.get_or_insert_with(|| format!("{} stores through a register at 0x{:08X}", t.func.name, node.pc()));
+        }
+    }
+}
+
+/// The writes of the function at `key` and everything it calls.
+fn writes(
+    key: &(String, u32),
+    by_key: &BTreeMap<(&str, u32), &psxw_lift::Translation>,
+    tiers: &BTreeMap<(String, u32), Tier>,
+    main: &str,
+) -> Writes {
+    use psxw_lift::graph::{Callee, Dest, Transfer};
+    let mut out = Writes::default();
+    let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
+    let mut work = vec![key.clone()];
+    while let Some((c, a)) = work.pop() {
+        if !seen.insert((c.clone(), a)) {
+            continue;
+        }
+        let Some(t) = by_key.get(&(c.as_str(), a)) else {
+            out.unbounded.get_or_insert_with(|| format!("a call to 0x{a:08X}, which nothing implements"));
+            continue;
+        };
+        match tiers.get(&(c.clone(), a)) {
+            Some(Tier::Lift { .. }) => {}
+            Some(Tier::C { .. }) => {
+                out.unbounded.get_or_insert_with(|| format!("{} is supplied C", t.func.name));
+                continue;
+            }
+            _ => {
+                out.unbounded.get_or_insert_with(|| format!("{} is an adapter", t.func.name));
+                continue;
+            }
+        }
+        for (node, d) in &t.graph.nodes {
+            if d.insn.op.is_store() {
+                store(&mut out, t, *node);
+            }
+            let tail = |d: &Dest| match d {
+                Dest::Tail(c) => vec![c.clone()],
+                Dest::Local(_) => vec![],
+            };
+            let callees: Vec<Callee> = match &d.transfer {
+                Transfer::Call { callee, next } | Transfer::CondCall { callee, next } => [vec![callee.clone()], tail(next)].concat(),
+                Transfer::FallOff(c) => vec![c.clone()],
+                Transfer::Jump(dest) => tail(dest),
+                Transfer::Cond { taken, fall } => [tail(taken), tail(fall)].concat(),
+                _ => vec![],
+            };
+            for callee in callees {
+                match callee {
+                    Callee::Direct { addr, .. } => {
+                        // As the linker locates it: the caller's container,
+                        // the main one, else every container holding it.
+                        let own = [c.as_str(), main].into_iter().find(|k| by_key.contains_key(&(*k, addr)));
+                        match own {
+                            Some(k) => work.push((k.to_string(), addr)),
+                            None => work.extend(by_key.keys().filter(|(_, x)| *x == addr).map(|(k, x)| (k.to_string(), *x))),
+                        }
+                        if !by_key.keys().any(|(_, x)| *x == addr) {
+                            out.unbounded.get_or_insert_with(|| format!("a call to 0x{addr:08X}, which nothing implements"));
+                        }
+                    }
+                    Callee::Indirect { .. } => {
+                        out.unbounded.get_or_insert_with(|| format!("{} calls through a pointer at 0x{:08X}", t.func.name, node.pc()));
+                    }
+                    Callee::Bios { .. } | Callee::Kernel { .. } => {
+                        out.unbounded.get_or_insert_with(|| format!("{} calls the BIOS or kernel at 0x{:08X}", t.func.name, node.pc()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The values a rule reads.
+fn reads(rule: &link::Rule) -> Vec<&link::Value> {
+    let mut v = vec![&rule.destination, &rule.length];
+    if let link::Effect::Publish { target, source_offset } = &rule.effect {
+        if let link::Target::Selector { value, .. } = target {
+            v.push(value);
+        }
+        if let link::Offset::Value(s) = source_offset {
+            v.push(s);
+        }
+    }
+    v
 }
 
 /// Count each entry's reference category and list what still bypasses
