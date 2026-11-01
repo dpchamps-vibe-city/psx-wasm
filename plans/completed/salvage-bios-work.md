@@ -1,6 +1,8 @@
 # Salvage the BIOS work
 
 **Status:** recovery milestone merged to `main`; full BIOS completion and validation remain open. General non-local returns are deferred by the user.
+**Superseded:** the remaining work is tracked in [`../bios-status.md`](../bios-status.md). This file is the recovery record.
+
 **Goal:** preserve the working native-port architecture, recover useful work from
 spec-fidelity, and finish the missing BIOS functionality in Rust.
 **Supersedes:** `plans/spec-fidelity.md` on `archive/spec-fidelity-b8a0683`
@@ -89,12 +91,12 @@ implied by the merge.
 
 ## Read first
 
-- [AGENTS.md](../AGENTS.md): smallest change, few tests, mostly integration.
-- [Emulation layers](../docs/emulation-layers.md): the architecture to preserve.
-- [Conventions](conventions.md): inputs, data hygiene, commands and commits.
+- [AGENTS.md](../../AGENTS.md): smallest change, few tests, mostly integration.
+- [Emulation layers](../../docs/emulation-layers.md): the architecture to preserve.
+- [Conventions](../../docs/conventions.md): inputs, data hygiene, commands and commits.
 - [Handoff](handoff-spec-fidelity.md): history and candidate commits. Its
   keep/remove classifications are leads to inspect, not authoritative decisions.
-- [Design](../docs/design.md): affected sections and the D67–D71 salvage
+- [Design](../../docs/design.md): affected sections and the D67–D71 salvage
   dispositions. The archived decisions were recorded without the user's input;
   only the explicitly reviewed recovery portions are retained.
 - [psx-spx BIOS reference](https://psx-spx.consoledev.net/kernelbios/): retail
@@ -159,7 +161,7 @@ unexplained; do not assume all are introduced by this work or already resolved.
 
 At planning time these user files are untracked and must be preserved:
 
-- `plans/handoff-spec-fidelity.md`
+- `plans/completed/handoff-spec-fidelity.md`
 - `games/bof4/replays/craash-after-name-select.rpl`
 - This plan, until deliberately committed.
 

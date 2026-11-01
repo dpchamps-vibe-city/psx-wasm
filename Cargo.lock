@@ -833,12 +833,14 @@ dependencies = [
  "psxw-inputs",
  "psxw-lift",
  "psxw-link",
+ "psxw-oracle",
  "rayon",
  "sdk-psyq",
  "serde",
  "serde_json",
  "wasm-encoder 0.262.0",
  "wasmparser 0.262.0",
+ "wasmtime",
 ]
 
 [[package]]

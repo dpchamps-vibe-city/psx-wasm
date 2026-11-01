@@ -94,12 +94,12 @@ StartSoundArchiveRead = "array-bounds: the decomp declares gSoundArchiveOffsets[
 StepSoundLoad = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"
 BeginSoundBankBodyTransfer = "array-bounds: the decomp declares gSoundArchiveOffsets[3], but the table is 0x25C bytes (151 entries) and the archive index ranges over all of it"
 
-# Named hook points for mods (plans/M11): real function boundaries many
+# Named hook points for mods (plans/completed/M11): real function boundaries many
 # mods want. A hook with "target": { "point": "frame" } is an `after` hook
 # on PollPadInputs, which RunSceneUpdateLoop calls once per scene frame.
 [mod]
 # The decomp's previous pin (census built): the mods gate checks script
-# mods across decomp iterations against its snapshot (plans/M12 phase 3).
+# mods across decomp iterations against its snapshot (plans/completed/M12 phase 3).
 previous_decomp = "3a159925fe0994ae43f11fd990eb6f5339f5833f"
 
 [mod.points]

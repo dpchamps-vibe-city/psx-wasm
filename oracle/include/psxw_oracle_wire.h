@@ -267,6 +267,16 @@
 /* channels and the MDEC. */
 #define PSXW_OP_MDEC_RUN 0x00000060u
 
+/* Payload: u32 entry, u32 sp, u32 args[4], u32 n_setup, n_setup × (u32 */
+/* addr, u32 len, len bytes), u32 n_captures, n_captures × (u32 addr, */
+/* u32 len). Result: u32 v0, u32 v1, then each capture. Writes the */
+/* setup, flushes the instruction cache (A0h:44h), then calls `entry` */
+/* with a0..a3 and $sp = `sp` (o32); every register the runner keeps */
+/* is restored afterwards. `entry`, `sp`, setups and captures lie in */
+/* the scratch region; captures are multiples of 4 bytes. Dispatch */
+/* conformance runs original MIPS programs with it. */
+#define PSXW_OP_GUEST_CALL 0x00000070u
+
 /* ---- Payload layouts and limits ---- */
 
 /* Bytes in a rect: u16 x, y, w, h. */

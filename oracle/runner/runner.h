@@ -112,9 +112,14 @@ op_fn op_bios_call;
 op_fn op_cd_cmds;
 op_fn op_mdec_run;
 op_fn op_bios_threads;
+op_fn op_guest_call;
 
 /* A0/B0/C0 call: jumps to `table` with t1 = func. */
 uint32_t psxw_bios_call(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t table, uint32_t func);
+
+/* Call original code at `entry` on stack `sp` (call.s); v1 lands in psxw_guest_v1. */
+uint32_t psxw_guest_call(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t entry, uint32_t sp);
+extern uint32_t psxw_guest_v1;
 
 extern uint8_t _end[];
 

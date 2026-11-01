@@ -1,6 +1,6 @@
 # Unified adapter layer, phase 2: the rest of PsyQ 4.7
 
-**Status:** not started
+**Status:** not started; superseded by [`../../adaptor-status.md`](../../adaptor-status.md), which carries its remaining work.
 **Depends on:** [phase 1](phase1.md).
 **Shared context:** [README.md](README.md).
 

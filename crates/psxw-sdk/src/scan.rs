@@ -1,5 +1,5 @@
 //! The hardware-reach analysis over an SDK's relocatable library objects
-//! (plans/unified-adaptor-layer, phase 1 task 2).
+//! (plans/completed/unified-adaptor-layer, phase 1 task 2).
 //!
 //! Per function: the chips its own instructions touch, through constant
 //! addresses, register pointers held in data (initialised, or stored there

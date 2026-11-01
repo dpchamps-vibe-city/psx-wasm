@@ -1,4 +1,4 @@
-//! Adapter conformance cases (plans/unified-adaptor-layer, "Conformance";
+//! Adapter conformance cases (plans/completed/unified-adaptor-layer, "Conformance";
 //! D59). A case calls SDK functions by name and records what code staying
 //! original could observe. `psxw conform <game> --chip C` runs every case
 //! of chip C twice: on the game with the chip native (its adapters) and

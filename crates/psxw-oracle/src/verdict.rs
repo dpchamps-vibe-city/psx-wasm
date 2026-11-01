@@ -1,4 +1,4 @@
-//! Verdict classes (plans/conventions.md "Reports separate verdict classes").
+//! Verdict classes (docs/conventions.md "Reports separate verdict classes").
 
 use crate::vector::Kind;
 use serde::Serialize;

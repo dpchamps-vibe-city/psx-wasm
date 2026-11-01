@@ -1,12 +1,14 @@
 # Unified adapter layer
 
-Shared context for [phase 1](phase1.md) (every adapter btn and bof4 need)
+**Current status and remaining work:** [`../../adaptor-status.md`](../../adaptor-status.md).
+
+Shared context for [phase 1](phase1.md) (every adapter btn and bof4 need; done)
 and [phase 2](phase2.md) (the rest of PsyQ 4.7).
 
-**Design refs:** [docs/design.md](../../docs/design.md) §5 (the SDK
+**Design refs:** [docs/design.md](../../../docs/design.md) §5 (the SDK
 boundary), §6 (time, interrupts); decisions D4, D40–D42, D45, D47, D58.
-Background: [docs/emulation-layers.md](../../docs/emulation-layers.md),
-[docs/adaptor-layer-status.md](../../docs/adaptor-layer-status.md).
+Background: [docs/emulation-layers.md](../../../docs/emulation-layers.md),
+[docs/adaptor-layer-status.md](../../../docs/adaptor-layer-status.md).
 
 ## Goal
 

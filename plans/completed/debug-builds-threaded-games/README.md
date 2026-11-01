@@ -1,8 +1,18 @@
 # Debug builds of games that switch threads: problem statement
 
-**Status:** problem statement; [findings and open feasibility questions](debug-builds-threaded-games-investigation.md)
+**Outcome:** implemented. The guard is gone; threaded games build with
+`--debug` through the patched Binaryen in
+[`toolchain/binaryen-dwarf/`](../../../toolchain/binaryen-dwarf/README.md)
+(design D53). Remaining follow-ups are in
+[open items](../../open-items.md#debug-builds-of-threaded-games-d53-d57).
+The files here are the research that led to it:
+[investigation](investigation.md), [DWARF repair](dwarf-repair.md) (the
+chosen direction), and the withdrawn
+[source-map proposal](source-maps-recommendation.md).
+
+**Original status:** problem statement; [findings and open feasibility questions](investigation.md)
 recorded, no implementation plan selected.
-**Design refs:** [docs/design.md](../docs/design.md) D53 (debug builds),
+**Design refs:** [docs/design.md](../../../docs/design.md) D53 (debug builds),
 D57 (guest threads).
 
 ## The problem
@@ -36,7 +46,7 @@ The check is in `crates/psxw-build/src/game.rs` (`prepare`). It refuses
   temporary locals—even when the DWARF verifier passes. Explicit DWARF 5
   has a separate Binaryen compatibility failure; it is not the current
   default or the explanation for this correctness defect.
-  See the [investigation](debug-builds-threaded-games-investigation.md)
+  See the [investigation](investigation.md)
   for the reproducer and upstream research. The diagnostic above
   overstates the problem: preserving valid DWARF is unsupported here,
   not inherently impossible.

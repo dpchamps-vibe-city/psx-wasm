@@ -77,7 +77,7 @@ libetc's `DMACallback`; `StartPAD`, `SetInitPadFlag`).
 
 ## Tasks
 
-1. [x] **Record D59** in [docs/design.md](../../docs/design.md)'s
+1. [x] **Record D59** in [docs/design.md](../../../docs/design.md)'s
    decision log (README, "Decisions this plan needs"), and update §5.
 2. [x] **`psxw sdk scan`: the hardware-reach analysis, in Rust.**
    - **Input:** an SDK version's relocatable library objects.

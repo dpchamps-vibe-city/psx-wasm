@@ -45,9 +45,9 @@ pub enum Tier {
 pub struct GameSpec {
     /// Every guest function: (container, address) → tier.
     pub tiers: BTreeMap<(String, u32), Tier>,
-    /// Addresses more than one container defines: each candidate's first
-    /// two original code words.
-    pub overlays: BTreeMap<u32, Vec<(String, [u32; 2])>>,
+    /// Addresses more than one container defines: each candidate's
+    /// distinguishing (guest address, original code word) checks.
+    pub overlays: BTreeMap<u32, Vec<(String, Vec<(u32, u32)>)>>,
     /// Loop iterations between safepoints.
     pub budget: u32,
     /// Trap on guest accesses to the I/O window.
@@ -890,21 +890,18 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
                     Some(h) => h.o32,
                     None => ctx.entry_raw(c, addr).context("overlay candidate without a tier")?,
                 };
-                entries.push((*words, e));
+                entries.push((words.clone(), e));
             }
             let mut f = Function::new([]);
-            let word = |f: &mut Function, off: u32| {
-                f.instruction(&I::I32Const(((addr + off) & WINDOW_MASK) as i32));
-                f.instruction(&I::I32Load(MemArg { offset: window as u64, align: 2, memory_index: 0 }));
-            };
-            for (w, e) in entries {
-                word(&mut f, 0);
-                f.instruction(&I::I32Const(w[0] as i32));
-                f.instruction(&I::I32Eq);
-                word(&mut f, 4);
-                f.instruction(&I::I32Const(w[1] as i32));
-                f.instruction(&I::I32Eq);
-                f.instruction(&I::I32And);
+            for (checks, e) in entries {
+                f.instruction(&I::I32Const(1));
+                for (at, word) in checks {
+                    f.instruction(&I::I32Const((at & WINDOW_MASK) as i32));
+                    f.instruction(&I::I32Load(MemArg { offset: window as u64, align: 2, memory_index: 0 }));
+                    f.instruction(&I::I32Const(word as i32));
+                    f.instruction(&I::I32Eq);
+                    f.instruction(&I::I32And);
+                }
                 f.instruction(&I::If(BlockType::Empty));
                 for l in 0..4 {
                     f.instruction(&I::LocalGet(l));

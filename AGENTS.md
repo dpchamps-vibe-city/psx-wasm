@@ -15,10 +15,16 @@ Important project considerations for all implementations:
   - It is a compiler and MIPS-to-c static recompiler for playstation games
   - The outcome is a native port, where SDK functions that touch playstation hardware are replaced with natively written adaptors
 
-The architecture should be thought of in terms of the wasm/host boundary:
+Architecture should be thought of in terms of the wasm/host boundary:
 
 - SDK -> Adaptor -> Native Backend
 - Host integrates into Native Backend
   - Of which, web is _a_ host
 
-See ./docs/emulation-layers.md for more details
+See ./docs/emulation-layers.md for more details.
+
+Never violate these principles in order to make conformance tests pass. Never fit designs to game implementations.
+
+--- 
+
+Edit README.slop.md, do not edit top-level README.md file

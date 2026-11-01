@@ -3,12 +3,12 @@
 **Status:** earlier recommendation withdrawn as the solution to this task.
 The user requires C-variable inspection in every game; a line-only baseline
 with variable debugging deferred is not acceptable. The current recommendation
-is [retain DWARF and repair value provenance](debug-builds-threaded-games-dwarf-repair.md).
+is [retain DWARF and repair value provenance](dwarf-repair.md).
 The experiments and earlier proposal below are retained as research, not an
 implementation selected for delivery.
-**Related:** [threaded-debug investigation](debug-builds-threaded-games-investigation.md),
-[original problem](debug-builds-threaded-games.md), D53/D56/D57 in
-[design.md](../docs/design.md).
+**Related:** [threaded-debug investigation](investigation.md),
+[original problem](README.md), D53/D56/D57 in
+[design.md](../../../docs/design.md).
 
 ## Earlier proposal (not selected)
 
@@ -291,7 +291,7 @@ replays, Worker/dev-mode acceptance and Firefox remain untested here.
 ## Mandatory variables rule this out as the solution
 
 The user confirmed that variables must work in every game. This is **not the
-recommended first delivery**. The [DWARF follow-up](debug-builds-threaded-games-dwarf-repair.md)
+recommended first delivery**. The [DWARF follow-up](dwarf-repair.md)
 now reports a producer-correctness experiment addressing the questions below:
 
 1. Isolate the first wrong value location in Binaryen roundtrip, flattening,

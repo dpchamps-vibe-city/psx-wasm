@@ -191,6 +191,9 @@ fn render(topic: &[&str]) -> Result<String> {
             ("Options", &[("--function <name>", "Function to test (required).")]),
         ]),
         ["ci", ..] => page("ci <game>", "Run every implemented milestone's validation gates.", &[]),
+        ["conform", "dispatch", ..] => page("conform dispatch [--case <ID>]", "Check overlay dispatch on synthetic original-MIPS programs, against the reference CPU.", &[
+            ("Options", &[("--case <ID>", "Only variants whose id starts with this (D01, D01/two-short-prefix): a partial run.")]),
+        ]),
         ["conform", ..] => page("conform <game> --lib <library> [options]", "Compare an SDK library's adapters with its original code.", &[
             ("Options", &[
                 ("--lib <library>", "Required: libpad, libgpu, libmcrd, libetc, libsnd or libspu."),
@@ -234,6 +237,7 @@ fn overview() -> String {
             ("difftest <game>", "Compare translated functions with decompiled C."),
             ("link-test <game>", "Link and test a single function pair."),
             ("conform <game>", "Check SDK adapters against original code."),
+            ("conform dispatch", "Check overlay dispatch, independent of any game."),
             ("web-test <command>", "Run browser GPU, storage and game tests."),
         ]),
         ("Modkit & oracle", &[

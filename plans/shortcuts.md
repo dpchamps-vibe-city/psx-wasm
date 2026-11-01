@@ -18,7 +18,7 @@ Not listed here:
   register-level devices;
 - the emulated devices' own fidelity (`psx-devices`, `psx-spu`): they are
   the fallback while the adapters are completed
-  ([`unified-adaptor-layer/`](unified-adaptor-layer/));
+  ([`adaptor-status.md`](adaptor-status.md));
 - features that aren't built yet;
 - bugs, which are in [`open-items.md`](open-items.md) under *Bugs*;
 - differences the architecture forces (see [Forced](#forced)).
@@ -227,7 +227,10 @@ By impact:
   Overlays sharing a slot often start with the same two instructions.
   Ref: D7, §3 (two-word compare, unchecked calls); ambiguity and
   main/overlay overlap undocumented. Impact: high. Checked: yes (the
-  two-word compare).
+  two-word compare). **Narrow collision fix:** shared prologues now get
+  additional distinguishing words from intersecting text. The broader
+  ambiguity and overlap questions remain open; no per-call whole-code
+  validation or new architectural contract was adopted.
 - [ ] **TR5. Virtual time counts loop passes, not work.**
   `psxw-link/src/rewrite.rs:356-363`, `game.rs:689-708`;
   `psx-runtime/src/wasm.rs:335`, `driver.rs:144-151`;

@@ -1,6 +1,6 @@
 # What is emulated: the layers
 
-The build modes in the [unified adaptor layer plan](../plans/unified-adaptor-layer/README.md):
+The build modes in the [unified adaptor layer plan](../plans/completed/unified-adaptor-layer/README.md):
 prefer native software interfaces, then fall back to hardware registers
 one chip at a time. These are architectural configurations, not snapshots
 of btn or bof4. See [adaptor-layer-status.md](adaptor-layer-status.md) for

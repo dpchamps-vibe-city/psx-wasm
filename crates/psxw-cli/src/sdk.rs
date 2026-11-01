@@ -1,5 +1,5 @@
 //! `psxw sdk scan`: the hardware-reach analysis of an SDK's library objects,
-//! joined with each game's link (psxw-sdk; plans/unified-adaptor-layer
+//! joined with each game's link (psxw-sdk; plans/completed/unified-adaptor-layer
 //! phase 1 task 2).
 //!
 //! ```text

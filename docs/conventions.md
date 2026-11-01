@@ -1,7 +1,8 @@
 # Conventions
 
-Rules every milestone follows. When a milestone needs something these don't
-cover, add it here, so the next milestone inherits it.
+Rules every milestone and plan in [`plans/`](../plans/README.md) follows.
+When a milestone needs something these don't cover, add it here, so the
+next milestone inherits it.
 
 ## Generality
 
@@ -109,8 +110,8 @@ components.
 
 - `docs/design.md` changes whenever an architectural decision changes.
   Record the change in `docs/design.md` (its decision log) too.
-- Each milestone file keeps its Status, ticked Tasks, Progress log and
+- Each plan or milestone file in `plans/` keeps its Status, ticked Tasks, Progress log and
   Findings current. Findings that affect later milestones are also copied
   into those milestones' Context sections.
-- The README's milestone index status is updated when a milestone changes
+- `plans/README.md`'s index status is updated when a milestone changes
   state.

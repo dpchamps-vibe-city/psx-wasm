@@ -164,6 +164,60 @@ void func_80011000(int a, char *p) { func_80012200(a, 0, 8); func_80012200(p, 0,
     assert_eq!(calls, [(callout::CALL, 0x8001_2200, 5), (callout::CALL, 0x8001_2200, 0x8001_5000)]);
 }
 
+/// Shared prologues must not route an overlay call to another scene's code.
+#[test]
+fn game_overlay_dispatch_checks_beyond_the_prologue() {
+    use psxw_abi::{WINDOW_BASE, guest};
+    use psxw_link::game::{GameSpec, Tier};
+    let Some((mut map, mut a)) = compile("psxw-overlay-a", "int func_80011000(void) { return 11; }") else { return };
+    let Some((_, mut b)) = compile("psxw-overlay-b", "int func_80011000(void) { return 22; }") else { return };
+    a.container = "a".into();
+    b.container = "b".into();
+    for id in ["a", "b"] {
+        let mut c = map.containers[0].clone();
+        c.id = id.into();
+        c.is_main = false;
+        map.containers.push(c);
+    }
+    let inputs = [a, b];
+    let addr = 0x8001_1000;
+    let tiers = inputs.iter().enumerate().map(|(i, input)| {
+        let func = input.obj.symbols.iter().find(|s| s.name == "func_80011000").unwrap().index.unwrap()
+            - input.obj.num_imported_funcs();
+        ((input.container.clone(), addr), Tier::C { input: i, func })
+    }).collect();
+    let prologue = [(addr, 0x27BD_FFE8), (addr + 4, 0x3C02_8011)];
+    let cand = |c: &str, word: u32| {
+        (c.into(), prologue.into_iter().chain([(addr + 0x80, word)]).collect())
+    };
+    let spec = GameSpec {
+        tiers, overlays: BTreeMap::from([(addr, vec![cand("a", 1), cand("b", 2)])]),
+        budget: 1000, debug_io: false, device_funcs: Default::default(), main: "t".into(),
+        min_pages: psxw_abi::window_pages(WINDOW_BASE), window_base: WINDOW_BASE,
+        debug_info: false, probes: vec![], mods: None, slots: None, threads: false,
+    };
+    let linked = psxw_link::game::link(&map, None, &spec, &inputs).unwrap();
+    let mut config = wasmtime::Config::new();
+    config.wasm_exceptions(true);
+    let engine = wasmtime::Engine::new(&config).unwrap();
+    let module = wasmtime::Module::new(&engine, &linked.wasm).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker.define_unknown_imports_as_traps(&module).unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let memory = instance.get_memory(&mut store, guest::MEMORY).unwrap();
+    let invoke = instance.get_typed_func::<(u32, u32, u32, u32, u32), u64>(&mut store, guest::INVOKE).unwrap();
+    for (at, word) in prologue {
+        memory.write(&mut store, (WINDOW_BASE + (at & 0x1F_FFFF)) as usize, &word.to_le_bytes()).unwrap();
+    }
+    for (word, result) in [(2u32, 22), (1, 11), (2, 22)] {
+        memory.write(&mut store, (WINDOW_BASE + ((addr + 0x80) & 0x1F_FFFF)) as usize, &word.to_le_bytes()).unwrap();
+        assert_eq!(invoke.call(&mut store, (addr, 0, 0, 0, 0)).unwrap() as u32, result);
+    }
+    memory.write(&mut store, (WINDOW_BASE + ((addr + 0x80) & 0x1F_FFFF)) as usize, &3u32.to_le_bytes()).unwrap();
+    assert!(invoke.call(&mut store, (addr, 0, 0, 0, 0)).is_err(), "unknown code must not choose the first overlay");
+}
+
 /// Saved native BIOS entries remain callable after a table patch. Exercise
 /// C's dynamic/constant pointers, a lifted direct call, and the o32 return.
 #[test]

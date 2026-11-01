@@ -8,12 +8,12 @@ where the last one stopped.
 | File | What it holds |
 |---|---|
 | [`../docs/design.md`](../docs/design.md) | The source of truth for *what* we build and *why*, ending in the decision log (D1–D66, then the D67–D71 salvage dispositions). Plans say *how* and *in what order*. |
-| [`conventions.md`](conventions.md) | Repo layout, commands, file formats, data hygiene, commit rules |
-| [`unified-adaptor-layer/`](unified-adaptor-layer/) | Native adapters per chip, with graceful degradation to the device models. Phase 1 (btn and bof4) is done; phase 2 (the rest of PsyQ 4.7) is not started. |
-| [`salvage-bios-work.md`](salvage-bios-work.md) | **Recovery merged into main; full BIOS remains unfinished.** Records the native recovery, remaining work packages, deferred non-local returns and checkpoint-specific validation. |
+| [`../docs/conventions.md`](../docs/conventions.md) | Repo layout, commands, file formats, data hygiene, commit rules |
+| [`adaptor-status.md`](adaptor-status.md) | SDK adapter coverage: btn and bof4 run every chip native but the GTE; the rest of PsyQ 4.7 (calling contexts, synthetic link, missing peripherals, coverage gate) is not started |
+| [`bios-status.md`](bios-status.md) | **The full native BIOS is unfinished.** Unsupported and partial services, the deferred `setjmp`/`longjmp` bug, validation gaps |
 | [`open-items.md`](open-items.md) | Every unfinished task, blocked item, human-needed input and erratum, in one place |
 | [`shortcuts.md`](shortcuts.md) | Every corner cut in the runtime, BIOS, devices, adapters and translator, as tasks to redo the spec's way |
-| [`completed/`](completed/) | Everything implemented: milestones M0–M13 (M9 never started) and the btn bug follow-ups, kept as history |
+| [`completed/`](completed/) | Everything implemented, kept as history: milestones M0–M13 (M9 never started), the btn bug follow-ups, unified adapter layer phase 1, threaded debug builds, the spec-fidelity handoff and the BIOS salvage |
 
 ## What psx-wasm is, in one screen
 
@@ -48,7 +48,7 @@ Nothing in code may be specific to either.
 
 ## How to execute this plan
 
-1. **Read** this README, `conventions.md`, then the design sections and
+1. **Read** this README, `docs/conventions.md`, then the design sections and
    decisions the plan cites.
 2. **Pick** the active plan's first phase whose status isn't `done`, and
    its first unticked task. Items in `open-items.md` are picked up only
@@ -77,10 +77,9 @@ Nothing in code may be specific to either.
 
 | Plan | Status | Depends on |
 |---|---|---|
-| [Salvage the BIOS work](salvage-bios-work.md): preserve the native-port architecture, recover reviewed work and finish the native Rust BIOS | **recovery merged; BIOS completion open** | — |
-| [Unified adapter layer, phase 1](unified-adaptor-layer/phase1.md): every adapter btn and bof4 need; both games native except the GTE | done | M13 |
-| [Unified adapter layer, phase 2](unified-adaptor-layer/phase2.md): the rest of PsyQ 4.7 | not started | phase 1 |
-| [Debug builds of threaded games](debug-builds-threaded-games.md): `--debug` is refused for games that switch threads (bof4) | problem statement only | — |
+| [Native BIOS](bios-status.md): finish the native Rust BIOS over the existing backends | **recovery merged; remaining services open** | User decisions for control flow and glyph resources |
+| [SDK adapters](adaptor-status.md): the rest of PsyQ 4.7 | not started | — |
+| [Dispatch conformance](dispatch-conformance.md): synthetic original-MIPS programs through production dispatch, checked independently of either game | **baseline implemented; failures and contract review block completion; D72 removed** | Operator approval before D5/D6/D7 changes |
 | [Geometry-provider addons](geometry-provider-addons.md): optional game-specific geometry feeds for independent visual consumers | planned; feasibility first | Existing modkit/visual interface; D56 decision |
 
 ## Completed
@@ -101,6 +100,10 @@ Nothing in code may be specific to either.
 | [M12](completed/M12-script-mods.md) | Script mods | Script twins == compiled mods; a pass-through on every hookable function == plain build | — |
 | [M13](completed/M13-bof4-static-recompilation.md) | Breath of Fire IV: a game with no decompiled C | A headless replay to the first field scene: determinism, no traps, reached-state checks | FMV differences; the harness push |
 | [Bugs](completed/bug-follows.md) | Bugs found playing btn in the browser | — | see open-items |
+| [UAL 1](completed/unified-adaptor-layer/phase1.md) | Unified adapter layer, phase 1: every adapter btn and bof4 need; both games native except the GTE | Conformance levels 1–3 per adapter; every chip native but the GTE; device fallback replays match | `psxw ci` left to the user |
+| [Debug](completed/debug-builds-threaded-games/README.md) | Debug builds of threaded games (D53, D57): DWARF repaired through Asyncify in [`toolchain/binaryen-dwarf/`](../toolchain/binaryen-dwarf/README.md) | Browser DWARF extension shows correct C variables across thread switches | rerun acceptance; see open-items |
+| [Handoff](completed/handoff-spec-fidelity.md) | Spec-fidelity handoff: the classification the BIOS salvage started from | — | superseded by the salvage plan |
+| [Salvage](completed/salvage-bios-work.md) | BIOS salvage: native recovery of the spec-fidelity work, merged as `ceefc20` | Focused BIOS/runtime/SDK tests; game replays; browser storage | the rest of the BIOS, in [`bios-status.md`](bios-status.md) |
 
 M9 (a second decompiled game) never started; it is an open item.
 

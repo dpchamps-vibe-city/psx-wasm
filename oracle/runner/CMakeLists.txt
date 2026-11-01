@@ -25,6 +25,9 @@ psn00bsdk_add_executable(
     mdec.c
     threads.c
     threads_call.s
+    # Appended last so every earlier op keeps its code addresses.
+    call.c
+    call.s
 )
 target_include_directories(psxw-runner PRIVATE ${PSXW_INCLUDE})
 target_compile_options(psxw-runner PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror -std=gnu11>)

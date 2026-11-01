@@ -164,6 +164,16 @@ impl AddressMap {
         }
     }
 
+    /// [`AddressMap::synthetic`] with each container's symbol entries, as
+    /// its symbol file would list them.
+    pub fn synthetic_with_symbols(main: &str, containers: Vec<Container>, symbols: HashMap<String, Vec<SymEntry>>) -> Self {
+        let by_name = symbols
+            .iter()
+            .map(|(id, entries)| (id.clone(), entries.iter().enumerate().map(|(i, e)| (e.name.clone(), i)).collect()))
+            .collect();
+        Self { symbols, by_name, ..Self::synthetic(main, containers) }
+    }
+
     pub fn container(&self, id: &str) -> Option<&Container> {
         self.containers.iter().find(|c| c.id == id)
     }

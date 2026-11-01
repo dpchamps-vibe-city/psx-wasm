@@ -36,6 +36,7 @@ mod ci;
 mod help;
 mod run;
 mod conform;
+mod dispatch;
 mod render;
 mod serve;
 mod webtest;
@@ -317,6 +318,11 @@ fn run() -> Result<()> {
             eprintln!("report: {}", json.display());
         }
         ["oracle", rest @ ..] => oracle::run(&ws, rest)?,
+        ["conform", "dispatch", rest @ ..] => {
+            if !dispatch::run(&ws, rest)? {
+                std::process::exit(2);
+            }
+        }
         ["conform", game, rest @ ..] => {
             if !conform::run(&ws, game, rest)? {
                 std::process::exit(2);

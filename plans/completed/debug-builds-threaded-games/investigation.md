@@ -1,14 +1,14 @@
 # Debug builds of threaded games: investigation
 
 **Status:** findings and open feasibility questions; no implementation selected or enabled.
-**Problem:** [debug-builds-threaded-games.md](debug-builds-threaded-games.md).
-**Design refs:** D53, D56, D57 in [docs/design.md](../docs/design.md).
+**Problem:** [README.md](README.md).
+**Design refs:** D53, D56, D57 in [docs/design.md](../../../docs/design.md).
 
-**Latest follow-up:** [Retain DWARF and repair value provenance](debug-builds-threaded-games-dwarf-repair.md).
+**Latest follow-up:** [Retain DWARF and repair value provenance](dwarf-repair.md).
 C-variable inspection is mandatory. New experiments isolate the demonstrated
 failure to Flatten and recover values in the browser DWARF extension with an
 incomplete producer-side patch. That is the recommended repair direction,
-not yet an enabled all-games solution. The [source-map-only proposal](source-maps-all-games-recommendation.md)
+not yet an enabled all-games solution. The [source-map-only proposal](source-maps-recommendation.md)
 is withdrawn as the solution. Findings and limits below describe the original
 investigation; the follow-up records the subsequent evidence.
 

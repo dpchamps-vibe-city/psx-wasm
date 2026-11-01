@@ -43,9 +43,6 @@ This is early days, no apis are stable or guaranteed. It's built around the Back
 with Breath of Fire IV. There are rough edges. Integration into other projects not guaranteed but certainly will
 be as project expands. Mileage will vary.
 
-Full BIOS coverage and full CI are not complete; remaining gaps and unresolved
-prerequisites are tracked in [plans/open-items.md](plans/open-items.md) and
-[plans/salvage-bios-work.md](plans/salvage-bios-work.md).
 
 ## Contributing
 

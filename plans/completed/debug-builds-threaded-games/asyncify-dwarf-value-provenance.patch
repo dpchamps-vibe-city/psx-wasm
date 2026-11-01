@@ -1,7 +1,7 @@
 # Research-only patch against Binaryen fba5005a132d85d578be5bd010e0487ed8e2ce3e.
 # NOT a production fix: incomplete control-flow validity, expression coverage,
 # location-list rebuilding and synthetic-state handling. Unsupported cases retain
-# their old metadata. See ../debug-builds-threaded-games-dwarf-repair.md.
+# their old metadata. See dwarf-repair.md.
 # Apply only to a disposable checkout: patch -p1 < this-file
 --- a/src/wasm.h
 +++ b/src/wasm.h

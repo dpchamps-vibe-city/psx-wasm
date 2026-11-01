@@ -40,7 +40,7 @@ url = "https://codeload.github.com/lab313ru/psx_psyq_signatures/tar.gz/e9e46e7e1
 sha256 = "3e06ce2bdd4e6ed215a9f465856d5406554f1281c119075f8489a18d774896ac"
 
 [oracle]
-# The device oracle's Docker images (plans/M03-oracle-harness.md). Both are
+# The device oracle's Docker images (plans/completed/M03-oracle-harness.md). Both are
 # built on this base, and install Debian packages from the snapshot the base
 # image itself was built from. Built image IDs go to .oracle/images.json.
 base_image = "debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad"
@@ -61,7 +61,7 @@ nugget_repo = "https://github.com/pcsx-redux/nugget"
 nugget_commit = "4dc70d2931121a0fde858a0354192b6df4fa22e8"
 
 [oracle.render_gl]
-# The GPU backend's headless image, psxw-render-gl (plans/M04-pixels.md):
+# The GPU backend's headless image, psxw-render-gl (plans/completed/M04-pixels.md):
 # Mesa llvmpipe (EGL surfaceless) from the [oracle] Debian snapshot on the
 # same base image, plus this Rust toolchain to build the render server.
 rust_version = "1.94.1"
@@ -116,7 +116,7 @@ commit = "654b23603a3825467209d7ea826505ed021a9d99"
 build = ["npm", "run", "verify"]
 
 [mods.btn]
-# btn's mods repository (plans/M11, M12): the CI gate `mods` checks, builds
+# btn's mods repository (plans/completed/M11, M12): the CI gate `mods` checks, builds
 # and tests it against this psx-wasm (compiled mods natively, script mods
 # in the browsers).
 repo = "../btn-mods"

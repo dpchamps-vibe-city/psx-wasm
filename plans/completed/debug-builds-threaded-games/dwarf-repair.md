@@ -4,9 +4,9 @@
 incomplete prototype; **not production-ready or enabled**.
 **Requirement:** C-variable inspection is mandatory in every game. Source-line
 mapping alone is not an acceptable substitute or the recommended first delivery.
-**Background:** [original investigation](debug-builds-threaded-games-investigation.md),
-[problem statement](debug-builds-threaded-games.md), D53/D56/D57 in
-[design.md](../docs/design.md).
+**Background:** [original investigation](investigation.md),
+[problem statement](README.md), D53/D56/D57 in
+[design.md](../../../docs/design.md).
 
 ## Recommendation
 
@@ -32,7 +32,7 @@ complete repair is tiny: validity ranges, synthetic execution states and
 other expression forms still need proper handling.
 
 No production code, build guard, runtime behavior, instrumentation scope or
-toolchain pin changed. The earlier [source-map proposal](source-maps-all-games-recommendation.md)
+toolchain pin changed. The earlier [source-map proposal](source-maps-recommendation.md)
 is not the recommendation for this requirement.
 
 ## 1. Stage isolation: the value is lost during flattening
@@ -65,7 +65,7 @@ value itself.
 
 ## 2. A producer-side repair experiment
 
-The [research patch](experiments/asyncify-dwarf-value-provenance.patch) applies
+The [research patch](asyncify-dwarf-value-provenance.patch) applies
 only to a disposable checkout of Binaryen
 `fba5005a132d85d578be5bd010e0487ed8e2ce3e` (version 133).
 

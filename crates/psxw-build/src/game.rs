@@ -234,7 +234,7 @@ pub struct Prepared {
     unvalidated: BTreeSet<String>,
     hardware: Vec<Unbound>,
     void_used: BTreeSet<(String, u32)>,
-    overlays: BTreeMap<u32, Vec<(String, [u32; 2])>>,
+    overlays: BTreeMap<u32, Vec<(String, Vec<(u32, u32)>)>>,
     spec: GameSpec,
     /// Functions that switch threads (wasm names), seeding Asyncify.
     switches: BTreeSet<String>,
@@ -412,48 +412,9 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
-            let stem = o.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-            let names: BTreeSet<String> = WasmObject::read(o)?
-                .symbols
-                .iter()
-                .filter(|s| s.kind == SymbolKind::Function && s.defined)
-                .map(|s| s.name.clone())
-                .collect();
-            let text = std::fs::read_to_string(o.with_extension("i"))?;
-            let variant = psxw_cc::ast::hook_variant(&text, &names);
             let (dir, flags): (PathBuf, &[&str]) =
                 if opts.ubsan { (ubsan_dir.join(c), &ubsan_flags) } else { (calls_dir.join(c), &dwarf_flags) };
-            std::fs::create_dir_all(&dir)?;
-            let vi = dir.join(format!("{stem}.i"));
-            let vo = dir.join(format!("{stem}.o"));
-            let older = |a: &Path, b: &Path| -> bool {
-                match (std::fs::metadata(a).and_then(|m| m.modified()), std::fs::metadata(b).and_then(|m| m.modified())) {
-                    (Ok(x), Ok(y)) => x < y,
-                    _ => true,
-                }
-            };
-            let stale = std::fs::read_to_string(&vi).ok().as_deref() != Some(variant.as_str())
-                || !vo.is_file()
-                || (opts.ubsan && older(&vo, &ignorelist));
-            if stale {
-                std::fs::write(&vi, &variant)?;
-                clang.compile_variant(&vi, &vo, flags)?;
-            }
-            let protos: BTreeMap<String, Proto> =
-                psxw_cc::protos::cached(&clang, &vi)?.into_iter().fold(BTreeMap::new(), |mut m, p| {
-                    if p.defined || !m.contains_key(&p.name) {
-                        m.insert(p.name.clone(), p);
-                    }
-                    m
-                });
-            Ok(Input {
-                label: format!("{c}/{stem}"),
-                container: c.clone(),
-                obj: WasmObject::read(&vo)?,
-                protos,
-                generated: false,
-                gcc: Some(gcc),
-            })
+            c_input(&clang, c, o, &dir, flags, opts.ubsan.then_some(ignorelist.as_path()), gcc)
         })
         .collect::<Result<_>>()?;
 
@@ -522,57 +483,10 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         );
     }
     bios_calls(&out_dir(ws, &opts.game), &lifted)?;
-    // Thread switches (ChangeThread, B0h:10h, or SYS(03h)) seed Asyncify
-    // by their wasm names. Conservatively include every syscall site:
-    // its function number may be computed at runtime.
-    let switches: BTreeSet<String> = lifted
-        .iter()
-        .filter(|t| {
-            psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10))
-                || t.graph.nodes.values().any(|d| d.insn.op == psxw_lift::decode::Op::Syscall)
-        })
-        .map(|t| format!("{}:{}", t.func.container, t.cname))
-        .collect();
-    let failures = psxw_lift::run::write_and_compile(ws, &lift_dir, &lifted)?;
-    if !failures.is_empty() {
-        bail!("{} translations don't compile; run `psxw lift {}`", failures.len(), opts.game);
-    }
-    for t in &lifted {
-        let path = lift_dir.join(&t.func.container).join(format!("{:08X}.o", t.func.addr));
-        let obj = WasmObject::read(&path)?;
-        let local = obj
-            .symbols
-            .iter()
-            .find(|s| s.kind == SymbolKind::Function && s.defined && s.name == t.cname)
-            .and_then(|s| s.index)
-            .with_context(|| format!("{} defines no {}", path.display(), t.cname))?
-            - obj.num_imported_funcs();
-        link_inputs.push(Input {
-            label: format!("lift {} {:08X}", t.func.container, t.func.addr),
-            container: t.func.container.clone(),
-            obj,
-            protos: BTreeMap::new(),
-            generated: true,
-            gcc: None,
-        });
-        tiers.insert((t.func.container.clone(), t.func.addr), Tier::Lift { input: link_inputs.len() - 1, func: local });
-    }
-
-    // Addresses several containers define (overlay slots).
-    let mut by_addr: BTreeMap<u32, Vec<String>> = BTreeMap::new();
-    for (c, a) in tiers.keys() {
-        by_addr.entry(*a).or_default().push(c.clone());
-    }
-    let mut overlays = BTreeMap::new();
-    for (a, cs) in by_addr.into_iter().filter(|(_, cs)| cs.len() > 1) {
-        let mut cands = Vec::new();
-        for c in cs {
-            let w0 = inputs.originals.word(&c, a).context("overlay code")?;
-            let w1 = inputs.originals.word(&c, a + 4).unwrap_or(0);
-            cands.push((c, [w0, w1]));
-        }
-        overlays.insert(a, cands);
-    }
+    let switches = thread_switches(&lifted);
+    link_lifted(ws, &lift_dir, &lifted, &mut link_inputs, &mut tiers)
+        .with_context(|| format!("run `psxw lift {}`", opts.game))?;
+    let overlays = overlay_plan(&inputs.program, &inputs.originals, &tiers)?;
 
     let spec = GameSpec {
         tiers: tiers.clone(),
@@ -723,8 +637,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
             .arg("-o")
             .arg(&merged))?;
         eprintln!("build: optimizing");
-        // `-g` keeps function names, so trap backtraces name guest functions.
-        run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg("-O2").arg("-g").arg(&merged).arg("-o").arg(&game))?;
+        optimize(ws, &merged, &game)?;
     }
     let mut bytes = std::fs::read(&game)?;
     validate(&bytes).context("game.wasm fails validation")?;
@@ -1165,7 +1078,7 @@ fn call_support(table: u32, func: Option<u32>) -> psx_bios::bios::Support {
 /// Instrument the guest with Asyncify over the functions that can be on
 /// the stack at a thread switch (D57; `psxw_link::asyncify`). Only
 /// `psx.bios` and `psx.syscall` unwind. Prints the scope's size.
-fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>, debug: bool) -> Result<Vec<u8>> {
+pub(crate) fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>, debug: bool) -> Result<Vec<u8>> {
     let tool = if debug { psxw_inputs::toolchain::dwarf_binaryen(ws)? } else { ws.tool("binaryen", "bin/wasm-opt")? };
     let scope = psxw_link::asyncify::scope(wasm, switches)?;
     let linked = dir.join("guest-linked.wasm");
@@ -1210,6 +1123,167 @@ pub fn game_path(ws: &Workspace, game: &str) -> PathBuf {
     out_dir(ws, game).join("game.wasm")
 }
 
+/// A census C object as the link takes it (D50): every non-inline
+/// function weak and noinline, compiled with `flags` into `dir`, with its
+/// prototype facts. The object is rebuilt when its variant changed, or
+/// when it is older than `newer_than`.
+pub(crate) fn c_input(
+    clang: &psxw_cc::Clang,
+    container: &str,
+    census_obj: &Path,
+    dir: &Path,
+    flags: &[&str],
+    newer_than: Option<&Path>,
+    gcc: Gcc,
+) -> Result<Input> {
+    let stem = census_obj.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let names: BTreeSet<String> = WasmObject::read(census_obj)?
+        .symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Function && s.defined)
+        .map(|s| s.name.clone())
+        .collect();
+    let text = std::fs::read_to_string(census_obj.with_extension("i"))?;
+    let variant = psxw_cc::ast::hook_variant(&text, &names);
+    std::fs::create_dir_all(dir)?;
+    let vi = dir.join(format!("{stem}.i"));
+    let vo = dir.join(format!("{stem}.o"));
+    let older = |a: &Path, b: &Path| -> bool {
+        match (std::fs::metadata(a).and_then(|m| m.modified()), std::fs::metadata(b).and_then(|m| m.modified())) {
+            (Ok(x), Ok(y)) => x < y,
+            _ => true,
+        }
+    };
+    let stale = std::fs::read_to_string(&vi).ok().as_deref() != Some(variant.as_str())
+        || !vo.is_file()
+        || newer_than.is_some_and(|n| older(&vo, n));
+    if stale {
+        std::fs::write(&vi, &variant)?;
+        clang.compile_variant(&vi, &vo, flags)?;
+    }
+    let protos: BTreeMap<String, Proto> = psxw_cc::protos::cached(clang, &vi)?.into_iter().fold(BTreeMap::new(), |mut m, p| {
+        if p.defined || !m.contains_key(&p.name) {
+            m.insert(p.name.clone(), p);
+        }
+        m
+    });
+    Ok(Input {
+        label: format!("{container}/{stem}"),
+        container: container.to_string(),
+        obj: WasmObject::read(&vo)?,
+        protos,
+        generated: false,
+        gcc: Some(gcc),
+    })
+}
+
+/// Write and compile the translations, and add each as a link input at
+/// the lift tier.
+pub(crate) fn link_lifted(
+    ws: &Workspace,
+    lift_dir: &Path,
+    lifted: &[&psxw_lift::Translation],
+    link_inputs: &mut Vec<Input>,
+    tiers: &mut BTreeMap<(String, u32), Tier>,
+) -> Result<()> {
+    let failures = psxw_lift::run::write_and_compile(ws, lift_dir, lifted)?;
+    if !failures.is_empty() {
+        bail!("{} translations don't compile", failures.len());
+    }
+    for t in lifted {
+        let path = lift_dir.join(&t.func.container).join(format!("{:08X}.o", t.func.addr));
+        let obj = WasmObject::read(&path)?;
+        let local = obj
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Function && s.defined && s.name == t.cname)
+            .and_then(|s| s.index)
+            .with_context(|| format!("{} defines no {}", path.display(), t.cname))?
+            - obj.num_imported_funcs();
+        link_inputs.push(Input {
+            label: format!("lift {} {:08X}", t.func.container, t.func.addr),
+            container: t.func.container.clone(),
+            obj,
+            protos: BTreeMap::new(),
+            generated: true,
+            gcc: None,
+        });
+        tiers.insert((t.func.container.clone(), t.func.addr), Tier::Lift { input: link_inputs.len() - 1, func: local });
+    }
+    Ok(())
+}
+
+/// Shared entry addresses need only enough immutable code words to tell
+/// the build-known overlays apart, not a hash of each function on every call.
+pub(crate) fn overlay_plan(
+    program: &psxw_lift::program::Program,
+    originals: &psxw_inputs::originals::Originals,
+    tiers: &BTreeMap<(String, u32), Tier>,
+) -> Result<BTreeMap<u32, Vec<(String, Vec<(u32, u32)>)>>> {
+    let mut by_addr: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for (c, a) in tiers.keys() {
+        by_addr.entry(*a).or_default().push(c.clone());
+    }
+    // Only text: mutable data must not decide which overlay is resident.
+    let code: BTreeMap<_, BTreeMap<_, _>> = program.containers.iter().map(|(c, p)| {
+        let words = p.text.iter().flat_map(|r| r.clone().step_by(4))
+            .filter_map(|a| originals.word(c, a).map(|w| (a, w))).collect();
+        (c.clone(), words)
+    }).collect();
+    let mut overlays = BTreeMap::new();
+    for (a, cs) in by_addr.into_iter().filter(|(_, cs)| cs.len() > 1) {
+        let words: Vec<_> = cs.iter().map(|c| {
+            let words = code.get(c).context("overlay code")?;
+            ensure!(words.contains_key(&a), "{c} {a:08X}: missing overlay code");
+            Ok(words)
+        }).collect::<Result<_>>()?;
+        let checks = overlay_checks(a, &words);
+        overlays.insert(a, cs.into_iter().zip(checks).collect());
+    }
+    Ok(overlays)
+}
+
+/// Thread switches (ChangeThread, B0h:10h, or SYS(03h)) seed Asyncify by
+/// their wasm names. Conservatively include every syscall site: its
+/// function number may be computed at runtime.
+pub(crate) fn thread_switches(lifted: &[&psxw_lift::Translation]) -> BTreeSet<String> {
+    lifted
+        .iter()
+        .filter(|t| {
+            psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10))
+                || t.graph.nodes.values().any(|d| d.insn.op == psxw_lift::decode::Op::Syscall)
+        })
+        .map(|t| format!("{}:{}", t.func.container, t.cname))
+        .collect()
+}
+
+/// The production optimization of a linked module: `wasm-opt -O2`,
+/// keeping names so trap backtraces name guest functions.
+pub(crate) fn optimize(ws: &Workspace, input: &Path, output: &Path) -> Result<()> {
+    run(Command::new(ws.tool("binaryen", "bin/wasm-opt")?).args(FEATURES).arg("-O2").arg("-g").arg(input).arg("-o").arg(output))
+}
+
+/// Entry words plus distinguishing words from intersecting text. Words
+/// outside the intersection may be stale after loading a shorter overlay.
+fn overlay_checks(addr: u32, code: &[&BTreeMap<u32, u32>]) -> Vec<Vec<(u32, u32)>> {
+    code.iter().map(|own| {
+        let mut checks: Vec<_> = [addr, addr + 4].into_iter()
+            .filter_map(|a| own.get(&a).map(|&w| (a, w))).collect();
+        for other in code {
+            if checks.iter().any(|(a, w)| other.get(a).is_some_and(|v| v != w)) {
+                continue;
+            }
+            // Prefer words near this entry before looking elsewhere in text.
+            if let Some((&a, &w)) = own.range(addr..).chain(own.range(..addr))
+                .find(|(a, w)| other.get(a).is_some_and(|v| v != *w))
+            {
+                checks.push((a, w));
+            }
+        }
+        checks
+    }).collect()
+}
+
 /// The guest address of the manifest's `[oracle] frame_counter`: the clock
 /// version 2 replays index by.
 pub fn frame_counter(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs) -> Result<u32> {
@@ -1223,6 +1297,28 @@ pub fn frame_counter(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs
 mod tests {
     use super::*;
     use psx_bios::bios::Support;
+
+    #[test]
+    fn overlay_prologues_do_not_identify_the_resident_code() {
+        let addr = 0x801F_0804;
+        // BoF4's ovl_4573 and ovl_7033 both start with addiu sp,-24;
+        // lui v0,0x8011, but their scene initializers are different.
+        let a = BTreeMap::from([(addr, 0x27BD_FFE8), (addr + 4, 0x3C02_8011), (addr + 8, 0x2403_0003)]);
+        let mut b = a.clone();
+        b.insert(addr + 8, 0x9043_4870);
+        // An identical entry can still belong to a different overlay whose
+        // other code differs. Do not use its mutable data to distinguish it.
+        let mut c = b.clone();
+        c.insert(addr - 4, 1);
+        b.insert(addr - 4, 2);
+        let checks = overlay_checks(addr, &[&a, &b, &c, &b]);
+        for (i, resident) in [&a, &b, &c].into_iter().enumerate() {
+            let selected = checks.iter().position(|p| p.iter().all(|(a, w)| resident.get(a) == Some(w)));
+            assert_eq!(selected, Some(i));
+        }
+        assert_eq!(checks[1], checks[3], "identical code may share an entry");
+        assert_eq!(checks[0].len(), 3, "only add discriminating words");
+    }
 
     #[test]
     fn bios_report_distinguishes_support_and_dynamic_calls() {

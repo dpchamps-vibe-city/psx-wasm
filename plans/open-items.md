@@ -4,16 +4,9 @@ Open tasks, blocked items, human-needed input, unresolved findings and errata.
 Milestone history is in [`completed/`](completed/). Older audit findings below
 retain their provenance; the active recovery status is recorded separately.
 
-- **Active plan:** [`salvage-bios-work.md`](salvage-bios-work.md), native recovery
-  merged into main as `ceefc20`; **full BIOS completion remains a separate,
-  unfinished milestone**. Its recovery checkpoint groups the remaining executable,
-  control-flow, CD/card, console, resource and validation work. The provisional
-  4–8 engineer-week allowance is low-confidence, not a delivery commitment.
-  Extra worktrees are removed; archived history and local artifacts are
-  preserved. The renderer/web work from `archive/main-wt-2-wip-20261031` is now
-  merged at the operator's request, with native renderer and browser GPU/storage
-  checks passing. Details and artifact locations are in the plan's merge checkpoints.
-  Checkpointed results supersede older coverage/gate claims below.
+- **BIOS:** remaining work is in [`bios-status.md`](bios-status.md). The native recovery
+  is merged (`ceefc20`); its record is
+  [`completed/salvage-bios-work.md`](completed/salvage-bios-work.md).
 - **Last full gate runs:** both `psxw ci btn` and `psxw ci bof4` completed at the
   ABI-17 recovery foundation (`a74f832`, code `4cce9e3`) and exited 2. Missing
   oracle prerequisites, BTN mods census inputs and two BTN difftest mismatches
@@ -21,97 +14,21 @@ retain their provenance; the active recovery status is recorded separately.
   focused tests/builds/replays do not constitute a fresh full-CI pass.
 - **The hardware boundary** (native adapters vs per-chip device fallback) is
   described in [`../docs/emulation-layers.md`](../docs/emulation-layers.md) and
-  [`unified-adaptor-layer/`](unified-adaptor-layer/).
+  [`adaptor-status.md`](adaptor-status.md).
+- **Dispatch conformance:** [the plan](dispatch-conformance.md) now has a
+  bounded production-pipeline runner and live original-MIPS reference command
+  (`psxw conform dispatch`). Fresh baseline: 51 variants, 34 execution passes,
+  2 rejection passes, 14 failures, 1 unresolved classification. D72 is removed;
+  failures remain visible rather than changing D5/D6/D7 without approval.
+  Contract review blocks remediation and completion. Sensitivity coverage,
+  the mandatory CI gate and save-backed BoF4 acceptance remain open.
 - **Shortcuts** (42, 2026-10-30 audit) are tracked in
   [`shortcuts.md`](shortcuts.md); the audit's bugs are under *Bugs* below.
 
-## Native BIOS recovery: current gaps
+## Native BIOS
 
-- **General `setjmp`/`longjmp`: deferred by the user.** Recognised setjmp sites
-  save registers and have compiled continuations, but an ordinary continuation
-  call does not unwind intervening frames and returns to the wrong caller.
-  Dependent C(19h)/A(B2h) `ioabort` remains unfinished. Note the bug and revisit
-  later; no control-flow design or implementation is pending approval now.
-- **Other control-flow gaps:** build-known Exec/LoadExec, warm boot, C06 hook
-  chaining, remaining exception context and callback/IRQ thread switches are
-  still open. A(40h) now has its documented fatal handling and patchable table
-  dispatch, with focused tests passing; BREAK event/exception entry is still
-  count-only. Do not replace existing Asyncify threading or infer approval for
-  a runtime redesign from the recovery work.
-- **Partial software services:** card helpers A7..AA/AE, built-in console input
-  and circular helpers, CD internal calls/filesystem details, and
-  non-main SetConf. Recent card Info/Load callback and guest-device console-scan
-  fixes do not complete these whole families. AF write-test notifications remain
-  unverified: OpenBIOS's missing body does not justify adding or removing them.
-  BIOS CD opens now honor explicit
-  ISO versions, default to `;1`, and support `?` filename matching without star
-  expansion; shared disc lookup and CdGetLbn are unchanged. CD file reads now
-  enforce 800h length/position alignment and reject positions at/beyond EOF.
-  They now use the existing native blocking status/read helpers directly,
-  honoring live command/event/error calls and scheduled completion, not the
-  A(A6h/A5h) table slots. Status bit 10h rejects before any seek/read; returning
-  status errors do too. The read's LBA/offset are obtained after status callbacks.
-  Full requested sectors transfer before clipping against live post-callback
-  FCB metadata. Completed sectors survive later failure; FCB error 10h/return -1
-  occur only if SystemError returns (its default is fatal). Success preserves
-  errno. Zero-count reads before EOF now reach the helper's bounded command
-  failure, not a no-op; installed BIOS CD events are required, as boot provides.
-  Path-table/disc-identity checks, status checks in other file operations and
-  native shell-open/acknowledgment behavior remain partial. No new CD driver or
-  scheduler was added. CD read errors now
-  retry after a returning SystemError patch, bounded to ten attempts. Blocking
-  calls now use live ordered event flags, including early software wakes and
-  disabled/consumed/reused slots and native cancellation. Seek/read/status now
-  call live A78/A7E/A7C entries with at most 99999/99999/9 acceptance attempts,
-  preserving arguments and awaiting patched continuations. MSF/status locals
-  use per-call guest stack frames; status reads the actual byte after DNE.
-  Software completion after a rejected/cancelled attempt does not inherit that
-  stale native cancellation. Completion probes now call patched B0B TestEvent
-  in order, honoring Call/Block and synthetic results without implicit flag
-  consumption. Native waits wake on table changes; patched polling yields on
-  the existing loop budget/quantum so wrappers cannot starve scheduled work.
-  Long command-acceptance loops now use the same local budget/quantum yields,
-  letting busy native work complete before retrying the live command table.
-  The 99999/99999/9 bounds remain exact, with no yield after success or final
-  exhaustion; nine status attempts can still exhaust without a yield. This
-  resets, but does not spend, the guest budget per attempt or claim retail
-  timing parity. INT5/chain services remain unfinished. An early read ERR can
-  still encounter busy SeekL after the patch returns, but long retries now
-  allow scheduled progress; no silent native-read cancellation is added.
-  A52/C09 contracts remain unresolved.
-- **Resources/policy:** legally usable font data and GetSystemInfo's BIOS
-  date/version identity remain undecided; no fabricated values or pointers.
-  B53's offset calculation itself needs no glyph resource, but the proposed
-  OpenBIOS original-font lookup aliases valid 899Eh/899Fh codes. Parent rejected
-  that mapping; reliable algorithm/vector evidence remains a separate gap.
-- **Validation:** the CD file-status follow-up passes BIOS 59 /
-  runtime 11 / SDK 42 tests and wasm32 runtime check. The initial focused run
-  found a test counter assertion counting the wrong redirected native callee;
-  corrected before the passing gate. Parent reviewed the diff and contract scout.
-  Logs are in session scratch under `cd-file-status-*`. No new game build/replay
-  cycle: release/runtime/game artifacts and four passing replays remain at
-  `15d15f3`, before the status change. Those replays do not call A60; file
-  integration tests cover it. All six chip groups were native in those builds;
-  ABI 18 and coverage classifications are unchanged. Previous logs, run/check
-  JSON and disposable run cards remain under `cd-file-flow-*`. Tests use ignored
-  `out/tmp-cd-live-wait` as TMPDIR. Inputs and user saves were untouched.
-  Following the operator's concern about prolonged tail work, no new follow-up
-  lanes are being opened at this checkpoint. Full BIOS remains unfinished;
-  the substantive gaps above are not merely final cleanup.
-  BTN's existing GPU timeout/reset logs remain unclassified.
-  Latest memcard conformance remains at `99fa333`. Non-empty oracle
-  validation, unresolved full-CI failures and save/persistence certification
-  remain open. Two-bundle browser disc isolation, locked-import refusal,
-  unlocked replacement and copy-error writer cleanup now pass 25 checks each
-  in Chromium/Firefox at `8e5badf`, through production pages and real OPFS
-  handles, retaining the seven card checks. At `9624526`, fresh ABI-18 BTN
-  browser bundles also pass five conformance scenarios and the 6,000-frame
-  title/recording replay in both browsers, with native RAM/VRAM/audio matching.
-  GPU-oracle goldens and BTN mod inputs remain missing; these focused gates
-  do not constitute full CI or game save/reload certification.
-
-See the active plan for exact service inventories, accepted source changes and
-next actions. Deferral or an unsupported diagnostic does not complete a service.
+See [`bios-status.md`](bios-status.md): unsupported and partial services, the deferred
+`setjmp`/`longjmp` bug, and validation gaps.
 
 ## Needs the human
 
@@ -368,8 +285,8 @@ disagree`) and 6 (`psxw oracle export`/`import`) are done.
 
 ## Debug builds of threaded games (D53, D57)
 
-The DWARF repair in `toolchain/binaryen-dwarf/` (plans
-`debug-builds-threaded-games*.md`). Its 2026-10-30 fixes: dead locals
+The DWARF repair in `toolchain/binaryen-dwarf/` (research in
+[`completed/debug-builds-threaded-games/`](completed/debug-builds-threaded-games/)). Its 2026-10-30 fixes: dead locals
 after a resume, statement rows, the Docker builder.
 - **Rerun the browser and real-game acceptance.** The README's results
   were recorded with the previous `value-provenance.patch` at `16dafb7`,
@@ -461,7 +378,7 @@ ResetEntryInt, closed-event guards, card bounds, old PAD arguments, file-slot
 allocation, printf, boot stack selection and several compiler/shared-device
 findings; per-call support classes now distinguish partial and unsupported
 services without changing the legacy `implemented` build gate. Accepted commits
-and tests are recorded in [`salvage-bios-work.md`](salvage-bios-work.md). Other
+and tests are recorded in [`completed/salvage-bios-work.md`](completed/salvage-bios-work.md). Other
 findings have not all been revalidated; retain them as investigation leads,
 not permission for a new project-wide fidelity audit. *Unchecked* records the
 original audit's uncertainty.
@@ -600,6 +517,21 @@ original audit's uncertainty.
   still give the older 21% figure (3,693 of 17,774 in bof4).
 
 *From:* the plan consolidation (2026-10-29).
+
+**Whole-game oracles**
+- **No stack-bounds check.** The design listed "the stack within bounds"
+  as a RAM invariant of whole-game runs, but no run check implements it:
+  `psxw run --check` has boot, determinism, no-trap, card, no-shadow-io
+  and no-io (`crates/psxw-cli/src/run.rs`). Add a check that the guest's
+  `$sp` stays inside its thread's stack, or decide it isn't worth having.
+  *From:* design audit, 2026-11-01.
+
+**Dead code**
+- **`psx::ADAPTER_PREFIX`** (`crates/psxw-abi/src/lib.rs`, `"adapter."`)
+  is unused and has been since M2 (`c55980a`). Its doc comment describes
+  per-adapter exports (`adapter.<name>`), but the runtime has always had
+  one `adapter(id, addr, a0..a3)` export (design §5). Remove it with the
+  next change to `psxw-abi`. *From:* design audit, 2026-11-01.
 
 ## Tests that still embed btn facts
 

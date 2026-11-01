@@ -16,8 +16,9 @@ dirty) and `psyq-decomp@302b6ae` on 2026-10-25/26.
 Take a matching PlayStation decompilation of a game, plus a decompilation of
 the PsyQ SDK it was built with (which may be partial), and produce a
 WebAssembly build that runs the game natively in a browser. The game's code
-is compiled to wasm. Below the SDK, Rust models the hardware at register
-level, on a deterministic virtual clock. There is no interpreter, no
+is compiled to wasm. Below the SDK, native adapters drive Rust cores of
+the hardware, with register-level device models as the fallback, on a
+deterministic virtual clock. There is no interpreter, no
 dynarec and no CPU model, and the devices are not modelled cycle by cycle:
 DMA and drawing complete instantly in virtual time.
 
@@ -41,8 +42,9 @@ manifest, without changes to the toolchain's code.
 | Interrupts, timers, DMA | **Native, per chip** (D59). libetc's and libapi's counter adapters run its interrupt layer (btn and bof4): after the BIOS's `SysEnqIntRP` chains, their dispatcher calls each pending line's handler, over the register-level interrupt controller, root counters and DMA controller that the other chips' devices share. As the fallback, libetc is original code over those devices, and the BIOS enters its dispatcher through its custom exception exit (D45). Interrupts are delivered at safepoints, on a deterministic virtual clock. |
 | BIOS/kernel | **Native Rust, partial coverage.** A0/B0/C0 services and syscalls implement events, critical sections, the heap, files and devices, memory cards (D43), threads (D57), exception hooks and kernel configuration over existing native facilities. The guest-visible RAM tables hold native stand-in pointers or guest patches, and callable thunks keep saved native pointers working. Coverage is reported per call as working, partial, unsupported, fatal or no-op; public services remain partial and some remain unsupported. There is no Sony BIOS ROM and no CPU interpreter. |
 
-So the CPU is not emulated: all code is compiled ahead of time. The
-hardware below the device libraries is emulated, at register level.
+So the CPU is not emulated: all code is compiled ahead of time. Below the
+SDK, native adapters drive Rust device cores; each chip's register-level
+device model remains its fallback.
 D4 and D8 placed the boundary at the SDK's API, with an adapter for every
 SDK function that touches hardware. D40–D58 moved it down to the registers,
 library by library, because the original library code then decides
@@ -53,7 +55,7 @@ remain where a library's policy keeps them (§5).
 builds and remaining adapter work.
 D59 moves each chip back to native adapters, degrading to its device
 model where the adapters don't cover a game
-([`plans/unified-adaptor-layer/`](../plans/unified-adaptor-layer/README.md)):
+([`plans/adaptor-status.md`](../plans/adaptor-status.md)):
 every chip but the GTE in both games: the CD (chip cd), the interrupt
 layer (chip irq), the GPU (chip gpu), the pads (chip sio0) and the SPU
 (chip spu), and the MDEC (chip mdec) in bof4, the game that links
@@ -104,8 +106,9 @@ files:
 **What this means for the design.** The toolchain cannot assume that SDK C
 exists:
 - Translation covers every library (D15). The libraries that touch
-  hardware mostly run as original code over the devices, translated where
-  there is no C, so their decompilation state doesn't gate anything.
+  hardware mostly run as original code over the adapters (D59), or over
+  the devices as the fallback, translated where there is no C, so their
+  decompilation state doesn't gate anything.
 - libsnd is the largest library the game links, and it is mostly asm. The
   game's ~49 `INCLUDE_ASM` functions sit on the render path.
 - So the lift tier (below) is on the critical path to the first frame. It is
@@ -122,7 +125,7 @@ keeps the original memory map instead of letting a wasm linker lay memory
 out:
 
 - **Data placement.** Every data symbol is placed at its original address,
-  taken from the matching build's ELFs and link maps.
+  taken from the decomp's splat configs and symbol files.
 - **Pointer values.** Pointers keep their PSX values (`0x80xxxxxx`) in
   registers and in memory. Only the *effective address* of a load or store
   is translated:
@@ -132,7 +135,8 @@ out:
   ```
 
   The `+ WINDOW_BASE` folds into the wasm `memarg` offset immediate, so each
-  guest memory access costs one `i32.and`. The same mask folds KSEG0, KSEG1
+  guest memory access costs one `i32.and`, plus an `i32.add` when it had a
+  constant offset. The same mask folds KSEG0, KSEG1
   and KUSEG onto one physical view and puts the scratchpad at window offset
   `0x800000`.
 - **Initial memory comes from the disc.** At boot the runtime loads the
@@ -174,8 +178,9 @@ reports the first frame where a shadow byte changed without a device
 access.
 
 The guest stack is the PSX stack. clang's shadow stack pointer for guest
-code is renamed to a separate `__guest_sp` global, initialized from the EXE
-header, so it never collides with the Rust stack. Lifted code uses the same
+code is renamed to a separate `__guest_sp` global, set at boot from
+SYSTEM.CNF's `STACK` (the BIOS's `0x801F_FF00` when it is absent or 0), as
+the BIOS's boot does, so it never collides with the Rust stack. Lifted code uses the same
 global as `$sp`.
 
 ### 2. Function pointers are MIPS addresses
@@ -200,20 +205,23 @@ call_indirect $dispatch ((fp & 0x003F_FFFC) >> 2)
   unprototyped and mismatched function pointers constantly. Normally wasm
   traps on these. Under o32 semantics they are harmless: extra arguments are
   ignored and missing ones read as garbage, as on hardware.
-- **Functions with no MIPS address.** Compiler-generated helpers whose
-  address is taken get synthetic addresses above RAM, in window offsets
-  `0x200000`–`0x3FFFFF`.
+- **Functions with no MIPS address.** Mod functions get synthetic
+  addresses above RAM (`SYNTHETIC_CODE`, `0x8020_0000`–`0x803F_FFFF`).
+  Taking the address of any other function the address map doesn't name
+  fails the link ("function pointer to X, which has no address").
 
 ### 3. Overlays: the bytes in RAM decide
 
 Each overlay's functions are compiled into `game.wasm` alongside the EXE.
 An address that more than one overlay defines gets a dispatch stub:
 
-1. Read the first word or two of guest RAM at that address.
-2. Compare them against each candidate overlay's original code at that
-   address.
-3. Call the candidate that matches. If none matches, trap with a diagnostic
-   ("no translation for resident code at 0x800BBC74").
+1. Read the entry words and, where candidates share them, a few additional
+   distinguishing words from their intersecting text ranges.
+2. Compare them against each candidate overlay's original code words.
+   Mutable data and non-overlapping text (which may be stale) are not used.
+3. Call the candidate that matches. If none matches, call
+   `psx.untranslated`, which traps with the address ("no implementation
+   for guest address 0x800bbc74").
 
 The 690 EXE→overlay imports, and every table entry for an overlay address,
 point at these stubs.
@@ -221,8 +229,12 @@ point at these stubs.
 Residency is decided by RAM contents, the same way the hardware decides
 which code runs. It doesn't matter how the bytes arrived: CD DMA, a game
 `memcpy`, or decompression. No per-game loader hook is needed. Calls inside
-an overlay are direct and unchecked. Caching the check against a
-region-write epoch is a later optimization.
+an overlay to an address only that overlay defines are direct and
+unchecked; a call to an address several overlays define goes through the
+stub, wherever it comes from. Caching the check against a
+region-write epoch is a later optimization. These sampled checks identify
+build-known overlays; they do not validate whole functions or promise support
+for arbitrary code mutation or partially loaded overlays.
 
 ### 4. Every function gets exactly one implementation
 
@@ -244,7 +256,7 @@ accesses reach the runtime's register-level devices (§1, §5).
 |---|---|---|
 | `adapter` | Rust, in the runtime | Chosen by the library's policy in `boundary/psyq.toml` and the object's identity |
 | `c` | Decompiled C | `psxw-cc` |
-| `lift` | Original MIPS from relocatable objects, translated ahead of time to C | `psxw-lift`, then `psxw-cc` |
+| `lift` | Original MIPS from the game's container images, translated ahead of time to C | `psxw-lift`, then `psxw-cc` |
 
 How each tier is produced:
 
@@ -292,8 +304,9 @@ How each tier is produced:
     function can move from translated to decompiled C without its callers
     changing.
   - **clang optimizes it.** Guest registers become locals that clang
-    promotes to SSA form. `#line` directives point back at the original
-    instructions for debugging.
+    promotes to SSA form. Each statement carries its original address and
+    disassembly as a comment, and a debug build's DWARF points at the
+    generated C (§9).
   - **UB discipline.** The output uses wrapping unsigned arithmetic,
     explicit sign extension and masked shifts, so clang has no undefined
     behaviour to exploit.
@@ -330,7 +343,8 @@ How each tier is produced:
   - the census's C definitions;
   - the EXE entry.
 
-  They grow from call targets and code addresses built in registers. An
+  They grow from call targets, code addresses built in registers, data
+  words pointing at code nothing else reaches, and setjmp return points. An
   address reachable inside an existing function becomes an interior entry
   instead of splitting it. Jump tables are recovered from the GCC idiom,
   including indices spilled to the stack. A constant read from the
@@ -417,7 +431,7 @@ version, because the original library decides every value a game can
 observe. Together they made the layer beneath the SDK an emulated device
 layer ([`emulation-layers.md`](emulation-layers.md)). D59 makes the
 adapters first again, chip by chip, with the device models as the
-fallback (`plans/unified-adaptor-layer/`).
+fallback (`plans/completed/unified-adaptor-layer/`).
 
 **The runtime splits into three layers**, so that SDK versions stay cheap:
 
@@ -469,9 +483,11 @@ fallback (`plans/unified-adaptor-layer/`).
   game's SDK headers, with offsets checked equal under the matching
   compiler and clang. The M0 layout probe showed clang's wasm32 layouts
   equal GCC's o32 layouts.
-- **Adapters take the o32 form** `(a0, a1, a2, a3) -> i64` and are
-  exported as `adapter.<name>`, so a caller in any tier reaches them the
-  same way.
+- **Adapters take the o32 form** `(a0, a1, a2, a3) -> i64`. The runtime
+  exports a single entry, `psx.adapter(id, addr, a0, a1, a2, a3)`; the
+  guest's thunk for each replaced function calls it with the adapter's id
+  (from the runtime's `psxw.adapters` table) and the function's guest
+  address (D61), so a caller in any tier reaches it the same way.
 - **Other SDK families**, such as PSn00bSDK or Net Yaroze, would be sibling
   boundary files and adapter sets over the same devices and BIOS.
 
@@ -528,8 +544,9 @@ Game-visible time is **virtual and deterministic**:
   the quantum the guest's passes have taken (`Machine::guest_now`, D66),
   so a busy-wait on a byte, its /ACK or the counter ends when the
   hardware's would, not at the next safepoint.
-- **Waiting is spinning.** libgpu's `DrawSync` is original code (D42),
-  and so is libetc's `VSync` with chip irq on its device (D45): they wait
+- **Waiting is spinning.** libgpu's `DrawSync` with chip gpu on its
+  device (D42), and libetc's `VSync` with chip irq on its device (D45),
+  are original code: they wait
   the way they do on hardware, by polling. `VSync(0)` spins until libetc's
   vblank handler, delivered at one of the loop's safepoints, advances
   `Vcount`. A spin loop like `while (!cd_done);` makes progress the same
@@ -537,13 +554,13 @@ Game-visible time is **virtual and deterministic**:
   `VSync`'s adapter moves time a quantum at a time, delivering what fell
   due and then running the handlers, as at the loop's safepoints. When
   interrupts are taken is observable: taken at once, bof4's CD streaming
-  goes another way (plans/unified-adaptor-layer, phase 1 findings).
+  goes another way (plans/completed/unified-adaptor-layer, phase 1 findings).
   So is how long a handler spins, and where it leaves the guest's
-  safepoint budget: libpad's adapters spend the quanta its SIO0 and root
-  counter waits take in the vblank interrupt (nothing delivered
-  meanwhile), then start the budget over as the original's last
-  safepoint did (`Regs::reset_budget`, psxw-abi `guest::BUDGET_RESET`;
-  D60). libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin as `VSync`'s
+  safepoint budget: libpad's adapters spend the loop-header passes its SIO0
+  and root counter waits take in the vblank interrupt from the guest's
+  budget, a quantum passing (nothing delivered) each time the budget runs
+  out, as the original's loops do (`libpad::spend_in_exception`, psxw-abi
+  `guest::BUDGET_GET`/`SET`; D60, D66). libcd's waits (`CD_sync`, `CD_ready`, `CD_cw`) spin as `VSync`'s
   do (D62); inside a callback, where no interrupt is taken, they poll the
   CD controller as the original does.
   Loops that aren't waits count too: libspu's adapters spend the passes
@@ -596,8 +613,8 @@ its buffer. `ReturnFromException` leaves from any depth.
   (libpad's vblank poll, when vblank is unmasked and pending).
   libmcx's `McxStartCom` instead appends its element to priority 2's
   chain itself, through the table of tables at 100h: the kernel keeps
-  its exception control blocks there, in RAM, and walks the elements
-  linked there after its own chain's (D65). With chip memcard native,
+  its exception control blocks there, in RAM, its own elements included,
+  and walks only those chains (D65, D68). With chip memcard native,
   the element steps queue ordinary calls to the statically bound vblank
   handler (`libmcx/mcxresi:0x80`) or `_mcxDsrEntry`. BIOS-table patches and
   DSR callbacks finish before their handler's continuation; nested RFE
@@ -644,7 +661,8 @@ can't see any of it.
 - **The runtime is prebuilt once per runtime version** (D38). It is
   game-agnostic Rust, built by cargo as a wasm32 `cdylib` that imports the
   guest's memory and keeps its data, stack and heap above the guest window
-  (`RUNTIME_BASE`; a debug build's window sits above them, §9). It reads
+  (`RUNTIME_BASE`). A debug build's window (§9) sits above its data and
+  stack, and its heap grows above the window. It reads
   and writes guest memory through the window, wherever the guest says it
   is (`guest.guest_window`), and never hands host pointers to the guest.
 - **binaryen `wasm-merge` joins it with the linked guest** into one
@@ -740,8 +758,8 @@ whatever machine the browser is on.
                  │  tracked config: splat configs, symbol files, sources, headers
                  │  original bytes: splat target_path + sha1, from the user's checkout
                  ▼
-          psxw-inputs ──► ProjectModel (containers, AddressMap, overlay slots,
-                 │                       per-function tier candidates)
+          psxw-inputs ──► AddressMap (containers, overlay slots,
+                 │                     per-function tier candidates)
                  │ per function: adapter │ decompiled C │ translated
      ┌───────────┴──────────┐            boundary/psyq.toml (library policies)
      ▼                      ▼                + object identity (validated.rs)
@@ -775,8 +793,9 @@ runtime again. So the runtime never holds a borrow of its own state across
 a call into guest code.
 
 - **Boot.** Does the BIOS's startup job: reads `SYSTEM.CNF` from the disc,
-  loads the PS-X EXE into RAM, zeroes BSS, sets `__guest_sp`, and calls
-  `guest_main`.
+  loads the PS-X EXE into RAM, zeroes BSS, sets `$sp` and `$gp`, lays out
+  the kernel's event and thread tables, and calls the EXE's entry point
+  (`pc0`) through the dispatch table.
 - **Threads (D57).** The BIOS keeps the kernel's thread tables in guest
   RAM (the table of tables' PCB and TCB entries, the PCB, and the TCBs
   from E000h, sized by SYSTEM.CNF `TCB=`), because games read and edit
@@ -814,7 +833,8 @@ a call into guest code.
   service coverage is partial; unsupported entries such as Exec (A(43h))
   and font access (B(51h)) are named in the build's BIOS-call report, not
   completed services. This is not full BIOS coverage.
-- **clock.** The virtual timeline: vblank (NTSC 59.94 Hz, PAL 50 Hz), a
+- **clock.** The virtual timeline: vblank (NTSC ≈59.82 Hz, PAL ≈49.75 Hz, exact rationals of the video
+  clock), a
   queue of pending device events, and the safepoint quantum. It delivers
   events in a fixed order by calling guest callbacks.
 - **The bus** (`psx-bios::io`). Device libraries' I/O-window accesses land
@@ -862,7 +882,9 @@ a call into guest code.
     - **CPU transfers.** `StoreImage` (8 call sites in btn) is a
       synchronous `readPixels`, which is fine in the worker. `MoveImage` (13
       sites) is a GPU-side copy.
-    - **Exactness.** It starts at 1× resolution, with upscaling later. The
+    - **Exactness.** Game-visible VRAM is always the exact 1× engine. An
+      optional host-only visual renderer (Clean Polygons, up to 4×) draws
+      presentation separately and never answers game reads. The
       remaining inexactness is 1-pixel rasterization differences on edges,
       which only presentation sees.
 - **gte.** `psx-gte`: exact fixed-point math. Its register file lives in the
@@ -873,7 +895,7 @@ a call into guest code.
   CD-input mixing. It runs on its own 44.1 kHz clock, brought up to the
   current cycle before every register access, every DMA4 transfer and
   every vblank. Its mix is what `host.audio` carries.
-- **cd.** Disc images (`.bin`/`.cue`, `.iso`), sectors verified by EDC, and
+- **cd.** Disc images (a `.cue` over raw 2352-byte `.bin` tracks), sectors verified by EDC, and
   a drive model: sector reads scheduled on the clock (with the timing
   toggle from §6), and XA-ADPCM streaming into the SPU's CD input. The CD
   controller (`psx-devices::cdc`, 1F801800h-3h, IRQ2, DMA3, D58) answers
@@ -984,7 +1006,8 @@ base (D51) beside compiled mods, with no build step (`web/script.js`).
   done yet.
 - **Input.** The main thread polls the Gamepad API (it isn't available in
   workers) and keyboard state, and writes them into a SharedArrayBuffer.
-- **Disc.** The user drops a `.bin`/`.cue` file, which is copied into OPFS.
+- **Disc.** The user picks the `.cue` and the `.bin` files it names, which
+  are copied into OPFS.
   The worker reads it synchronously through `FileSystemSyncAccessHandle`.
   Memory cards are stored in OPFS too, as raw `.mcr` images the page
   imports and exports.
@@ -1014,8 +1037,7 @@ report marks it unverified and nothing calls it correct.
 ### Oracles from the original code
 
 - **Translated vs decompiled C**, for every function that has both:
-  thousands of functions across the two repos. This is the idea in
-  btn-decompilation `plans/static-recompilation-project`.
+  thousands of functions across the two repos.
 - **Adapters vs the original library over the devices** (`psxw conform`,
   §5). One scenario of SDK calls and vblanks runs on the adapters and on
   the translated original library over the register-level devices, and
@@ -1036,8 +1058,8 @@ report marks it unverified and nothing calls it correct.
   - compile with `-std=gnu89 -fwrapv -fno-strict-aliasing
     -fno-delete-null-pointer-checks -funsigned-char -ffreestanding
     -ftrivial-auto-var-init=zero`;
-  - test builds add `-fsanitize=undefined`, with trap handlers the runtime
-    implements;
+  - test builds (`--ubsan`) add `-fsanitize=undefined` in trap mode: each
+    check is an `unreachable`, located by the trap's backtrace;
   - translated-vs-C tests catch whatever the flags miss.
 
 ### The device oracle harness
@@ -1052,16 +1074,17 @@ emulators now, a real console when one is available.
                 ┌───────────────────────────────────┤
                 ▼                                   ▼
    runner.exe on a device target          psx-wasm device under test
-   (emulator A, emulator B, or a PS1)     (same vector)
+   (the emulator, or a PS1)               (same vector)
                 │                                   │
                 ▼                                   │
    golden store (result + provenance) ──► compare ◄─┘
 ```
 
 - **The vector recorder** captures, from real psx-wasm runs, what the game
-  asks of each device: draw commands with the VRAM state before them, GTE
-  inputs, SPU voice setups and sample counts, CD command sequences. Coverage
-  is the game's real workload.
+  asks of the GPU and SPU: draw commands with the VRAM state before them,
+  and SPU voice setups and sample counts. Coverage there is the game's real
+  workload. GTE, CD controller, MDEC and BIOS-thread vectors come from
+  seeded or scripted generators.
 - **The runner** is one small PS1 program, built with PSn00bSDK, that
   executes vectors directly on the chips:
   - load VRAM, send draw commands, read VRAM back;
@@ -1072,9 +1095,10 @@ emulators now, a real console when one is available.
   - feed the MDEC tables and macroblocks and read the decoded pixels;
   - call the BIOS's thread functions and read the TCBs back.
 
-  It writes results to main RAM. A target therefore only needs to load an
-  EXE, run headless, and dump main RAM. On a console, vectors and results
-  travel over the serial port instead.
+  It exchanges batches through a mailbox in main RAM, so a target only
+  needs to boot the runner and read and write that mailbox between frames.
+  For a console, `psxw oracle export` packages the batches and
+  `psxw oracle import` takes the results back.
 - **Targets:**
   - *An emulator now:* Beetle PSX (Mednafen's PlayStation core), driven by
     a small headless libretro host. It is built from source at a pinned
@@ -1143,7 +1167,7 @@ verified 1× mode as explicitly unverified options.
     RAM predicates by symbol that must hold once the frame counter
     reaches each value (M13).
   - RAM invariants: no access into the I/O range outside device libraries
-    (`no-shadow-io`), and the stack within bounds.
+    (`no-shadow-io`). A stack-bounds check is an open item.
   - The game's own integrity checks, such as save checksums, pass.
 
 ## Pinning the inputs
@@ -1155,7 +1179,7 @@ consumes:
   oracle images' pins, and the expected hashes of the user-supplied disc
   files. The disc files themselves are never committed.
 - **`psxw inputs sync`** snapshots each repo at its pinned SHA with
-  `git archive` into `.inputs/<name>-<sha>/`. The local checkout is used
+  `git archive` into `.inputs/<name>-<short sha>/`. The local checkout is used
   only as an object store: no worktree metadata is added to it, and its
   uncommitted work is never read (btn-decompilation had 147 modified paths
   on 2026-10-25).
@@ -1174,7 +1198,7 @@ consumes:
 ## Roadmap
 
 The milestones, one file each, are kept as history in
-[`plans/completed/`](../plans/completed/); the plan index, the active plan
+[`plans/completed/`](../plans/completed/); the plan index, the active plans
 and the open items are in [`plans/README.md`](../plans/README.md). Each
 milestone's exit is gated by an automated oracle.
 
@@ -1185,7 +1209,11 @@ the human (recordings, a hardware rig for M10, pushing the harness), and
 M8 left the translated-SDK cache and the per-function psyq-decomp
 integration (its tasks 5–6). M9
 never started; M13 brought up a second game, bof4, which needed
-toolchain work. The active plan is the unified adapter layer.
+toolchain work. The unified adapter layer's phase 1 is done (D59): both
+games run every chip native but the GTE. What remains of the native BIOS
+and of PsyQ 4.7's adapters is tracked in
+[`plans/bios-status.md`](../plans/bios-status.md) and
+[`plans/adaptor-status.md`](../plans/adaptor-status.md).
 
 | # | Milestone | Gating oracle |
 |---|---|---|
@@ -1249,7 +1277,8 @@ toolchain work. The active plan is the unified adapter layer.
 
   I/O and BIOS-kernel accesses all sit in SDK objects then destined for
   adapters (`libpad/pdresres`, `libmcx/*`, `libcard/patch`,
-  `libapi/first`); libpad has since run as original code over SIO0 (D40).
+  `libapi/first`); libpad has since run as original code over SIO0 (D40),
+  and then as adapters that run its engine (D60).
 - **Inline expansion.** 13 functions inline callees that pass values in
   registers: the libgte `msc02` cluster, the BIOS GTE patch stub, and 7
   undecompiled game functions that return their caller's `v0`.
@@ -1283,19 +1312,14 @@ toolchain work. The active plan is the unified adapter layer.
 | PSX RAM mirroring (`0x80200000` aliasing `0x80000000`) is relied on | The aux region occupies the mirrors. If a game needs mirroring, it can be enabled by masking with `0x1FFFFF` for that game. |
 | Browser constraints: COOP/COEP, Gamepad API only on the main thread, Safari gaps | A Worker paced with `Atomics.wait` over SharedArrayBuffers, yielding through JSPI where the browser has it; a browser tab only, for now (D46). |
 | WebGL2 limits: no blending into integer textures, no framebuffer fetch | `R16UI` VRAM with all blending and mask logic in integer shader code; the destination is read from a read copy of VRAM; batches split on overlap. |
-| An SDK object with no adapter (new version, patched library) | Translate it and cut one level lower, down to the BIOS calls. Failing that, the build names the functions whose objects need adapters, or their library a `device` policy, so the original runs over the register-level devices. |
+| An SDK object with no adapter (new version, patched library) | Translate it and cut one level lower, down to the BIOS calls. In a chip's libraries, an object with no validated adapter sends that whole chip to its register-level device (D59); the build fails only if `game.toml`'s `[chips]` expects the chip native. In an `adapter`-policy library (libapi, libcard), the build names the functions that touch hardware with no validated adapter. |
 
 ## Open questions
 
-1. **Where the shipped boundary sits.** D40–D58 put it at the hardware
-   registers, so both games run on register-level device models. Whether
-   to move it back up is the human's open decision; the unified adapter
-   layer plan (`plans/unified-adaptor-layer/`, being written) proposes
-   native adapters per chip with the device models as the fallback.
-2. **Distribution posture.** `game.wasm` contains compiled game code but
+1. **Distribution posture.** `game.wasm` contains compiled game code but
    no disc data. Will it be distributed, or only built locally from the
    user's own checkouts?
-3. **Q3. The license for psx-wasm.** Needed before any public release.
+2. **Q3. The license for psx-wasm.** Needed before any public release.
    Constraint so far: `psx-devices::sio` is a close Rust port of Beetle
    PSX's `frontio.c` (GPLv2), made so SIO0 matches the oracle bit for bit.
    A license that isn't GPL-compatible means re-implementing it from a
@@ -1303,6 +1327,10 @@ toolchain work. The active plan is the unified adapter layer.
    the emulator used only as an oracle.
 
 Decided or settled:
+- **Where the shipped boundary sits.** D40–D58 put it at the hardware
+  registers. D59 moved it back up: adapters first, per chip, with the
+  device models as the fallback. Both games run every chip native but the
+  GTE.
 - **Q1. Webview shell (Tauri) or browser tab only.** Browser tab only, for
   now (D46).
 - **Q2. Register-level SPU fallback for unknown libspu versions.** Yes
@@ -1336,7 +1364,8 @@ device behaviour, in the same family as libultraship, PsyCross and Wine.
 (design: Goal; What "native, not an emulator" means)
 
 *Later:* D40–D58 moved the boundary below the SDK, so the hardware there
-is modelled at register level. There is still no CPU emulation.
+is modelled at register level. There is still no CPU emulation. D59 moved
+it back up: adapters first, the devices as the fallback.
 
 **D2. psx-wasm vs a static recompiler.** Static recompilers translate all
 machine code and emulate the hardware around it. psx-wasm compiles the
@@ -1389,12 +1418,17 @@ The rule is applied per function or member, never per library.
 
 *Later:* whether a function may have an adapter is set per library by
 its policy in `boundary/psyq.toml`. Device libraries get none (D40), and
-`adapter-or-device` decides a whole library at once (D58).
+`adapter-or-device` decides a whole library at once (D58). Since D59 it is
+decided per chip group, and no library has the `device` policy.
 
 **D9. Translate into generated C.** It is compiled by the same clang
 pipeline, not emitted as wasm, Rust or LLVM IR. *Why:* one pipeline, clang
 optimizes it, it's debuggable through `#line`, and N64Recomp and
 PSXRecomp prove the approach. (design §4)
+
+*Later:* no `#line` directives are emitted. A debugger shows the
+generated C itself, one MIPS instruction a line with its address in a
+comment (D53).
 
 **D10. The translator reads original images.** Per game, it reads the
 original EXE and overlay images, which is valid because of D5. Relocatable
@@ -1435,7 +1469,8 @@ what the game shows, plays and decides (`rand`, the music sequencer).
 (design §5)
 
 *Later:* libsnd stays original code but is a device library, because its
-own SPU register writes must reach the SPU (D47).
+own SPU register writes must reach the SPU (D47). Since D59 those accesses
+are adapted (`_SsInit`, D63).
 
 **D15. The decompiled SDK is not on the critical path.** Translation
 covers everything. Decomp effort pays off most on the boundary libraries,
@@ -1457,8 +1492,10 @@ the exact wasm that ships. (design §7)
 safepoints, and callbacks run at safepoints. The browser runs it in a Web
 Worker paced with `Atomics.wait`; JSPI is the fallback. (design §6)
 
-*Later:* libetc's `VSync` and libgpu's `DrawSync` run as original code
-(D42, D45) and wait by polling, so time mostly moves at safepoints. Where
+*Later:* libetc's `VSync` and libgpu's `DrawSync` ran as original code
+(D42, D45) and waited by polling. Since D59 both are adapters that wait the
+way the spin did, a quantum at a time, so time still mostly moves at
+safepoints. Where
 the browser has JSPI, the Worker uses it besides `Atomics.wait`, to yield
 to its event loop at each vblank.
 
@@ -1510,6 +1547,11 @@ records its provenance. When hardware arrives, the whole archive reruns.
 **D25. Inputs are pinned** in `inputs.lock` and read through `git archive`
 snapshots. No worktrees, and no builds of the decomp repos.
 
+*Later:* `psxw sdk scan` reads the SDK's converted library objects
+(`library-input/redux`, generated and untracked) from the psyq-decomp
+checkout. Its output, `boundary/reach/<sdk>.json`, is committed, so builds
+don't depend on it (D59).
+
 **D26. Original bytes come from splat** `target_path` + `sha1`, not from
 harness-specific manifests.
 
@@ -1534,8 +1576,8 @@ M1 added four lift rules, each for C that can't say what the original does
 (see D35).
 
 **D29. Host support functions.** GCC inlined some builtins (`abs`,
-`labs`, `fabs`), so the original binaries carry no copy; the runtime
-supplies them.
+`labs`, `fabs`), so the original binaries carry no copy; the linker
+synthesizes their bodies (`psxw_link::bodies`).
 
 **D30. Milestone order.**
 - Translator before boot.
@@ -1646,13 +1688,13 @@ the first frames, the buffers start `FF 00`, PadStopCom returns 0, and
 port 2 is first polled a vblank after port 1. An adapter would have to
 reimplement that per libpad version. The original over the device is
 exact by construction, and costs a few SIO0 bytes per frame. Other
-functions keep adapters. A debug build still traps on their I/O
-(`psx.io_trap`). (The general rule stays §5: adapters for what touches
+functions keep adapters. A `--debug-io` build still traps on their
+I/O (`psx.io_trap`). (The general rule stays §5: adapters for what touches
 hardware. This is the exception where the hardware is small and the
 library's logic is the behaviour.)
 
 **D41. Q2 decided: a register-level SPU is the fallback for unknown libspu
-versions** (M8). M6's `psx-devices::spu` models the SPU at register level
+versions** (M8). M6's `psx-spu` crate models the SPU at register level
 anyway: its oracle vectors (`SPU_RUN`) are register writes. A libspu object
 with no validated adapter therefore gets `policy = "device"` in the
 boundary: the original library runs over the SPU registers, as libpad does
@@ -1977,7 +2019,8 @@ Limits:
   (`0x1F80_xxxx`) and KUSEG/KSEG1 pointers point into the unused gap, so
   the debugger shows zeros. The game itself runs correctly.
 - **`-O2` C steps unevenly**, and some variables are optimized out.
-- **It doesn't combine with `--moddable`, `--ubsan` or mods yet.**
+- **It doesn't combine with `--ubsan` or linked-in mods yet.** A debug
+  moddable base loads script mods (D56).
 
 *Why:* the human wants C-level debugging in DevTools, variables included.
 Source maps carry only lines, so they were rejected. Chrome's C/C++
@@ -2188,7 +2231,7 @@ hardware"). It reverses the device default of D40, D42, D45 and D47,
 which made the layer beneath the SDK an emulator, and generalizes D41
 and D58 (libspu's and libcd's adapter-or-device policies) from one
 library to every chip. The device models stay, as the fallback and as
-the oracle. (plans/unified-adaptor-layer)
+the oracle. (plans/completed/unified-adaptor-layer)
 
 **D60. libpad's adapters run libpad's engine, including its time**
 (unified adapter layer, phase 1 task 9c). D40 kept libpad original
@@ -2208,6 +2251,9 @@ that machine instead of approximating it:
   (`Sdk::chain_element`): `PadStartCom` queues an address no game code
   has at priority 2, and the kernel runs it in its place in the chain.
   The pads latch their buttons at the vblank, as SIO0's do.
+  *Later:* libpad's state lives in its own `.data`/`.bss`, only the pad
+  model's latched buttons in the runtime, and the element is libpad's own
+  `_padVsyncParam`, queued through C0h:02h (D67 salvage).
 - **Its busy-waits take their time.** Each of the original's waits on
   SIO0 or root counter 2 ends at the next safepoint, a quantum later,
   inside the interrupt: half a frame with two pads, where hardware takes
@@ -2323,7 +2369,7 @@ own writes of the callback slots, and a reimplementation of `CdRead`'s and
 `CdSearchFile`'s retries and callbacks. Sharing the controller's core
 makes commands, interrupts and sectors arrive at the same cycle in both
 modes, so conformance compares only the library logic. Decided without
-the human's input, as the task said (plans/unified-adaptor-layer, phase 1
+the human's input, as the task said (plans/completed/unified-adaptor-layer, phase 1
 findings).
 
 *Later:* with `CdRead` original, btn needs its CPU to take each sector
@@ -2394,7 +2440,7 @@ moved every later safepoint, and without quiet returns btn made one
 completion ran at the return of `_spu_FsetRXXa`, the adapter
 `SpuWritePartly` calls after `_spu_Fw`, instead of at the guest's next
 safepoint. Decided without the human's input, as the task said
-(plans/unified-adaptor-layer, phase 1 findings).
+(plans/completed/unified-adaptor-layer, phase 1 findings).
 
 **D64. libpress's adapters drive the MDEC's decode function, and hold
 the interrupts its register writes raised** (unified adapter layer, phase
@@ -2437,7 +2483,7 @@ decoded frame. Held, `title-to-field`'s RAM matches the device at every
 checkpoint except dead stack, and the renderer's command stream is the
 same, the movie's slices included. The same rule as D59's and D60's: the
 device decides when a callback runs. Decided without the human's input,
-as the task said (plans/unified-adaptor-layer, phase 1 findings).
+as the task said (plans/completed/unified-adaptor-layer, phase 1 findings).
 
 **D65. libmcx is a chip, memcard: its adapters drive the card port
 without SIO0's registers, and its device is SIO0 with the BIOS's cards**
@@ -2460,7 +2506,8 @@ and nothing after it (McxErrInvalid), an empty slot nothing (McxErrNoCard).
   normally). So the native kernel keeps its exception control blocks in RAM
   where the table of tables points (psxw-abi `kernel::EXCB`), walks the
   elements linked there after its own chain, and unlinks them in
-  `SysDeqIntRP`; then original libmcx runs, over SIO0. Its chip is
+  `SysDeqIntRP` (*Later:* the kernel's own elements live in those RAM
+  chains too, and the handler walks only them, D68 salvage); then original libmcx runs, over SIO0. Its chip is
   `memcard`, apart from sio0: the two drive different devices on SIO0's
   wire (pads answer 01h, cards 81h), neither's adapters touch the port's
   registers, and sio0's mode (both games) needn't follow libmcx's (btn).
@@ -2471,7 +2518,10 @@ and nothing after it (McxErrInvalid), an empty slot nothing (McxErrNoCard).
   (D61's way: found through `mcxinit`'s, `mcxresi`'s and `mcxmain`'s
   relocated code), so the command functions, their callbacks (which the
   adapter calls where `_mcxStepSio` does), `McxSync` and `McxStopCom`
-  stay original. The six old libmcx adapters answered at once, and
+  stay original. *Later:* the vblank handler is a third adapter, bound at
+  its place (`libmcx/mcxresi:0x80`); the element steps run only the
+  verifiers and queue the vblank handler or `_mcxDsrEntry` as ordinary
+  guest calls, so a patched BIOS call can suspend and resume them. The six old libmcx adapters answered at once, and
   `McxSync`'s command number and zeroed out-parameters were wrong.
 - **The card is the BIOS's image on both paths** (D43's cards):
   `psx_devices::memcard::Responder`, a standard card as Beetle's is (81h
@@ -2501,7 +2551,7 @@ interrupt the machine takes (a vblank, a root counter's), so a transfer
 of more than a few bytes doesn't end before the vblank's timeout, and
 `McxExecFlag` on a standard card times out (McxErrInvalid) where hardware
 would read the block's directory frame and write it back. Decided without
-the human's input, as the task said (plans/unified-adaptor-layer, phase 1
+the human's input, as the task said (plans/completed/unified-adaptor-layer, phase 1
 findings).
 
 **D66. SIO0 and root counter 2 see the cycle the guest is at** (unified
@@ -2560,7 +2610,7 @@ cost of more safepoints. bof4 feels it: its pad interrupt is shorter, and
 `title-to-field` reaches the field about 370 frames later than when the
 replay was authored (counter 12390 at frame 25,138, was 24,768; the
 replay now runs 26,000 frames). Decided without the human's input
-(plans/unified-adaptor-layer, phase 1 findings).
+(plans/completed/unified-adaptor-layer, phase 1 findings).
 
 ### Salvage dispositions: D67–D71
 
@@ -2568,7 +2618,7 @@ The spec-fidelity branch recorded D67–D71 without the human's input. The
 recovery keeps only the parts that were source-reviewed and integrated here;
 these are partial dispositions of useful work, not approval of the archived
 decisions as a whole. The rejected architecture below is absent from this
-design. [plans/salvage-bios-work.md](../plans/salvage-bios-work.md) records the
+design. [plans/completed/salvage-bios-work.md](../plans/completed/salvage-bios-work.md) records the
 review.
 
 - **D67 (SDK state in the library's own data): partially salvaged.** The

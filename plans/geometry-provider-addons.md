@@ -8,7 +8,7 @@ or renderer or making geometry support a prerequisite for running a game.
 **First delivery:** one provider, one game, one bounded rendering path, and one
 small visual consumer. Not a complete scene extractor or production ray tracer.
 
-Read [conventions](conventions.md), the current
+Read [conventions](../docs/conventions.md), the current
 [host implementation guide](../docs/host-implementation.md),
 [renderer extension guide](../crates/psx-render-gl/README.md), and design §7,
 §Host scripting, D49 and **D56** in [design.md](../docs/design.md) before work.

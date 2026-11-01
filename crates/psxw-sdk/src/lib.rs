@@ -1,5 +1,5 @@
 //! `psxw sdk scan`: which SDK functions reach hardware, and which of them
-//! each game needs adapters for (plans/unified-adaptor-layer, phase 1
+//! each game needs adapters for (plans/completed/unified-adaptor-layer, phase 1
 //! task 2; docs/design.md D59).
 //!
 //! Input: an SDK version's relocatable library objects, one directory per

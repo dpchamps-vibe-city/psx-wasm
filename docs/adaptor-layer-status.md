@@ -107,7 +107,7 @@ a source-level C port or remove the remaining MIPS translation from btn.
 
 ## What has been checked
 
-The [adapter implementation record](../plans/unified-adaptor-layer/phase1.md)
+The [adapter implementation record](../plans/completed/unified-adaptor-layer/phase1.md)
 documents these results:
 
 - Both games report all chip groups native. The recorded 1,200-frame runs
@@ -139,7 +139,7 @@ psxw run bof4 --frames 1200 --check no-io
 
 The two game builds do not establish complete SDK coverage. They use a subset
 of PsyQ 4.7, and another game can need functions or peripherals that neither
-uses. The [next phase](../plans/unified-adaptor-layer/phase2.md) covers the rest
+uses. The [adapter status](../plans/adaptor-status.md) tracks the rest
 of PsyQ 4.7; other SDK versions are separate work.
 
 ### Device fallback for other games
