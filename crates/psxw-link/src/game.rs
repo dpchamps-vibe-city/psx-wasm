@@ -383,6 +383,16 @@ impl Ctx<'_> {
         *self.references.entry(class).or_default() += 1;
     }
 
+    /// Whether `name`, called from `container`, is a function a binding
+    /// rule instruments (by address, as the call would resolve).
+    fn instrumented(&self, container: &str, name: &str) -> bool {
+        let (Some(b), Some(r)) = (&self.spec.binding, self.map.resolve(container, name)) else { return false };
+        match self.home(container, r.addr) {
+            Some(Some(c)) => b.operations.contains_key(&(c, r.addr)),
+            _ => b.operations.keys().any(|(_, a)| *a == r.addr),
+        }
+    }
+
     fn lookup_reference(&mut self) {
         *self.references.entry("lookup").or_default() += 1;
     }
@@ -570,10 +580,13 @@ impl Resolver for R<'_, '_> {
             );
             return Ok(Lowered::Call(self.ctx.synth(Synth::Marker(rule))));
         }
-        if ["abs", "labs", "fabs"].contains(&name.as_str()) && !s.defined {
+        // A guest function a binding rule instruments is called, never
+        // lowered to an intrinsic: its events must happen.
+        let lower = !self.ctx.instrumented(&container, &name);
+        if lower && ["abs", "labs", "fabs"].contains(&name.as_str()) && !s.defined {
             return Ok(Lowered::Call(self.ctx.synth(Synth::Support(name, sig.clone()))));
         }
-        if name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
+        if lower && name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
             return Ok(Lowered::Call(self.ctx.synth(Synth::InlineCopy)));
         }
         if let Some(op) = crate::link::division_intrinsic(&name) {

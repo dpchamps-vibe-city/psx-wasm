@@ -762,6 +762,9 @@ enum Loader {
     MarkerElsewhere,
     /// The marker passes source offset 4 where the placement maps 0.
     MarkerBadOffset,
+    /// Only `load_c` is C: it copies through `memcpy` with a constant
+    /// length, which a rule instruments.
+    MemcpyC,
 }
 
 /// The executable: a resident loader, `load_module(sel, dst, len)`, that
@@ -798,13 +801,33 @@ fn explicit_main(lay: &Layout, loader: Loader) -> Image {
         u.func("drive_cp").addiu(SP, SP, -24).sw(RA, 16, SP).mov(T0, A0).jalr(T0).mov(A0, A1);
         u.a.lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
         u.func("load_c").j("load_module").nop();
+        // memcpy(dst, src, bytes): a word copy, returning dst.
+        u.func("memcpy").mov(V0, A0);
+        u.a.label("mc_loop");
+        u.a.lw(T0, 0, A1).addiu(A1, A1, 4).sw(T0, 0, A0).addiu(A2, A2, -4).bne(A2, ZERO, "mc_loop").addiu(A0, A0, 4);
+        u.a.jr(RA).nop();
         u.func("clear").beq(A1, ZERO, "clr_done").nop();
         u.a.label("clr_loop");
         u.a.sw(ZERO, 0, A0).addiu(A1, A1, -4).bne(A1, ZERO, "clr_loop").addiu(A0, A0, 4);
         u.a.label("clr_done");
         u.a.jr(RA).ori(V0, ZERO, 0);
     });
-    if loader != Loader::Lifted {
+    if loader == Loader::MemcpyC {
+        // A constant-length memcpy GCC would have inlined: the rule on
+        // memcpy must still see the call. (Every load_c call here copies
+        // 0x80 bytes, as the length passed says.)
+        main.c = Some(format!(
+            "void *memcpy(void *dst, const void *src, unsigned len);\n\
+             void flush(void);\n\
+             int load_c(unsigned sel, unsigned *dst, unsigned len) {{\n\
+             \x20   if (sel >= {STAGED}u) return 1;\n\
+             \x20   memcpy(dst, (void *)(0x{stage:08X}u + sel * 0x400u), 0x80u);\n\
+             \x20   flush();\n\
+             \x20   return 0;\n\
+             }}\n",
+            stage = lay.stage,
+        ));
+    } else if loader != Loader::Lifted {
         let edit = match loader {
             // An effect the binary lacks, and the request overwritten after
             // the copy: the rule still reads the selector passed in.
@@ -993,11 +1016,11 @@ fn explicit_images(lay: &Layout, n: &Names, c: bool) -> (Image, Image, Image) {
 /// unaffected second region, and an empty clear that changes nothing.
 fn d05_explicit(lay: &Layout, n: &Names, loader: Loader) -> Fixture {
     let main = explicit_main(lay, loader);
-    let (a, b, c) = explicit_images(lay, n, loader != Loader::Lifted);
+    let (a, b, c) = explicit_images(lay, n, !matches!(loader, Loader::Lifted | Loader::MemcpyC));
     let len = |im: &Image| im.bytes.len() as u32;
     let edit: &[u32] = if loader == Loader::EditedC { &[EDIT_MARK] } else { &[] };
     let (lm, load_c) = (main.addr("load_module"), main.addr("load_c"));
-    let (direct, pointer) = if loader == Loader::Lifted { ("call_slot", "call_ptr") } else { ("drive_c", "drive_cp") };
+    let (direct, pointer) = if matches!(loader, Loader::Lifted | Loader::MemcpyC) { ("call_slot", "call_ptr") } else { ("drive_c", "drive_cp") };
     let (direct, pointer, saved, slot2) = (main.addr(direct), main.addr(pointer), main.addr("call_saved"), main.addr("call_slot2"));
     let mut s = Script::default();
     s.call(main.addr("save_ptr"), [lay.slot, 0, 0, 0], 0, &[]);
@@ -1026,6 +1049,17 @@ fn d05_explicit(lay: &Layout, n: &Names, loader: Loader) -> Fixture {
     let rule = match loader {
         Loader::MarkerC | Loader::MarkerElsewhere | Loader::MarkerBadOffset => write_rule(&main, Some("module_written"), "placement"),
         Loader::Lifted => return_rule("load_module"),
+        // B arrives through load_c's memcpy, whose completed return
+        // publishes it.
+        Loader::MemcpyC => format!(
+            "{}\n[[dispatch.writers]]\nid = \"copier\"\ncontainer = \"main\"\nfunction = \"memcpy\"\n\
+             destinations = [{{ start = 0x{:08X}, end = 0x{:08X} }}]\n\n\
+             [[dispatch.rules]]\nid = \"copy-completed\"\ncontainer = \"main\"\nfunction = \"memcpy\"\nevent = \"return\"\n\
+             effect = \"publish\"\nplacement = \"slot-b\"\ndestination = \"arg:0\"\nlength = \"arg:2\"\nsource_offset = \"const:0\"\n",
+            return_rule("load_module"),
+            lay.slot,
+            lay.slot + SLOT_BYTES
+        ),
         _ => return_rule(&format!("func_{:08X}", main.addr("load_module"))),
     };
     let mut f = Fixture::new(vec![main, a, b, c], s);
@@ -1042,6 +1076,9 @@ fn d05_explicit_mixed(lay: &Layout, n: &Names) -> Fixture {
 }
 fn d05_explicit_edited(lay: &Layout, n: &Names) -> Fixture {
     d05_explicit(lay, n, Loader::EditedC)
+}
+fn d05_explicit_memcpy(lay: &Layout, n: &Names) -> Fixture {
+    d05_explicit(lay, n, Loader::MemcpyC)
 }
 fn d05_explicit_marker(lay: &Layout, n: &Names) -> Fixture {
     d05_explicit(lay, n, Loader::MarkerC)
@@ -1605,6 +1642,7 @@ fn defs() -> Vec<Def> {
             Evidence::ClosedForm("authored C edit: its log entry is absent from the original binary"),
             d05_explicit_edited,
         ),
+        d("D05", "explicit-binding-memcpy", "supported: explicit binding on a constant-length memcpy", REF, d05_explicit_memcpy),
         d("D05", "explicit-binding-c-marker", "supported: explicit binding from authored C's c_marker write site", REF, d05_explicit_marker),
         d("D05", "explicit-binding-missing-c-site", "rejected facts: a C write site without its c_marker", REF, d05_explicit_missing_c_site),
         d("D05", "explicit-binding-marker-elsewhere", "rejected facts: the marker call isn't in the function holding the write", REF, d05_explicit_marker_elsewhere),

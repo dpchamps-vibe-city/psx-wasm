@@ -258,8 +258,9 @@ replaces the stub for the regions it covers:
   supplied C stays the implementation. A declared operation, and any C
   function at a covered address, keeps its call boundary even when written
   `inline` (weak and noinline, like D50's other functions; chosen by address,
-  whatever name the C or the facts use). The arguments a rule reads are
-  captured at entry. A selector no case names, or a
+  whatever name the C or the facts use), and a call to it is never lowered
+  to an intrinsic (a constant-length `memcpy`). The arguments a rule reads
+  are captured at entry. A selector no case names, or a
   destination outside the placement's layout, calls `psx.binding_fault`
   (ABI 19) instead of publishing a guess.
 - A write inside supplied C is stated by the C itself: the rule names a

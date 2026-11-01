@@ -373,6 +373,16 @@ for the required CLI/reference run.
   65 variants: 38 execution, 12 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved variant being the legacy baseline
   set. `psxw build btn` links at 2,604,703 bytes and `psxw run btn --frames 300 --check no-trap` passes.
 
+- 2026-11-01, third review fix. The linker lowered a constant-length `memcpy`
+  (and `abs`, `labs`, `fabs`) to an intrinsic before resolving the callee, so a
+  rule on `memcpy` never ran. A guest function a rule instruments is now always
+  called. `explicit-binding-memcpy` loads B through C's constant-length
+  `memcpy`, which a rule publishes; reverting the fix returns stale A. Evidence:
+  the explicit subset is 15 variants, 5 execution and 10 safety, 0 failed, 0
+  unresolved, the live reference agreeing on the 8 it runs. Full corpus:
+  66 variants: 39 execution, 12 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved variant being the legacy baseline
+  set. `psxw build btn` links at 2,604,703 bytes and `psxw run btn --frames 300 --check no-trap` passes.
+
 ## Findings
 
 ### A1 reference inventory
