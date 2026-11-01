@@ -464,6 +464,9 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         .map(|(n, _)| n.as_str())
         .chain(opts.lift.iter().map(String::as_str))
         .collect();
+    // Supplied C an explicit build would otherwise replace needs a pin.
+    let name_of = |k: &(String, u32)| translations.iter().find(|t| (&t.func.container, t.func.addr) == (&k.0, k.1)).map(|t| t.func.name.clone());
+    let auto_lift = c_replaced(&void_used, &name_of, &pinned, inputs.manifest.dispatch.is_some())?;
     let adapter_id: BTreeMap<&str, u32> = adapters.iter().enumerate().map(|(i, n)| (n.as_str(), i as u32)).collect();
     let mut tiers: BTreeMap<(String, u32), Tier> = BTreeMap::new();
     let mut lifted = Vec::new();
@@ -482,7 +485,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         let tier = if let (Some(&id), true) = (adapter, object_ok) {
             Tier::Adapter(id)
         } else if let (Some(&(input, func)), false) =
-            (c_defs.get(&key), pinned.contains(t.func.name.as_str()) || void_used.contains(&key))
+            (c_defs.get(&key), pinned.contains(t.func.name.as_str()) || auto_lift.contains(&key))
         {
             debug_assert!(t.func.sources.contains(&Source::Defined));
             Tier::C { input, func }
@@ -850,6 +853,34 @@ impl std::fmt::Display for Unbound {
         let how = if self.reachable { "reachable" } else { "unreachable" };
         write!(f, "{} 0x{:08X} in {} ({}; {how})", self.name, self.addr, self.member, self.what)
     }
+}
+
+/// The supplied C functions to run translated without a pin: void C whose
+/// result callers read ([`void_results`]). In an explicit binding build
+/// supplied C is authoritative (plans/dispatch-binding Contract 1), so none
+/// is replaced automatically: each needs a `[tier]` lift pin, the explicit
+/// selection, or the build fails naming them.
+fn c_replaced(
+    void_used: &BTreeSet<(String, u32)>,
+    name_of: &dyn Fn(&(String, u32)) -> Option<String>,
+    pinned: &BTreeSet<&str>,
+    explicit: bool,
+) -> Result<BTreeSet<(String, u32)>> {
+    if !explicit {
+        return Ok(void_used.clone());
+    }
+    let unpinned: Vec<String> = void_used
+        .iter()
+        .filter(|k| name_of(k).is_none_or(|n| !pinned.contains(n.as_str())))
+        .map(|k| format!("{} {} ({:#010x})", k.0, name_of(k).unwrap_or_default(), k.1))
+        .collect();
+    ensure!(
+        unpinned.is_empty(),
+        "binding.c_replaced: these C functions are void but callers read their result, and supplied C is authoritative in a \
+         [dispatch] build: pin each to the lift tier in [tier] (with the evidence) or make its C return the value:\n  {}",
+        unpinned.join("\n  ")
+    );
+    Ok(BTreeSet::new())
 }
 
 /// C functions defined `void` whose result a caller may read: C declaring
@@ -1353,6 +1384,19 @@ mod tests {
         }
         assert_eq!(checks[1], checks[3], "identical code may share an entry");
         assert_eq!(checks[0].len(), 3, "only add discriminating words");
+    }
+
+    #[test]
+    fn explicit_builds_never_replace_supplied_c_unpinned() {
+        let void_used: BTreeSet<(String, u32)> = [("main".to_string(), 0x8001_0000)].into();
+        let name_of = |_: &(String, u32)| Some("g".to_string());
+        let none = BTreeSet::new();
+        // The migration path keeps its policy.
+        assert_eq!(c_replaced(&void_used, &name_of, &none, false).unwrap(), void_used);
+        let e = c_replaced(&void_used, &name_of, &none, true).unwrap_err().to_string();
+        assert!(e.starts_with("binding.c_replaced") && e.contains("main g (0x80010000)"), "{e}");
+        // A pin is the explicit selection: its own tier rule lifts it.
+        assert!(c_replaced(&void_used, &name_of, &["g"].into(), true).unwrap().is_empty());
     }
 
     #[test]

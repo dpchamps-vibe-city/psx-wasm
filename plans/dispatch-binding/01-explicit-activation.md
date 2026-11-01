@@ -383,6 +383,28 @@ for the required CLI/reference run.
   66 variants: 39 execution, 12 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved variant being the legacy baseline
   set. `psxw build btn` links at 2,604,703 bytes and `psxw run btn --frames 300 --check no-trap` passes.
 
+- 2026-11-01, fourth review fixes:
+  1. Intrinsic lowering still replaced a call to a function at a covered
+     address (one named `abs`), skipping its binding lookup. Calls to changing
+     slots now stay calls too. `explicit-binding-intrinsic-slot` names the slot
+     function `abs`; reverting returns 1 with no effect instead of 0x101.
+  2. Any rule at a writer's site counted as covering it, whatever its range.
+     When every covering rule's range is constant, those ranges must now cover
+     the code the writer can change. `explicit-binding-uncovered-write`: a known
+     store into the slot's code, covered only by an unrelated constant range,
+     fails the build. A range computed at run time can't be refuted at build
+     time and still counts.
+  3. Production's void-result policy replaced supplied C with its translation
+     unconditionally. In a `[dispatch]` build it no longer does: each such
+     function needs an explicit `[tier]` lift pin, or the build fails with
+     `binding.c_replaced` naming them. Builds without `[dispatch]` keep the
+     migration policy. A unit test covers both; the fixture pipeline has no
+     void-result selection to exercise.
+  Evidence: the explicit subset is 17 variants, 6 execution and 11 safety, 0
+  failed, 0 unresolved, the live reference agreeing on the 9 it runs; reverting
+  fix 1 or 2 fails its fixture. `psxw-build` 5 tests pass. Full corpus: 68 variants: 40 execution, 13 safety, 14 failed, 1 unresolved (exit 2),
+  the failures and the unresolved variant being the legacy baseline set. `psxw build btn` (no `[dispatch]`, so its void-result policy is unchanged) links at 2,604,703 bytes and `psxw run btn --frames 300 --check no-trap` passes.
+
 ## Findings
 
 ### A1 reference inventory

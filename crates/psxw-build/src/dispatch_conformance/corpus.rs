@@ -1141,6 +1141,43 @@ fn d05_explicit_cleared(lay: &Layout, n: &Names) -> Fixture {
     f
 }
 
+/// The slot function is named `abs`, which the linker otherwise lowers to
+/// an intrinsic: a changing slot's call must stay a lookup.
+fn d05_explicit_intrinsic_slot(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MatchingC);
+    let slot_name = format!("func_{:08X}", lay.slot);
+    for im in &mut f.images {
+        if im.id == n.of("a") || im.id == n.of("b") {
+            for func in im.funcs.iter_mut().filter(|func| func.0 == "f") {
+                func.0 = "abs".into();
+            }
+        }
+        im.c = im.c.take().map(|c| c.replace(&slot_name, "abs").replace("int f(", "int abs(").replace("= f(a)", "= abs(a)"));
+    }
+    f
+}
+
+/// save_ptr stores into the slot's code, a write analysis knows; the only
+/// rule at its site invalidates an unrelated constant range.
+fn d05_explicit_uncovered_write(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let main = &mut f.images[0];
+    let at = (main.addr("save_ptr") - main.base) as usize;
+    let dest = lay.slot + 4;
+    // save_ptr's `li t0, saved` (lui; ori) now names the slot's code.
+    main.bytes[at..at + 4].copy_from_slice(&(0x3C08_0000 | dest >> 16).to_le_bytes());
+    main.bytes[at + 4..at + 8].copy_from_slice(&(0x3508_0000 | dest & 0xFFFF).to_le_bytes());
+    let rule = format!(
+        "\n[[dispatch.rules]]\nid = \"unrelated-range\"\ncontainer = \"main\"\nfunction = \"save_ptr\"\nevent = \"return\"\n\
+         effect = \"invalidate\"\ndestination = \"const:0x{:08X}\"\nlength = \"const:4\"\n",
+        lay.stage
+    );
+    f.dispatch = f.dispatch.take().map(|d| d + &rule);
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.uncovered_writer: writer `pointer-store`".into());
+    f
+}
+
 /// A declared writer bound its known store falls outside.
 fn d05_explicit_wrong_writer(lay: &Layout, n: &Names) -> Fixture {
     let mut f = d05_explicit(lay, n, Loader::Lifted);
@@ -1649,6 +1686,8 @@ fn defs() -> Vec<Def> {
         d("D05", "explicit-binding-marker-mismatch", "port rejection: a marker value contradicts its rule", REF, d05_explicit_marker_mismatch),
         d("D05", "explicit-binding-marker-offset", "port rejection: a marker's source offset contradicts the placement", REF, d05_explicit_marker_offset),
         d("D05", "explicit-binding-cleared", "port rejection: an invalidated module isn't callable", REF, d05_explicit_cleared),
+        d("D05", "explicit-binding-intrinsic-slot", "supported: a changing slot named like an intrinsic is still looked up", REF, d05_explicit_intrinsic_slot),
+        d("D05", "explicit-binding-uncovered-write", "rejected facts: a known code write its rule's constant range misses", REF, d05_explicit_uncovered_write),
         d("D05", "explicit-binding-wrong-writer", "rejected facts: a declared writer bound contradicts a known write", REF, d05_explicit_wrong_writer),
         d("D05", "explicit-binding-unknown-selector", "port rejection: a completed load names no placement", REF, d05_explicit_unknown_selector),
         d("D05", "explicit-binding-bad-destination", "port rejection: a load outside its placement's layout", REF, d05_explicit_bad_destination),

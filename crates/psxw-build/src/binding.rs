@@ -130,6 +130,18 @@ fn overlaps(a: &Range<u32>, b: &Range<u32>) -> bool {
     a.start < b.end && b.start < a.end
 }
 
+/// Whether the union of `ranges` contains all of `want`.
+fn covers(ranges: &[Range<u32>], want: &Range<u32>) -> bool {
+    let mut at = want.start;
+    while at < want.end {
+        match ranges.iter().filter(|r| r.contains(&at)).map(|r| r.end).max() {
+            Some(end) => at = end,
+            None => return false,
+        }
+    }
+    true
+}
+
 fn hex(r: &Range<u32>) -> String {
     format!("0x{:08X}..0x{:08X}", r.start, r.end)
 }
@@ -479,7 +491,7 @@ pub(crate) fn plan(
             Site::Function { container: c, function } => map.resolve(c, function).map(|r| (c.clone(), r.addr)),
             _ => None,
         };
-        let by: Vec<&str> = f
+        let by_rules: Vec<&facts::RuleFacts> = f
             .rules
             .iter()
             .filter(|r| {
@@ -487,14 +499,39 @@ pub(crate) fn plan(
                     || at(&r.site).is_some_and(|k| at(&w.site) == Some(k))
                     || matches!((&r.site, &extent), (Site::Pc { container: c, pc }, Some((wc, e))) if c == wc && e.contains(pc))
             })
-            .map(|r| r.id.as_str())
             .collect();
+        let by: Vec<&str> = by_rules.iter().map(|r| r.id.as_str()).collect();
         ensure!(
             code.is_empty() || !by.is_empty(),
             "binding.uncovered_writer: {what} at {} can write placement code at {}; add a rule for its code-changing effect",
             w.site,
             code.join(", ")
         );
+        // Rules whose ranges are constants must cover the code it can write;
+        // a range known only at run time can't be refuted here.
+        let fixed: Option<Vec<Range<u32>>> = by_rules
+            .iter()
+            .map(|r| match (&r.destination, &r.length) {
+                (Some(facts::Value::Const(d)), Some(facts::Value::Const(n))) if *n > 0 => Some(window(&(*d..d.wrapping_add(*n)))),
+                (Some(facts::Value::Const(_)), Some(facts::Value::Const(_))) => Some(0..0),
+                _ => None,
+            })
+            .collect();
+        if let Some(fixed) = fixed.filter(|_| !code.is_empty()) {
+            for b in bounds.iter().map(window) {
+                for k in &covered {
+                    let piece = b.start.max(k.start)..b.end.min(k.end);
+                    ensure!(
+                        piece.is_empty() || covers(&fixed, &piece),
+                        "binding.uncovered_writer: {what} at {} can write placement code at window {:#x}..{:#x}, which its rules' ranges ({}) don't cover",
+                        w.site,
+                        piece.start,
+                        piece.end,
+                        fixed.iter().map(|r| format!("{:#x}..{:#x}", r.start, r.end)).collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
+        }
         let mut known: BTreeSet<String> = analysed.known.iter().map(|(_, r)| hex(r)).collect();
         if analysed.stack {
             known.insert("its stack frames".into());

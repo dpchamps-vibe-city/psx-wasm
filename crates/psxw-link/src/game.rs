@@ -384,9 +384,13 @@ impl Ctx<'_> {
     }
 
     /// Whether `name`, called from `container`, is a function a binding
-    /// rule instruments (by address, as the call would resolve).
-    fn instrumented(&self, container: &str, name: &str) -> bool {
+    /// rule instruments or one at a changing slot (by address, as the call
+    /// would resolve): a call to it must stay a call.
+    fn keeps_call(&self, container: &str, name: &str) -> bool {
         let (Some(b), Some(r)) = (&self.spec.binding, self.map.resolve(container, name)) else { return false };
+        if b.slots.contains_key(&r.addr) {
+            return true;
+        }
         match self.home(container, r.addr) {
             Some(Some(c)) => b.operations.contains_key(&(c, r.addr)),
             _ => b.operations.keys().any(|(_, a)| *a == r.addr),
@@ -580,9 +584,10 @@ impl Resolver for R<'_, '_> {
             );
             return Ok(Lowered::Call(self.ctx.synth(Synth::Marker(rule))));
         }
-        // A guest function a binding rule instruments is called, never
-        // lowered to an intrinsic: its events must happen.
-        let lower = !self.ctx.instrumented(&container, &name);
+        // A guest function a binding rule instruments, or one at a
+        // changing slot, is called, never lowered to an intrinsic: its
+        // events must happen, and its binding decides what runs.
+        let lower = !self.ctx.keeps_call(&container, &name);
         if lower && ["abs", "labs", "fabs"].contains(&name.as_str()) && !s.defined {
             return Ok(Lowered::Call(self.ctx.synth(Synth::Support(name, sig.clone()))));
         }

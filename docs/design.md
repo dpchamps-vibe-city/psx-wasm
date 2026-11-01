@@ -255,12 +255,15 @@ replaces the stub for the regions it covers:
   unbinds only slots whose bound implementation depends on a written byte,
   so an untouched tail stays bound.
 - The operation runs unchanged: the wrapper takes the function's place, so
-  supplied C stays the implementation. A declared operation, and any C
-  function at a covered address, keeps its call boundary even when written
-  `inline` (weak and noinline, like D50's other functions; chosen by address,
+  supplied C stays the implementation. A declared operation, and any function
+  at a covered address, keeps its call boundary: its C stays out of line
+  even when written `inline` (weak and noinline, like D50's other functions; chosen by address,
   whatever name the C or the facts use), and a call to it is never lowered
   to an intrinsic (a constant-length `memcpy`). The arguments a rule reads
-  are captured at entry. A selector no case names, or a
+  are captured at entry. In a `[dispatch]` build supplied C is never
+  replaced by its translation automatically: void C whose result callers
+  read needs a `[tier]` lift pin (`binding.c_replaced`). A selector no case
+  names, or a
   destination outside the placement's layout, calls `psx.binding_fault`
   (ABI 19) instead of publishing a guess.
 - A write inside supplied C is stated by the C itself: the rule names a
@@ -269,7 +272,8 @@ replaces the stub for the regions it covers:
   Values the rule declares literally must match the call's, and a source
   offset the rule derives from the placement must match the derived one. Writer summaries are inferred
   from constant-address stores first; declared bounds cover what analysis
-  can't and must contain every known write.
+  can't and must contain every known write. When a writer's rules all have
+  constant ranges, they must cover the code it can change.
 - Facts the build can't honour fail it with a `binding.*` diagnostic:
   unknown fields, an overlapping image without a placement, a translation
   embedding replaceable code, an expanded operation, a code-changing writer
