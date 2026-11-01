@@ -3,16 +3,13 @@
 //! original code, the C (F_c) and the translation of the original (F_t)
 //! run from the same memory with the same arguments; every call they make
 //! is logged and answered identically. Return values, memory and the
-//! call-out logs must agree, on inputs inside the function's domain as the
-//! original alone decides it (`run_pair`, D34).
+//! call-out logs must agree.
 //!
 //! The decomp is byte-matching, so its C and the original MIPS define the
 //! same behaviour: a difference is a translator bug, clang UB in the C, or
 //! a nondeterminism the original has too.
 
 pub mod runner;
-#[cfg(test)]
-mod tests;
 
 use anyhow::{Context as _, Result, bail};
 use psxw_cc::protos::{Kind, Proto};
@@ -29,9 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const SCHEMA_VERSION: u32 = 1;
 const PAIRS_PER_SHARD: usize = 48;
-/// Twice what it was before the budget's spends (D71), which add a few
-/// operators to each block of the translation and segment of the C.
-const FUEL: u64 = 40_000_000;
+const FUEL: u64 = 20_000_000;
 /// Fuel is a termination bound, not semantics: the translation keeps every
 /// guest register in a local and re-reads memory at loop heads, so it may
 /// take a few times the C's wasm instructions for the same work.
@@ -39,13 +34,6 @@ const TRANSLATED_FUEL_SCALE: u64 = 4;
 /// One side ran out of fuel and the other didn't: the seed is run again
 /// with this much more fuel for both before it counts as a `fuel` verdict.
 const RETRY_FUEL_SCALE: u64 = 4;
-/// A function draws at most this many times its seeds, replacing those
-/// outside its domain.
-const DRAW_SCALE: u32 = 4;
-/// Kinds of seed outside a function's domain: the original faults, or its
-/// result moves with its stack.
-const FAULT: &str = "fault";
-const STACK_DEPENDENT: &str = "stack-dependent";
 /// The C side compiles each function as if alone: no automatic inlining,
 /// and no tail-call or tail-recursion rewriting of the calls it makes.
 const HARNESS_FLAGS: &[&str] = &["-fno-inline-functions", "-fno-optimize-sibling-calls"];
@@ -89,17 +77,6 @@ pub struct PairReport {
     /// Seeds where both sides ran out of fuel.
     #[serde(skip_serializing_if = "is_zero")]
     pub both_fuel: u32,
-    /// Seeds compared: those inside the function's domain.
-    pub accepted: u32,
-    /// Seeds outside the domain, by kind (see `run_pair`): `fault`,
-    /// `stack-dependent`.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub outside: BTreeMap<String, u32>,
-    /// Per seed both sides returned alike: the safepoint budget each spent
-    /// (psxw-abi `guest::BUDGET_UNIT`s, D71), the C's estimate and the
-    /// translation's exact count of the original's instructions.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub time: Vec<[i64; 2]>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -119,45 +96,16 @@ pub struct Report {
     pub pairs: Vec<PairReport>,
 }
 
-/// A verdict that fails the gate. `outside` (no seed inside the function's
-/// domain) doesn't, but is listed.
-fn failing(p: &PairReport) -> bool {
-    !matches!(p.verdict.as_str(), "pass" | "pinned" | "excluded" | "outside")
-}
-
 impl Report {
-    /// Seeds outside their function's domain over every pair, by kind.
-    pub fn outside(&self) -> String {
-        let mut total: BTreeMap<&str, u32> = BTreeMap::new();
-        for p in &self.pairs {
-            for (k, n) in &p.outside {
-                *total.entry(k).or_default() += n;
-            }
-        }
-        let kinds: Vec<String> =
-            [FAULT, STACK_DEPENDENT].iter().map(|k| format!("{k} {}", total.get(k).copied().unwrap_or(0))).collect();
-        format!("outside: {}", kinds.join(", "))
-    }
-
     pub fn summary(&self) -> String {
         use std::fmt::Write;
         let mut s = String::new();
-        let _ = writeln!(
-            s,
-            "difftest {} @ {}: {} seeds, {} shards; {}",
-            self.game,
-            &self.commit[..7],
-            self.seeds,
-            self.shards,
-            self.outside()
-        );
+        let _ = writeln!(s, "difftest {} @ {}: {} seeds, {} shards", self.game, &self.commit[..7], self.seeds, self.shards);
         for (k, n) in &self.counts {
             let _ = writeln!(s, "  {k:<11} {n}");
         }
-        // Failures first, then the pairs short of their seeds.
-        let short = |p: &&PairReport| matches!(p.verdict.as_str(), "pass" | "outside") && p.accepted < self.seeds;
         let bad: Vec<&PairReport> =
-            self.pairs.iter().filter(|p| failing(p)).chain(self.pairs.iter().filter(short)).collect();
+            self.pairs.iter().filter(|p| !matches!(p.verdict.as_str(), "pass" | "pinned" | "excluded")).collect();
         for p in bad.iter().take(40) {
             let _ = writeln!(
                 s,
@@ -175,10 +123,9 @@ impl Report {
         s
     }
 
-    /// Every pair passes, carries a recorded disposition or has no seed
-    /// inside its domain.
+    /// Every pair passes or carries a recorded disposition.
     pub fn pass(&self) -> bool {
-        !self.pairs.iter().any(failing)
+        self.pairs.iter().all(|p| matches!(p.verdict.as_str(), "pass" | "pinned" | "excluded"))
     }
 }
 
@@ -327,9 +274,6 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                     detail: Some(reason),
                     seed: None,
                     both_fuel: 0,
-                    accepted: 0,
-                    outside: BTreeMap::new(),
-                    time: vec![],
                 });
                 false
             }
@@ -399,9 +343,6 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
             (o.clone(), m)
         })
         .collect();
-    // The original's loops and instructions, which the C spends (D71).
-    let costs: BTreeMap<(String, u32), psxw_link::cost::LoopTree> =
-        translations.iter().map(|t| ((t.func.container.clone(), t.func.addr), t.graph.loop_tree())).collect();
     let base_seed = 0x5053_5857u64;
     let done = AtomicUsize::new(0);
     let nshards = shards.len();
@@ -426,7 +367,6 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                 &shard_dir,
                 opts,
                 base_seed,
-                &costs,
             );
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 10 == 0 || n == nshards {
@@ -443,9 +383,6 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
                         detail: Some(format!("{e:#}")),
                         seed: None,
                         both_fuel: 0,
-                        accepted: 0,
-                        outside: BTreeMap::new(),
-                        time: vec![],
                     })
                     .collect()
             })
@@ -470,34 +407,7 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     };
     let json = out.join("difftest.json");
     std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
-    eprintln!("difftest: {}", time_summary(&report.pairs));
     Ok((report, json))
-}
-
-/// How far the C's estimated time is from the translation's exact count
-/// (D71): over every seed both sides ran alike, the error (C - T) / T as
-/// percentiles of its size, and the totals' ratio.
-pub fn time_summary(pairs: &[PairReport]) -> String {
-    let runs: Vec<[i64; 2]> = pairs.iter().flat_map(|p| p.time.iter().copied()).filter(|[_, t]| *t > 0).collect();
-    if runs.is_empty() {
-        return "time: no runs".into();
-    }
-    let mut err: Vec<f64> = runs.iter().map(|[c, t]| (*c - *t) as f64 / *t as f64).collect();
-    err.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
-    let at = |q: f64| 100.0 * err[((err.len() - 1) as f64 * q) as usize].abs();
-    let within = |x: f64| 100.0 * err.iter().filter(|e| e.abs() <= x).count() as f64 / err.len() as f64;
-    let (c, t): (i64, i64) = runs.iter().fold((0, 0), |(a, b), [c, t]| (a + c, b + t));
-    format!(
-        "time: {} runs, C/T error |e| p50 {:.1}% p90 {:.1}% p99 {:.1}% max {:.1}%; within 10% {:.1}%, 25% {:.1}%; totals C/T {:.3}",
-        err.len(),
-        at(0.5),
-        at(0.9),
-        at(0.99),
-        at(1.0),
-        within(0.10),
-        within(0.25),
-        c as f64 / t as f64
-    )
 }
 
 /// The division checks the game's own C was assembled with, read from the
@@ -553,7 +463,6 @@ fn run_shard(
     dir: &Path,
     opts: &Options,
     base_seed: u64,
-    costs: &BTreeMap<(String, u32), psxw_link::cost::LoopTree>,
 ) -> Result<Vec<PairReport>> {
     let container = shard[0].container.clone();
     let mut inputs: Vec<Input> = Vec::new();
@@ -592,7 +501,7 @@ fn run_shard(
             o32: false,
         });
     }
-    let mode = Mode::Harness { sp: runner::STACK_TOP, gp, dirty: Some(runner::DIRTY_MAP), costs: Some(costs) };
+    let mode = Mode::Harness { sp: runner::STACK_TOP, gp, dirty: Some(runner::DIRTY_MAP) };
     let linked = psxw_link::link(map, Some(rodata), mode, &inputs, &exports)?;
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::default())
         .validate_all(&linked.wasm)
@@ -674,16 +583,9 @@ fn run_pair(
         detail: None,
         seed: None,
         both_fuel: 0,
-        accepted: 0,
-        outside: BTreeMap::new(),
-        time: vec![],
     };
-    let stack_range = (runner::STACK_TOP - runner::STACK_EXCLUDE)..(runner::STACK_TOP + 64);
-    let moved_range = (runner::STACK_TOP - runner::STACK_SHIFT - runner::STACK_EXCLUDE)..(runner::STACK_TOP + 64);
-    let mut k = 0;
-    while report.accepted < seeds && k < DRAW_SCALE * seeds {
+    for k in 0..seeds {
         let seed = runner::mix(base_seed ^ ((p.addr as u64) << 16) ^ k as u64);
-        k += 1;
         let (mut args, scratch, mut stack) = gen_inputs(seed, &p.refs);
         // The o32 caller extends narrow arguments to their declared type,
         // and passes real pointers (or NULL) for pointer parameters.
@@ -700,82 +602,40 @@ fn run_pair(
                 _ => *slot,
             };
         }
-        // The original decides the function's domain, as C defines it: a
-        // seed is outside when the original faults (a bus error, any trap),
-        // or when moving its stack changes its result (it reaches its frame
-        // in a way C leaves undefined, so C's frame and the original's
-        // differ there). Such seeds compare nothing; the next replaces them.
         // When only one side runs out of fuel the budget, not the code,
         // decided: retry once with RETRY_FUEL_SCALE times as much for both.
         let mut verdict = Err(("fuel", String::new()));
-        let mut outside = None;
-        let mut spent = [0, 0];
         for scale in [1, RETRY_FUEL_SCALE] {
-            let t = h.run(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE * scale);
-            let t_pages = h.take_pages(&t.dirty);
-            if matches!(&t.outcome, Outcome::Trap(m) if m != runner::CALLOUT_LIMIT) {
-                outside = Some((FAULT, format!("{:?}", t.outcome)));
-                break;
-            }
-            let top = runner::STACK_TOP - runner::STACK_SHIFT;
-            let m = h.run_at(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE * scale, top);
-            let m_pages = h.take_pages(&m.dirty);
-            if let Err((_, d)) = compare(h, p, &t, &m, &t_pages, &m_pages, masks, same_string, &moved_range) {
-                outside = Some((STACK_DEPENDENT, format!("{d} (C: the original; translated: it, stack moved)")));
-                break;
-            }
             let c = h.run(&fc, seed, args, &scratch, &stack, scale);
-            let c_pages = h.take_pages(&c.dirty);
-            spent = [c.spent, t.spent];
-            verdict = compare(h, p, &c, &t, &c_pages, &t_pages, masks, same_string, &stack_range);
+            let c_pages: BTreeMap<usize, Vec<u8>> = c.dirty.iter().map(|&pg| (pg, h.page(pg).to_vec())).collect();
+            h.restore(&c.dirty);
+            let t = h.run(&ft, seed, args, &scratch, &stack, TRANSLATED_FUEL_SCALE * scale);
+            verdict = compare(h, p, &c, &t, &c_pages, masks, same_string);
+            let mut all = c.dirty.clone();
+            all.extend(t.dirty.iter().copied());
             if verdict.is_err() && verbose {
-                explain(h, p, &args, &stack, &c, &t, &c_pages, &t_pages);
+                explain(h, p, &args, &stack, &c, &t, &c_pages);
             }
+            h.restore(&all);
             if !matches!(verdict, Err(("fuel", _))) {
                 break;
             }
         }
-        if let Some((kind, detail)) = outside {
-            if verbose {
-                eprintln!("=== {} {:08X}: seed {seed:016X} outside, {kind}: {detail}", p.name, p.addr);
-            }
-            *report.outside.entry(kind.into()).or_default() += 1;
-            continue;
-        }
-        report.accepted += 1;
         match verdict {
-            Ok(Agree::Same) => report.time.push(spent),
+            Ok(Agree::Same) => {}
             Ok(Agree::BothFuel) => report.both_fuel += 1,
             Err((verdict, detail)) => {
                 report.verdict = verdict.into();
                 report.detail = Some(detail);
                 report.seed = Some(seed);
-                return Ok(report);
+                break;
             }
-        }
-    }
-    // Short of its seeds: say how many it got, and why.
-    if report.accepted < seeds {
-        let kinds: Vec<String> = report.outside.iter().map(|(k, n)| format!("{k} {n}")).collect();
-        report.detail = Some(format!("{} of {seeds} seeds inside its domain; outside: {}", report.accepted, kinds.join(", ")));
-        if report.accepted == 0 {
-            report.verdict = "outside".into();
         }
     }
     Ok(report)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn explain(
-    h: &Harness,
-    p: &Pair,
-    args: &[u32; 4],
-    stack: &[u32; 8],
-    c: &Run,
-    t: &Run,
-    c_pages: &BTreeMap<usize, Vec<u8>>,
-    t_pages: &BTreeMap<usize, Vec<u8>>,
-) {
+fn explain(h: &Harness, p: &Pair, args: &[u32; 4], stack: &[u32; 8], c: &Run, t: &Run, c_pages: &BTreeMap<usize, Vec<u8>>) {
     eprintln!("=== {} {:08X}: args {args:08X?} stack {stack:08X?}", p.name, p.addr);
     for (side, r) in [("C", c), ("T", t)] {
         eprintln!("  {side}: {:?}", r.outcome);
@@ -795,11 +655,11 @@ fn explain(
     pages.extend(t.dirty.iter().copied());
     let mut shown = 0;
     for pg in pages {
-        let tb: &[u8] = t_pages.get(&pg).map_or_else(|| h.snapshot_page(pg), |b| b.as_slice());
+        let tb = h.page(pg);
         let cb: &[u8] = c_pages.get(&pg).map_or_else(|| h.snapshot_page(pg), |b| b.as_slice());
         let snap = h.snapshot_page(pg);
         for i in 0..runner::PAGE {
-            let (x, y) = (cb.get(i).copied().unwrap_or(0), tb.get(i).copied().unwrap_or(0));
+            let (x, y) = (cb.get(i).copied().unwrap_or(0), tb[i]);
             if x != y && shown < 24 {
                 let s = snap.get(i).copied().unwrap_or(0);
                 eprintln!("  mem 0x{:08X}: C {x:02X} T {y:02X} (was {s:02X})", 0x8000_0000 | (pg * runner::PAGE + i) as u32);
@@ -814,20 +674,14 @@ enum Agree {
     BothFuel,
 }
 
-/// Compare two runs, each memory's pages as `take_pages` copied them:
-/// C's and the original's, or the original's at two stack places. `stack`
-/// is the stack area, both runs' when they differ.
-#[allow(clippy::too_many_arguments)]
 fn compare(
     h: &Harness,
     p: &Pair,
     c: &Run,
     t: &Run,
     c_pages: &BTreeMap<usize, Vec<u8>>,
-    t_pages: &BTreeMap<usize, Vec<u8>>,
     masks: &BTreeMap<u32, Vec<u32>>,
     same_string: &dyn Fn(u32, u32) -> bool,
-    stack: &std::ops::Range<u32>,
 ) -> std::result::Result<Agree, (&'static str, String)> {
     // Pointers into the stack can't be compared: clang and GCC lay out
     // frames differently. Any two stack addresses are equivalent. Nor can
@@ -835,8 +689,9 @@ fn compare(
     // C's literal on identical original bytes, and GCC keeps a copy per
     // function where clang keeps one per file. The same string is
     // equivalent.
+    let stack = (runner::STACK_TOP - runner::STACK_EXCLUDE)..(runner::STACK_TOP + 64);
     let word_eq = |a: u32, b: u32, mask: u32| a & mask == b & mask || (stack.contains(&a) && stack.contains(&b)) || same_string(a, b);
-    let diverges = |o: &Outcome| matches!(o, Outcome::Fuel) || *o == Outcome::Trap(runner::CALLOUT_LIMIT.into());
+    let diverges = |o: &Outcome| matches!(o, Outcome::Fuel) || *o == Outcome::Trap("call-out limit".into());
     match (&c.outcome, &t.outcome) {
         // Both sides loop forever on this input (e.g. waiting for a flag
         // only another function sets); compare what they did before.
@@ -916,13 +771,16 @@ fn compare(
         ));
     }
     // Memory: every page either side touched.
-    let lo = (stack.start & 0x00FF_FFFF) as usize;
-    let hi = (stack.end & 0x00FF_FFFF) as usize;
+    let lo = ((runner::STACK_TOP - runner::STACK_EXCLUDE) & 0x00FF_FFFF) as usize;
+    let hi = ((runner::STACK_TOP + 64) & 0x00FF_FFFF) as usize;
     let mut pages: BTreeSet<usize> = c.dirty.clone();
     pages.extend(t.dirty.iter().copied());
     for pg in pages {
-        let tb: &[u8] = t_pages.get(&pg).map_or_else(|| h.snapshot_page(pg), |b| b.as_slice());
-        let cb: &[u8] = c_pages.get(&pg).map_or_else(|| h.snapshot_page(pg), |b| b.as_slice());
+        let tb = h.page(pg);
+        let cb: &[u8] = match c_pages.get(&pg) {
+            Some(b) => b,
+            None => h.snapshot_page(pg),
+        };
         for (i, (x, y)) in cb.iter().zip(tb).enumerate() {
             let a = pg * runner::PAGE + i;
             if x != y && !(lo..hi).contains(&a) {

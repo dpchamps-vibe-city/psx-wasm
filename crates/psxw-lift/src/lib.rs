@@ -119,8 +119,7 @@ pub fn translate(
     let mut not_const = BTreeSet::new();
     let (graph, facts) = loop {
         let graph = Explorer { program, originals, func, not_const: &not_const, inline }.explore()?;
-        let through_pointers = program.through_pointers.contains(&(func.container.clone(), func.addr));
-        let facts = analysis::analyze(&graph, &in_code, through_pointers);
+        let facts = analysis::analyze(&graph, &in_code);
         let wrong: Vec<u32> = graph
             .const_targets
             .iter()
@@ -619,17 +618,10 @@ mod tests {
     /// Translate `words` placed at [`BASE`], with function starts at the
     /// given (address, size) pairs.
     fn lift_words(words: &[u32], starts: &[(u32, u32)]) -> Outcome {
-        lift_words_through(words, starts, &[])
-    }
-
-    /// As [`lift_words`], with `through` the functions that reach
-    /// registers through pointers in data.
-    fn lift_words_through(words: &[u32], starts: &[(u32, u32)], through: &[u32]) -> Outcome {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let start = |size: u32| Start { name: None, size: Some(size), sources: [Source::Symbol].into(), boundary: true };
         let mut program = Program {
             main: "test".into(),
-            through_pointers: through.iter().map(|&a| ("test".to_string(), a)).collect(),
             containers: [(
                 "test".to_string(),
                 Code {
@@ -643,58 +635,6 @@ mod tests {
         };
         let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
         translate_all(&mut program, &originals, &["test".into()])
-    }
-
-    /// Accesses at a constant device address are volatile and fenced, so
-    /// clang keeps both of two equal stores and keeps RAM accesses on their
-    /// side; RAM stays plain memory.
-    #[test]
-    fn device_accesses_are_volatile() {
-        let words = [
-            0x3C08_1F80, // lui t0, 0x1F80
-            0x2409_0001, // addiu t1, zero, 1
-            0x3C0A_8001, // lui t2, 0x8001
-            0xAD09_1810, // sw t1, 0x1810(t0)
-            0xAD09_1810, // sw t1, 0x1810(t0)
-            0xAD49_0100, // sw t1, 0x100(t2)
-            0x8D0B_1814, // lw t3, 0x1814(t0)
-            0,           // nop
-            0xAD4B_0104, // sw t3, 0x104(t2)
-            0x03E0_0008, // jr ra
-            0,           // nop
-        ];
-        let out = lift_words(&words, &[(BASE, 4 * words.len() as u32)]);
-        assert!(out.failed.is_empty(), "{:?}", out.failed);
-        let c = &out.ok[0].c;
-        assert_eq!(c.matches("PSXW_FENCE(); PSXW_SWV(r8 + 0x1810u, r9); PSXW_FENCE();").count(), 2, "{c}");
-        assert!(c.contains("PSXW_FENCE(); r11 = (uint32_t)PSXW_LWV(r8 + 0x1814u); PSXW_FENCE();"), "{c}");
-        assert!(c.contains("PSXW_SW(r10 + 0x100u, r9);") && c.contains("PSXW_SW(r10 + 0x104u, r11);"), "{c}");
-    }
-
-    /// In a function that reaches registers through pointers in data,
-    /// every access through a loaded pointer is volatile and fenced; the
-    /// stack's and those at constant RAM addresses stay plain.
-    #[test]
-    fn accesses_through_register_pointers_are_volatile() {
-        let words = [
-            0x27BD_FFE8, // addiu sp, sp, -24
-            0xAFBF_0010, // sw ra, 16(sp)
-            0x3C08_8001, // lui t0, 0x8001
-            0x8D09_0100, // lw t1, 0x100(t0)
-            0,           // nop
-            0xA520_000A, // sh zero, 10(t1)
-            0x8FBF_0010, // lw ra, 16(sp)
-            0x03E0_0008, // jr ra
-            0x27BD_0018, // addiu sp, sp, 24
-        ];
-        let out = lift_words_through(&words, &[(BASE, 4 * words.len() as u32)], &[BASE]);
-        assert!(out.failed.is_empty(), "{:?}", out.failed);
-        let c = &out.ok[0].c;
-        assert!(c.contains("PSXW_FENCE(); PSXW_SHV(r9 + 0xAu, 0u); PSXW_FENCE();"), "{c}");
-        assert_eq!(c.matches("PSXW_FENCE();").count(), 2, "{c}");
-        // Without the reach, plain memory.
-        let out = lift_words(&words, &[(BASE, 4 * words.len() as u32)]);
-        assert!(!out.ok[0].c.contains("PSXW_FENCE();"), "{}", out.ok[0].c);
     }
 
     /// A callee inlined for the registers it reads ends in a tail jump to
@@ -805,7 +745,6 @@ mod tests {
         let start = |name: &str, size: u32| Start { name: Some(name.into()), size: Some(size), sources: [Source::Symbol].into(), boundary: true };
         let mut program = Program {
             main: "test".into(),
-            through_pointers: Default::default(),
             containers: [(
                 "test".to_string(),
                 Code {
@@ -852,7 +791,6 @@ mod tests {
         let start = |name: &str, size: u32| Start { name: Some(name.into()), size: Some(size), sources: [Source::Symbol].into(), boundary: true };
         let mut program = Program {
             main: "test".into(),
-            through_pointers: Default::default(),
             containers: [(
                 "test".to_string(),
                 Code {
@@ -899,7 +837,6 @@ mod tests {
             let start = |size: u32| Start { name: None, size: Some(size), sources: [Source::Symbol].into(), boundary: true };
             let mut program = Program {
                 main: "test".into(),
-                through_pointers: Default::default(),
                 containers: [(
                     "test".to_string(),
                     Code {
@@ -940,7 +877,6 @@ mod tests {
         let start = Start { name: None, size: Some(code.len() as u32), sources: [Source::Symbol].into(), boundary: true };
         let mut program = Program {
             main: "test".into(),
-            through_pointers: Default::default(),
             containers: [(
                 "test".to_string(),
                 Code { id: "test".into(), text: vec![BASE..BASE + code.len() as u32], data: vec![], starts: [(BASE, start)].into() },
@@ -981,7 +917,6 @@ mod tests {
         let start = Start { name: None, size: Some(code.len() as u32), sources: [Source::Symbol].into(), boundary: true };
         let mut program = Program {
             main: "test".into(),
-            through_pointers: Default::default(),
             containers: [(
                 "test".to_string(),
                 Code { id: "test".into(), text: vec![BASE..BASE + code.len() as u32], data: vec![], starts: [(BASE, start)].into() },

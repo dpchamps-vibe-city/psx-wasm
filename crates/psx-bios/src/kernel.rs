@@ -2,9 +2,9 @@
 //! buffers the kernel fills at vblank, the heap, interrupt handler queues
 //! (psx-spx "Kernel (BIOS)").
 
-use crate::{Machine, Sdk};
-#[allow(unused_imports)]
-use crate::IrqStep;
+use crate::machine::Host;
+use crate::{Flow, GuestCall, Machine, Sdk};
+use crate::machine::seq;
 use psxw_abi::kernel as k;
 use psx_devices::mem::Mem;
 
@@ -49,17 +49,13 @@ pub struct Kernel {
     /// `PAD_init2`'s `button_dest`: where `PAD_dr` stores its result; the
     /// handler calls it at each vblank when nonzero.
     pub pad_dest: u32,
-    /// The `InitHeap` heap, (base, end) (`crate::libc`); none until then.
     pub heap: (u32, u32),
-    /// The kernel's heap (`alloc_kernel_memory`), set up on first use
-    /// ([`Machine::kernel_heap`]).
+    /// The kernel's heap, set up on first allocation after the event blocks.
     pub kheap: (u32, u32),
     /// Where `strtok`'s next fragment starts (0: none).
     pub strtok: u32,
     /// The file functions' state outside the control blocks.
     pub files: crate::files::Files,
-    /// The CD-ROM driver.
-    pub cd: crate::cdrom::Driver,
     /// Whether the kernel's handlers acknowledge what they handle: root
     /// counters 0-2 and vblank (`ChangeClearRCnt`), the pad handler's vblank
     /// (`ChangeClearPad`), the IRQ events' lines (`SetIrqAutoAck`).
@@ -73,6 +69,11 @@ pub struct Kernel {
     pub threads: crate::threads::Threads,
     /// The C library's random generator (A0h:2Fh/30h).
     pub rand: u32,
+    /// The initial stack top `GetConf` reports (A0h:9Dh): the guest's sp
+    /// when the thread tables were laid out, or `SetConf`'s argument.
+    pub stack_top: u32,
+    /// The BIOS CD driver's software state (A0h:54h..A6h).
+    pub cd: crate::cdrom::Cd,
 }
 
 impl Kernel {
@@ -129,6 +130,27 @@ impl Kernel {
         out
     }
 
+    /// The pad and card handler's pads: each port's state into the
+    /// `InitPAD2` buffers (status 0x00 + ID + data, or 0xFF when nothing is
+    /// connected), at most 22h bytes whatever the buffer's size; then
+    /// `PAD_dr` when `PAD_init2` named a destination.
+    pub fn pad_vblank(&mut self, mem: &mut dyn Mem, host: &mut dyn Host) {
+        let (Some(bufs), true) = (self.pad_bufs, self.pad_enable) else { return };
+        for (port, (addr, _)) in bufs.iter().enumerate() {
+            let state = host.pad_state(port as u32);
+            if state.is_empty() {
+                mem.w8(*addr, 0xFF);
+                continue;
+            }
+            let mut out = vec![0x00, if state.len() > 2 { 0x73 } else { 0x41 }];
+            out.extend(&state);
+            out.truncate(PAD_BUF as usize);
+            mem.write(*addr, &out);
+        }
+        if self.pad_dest != 0 {
+            self.pad_dr(mem);
+        }
+    }
 }
 
 /// The event control blocks, in kernel RAM through the table of tables
@@ -140,6 +162,21 @@ impl<S: Sdk> Machine<S> {
         self.mem.w32(k::EVCB_ENTRY, 0xA000_0000 | k::EVCBS);
         self.mem.w32(k::EVCB_ENTRY + 4, n * k::EVCB_SIZE);
         self.mem.write(k::EVCBS, &vec![0; (n * k::EVCB_SIZE) as usize]);
+    }
+
+    /// How many event blocks the kernel has (lay them out first if the
+    /// boot has not).
+    pub fn event_count(&mut self) -> u32 {
+        self.evcb(EV_HANDLE);
+        self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE
+    }
+
+    /// C(04h) `get_free_EvCB_slot`: the first free block's index, or -1.
+    pub fn free_event_slot(&mut self) -> u32 {
+        let n = self.event_count();
+        (0..n)
+            .find(|&i| self.mem.r32(self.evcb_at(EV_HANDLE | i).expect("in range") + 4) == EV_UNUSED)
+            .unwrap_or(u32::MAX)
     }
 
     /// Handle `h`'s block; before the boot laid them out, the default
@@ -221,6 +258,36 @@ impl<S: Sdk> Machine<S> {
         calls
     }
 
+    /// DeliverEvent as a nested BIOS call, including in an IRQ verifier.
+    /// Resume the RAM-table walk after each callback, so its edits to later
+    /// events are visible before those events are considered.
+    pub fn deliver_event_now(&mut self, class: u32, spec: u32) -> Flow<S> {
+        self.evcb(EV_HANDLE);
+        self.deliver_event_from(class, spec, 0)
+    }
+
+    fn deliver_event_from(&mut self, class: u32, spec: u32, start: u32) -> Flow<S> {
+        let n = self.mem.r32(k::EVCB_ENTRY + 4) / k::EVCB_SIZE;
+        for i in start..n {
+            let Some(a) = self.evcb_at(EV_HANDLE | i) else { break };
+            let e = self.read_ev(a);
+            if e.status != EV_ENABLED || e.class != class || e.spec != spec {
+                continue;
+            }
+            if e.mode == EV_MODE_INTR {
+                if e.func != 0 {
+                    return Flow::Call {
+                        call: GuestCall { addr: e.func, args: [0; 4] },
+                        then: Box::new(move |m, _| m.deliver_event_from(class, spec, i + 1)),
+                    };
+                }
+            } else {
+                self.mem.w32(a + 4, EV_READY);
+            }
+        }
+        Flow::ret(1)
+    }
+
     /// UnDeliverEvent: ready events of mode 2000h with this class and spec
     /// are busy again (psx-spx).
     pub(crate) fn undeliver_event(&mut self, class: u32, spec: u32) {
@@ -234,16 +301,17 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
-    /// The kernel's heap (B0h:00h `alloc_kernel_memory`), set up on first
-    /// use. Sony's kernel allocates the control blocks from A000E000h-
-    /// A000FFFFh and leaves the rest to this heap; here the blocks sit at
-    /// fixed addresses (`psxw_abi::kernel`), so the heap is what follows
-    /// the event control blocks.
+    /// B0h:00h uses the space left after the kernel's control blocks, not
+    /// the application's InitHeap area. Our blocks have fixed addresses;
+    /// the event count determines how much of the remaining RAM is free.
     pub fn kernel_heap(&mut self) -> (u32, u32) {
         if self.kernel.kheap == (0, 0) {
             self.evcb(EV_HANDLE);
-            let start = self.mem.r32(k::EVCB_ENTRY) + self.mem.r32(k::EVCB_ENTRY + 4);
-            self.kernel.kheap = crate::libc::heap_init(&mut *self.mem, start, 0xA001_0000 - start);
+            let start = self.mem.r32(k::EVCB_ENTRY).checked_add(self.mem.r32(k::EVCB_ENTRY + 4));
+            if let Some(start) = start {
+                let size = 0xA001_0000u32.saturating_sub(start);
+                self.kernel.kheap = crate::libc::heap_init(&mut *self.mem, start, size);
+            }
         }
         self.kernel.kheap
     }
@@ -251,27 +319,20 @@ impl<S: Sdk> Machine<S> {
 
 /// The kernel's own `SysEnqIntRP` elements, in its data (D68): root
 /// counters 0-2 and vblank (0-3, priority 1) and the IRQ events (priority
-/// 3), as OpenBIOS's `handlers/irq.c` enqueues them at boot, the pad and
+/// 3), as OpenBIOS's `handlers/irq.c` enqueues them at boot, and the pad and
 /// card handler (priority 2, `sio0/driver.c`), which `StartPAD2` and
-/// `StartCARD2` enqueue, the syscall handler (priority 0; syscalls here
-/// are calls, so it never acts) and the CD-ROM driver's (priority 0,
-/// `_96_init`'s). Their verifiers and handlers are kernel code here, at
-/// addresses in the BIOS ROM's range ([`KERNEL_CODE`], the CD-ROM's the
-/// A(90h..93h) stand-ins), run as [`IrqStep::Kernel`] steps in their places.
+/// `StartCARD2` enqueue. Their verifiers and handlers name callable native
+/// thunks in [`psxw_abi::KERNEL_STAND_INS`]. The RAM pointers, including guest
+/// replacements, are dispatched just like any other chain element.
 pub const KERNEL_ELEMENTS: u32 = 0x8000_7100;
 pub const IRQ_ELEMENT: u32 = 4;
 pub const SIO0_ELEMENT: u32 = 5;
-pub const SYSCALL_ELEMENT: u32 = 6;
-pub const CD_IO_ELEMENT: u32 = 7;
-pub const CD_DMA_ELEMENT: u32 = 8;
-const ELEMENTS: u32 = 9;
-const KERNEL_CODE: u32 = 0xBFC0_8000;
+const ELEMENTS: u32 = 6;
+const KERNEL_CODE: u32 = psxw_abi::KERNEL_STAND_INS.start;
 
-/// The default exception exit `ResetEntryInt` applies (psx-spx), a
-/// `setjmp` buffer: ReturnFromException, the exception stack's top less 4
-/// (its 1000h bytes below the kernel's data), zeros.
+/// The default exception exit's setjmp buffer: native ReturnFromException,
+/// the exception stack, then zeroed saved registers (psx-spx).
 pub const DEFAULT_EXIT: u32 = 0xA000_7940;
-const EXCEPTION_STACK: u32 = 0x8000_7000;
 
 pub fn kernel_element(i: u32) -> u32 {
     KERNEL_ELEMENTS + 16 * i
@@ -294,113 +355,117 @@ const IRQ_EVENTS: [(u32, u32); 11] = [
 ];
 
 impl<S: Sdk> Machine<S> {
-    /// The elements, the syscall handler at priority 0, the IRQ events at 3
-    /// and the root counters at 1, acknowledging what they handle
-    /// (`enqueueSyscallHandler(0)`, `enqueueIrqHandler(3)`,
+    /// The elements, the IRQ events at priority 3 and the root counters at
+    /// 1, acknowledging what they handle (`enqueueIrqHandler(3)`,
     /// `enqueueRCntIrqs(1)`).
     pub fn lay_out_kernel_handlers(&mut self) {
         for i in 0..ELEMENTS {
             let e = kernel_element(i);
-            let (handler, verifier) = match i {
-                CD_IO_ELEMENT => (crate::tables::stand_in(0xA0, 0x92), crate::tables::stand_in(0xA0, 0x90)),
-                CD_DMA_ELEMENT => (crate::tables::stand_in(0xA0, 0x93), crate::tables::stand_in(0xA0, 0x91)),
-                _ => (KERNEL_CODE + 8 * i + 4, KERNEL_CODE + 8 * i),
-            };
-            for (o, v) in [(0, 0), (4, handler), (8, verifier), (12, 0)] {
+            // IRQ and native pad/card verifiers do their work themselves
+            // and return zero: neither has a second-stage handler.
+            let handler = if i < 4 { KERNEL_CODE + 8 * i + 4 } else { 0 };
+            for (o, v) in [(0, 0), (4, handler), (8, KERNEL_CODE + 8 * i), (12, 0)] {
                 self.mem.w32(e + o, v);
             }
         }
-        self.enqueue_syscall_handler(0);
         self.init_def_int(3);
         self.enqueue_rcnt_irqs(1);
         self.lay_out_default_exit();
     }
 
-    /// [`DEFAULT_EXIT`], laid out; its address.
+    /// C(00h): enqueue the four native counter/vblank elements, enable
+    /// their acknowledgements, mask their IRQs and reset the timer core
+    /// (OpenBIOS `enqueueRCntIrqs`). Existing element pointers stay editable.
+    pub fn enqueue_rcnt_irqs(&mut self, priority: u32) {
+        if let Some(io) = self.io.as_mut() {
+            io.irq.mask &= !0x71;
+        }
+        for i in 0..4 {
+            self.kernel.clear_rcnt[i] = 1;
+            self.enq_int_rp(priority, kernel_element(i as u32));
+        }
+        for i in 0..3 {
+            let now = self.timer_now(i);
+            self.timers[i].write_mode(0, now);
+            self.timers[i].target = 0;
+            self.reschedule_timer(i);
+        }
+    }
+
+    /// C(0Ch): enqueue IRQ-event delivery and clear all automatic acks.
+    pub fn init_def_int(&mut self, priority: u32) {
+        self.kernel.irq_auto_ack = [0; 11];
+        self.enq_int_rp(priority, kernel_element(IRQ_ELEMENT));
+    }
+
+    /// ResetEntryInt's guest-visible default exit structure.
     pub fn lay_out_default_exit(&mut self) -> u32 {
         self.mem.write(DEFAULT_EXIT, &[0; 0x30]);
-        self.mem.w32(DEFAULT_EXIT, crate::tables::stand_in(0xB0, 0x17));
-        self.mem.w32(DEFAULT_EXIT + 4, EXCEPTION_STACK - 4);
+        self.mem.w32(DEFAULT_EXIT, psxw_abi::BIOS_RETURN_FROM_EXCEPTION);
+        self.mem.w32(DEFAULT_EXIT + 4, 0x8000_6FFC);
         DEFAULT_EXIT
     }
 
-    /// C(00h) `EnqueueTimerAndVblankIrqs(priority)`: the root counter and
-    /// vblank elements, acknowledging what they handle.
-    pub fn enqueue_rcnt_irqs(&mut self, prio: u32) {
-        for i in 0..4 {
-            self.kernel.clear_rcnt[i] = 1;
-            self.enq_int_rp(prio, kernel_element(i as u32));
+    fn irq_taken(&self, bit: u32) -> bool {
+        self.io.as_ref().is_some_and(|io| io.irq.stat & io.irq.mask & 1 << bit != 0)
+    }
+
+    /// A saved kernel verifier/handler pointer. No machine borrow may be
+    /// held while the caller runs the returned flow's guest calls.
+    pub fn kernel_call(&mut self, addr: u32, _args: [u32; 4]) -> Option<Flow<S>> {
+        let off = addr.checked_sub(KERNEL_CODE)?;
+        if off % 4 != 0 || off >= ELEMENTS * 8 {
+            return None;
         }
-    }
-
-    /// C(01h) `EnqueueSyscallHandler(priority)`.
-    pub fn enqueue_syscall_handler(&mut self, prio: u32) {
-        self.enq_int_rp(prio, kernel_element(SYSCALL_ELEMENT));
-    }
-
-    /// C(0Ch) `InitDefInt(priority)`: the IRQ events' element, none of them
-    /// acknowledged.
-    pub fn init_def_int(&mut self, prio: u32) {
-        self.kernel.irq_auto_ack = [0; 11];
-        self.enq_int_rp(prio, kernel_element(IRQ_ELEMENT));
-    }
-
-    /// The kernel element `h` is, if it is one.
-    pub fn kernel_element_at(&self, h: u32) -> Option<u32> {
-        let off = (h & 0x1FFF_FFFF).checked_sub(KERNEL_ELEMENTS & 0x1FFF_FFFF)?;
-        (off % 16 == 0 && off / 16 < ELEMENTS).then_some(off / 16)
-    }
-
-    /// Kernel element `i`'s verifier, and its handler when that says so;
-    /// whether the handler returned from the exception (the rest of it
-    /// skipped).
-    pub fn kernel_step(&mut self, i: u32) -> bool {
-        let taken = |m: &Self, bit: u32| m.io.as_ref().is_some_and(|io| io.irq.stat & io.irq.mask & 1 << bit != 0);
-        let ack = |m: &mut Self, bit: u32| {
-            let _ = m.reg_write(psx_devices::irq::I_STAT, 4, !(1 << bit));
-        };
-        match i {
-            0..=3 => {
+        let (i, handler) = (off / 8, off & 4 != 0);
+        Some(match (i, handler) {
+            (0..=3, false) => {
                 let bit = if i == 3 { psx_devices::irq::VBLANK } else { psx_devices::irq::TIMER0 + i };
-                if !taken(self, bit) {
-                    return false;
-                }
-                self.deliver_event(0xF200_0000 | i, 2);
-                if self.kernel.clear_rcnt[i as usize] == 0 {
-                    return false;
-                }
-                ack(self, bit);
-                true
+                if self.irq_taken(bit) { self.deliver_event_now(0xF200_0000 | i, 2) } else { Flow::ret(0) }
             }
-            IRQ_ELEMENT => {
-                for (bit, class) in IRQ_EVENTS {
-                    if taken(self, bit) {
-                        self.deliver_event(class, 0x1000);
-                        if self.kernel.irq_auto_ack[bit as usize] != 0 {
-                            ack(self, bit);
-                        }
+            (0..=3, true) => {
+                if self.kernel.clear_rcnt[i as usize] == 0 {
+                    Flow::ret(0)
+                } else {
+                    let bit = if i == 3 { psx_devices::irq::VBLANK } else { psx_devices::irq::TIMER0 + i };
+                    let _ = self.reg_write(psx_devices::irq::I_STAT, 4, !(1 << bit));
+                    // Use the existing callable RFE thunk: its wasm tag
+                    // unwinds nested guest/native calls to invoke_irq.
+                    Flow::Call {
+                        call: GuestCall { addr: psxw_abi::BIOS_RETURN_FROM_EXCEPTION, args: [0; 4] },
+                        then: Box::new(|_, _| Flow::ret(0)),
                     }
                 }
-                false
             }
-            CD_IO_ELEMENT => self.cd_io_verifier() != 0 && self.cd_handler(false),
-            CD_DMA_ELEMENT => self.cd_dma_verifier() != 0 && self.cd_handler(true),
-            SIO0_ELEMENT => {
+            (IRQ_ELEMENT, false) => self.kernel_irq_events(0),
+            (SIO0_ELEMENT, false) => {
                 let vblank = psx_devices::irq::VBLANK;
-                if !taken(self, vblank) {
-                    return false;
+                if self.irq_taken(vblank) {
+                    self.kernel.pad_vblank(&mut *self.mem, &mut *self.host);
+                    if self.kernel.clear_pad != 0 {
+                        let _ = self.reg_write(psx_devices::irq::I_STAT, 4, !(1 << vblank));
+                    }
                 }
-                self.read_pads();
-                if self.kernel.clear_pad != 0 {
-                    ack(self, vblank);
-                }
-                if self.kernel.card_started {
-                    self.card_step();
-                }
-                false
+                Flow::ret(0)
             }
-            _ => false,
+            _ => return None,
+        })
+    }
+
+    fn kernel_irq_events(&mut self, start: usize) -> Flow<S> {
+        for (i, (bit, class)) in IRQ_EVENTS.into_iter().enumerate().skip(start) {
+            if self.irq_taken(bit) {
+                let flow = self.deliver_event_now(class, 0x1000);
+                return seq(self, flow, move |m, _| m.kernel_irq_events(i + 1));
+            }
         }
+        // Retail IRQVerifier acknowledges configured lines after all event
+        // callbacks (the retail variant preserved in OpenBIOS irq.c).
+        let mask = self.kernel.irq_auto_ack.iter().enumerate().fold(0, |v, (bit, &ack)| v | (u32::from(ack != 0) << bit));
+        if mask != 0 {
+            let _ = self.reg_write(psx_devices::irq::I_STAT, 4, !mask);
+        }
+        Flow::ret(0)
     }
 
     /// `StartPAD2`/`StartCARD2` (OpenBIOS `startPad`, `startCard`): the pad
@@ -426,53 +491,6 @@ impl<S: Sdk> Machine<S> {
         self.deq_int_rp(2, kernel_element(SIO0_ELEMENT));
         if card {
             self.kernel.card_started = false;
-        }
-    }
-
-    /// The pad and card handler's pads (OpenBIOS `readPad`, psx-spx
-    /// `InitPAD2`): each port's pad through SIO0's model of it, with the
-    /// buttons it latched at this vblank (BIOS5): selected, 01h, 42h (its
-    /// ID), 00h (5Ah), then as many halfwords as the ID's low nibble says
-    /// (16 for 0), stored after the status and the ID, at most 22h bytes
-    /// whatever the buffer's size; the status is 00h, or FFh when the pad
-    /// doesn't acknowledge or answer 5Ah. Then `PAD_dr` when `PAD_init2`
-    /// named a destination.
-    fn read_pads(&mut self) {
-        let (Some(bufs), true) = (self.kernel.pad_bufs, self.kernel.pad_enable) else { return };
-        for (port, (addr, _)) in bufs.into_iter().enumerate() {
-            let Some(io) = self.io.as_mut() else { return };
-            let pad = &mut io.sio0.pads[port];
-            pad.select();
-            let mut got = vec![0xFF];
-            let (_, ack) = pad.exchange(0x01);
-            if ack {
-                let (id, ack) = pad.exchange(0x42);
-                got.push(id);
-                let (z, mut ack) = if ack { pad.exchange(0) } else { (0, false) };
-                if ack && z == 0x5A {
-                    let n = match id & 0x0F {
-                        0 => 32,
-                        h => 2 * h as usize,
-                    };
-                    for i in 0..n {
-                        if !ack {
-                            break;
-                        }
-                        let (b, a) = pad.exchange(0);
-                        got.push(b);
-                        ack = a || i + 1 == n;
-                    }
-                    if ack {
-                        got[0] = 0x00;
-                    }
-                }
-            }
-            pad.deselect();
-            got.truncate(PAD_BUF as usize);
-            self.mem.write(addr, &got);
-        }
-        if self.kernel.pad_dest != 0 {
-            self.kernel.pad_dr(&mut *self.mem);
         }
     }
 

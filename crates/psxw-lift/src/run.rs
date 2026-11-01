@@ -57,21 +57,6 @@ pub fn load(ws: &Workspace, game: &str) -> Result<Inputs> {
     let exe = psxexe::parse(exe_bytes).context("main container")?;
     program.add(&map.main, exe.pc0, None, Source::Entry, true);
 
-    // SDK functions that reach device registers through pointers in data
-    // (TR1); kernel RAM is plain memory.
-    if let Some(sdk) = &manifest.game.sdk {
-        let reach = psxw_inputs::boundary::Reach::load(&ws.root, sdk)?;
-        for c in &map.containers {
-            for p in c.sdk.iter().filter(|p| p.is_text()) {
-                for (off, chips) in reach.members.get(&p.member).into_iter().flatten() {
-                    if chips.iter().any(|c| c != "kernel") {
-                        program.through_pointers.insert((c.id.clone(), p.vram.start + off));
-                    }
-                }
-            }
-        }
-    }
-
     let census_obj = ws.out_dir().join("census").join(game).join(pin.short()).join("obj");
     if !census_obj.is_dir() {
         bail!("{} missing; run `psxw census {game}` first", census_obj.display());

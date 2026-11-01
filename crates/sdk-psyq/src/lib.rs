@@ -50,182 +50,6 @@ pub(crate) fn set_reg(m: &mut M, addr: u32, size: u32, v: u32) -> std::result::R
     m.reg_write(addr, size, v)
 }
 
-/// A BIOS call the replaced code makes, which returns at once: its v0.
-/// It goes through the table's entry, as the original's vector call does,
-/// and fails on an entry the game patched.
-pub(crate) fn bios(m: &mut M, table: u32, func: u32, a: [u32; 4]) -> std::result::Result<u32, String> {
-    match psx_bios::bios::dispatch(m, table, func, a)? {
-        Flow::Return(v) => Ok(v as u32),
-        Flow::Call { call, .. } => {
-            Err(format!("BIOS {table:02X}h:{func:02X}h is patched to {:#010x}, which an adapter doesn't call", call.addr))
-        }
-        _ => Err(format!("BIOS {table:02X}h:{func:02X}h blocks in an adapter")),
-    }
-}
-
-/// The budget an original instruction takes (psxw-abi `guest::BUDGET_UNIT`,
-/// D71): the unit of what adapters spend for the code they replace.
-pub(crate) const UNIT: i64 = psxw_abi::guest::BUDGET_UNIT as i64;
-
-/// The guest's safepoint budget left (D71): at or below 0, its next loop
-/// header takes a safepoint. The link's whole budget where the host keeps
-/// none (tests).
-pub(crate) fn budget(m: &M) -> i64 {
-    m.regs.budget().map_or(psx_bios::BUDGET, i64::from)
-}
-
-/// `n` of the original's instructions spent from the guest's budget.
-pub(crate) fn take(m: &mut M, n: u64) {
-    if let Some(b) = m.regs.budget() {
-        m.regs.set_budget((b as i64 - n as i64 * UNIT) as i32);
-    }
-}
-
-/// The instructions a call through libapi's stubs spends before the
-/// BIOS's code, which spends none (D71): a syscall's (`EnterCriticalSection`,
-/// `a36`), and a vector's (`SysEnqIntRP`, `l02`: `jr` to A0h, B0h or C0h).
-pub(crate) const SYSCALL_STUB: u64 = 4;
-pub(crate) const VECTOR_STUB: u64 = 3;
-
-/// The original's instructions in these ranges of its code (the offsets
-/// of each range's first and last instruction): the blocks on the path an
-/// adapter's original runs, spent from the guest's budget as they start
-/// (D71). An adapter spends a block before what the block does that time
-/// can see (a root counter 2 or SIO0 access, a loop header, a guest call).
-pub(crate) fn path(m: &mut M, ranges: &[(u32, u32)]) {
-    take(m, count(ranges));
-}
-
-fn count(ranges: &[(u32, u32)]) -> u64 {
-    ranges.iter().map(|&(a, b)| ((b - a) / 4 + 1) as u64).sum()
-}
-
-/// [`path`] in an interrupt handler an adapter runs, where a register
-/// read sees the time after the blocks spent so far (`Machine::guest_now`,
-/// D66). Without a guest budget (tests) the time passes on the clock.
-pub(crate) fn irq_path(m: &mut M, ranges: &[(u32, u32)]) {
-    let n = count(ranges);
-    if m.regs.budget().is_some() {
-        return take(m, n);
-    }
-    let t = m.clock.now + n * psxw_abi::guest::CYCLES_PER_INSTRUCTION as u64;
-    m.clock.advance_to(t);
-}
-
-/// One of the original's loop headers in an interrupt handler: where the
-/// budget has run out, a quantum passes there, delivering nothing
-/// (interrupts are off), as at the original's safepoint (D60, D71).
-/// Nowhere else in the handler does one.
-pub(crate) fn irq_header(m: &mut M) {
-    if let Some(b) = m.regs.budget().filter(|&b| b <= 0) {
-        m.regs.set_budget(b + psx_bios::BUDGET as i32);
-        let t = m.clock.now + m.quantum();
-        m.clock.advance_to(t);
-    }
-}
-
-/// Passes of a loop of `per` instructions an iteration until the budget
-/// runs out: the next pass's loop header takes a safepoint.
-pub(crate) fn room(m: &M, per: u32) -> u64 {
-    match budget(m) {
-        b if b <= 0 => 0,
-        b => (b as u64).div_ceil(per as u64 * UNIT as u64),
-    }
-}
-
-/// A safepoint in the code an adapter replaces: the budget a quantum gives
-/// is added (what was spent past the last carries over), a quantum
-/// passes, what fell due is delivered and its callbacks run.
-pub(crate) fn safepoint(m: &mut M, k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
-    m.release_irq();
-    if let Some(b) = m.regs.budget() {
-        m.regs.set_budget(b + psx_bios::BUDGET as i32);
-    }
-    let until = m.clock.now + libetc::quantum(m);
-    m.run_until(until);
-    Flow::Block { until: psx_bios::Wait::Cycle(until), then: Box::new(k) }
-}
-
-/// A guest loop an adapter replaces, of `per` instructions an iteration
-/// (the original's, D71), which looks at `done` once a pass for at most
-/// `limit` passes (SDK3-5): each pass spends its instructions from the
-/// guest's budget, and the pass after the budget runs out comes after a
-/// safepoint, as the original's loop header takes it. What `done` reads
-/// changes only at a safepoint, so the passes between are spent at once.
-/// `k(true)` once it holds, `k(false)` past the limit.
-pub(crate) fn poll(
-    m: &mut M,
-    per: u32,
-    limit: u64,
-    done: std::rc::Rc<dyn Fn(&mut M) -> bool>,
-    k: Box<dyn FnOnce(&mut M, bool) -> Flow<Psyq>>,
-) -> Flow<Psyq> {
-    if limit == 0 {
-        return k(m, false);
-    }
-    take(m, per as u64);
-    if done(m) {
-        return k(m, true);
-    }
-    let more = room(m, per).min(limit - 1);
-    take(m, more * per as u64);
-    let left = limit - 1 - more;
-    if left == 0 {
-        return k(m, false);
-    }
-    safepoint(m, move |m| poll(m, per, left, done, k))
-}
-
-/// A loop of the original's that only spends: `passes` passes of `per`
-/// instructions, a safepoint where the budget runs out ([`poll`]), then
-/// `k`.
-pub(crate) fn spin(m: &mut M, per: u32, passes: u64, k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
-    poll(m, per, passes, std::rc::Rc::new(|_: &mut M| false), Box::new(move |m, _| k(m)))
-}
-
-/// A call the replaced code makes to a guest function `f` (the game's
-/// `printf`, `puts`) as its own nested call, then `k`. Arguments past the
-/// fourth go on the stack, in a frame below the caller's, where the
-/// original's own frame holds them.
-pub(crate) fn guest_call(m: &mut M, f: u32, args: &[u32], k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
-    let sp = m.regs.sp();
-    let mut a = [0; 4];
-    for (d, v) in a.iter_mut().zip(args) {
-        *d = *v;
-    }
-    let framed = args.len() > 4;
-    if framed {
-        let frame = sp - ((args.len() as u32 * 4 + 7) & !7);
-        for (i, v) in args.iter().enumerate().skip(4) {
-            m.mem.w32(frame + 4 * i as u32, *v);
-        }
-        m.regs.set_sp(frame);
-    }
-    Flow::Call {
-        call: psx_bios::GuestCall { addr: f, args: a },
-        then: Box::new(move |m, _| {
-            if framed {
-                m.regs.set_sp(sp);
-            }
-            k(m)
-        }),
-    }
-}
-
-/// One of the SDK's own messages, printed as the original prints it: the
-/// `jal` of the game's `printf` or `puts` at `jal`, the format from the
-/// `lui`/`addiu` pair at `hi`, `lo`, then `args`; then `k`. Where the code
-/// isn't the object's, the host log says so and `k` runs.
-pub(crate) fn say(m: &mut M, (hi, lo, jal): (u32, u32, u32), args: &[u32], k: impl FnOnce(&mut M) -> Flow<Psyq> + 'static) -> Flow<Psyq> {
-    match (libspu::jal(m, jal), libspu::pair(m, hi, lo)) {
-        (Some(f), Some(fmt)) => guest_call(m, f, &[&[fmt][..], args].concat(), k),
-        _ => {
-            m.log(&format!("SDK message at {jal:#010x}: no printf call where PsyQ 4.7's object has it"));
-            k(m)
-        }
-    }
-}
-
 /// Libraries that run as original code, their I/O-window accesses reaching
 /// the runtime's register-level devices (`psx_bios::io`), instead of
 /// being replaced.
@@ -309,6 +133,9 @@ impl Sdk for Psyq {
         libpad::chain_element(m, elem).or_else(|| libmc::chain_element(m, elem))
     }
 
+    fn stand_in(m: &mut M, addr: u32, state: u32) -> Option<psx_bios::StandIn> {
+        libetc::stand_in(m, addr, state).or_else(|| libgpu::stand_in(m, addr, state)).or_else(|| libcd::stand_in(m, addr, state))
+    }
 }
 
 pub(crate) fn ret(v: u32) -> Result {
@@ -428,6 +255,14 @@ pub mod testing {
 
     std::thread_local! {
         static IRQ_CALLS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static IRQ_ARGS: std::cell::RefCell<Vec<[u32; 4]>> = const { std::cell::RefCell::new(Vec::new()) };
+        static DOUBLES: std::cell::RefCell<std::collections::BTreeMap<u32, fn(&mut M)>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+
+    /// Guest code at `addr` the tests need run (an SDK object's own
+    /// function, which only the real game has): `f` stands in for it.
+    pub fn double(addr: u32, f: fn(&mut M)) {
+        DOUBLES.with(|d| d.borrow_mut().insert(addr, f));
     }
 
     /// Run the exception handler's queued steps as the runtime's driver
@@ -442,49 +277,67 @@ pub mod testing {
         while let Some(s) = m.irq_calls.pop_front() {
             match s {
                 IrqStep::Sdk(s) => Psyq::irq_step(m, s),
-                IrqStep::Kernel(k) => {
-                    if m.kernel_step(k) {
+                IrqStep::Chain(c, handler) => {
+                    m.in_irq = true;
+                    m.rfe = false;
+                    let v = guest_with_args(m, c);
+                    if let Some(addr) = handler.filter(|_| v != 0 && !m.rfe) {
+                        guest_with_args(m, psx_bios::GuestCall { addr, args: [v, 0, 0, 0] });
+                    }
+                    if m.rfe {
                         while m.irq_calls.pop_front().is_some_and(|s| s != IrqStep::Exit) {}
                     }
+                    m.rfe = false;
+                    m.in_irq = false;
                 }
-                IrqStep::Chain(c, _) => guest(m, c.addr),
                 IrqStep::Exit => {}
             }
         }
     }
 
-    std::thread_local! {
-        static DOUBLES: std::cell::RefCell<std::collections::BTreeMap<u32, fn(&mut M)>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
-    }
-
-    /// Guest code at `addr` the tests need run (an SDK object's own
-    /// function, which only the real game has): `f` stands in for it.
-    pub fn double(addr: u32, f: fn(&mut M)) {
-        DOUBLES.with(|d| d.borrow_mut().insert(addr, f));
-    }
-
     /// A guest call: a test double or a stand-in runs (as the runtime's
     /// `untranslated` does), anything else is logged.
     pub fn guest(m: &mut M, addr: u32) {
+        guest_with_args(m, psx_bios::GuestCall { addr, args: [0; 4] });
+    }
+
+    /// A guest call with the arguments the original leaves.
+    pub fn guest_with_args(m: &mut M, call: psx_bios::GuestCall) -> u32 {
+        let addr = call.addr;
+        if addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+            m.rfe = true;
+            return 0;
+        }
+        if let Some(flow) = m.kernel_call(addr, call.args) {
+            return finish(m, Ok(flow));
+        }
+        IRQ_ARGS.with(|v| v.borrow_mut().push(call.args));
         if let Some(f) = DOUBLES.with(|d| d.borrow().get(&addr).copied()) {
-            return f(m);
+            f(m);
+            return 0;
         }
         let mut state = 0;
         while let Some(step) = Psyq::stand_in(m, addr, state) {
             match step {
                 psx_bios::StandIn::Call(c, next) => {
-                    guest(m, c.addr);
+                    guest_with_args(m, c);
                     state = next;
                 }
-                psx_bios::StandIn::Return(_) => return,
+                psx_bios::StandIn::Return(v) => return v as u32,
             }
         }
         IRQ_CALLS.with(|v| v.borrow_mut().push(addr));
+        0
     }
 
     /// The guest functions interrupts called since the last look.
     pub fn irq_calls() -> Vec<u32> {
         IRQ_CALLS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+
+    /// The argument registers those calls got, since the last look.
+    pub fn irq_args() -> Vec<[u32; 4]> {
+        IRQ_ARGS.with(|v| std::mem::take(&mut *v.borrow_mut()))
     }
 
     /// Run a flow to completion the way the runtime's driver does (kernel
@@ -497,7 +350,7 @@ pub mod testing {
                 Flow::Return(v) => return v as u32,
                 Flow::Block { until, then } => {
                     let mut guard = 0;
-                    while !m.holds(until) {
+                    while !m.holds(&until) {
                         let limit = m.clock.now + psx_devices::clock::CPU_HZ;
                         m.step(limit);
                         drain(m);
@@ -507,8 +360,9 @@ pub mod testing {
                     f = then(m);
                 }
                 Flow::Call { call, then } => {
-                    guest(m, call.addr);
-                    f = then(m, 0);
+                    let v = guest_with_args(m, call);
+                    if m.rfe { return 0; }
+                    f = then(m, v as u64);
                 }
             }
         }
@@ -519,28 +373,6 @@ pub mod testing {
         let until = m.vblanks + n;
         let f: Result = Ok(Flow::Block { until: psx_bios::Wait::Vblanks(until), then: Box::new(|_| Flow::Return(0)) });
         finish(m, f);
-    }
-}
-
-#[cfg(test)]
-mod calls {
-    use super::*;
-
-    /// The SDK's messages: a fifth argument goes on the stack, below the
-    /// caller's frame, and sp comes back.
-    #[test]
-    fn guest_call_puts_extra_arguments_on_the_stack() {
-        let mut m = testing::machine(vec![], Default::default());
-        let sp = m.regs.sp();
-        let f = guest_call(&mut m, 0x8001_0000, &[1, 2, 3, 4, 5], |m| {
-            assert_eq!(m.mem.r32(m.regs.sp() - 24 + 16), 5);
-            Flow::Return(0)
-        });
-        let Flow::Call { call, then } = f else { panic!("not a call") };
-        assert_eq!((call.addr, call.args), (0x8001_0000, [1, 2, 3, 4]));
-        assert_eq!(m.regs.sp(), sp - 24);
-        let _ = then(&mut m, 0);
-        assert_eq!(m.regs.sp(), sp);
     }
 }
 

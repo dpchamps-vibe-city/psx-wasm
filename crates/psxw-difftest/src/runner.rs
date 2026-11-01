@@ -19,26 +19,17 @@ pub const STACK_TOP: u32 = 0x801F_F000;
 /// Compared memory excludes the callee's frames and the caller's argument
 /// area: `[STACK_TOP - STACK_EXCLUDE, STACK_TOP + 64)`.
 pub const STACK_EXCLUDE: u32 = 0x1_0000;
-/// How far the domain check moves the original's stack down: a page and
-/// a doubleword, so frame-relative accesses land on another page and at
-/// another offset in it, with sp still 8-aligned.
-pub const STACK_SHIFT: u32 = 0x1008;
 /// All-ones bytes just below that area. A function given a random pointer
 /// may scan memory for an all-ones terminator (`0xFFFF`, `-1`) and run up
 /// into the stack frames, where C and the original lay out spills
 /// differently; the guard ends such a scan first, on both sides alike.
 pub const STACK_GUARD: u32 = 0x100;
-/// Seeded scratch memory that pointer arguments point into: in
-/// psx-wasm's own space (psxw-abi `own`), clear of RAM and its mirrors.
-pub const SCRATCH: u32 = psxw_abi::own(0x0070_0000);
+/// Seeded scratch memory that pointer arguments point into.
+pub const SCRATCH: u32 = 0x8070_0000;
 pub const SCRATCH_LEN: u32 = 0x8000;
 /// Snapshot extent: RAM, AUX and the scratchpad.
 const SNAPSHOT_LEN: usize = 0x0080_0400;
 const MAX_CALLOUTS: usize = 4096;
-/// The trap of an access the console's map has no memory for, on either side.
-pub const BUS_ERROR: &str = "bus error";
-/// The harness's bound on call-outs: a divergence, like running out of fuel.
-pub const CALLOUT_LIMIT: &str = "call-out limit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Callout {
@@ -107,8 +98,6 @@ pub struct Harness {
     memory: Memory,
     snapshot: Vec<u8>,
     sp: wasmtime::Global,
-    /// The safepoint budget guest code spends (D71).
-    budget: Option<wasmtime::Global>,
     fuel: u64,
 }
 
@@ -117,8 +106,6 @@ pub struct Run {
     pub log: Vec<Callout>,
     /// Pages written, plus the setup's pages.
     pub dirty: BTreeSet<usize>,
-    /// The safepoint budget the call spent (psxw-abi `guest::BUDGET_UNIT`s).
-    pub spent: i64,
 }
 
 impl Harness {
@@ -151,7 +138,7 @@ impl Harness {
                 let (kind, target) = (kind as u32, target as u32);
                 let st = caller.data_mut();
                 if st.log.len() >= MAX_CALLOUTS {
-                    return Err(wasmtime::Error::msg(CALLOUT_LIMIT));
+                    return Err(wasmtime::Error::msg("call-out limit"));
                 }
                 st.log.push(Callout {
                     kind,
@@ -175,29 +162,11 @@ impl Harness {
                 Ok(v)
             },
         )?;
-        // The console's map, as the game's runtime answers it (psx-runtime
-        // `map_access`). A bus error is a fault on either side, wherever
-        // it falls.
-        linker.func_wrap(
-            "h",
-            psxw_abi::psx::MAP_ACCESS,
-            |mut caller: Caller<'_, State>, addr: i32, len: i32, store: i32| -> wasmtime::Result<i32> {
-                let (addr, len, store) = (addr as u32, len as u32, store != 0);
-                let off = psxw_abi::map::access(addr, len, store).ok_or_else(|| wasmtime::Error::msg(BUS_ERROR))?;
-                if let (false, Some(psxw_abi::map::Region::Expansion(v))) = (store, psxw_abi::map::place(addr).map(|p| p.region)) {
-                    let mem = caller.get_export("memory").and_then(|e| e.into_memory()).expect("memory");
-                    let at = WINDOW_BASE + off as usize;
-                    mem.data_mut(&mut caller)[at..at + len as usize].fill(v);
-                }
-                Ok(off as i32)
-            },
-        )?;
         let mut store = Store::new(&engine, State { ret_ext, ..Default::default() });
         store.set_fuel(u64::MAX)?;
         let instance = linker.instantiate(&mut store, &module)?;
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| anyhow::anyhow!("no memory export"))?;
         let sp = instance.get_global(&mut store, "__guest_sp").ok_or_else(|| anyhow::anyhow!("no __guest_sp"))?;
-        let budget = instance.get_global(&mut store, psxw_abi::guest::BUDGET_SYMBOL);
         for (addr, bytes) in images {
             let at = (*addr & 0x00FF_FFFF) as usize + WINDOW_BASE;
             memory.data_mut(&mut store)[at..at + bytes.len()].copy_from_slice(bytes);
@@ -205,7 +174,7 @@ impl Harness {
         let guard = ((STACK_TOP - STACK_EXCLUDE - STACK_GUARD) & 0x00FF_FFFF) as usize + WINDOW_BASE;
         memory.data_mut(&mut store)[guard..guard + STACK_GUARD as usize].fill(0xFF);
         let snapshot = memory.data(&store)[WINDOW_BASE..WINDOW_BASE + SNAPSHOT_LEN].to_vec();
-        Ok(Self { store, instance, memory, snapshot, sp, budget, fuel })
+        Ok(Self { store, instance, memory, snapshot, sp, fuel })
     }
 
     pub fn func(&mut self, name: &str) -> anyhow::Result<TypedFunc<(i32, i32, i32, i32), i64>> {
@@ -218,19 +187,10 @@ impl Harness {
         self.memory.data(&self.store)[at..at + len].to_vec()
     }
 
-    /// A page as a run starts from it: past the snapshot, `restore` zeroes.
     pub fn snapshot_page(&self, p: usize) -> &[u8] {
-        static ZERO: [u8; PAGE] = [0; PAGE];
         let start = p * PAGE;
         let end = (start + PAGE).min(self.snapshot.len());
-        if start >= self.snapshot.len() { &ZERO } else { &self.snapshot[start..end] }
-    }
-
-    /// Copy out the pages a run wrote, then put them back to the snapshot.
-    pub fn take_pages(&mut self, pages: &BTreeSet<usize>) -> BTreeMap<usize, Vec<u8>> {
-        let taken = pages.iter().map(|&p| (p, self.page(p).to_vec())).collect();
-        self.restore(pages);
-        taken
+        if start >= self.snapshot.len() { &[] } else { &self.snapshot[start..end] }
     }
 
     pub fn page(&self, p: usize) -> &[u8] {
@@ -266,38 +226,19 @@ impl Harness {
         stack_args: &[u32; 8],
         fuel_scale: u64,
     ) -> Run {
-        self.run_at(f, seed, args, scratch, stack_args, fuel_scale, STACK_TOP)
-    }
-
-    /// [`Harness::run`] with the stack at `top`: sp, the stack arguments
-    /// and the stack area all move with it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_at(
-        &mut self,
-        f: &TypedFunc<(i32, i32, i32, i32), i64>,
-        seed: u64,
-        args: [u32; 4],
-        scratch: &[u8],
-        stack_args: &[u32; 8],
-        fuel_scale: u64,
-        top: u32,
-    ) -> Run {
         let data = self.memory.data_mut(&mut self.store);
         let map = DIRTY_MAP as usize;
         data[map..map + PAGES].fill(0);
         let s = (SCRATCH & 0x00FF_FFFF) as usize + WINDOW_BASE;
         data[s..s + scratch.len()].copy_from_slice(scratch);
-        let a = ((top + 16) & 0x00FF_FFFF) as usize + WINDOW_BASE;
+        let a = ((STACK_TOP + 16) & 0x00FF_FFFF) as usize + WINDOW_BASE;
         for (k, w) in stack_args.iter().enumerate() {
             data[a + 4 * k..a + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
         }
         let st = self.store.data_mut();
         st.seed = seed;
         st.log.clear();
-        let _ = self.sp.set(&mut self.store, wasmtime::Val::I32(top as i32));
-        if let Some(b) = self.budget {
-            let _ = b.set(&mut self.store, wasmtime::Val::I32(0));
-        }
+        let _ = self.sp.set(&mut self.store, wasmtime::Val::I32(STACK_TOP as i32));
         let _ = self.store.set_fuel(self.fuel * fuel_scale);
         let r = f.call(&mut self.store, (args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32));
         let outcome = match r {
@@ -318,13 +259,12 @@ impl Harness {
         dirty.extend(sp..sp + SCRATCH_LEN as usize / PAGE);
         // The whole stack area: adapters write outgoing arguments there
         // without marking, and each side must start from the same stack.
-        let lo = ((top - STACK_EXCLUDE) & 0x00FF_FFFF) as usize / PAGE;
-        dirty.extend(lo..=((top + 64) & 0x00FF_FFFF) as usize / PAGE);
+        let lo = ((STACK_TOP - STACK_EXCLUDE) & 0x00FF_FFFF) as usize / PAGE;
+        dirty.extend(lo..=((STACK_TOP + 64) & 0x00FF_FFFF) as usize / PAGE);
         // A store may straddle into the next page; past the window's last
         // page that is the guard page, which is tracked like the others.
         let next: Vec<usize> = dirty.iter().map(|p| p + 1).filter(|&p| p <= PAGES).collect();
         dirty.extend(next);
-        let spent = self.budget.and_then(|b| b.get(&mut self.store).i32()).map_or(0, |b| -(b as i64));
-        Run { outcome, log: std::mem::take(&mut self.store.data_mut().log), dirty, spent }
+        Run { outcome, log: std::mem::take(&mut self.store.data_mut().log), dirty }
     }
 }

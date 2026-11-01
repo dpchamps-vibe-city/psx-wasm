@@ -29,16 +29,17 @@ const fromWord = {
 };
 
 export class Types {
-  /**
-   * `mem()`: a DataView of the module's memory; `ptr(a, n, store)`: the
-   * wasm address of `n` bytes at guest address `a` (the console's map).
-   */
-  constructor(snapshot, mem, ptr) {
+  /** `mem()`: a DataView of the module's memory; `window`: the guest window's wasm address. */
+  constructor(snapshot, mem, window) {
     this.defs = snapshot.types || {};
     this.mem = mem;
-    this.ptr = ptr;
+    this.window = window;
     this.protos = new Map();
     this.recordTypes = null;
+  }
+
+  at(a) {
+    return this.window + (a & 0xffffff);
   }
 
   /** A type with typedefs and enums seen through: a width, or the expression. */
@@ -71,13 +72,13 @@ export class Types {
   }
 
   read(width, a) {
-    const [n, get] = WIDTHS[width];
-    return this.mem()[get](this.ptr(a, n, false), true);
+    const [, get] = WIDTHS[width];
+    return this.mem()[get](this.at(a), true);
   }
 
   write(width, a, v) {
-    const [n, , set] = WIDTHS[width];
-    this.mem()[set](this.ptr(a, n, true), width.endsWith("64") ? BigInt.asIntN(64, BigInt(v)) : Number(v), true);
+    const [, , set] = WIDTHS[width];
+    this.mem()[set](this.at(a), width.endsWith("64") ? BigInt.asIntN(64, BigInt(v)) : Number(v), true);
   }
 
   /** What a field or element of type `t` at `a` reads as: a value, or a view. */

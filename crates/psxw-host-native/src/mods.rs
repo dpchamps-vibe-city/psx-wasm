@@ -100,8 +100,8 @@ pub struct Loader {
     pub booted: bool,
 }
 
-const AREA_START: u32 = psxw_abi::own(psxw_abi::phys::MOD_DATA.start);
-const AREA_END: u32 = psxw_abi::own(psxw_abi::phys::MOD_DATA.end);
+const AREA_START: u32 = 0x8000_0000 | psxw_abi::phys::MOD_DATA.start;
+const AREA_END: u32 = 0x8000_0000 | psxw_abi::phys::MOD_DATA.end;
 
 impl Loader {
     /// For a moddable base (`None` for any other game.wasm).

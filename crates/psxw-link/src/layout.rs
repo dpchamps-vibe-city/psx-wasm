@@ -19,13 +19,12 @@ use anyhow::{Result, bail};
 use psxw_inputs::{AddressMap, originals::Originals};
 use std::collections::{BTreeMap, HashMap};
 
-/// The AUX region (window offsets `phys::AUX_DATA`) at its own guest
-/// addresses (psxw-abi `own`).
-pub const AUX_BASE: u32 = psxw_abi::own(psxw_abi::phys::AUX_DATA.start);
-pub const AUX_END: u32 = psxw_abi::own(psxw_abi::phys::AUX_DATA.end);
+/// Start of the AUX region (window offset `phys::AUX_DATA.start`).
+pub const AUX_BASE: u32 = 0x8000_0000 | psxw_abi::phys::AUX_DATA.start;
+pub const AUX_END: u32 = 0x8000_0000 | psxw_abi::phys::AUX_DATA.end;
 /// Static mods' data: from the mod area's start up to its stack.
-pub const MOD_BASE: u32 = psxw_abi::own(psxw_abi::phys::MOD_DATA.start);
-pub const MOD_END: u32 = psxw_abi::own(psxw_abi::phys::MOD_STACK.start);
+pub const MOD_BASE: u32 = 0x8000_0000 | psxw_abi::phys::MOD_DATA.start;
+pub const MOD_END: u32 = 0x8000_0000 | psxw_abi::phys::MOD_STACK.start;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum How {
@@ -187,16 +186,6 @@ impl Layout {
             );
         }
         Ok(l)
-    }
-
-    /// Room for `len` bytes of the linker's own read-only data in AUX.
-    pub fn aux_bytes(&mut self, len: u32) -> Result<u32> {
-        let addr = self.next.div_ceil(8) * 8;
-        self.next = addr + len;
-        if self.next > AUX_END {
-            bail!("AUX region exhausted placing {len} bytes of the linker's");
-        }
-        Ok(addr)
     }
 
     /// Address of data symbol `si` of input `i`: its placement, or for an

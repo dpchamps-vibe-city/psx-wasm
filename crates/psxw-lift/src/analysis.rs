@@ -5,7 +5,6 @@
 
 use crate::decode::{Insn, Op};
 use crate::graph::{Callee, Graph, Node, Transfer};
-use psxw_abi::map;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Registers the callee may clobber, as the o32 ABI defines.
@@ -56,21 +55,11 @@ pub struct Facts {
     /// still happen on hardware, and from an I/O register a read pops a
     /// FIFO, so they are emitted as volatile reads clang keeps.
     pub dead_loads: BTreeSet<Node>,
-    /// Loads and stores at a constant address that isn't RAM or the
-    /// scratchpad: device registers and the other bus regions. Each is
-    /// emitted volatile, between compiler barriers, so clang keeps it,
-    /// doesn't merge it, and keeps it in order with every other access.
-    /// In a function that reaches registers through pointers in data, also
-    /// every access through a base that isn't a constant or the stack
-    /// pointer.
-    pub device: BTreeSet<Node>,
 }
 
-/// `through_pointers`: the function reaches device registers through
-/// pointers in data ([`crate::program::Program::through_pointers`]).
-pub fn analyze(g: &Graph, in_code: &dyn Fn(u32) -> bool, through_pointers: bool) -> Facts {
+pub fn analyze(g: &Graph, in_code: &dyn Fn(u32) -> bool) -> Facts {
     let mut f = Facts::default();
-    constants(g, in_code, through_pointers, &mut f);
+    constants(g, in_code, &mut f);
     liveness(g, &mut f);
     hazards(g, &mut f);
     sites(g, &mut f);
@@ -141,18 +130,8 @@ fn sites(g: &Graph, f: &mut Facts) {
     }
 }
 
-fn region(addr: u32) -> Option<map::Region> {
-    map::place(addr).map(|p| p.region)
-}
-
 fn is_io(addr: u32) -> bool {
-    region(addr) == Some(map::Region::Io)
-}
-
-/// Main RAM or the scratchpad in the console's map (psxw-abi `map`): plain
-/// memory, where an access does nothing but read or write its bytes.
-fn is_memory(addr: u32) -> bool {
-    matches!(region(addr), Some(map::Region::Ram | map::Region::Scratchpad))
+    (0x1F80_1000..0x1F80_3000).contains(&(addr & 0x1FFF_FFFF))
 }
 
 /// The BIOS kernel's RAM, but for the tables the runtime's BIOS keeps in
@@ -202,7 +181,7 @@ fn is_call(t: &Transfer) -> bool {
     matches!(t, Transfer::Call { .. } | Transfer::CondCall { .. })
 }
 
-fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, through_pointers: bool, f: &mut Facts) {
+fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, f: &mut Facts) {
     let mut entry: Consts = [None; 32];
     entry[0] = Some(0);
     let mut work = VecDeque::from([Node::Normal(g.entry)]);
@@ -245,22 +224,13 @@ fn constants(g: &Graph, in_code: &dyn Fn(u32) -> bool, through_pointers: bool, f
             f.kernel.push((n.pc(), *addr));
         }
         if i.op.is_load() || i.op.is_store() {
-            match st[i.rs as usize] {
-                Some(base) => {
-                    let a = base.wrapping_add(i.simm as u32);
-                    if !is_memory(a) {
-                        f.device.insert(*n);
-                    }
-                    if is_io(a) {
-                        f.io.push((n.pc(), a));
-                    } else if is_kernel(a) {
-                        f.kernel.push((n.pc(), a));
-                    }
+            if let Some(base) = st[i.rs as usize] {
+                let a = base.wrapping_add(i.simm as u32);
+                if is_io(a) {
+                    f.io.push((n.pc(), a));
+                } else if is_kernel(a) {
+                    f.kernel.push((n.pc(), a));
                 }
-                None if through_pointers && i.rs != 29 => {
-                    f.device.insert(*n);
-                }
-                None => {}
             }
         }
         if matches!(i.op, Op::Addiu | Op::Ori) {
@@ -424,20 +394,14 @@ mod tests {
         // The TCB array pointer and the TCBs themselves (D57).
         assert!(!super::is_kernel(0x0000_0110));
         assert!(!super::is_kernel(0xA000_E010 + 0xC0 + 0x94));
-        // Tables the BIOS doesn't lay out, and its patch area, are.
-        assert!(super::is_kernel(0x0000_0158));
+        // File/device table pointers and their RAM-backed control blocks.
+        for addr in [0x140, 0x150, psxw_abi::kernel::FCBS, psxw_abi::kernel::DCBS] {
+            assert!(!super::is_kernel(addr));
+            assert!(!super::is_kernel(0xA000_0000 | addr));
+        }
+        // Unprovided tables and the BIOS patch area still require an adaptor.
+        assert!(super::is_kernel(0x0000_0160));
         assert!(super::is_kernel(0xA000_DF80));
         assert!(!super::is_kernel(0));
-    }
-
-    #[test]
-    fn memory_regions() {
-        assert!(super::is_memory(0x8001_0000) && super::is_memory(0xA07F_FFFC) && super::is_memory(0x0000_0100));
-        assert!(super::is_memory(0x1F80_03FC) && super::is_memory(0x9F80_0000));
-        // The scratchpad isn't in KSEG1; I/O, expansion, unmapped space
-        // and KSEG2's cache control aren't memory.
-        assert!(!super::is_memory(0xBF80_0000));
-        assert!(!super::is_memory(0x1F80_1810) && !super::is_memory(0xBF80_1070) && !super::is_memory(0x1F00_0084));
-        assert!(!super::is_memory(0x0080_0000) && !super::is_memory(0xFFFE_0130) && !super::is_memory(0x2000_0000));
     }
 }

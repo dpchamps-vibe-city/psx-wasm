@@ -13,7 +13,7 @@ use psx_devices::clock::{Clock, Video};
 use psx_devices::mem::Mem;
 use psx_devices::timers::Timer;
 use psxw_abi::BootOptions;
-use std::collections::{BTreeMap, VecDeque};
+use std::{cell::Cell, collections::{BTreeMap, VecDeque}, rc::Rc};
 
 /// What the runtime needs from its host.
 pub trait Host {
@@ -78,16 +78,16 @@ pub trait Regs {
     /// (psxw-abi `guest::BUDGET_RESET`): an adapter that replaces a
     /// busy-wait leaves it as the wait's last safepoint would.
     fn reset_budget(&mut self) {}
-    /// The guest's safepoint budget left (psxw-abi `guest::BUDGET_GET`), in
-    /// the original's instructions in fixed point (`guest::BUDGET_UNIT`,
-    /// D71): at or below 0, the next loop header takes a safepoint. `None`
-    /// where there is no guest to ask. An adapter that replaces code spends
-    /// what the original's instructions would (`set_budget`, psxw-abi
-    /// `guest::BUDGET_SET`), with a safepoint each time it runs out.
-    fn budget(&self) -> Option<i32> {
-        None
+    /// The guest's safepoint budget: loop-header passes left before its
+    /// next safepoint (psxw-abi `guest::BUDGET_GET`), 1 to the link's
+    /// budget; 0 where there is no guest to ask. An adapter that replaces
+    /// code with loops spends what the original's loops would
+    /// (`set_budget`, psxw-abi `guest::BUDGET_SET`), with a safepoint each
+    /// time it runs out.
+    fn budget(&self) -> u32 {
+        0
     }
-    fn set_budget(&mut self, _v: i32) {}
+    fn set_budget(&mut self, _v: u32) {}
 }
 
 /// A guest function to call with o32 arguments.
@@ -110,9 +110,6 @@ pub enum IrqStep {
     /// ([`Sdk::chain_element`]): [`Sdk::irq_step`] runs it at its turn,
     /// and may queue further steps (callbacks among them) at the front.
     Sdk(u32),
-    /// One of the kernel's own elements (D68): its verifier, and its
-    /// handler when that says so ([`Machine::kernel_step`]).
-    Kernel(u32),
     /// The end of the handler: the custom exit (`HookEntryInt`, B0h:19h)
     /// if one is set, entered like a longjmp to its buffer with 1.
     Exit,
@@ -129,6 +126,8 @@ pub enum Event {
     Sdk(u32, u32),
     /// The register-level CD controller has work due (D58).
     Cdc,
+    /// A BIOS CD software call's next step ([`crate::cdrom`]).
+    Cd,
 }
 
 /// A step of a stand-in function ([`Sdk::stand_in`]).
@@ -181,7 +180,7 @@ pub fn seq<S: Sdk>(m: &mut Machine<S>, flow: Flow<S>, f: impl FnOnce(&mut Machin
 }
 
 /// Conditions a blocked call waits for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wait {
     /// `vblanks >= n`.
     Vblanks(u64),
@@ -191,8 +190,10 @@ pub enum Wait {
     Sdk(u32),
     /// A BIOS event becomes ready.
     Event(u32),
-    /// One of these BIOS events becomes ready (0: none).
-    Events([u32; 3]),
+    /// A blocking CD call's live events, cancellation of its own native
+    /// operation, or a changed TestEvent entry that must be called again.
+    /// Normal completion alone does not satisfy the wait.
+    Cd { done: Rc<Cell<Option<u64>>>, read: bool },
 }
 
 /// SDK adapter state plugs into the machine through this trait.
@@ -216,25 +217,23 @@ pub trait Sdk: Sized + 'static {
     fn irq_step(_m: &mut Machine<Self>, _step: u32) {}
     /// Guest code called `addr`, which no guest function implements: if it
     /// is a function pointer the adapters handed out for SDK code they
-    /// replace, its next step from `state` (0 on entry). PsyQ's adapters
-    /// hand out none since D67: their functions are at the SDK's own
-    /// addresses. The runtime makes the guest calls it asks for
+    /// replace (libetc's own interrupt handlers, D59), its next step from
+    /// `state` (0 on entry). The runtime makes the guest calls it asks for
     /// as nested calls, like the original's, and comes back with the state.
     fn stand_in(_m: &mut Machine<Self>, _addr: u32, _state: u32) -> Option<StandIn> {
         None
     }
-    /// A `SysEnqIntRP` element whose verifier and handler the adapters
-    /// replace (libpad's vblank poll, D60; the element itself is the SDK's,
-    /// in its RAM): the [`IrqStep::Sdk`] step to run in its place in the
-    /// chain.
+    /// A `SysEnqIntRP` element the adapters installed for SDK code they
+    /// replace (libpad's vblank poll, D60), which has no fields in guest
+    /// RAM: the [`IrqStep::Sdk`] step to run in its place in the chain.
     fn chain_element(_m: &Machine<Self>, _elem: u32) -> Option<u32> {
         None
     }
 }
 
-/// The link's safepoint budget a quantum gives (psxw-abi `guest::BUDGET`):
-/// the original's instructions in fixed point (`guest::BUDGET_UNIT`, D71).
-pub const BUDGET: i64 = psxw_abi::guest::BUDGET as i64;
+/// The link's safepoint budget: loop-header passes per quantum
+/// (psxw-build's, which the link compiles into every loop header).
+pub const LOOP_BUDGET: u64 = 1000;
 
 pub struct Machine<S> {
     pub mem: Box<dyn Mem>,
@@ -322,13 +321,12 @@ impl<S: Sdk> Machine<S> {
         };
         let first = m.clock.video.vblank_at(1);
         m.clock.schedule(first, Event::Vblank);
-        // The kernel's call tables and vectors, its file and device control
-        // blocks with stdio open, its exception control blocks and its own
-        // handlers in their chains are there before a game runs.
+        // Guest-visible native kernel data exists before a game runs.
         m.lay_out_tables();
         m.lay_out_files();
         m.lay_out_excb();
         m.lay_out_kernel_handlers();
+        m.kernel.stack_top = m.regs.sp();
         m
     }
 
@@ -353,13 +351,13 @@ impl<S: Sdk> Machine<S> {
     }
 
     /// Whether a wait condition holds.
-    pub fn holds(&self, w: Wait) -> bool {
+    pub fn holds(&self, w: &Wait) -> bool {
         match w {
-            Wait::Vblanks(n) => self.vblanks >= n,
-            Wait::Cycle(t) => self.clock.now >= t,
-            Wait::Sdk(c) => S::ready(self, c),
-            Wait::Event(h) => self.event_ready(h),
-            Wait::Events(hs) => hs.iter().any(|&h| self.event_ready(h)),
+            Wait::Vblanks(n) => self.vblanks >= *n,
+            Wait::Cycle(t) => self.clock.now >= *t,
+            Wait::Sdk(c) => S::ready(self, *c),
+            Wait::Event(h) => self.event_ready(*h),
+            Wait::Cd { done, read } => self.cd_wait_ready(done, *read),
         }
     }
 
@@ -380,27 +378,25 @@ impl<S: Sdk> Machine<S> {
         any
     }
 
-    /// The safepoint quantum: virtual time the guest's [`BUDGET`] takes
-    /// (§6): an original instruction a cycle by default.
+    /// The safepoint quantum: virtual time a guest loop's [`LOOP_BUDGET`]
+    /// header passes take (§6).
     pub fn quantum(&self) -> u64 {
         if self.opts.safepoint_quantum == 0 { 20_000 } else { self.opts.safepoint_quantum as u64 }
     }
 
     /// The cycle the guest is at for SIO0 and root counter 2 (D66):
-    /// virtual time moves a quantum at a safepoint, but the instructions the
-    /// guest has run since took their share of it (D71), past it where the
-    /// guest overran its budget before its next loop header. A busy-wait on
-    /// a byte, its /ACK or the counter so sees the cycle each poll is made
-    /// at and ends when the hardware's would, not at the next safepoint.
-    /// While events are delivered, or with no guest to ask, it is the clock.
+    /// virtual time moves a quantum at a safepoint, but the loop passes the
+    /// guest has made since its budget started over took their share of
+    /// that quantum. A busy-wait on a byte, its /ACK or the counter so sees
+    /// the cycle each poll is made at and ends when the hardware's would,
+    /// not at the next safepoint. While events are delivered, or with no
+    /// guest to ask, it is the clock.
     pub fn guest_now(&self) -> u64 {
-        match self.regs.budget() {
-            Some(left) if !self.delivering => {
-                let spent = (BUDGET - left as i64).max(0) as u64;
-                self.clock.now + spent * self.quantum() / BUDGET as u64
-            }
-            _ => self.clock.now,
+        let left = self.regs.budget() as u64;
+        if self.delivering || left == 0 || left > LOOP_BUDGET {
+            return self.clock.now;
         }
+        self.clock.now + (LOOP_BUDGET - left) * self.quantum() / LOOP_BUDGET
     }
 
     /// Advance to the next event (or `limit`) and deliver it.
@@ -428,7 +424,7 @@ impl<S: Sdk> Machine<S> {
                 // chains when the interrupt is taken.
                 self.raise_irq(psx_devices::irq::VBLANK);
                 self.gpu_vblank();
-                self.save_cards();
+                self.card_vblank();
                 self.audio_vblank();
                 self.host.vblank(self.vblanks);
                 self.host.wait_vblank(self.vblanks);
@@ -446,6 +442,7 @@ impl<S: Sdk> Machine<S> {
             }
             Event::Sdk(kind, data) => S::on_event(self, kind, data),
             Event::Cdc => self.cdc_sync(),
+            Event::Cd => self.cd_step(),
         }
     }
 

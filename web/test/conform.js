@@ -8,9 +8,11 @@
 
 import init, { WebRenderer } from "./pkg/psxw_host_web.js";
 
-const ABI_VERSION = 14;
+const ABI_VERSION = 18;
 const NOTHING_PRESSED = 0xffff;
 const REPLAY_HEADER = 64; // version 2, entries by vblank (clock 0)
+const WINDOW_BASE = 0x01000000;
+const WINDOW_MASK = 0x00ffffff;
 
 const browser = new URLSearchParams(location.search).get("browser") || "unknown";
 const out = document.getElementById("out");
@@ -48,13 +50,7 @@ async function scenario(module, rec, ram, replay) {
   const mem = () => exports.memory.buffer;
   const bytes = (p, n) => new Uint8Array(mem(), p, n);
   const text = (p, n) => new TextDecoder().decode(bytes(p, n).slice());
-  // Guest bytes through the console's map (psxw-abi `exports::GUEST_PTR`).
-  const ptr = (addr, n, store) => {
-    const p = exports.psxw_guest_ptr(addr | 0, n, store ? 1 : 0) >>> 0;
-    if (!p) throw new Error(`no memory at guest address 0x${(addr >>> 0).toString(16)}`);
-    return p;
-  };
-  const guest = (addr, n, store) => bytes(ptr(addr, n, store), n);
+  const guest = (addr, n) => bytes(WINDOW_BASE + (addr & WINDOW_MASK), n);
   const host = {
     log() {},
     trap(code, p, n) {
@@ -100,7 +96,7 @@ async function scenario(module, rec, ram, replay) {
   };
   exports = (await WebAssembly.instantiate(module, { host })).exports;
   if (exports.psxw_abi_version() !== ABI_VERSION) throw new Error(`game.wasm ABI ${exports.psxw_abi_version()}`);
-  guest(rec.ram_addr, ram.length, true).set(ram);
+  guest(rec.ram_addr, ram.length).set(ram);
   const opts = exports.psxw_alloc(24);
   new Uint8Array(mem(), opts, 24).fill(0);
   exports.psxw_conform_init(opts, rec.sp, rec.gp);
@@ -108,13 +104,13 @@ async function scenario(module, rec, ram, replay) {
   const diffs = [];
   rec.steps.forEach((s, i) => {
     if (diffs.length >= 16) return;
-    if (s.op === "write") guest(s.addr, s.hex.length / 2, true).set(unhex(s.hex));
+    if (s.op === "write") guest(s.addr, s.hex.length / 2).set(unhex(s.hex));
     else if (s.op === "read") {
       const got = hex(guest(s.addr, s.len));
       if (got !== s.hex) diffs.push({ step: i, op: "read", addr: s.addr, got, want: s.hex });
     } else if (s.op === "vblanks") exports.psxw_run_vblanks(s.n);
     else if (s.op === "call") {
-      s.args.slice(4).forEach((a, k) => new DataView(mem()).setUint32(ptr(rec.sp + 4 * (k + 4), 4, true), a, true));
+      s.args.slice(4).forEach((a, k) => new DataView(mem()).setUint32(WINDOW_BASE + ((rec.sp + 4 * (k + 4)) & WINDOW_MASK), a, true));
       const a = (k) => s.args[k] ?? 0;
       const got = "0x" + (BigInt(exports.psxw_call(s.addr, a(0), a(1), a(2), a(3))) & 0xffffffffffffffffn).toString(16);
       if (got !== s.ret) diffs.push({ step: i, op: "call", addr: s.addr, got, want: s.ret });

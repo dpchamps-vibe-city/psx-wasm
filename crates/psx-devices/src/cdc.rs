@@ -455,17 +455,13 @@ impl Cdc {
         self.interrupt(INT2, res, None);
     }
 
-    /// The head reaches the next sector of a read.
-    fn next_sector(&mut self, now: u64, disc: &mut dyn Disc) {
-        self.seeking = false;
-        let lba = self.drive.head;
-        self.drive.head += 1;
-        let t = now + self.drive.sector_cycles();
-        self.schedule(t, Job::Sector);
+    /// Read and validate one sector from the disc, recording the same
+    /// errors and volatile state the controller's own sector path does.
+    fn take_sector(&mut self, lba: u32, disc: &mut dyn Disc) -> Option<Box<[u8; RAW]>> {
         let mut raw = Box::new([0u8; RAW]);
         if !disc.read_raw(lba, &mut raw) {
             self.edc_errors.push(format!("LBA {lba}: unreadable"));
-            return;
+            return None;
         }
         if let Err(e) = cd::check(&raw, lba) {
             self.edc_errors.push(e);
@@ -473,6 +469,17 @@ impl Cdc {
         self.sectors += 1;
         self.subq = lba;
         self.loc.copy_from_slice(&raw[12..20]);
+        Some(raw)
+    }
+
+    /// The head reaches the next sector of a read.
+    fn next_sector(&mut self, now: u64, disc: &mut dyn Disc) {
+        self.seeking = false;
+        let lba = self.drive.head;
+        self.drive.head += 1;
+        let t = now + self.drive.sector_cycles();
+        self.schedule(t, Job::Sector);
+        let Some(raw) = self.take_sector(lba, disc) else { return };
         if self.xa_sector(&raw) {
             return;
         }
@@ -585,6 +592,85 @@ impl Cdc {
     pub fn set_volume(&mut self, vol: [u8; 4]) {
         self.vol_next = vol;
         self.vol = vol;
+    }
+
+    /// The drive's status as the controller reports it (GetStat and the
+    /// status byte of its interrupts).
+    pub fn status(&self) -> u8 {
+        self.stat()
+    }
+
+    /// Stop the drive's conventional command/read work and drop its
+    /// undelivered interrupts: a native BIOS operation takes over the
+    /// controller.
+    pub fn native_stop(&mut self) {
+        self.stop_reading();
+        self.jobs.clear();
+        self.busy = false;
+        self.setloc_pending = false;
+        self.params.clear();
+        self.cmd_params.clear();
+        self.queue.clear();
+        self.int = 0;
+        self.response.clear();
+        self.sector = None;
+        self.fifo.clear();
+        self.fifo_pos = 0;
+    }
+
+    /// Native `_96_init`'s controller side: take over, motor on, mode 0.
+    pub fn native_init(&mut self) {
+        self.native_stop();
+        self.motor = true;
+        self.drive.mode = 0;
+    }
+
+    /// Move the head to `target` for a native BIOS seek: no command, but
+    /// the same timing, head, subchannel Q and busy state the controller's
+    /// own seek has.
+    pub fn native_seek(&mut self, target: u32) -> u64 {
+        self.native_stop();
+        self.motor = true;
+        let cycles = self.drive.seek_cycles(self.drive.head, target);
+        self.drive.head = target;
+        self.drive.setloc = target;
+        self.subq = target;
+        self.seeking = cycles > 0;
+        cycles
+    }
+
+    /// The native seek has completed.
+    pub fn native_seek_done(&mut self) {
+        self.seeking = false;
+    }
+
+    /// Start a native BIOS read at `mode`: the controller's drive and
+    /// status reflect it, and any earlier sector job is cancelled. Returns
+    /// one sector's time.
+    pub fn native_begin_read(&mut self, mode: u8) -> u64 {
+        self.native_stop();
+        self.motor = true;
+        self.drive.mode = mode;
+        self.reading = true;
+        self.drive.sector_cycles()
+    }
+
+    /// A native read has finished or ended early.
+    pub fn native_finish(&mut self) {
+        self.native_stop();
+    }
+
+    /// One native BIOS read sector, with the controller's validation,
+    /// volatile header/subchannel updates and head advance.
+    pub fn native_sector(&mut self, lba: u32, disc: &mut dyn Disc) -> Option<[u8; RAW]> {
+        let sector = self.take_sector(lba, disc)?;
+        self.drive.head = lba + 1;
+        Some(*sector)
+    }
+
+    /// Set the mode for native mode-only state.
+    pub fn native_set_mode(&mut self, mode: u8) {
+        self.drive.mode = mode;
     }
 }
 

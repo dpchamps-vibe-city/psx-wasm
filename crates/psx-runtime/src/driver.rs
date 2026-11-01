@@ -16,32 +16,24 @@ pub trait Invoke {
     fn invoke_irq(&mut self, call: GuestCall) -> u64 {
         self.invoke(call)
     }
-    /// The disc wrote `len` bytes at `addr` (overlay residency, D69, and
-    /// mods' overlay data patches).
+    /// The disc wrote `len` bytes at `addr` (mods' overlay data patches).
     fn loaded(&mut self, _addr: u32, _len: u32) {}
     /// Service a host-requested call, with no machine borrow held and
     /// outside interrupt handlers and critical sections.
     fn host_calls(&mut self) {}
 }
 
-/// Tell the guest what the disc wrote since it last heard, before any of
-/// its code runs again: which overlay code is resident is decided from
-/// these writes (D69), and mods' overlay data patches apply with them.
-pub fn deliver_loaded<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
-    let loaded = std::mem::take(&mut rt.borrow_mut().loaded);
-    for (addr, len) in loaded {
-        inv.loaded(addr, len);
-    }
-}
-
 /// Run queued callbacks, unless one is already running (no nesting:
 /// interrupts are disabled in a handler, as on hardware). Then service a
 /// pending host call, with the machine unborrowed.
 pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
+    // What the disc wrote first, so no guest code sees an overlay before
+    // its mods' patches (even in a handler).
+    let loaded = std::mem::take(&mut rt.borrow_mut().loaded);
+    for (addr, len) in loaded {
+        inv.loaded(addr, len);
+    }
     loop {
-        // What the disc wrote first, so no guest code sees an overlay
-        // before its residency and its mods' patches (even in a handler).
-        deliver_loaded(rt, inv);
         let (step, exception) = {
             let mut m = rt.borrow_mut();
             if m.in_irq || m.crit {
@@ -63,18 +55,6 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
             // callbacks it runs at the front.
             if let IrqStep::Sdk(s) = step.0 {
                 S::irq_step(&mut m, s);
-                continue;
-            }
-            // The kernel's own handlers: Rust too. One that returns from
-            // the exception skips the rest of it.
-            if let IrqStep::Kernel(k) = step.0 {
-                if m.kernel_step(k) && step.1 {
-                    while let Some(s) = m.irq_calls.pop_front() {
-                        if s == IrqStep::Exit {
-                            break;
-                        }
-                    }
-                }
                 continue;
             }
             m.in_irq = true;
@@ -100,7 +80,7 @@ pub fn drain<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke) {
                     }
                 }
             }
-            IrqStep::Sdk(_) | IrqStep::Kernel(_) => unreachable!("run above"),
+            IrqStep::Sdk(_) => unreachable!("run above"),
             IrqStep::Exit => {
                 let buf = rt.borrow().kernel.custom_exit;
                 let resume = rt.borrow().mem.r32(buf);
@@ -122,9 +102,7 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
             Flow::Return(v) => {
                 // An adapter whose original makes no runtime call here
                 // returns without a safepoint (`Machine::quiet`, D63).
-                if std::mem::take(&mut rt.borrow_mut().quiet) {
-                    deliver_loaded(rt, inv);
-                } else {
+                if !std::mem::take(&mut rt.borrow_mut().quiet) {
                     drain(rt, inv);
                 }
                 return v;
@@ -134,7 +112,7 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
                 loop {
                     drain(rt, inv);
                     let mut m = rt.borrow_mut();
-                    if m.holds(until) {
+                    if m.holds(&until) {
                         break;
                     }
                     // With interrupts disabled nothing can satisfy an event
@@ -153,7 +131,6 @@ pub fn run<S: Sdk>(rt: &RefCell<Machine<S>>, inv: &mut dyn Invoke, mut flow: Flo
                 flow = then(&mut m);
             }
             Flow::Call { call, then } => {
-                deliver_loaded(rt, inv);
                 let v = inv.invoke(call);
                 let mut m = rt.borrow_mut();
                 flow = then(&mut m, v);
@@ -200,12 +177,12 @@ mod tests {
         }
         fn report(&mut self, _: &str) {}
     }
-    struct Regs;
+    struct Regs(u32);
     impl psx_bios::Regs for Regs {
         fn sp(&self) -> u32 {
-            0x801F_F000
+            self.0
         }
-        fn set_sp(&mut self, _: u32) {}
+        fn set_sp(&mut self, sp: u32) { self.0 = sp; }
         fn gp(&self) -> u32 {
             0
         }
@@ -221,6 +198,14 @@ mod tests {
     }
     impl Invoke for Guest<'_> {
         fn invoke(&mut self, call: GuestCall) -> u64 {
+            let flow = self.rt.borrow_mut().kernel_call(call.addr, call.args);
+            if let Some(flow) = flow {
+                return run(self.rt, self, flow);
+            }
+            if call.addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+                self.rt.borrow_mut().rfe = true;
+                return 0;
+            }
             self.seen.push((call.addr, call.args));
             if self.rfe.contains(&call.addr) {
                 self.rt.borrow_mut().rfe = true;
@@ -230,7 +215,7 @@ mod tests {
     }
 
     fn machine() -> RefCell<Machine<Psyq>> {
-        RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(Host), Box::new(Regs), Default::default(), Psyq::default()))
+        RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(Host), Box::new(Regs(0x801F_F000)), Default::default(), Psyq::default()))
     }
 
     /// A `SysEnqIntRP` element at `at` (verifier, handler) in a chain.
@@ -239,6 +224,321 @@ mod tests {
         m.mem.w32(at + 4, handler);
         m.mem.w32(at + 8, verifier);
         m.enq_int_rp(prio, at);
+    }
+
+    /// A queued guest callback delivers ERR, cancels CdGetStatus, or writes
+    /// the patched command's local status byte before delivering DNE. The
+    /// ordinary driver resumes immediately with the frame intact throughout.
+    #[test]
+    fn cd_event_wait_wakes_from_a_guest_callback_without_advancing_time() {
+        use psx_bios::{bios, cdrom};
+        const DELIVER: u32 = 0x8001_1000;
+        const ERROR: u32 = 0x8001_2000;
+        const STATUS: u32 = 0x8001_3000;
+        const SP: u32 = 0x801F_F000;
+        struct CdGuest<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            seen: Vec<u32>,
+            cancel: bool,
+            status: Option<u32>,
+        }
+        impl Invoke for CdGuest<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                self.seen.push(call.addr);
+                assert_eq!(self.rt.borrow().regs.sp(), SP - 24);
+                if call.addr == STATUS {
+                    let mut m = self.rt.borrow_mut();
+                    assert!(!m.in_irq);
+                    assert_eq!(call.args, [SP - 8, 0, 0, 0]);
+                    m.mem.write(SP - 24, &[0xCC; 16]); // o32 argument homes
+                    m.mem.w8(call.args[0], 0x42);
+                    self.status = Some(call.args[0]);
+                    return 1;
+                }
+                if call.addr == DELIVER {
+                    assert!(self.rt.borrow().in_irq);
+                    let flow = if let Some(status) = self.status {
+                        let mut m = self.rt.borrow_mut();
+                        assert_eq!(m.mem.r8(status), 0x42);
+                        m.mem.w8(status, 0xA5);
+                        bios::dispatch(&mut m, 0xB0, 0x07, [cdrom::EV_CD, cdrom::DNE, 0, 0]).unwrap()
+                    } else if self.cancel {
+                        bios::dispatch(&mut self.rt.borrow_mut(), 0xA0, 0x95, [0; 4]).unwrap()
+                    } else {
+                        bios::dispatch(&mut self.rt.borrow_mut(), 0xB0, 0x07,
+                            [cdrom::EV_CD, cdrom::ERR, 0, 0]).unwrap()
+                    };
+                    run(self.rt, self, flow)
+                } else {
+                    assert_eq!(call.addr, ERROR);
+                    assert_eq!(call.args, [0x44, 0x20, 0, 0]);
+                    let m = self.rt.borrow();
+                    assert!(!m.in_irq);
+                    assert!(!m.event_ready(m.kernel.cd.events[4]), "ERR consumed before SystemError");
+                    123
+                }
+            }
+        }
+        for (cancel, software) in [(false, false), (true, false), (false, true)] {
+            let rt = machine();
+            let (flow, now, due) = {
+                let mut m = rt.borrow_mut();
+                m.cd_init();
+                m.mem.w32(psx_bios::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+                if software { m.mem.w32(psx_bios::tables::entry(0xA0, 0x7C).unwrap(), STATUS); }
+                let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+                m.calls.push_back(GuestCall { addr: DELIVER, args: [0; 4] });
+                (flow, m.clock.now, m.cd_due())
+            };
+            assert!(due > now);
+            let mut guest = CdGuest { rt: &rt, seen: vec![], cancel, status: None };
+            assert_eq!(run(&rt, &mut guest, flow), if software { 0xA5 } else { u32::MAX as u64 });
+            assert_eq!(guest.seen, if software { [STATUS, DELIVER] } else { [DELIVER, ERROR] });
+            assert_eq!(rt.borrow().regs.sp(), SP);
+            assert_eq!(rt.borrow().clock.now, now);
+            assert_eq!(rt.borrow().clock.pending(|e| *e == psx_bios::Event::Cd),
+                if cancel || software { None } else { Some(due) });
+        }
+    }
+
+    /// A callback can patch TestEvent while a native CD wait is asleep.
+    /// Synthetic replies need no flags/time; a wrapper around the original
+    /// must let scheduled work progress even when the wrapper has no loop.
+    #[test]
+    fn cd_testevent_patch_wakes_and_yields_through_the_driver() {
+        use psx_bios::{bios, tables};
+        use std::{cell::Cell, rc::Rc};
+        const INSTALL: u32 = 0x8001_1000;
+        const POLL: u32 = 0x8001_2000;
+        const SP: u32 = 0x801F_F000;
+        struct PollRegs {
+            sp: u32,
+            budget: Rc<Cell<u32>>,
+            resets: Rc<Cell<u32>>,
+        }
+        impl psx_bios::Regs for PollRegs {
+            fn sp(&self) -> u32 { self.sp }
+            fn set_sp(&mut self, sp: u32) { self.sp = sp; }
+            fn gp(&self) -> u32 { 0 }
+            fn set_gp(&mut self, _: u32) {}
+            fn budget(&self) -> u32 { self.budget.get() }
+            fn reset_budget(&mut self) {
+                self.budget.set(psx_bios::machine::LOOP_BUDGET as u32);
+                self.resets.set(self.resets.get() + 1);
+            }
+        }
+        struct PollGuest<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            wrap: bool,
+            saved: u32,
+            polls: usize,
+            expected: usize,
+        }
+        impl Invoke for PollGuest<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                let mut m = self.rt.borrow_mut();
+                assert_eq!(m.regs.sp(), SP - 24);
+                if call.addr == INSTALL {
+                    assert!(m.in_irq);
+                    assert!(!m.event_ready(m.kernel.cd.events[1]));
+                    m.mem.w8(SP - 8, 0xA5);
+                    m.mem.w32(tables::entry(0xB0, 0x0B).unwrap(), POLL);
+                    return 0;
+                }
+                assert_eq!(call.addr, POLL);
+                assert!(!m.in_irq, "TestEvent is an ordinary call, not a callback");
+                assert_eq!(m.regs.budget(), if m.clock.now == 0 { 7 } else { psx_bios::machine::LOOP_BUDGET as u32 });
+                let slot = if self.polls % 2 == 0 { 1 } else { 4 };
+                assert_eq!(call.args, [m.kernel.cd.events[slot], 0, 0, 0]);
+                self.polls += 1;
+                if !self.wrap {
+                    assert_eq!(m.clock.now, 0, "success on the second round needs no yield");
+                    return if self.polls == 3 { u32::MAX as u64 } else { 1 << 32 };
+                }
+                // No loop or safepoint in this guest wrapper. The outer BIOS
+                // polling loop, not this callback, must yield to the drive.
+                assert!(self.polls <= self.expected);
+                let (t, f) = tables::stand_in_fn(self.saved).unwrap();
+                match bios::call(&mut m, t, f, call.args).unwrap() {
+                    Flow::Return(v) => v,
+                    _ => panic!("native TestEvent is nonblocking"),
+                }
+            }
+        }
+        for wrap in [false, true] {
+            let rt = machine();
+            let budget = Rc::new(Cell::new(7));
+            let resets = Rc::new(Cell::new(0));
+            let (flow, saved, due) = {
+                let mut m = rt.borrow_mut();
+                m.regs = Box::new(PollRegs { sp: SP, budget: budget.clone(), resets: resets.clone() });
+                m.cd_init();
+                let saved = m.mem.r32(tables::entry(0xB0, 0x0B).unwrap());
+                let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+                let Flow::Block { ref until, .. } = flow else { panic!("native CD wait") };
+                assert!(!m.holds(until));
+                m.calls.push_back(GuestCall { addr: INSTALL, args: [0; 4] });
+                (flow, saved, m.cd_due())
+            };
+            let yields = due.div_ceil(rt.borrow().quantum());
+            let expected = (2 * yields * psx_bios::machine::LOOP_BUDGET + 1) as usize;
+            let mut guest = PollGuest { rt: &rt, wrap, saved, polls: 0, expected };
+            assert_eq!(run(&rt, &mut guest, flow), if wrap { 2 } else { 0xA5 });
+            let m = rt.borrow();
+            assert_eq!(m.regs.sp(), SP);
+            assert!(!m.event_ready(m.kernel.cd.events[1]));
+            if wrap {
+                assert!(m.clock.now >= due);
+                assert!(m.clock.now < due + m.quantum());
+                assert_eq!(guest.polls, expected);
+                assert_eq!(resets.get() as u64, yields);
+                assert_eq!(budget.get() as u64, psx_bios::machine::LOOP_BUDGET);
+                assert!(m.clock.pending(|e| *e == psx_bios::Event::Cd).is_none());
+            } else {
+                assert_eq!(guest.polls, 3);
+                assert_eq!(resets.get(), 0);
+                assert_eq!(budget.get(), 7);
+                assert_eq!(m.clock.now, 0);
+                assert_eq!(m.clock.pending(|e| *e == psx_bios::Event::Cd), Some(due));
+            }
+        }
+    }
+
+    /// Long command-acceptance loops yield through the ordinary driver. Busy
+    /// work can finish, and callbacks can patch/cancel it without losing the
+    /// next attempt's live table, arguments or per-call guest stack frame.
+    #[test]
+    fn cd_busy_acceptance_progresses_and_rereads_patches_after_yields() {
+        use psx_bios::{bios, cdrom, tables, machine::LOOP_BUDGET};
+        use psx_devices::cd;
+        use std::{cell::Cell, rc::Rc};
+        const INSTALL: u32 = 0x8001_1000;
+        const COMMAND: u32 = 0x8001_2000;
+        const SEEK: u32 = 0x8001_3000;
+        const SP: u32 = 0x801F_F000;
+        const OLD_STATUS: u32 = 0x8002_1000;
+        const DST: u32 = 0x8003_0000;
+        struct Disc(Rc<Cell<u32>>);
+        impl psx_bios::Host for Disc {
+            fn log(&mut self, _: u32, _: &str) {}
+            fn wait_vblank(&mut self, _: u64) {}
+            fn disc_read(&mut self, lba: u32, raw: &mut [u8; cd::RAW]) -> bool {
+                self.0.set(self.0.get() + 1);
+                assert!(lba < 2);
+                *raw = [0; cd::RAW];
+                raw[1..11].fill(0xFF);
+                raw[12..15].copy_from_slice(&cd::lba_to_msf(lba));
+                raw[15] = 2;
+                raw[0x18..0x818].fill(0x5A + lba as u8);
+                let edc = cd::edc(&raw[0x10..0x818]);
+                raw[0x818..0x81C].copy_from_slice(&edc.to_le_bytes());
+                true
+            }
+            fn has_disc(&mut self) -> bool { true }
+            fn pad_state(&mut self, _: u32) -> Vec<u8> { vec![] }
+            fn storage_read(&mut self, _: &str) -> Option<Vec<u8>> { None }
+            fn storage_write(&mut self, _: &str, _: &[u8]) -> bool { false }
+            fn report(&mut self, _: &str) {}
+        }
+        struct AcceptRegs { sp: u32, budget: u32, resets: Rc<Cell<u32>> }
+        impl psx_bios::Regs for AcceptRegs {
+            fn sp(&self) -> u32 { self.sp }
+            fn set_sp(&mut self, sp: u32) { self.sp = sp; }
+            fn gp(&self) -> u32 { 0 }
+            fn set_gp(&mut self, _: u32) {}
+            fn budget(&self) -> u32 { self.budget }
+            fn reset_budget(&mut self) {
+                self.budget = LOOP_BUDGET as u32;
+                self.resets.set(self.resets.get() + 1);
+            }
+        }
+        struct AcceptGuest<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            command: u32,
+            mode: u32,
+            saved: u32,
+            installs: u32,
+            commands: u64,
+        }
+        impl Invoke for AcceptGuest<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                let mut m = self.rt.borrow_mut();
+                assert_eq!(m.regs.sp(), SP - 24);
+                if call.addr == SEEK {
+                    assert!(!m.in_irq);
+                    assert_eq!(call.args, [SP - 8, 0, 0, 0]);
+                    assert_eq!(m.mem.bytes(SP - 8, 3), [0, 2, 0]);
+                    // Software seek completion leaves the initial native status
+                    // busy, so A7E must retry before it can start a real read.
+                    assert!(matches!(bios::dispatch(&mut m, 0xB0, 0x07,
+                        [cdrom::EV_CD, cdrom::DNE, 0, 0]).unwrap(), Flow::Return(_)));
+                    return 1;
+                }
+                if call.addr == INSTALL {
+                    assert!(m.in_irq);
+                    assert_eq!(m.clock.now, 0, "callback runs at the first yield");
+                    assert_eq!(m.regs.budget() as u64, LOOP_BUDGET);
+                    assert_eq!(m.mem.r8(OLD_STATUS), 0xEE, "pending work was not forced to finish");
+                    self.installs += 1;
+                    m.mem.w32(tables::entry(0xA0, self.command).unwrap(), COMMAND);
+                    if self.mode == 2 {
+                        assert!(matches!(bios::dispatch(&mut m, 0xA0, 0x95, [0; 4]).unwrap(), Flow::Return(1)));
+                        assert!(!m.event_ready(m.kernel.cd.events[4]), "reset is not an INT5");
+                    }
+                    return 0;
+                }
+                assert_eq!(call.addr, COMMAND);
+                assert!(!m.in_irq, "command is an ordinary call");
+                assert_eq!(call.args, if self.command == 0x78 { [SP - 8, 0, 0, 0] } else { [2, DST, 0x80, 0] });
+                assert_eq!(m.regs.budget() as u64, LOOP_BUDGET);
+                self.commands += 1;
+                let (t, f) = tables::stand_in_fn(self.saved).unwrap();
+                match bios::call(&mut m, t, f, call.args).unwrap() {
+                    Flow::Return(v) => v,
+                    _ => panic!("async command must not block"),
+                }
+            }
+        }
+        for command in [0x78, 0x7E] {
+            for mode in 0..3 { // native, patch at yield, patch plus native reset
+                let rt = machine();
+                let resets = Rc::new(Cell::new(0));
+                let reads = Rc::new(Cell::new(0));
+                let (flow, saved, due) = {
+                    let mut m = rt.borrow_mut();
+                    m.host = Box::new(Disc(reads.clone()));
+                    m.regs = Box::new(AcceptRegs { sp: SP, budget: 7, resets: resets.clone() });
+                    m.opts.safepoint_quantum = 13_000; // not the default quantum
+                    m.cd_init();
+                    m.mem.w8(OLD_STATUS, 0xEE);
+                    assert!(matches!(bios::dispatch(&mut m, 0xA0, 0x7C,
+                        [OLD_STATUS, 0, 0, 0]).unwrap(), Flow::Return(1)));
+                    let due = m.cd_due();
+                    let saved = m.mem.r32(tables::entry(0xA0, command).unwrap());
+                    if command == 0x7E { m.mem.w32(tables::entry(0xA0, 0x78).unwrap(), SEEK); }
+                    let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 0, DST, 0]).unwrap();
+                    if mode != 0 { m.calls.push_back(GuestCall { addr: INSTALL, args: [0; 4] }); }
+                    (flow, saved, due)
+                };
+                let yields = if mode == 2 { 1 } else { due.div_ceil(rt.borrow().quantum()) };
+                let attempts = yields * LOOP_BUDGET + 1;
+                assert!(attempts < 99999);
+                let mut guest = AcceptGuest { rt: &rt, command, mode, saved, installs: 0, commands: 0 };
+                assert_eq!(run(&rt, &mut guest, flow), 2);
+                let m = rt.borrow();
+                assert_eq!(m.regs.sp(), SP);
+                assert_eq!(m.mem.r8(OLD_STATUS), if mode == 2 { 0xEE } else { 2 });
+                assert_eq!(m.mem.bytes(DST, 16), [0x5A; 16]);
+                assert_eq!(m.mem.bytes(DST + 0x800, 16), [0x5B; 16]);
+                assert_eq!(reads.get(), 2, "one read, not a duplicate native start");
+                assert_eq!(m.counts[&format!("bios.A0h:{command:02X}h {}", bios::name(0xA0, command))], attempts);
+                assert_eq!(resets.get() as u64, yields);
+                assert_eq!(guest.installs, if mode == 0 { 0 } else { 1 });
+                assert_eq!(guest.commands, if mode == 0 { 0 } else { attempts - LOOP_BUDGET });
+                assert!(!m.event_ready(m.kernel.cd.events[1]));
+                assert!(m.clock.pending(|e| *e == psx_bios::Event::Cd).is_none());
+            }
+        }
     }
 
     /// The ABI 10 host: `vblank` at every delivered vblank, `wait_vblank`
@@ -279,7 +579,7 @@ mod tests {
         let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
         let hold = std::rc::Rc::new(crate::hold::Hold::new());
         let host = Paced { seen: seen.clone(), hold: hold.clone() };
-        let rt = RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(host), Box::new(Regs), Default::default(), Psyq::default()));
+        let rt = RefCell::new(Machine::new(Box::new(VecMem::default()), Box::new(host), Box::new(Regs(0x801F_F000)), Default::default(), Psyq::default()));
         let mut g = Guest { rt: &rt, rfe: vec![], seen: vec![] };
         let vblank = psx_devices::clock::CPU_HZ / 60;
         let run_vblanks = |g: &mut Guest, n: u64| {
@@ -374,6 +674,84 @@ mod tests {
         let addrs: Vec<u32> = g.seen.iter().map(|c| c.0).collect();
         assert_eq!(addrs, vec![0x8001_0000, 0x8001_0000]);
         assert!(rt.borrow().irq_calls.is_empty());
+    }
+
+    #[test]
+    fn native_kernel_callbacks_and_patched_chain_functions() {
+        use psx_bios::kernel::{self, EV_ENABLED, EV_MODE_INTR};
+        use psx_devices::irq::VBLANK;
+        const EVENT: u32 = 0x8002_0000;
+        const DISABLED: u32 = EVENT + 4;
+        const NESTED: u32 = EVENT + 8;
+        const HANDLER: u32 = EVENT + 12;
+        const VERIFIER: u32 = EVENT + 16;
+        const LATER: u32 = EVENT + 20;
+        struct Patched<'a> {
+            rt: &'a RefCell<Machine<Psyq>>,
+            disable: u32,
+            seen: Vec<u32>,
+        }
+        impl Invoke for Patched<'_> {
+            fn invoke(&mut self, call: GuestCall) -> u64 {
+                let flow = self.rt.borrow_mut().kernel_call(call.addr, call.args);
+                if let Some(flow) = flow { return run(self.rt, self, flow); }
+                let mut m = self.rt.borrow_mut();
+                assert!(m.in_irq);
+                if call.addr == psxw_abi::BIOS_RETURN_FROM_EXCEPTION {
+                    m.rfe = true;
+                    return 0;
+                }
+                self.seen.push(call.addr);
+                assert_ne!(m.io.as_ref().unwrap().irq.stat & (1 << VBLANK), 0, "callback precedes ack");
+                match call.addr {
+                    EVENT => {
+                        m.kernel.clear_rcnt[3] = 0;
+                        m.set_ev_status(self.disable, kernel::EV_DISABLED);
+                        let f = psx_bios::bios::call(&mut m, 0xB0, 7, [0xF000_0042, 2, 0, 0]).unwrap();
+                        drop(m);
+                        run(self.rt, self, f)
+                    }
+                    HANDLER => { assert_eq!(call.args[0], 1); 0 }
+                    VERIFIER => 7,
+                    NESTED | LATER => 0,
+                    _ => panic!("unexpected callback {:#x}", call.addr),
+                }
+            }
+        }
+        let rt = machine();
+        let e = kernel::kernel_element(3);
+        let disable;
+        let saved_handler;
+        {
+            let mut m = rt.borrow_mut();
+            m.io = Some(Default::default());
+            m.io.as_mut().unwrap().irq.mask = 1 << VBLANK;
+            let event = m.open_event(0xF200_0003, 2, EV_MODE_INTR, EVENT);
+            disable = m.open_event(0xF200_0003, 2, EV_MODE_INTR, DISABLED);
+            let nested = m.open_event(0xF000_0042, 2, EV_MODE_INTR, NESTED);
+            for h in [event, disable, nested] { m.set_ev_status(h, EV_ENABLED); }
+            saved_handler = m.mem.r32(e + 4);
+            m.mem.w32(e + 4, HANDLER);
+        }
+        element(&rt, 2, 0x8000_1000, LATER, 0);
+        let mut guest = Patched { rt: &rt, disable, seen: vec![] };
+        rt.borrow_mut().raise_irq(VBLANK);
+        drain(&rt, &mut guest);
+        assert_eq!(guest.seen, [EVENT, NESTED, HANDLER, LATER]);
+        assert!(rt.borrow().calls.is_empty(), "nested event callbacks were not deferred");
+        // Patch only the verifier; the saved native handler is still callable
+        // and returns from the exception, skipping the lower-priority element.
+        {
+            let mut m = rt.borrow_mut();
+            m.mem.w32(e + 8, VERIFIER);
+            m.mem.w32(e + 4, saved_handler);
+            m.kernel.clear_rcnt[3] = 1;
+            m.queue_irq_chains();
+        }
+        drain(&rt, &mut guest);
+        assert_eq!(guest.seen, [EVENT, NESTED, HANDLER, LATER, VERIFIER]);
+        assert_eq!(rt.borrow().io.as_ref().unwrap().irq.stat & (1 << VBLANK), 0);
+        assert!(!rt.borrow().in_irq && !rt.borrow().rfe);
     }
 
     #[test]

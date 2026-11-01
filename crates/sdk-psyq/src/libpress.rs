@@ -15,15 +15,14 @@
 //!
 //! **The hardware.** The MDEC is the bus's core (`psx_devices::mdec`),
 //! driven through its decode function ([`Mdec::input`], [`Mdec::output`]),
-//! the one the device's DMA0 and DMA1 use. The channels are started
-//! through the shared DMA controller's registers as libpress writes them
-//! (MADR, BCR, CHCR; psyq-decomp's `func_00000428`/`func_000004B8`), and
-//! the controller moves the words: `DecDCTin`'s command and parameters in
-//! by DMA0, `DecDCTout`'s words out by DMA1, which waits, as its request
-//! line does, while a decode is still taking input and hasn't produced the
-//! words asked for; `DecDCTin`, a reset or a timeout lets it go. DMA1's
-//! busy bit is CHCR1's, as `DecDCToutSync` polls it. The channels'
-//! completions are held ([`psx_bios::Machine::dma_start_held`]): DICR's flags and
+//! the one the device's DMA0 and DMA1 use, without the register protocol:
+//! `DecDCTin`'s command and parameter words go in as the DMA0 transfer
+//! libpress programs would deliver them (blocks of 32 words, at least
+//! one), and `DecDCTout`'s words come out as DMA1 would take them. DMA1
+//! waits, as its request line does on the device, while a decode is still
+//! taking input and hasn't produced the words asked for; `DecDCTin`, a
+//! reset or a timeout lets it go. The channels' completions are the DMA
+//! controller's ([`psx_bios::Machine::dma_done_held`]): DICR's flags and
 //! IRQ3, so the callbacks `DecDCTinCallback`/`DecDCToutCallback` set run
 //! through libetc's DMA handler (its adapters' or its own). IRQ3 is held
 //! until the adapter returns, as one libpress's register write raises is
@@ -31,23 +30,23 @@
 //! player goes on decoding the next frame's run-length codes after
 //! `DecDCTout`, and the callbacks that load each slice come when that work
 //! reaches a safepoint, natively as on the device. DPCR gets libpress's
-//! enables.
+//! enables. CHCR0 and CHCR1 are left alone: DMA1's busy bit is
+//! [`Press::out`], which only libpress's own functions read.
 //!
 //! **Waits spin like libpress's loops** (the MDEC taking input, DMA1
-//! running): each iteration the original's 16 instructions from the
-//! guest's budget (D71), a safepoint (interrupts delivered) each time it
-//! runs out, and after 0x100000 iterations the timeout,
+//! running): a safepoint quantum per thousand iterations, interrupts
+//! delivered between quanta, and after 0x100000 iterations the timeout,
 //! which prints libpress's message through the game's `printf` and resets
 //! the MDEC and both channels, as the original does.
 //!
-//! DMA0's and DMA1's address and block registers hold what libpress wrote
-//! and, once a transfer ends, what the controller leaves (the address past
-//! the last word, no blocks left). `DecDCTPutEnv`'s table copies spend the
-//! guest's safepoint budget: two loops of 16 iterations, 5 instructions
-//! each.
+//! **What isn't reproduced.** DMA0 and DMA1's address and count registers
+//! after a transfer (nothing but the controller reads them); DPCR turning
+//! DMA1 off while it waits (libpress turns it on before every transfer);
+//! the safepoint budget libpress's own table copies spend (`DecDCTPutEnv`,
+//! 32 iterations).
 
 use crate::{Adapter, M, Psyq, Result, reg, set_reg};
-use psx_bios::{Flow, GuestCall};
+use psx_bios::{Flow, GuestCall, Wait};
 use psx_devices::mdec::Mdec;
 
 pub const ADAPTERS: &[(&str, Adapter)] = &[
@@ -106,13 +105,6 @@ const DPCR: u32 = psx_devices::dma::DPCR;
 /// DPCR's enables for DMA0 and DMA1, which libpress sets before each
 /// transfer.
 const ENABLES: u32 = 0x88;
-/// DMA0's and DMA1's address and block registers.
-const MADR0: u32 = 0x1F80_1080;
-const BCR0: u32 = 0x1F80_1084;
-const MADR1: u32 = 0x1F80_1090;
-const BCR1: u32 = 0x1F80_1094;
-const CHCR0: u32 = 0x1F80_1088;
-const CHCR1: u32 = 0x1F80_1098;
 /// The MDEC's control words libpress writes: reset, then both DMA
 /// requests on.
 const RESET: u32 = 0x8000_0000;
@@ -120,6 +112,8 @@ const REQUESTS: u32 = 0x6000_0000;
 /// libpress's wait loops count down from this; one more iteration is the
 /// timeout.
 const TIMEOUT: u32 = 0x10_0000;
+/// Guest loop iterations per safepoint (psxw-build's budget).
+const LOOP_BUDGET: u32 = 1000;
 
 /// Where `libpress/libpress` is in this game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +129,11 @@ pub struct Obj {
 #[derive(Debug, Default)]
 pub struct Press {
     pub obj: Option<Obj>,
+    /// DMA1, started by `DecDCTout` and not done: where its words go, and
+    /// how many (CHCR1's busy bit on the device).
+    pub out: Option<(u32, u32)>,
+    /// The phase of libpress's wait loops within a safepoint quantum.
+    pub phase: u32,
 }
 
 /// The address a `lui` at `hi` and an immediate at `lo` with the `lui`'s
@@ -180,12 +179,25 @@ fn fail(e: String) -> Flow<Psyq> {
 
 // --- DMA1 and the resets -----------------------------------------------------
 
-/// The shared controller runs what's ready, each completion held (D64):
-/// DMA1, which `DecDCTout` started, goes once the MDEC isn't holding it
-/// back (a decode still taking input that hasn't produced the words asked
-/// for). What the device does after every MDEC write.
+/// DMA1 as the controller runs it: a transfer `DecDCTout` started goes
+/// once the MDEC isn't holding it back (a decode still taking input that
+/// hasn't produced the words asked for), its words into RAM, then the
+/// channel's completion. What the device does after every MDEC write.
 fn pump(m: &mut M) -> std::result::Result<(), String> {
-    m.run_dma_held()
+    let Some((addr, n)) = m.sdk.press.out else { return Ok(()) };
+    let md = mdec(m)?;
+    if md.busy() && md.available() < n as usize {
+        return Ok(());
+    }
+    let words = md.output(n as usize);
+    m.sdk.press.out = None;
+    let mut a = addr & 0x1F_FFFC;
+    for w in words {
+        m.mem.w32(a, w);
+        a = a.wrapping_add(4) & 0x1F_FFFC;
+    }
+    m.dma_done_held(1);
+    Ok(())
 }
 
 /// DPCR with DMA0 and DMA1 on, as libpress sets it before a transfer.
@@ -201,10 +213,15 @@ fn enable(m: &mut M) -> std::result::Result<(), String> {
 fn stop(m: &mut M) -> std::result::Result<(), String> {
     mdec(m)?.control(RESET);
     pump(m)?;
-    set_reg(m, CHCR0, 4, 0)?;
-    set_reg(m, CHCR1, 4, 0)?;
+    m.sdk.press.out = None;
     mdec(m)?.control(REQUESTS);
     pump(m)
+}
+
+/// DMA blocks of 32 words, as libpress counts them into BCR: `n` words'
+/// worth, at least one block (what the controller makes of zero blocks).
+fn blocks(n: u32) -> u32 {
+    32 * ((n >> 5) & 0xFFFF).max(1)
 }
 
 // --- Waits -------------------------------------------------------------------
@@ -220,79 +237,55 @@ enum Busy {
     Out,
 }
 
-fn busy(m: &mut M, b: Busy) -> bool {
+fn busy(m: &M, b: Busy) -> bool {
     match b {
         Busy::In => m.io.as_ref().is_some_and(|io| io.mdec.command_busy()),
-        Busy::Out => reg(m, CHCR1, 4).is_ok_and(|c| c & psx_devices::dma::CHCR_BUSY != 0),
+        Busy::Out => m.sdk.press.out.is_some(),
     }
 }
 
-/// The waits (PsyQ 4.7 `libpress:0x4cc`, the input; `0x560`, DMA1), the
-/// same blocks from each: the first look (+0h..+28h); while busy (+2Ch),
-/// the countdown from 0x100000, a pass (+30h..+4Ch, +64h..+80h, its header
-/// at +30h) of 16 instructions (D71) a look; past zero, the timeout
-/// (+50h..+58h, then +5Ch..+60h); the return (+84h..+90h).
-fn base(b: Busy) -> u32 {
-    if b == Busy::In { 0x4CC } else { 0x560 }
+fn quantum(m: &M) -> u64 {
+    if m.opts.safepoint_quantum == 0 { 20_000 } else { m.opts.safepoint_quantum as u64 }
 }
 
-const WAIT_PASS: u32 = 16;
-
-/// `k` gets 0, or -1 after the timeout.
+/// `libpress:0x4cc` (the input) and `0x560` (DMA1): while busy, count
+/// down from 0x100000, timing out past zero. `k` gets 0, or -1 after the
+/// timeout.
 fn wait(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
-    let w = base(b);
-    crate::path(m, &[(w, w + 0x28)]);
     if !busy(m, b) {
-        crate::path(m, &[(w + 0x84, w + 0x90)]);
         return k(m, 0);
     }
-    crate::path(m, &[(w + 0x2C, w + 0x2C)]);
-    spin(m, o, b, TIMEOUT, k)
+    spin(m, o, b, TIMEOUT + 1, k)
 }
 
-/// The countdown's passes, `left` before the one that times out. What
-/// `busy` reads changes only at a safepoint, so after a pass that sees it
-/// busy, those up to the next safepoint are spent at once.
+/// `left` iterations to the timeout: those before the next safepoint, then
+/// a quantum (what fell due delivered, interrupts taken, those held
+/// included), and another look.
 fn spin(m: &mut M, o: Obj, b: Busy, left: u32, k: K) -> Flow<Psyq> {
-    crate::libspu::header(
-        m,
-        Box::new(move |m| {
-            let w = base(b);
-            if left == 0 {
-                crate::path(m, &[(w + 0x30, w + 0x4C), (w + 0x50, w + 0x58)]);
-                return timeout(m, o, b, k);
-            }
-            crate::path(m, &[(w + 0x30, w + 0x4C), (w + 0x64, w + 0x80)]);
-            if !busy(m, b) {
-                crate::path(m, &[(w + 0x84, w + 0x90)]);
-                return k(m, 0);
-            }
-            let room = crate::room(m, WAIT_PASS) as u32;
-            let n = room.min(left - 1);
-            crate::take(m, n as u64 * WAIT_PASS as u64);
-            if n == room {
-                return crate::safepoint(m, move |m| spin(m, o, b, left - 1 - n, k));
-            }
-            spin(m, o, b, left - 1 - n, k)
-        }),
-    )
+    let room = LOOP_BUDGET - m.sdk.press.phase.min(LOOP_BUDGET - 1);
+    if left < room {
+        m.sdk.press.phase += left;
+        return timeout(m, o, b, k);
+    }
+    m.sdk.press.phase = 0;
+    m.release_irq();
+    let until = m.clock.now + quantum(m);
+    m.run_until(until);
+    Flow::Block {
+        until: Wait::Cycle(until),
+        then: Box::new(move |m| if busy(m, b) { spin(m, o, b, left - room, k) } else { k(m, 0) }),
+    }
 }
 
 /// `libpress:0x60c`: "<what> timeout:" through `printf`, then the MDEC and
 /// both channels reset.
-fn timeout(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
-    crate::path(m, &[(0x60C, 0x624)]);
+fn timeout(_m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
     let what = o.rdata + if b == Busy::In { rdata::IN_SYNC } else { rdata::OUT_SYNC };
     Flow::Call {
         call: GuestCall { addr: o.printf, args: [o.rdata + rdata::TIMEOUT, what, 0, 0] },
-        then: Box::new(move |m, _| {
-            crate::path(m, &[(0x628, 0x684)]);
-            if let Err(e) = stop(m) {
-                return fail(e);
-            }
-            let w = base(b);
-            crate::path(m, &[(w + 0x5C, w + 0x60), (w + 0x84, w + 0x90)]);
-            k(m, u32::MAX)
+        then: Box::new(move |m, _| match stop(m) {
+            Ok(()) => k(m, u32::MAX),
+            Err(e) => fail(e),
         }),
     }
 }
@@ -304,22 +297,22 @@ fn timeout(m: &mut M, o: Obj, b: Busy, k: K) -> Flow<Psyq> {
 /// `p + 4`) into the MDEC; DMA0's completion, then DMA1's if it was waiting
 /// for them. `k` gets what the original leaves in v0 (DMA0's CHCR pointer).
 fn send(m: &mut M, o: Obj, p: u32, n: u32, k: K) -> Flow<Psyq> {
-    crate::path(m, &[(0x3B0, 0x3C8)]);
     wait(
         m,
         o,
         Busy::In,
         Box::new(move |m, _| {
-            crate::path(m, &[(0x3CC, 0x43C)]);
             let r = (|| -> std::result::Result<(), String> {
                 enable(m)?;
                 pump(m)?;
                 let cmd = m.mem.r32(p);
                 mdec(m)?.input(&[cmd]);
                 pump(m)?;
-                set_reg(m, MADR0, 4, p.wrapping_add(4) & 0x00FF_FFFF)?;
-                set_reg(m, BCR0, 4, (n >> 5) << 16 | 0x20)?;
-                m.dma_start_held(0, 0x0100_0201)
+                let from = p.wrapping_add(4) & 0x1F_FFFC;
+                let words: Vec<u32> = (0..blocks(n)).map(|i| m.mem.r32(from.wrapping_add(4 * i) & 0x1F_FFFC)).collect();
+                mdec(m)?.input(&words);
+                m.dma_done_held(0);
+                pump(m)
             })();
             match r {
                 Ok(()) => {
@@ -333,36 +326,13 @@ fn send(m: &mut M, o: Obj, p: u32, n: u32, k: K) -> Flow<Psyq> {
 }
 
 /// The tables in libpress's `.data` into the MDEC: quantization, then
-/// scale, the caller's blocks `between` and `after` the two.
-fn tables(m: &mut M, o: Obj, between: (u32, u32), after: (u32, u32), k: K) -> Flow<Psyq> {
-    send(
-        m,
-        o,
-        o.data + data::QUANT,
-        32,
-        Box::new(move |m, _| {
-            crate::path(m, &[between]);
-            send(
-                m,
-                o,
-                o.data + data::SCALE,
-                32,
-                Box::new(move |m, v| {
-                    crate::path(m, &[after]);
-                    k(m, v)
-                }),
-            )
-        }),
-    )
+/// scale.
+fn tables(m: &mut M, o: Obj, k: K) -> Flow<Psyq> {
+    send(m, o, o.data + data::QUANT, 32, Box::new(move |m, _| send(m, o, o.data + data::SCALE, 32, k)))
 }
 
-/// Return `v` after the blocks `tail` (each adapter's spends its
-/// original's path, D71).
-fn back(tail: &'static [(u32, u32)]) -> K {
-    Box::new(move |m, v| {
-        crate::path(m, tail);
-        Flow::ret(v)
-    })
+fn done() -> K {
+    Box::new(|_, v| Flow::ret(v))
 }
 
 // --- The adapters --------------------------------------------------------
@@ -373,47 +343,28 @@ fn back(tail: &'static [(u32, u32)]) -> K {
 fn dct_reset(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::RESET)?;
     let mode = a[0];
-    crate::path(m, &[(0x0, 0x10)]);
     if mode == 0 {
-        crate::path(m, &[(0x14, 0x18)]);
-        return Ok(Flow::Call {
-            call: GuestCall { addr: o.reset_callback, args: [0; 4] },
-            then: Box::new(move |m, _| {
-                crate::path(m, &[(0x1C, 0x20)]);
-                reset(m, o, mode)
-            }),
-        });
+        return Ok(Flow::Call { call: GuestCall { addr: o.reset_callback, args: [0; 4] }, then: Box::new(move |m, _| reset(m, o, mode)) });
     }
-    crate::path(m, &[(0x1C, 0x20)]);
     Ok(reset(m, o, mode))
 }
 
 /// `libpress:0x2c0`, the reset by mode.
 fn reset(m: &mut M, o: Obj, mode: u32) -> Flow<Psyq> {
-    const TAIL: &[(u32, u32)] = &[(0x3A0, 0x3AC), (0x24, 0x30)];
-    crate::path(m, &[(0x2C0, 0x2CC)]);
     match mode {
         0 | 1 => {
-            crate::path(m, if mode == 0 { &[(0x2E4, 0x328)] } else { &[(0x2D0, 0x2D8), (0x344, 0x390)] });
             if let Err(e) = stop(m) {
                 return fail(e);
             }
-            if mode == 1 {
-                return back(TAIL)(m, REQUESTS);
-            }
-            tables(m, o, (0x32C, 0x338), (0x33C, 0x340), back(TAIL))
+            if mode == 1 { Flow::ret(REQUESTS) } else { tables(m, o, done()) }
         }
-        _ => {
-            crate::path(m, &[(0x2D0, 0x2D8), (0x2DC, 0x2E0), (0x394, 0x39C)]);
-            Flow::Call { call: GuestCall { addr: o.printf, args: [o.rdata + rdata::BAD_OPTION, mode, 0, 0] }, then: Box::new(|m, v| back(TAIL)(m, v as u32)) }
-        }
+        _ => Flow::Call { call: GuestCall { addr: o.printf, args: [o.rdata + rdata::BAD_OPTION, mode, 0, 0] }, then: Box::new(|_, v| Flow::Return(v)) },
     }
 }
 
 /// `DecDCTPutEnv(env)`: the environment's quantization tables into
-/// libpress's (two copy loops of 16 passes, +E0h and +10Ch), then both of
-/// libpress's tables into the MDEC (the scale table is libpress's own, not
-/// the environment's). Returns `env`.
+/// libpress's, then both of libpress's tables into the MDEC (the scale
+/// table is libpress's own, not the environment's). Returns `env`.
 fn dct_put_env(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::PUT_ENV)?;
     let env = a[0];
@@ -422,17 +373,7 @@ fn dct_put_env(m: &mut M, a: [u32; 4]) -> Result {
         m.mem.w32(o.data + data::LUMA + 4 * i, luma);
         m.mem.w32(o.data + data::CHROMA + 4 * i, chroma);
     }
-    crate::path(m, &[(0xC0, 0xDC)]);
-    let none = || std::rc::Rc::new(|_: &mut M, _: u32| {});
-    let load: crate::libspu::K = Box::new(move |m| {
-        crate::path(m, &[(0x124, 0x130)]);
-        tables(m, o, (0x134, 0x140), (0x144, 0x154), Box::new(move |_, _| Flow::ret(env)))
-    });
-    let chroma: crate::libspu::K = Box::new(move |m| {
-        crate::path(m, &[(0xF8, 0x108)]);
-        crate::libspu::each(m, 0, 16, 6, none(), load)
-    });
-    Ok(crate::libspu::each(m, 0, 16, 6, none(), chroma))
+    Ok(tables(m, o, Box::new(move |_, _| Flow::ret(env))))
 }
 
 /// `DecDCTin(buf, mode)`: the command word's depth (mode bit 0: 24-bit,
@@ -446,36 +387,29 @@ fn dct_in(m: &mut M, a: [u32; 4]) -> Result {
     w = if mode & 1 != 0 { w & !0x0800_0000 } else { w | 0x0800_0000 };
     w = if mode & 2 != 0 { w | 0x0200_0000 } else { w & !0x0200_0000 };
     m.mem.w32(buf, w);
-    let depth = if mode & 1 != 0 { (0x168, 0x178) } else { (0x17C, 0x184) };
-    let half = if mode & 2 != 0 { (0x198, 0x1A0) } else { (0x1A4, 0x1B0) };
-    crate::path(m, &[(0x158, 0x164), depth, (0x188, 0x194), half, (0x1B4, 0x1C0)]);
-    Ok(send(m, o, buf, w & 0xFFFF, back(&[(0x1C4, 0x1D0)])))
+    Ok(send(m, o, buf, w & 0xFFFF, done()))
 }
 
-/// `DecDCTout(buf, size)` (`libpress:0x440`): after the DMA1 wait, DMA1
-/// for `size` words (in blocks) into `buf`, now or when the MDEC has them.
+/// `DecDCTout(buf, size)`: after the DMA1 wait, DMA1 for `size` words (in
+/// blocks) into `buf`, now or when the MDEC has them.
 fn dct_out(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::DCT_OUT)?;
     let (buf, size) = (a[0], a[1]);
-    crate::path(m, &[(0x1D4, 0x1E0), (0x440, 0x458)]);
     Ok(wait(
         m,
         o,
         Busy::Out,
         Box::new(move |m, _| {
-            crate::path(m, &[(0x45C, 0x4C8)]);
             let r = (|| -> std::result::Result<(), String> {
                 enable(m)?;
                 pump(m)?;
-                set_reg(m, CHCR1, 4, 0)?;
-                set_reg(m, MADR1, 4, buf & 0x00FF_FFFF)?;
-                set_reg(m, BCR1, 4, (size >> 5) << 16 | 0x20)?;
-                m.dma_start_held(1, 0x0100_0200)
+                m.sdk.press.out = Some((buf, blocks(size)));
+                pump(m)
             })();
             match r {
                 Ok(()) => {
                     let v = m.mem.r32(o.data + data::CHCR1_PTR);
-                    back(&[(0x1E4, 0x1F0)])(m, v)
+                    Flow::ret(v)
                 }
                 Err(e) => fail(e),
             }
@@ -484,15 +418,12 @@ fn dct_out(m: &mut M, a: [u32; 4]) -> Result {
 }
 
 /// `DecDCTinSync(mode)`: mode 0 waits while the MDEC takes input (0, or
-/// -1 after the timeout); otherwise whether it is (`libpress:0x5f4`).
+/// -1 after the timeout); otherwise whether it is.
 fn dct_in_sync(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::IN_SYNC)?;
-    crate::path(m, &[(0x1F4, 0x1FC)]);
     if a[0] == 0 {
-        crate::path(m, &[(0x200, 0x204)]);
-        return Ok(wait(m, o, Busy::In, back(&[(0x208, 0x20C), (0x220, 0x22C)])));
+        return Ok(wait(m, o, Busy::In, done()));
     }
-    crate::path(m, &[(0x210, 0x214), (0x5F4, 0x608), (0x218, 0x21C), (0x220, 0x22C)]);
     Ok(Flow::ret(busy(m, Busy::In) as u32))
 }
 
@@ -500,12 +431,9 @@ fn dct_in_sync(m: &mut M, a: [u32; 4]) -> Result {
 /// timeout); otherwise whether it does.
 fn dct_out_sync(m: &mut M, a: [u32; 4]) -> Result {
     let o = obj(m, at::OUT_SYNC)?;
-    crate::path(m, &[(0x230, 0x238)]);
     if a[0] == 0 {
-        crate::path(m, &[(0x23C, 0x240)]);
-        return Ok(wait(m, o, Busy::Out, back(&[(0x244, 0x248), (0x268, 0x274)])));
+        return Ok(wait(m, o, Busy::Out, done()));
     }
-    crate::path(m, &[(0x24C, 0x264), (0x268, 0x274)]);
     Ok(Flow::ret(busy(m, Busy::Out) as u32))
 }
 
@@ -604,10 +532,6 @@ mod tests {
         // 16×16 halfwords: 128 words.
         assert_eq!(run(&mut m, at::DCT_OUT, dct_out, [OUT, 128, 0, 0]), 0x1F80_1098);
         assert_eq!(irq_calls(), vec![CALLBACK], "DMA1's callback");
-        // The controller's registers as the transfers leave them.
-        let d = &m.io.as_ref().unwrap().dma;
-        assert_eq!((d.madr[0], d.bcr[0]), ((IN + 4 + 4 * 32) & 0x1F_FFFC, 0x20));
-        assert_eq!((d.madr[1], d.bcr[1]), ((OUT + 4 * 128) & 0x1F_FFFC, 0x20));
         let px = m.mem.r32(OUT);
         assert_eq!(px & 0x8000, 0x8000);
         assert!((0..128).all(|i| m.mem.r32(OUT + 4 * i) == px), "flat");
@@ -638,13 +562,11 @@ mod tests {
         flat_macroblock(&mut m, IN, 40);
         run(&mut m, at::DCT_OUT, dct_out, [OUT, 256, 0, 0]);
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [1, 0, 0, 0]), 1);
-        // The wait for DMA1 times out after 0x100000 iterations of 16
-        // instructions and the start of one more (this machine has no guest
-        // budget: a quantum each 626 passes, 1,675 and some), prints, and
-        // resets: DMA1 takes zeros.
+        // The wait for DMA1 times out after 0x100001 iterations (1,048
+        // quanta and some), prints, and resets: DMA1 takes zeros.
         let t = m.clock.now;
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [0, 0, 0, 0]), u32::MAX);
-        assert_eq!((m.clock.now - t) / 20_000, 1675);
+        assert_eq!((m.clock.now - t) / 20_000, 1048);
         assert_eq!(irq_calls(), vec![PRINTF]);
         assert_eq!(run(&mut m, at::OUT_SYNC, dct_out_sync, [1, 0, 0, 0]), 0);
         assert_eq!(run(&mut m, at::IN_SYNC, dct_in_sync, [1, 0, 0, 0]), 0);

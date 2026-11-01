@@ -125,7 +125,6 @@ fn run(words: &[u32], args: [u32; 4], data: &[u8]) -> Option<Run> {
     );
     let program = Program {
         main: "test".into(),
-        through_pointers: Default::default(),
         containers: [("test".to_string(), Code { id: "test".into(), text: vec![text.clone()], data: vec![], starts })].into(),
     };
     let originals = Originals::from_images(vec![("test".into(), BASE, code.clone())]);
@@ -152,7 +151,7 @@ fn run(words: &[u32], args: [u32; 4], data: &[u8]) -> Option<Run> {
     let map = AddressMap::synthetic("test", vec![container]);
     let input = Input { label: "f".into(), container: "test".into(), obj, protos: BTreeMap::new(), generated: true, gcc: None };
     let export = ExportSpec { name: "t".into(), input: 0, function: t.cname.clone(), o32: false };
-    let linked = psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None, costs: None }, &[input], &[export])
+    let linked = psxw_link::link(&map, None, Mode::Harness { sp: STACK_TOP, gp: 0, dirty: None }, &[input], &[export])
         .expect("links");
     wasmparser::Validator::new().validate_all(&linked.wasm).expect("valid module");
     let mut h = Harness::new(&linked.wasm, &[(BASE, &code), (DATA, data)], BTreeMap::new(), 1_000_000).expect("instantiates");

@@ -110,9 +110,9 @@ export class Calls {
 
 /** A snapshot's indexes and types, for its `game`s. */
 class Names {
-  constructor(snapshot, mem, ptr) {
+  constructor(snapshot, mem, window) {
     this.snapshot = snapshot;
-    this.types = new Types(snapshot, mem, ptr);
+    this.types = new Types(snapshot, mem, window);
     this.main = snapshot.main;
     this.containers = new Map(snapshot.containers.map((c) => [c.id, c]));
     this.functions = new Map();
@@ -183,16 +183,10 @@ export class ScriptHost {
    * bundle's (snapshot.json); `calls`: the queued calls; `log(text)`: a
    * line for the page and the run's logs; `status(text)`: for the page.
    */
-  constructor({ exports, loader, snapshot, calls, log, status }) {
+  constructor({ exports, loader, snapshot, windowBase, calls, log, status }) {
     this.x = exports;
     this.loader = loader;
-    // The wasm address of `n` bytes at guest address `a`, through the
-    // console's map (psxw-abi `exports::GUEST_PTR`); no memory there throws.
-    this.ptr = (a, n, store) => {
-      const p = exports.psxw_guest_ptr(a | 0, n, store ? 1 : 0) >>> 0;
-      if (!p) throw new RangeError(`no memory for ${n} bytes at guest address ${hex(a)}`);
-      return p;
-    };
+    this.window = windowBase;
     this.calls = calls;
     this.logLine = log;
     this.status = status;
@@ -203,7 +197,7 @@ export class ScriptHost {
     // Errors that came out of game code, which handlers pass on.
     this.fromGame = new WeakSet();
     this.dv = () => new DataView(this.x.memory.buffer);
-    this.names = new Names(snapshot, this.dv, this.ptr);
+    this.names = new Names(snapshot, this.dv, windowBase);
     this.snapshots = new Map([[snapshot.source?.version ?? "bundle", this.names]]);
     this.records = new Map();
     this.pending = [];
@@ -267,7 +261,7 @@ export class ScriptHost {
     const newSp = (sp - frame) | 0;
     if (words.length > 4) {
       const dv = new DataView(x.memory.buffer);
-      for (let k = 4; k < words.length; k++) dv.setUint32(this.ptr(newSp + 4 * k, 4, true), words[k] >>> 0, true);
+      for (let k = 4; k < words.length; k++) dv.setUint32(this.window + ((newSp + 4 * k) & 0xffffff), words[k] >>> 0, true);
     }
     x.__guest_sp.value = newSp;
     try {
@@ -334,15 +328,15 @@ export class ScriptHost {
   // --- what a mod sees --------------------------------------------------
 
   makeMem() {
-    const p = this.ptr;
+    const w = this.window;
     const dv = () => new DataView(this.x.memory.buffer);
     const m = {};
-    for (const [t, [n, get, set]] of Object.entries(SCALARS)) {
-      m[t] = (a) => dv()[get](p(a, n, false), true);
-      m[`set${t[0].toUpperCase()}${t.slice(1)}`] = (a, v) => dv()[set](p(a, n, true), Number(v), true);
+    for (const [t, [, get, set]] of Object.entries(SCALARS)) {
+      m[t] = (a) => dv()[get](w + (a & 0xffffff), true);
+      m[`set${t[0].toUpperCase()}${t.slice(1)}`] = (a, v) => dv()[set](w + (a & 0xffffff), Number(v), true);
     }
-    m.bytes = (a, n) => new Uint8Array(this.x.memory.buffer, p(a, n, false), n).slice();
-    m.setBytes = (a, bytes) => new Uint8Array(this.x.memory.buffer, p(a, bytes.length, true), bytes.length).set(bytes);
+    m.bytes = (a, n) => new Uint8Array(this.x.memory.buffer, w + (a & 0xffffff), n).slice();
+    m.setBytes = (a, bytes) => new Uint8Array(this.x.memory.buffer, w + (a & 0xffffff), bytes.length).set(bytes);
     return Object.freeze(m);
   }
 
@@ -553,7 +547,7 @@ export class ScriptHost {
     const module = await import(url);
     const d = module.default;
     if (!d || !d[MOD]) throw new Error(`${pack.id}: its default export isn't mod(factory)`);
-    return { url, factory: d[MOD], names: new Names(pack.snapshot, this.dv, this.ptr) };
+    return { url, factory: d[MOD], names: new Names(pack.snapshot, this.dv, this.window) };
   }
 
   /** A snapshot by URL, read once. */
@@ -561,7 +555,7 @@ export class ScriptHost {
     if (!this.snapshots.has(url)) {
       const r = await fetch(url);
       if (!r.ok) throw new Error(`${url}: ${r.status}`);
-      this.snapshots.set(url, new Names(await r.json(), this.dv, this.ptr));
+      this.snapshots.set(url, new Names(await r.json(), this.dv, this.window));
     }
     return this.snapshots.get(url);
   }

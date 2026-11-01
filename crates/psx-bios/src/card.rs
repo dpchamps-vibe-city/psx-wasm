@@ -1,46 +1,39 @@
 //! The BIOS memory card functions (psx-spx "BIOS Memory Card Functions"
-//! and "BIOS File Functions" on device `bu`), over the cards in SIO0's
-//! slots (D68), images the host stores (`card0.mcr`, `card1.mcr`).
+//! and "BIOS File Functions" on device `bu`), over [`Card`] images the host
+//! stores (`card0.mcr`, `card1.mcr`).
 //!
-//! - The driver talks to a card as the port does: each sector read or
-//!   write is the card's own protocol, a byte at a time
-//!   (`memcard::Responder`): its FLAG (a new card), the sector it
-//!   confirms, the data, the checksum and the end byte decide the outcome
-//!   (OpenBIOS `sio0/card.c`).
 //! - Slot 1 always holds a card: the stored image, or a freshly formatted
 //!   one. Slot 2 holds one only when its image exists (the oracle's
 //!   default has memory card 2 off).
 //! - Every card access the BIOS makes delivers the low-level driver's
 //!   completion event (F0000011h): 04h done, 100h no card, 2000h new
 //!   card, 8000h error. The higher-level event (F4000001h, same specs)
-//!   comes only from the A-table functions (`_card_info`, `_card_load`,
-//!   `card_write_test`) and asynchronous file I/O, as in OpenBIOS
-//!   (`sio0/driver.c`, `card/backupunit.c`). libmcrd waits on exactly
+//!   comes from `_card_info`, `_card_load` and asynchronous file I/O,
+//!   as in OpenBIOS (`sio0/driver.c`, `card/backupunit.c`). The existing
+//!   `card_write_test` high notification remains unverified: OpenBIOS
+//!   leaves A(AFh) unimplemented. libmcrd waits on exactly
 //!   this split: on F0000011h after `_card_read`/`_card_write` and after
 //!   a `firstfile` that finds nothing, on F4000001h after `_card_info`,
 //!   `_card_load` and file reads and writes.
 //! - Sector I/O (`_card_read`, `_card_write`, `_card_info`, `_card_load`)
-//!   is asynchronous: one operation completes per vblank, in the kernel's
-//!   pad and card handler once `StartCARD2` has started the cards, as the
-//!   BIOS paces it.
+//!   is asynchronous: one operation completes per vblank, as the BIOS
+//!   paces it.
 //! - A card is "new" from insertion until a sector write; while it is,
 //!   I/O fails with 2000h unless `_new_card` was called first.
-//! - The `bu` device's functions (A(65h..6Eh), reached through its DCB,
-//!   `crate::files`) read the directory from the card's image, and move
-//!   their frames through the protocol, after the check the BIOS makes
-//!   first (`card_check`: a synchronous read of frame 0, whose event is
-//!   delivered during the call). The FCB holds the port, the file's first
-//!   block (its LBA) and size. Reads and writes are in 128-byte frames. A
-//!   file opened with mode bit 15 is asynchronous: `read`/`write` return 0
-//!   once the request is accepted (libmcrd retries until they do), and it
-//!   completes one frame per vblank, delivering event class `fd` and
-//!   F4000001h with spec 04h at the end.
+//! - File functions on `buXY:` work on the directory directly, after the
+//!   check the BIOS makes first (`card_check`: a synchronous
+//!   read of frame 0, whose event is delivered during the call). Reads
+//!   and writes are in 128-byte frames. A file opened with mode bit 15 is
+//!   asynchronous: `read`/`write` return 0 once the request is accepted
+//!   (libmcrd retries until they do), and it completes one frame per
+//!   vblank, delivering event class `fd` and F4000001h with spec 04h at
+//!   the end.
 //! - Changed images are written back to host storage at vblank.
 
-use crate::files::{ASYNC, CREATE, E_ALIGN, E_EXISTS, E_FULL, E_GENERAL, E_NOT_FOUND, fcb};
-use crate::machine::{Machine, Sdk};
-use psx_devices::memcard::{self, Card, FileInfo, Responder};
-use std::collections::VecDeque;
+use crate::files::{fcb, fcb_at};
+use crate::machine::{Flow, Machine, Sdk, Wait};
+use psx_devices::memcard::{self, Card};
+use std::collections::{BTreeMap, VecDeque};
 
 pub const EV_LOW: u32 = 0xF000_0011;
 pub const EV_HIGH: u32 = 0xF400_0001;
@@ -57,54 +50,81 @@ pub const BUSY_INFO: u32 = 0x08;
 pub const FAIL_TIMEOUT: u32 = 0x11;
 pub const FAIL_GENERAL: u32 = 0x21;
 
+/// File error numbers (`_get_errno`).
+pub const E_NOT_FOUND: u32 = 0x02;
+pub const E_BAD_FD: u32 = 0x09;
+pub const E_GENERAL: u32 = 0x10;
+pub const E_EXISTS: u32 = 0x11;
+pub const E_NO_DEVICE: u32 = 0x13;
+pub const E_ALIGN: u32 = 0x16;
+pub const E_NO_FDS: u32 = 0x18;
+pub const E_FULL: u32 = 0x1C;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Op {
     Read { frame: u32, dst: u32 },
-    /// `high`: `card_write_test` (A-table), which also delivers F4000001h.
+    /// `high`: the existing `card_write_test` notification policy; unverified.
     Write { frame: u32, data: Vec<u8>, high: bool },
-    Info,
-    Load,
-    /// An asynchronous file read or write whose bytes already moved; only
-    /// its pacing (a frame per vblank) and completion event are pending.
-    FileFrame,
-    FileDone { fd: u32 },
+    /// `high`: `_card_info` (A-table), which also delivers F4000001h.
+    Info { high: bool },
+    Load { high: bool },
+    /// One frame of an asynchronous file read or write, moved when the
+    /// operation completes. `buf` is where that frame goes or comes from;
+    /// `id` identifies the file open that requested it.
+    FileFrame { fd: u32, id: u64, frame: u32, buf: u32, to_card: bool, last: bool },
+    /// The final card-info stage of an asynchronous write: its file's
+    /// completion event, then the higher-level card event.
+    FileDone { fd: u32, id: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardFile {
+    /// Identifies this open across fd reuse.
+    pub id: u64,
+    /// The exact device id the file was opened on (00h or 10h).
+    pub device: u32,
+    pub slot: usize,
+    pub name: String,
+    pub size: u32,
+    pub pos: u32,
+    pub asynchronous: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Cards {
+    pub slots: [Option<Card>; 2],
     loaded: bool,
     /// `InitCARD2` ran before (its return value).
     initialized: bool,
     ignore_new: [bool; 2],
     pub status: [u32; 2],
-    pending: VecDeque<(usize, Op)>,
-    pub auto_format: bool,
+    /// The slot whose card operation completed last.
+    last: Option<usize>,
+    /// `mcGetLastDevice`: the requested device id (00h or 10h).
+    last_device: Option<u32>,
+    pending: VecDeque<(usize, u32, Op)>,
+    next_file_id: u64,
+    pub files: BTreeMap<u32, CardFile>,
+    pub errno: u32,
+    pub auto_format: u32,
     pub find_mode: u32,
     /// firstfile/nextfile: (slot, pattern, next directory index).
     search: Option<(usize, String, usize)>,
 }
 
+/// `buXY:NAME` → (slot, device id, name).
+pub fn parse_path(path: &str) -> Option<(usize, u32, String)> {
+    let lower = path.to_ascii_lowercase();
+    let rest = lower.strip_prefix("bu")?;
+    let (dev, _) = rest.split_once(':')?;
+    let device = u32::from_str_radix(dev, 16).ok()?;
+    let name = &path[path.find(':')? + 1..];
+    Some((slot_of(device), device, name.to_string()))
+}
+
 /// Port (00h, 10h, …) → slot.
 fn slot_of(port: u32) -> usize {
     ((port >> 4) & 1) as usize
-}
-
-/// The card in the port's `slot`; none without a bus.
-pub fn slot_card(io: &mut Option<crate::io::Io>, slot: usize) -> Option<&mut Card> {
-    io.as_mut()?.sio0.slots[slot].as_mut()
-}
-
-/// How a transfer with a card ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Xfer {
-    /// Nothing acknowledged the card's address.
-    NoCard,
-    /// The FLAG byte says new card, and the driver wasn't told to accept it.
-    NewCard,
-    /// The card refused the sector, or the transfer went wrong (checksum,
-    /// end byte).
-    Error,
-    Done(Vec<u8>),
 }
 
 impl<S: Sdk> Machine<S> {
@@ -116,78 +136,19 @@ impl<S: Sdk> Machine<S> {
         self.kernel.cards.loaded = true;
         let c0 = self.host.storage_read("card0.mcr").and_then(|b| Card::from_image(&b)).unwrap_or_else(Card::formatted);
         let c1 = self.host.storage_read("card1.mcr").and_then(|b| Card::from_image(&b));
-        if let Some(io) = self.io.as_mut() {
-            io.sio0.slots = [Some(c0), c1];
-        }
+        self.kernel.cards.slots = [Some(c0), c1];
         self.kernel.cards.status = [READY; 2];
-    }
-
-    /// A sector read through the port: 81h, 52h, the sector, and the
-    /// card's answers (psx-spx "Memory Card Read/Write Commands").
-    fn xfer_read(&mut self, slot: usize, frame: u32, accept_new: bool) -> Xfer {
-        let mut r = Responder::default();
-        let io = &mut self.io;
-        let mut send = |b: u8| -> (u8, bool) {
-            let got = r.next().unwrap_or(0xFF);
-            (got, r.byte(slot_card(io, slot), b).is_some())
-        };
-        if !send(0x81).1 {
-            return Xfer::NoCard;
-        }
-        let (flag, _) = send(b'R');
-        if flag & 8 != 0 && !accept_new {
-            return Xfer::NewCard;
-        }
-        let head: Vec<u8> = [0, 0, (frame >> 8) as u8, frame as u8, 0, 0, 0, 0].iter().map(|&b| send(b).0).collect();
-        let confirmed = (head[6] as u32) << 8 | head[7] as u32;
-        if head[..2] != [0x5A, 0x5D] || confirmed != frame {
-            return Xfer::Error;
-        }
-        let data: Vec<u8> = (0..memcard::FRAME).map(|_| send(0).0).collect();
-        let (sum, end) = (send(0).0, send(0).0);
-        let want = data.iter().fold((frame >> 8) as u8 ^ frame as u8, |a, b| a ^ b);
-        if sum != want || end != b'G' {
-            return Xfer::Error;
-        }
-        Xfer::Done(data)
-    }
-
-    /// A sector write through the port: 81h, 57h, the sector, the frame,
-    /// its checksum, and the card's end byte.
-    fn xfer_write(&mut self, slot: usize, frame: u32, data: &[u8], accept_new: bool) -> Xfer {
-        let mut r = Responder::default();
-        let io = &mut self.io;
-        let mut send = |b: u8| -> (u8, bool) {
-            let got = r.next().unwrap_or(0xFF);
-            (got, r.byte(slot_card(io, slot), b).is_some())
-        };
-        if !send(0x81).1 {
-            return Xfer::NoCard;
-        }
-        let (flag, _) = send(b'W');
-        if flag & 8 != 0 && !accept_new {
-            return Xfer::NewCard;
-        }
-        let (msb, lsb) = ((frame >> 8) as u8, frame as u8);
-        for b in [0, 0, msb, lsb] {
-            send(b);
-        }
-        for &b in &data[..memcard::FRAME] {
-            send(b);
-        }
-        let sum = data[..memcard::FRAME].iter().fold(msb ^ lsb, |a, b| a ^ b);
-        send(sum);
-        let end = [0, 0, 0].iter().map(|&b| send(b).0).last().unwrap_or(0xFF);
-        if end == b'G' { Xfer::Done(Vec::new()) } else { Xfer::Error }
     }
 
     /// The driver's completion event, and the higher-level one when an
     /// A-table function or file I/O asked for the access.
     fn card_event(&mut self, spec: u32, high: bool) {
-        self.deliver_event(EV_LOW, spec);
+        // The completion callback delivers the higher-level event before
+        // the driver's low-level event (OpenBIOS `driver.c`).
         if high {
             self.deliver_event(EV_HIGH, spec);
         }
+        self.deliver_event(EV_LOW, spec);
     }
 
     /// The check the BIOS's `bu` functions make before using the
@@ -196,24 +157,37 @@ impl<S: Sdk> Machine<S> {
     /// (2000h); the BIOS then reloads the card, accepting it (its write
     /// of frame 3Fh clears the flag), and the rereads complete (04h).
     /// False when the slot is empty (100h).
-    fn card_check(&mut self, slot: usize) -> bool {
+    fn card_check(&mut self, slot: usize, device: u32) -> bool {
         self.cards_ready();
+        self.kernel.cards.last = Some(slot);
+        self.kernel.cards.last_device = Some(device);
         let ignore = std::mem::take(&mut self.kernel.cards.ignore_new[slot]);
-        match self.xfer_read(slot, 0, ignore) {
-            Xfer::NoCard => {
-                self.kernel.cards.status[slot] = FAIL_TIMEOUT;
-                self.card_event(SPEC_NO_CARD, false);
+        if self.kernel.cards.slots[slot].is_none() {
+            self.kernel.cards.status[slot] = FAIL_TIMEOUT;
+            self.card_event(SPEC_NO_CARD, false);
+            return false;
+        }
+        // The low-level read reports the card-change flag first; only then
+        // does buDevInit inspect the MC header and maybe format.
+        let new_card = self.kernel.cards.slots[slot].as_ref().is_some_and(|c| c.new_card) && !ignore;
+        if new_card {
+            let card = self.kernel.cards.slots[slot].as_mut().expect("checked");
+            card.new_card = false;
+            self.card_event(SPEC_NEW, false);
+        }
+        let bad_id = !self.kernel.cards.slots[slot].as_ref().is_some_and(|c| c.frame(0).starts_with(b"MC"));
+        if bad_id {
+            if self.kernel.cards.auto_format != 0 {
+                let card = self.kernel.cards.slots[slot].as_mut().expect("checked");
+                card.format();
+                card.new_card = false;
+            } else {
+                if !new_card {
+                    self.card_event(SPEC_DONE, false);
+                }
+                self.kernel.cards.status[slot] = FAIL_GENERAL;
                 return false;
             }
-            Xfer::NewCard => {
-                self.card_event(SPEC_NEW, false);
-                // The reload: frame 3Fh rewritten as it is, accepting the
-                // card, which clears its flag.
-                if let Xfer::Done(data) = self.xfer_read(slot, 0x3F, true) {
-                    self.xfer_write(slot, 0x3F, &data, true);
-                }
-            }
-            _ => {}
         }
         self.kernel.cards.status[slot] = READY;
         self.card_event(SPEC_DONE, false);
@@ -223,7 +197,7 @@ impl<S: Sdk> Machine<S> {
     /// Queue a low-level operation; false while the slot's last one is
     /// still running (OpenBIOS: flags bit 0 clear). A missing card fails
     /// later, with its event.
-    fn card_queue(&mut self, slot: usize, op: Op) -> bool {
+    fn card_queue(&mut self, slot: usize, device: u32, op: Op) -> bool {
         self.cards_ready();
         if self.kernel.cards.status[slot] & READY == 0 {
             return false;
@@ -234,7 +208,7 @@ impl<S: Sdk> Machine<S> {
             _ => BUSY_INFO,
         };
         self.kernel.cards.status[slot] = busy;
-        self.kernel.cards.pending.push_back((slot, op));
+        self.kernel.cards.pending.push_back((slot, device, op));
         true
     }
 
@@ -244,7 +218,7 @@ impl<S: Sdk> Machine<S> {
         if sector > memcard::FRAMES {
             return 0;
         }
-        self.card_queue(slot_of(port), Op::Read { frame: sector, dst }) as u32
+        self.card_queue(slot_of(port), port, Op::Read { frame: sector, dst }) as u32
     }
 
     /// `_card_write(port, sector, src)`: the frame is taken now.
@@ -254,15 +228,21 @@ impl<S: Sdk> Machine<S> {
         }
         let mut data = vec![0u8; memcard::FRAME];
         self.mem.read(src, &mut data);
-        self.card_queue(slot_of(port), Op::Write { frame: sector, data, high: false }) as u32
+        self.card_queue(slot_of(port), port, Op::Write { frame: sector, data, high: false }) as u32
     }
 
     pub fn card_info(&mut self, port: u32) -> u32 {
-        self.card_queue(slot_of(port), Op::Info) as u32
+        self.card_queue(slot_of(port), port, Op::Info { high: true }) as u32
+    }
+
+    /// `_card_info_subfunc(port)`: the lower-level `_card_info` operation,
+    /// whose completion reports only the driver's event.
+    pub fn card_info_subfunc(&mut self, port: u32) -> u32 {
+        self.card_queue(slot_of(port), port, Op::Info { high: false }) as u32
     }
 
     pub fn card_load(&mut self, port: u32) -> u32 {
-        self.card_queue(slot_of(port), Op::Load) as u32
+        self.card_queue(slot_of(port), port, Op::Load { high: true }) as u32
     }
 
     /// `card_write_test(port)`: rewrite frame 3Fh as it is, ignoring the
@@ -270,8 +250,8 @@ impl<S: Sdk> Machine<S> {
     pub fn card_write_test(&mut self, port: u32) -> u32 {
         let slot = slot_of(port);
         self.cards_ready();
-        let data = slot_card(&mut self.io, slot).map(|c| c.frame(0x3F).to_vec()).unwrap_or_else(|| vec![0; memcard::FRAME]);
-        let queued = self.card_queue(slot, Op::Write { frame: 0x3F, data, high: true });
+        let data = self.kernel.cards.slots[slot].as_ref().map(|c| c.frame(0x3F).to_vec()).unwrap_or_else(|| vec![0; memcard::FRAME]);
+        let queued = self.card_queue(slot, port, Op::Write { frame: 0x3F, data, high: true });
         self.kernel.cards.ignore_new[slot] |= queued;
         queued as u32
     }
@@ -290,240 +270,455 @@ impl<S: Sdk> Machine<S> {
         self.kernel.cards.ignore_new[slot_of(port)] = true;
     }
 
-    /// The pad and card handler's cards, at its vblank: one pending
-    /// operation completes.
-    pub fn card_step(&mut self) {
-        if let Some((slot, op)) = self.kernel.cards.pending.pop_front() {
-            self.card_complete(slot, op);
+    /// Complete one pending operation, and save changed images.
+    pub fn card_vblank(&mut self) {
+        if let Some((slot, device, op)) = self.kernel.cards.pending.pop_front() {
+            self.card_complete(slot, device, op);
         }
-    }
-
-    /// Changed images back to host storage (each vblank).
-    pub fn save_cards(&mut self) {
         for (i, name) in ["card0.mcr", "card1.mcr"].iter().enumerate() {
-            let Some(c) = slot_card(&mut self.io, i).filter(|c| c.dirty) else { continue };
+            let Some(c) = self.kernel.cards.slots[i].as_mut().filter(|c| c.dirty) else { continue };
             c.dirty = false;
             let data = c.data.clone();
             self.host.storage_write(name, &data);
         }
     }
 
-    fn card_complete(&mut self, slot: usize, op: Op) {
+    fn op_file(op: &Op) -> Option<(u32, u64)> {
         match op {
-            Op::FileFrame => {
-                self.card_event(SPEC_DONE, false);
+            Op::FileFrame { fd, id, .. } | Op::FileDone { fd, id } => Some((*fd, *id)),
+            _ => None,
+        }
+    }
+
+    /// The active asynchronous file operation for `slot`, if one is
+    /// pending: (fd, open identity).
+    fn card_file_active(&self, slot: usize) -> Option<(u32, u64)> {
+        self.kernel.cards.pending.iter().find_map(|(s, _, op)| (*s == slot).then(|| Self::op_file(op)).flatten())
+    }
+
+    /// Whether `fd` has an asynchronous operation still in the queue.
+    pub fn card_file_pending(&self, fd: u32) -> bool {
+        self.kernel.cards.pending.iter().any(|(_, _, op)| matches!(Self::op_file(op), Some((f, _)) if f == fd))
+    }
+
+    /// Native close policy: psxclose releases the fd even when the device
+    /// close fails, so drop the old open's queued work. This is not a retail
+    /// implementation: it keeps a reused fd from receiving stale frames.
+    /// The completed offset stays in the FCB; no completion is fabricated.
+    pub fn card_file_closed(&mut self, fd: u32) {
+        if let Some(f) = self.kernel.cards.files.remove(&fd) {
+            self.card_file_cancel(f.slot, fd, f.id);
+        }
+    }
+
+    /// Drop this open's queued work without touching its buffer, image or
+    /// FCB. The identity check keeps a reopened fd's frames intact.
+    fn card_file_cancel(&mut self, slot: usize, fd: u32, id: u64) {
+        self.kernel.cards.pending.retain(|(s, _, op)| !(*s == slot && Self::op_file(op) == Some((fd, id))));
+        if !self.kernel.cards.pending.iter().any(|(s, _, _)| *s == slot) {
+            self.kernel.cards.status[slot] = READY;
+        }
+    }
+
+    /// Record an asynchronous file error where the guest looks for it: the
+    /// FCB's errno and `_get_errno`.
+    fn card_file_errno(&mut self, fd: u32, errno: u32) {
+        self.kernel.cards.errno = errno;
+        self.kernel.files.errno = errno;
+        self.mem.w32(fcb_at(fd) + fcb::ERRNO, errno);
+    }
+
+    /// An asynchronous file operation failed: cancel its remaining steps,
+    /// keep the partial offset, and report the driver's and higher-level
+    /// events. `low` is false for the bufs callbacks: the low event is
+    /// owned by the driver, not emitted by the callback.
+    fn card_file_fail(&mut self, slot: usize, fd: u32, id: u64, errno: u32, spec: u32, low: bool) {
+        self.card_file_cancel(slot, fd, id);
+        self.kernel.cards.status[slot] = if spec == SPEC_NO_CARD { FAIL_TIMEOUT } else { FAIL_GENERAL };
+        if self.kernel.cards.files.get(&fd).is_some_and(|f| f.id == id) {
+            self.card_file_errno(fd, errno);
+        }
+        self.deliver_event(EV_HIGH, spec);
+        if low {
+            self.deliver_event(EV_LOW, spec);
+        }
+    }
+
+    /// End a write's card-info stage: fd event, high event, then the
+    /// info completion's low event. A reused fd is not treated as success.
+    fn card_file_done(&mut self, slot: usize, fd: u32, id: u64) {
+        let Some(f) = self.kernel.cards.files.get(&fd) else {
+            self.card_file_cancel(slot, fd, id);
+            return;
+        };
+        if f.id != id {
+            self.card_file_cancel(slot, fd, id);
+            return;
+        }
+        let ignore = std::mem::take(&mut self.kernel.cards.ignore_new[slot]);
+        let card_state = self.kernel.cards.slots[slot].as_ref().map(|c| c.new_card && !ignore);
+        if card_state.is_none() {
+            self.card_file_fail(slot, fd, id, E_GENERAL, SPEC_NO_CARD, true);
+            return;
+        }
+        if card_state == Some(true) {
+            self.card_file_fail(slot, fd, id, E_GENERAL, SPEC_NEW, true);
+            return;
+        }
+        self.kernel.cards.status[slot] = READY;
+        self.deliver_event(fd, SPEC_DONE);
+        self.deliver_event(EV_HIGH, SPEC_DONE);
+        self.deliver_event(EV_LOW, SPEC_DONE);
+    }
+
+    fn card_complete(&mut self, slot: usize, device: u32, op: Op) {
+        self.kernel.cards.last = Some(slot);
+        self.kernel.cards.last_device = Some(device);
+        match op {
+            Op::FileFrame { fd, id, frame, buf, to_card, last } => {
+                let Some(f) = self.kernel.cards.files.get(&fd).cloned() else {
+                    self.card_file_cancel(slot, fd, id);
+                    return;
+                };
+                if f.id != id {
+                    self.card_file_cancel(slot, fd, id);
+                    return;
+                }
+                let ignore = std::mem::take(&mut self.kernel.cards.ignore_new[slot]);
+                let new_card = self.kernel.cards.slots[f.slot].as_ref().is_some_and(|c| c.new_card) && !ignore;
+                if new_card {
+                    self.card_file_fail(slot, fd, id, E_GENERAL, SPEC_NEW, true);
+                    return;
+                }
+                let Some(card) = self.kernel.cards.slots[f.slot].as_mut() else {
+                    self.card_file_fail(slot, fd, id, E_GENERAL, SPEC_NO_CARD, true);
+                    return;
+                };
+                if to_card {
+                    let mut data = vec![0u8; memcard::FRAME];
+                    self.mem.read(buf, &mut data);
+                    card.write_frame(frame, &data);
+                } else {
+                    let data = card.frame(frame).to_vec();
+                    self.mem.write(buf, &data);
+                }
+                if let Some(f) = self.kernel.cards.files.get_mut(&fd) {
+                    f.pos += memcard::FRAME as u32;
+                    self.mem.w32(fcb_at(fd) + fcb::OFFSET, f.pos);
+                }
+                if last && !to_card {
+                    // Read final: high, fd, then the driver's low event.
+                    self.kernel.cards.status[slot] = READY;
+                    self.deliver_event(EV_HIGH, SPEC_DONE);
+                    self.deliver_event(fd, SPEC_DONE);
+                    self.deliver_event(EV_LOW, SPEC_DONE);
+                } else {
+                    self.card_event(SPEC_DONE, false);
+                }
                 return;
             }
-            Op::FileDone { fd } => {
-                self.deliver_event(fd, SPEC_DONE);
-                self.card_event(SPEC_DONE, true);
+            Op::FileDone { fd, id } => {
+                self.card_file_done(slot, fd, id);
                 return;
             }
             _ => {}
         }
-        let high = matches!(op, Op::Info | Op::Load | Op::Write { high: true, .. });
+        let high = matches!(op, Op::Info { high: true } | Op::Load { high: true } | Op::Write { high: true, .. });
         let ignore = std::mem::take(&mut self.kernel.cards.ignore_new[slot]);
-        // A sector past the card's last is confirmed as FFFFh: an error.
-        let x = match &op {
-            Op::Read { frame, .. } => self.xfer_read(slot, *frame, ignore),
-            Op::Write { frame, data, .. } => self.xfer_write(slot, *frame, data, ignore),
-            _ => self.xfer_read(slot, 0, ignore),
+        let Some(card) = self.kernel.cards.slots[slot].as_mut() else {
+            self.kernel.cards.status[slot] = FAIL_TIMEOUT;
+            self.card_event(SPEC_NO_CARD, high);
+            return;
         };
-        let (status, spec) = match x {
-            Xfer::NoCard => (FAIL_TIMEOUT, SPEC_NO_CARD),
-            Xfer::NewCard => (FAIL_GENERAL, SPEC_NEW),
-            Xfer::Error => (FAIL_GENERAL, SPEC_ERROR),
-            Xfer::Done(data) => {
-                if let Op::Read { dst, .. } = op {
-                    self.mem.write(dst, &data);
-                }
-                (READY, SPEC_DONE)
+        if card.new_card && !ignore {
+            self.kernel.cards.status[slot] = FAIL_GENERAL;
+            self.card_event(SPEC_NEW, high);
+            return;
+        }
+        if let Op::Read { frame, .. } | Op::Write { frame, .. } = op {
+            // The card answers a sector past its last with FFFFh, and the
+            // driver fails the operation.
+            if frame >= memcard::FRAMES {
+                self.kernel.cards.status[slot] = FAIL_GENERAL;
+                self.card_event(SPEC_ERROR, high);
+                return;
             }
-        };
-        self.kernel.cards.status[slot] = status;
-        self.card_event(spec, high);
+        }
+        match op {
+            Op::Read { frame, dst } => {
+                let data = card.frame(frame).to_vec();
+                self.mem.write(dst, &data);
+            }
+            Op::Write { frame, data, .. } => card.write_frame(frame, &data),
+            Op::Info { .. } | Op::Load { .. } | Op::FileFrame { .. } | Op::FileDone { .. } => {}
+        }
+        self.kernel.cards.status[slot] = READY;
+        self.card_event(SPEC_DONE, high);
     }
 
-    /// `_card_wait(slot)`: finish the slot's pending operations now.
-    pub fn card_wait(&mut self, slot: u32) -> u32 {
+    /// `_card_wait(slot)`: wait for a non-busy status. Pending operations
+    /// complete one per vblank, driven by the virtual scheduler.
+    pub fn card_wait(&mut self, slot: u32) -> Flow<S> {
         let slot = (slot & 1) as usize;
-        while let Some(i) = self.kernel.cards.pending.iter().position(|(s, _)| *s == slot) {
-            let (s, op) = self.kernel.cards.pending.remove(i).expect("position");
-            self.card_complete(s, op);
+        self.cards_ready();
+        self.card_wait_ready(slot)
+    }
+
+    fn card_wait_ready(&mut self, slot: usize) -> Flow<S> {
+        let status = self.kernel.cards.status[slot];
+        if !matches!(status, BUSY_READ | BUSY_WRITE | BUSY_INFO) {
+            return Flow::ret(status);
+        }
+        Flow::Block { until: Wait::Vblanks(self.vblanks + 1), then: Box::new(move |m| m.card_wait_ready(slot)) }
+    }
+
+    fn card_slot_busy(&self, slot: usize) -> bool {
+        matches!(self.kernel.cards.status[slot], BUSY_READ | BUSY_WRITE | BUSY_INFO)
+    }
+
+    /// `_card_chan()`: `mcGetLastDevice`, the exact requested device id
+    /// (normally 00h or 10h) of the most recent completion.
+    pub fn card_chan(&self) -> u32 {
+        self.kernel.cards.last_device.unwrap_or(0)
+    }
+
+    /// A(A7h..AAh, AEh) `bufs_cb_*`: the BIOS's completion callbacks.
+    /// Native completion already performed A7's state advancement; A7 must
+    /// not consume or replay a scheduled stage here. A8/A9/AA end a pending
+    /// Info/Load high-level operation, leaving driver status and the low-level
+    /// completion alone (OpenBIOS buLowLevelOpError1/2/3). File cancellation
+    /// retains the native policy below. AE's body and write_test effects
+    /// remain unverified. v0 is unspecified; keep the existing status return.
+    pub fn card_bufs_cb(&mut self, which: u32) -> u32 {
+        let slot = self.kernel.cards.last.unwrap_or(0);
+        if which == 0 {
+            return self.kernel.cards.status[slot];
+        }
+        let spec = match which {
+            1 | 4 => SPEC_ERROR,
+            2 => SPEC_NO_CARD,
+            3 => SPEC_NEW,
+            _ => return self.kernel.cards.status[slot],
+        };
+        if let Some((fd, id)) = self.card_file_active(slot) {
+            self.card_file_fail(slot, fd, id, E_GENERAL, spec, false);
+        } else if which <= 3 {
+            // Clearing only the high-level operation mirrors buFinishAndTrigger:
+            // the in-flight driver operation still owns its eventual low event.
+            let ended = self.kernel.cards.pending.iter_mut().any(|(s, _, op)| {
+                if *s != slot {
+                    return false;
+                }
+                match op {
+                    Op::Info { high } | Op::Load { high } => std::mem::take(high),
+                    _ => false,
+                }
+            });
+            if ended {
+                self.deliver_event(EV_HIGH, spec);
+            }
         }
         self.kernel.cards.status[slot]
     }
 
-    /// The FCB's error, and -1.
-    fn bu_fail(&mut self, f: u32, errno: u32) -> u32 {
-        self.mem.w32(f + fcb::ERRNO, errno);
+    fn card_fail(&mut self, errno: u32) -> u32 {
+        self.kernel.cards.errno = errno;
         u32::MAX
     }
 
-    /// The FCB's slot (its port, 00h or 10h), and the name at `name`.
-    fn bu_args(&mut self, f: u32, name: u32) -> (usize, String) {
-        let slot = slot_of(self.mem.r32(f + fcb::DEVICE_ID));
-        (slot, String::from_utf8_lossy(&self.mem.cstr(name, 64)).into_owned())
-    }
-
-    /// The file whose first block the FCB holds.
-    fn bu_file(&mut self, f: u32) -> Option<(usize, FileInfo)> {
-        let slot = slot_of(self.mem.r32(f + fcb::DEVICE_ID));
-        let first = self.mem.r32(f + fcb::LBA) as usize;
-        let card = slot_card(&mut self.io, slot)?;
-        card.files().into_iter().find(|i| !i.deleted && i.blocks.first() == Some(&first)).map(|i| (slot, i))
-    }
-
-    /// A(65h) `dev_card_open(fcb, name, mode)`: an existing file, or (mode
-    /// bit 9) a new one of mode's bits 16-31 blocks; 0, or -1.
-    pub fn dev_bu_open(&mut self, f: u32, name: u32, mode: u32) -> u32 {
+    /// `open("buXY:NAME", mode)`.
+    pub fn card_open(&mut self, path: &str, mode: u32, fd: u32) -> u32 {
         self.cards_ready();
-        let (slot, name) = self.bu_args(f, name);
-        // An asynchronous open skips the check.
-        if mode & ASYNC == 0 && !self.card_check(slot) {
-            return self.bu_fail(f, E_GENERAL);
+        let Some((slot, device, name)) = parse_path(path) else { return self.card_fail(E_NO_DEVICE) };
+        if self.card_slot_busy(slot) {
+            return self.card_fail(E_GENERAL);
         }
-        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
-        let file = if mode & CREATE != 0 {
+        // An asynchronous open skips the check.
+        if mode & 0x8000 == 0 && !self.card_check(slot, device) {
+            return self.card_fail(E_GENERAL);
+        }
+        let Some(card) = self.kernel.cards.slots[slot].as_mut() else { return self.card_fail(E_GENERAL) };
+        let file = if mode & 0x200 != 0 {
             let blocks = (mode >> 16) as usize;
             if card.find(&name).is_some() {
-                return self.bu_fail(f, E_EXISTS);
+                return self.card_fail(E_EXISTS);
             }
             match card.create(&name, blocks.max(1)) {
-                Some(i) => i,
-                None => return self.bu_fail(f, E_FULL),
+                Some(f) => f,
+                None => return self.card_fail(E_FULL),
             }
         } else {
             match card.find(&name) {
-                Some(i) => i,
-                None => return self.bu_fail(f, E_NOT_FOUND),
+                Some(f) => f,
+                None => return self.card_fail(E_NOT_FOUND),
             }
         };
-        for (o, v) in [(fcb::LBA, file.blocks[0] as u32), (fcb::LENGTH, file.size), (fcb::ERRNO, 0)] {
-            self.mem.w32(f + o, v);
-        }
-        0
+        let id = self.kernel.cards.next_file_id;
+        self.kernel.cards.next_file_id = id.wrapping_add(1);
+        self.kernel.cards.files.insert(fd, CardFile { id, device, slot, name: file.name, size: file.size, pos: 0, asynchronous: mode & 0x8000 != 0 });
+        fd
     }
 
-    /// A(66h) `dev_card_read`, A(67h) `dev_card_write` (`to_card`): whole
-    /// frames from a frame boundary inside the file.
-    pub fn dev_bu_io(&mut self, f: u32, buf: u32, len: u32, to_card: bool) -> u32 {
-        let (pos, size) = (self.mem.r32(f + fcb::OFFSET), self.mem.r32(f + fcb::LENGTH));
-        if len % memcard::FRAME as u32 != 0 || pos % memcard::FRAME as u32 != 0 || pos >= size {
-            return self.bu_fail(f, E_ALIGN);
+    /// `read`/`write` on a card file; `to_card` writes. An asynchronous
+    /// request only queues its frames: each moves when it completes, one
+    /// per vblank.
+    pub fn card_io(&mut self, fd: u32, buf: u32, len: u32, to_card: bool) -> u32 {
+        let Some(f) = self.kernel.cards.files.get(&fd).cloned() else { return self.card_fail(E_BAD_FD) };
+        if self.card_slot_busy(f.slot) {
+            return self.card_fail(E_GENERAL);
         }
-        let n = len.min(size - pos);
-        let Some((slot, info)) = self.bu_file(f) else { return self.bu_fail(f, E_GENERAL) };
-        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
-        let frames: Vec<u32> = (0..n).step_by(memcard::FRAME).map_while(|o| card.file_frame(&info, pos + o)).collect();
+        if len % memcard::FRAME as u32 != 0 || f.pos % memcard::FRAME as u32 != 0 || f.pos >= f.size {
+            return self.card_fail(E_ALIGN);
+        }
+        let n = len.min(f.size - f.pos);
+        let Some(info) = self.kernel.cards.slots[f.slot].as_ref().and_then(|c| c.find(&f.name)) else {
+            return self.card_fail(E_NOT_FOUND);
+        };
+        let mut frames = Vec::new();
         let mut off = 0;
-        // Each frame through the port, the card accepted by the open's
-        // check.
-        for frame in frames {
-            let x = if to_card {
-                let mut data = vec![0u8; memcard::FRAME];
-                self.mem.read(buf + off, &mut data);
-                self.xfer_write(slot, frame, &data, true)
-            } else {
-                let x = self.xfer_read(slot, frame, true);
-                if let Xfer::Done(data) = &x {
-                    self.mem.write(buf + off, data);
-                }
-                x
-            };
-            if !matches!(x, Xfer::Done(_)) {
-                break;
-            }
+        while off < n {
+            let Some(frame) = self.kernel.cards.slots[f.slot].as_ref().and_then(|c| c.file_frame(&info, f.pos + off)) else { break };
+            frames.push((frame, off));
             off += memcard::FRAME as u32;
         }
-        self.mem.w32(f + fcb::OFFSET, pos + off);
-        self.mem.w32(f + fcb::ERRNO, 0);
-        let frames = off / memcard::FRAME as u32;
-        if self.mem.r32(f + fcb::FLAGS) & ASYNC == 0 {
-            for _ in 0..frames {
+        if !f.asynchronous {
+            let Some(card) = self.kernel.cards.slots[f.slot].as_mut() else { return self.card_fail(E_GENERAL) };
+            for &(frame, at) in &frames {
+                if to_card {
+                    let mut data = vec![0u8; memcard::FRAME];
+                    self.mem.read(buf + at, &mut data);
+                    card.write_frame(frame, &data);
+                } else {
+                    let data = card.frame(frame).to_vec();
+                    self.mem.write(buf + at, &data);
+                }
+            }
+            if let Some(f) = self.kernel.cards.files.get_mut(&fd) {
+                f.pos += off;
+            }
+            self.kernel.cards.last = Some(f.slot);
+            self.kernel.cards.last_device = Some(f.device);
+            for _ in &frames {
                 self.card_event(SPEC_DONE, false);
             }
             return off;
         }
-        let fd = self.mem.r32(f + fcb::FD);
-        for _ in 1..frames.max(1) {
-            self.kernel.cards.pending.push_back((slot, Op::FileFrame));
+        let slot = f.slot;
+        self.kernel.cards.last = Some(slot);
+        self.kernel.cards.last_device = Some(f.device);
+        if frames.is_empty() {
+            // OpenBIOS's async read/write early path reports completion
+            // without a file-handle event.
+            self.deliver_event(EV_HIGH, SPEC_DONE);
+            return 0;
         }
-        self.kernel.cards.pending.push_back((slot, Op::FileDone { fd }));
+        self.kernel.cards.status[slot] = if to_card { BUSY_WRITE } else { BUSY_READ };
+        let count = frames.len();
+        for (i, (frame, at)) in frames.into_iter().enumerate() {
+            let last = i + 1 == count;
+            self.kernel.cards.pending.push_back((slot, f.device, Op::FileFrame { fd, id: f.id, frame, buf: buf + at, to_card, last }));
+        }
+        if to_card {
+            // A write's final sector is followed by a card-info completion.
+            self.kernel.cards.pending.push_back((slot, f.device, Op::FileDone { fd, id: f.id }));
+        }
         0
     }
 
-    /// A(69h) `dev_card_firstfile(fcb, pattern, direntry)` and A(6Ah)
-    /// `dev_card_nextfile(fcb, direntry)` (`pattern` 0).
-    pub fn dev_bu_find(&mut self, f: u32, pattern: u32, dir: u32) -> u32 {
+    /// `firstfile("buXY:PATTERN", direntry)` and `nextfile(direntry)`.
+    pub fn card_find(&mut self, pattern: Option<&str>, dir: u32) -> u32 {
         self.cards_ready();
-        if pattern != 0 {
-            let (slot, name) = self.bu_args(f, pattern);
+        if let Some(p) = pattern {
+            let Some((slot, device, name)) = parse_path(p) else { return 0 };
+            if self.card_slot_busy(slot) {
+                return 0;
+            }
             self.kernel.cards.search = Some((slot, name, 0));
-            if !self.card_check(slot) {
+            if !self.card_check(slot, device) {
                 return 0;
             }
         }
         let Some((slot, pat, from)) = self.kernel.cards.search.clone() else { return 0 };
+        if self.card_slot_busy(slot) {
+            return 0;
+        }
         let deleted = self.kernel.cards.find_mode == 1;
-        let Some(card) = slot_card(&mut self.io, slot) else { return 0 };
+        let Some(card) = self.kernel.cards.slots[slot].as_ref() else { return 0 };
         let files = card.files();
-        let hit = files.iter().enumerate().skip(from).find(|(_, i)| i.deleted == deleted && memcard::name_matches(&pat, &i.name));
-        let Some((i, file)) = hit else {
+        let hit = files.iter().enumerate().skip(from).find(|(_, f)| f.deleted == deleted && memcard::name_matches(&pat, &f.name));
+        let Some((i, f)) = hit else {
             self.kernel.cards.search = Some((slot, pat, files.len()));
             return 0;
         };
         let mut e = vec![0u8; 0x28];
-        let n = file.name.as_bytes();
+        let n = f.name.as_bytes();
         e[..n.len().min(0x13)].copy_from_slice(&n[..n.len().min(0x13)]);
-        e[0x14..0x18].copy_from_slice(&(if file.deleted { 0xA0u32 } else { 0x50 }).to_le_bytes());
-        e[0x18..0x1C].copy_from_slice(&file.size.to_le_bytes());
-        e[0x20..0x24].copy_from_slice(&((file.blocks[0] * 64) as u32).to_le_bytes());
+        e[0x14..0x18].copy_from_slice(&(if f.deleted { 0xA0u32 } else { 0x50 }).to_le_bytes());
+        e[0x18..0x1C].copy_from_slice(&f.size.to_le_bytes());
+        e[0x20..0x24].copy_from_slice(&((f.blocks[0] * 64) as u32).to_le_bytes());
         self.mem.write(dir, &e);
         self.kernel.cards.search = Some((slot, pat, i + 1));
         dir
     }
 
-    /// A(6Bh) `dev_card_erase`, A(6Ch) `dev_card_undelete` (fcb, name): 0,
-    /// or -1.
-    pub fn dev_bu_erase(&mut self, f: u32, name: u32, undelete: bool) -> u32 {
+    /// erase, undelete, rename, format on `bu`; 1 ok, 0 failed.
+    pub fn card_erase(&mut self, path: &str, undelete: bool) -> u32 {
         self.cards_ready();
-        let (slot, name) = self.bu_args(f, name);
-        if !self.card_check(slot) {
-            return self.bu_fail(f, E_GENERAL);
+        let Some((slot, device, name)) = parse_path(path) else { return 0 };
+        if self.card_slot_busy(slot) {
+            self.kernel.cards.errno = E_GENERAL;
+            return 0;
         }
-        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
+        if !self.card_check(slot, device) {
+            self.kernel.cards.errno = E_GENERAL;
+            return 0;
+        }
+        let Some(card) = self.kernel.cards.slots[slot].as_mut() else { return 0 };
         let ok = if undelete { card.undelete(&name) } else { card.delete(&name) };
-        if ok { 0 } else { self.bu_fail(f, E_NOT_FOUND) }
-    }
-
-    /// A(6Eh) `dev_card_rename(fcb1, name1, fcb2, name2)`: 0, or -1.
-    pub fn dev_bu_rename(&mut self, f: u32, from: u32, to: u32) -> u32 {
-        self.cards_ready();
-        let (slot, a) = self.bu_args(f, from);
-        let (_, b) = self.bu_args(f, to);
-        if !self.card_check(slot) {
-            return self.bu_fail(f, E_GENERAL);
+        if !ok {
+            self.kernel.cards.errno = E_NOT_FOUND;
         }
-        let Some(card) = slot_card(&mut self.io, slot) else { return self.bu_fail(f, E_GENERAL) };
-        if card.rename(&a, &b) { 0 } else { self.bu_fail(f, E_NOT_FOUND) }
+        ok as u32
     }
 
-    /// A(6Dh) `dev_card_format(fcb)`: 0, or -1 without a card. Its writes
-    /// accept a new card.
-    pub fn dev_bu_format(&mut self, f: u32) -> u32 {
+    pub fn card_rename(&mut self, from: &str, to: &str) -> u32 {
         self.cards_ready();
-        let slot = slot_of(self.mem.r32(f + fcb::DEVICE_ID));
-        match slot_card(&mut self.io, slot) {
+        let (Some((slot, device, a)), Some((slot2, _, b))) = (parse_path(from), parse_path(to)) else { return 0 };
+        if slot != slot2 {
+            self.kernel.cards.errno = 0x12;
+            return 0;
+        }
+        if self.card_slot_busy(slot) {
+            self.kernel.cards.errno = E_GENERAL;
+            return 0;
+        }
+        if !self.card_check(slot, device) {
+            self.kernel.cards.errno = E_GENERAL;
+            return 0;
+        }
+        let Some(card) = self.kernel.cards.slots[slot].as_mut() else { return 0 };
+        card.rename(&a, &b) as u32
+    }
+
+    pub fn card_format(&mut self, path: &str) -> u32 {
+        self.cards_ready();
+        let Some((slot, device, _)) = parse_path(path) else { return 0 };
+        if self.card_slot_busy(slot) {
+            return 0;
+        }
+        // Its writes accept a new card.
+        self.kernel.cards.last = Some(slot);
+        self.kernel.cards.last_device = Some(device);
+        match self.kernel.cards.slots[slot].as_mut() {
             Some(c) => {
                 c.format();
                 c.new_card = false;
                 self.card_event(SPEC_DONE, false);
-                0
+                1
             }
             None => {
                 self.card_event(SPEC_NO_CARD, false);
-                self.bu_fail(f, E_GENERAL)
+                0
             }
         }
     }
@@ -531,68 +726,88 @@ impl<S: Sdk> Machine<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::testing::machine;
+    use crate::{bios, tables, Flow, GuestCall};
+    use crate::testing::NoSdk;
+    use psx_devices::memcard::Card;
+
+    fn ret(f: Result<Flow<NoSdk>, String>) -> u32 {
+        match f.unwrap() {
+            Flow::Return(v) => v as u32,
+            Flow::Block { .. } | Flow::Call { .. } => panic!("not a return"),
+        }
+    }
+
+    /// Drive a flow the way the runtime does: advance to each event the
+    /// wait needs.
+    fn finish(m: &mut crate::Machine<NoSdk>, mut flow: Flow<NoSdk>) -> u32 {
+        loop {
+            match flow {
+                Flow::Return(v) => return v as u32,
+                Flow::Block { until, then } => {
+                    let mut steps = 0;
+                    while !m.holds(&until) {
+                        let next = m.clock.next_time().expect("a vblank");
+                        m.step(next);
+                        steps += 1;
+                        assert!(steps < 10, "wait did not complete");
+                    }
+                    flow = then(m);
+                }
+                Flow::Call { .. } => panic!("unexpected guest call"),
+            }
+        }
+    }
 
     #[test]
     fn raw_io_is_async_and_new_card_needs_accepting() {
         let mut m = machine();
-        m.io = Some(Default::default());
         let (buf, out) = (0x8001_0000, 0x8001_0100);
         m.mem.write(buf, &[0x5A; 128]);
         assert_eq!(m.card_write(0x00, 0x40, buf), 1);
         assert_eq!(m.kernel.cards.status[0], super::BUSY_WRITE);
         assert_eq!(m.card_read(0x00, 0x40, out), 0, "busy");
-        m.card_step();
+        m.card_vblank();
         assert_eq!(m.kernel.cards.status[0], super::FAIL_GENERAL, "new card refuses I/O");
         m.card_new(0x00);
         m.card_write(0x00, 0x40, buf);
-        m.card_step();
+        m.card_vblank();
         assert_eq!(m.kernel.cards.status[0], super::READY);
         m.card_read(0x00, 0x40, out);
-        m.card_step();
+        m.card_vblank();
         let mut back = [0u8; 128];
         m.mem.read(out, &mut back);
         assert_eq!(back, [0x5A; 128]);
         // Sector 400h reaches the card, which rejects it; 401h doesn't.
         assert_eq!(m.card_read(0x00, 0x400, out), 1);
-        m.card_step();
+        m.card_vblank();
         assert_eq!(m.kernel.cards.status[0], super::FAIL_GENERAL);
         assert_eq!(m.card_read(0x00, 0x401, out), 0);
         // Slot 2 is empty.
         m.card_info(0x10);
-        m.card_step();
+        m.card_vblank();
         assert_eq!(m.kernel.cards.status[1], super::FAIL_TIMEOUT);
     }
 
-    /// Through the device table: create, write, reopen, read, find,
-    /// erase.
     #[test]
     fn files_on_bu00() {
         let mut m = machine();
-        m.io = Some(Default::default());
-        let call = |m: &mut crate::Machine<crate::testing::NoSdk>, f: u32, a: [u32; 4]| match crate::bios::call(m, 0xB0, f, a).unwrap() {
-            crate::Flow::Return(v) => v as u32,
-            _ => panic!("blocked"),
-        };
-        let name = 0x8001_0100;
-        m.mem.write(name, b"bu00:BASLUS-01115TEST\0");
-        assert_eq!(call(&mut m, 0x32, [name, 0x200 | 2 << 16 | 3, 0, 0]), 2);
+        let name = "bu00:BASLUS-01115TEST";
+        assert_eq!(m.card_open(name, 0x200 | 2 << 16 | 3, 3), 3);
         m.mem.write(0x8001_0000, &[7; 256]);
-        assert_eq!(call(&mut m, 0x35, [2, 0x8001_0000, 256, 0]), 256);
-        assert_eq!(call(&mut m, 0x36, [2, 0, 0, 0]), 2);
-        assert_eq!(call(&mut m, 0x32, [name, 1, 0, 0]), 2);
-        assert_eq!(call(&mut m, 0x34, [2, 0x8002_0000, 128, 0]), 128);
+        assert_eq!(m.card_io(3, 0x8001_0000, 256, true), 256);
+        m.kernel.cards.files.remove(&3);
+        assert_eq!(m.card_open(name, 1, 4), 4);
+        assert_eq!(m.card_io(4, 0x8002_0000, 128, false), 128);
         assert_eq!(m.mem.r8(0x8002_007F), 7);
-        m.mem.write(0x8001_0200, b"bu00:BASLUS*\0");
-        assert_eq!(call(&mut m, 0x42, [0x8001_0200, 0x8003_0000, 0, 0]), 0x8003_0000);
+        assert_eq!(m.card_find(Some("bu00:BASLUS*"), 0x8003_0000), 0x8003_0000);
         assert_eq!(m.mem.r32(0x8003_0018), 0x4000);
-        assert_eq!(call(&mut m, 0x43, [0x8003_0000, 0, 0, 0]), 0);
-        assert_eq!(call(&mut m, 0x32, [name, 0x200 | 1 << 16, 0, 0]), u32::MAX, "exists");
-        assert_eq!(call(&mut m, 0x54, [0; 4]), E_EXISTS);
-        assert_eq!(call(&mut m, 0x45, [name, 0, 0, 0]), 1);
-        assert_eq!(call(&mut m, 0x32, [name, 1, 0, 0]), u32::MAX);
-        assert!(m.io.as_ref().unwrap().sio0.slots[0].as_ref().unwrap().valid());
+        assert_eq!(m.card_find(None, 0x8003_0000), 0);
+        assert_eq!(m.card_open(name, 0x200 | 1 << 16, 5), u32::MAX, "exists");
+        assert_eq!(m.kernel.cards.errno, super::E_EXISTS);
+        assert_eq!(m.card_erase(name, false), 1);
+        assert_eq!(m.card_open(name, 1, 5), u32::MAX);
+        assert!(m.kernel.cards.slots[0].as_ref().unwrap().valid());
     }
 
     /// Ready-mode events for each card spec on `class`, by spec.
@@ -618,48 +833,421 @@ mod tests {
     #[test]
     fn bu_functions_deliver_the_low_level_event() {
         let mut m = machine();
-        m.io = Some(Default::default());
         let low = card_events(&mut m, super::EV_LOW);
-        let f = crate::files::fcb_at(2);
-        let at = |m: &mut crate::Machine<crate::testing::NoSdk>, port: u32, name: &[u8]| {
-            m.mem.w32(f + fcb::DEVICE_ID, port);
-            m.mem.write(0x8001_0000, name);
-            m.mem.w8(0x8001_0000 + name.len() as u32, 0);
-            0x8001_0000
-        };
         // A new card: the read fails (2000h), the BIOS accepts it, and
         // the reread completes (04h).
-        let p = at(&mut m, 0, b"BASLUS*");
-        assert_eq!(m.dev_bu_find(f, p, 0x8003_0000), 0);
+        assert_eq!(m.card_find(Some("bu00:BASLUS*"), 0x8003_0000), 0);
         assert_eq!(ready(&m, &low), [super::SPEC_DONE, super::SPEC_NEW]);
-        assert!(!m.io.as_ref().unwrap().sio0.slots[0].as_ref().unwrap().new_card);
+        assert!(!m.kernel.cards.slots[0].as_ref().unwrap().new_card);
         let mut m = machine();
-        m.io = Some(Default::default());
         let low = card_events(&mut m, super::EV_LOW);
         m.cards_ready();
-        m.io.as_mut().unwrap().sio0.slots[0].as_mut().unwrap().new_card = false;
-        let p = at(&mut m, 0, b"*");
-        assert_eq!(m.dev_bu_find(f, p, 0x8003_0000), 0);
+        m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+        assert_eq!(m.card_find(Some("bu00:*"), 0x8003_0000), 0);
         assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
         // Slot 2 is empty.
         let low = card_events(&mut m, super::EV_LOW);
-        let p = at(&mut m, 0x10, b"*");
-        assert_eq!(m.dev_bu_find(f, p, 0x8003_0000), 0);
+        assert_eq!(m.card_find(Some("bu10:*"), 0x8003_0000), 0);
         assert_eq!(ready(&m, &low), [super::SPEC_NO_CARD]);
-        let p = at(&mut m, 0x10, b"X");
-        assert_eq!(m.dev_bu_open(f, p, 1), u32::MAX);
+        assert_eq!(m.card_open("bu10:X", 1, 3), u32::MAX);
         // An asynchronous open doesn't check; sector I/O is low-level only.
         let low = card_events(&mut m, super::EV_LOW);
         let high = card_events(&mut m, super::EV_HIGH);
-        let p = at(&mut m, 0, b"X");
-        assert_eq!(m.dev_bu_open(f, p, 0x8001), u32::MAX);
+        assert_eq!(m.card_open("bu00:X", 0x8001, 3), u32::MAX);
         assert_eq!(ready(&m, &low), []);
         m.card_read(0x00, 0x40, 0x8001_0000);
-        m.card_step();
+        m.card_vblank();
         assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
         assert_eq!(ready(&m, &high), []);
         m.card_info(0x00);
-        m.card_step();
+        m.card_vblank();
         assert_eq!(ready(&m, &high), [super::SPEC_DONE]);
+    }
+
+    /// `_card_wait` does not move the operation itself: scheduled vblanks
+    /// complete it, and the wait returns the resulting status.
+    #[test]
+    fn card_wait_waits_for_scheduled_completions() {
+        let mut m = machine();
+        let low = card_events(&mut m, super::EV_LOW);
+        let high = card_events(&mut m, super::EV_HIGH);
+        let (src, dst) = (0x8001_0000, 0x8001_0100);
+        m.mem.write(src, &[0x33; 128]);
+        m.card_new(0x00);
+        assert_eq!(m.card_write(0x00, 0x40, src), 1);
+        assert_eq!(m.kernel.cards.status[0], super::BUSY_WRITE);
+        assert!(matches!(bios::call(&mut m, 0xB0, 0x5D, [0; 4]).unwrap(), Flow::Block { .. }));
+        assert_eq!(ready(&m, &low), Vec::<u32>::new(), "the wait did not drain");
+        let flow = bios::call(&mut m, 0xB0, 0x5D, [0; 4]).unwrap();
+        assert_eq!(finish(&mut m, flow), super::READY);
+        assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
+        assert_eq!(ready(&m, &high), Vec::<u32>::new(), "raw I/O is low-level only");
+
+        assert_eq!(m.card_read(0x00, 0x40, dst), 1);
+        let flow = bios::call(&mut m, 0xB0, 0x5D, [0; 4]).unwrap();
+        assert_eq!(finish(&mut m, flow), super::READY);
+        let mut back = [0u8; 128];
+        m.mem.read(dst, &mut back);
+        assert_eq!(back, [0x33; 128]);
+
+        // A missing card wakes the wait through the same completions.
+        assert_eq!(m.card_info(0x10), 1);
+        let flow = bios::call(&mut m, 0xB0, 0x5D, [1, 0, 0, 0]).unwrap();
+        assert_eq!(finish(&mut m, flow), super::FAIL_TIMEOUT);
+        assert_eq!(ready(&m, &low), [super::SPEC_DONE, super::SPEC_NO_CARD]);
+        assert_eq!(ready(&m, &high), [super::SPEC_NO_CARD]);
+    }
+
+    /// Asynchronous file I/O queues one native frame at a time. Until its
+    /// vblank, the guest buffer and card are unchanged and the slot refuses
+    /// another request; the final frame and the file's event follow.
+    #[test]
+    fn async_file_io_moves_frames_and_reports_completion() {
+        let mut m = machine();
+        m.cards_ready();
+        m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+        let name = "bu00:ASYNCTEST";
+        assert_eq!(m.card_open(name, 0x200 | 2 << 16, 3), 3);
+        let src = 0x8001_0000;
+        m.mem.write(src, &[7; 256]);
+        assert_eq!(m.card_io(3, src, 256, true), 256);
+        m.kernel.cards.files.remove(&3);
+
+        let dst = 0x8002_0000;
+        m.mem.write(dst, &[0; 256]);
+        let low = card_events(&mut m, super::EV_LOW);
+        let high = card_events(&mut m, super::EV_HIGH);
+        let fd_event = m.open_event(4, super::SPEC_DONE, 0x2000, 0);
+        m.set_ev_status(fd_event, crate::kernel::EV_ENABLED);
+        assert_eq!(m.card_open(name, 0x8001, 4), 4);
+        assert_eq!(m.card_io(4, dst, 256, false), 0);
+        assert_eq!(m.kernel.cards.status[0], super::BUSY_READ);
+        assert_eq!(m.mem.r8(dst), 0, "no bytes have moved yet");
+        assert_eq!(m.card_io(4, dst, 128, false), u32::MAX, "the slot is busy");
+        assert_eq!(m.kernel.cards.errno, super::E_GENERAL);
+
+        m.card_vblank();
+        assert_eq!(m.mem.r8(dst), 7, "the first frame is visible");
+        assert_eq!(m.mem.r8(dst + 128), 0, "the second frame is not");
+        assert_eq!(m.kernel.cards.status[0], super::BUSY_READ);
+        assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
+        m.card_vblank();
+        assert_eq!(m.mem.r8(dst + 128), 7);
+        assert_eq!(m.kernel.cards.status[0], super::READY, "a read ends on its final low event");
+        assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
+        assert_eq!(m.kernel.cards.files[&4].pos, 256);
+        assert_eq!(m.mem.r32(crate::files::fcb_at(4) + crate::files::fcb::OFFSET), 256);
+        assert!(m.event_ready(fd_event));
+        assert_eq!(ready(&m, &high), [super::SPEC_DONE]);
+        for (_, h) in low.iter().chain(high.iter()) {
+            m.set_ev_status(*h, crate::kernel::EV_UNUSED);
+        }
+        m.set_ev_status(fd_event, crate::kernel::EV_UNUSED);
+
+        // The write direction moves its frame at the completing vblank too.
+        let wname = "bu00:ASYNCW";
+        assert_eq!(m.card_open(wname, 0x200 | 1 << 16 | 0x8000, 5), 5);
+        let frame = {
+            let card = m.kernel.cards.slots[0].as_ref().unwrap();
+            card.find("ASYNCW").unwrap().blocks[0] as u32 * 64
+        };
+        assert_eq!(m.card_io(5, src, 128, true), 0);
+        assert_eq!(m.kernel.cards.slots[0].as_ref().unwrap().frame(frame)[0], 0, "not written yet");
+        m.card_vblank();
+        assert_eq!(m.kernel.cards.slots[0].as_ref().unwrap().frame(frame)[0], 7);
+        assert_eq!(m.kernel.cards.status[0], super::BUSY_WRITE);
+        m.card_vblank();
+        assert_eq!(m.kernel.cards.status[0], super::READY);
+
+        // A frame after the card-change flag is set fails with NEW and keeps
+        // the partial offset, without writing the card.
+        assert_eq!(m.card_open("bu00:NEWERR", 0x200 | 1 << 16 | 0x8000, 6), 6);
+        let low = card_events(&mut m, super::EV_LOW);
+        let high = card_events(&mut m, super::EV_HIGH);
+        assert_eq!(m.card_io(6, src, 128, true), 0);
+        m.kernel.cards.slots[0].as_mut().unwrap().new_card = true;
+        let card_before = m.kernel.cards.slots[0].as_ref().unwrap().data.clone();
+        m.card_vblank();
+        assert_eq!(m.kernel.cards.status[0], super::FAIL_GENERAL);
+        assert_eq!(m.kernel.cards.slots[0].as_ref().unwrap().data, card_before);
+        assert_eq!(m.kernel.cards.files[&6].pos, 0);
+        assert_eq!(m.mem.r32(crate::files::fcb_at(6) + crate::files::fcb::ERRNO), super::E_GENERAL);
+        assert_eq!(ready(&m, &high), [super::SPEC_NEW]);
+        assert_eq!(ready(&m, &low), [super::SPEC_NEW]);
+        for (_, h) in low.iter().chain(high.iter()) {
+            m.set_ev_status(*h, crate::kernel::EV_UNUSED);
+        }
+
+        // The write-info stage rechecks the card: removing it after the
+        // final frame is an error, not success.
+        m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+        m.kernel.cards.status[0] = super::READY;
+        assert_eq!(m.card_open("bu00:DONEERR", 0x200 | 2 << 16 | 0x8000, 7), 7);
+        let low = card_events(&mut m, super::EV_LOW);
+        let high = card_events(&mut m, super::EV_HIGH);
+        let fd_event = m.open_event(7, super::SPEC_DONE, 0x2000, 0);
+        m.set_ev_status(fd_event, crate::kernel::EV_ENABLED);
+        assert_eq!(m.card_io(7, src, 128, true), 0);
+        m.card_vblank();
+        assert!(m.card_file_pending(7));
+        m.kernel.cards.slots[0] = None;
+        m.card_vblank();
+        assert_eq!(m.kernel.cards.status[0], super::FAIL_TIMEOUT);
+        assert_eq!(m.kernel.cards.files[&7].pos, 128);
+        assert_eq!(m.mem.r32(crate::files::fcb_at(7) + crate::files::fcb::OFFSET), 128);
+        assert_eq!(m.mem.r32(crate::files::fcb_at(7) + crate::files::fcb::ERRNO), super::E_GENERAL);
+        assert_eq!(ready(&m, &high), [super::SPEC_NO_CARD]);
+        assert_eq!(ready(&m, &low), [super::SPEC_DONE, super::SPEC_NO_CARD]);
+        assert!(!m.event_ready(fd_event), "no success event");
+    }
+
+    /// Auto format is opt-in, formats only a card whose frame 0 lacks the
+    /// "MC" id, and `_bu_init` turns it back off.
+    #[test]
+    fn card_auto_format_is_opt_in_and_reset_by_bu_init() {
+        let mut m = machine();
+        m.cards_ready();
+        m.kernel.cards.slots[0].as_mut().unwrap().data[0] = 0;
+        m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+        assert_eq!(m.kernel.cards.auto_format, 0);
+        assert_eq!(m.card_open("bu00:NOPE", 1, 3), u32::MAX);
+        assert!(!m.kernel.cards.slots[0].as_ref().unwrap().valid(), "not formatted silently");
+        assert_eq!(m.kernel.cards.errno, super::E_GENERAL);
+
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0xAD, [2, 0, 0, 0])), 0, "the old setting");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0xAD, [1, 0, 0, 0])), 2, "preserve the exact old value");
+        assert_eq!(m.kernel.cards.auto_format, 1);
+        let low = card_events(&mut m, super::EV_LOW);
+        assert_eq!(m.card_open("bu00:NOPE", 1, 3), u32::MAX);
+        assert!(m.kernel.cards.slots[0].as_ref().unwrap().valid(), "bad MC id was formatted");
+        assert_eq!(m.kernel.cards.errno, super::E_NOT_FOUND);
+        assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
+
+        ret(bios::call(&mut m, 0xA0, 0x55, [0; 4]));
+        assert_eq!(m.kernel.cards.auto_format, 0, "_bu_init resets it");
+        // A missing card is not created, and a valid card is not formatted.
+        m.kernel.cards.auto_format = 1;
+        assert_eq!(m.card_find(Some("bu10:*"), 0x8003_0000), 0);
+        assert!(m.kernel.cards.slots[1].is_none());
+        let before = m.kernel.cards.slots[0].as_ref().unwrap().data.clone();
+        assert_eq!(m.card_open("bu00:NOPE", 1, 3), u32::MAX);
+        assert_eq!(m.kernel.cards.slots[0].as_ref().unwrap().data, before);
+    }
+
+    /// `_card_info_subfunc` is the low-level info operation, `_card_chan`
+    /// names the slot it completed on, and the bufs callbacks report only
+    /// the higher-level event with the side effects psx-spx gives them.
+    #[test]
+    fn card_completion_helpers_follow_the_last_completion() {
+        let mut m = machine();
+        let high = card_events(&mut m, super::EV_HIGH);
+        assert_eq!(m.card_info_subfunc(0x00), 1);
+        m.card_vblank();
+        assert_eq!(ready(&m, &high), Vec::<u32>::new(), "the subfunction is low-level");
+        assert_eq!(m.card_chan(), 0x00, "exact device id");
+        assert_eq!(m.card_info_subfunc(0x10), 1);
+        m.card_vblank();
+        assert_eq!(m.card_chan(), 0x10);
+        assert_eq!(m.kernel.cards.status[1], super::FAIL_TIMEOUT);
+
+        // A8/A9/AA/AE are error callbacks: they cancel an active file
+        // operation, leave the low-level event alone and report high only.
+        for (which, spec, status) in [
+            (1, super::SPEC_ERROR, super::FAIL_GENERAL),
+            (2, super::SPEC_NO_CARD, super::FAIL_TIMEOUT),
+            (3, super::SPEC_NEW, super::FAIL_GENERAL),
+            (4, super::SPEC_ERROR, super::FAIL_GENERAL),
+        ] {
+            let mut m = machine();
+            m.cards_ready();
+            m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+            let src = 0x8001_0000;
+            m.mem.write(src, &[1; 128]);
+            assert_eq!(m.card_open("bu00:CB", 0x200 | 1 << 16, 5), 5);
+            assert_eq!(m.card_io(5, src, 128, true), 128);
+            m.kernel.cards.files.remove(&5);
+            assert_eq!(m.card_open("bu00:CB", 0x8001, 3), 3);
+            let dst = 0x8001_0100;
+            m.mem.write(dst, &[0; 128]);
+            assert_eq!(m.card_io(3, dst, 128, false), 0);
+            let card_before = m.kernel.cards.slots[0].as_ref().unwrap().data.clone();
+            let low = card_events(&mut m, super::EV_LOW);
+            let high = card_events(&mut m, super::EV_HIGH);
+            m.card_bufs_cb(which);
+            assert_eq!(ready(&m, &low), Vec::<u32>::new(), "no low replay");
+            assert_eq!(ready(&m, &high), [spec]);
+            assert!(!m.card_file_pending(3), "the remaining frames are canceled");
+            assert_eq!(m.kernel.cards.status[0], status);
+            assert_eq!(m.mem.r8(dst), 0, "the canceled frame never touched the buffer");
+            assert_eq!(m.kernel.cards.slots[0].as_ref().unwrap().data, card_before);
+            assert_eq!(m.kernel.cards.files[&3].pos, 0);
+            assert_eq!(m.mem.r32(crate::files::fcb_at(3) + crate::files::fcb::OFFSET), 0);
+            assert_eq!(m.mem.r32(crate::files::fcb_at(3) + crate::files::fcb::ERRNO), super::E_GENERAL);
+        }
+
+        // With no active operation A7 reports nothing.
+        let mut m = machine();
+        let high = card_events(&mut m, super::EV_HIGH);
+        m.card_bufs_cb(0);
+        assert_eq!(ready(&m, &high), Vec::<u32>::new());
+    }
+
+    /// Error callbacks end only the last device's high-level Info/Load
+    /// notification, not the driver's pending operation or another slot's work.
+    #[test]
+    fn card_error_callbacks_end_info_and_load_without_draining() {
+        for (func, spec) in [(0xA8, super::SPEC_ERROR), (0xA9, super::SPEC_NO_CARD), (0xAA, super::SPEC_NEW)] {
+            for request in [0xAB, 0xAC] {
+                let mut m = machine();
+                m.cards_ready();
+                m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+                m.kernel.cards.slots[1] = m.kernel.cards.slots[0].clone();
+                assert_eq!(m.card_info_subfunc(0x10), 1);
+                m.card_vblank();
+                assert_eq!(m.card_chan(), 0x10);
+                let (error, done, low) = (0x8003_0000, 0x8003_0004, 0x8003_0008);
+                for (class, spec, addr) in [(super::EV_HIGH, spec, error), (super::EV_HIGH, super::SPEC_DONE, done), (super::EV_LOW, super::SPEC_DONE, low)] {
+                    let h = m.open_event(class, spec, 0x1000, addr);
+                    m.set_ev_status(h, crate::kernel::EV_ENABLED);
+                }
+                assert_eq!(m.card_info(0x00), 1, "other slot queues first");
+                assert_eq!(ret(bios::dispatch(&mut m, 0xA0, request, [0x10, 0, 0, 0])), 1);
+                ret(bios::dispatch(&mut m, 0xA0, 0xA7, [0; 4]));
+                assert!(m.calls.is_empty(), "A7 never advances the pending native operation");
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert_eq!(m.calls.pop_front(), Some(GuestCall { addr: error, args: [0; 4] }));
+                assert!(m.calls.is_empty(), "the callback emits high only");
+                assert_eq!(m.kernel.cards.status, [super::BUSY_INFO; 2], "callbacks do not change driver flags");
+                assert_eq!(m.kernel.cards.pending.len(), 2, "neither low-level operation was consumed");
+                assert_eq!(m.card_info(0x10), 0, "the low-level driver remains busy");
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert!(m.calls.is_empty(), "the high-level operation ended once");
+                m.card_vblank();
+                assert_eq!(m.calls.iter().map(|c| c.addr).collect::<Vec<_>>(), [done, low], "other slot retains its high completion");
+                m.calls.clear();
+                m.card_vblank();
+                assert_eq!(m.calls.pop_front(), Some(GuestCall { addr: low, args: [0; 4] }));
+                assert!(m.calls.is_empty(), "no second high event at completion");
+                assert_eq!(m.kernel.cards.status, [super::READY; 2]);
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert!(m.calls.is_empty(), "idle callbacks do not deliver high events");
+                assert_eq!(m.card_info_subfunc(0x10), 1);
+                ret(bios::dispatch(&mut m, 0xA0, func, [0; 4]));
+                assert!(m.calls.is_empty(), "B4D has no high-level operation to end");
+                m.card_vblank();
+                assert_eq!(m.calls.pop_front(), Some(GuestCall { addr: low, args: [0; 4] }));
+                assert!(m.calls.is_empty());
+            }
+        }
+    }
+
+    /// A7 is dispatched as the low-level completion callback. Native
+    /// completion already advanced the frame stage; A7 must not consume the
+    /// scheduled write-info stage early, and must not replay the low event.
+    #[test]
+    fn card_completion_callback_does_not_consume_future_work() {
+        let mut m = machine();
+        m.cards_ready();
+        m.kernel.cards.slots[0].as_mut().unwrap().new_card = false;
+        assert_eq!(m.card_open("bu00:CB7", 0x200 | 1 << 16 | 0x8000, 3), 3);
+        let src = 0x8001_0000;
+        m.mem.write(src, &[5; 128]);
+        assert_eq!(m.card_io(3, src, 128, true), 0);
+
+        let a7 = tables::stand_in(0xA0, 0xA7);
+        let low = m.open_event(super::EV_LOW, super::SPEC_DONE, 0x1000, a7);
+        m.set_ev_status(low, crate::kernel::EV_ENABLED);
+        let (fd_call, high_call) = (0x8002_0000, 0x8002_0004);
+        let fd_event = m.open_event(3, super::SPEC_DONE, 0x1000, fd_call);
+        m.set_ev_status(fd_event, crate::kernel::EV_ENABLED);
+        let high_event = m.open_event(super::EV_HIGH, super::SPEC_DONE, 0x1000, high_call);
+        m.set_ev_status(high_event, crate::kernel::EV_ENABLED);
+
+        m.card_vblank();
+        assert_eq!(m.calls.pop_front(), Some(GuestCall { addr: a7, args: [0; 4] }));
+        assert!(m.calls.is_empty(), "the final frame's low event queued A7");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0xA7, [0; 4])), super::BUSY_WRITE);
+        assert!(m.calls.is_empty(), "A7 did not queue fd/high or another low event");
+        assert!(m.card_file_pending(3), "the scheduled info stage remains");
+
+        m.card_vblank();
+        assert_eq!(m.calls.iter().map(|c| c.addr).collect::<Vec<_>>(), [fd_call, high_call, a7], "fd, high, then low");
+        assert_eq!(m.kernel.cards.status[0], super::READY);
+        assert!(!m.card_file_pending(3));
+        m.calls.clear();
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0xA7, [0; 4])), super::READY);
+        assert!(m.calls.is_empty(), "a repeated A7 delivers nothing");
+    }
+
+    /// psxclose releases the fd even while the card device reports busy.
+    /// The native close policy cancels the old open, so reopening the SAME
+    /// fd on the other card cannot receive stale frames, buffers or events.
+    #[test]
+    fn async_file_close_releases_the_fd_without_stale_card_work() {
+        let mut m = machine();
+        m.cards_ready();
+        m.kernel.cards.slots[1] = Some(Card::formatted());
+        m.kernel.cards.status[1] = super::READY;
+        for slot in 0..2 {
+            m.kernel.cards.slots[slot].as_mut().unwrap().new_card = false;
+        }
+        let (path0, path1) = (0x8001_0000, 0x8001_0020);
+        m.mem.write(path0, b"bu00:CLOSETEST\0");
+        m.mem.write(path1, b"bu10:CLOSETEST\0");
+        let src = 0x8001_1000;
+        m.mem.write(src, &[9; 256]);
+        let open_create = 0x200 | 1 << 16;
+        let fd0 = ret(bios::call(&mut m, 0xB0, 0x32, [path0, open_create, 0, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x35, [fd0, src, 256, 0])), 256);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x36, [fd0, 0, 0, 0])), fd0);
+        let fd1 = ret(bios::call(&mut m, 0xB0, 0x32, [path1, open_create, 0, 0]));
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x35, [fd1, src, 256, 0])), 256);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x36, [fd1, 0, 0, 0])), fd1);
+
+        let fd = ret(bios::call(&mut m, 0xB0, 0x32, [path0, 0x8001, 0, 0]));
+        let dst0 = 0x8001_2000;
+        m.mem.write(dst0, &[0; 256]);
+        let low = card_events(&mut m, super::EV_LOW);
+        let high = card_events(&mut m, super::EV_HIGH);
+        let fd_event = m.open_event(fd, super::SPEC_DONE, 0x2000, 0);
+        m.set_ev_status(fd_event, crate::kernel::EV_ENABLED);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x34, [fd, dst0, 256, 0])), 0);
+        assert!(m.card_file_pending(fd));
+        m.card_vblank();
+        assert_eq!(m.mem.r8(dst0), 9);
+        assert_eq!(m.mem.r8(dst0 + 128), 0);
+        for (_, h) in &low {
+            m.set_ev_status(*h, crate::kernel::EV_ENABLED);
+        }
+        let fcb = crate::files::fcb_at(fd);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x36, [fd, 0, 0, 0])), u32::MAX);
+        assert_eq!(m.mem.r32(fcb + crate::files::fcb::FLAGS), 0, "psxclose releases the fd");
+        assert!(!m.card_file_pending(fd), "the old open's frames are canceled");
+        assert!(!m.kernel.cards.files.contains_key(&fd), "the old open is invalidated");
+        assert_eq!(m.mem.r32(fcb + crate::files::fcb::OFFSET), 128, "preserve completed frames");
+        assert_eq!(m.mem.r8(dst0 + 128), 0);
+        assert_eq!(m.kernel.cards.status[0], super::READY);
+        assert_eq!(ready(&m, &low), Vec::<u32>::new(), "no cancellation events");
+        assert_eq!(ready(&m, &high), Vec::<u32>::new());
+        assert!(!m.event_ready(fd_event));
+
+        // Reusing the SAME fd on slot 2 starts a new open.
+        let reused = ret(bios::call(&mut m, 0xB0, 0x32, [path1, 0x8001, 0, 0]));
+        assert_eq!(reused, fd);
+        let dst1 = 0x8001_2100;
+        m.mem.write(dst1, &[0; 256]);
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x34, [fd, dst1, 256, 0])), 0);
+        m.card_vblank();
+        m.card_vblank();
+        assert_eq!(m.mem.r8(dst0), 9, "keep the completed frame");
+        assert_eq!(m.mem.r8(dst0 + 128), 0, "the canceled frame stays untouched");
+        assert_eq!(m.mem.r8(dst1), 9, "the slot-2 read moved its own buffer");
+        assert_eq!(m.kernel.cards.status[0], super::READY);
+        assert_eq!(m.kernel.cards.status[1], super::READY);
+        assert_eq!(m.mem.r32(fcb + crate::files::fcb::OFFSET), 256);
+        assert_eq!(ready(&m, &low), [super::SPEC_DONE]);
+        assert_eq!(ready(&m, &high), [super::SPEC_DONE]);
+        assert!(m.event_ready(fd_event));
+        assert_eq!(ret(bios::call(&mut m, 0xB0, 0x36, [fd, 0, 0, 0])), fd);
     }
 }

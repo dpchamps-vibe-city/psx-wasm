@@ -1,15 +1,113 @@
 # Open items
 
-Every open task, blocked item, human-needed input, unresolved finding and
-erratum, as of 2026-10-30. Milestone history is in [`completed/`](completed/).
-Each item says what it is, why it's open, and where it came from.
+Open tasks, blocked items, human-needed input, unresolved findings and errata.
+Milestone history is in [`completed/`](completed/). Older audit findings below
+retain their provenance; the active recovery status is recorded separately.
 
-- **Last full gate runs:** `psxw ci btn` passed every gate on 2026-10-27
-  (M12). `psxw ci bof4` hasn't run at the current pin (M13 task 22).
-- **The hardware boundary** (native adapters vs emulated devices) is
-  planned in [`unified-adaptor-layer/`](unified-adaptor-layer/).
-- **Shortcuts, the audit's bugs and the BIOS rework** (2026-10-30) are
-  planned in [`spec-fidelity.md`](spec-fidelity.md).
+- **Active plan:** [`salvage-bios-work.md`](salvage-bios-work.md), native recovery
+  accepted for merge to main; **full BIOS completion remains a separate,
+  unfinished milestone**. Its recovery checkpoint groups the remaining executable,
+  control-flow, CD/card, console, resource and validation work. The provisional
+  4–8 engineer-week allowance is low-confidence, not a delivery commitment.
+  Checkpointed results supersede older coverage/gate claims below.
+- **Last full gate runs:** both `psxw ci btn` and `psxw ci bof4` completed at the
+  ABI-17 recovery foundation (`a74f832`, code `4cce9e3`) and exited 2. Missing
+  oracle prerequisites, BTN mods census inputs and two BTN difftest mismatches
+  remain unresolved; regression attribution is not established. Later ABI-18
+  focused tests/builds/replays do not constitute a fresh full-CI pass.
+- **The hardware boundary** (native adapters vs per-chip device fallback) is
+  described in [`../docs/emulation-layers.md`](../docs/emulation-layers.md) and
+  [`unified-adaptor-layer/`](unified-adaptor-layer/).
+- **Shortcuts** (42, 2026-10-30 audit) are tracked in
+  [`shortcuts.md`](shortcuts.md); the audit's bugs are under *Bugs* below.
+
+## Native BIOS recovery: current gaps
+
+- **General `setjmp`/`longjmp`: deferred by the user.** Recognised setjmp sites
+  save registers and have compiled continuations, but an ordinary continuation
+  call does not unwind intervening frames and returns to the wrong caller.
+  Dependent C(19h)/A(B2h) `ioabort` remains unfinished. Note the bug and revisit
+  later; no control-flow design or implementation is pending approval now.
+- **Other control-flow gaps:** build-known Exec/LoadExec, warm boot, C06 hook
+  chaining, remaining exception context and callback/IRQ thread switches are
+  still open. A(40h) now has its documented fatal handling and patchable table
+  dispatch, with focused tests passing; BREAK event/exception entry is still
+  count-only. Do not replace existing Asyncify threading or infer approval for
+  a runtime redesign from the recovery work.
+- **Partial software services:** card helpers A7..AA/AE, built-in console input
+  and circular helpers, CD internal calls/filesystem details, and
+  non-main SetConf. Recent card Info/Load callback and guest-device console-scan
+  fixes do not complete these whole families. AF write-test notifications remain
+  unverified: OpenBIOS's missing body does not justify adding or removing them.
+  BIOS CD opens now honor explicit
+  ISO versions, default to `;1`, and support `?` filename matching without star
+  expansion; shared disc lookup and CdGetLbn are unchanged. CD file reads now
+  enforce 800h length/position alignment and reject positions at/beyond EOF.
+  They now use the existing native blocking status/read helpers directly,
+  honoring live command/event/error calls and scheduled completion, not the
+  A(A6h/A5h) table slots. Status bit 10h rejects before any seek/read; returning
+  status errors do too. The read's LBA/offset are obtained after status callbacks.
+  Full requested sectors transfer before clipping against live post-callback
+  FCB metadata. Completed sectors survive later failure; FCB error 10h/return -1
+  occur only if SystemError returns (its default is fatal). Success preserves
+  errno. Zero-count reads before EOF now reach the helper's bounded command
+  failure, not a no-op; installed BIOS CD events are required, as boot provides.
+  Path-table/disc-identity checks, status checks in other file operations and
+  native shell-open/acknowledgment behavior remain partial. No new CD driver or
+  scheduler was added. CD read errors now
+  retry after a returning SystemError patch, bounded to ten attempts. Blocking
+  calls now use live ordered event flags, including early software wakes and
+  disabled/consumed/reused slots and native cancellation. Seek/read/status now
+  call live A78/A7E/A7C entries with at most 99999/99999/9 acceptance attempts,
+  preserving arguments and awaiting patched continuations. MSF/status locals
+  use per-call guest stack frames; status reads the actual byte after DNE.
+  Software completion after a rejected/cancelled attempt does not inherit that
+  stale native cancellation. Completion probes now call patched B0B TestEvent
+  in order, honoring Call/Block and synthetic results without implicit flag
+  consumption. Native waits wake on table changes; patched polling yields on
+  the existing loop budget/quantum so wrappers cannot starve scheduled work.
+  Long command-acceptance loops now use the same local budget/quantum yields,
+  letting busy native work complete before retrying the live command table.
+  The 99999/99999/9 bounds remain exact, with no yield after success or final
+  exhaustion; nine status attempts can still exhaust without a yield. This
+  resets, but does not spend, the guest budget per attempt or claim retail
+  timing parity. INT5/chain services remain unfinished. An early read ERR can
+  still encounter busy SeekL after the patch returns, but long retries now
+  allow scheduled progress; no silent native-read cancellation is added.
+  A52/C09 contracts remain unresolved.
+- **Resources/policy:** legally usable font data and GetSystemInfo's BIOS
+  date/version identity remain undecided; no fabricated values or pointers.
+  B53's offset calculation itself needs no glyph resource, but the proposed
+  OpenBIOS original-font lookup aliases valid 899Eh/899Fh codes. Parent rejected
+  that mapping; reliable algorithm/vector evidence remains a separate gap.
+- **Validation:** the CD file-status follow-up passes BIOS 59 /
+  runtime 11 / SDK 42 tests and wasm32 runtime check. The initial focused run
+  found a test counter assertion counting the wrong redirected native callee;
+  corrected before the passing gate. Parent reviewed the diff and contract scout.
+  Logs are in session scratch under `cd-file-status-*`. No new game build/replay
+  cycle: release/runtime/game artifacts and four passing replays remain at
+  `15d15f3`, before the status change. Those replays do not call A60; file
+  integration tests cover it. All six chip groups were native in those builds;
+  ABI 18 and coverage classifications are unchanged. Previous logs, run/check
+  JSON and disposable run cards remain under `cd-file-flow-*`. Tests use ignored
+  `out/tmp-cd-live-wait` as TMPDIR. Inputs and user saves were untouched.
+  Following the operator's concern about prolonged tail work, no new follow-up
+  lanes are being opened at this checkpoint. Full BIOS remains unfinished;
+  the substantive gaps above are not merely final cleanup.
+  BTN's existing GPU timeout/reset logs remain unclassified.
+  Latest memcard conformance remains at `99fa333`. Non-empty oracle
+  validation, unresolved full-CI failures and save/persistence certification
+  remain open. Two-bundle browser disc isolation, locked-import refusal,
+  unlocked replacement and copy-error writer cleanup now pass 25 checks each
+  in Chromium/Firefox at `8e5badf`, through production pages and real OPFS
+  handles, retaining the seven card checks. At `9624526`, fresh ABI-18 BTN
+  browser bundles also pass five conformance scenarios and the 6,000-frame
+  title/recording replay in both browsers, with native RAM/VRAM/audio matching.
+  GPU-oracle goldens and BTN mod inputs remain missing; these focused gates
+  do not constitute full CI or game save/reload certification.
+
+See the active plan for exact service inventories, accepted source changes and
+next actions. Deferral or an unsupported diagnostic does not complete a service.
 
 ## Needs the human
 
@@ -94,17 +192,16 @@ Each item says what it is, why it's open, and where it came from.
   task 6.
 - **Task 8.** Add tasks 4–5 to `psxw ci`; docs; README status. *From:* M7
   task 8.
-- **libcard and libmcx conformance** (exit criterion 3). `psxw conform`
-  covers libpad, libgpu, libmcrd, libetc, libsnd and libspu.
-  - **libcard** keeps thin adapters: `_patch_card` scans Sony BIOS RAM,
-    which doesn't exist here.
-  - **libmcx's** adapters answer McxErrInvalid for an ordinary card, taken
-    from btn's own handling of the result. Conformance against the
-    original library needs an SIO memory card device, and the BIOS
-    exception-handler patching libmcx's fast DSR does, which the HLE BIOS
-    lacks.
+- **Card conformance and remaining persistence coverage** (exit criterion 3).
+  The old missing-device blocker is obsolete: libmcx runs against shared native
+  card images or the SIO fallback, and `conform btn --chip memcard` passes nine
+  case runs at `99fa333`. Its vblank handler is statically bound and honors BIOS
+  patches through existing Flow calls; no Sony BIOS instruction patch is executed.
+  libcard's Sony-code patch functions remain native adaptors. These gates do not
+  certify every card helper or a game save/reload session; the recordings and
+  assertions above are still missing.
 
-  *From:* M7 exit criterion 3; follow-up tasks.
+  *From:* M7 exit criterion 3; updated by the native BIOS recovery.
 
 ## M8: SDK generality
 
@@ -349,11 +446,91 @@ after a resume, statement rows, the Docker builder.
   (t1/t2), `func_80037470` and `func_80037494` (t0–t2), `func_8003A2A4`
   (t3). They aren't inlined, so their callers' values don't reach them.
   Audit each. M13 expects more at bof4's scale. *From:* bug-follows §4;
-  follow-up tasks; M13 Risks. (Spec-fidelity's TR2 closed it and was
-  unwound on 2026-10-31.)
+  follow-up tasks; M13 Risks.
 
-The 23 bugs the 2026-10-30 shortcuts audit found are tasks B1–B23 in
-[`spec-fidelity.md`](spec-fidelity.md), phase 1.
+### Historical shortcuts-audit findings
+
+Found by the shortcuts audit (2026-10-30; [`shortcuts.md`](shortcuts.md)).
+Paths and line numbers below refer to that audit, not current source.
+**This is not a current unresolved-bug count.** Recovery has since addressed
+ResetEntryInt, closed-event guards, card bounds, old PAD arguments, file-slot
+allocation, printf, boot stack selection and several compiler/shared-device
+findings; per-call support classes now distinguish partial and unsupported
+services without changing the legacy `implemented` build gate. Accepted commits
+and tests are recorded in [`salvage-bios-work.md`](salvage-bios-work.md). Other
+findings have not all been revalidated; retain them as investigation leads,
+not permission for a new project-wide fidelity audit. *Unchecked* records the
+original audit's uncertainty.
+
+- **`SetDefaultExitFromException` (B0:18h) does nothing.**
+  `psx-bios/src/bios.rs:339` doesn't clear `kernel.custom_exit`, so the
+  exception handler keeps entering the old custom exit
+  (`psx-runtime/src/driver.rs:51, 85`) after libetc's `StopCallback`.
+- **`EnableEvent`/`DisableEvent` change closed event slots.**
+  `psx-bios/src/bios.rs:303-316`: enabling a closed handle revives it;
+  disabling one leaks it, since `OpenEvent` reuses only unused slots
+  (`kernel.rs:70`).
+- **Memory card sector 1024 is accepted** as 1023
+  (`psx-bios/src/card.rs:178, 186`: `>` should be `>=`).
+- **B0:15h and libapi's `PAD_init` disagree on their arguments**
+  (`psx-bios/src/bios.rs:332`, `sdk-psyq/src/libapi.rs:105`). psx-spx has
+  `OutdatedPadInitAndStart(type, button_dest, …)`.
+- **`open` on `cdrom:` hands out descriptor 16 when all are taken**
+  (`psx-bios/src/bios.rs:362`); a second overflow replaces the first file.
+- **`bios::implemented()` counts calls that always error** (`longjmp`,
+  `Exec`, `ReturnFromException`, `SystemError`), which the build's
+  coverage check trusts (`psx-bios/src/bios.rs:104`).
+- **BIOS `printf` zero-pads negatives as `000-5`** and ignores `+`, space
+  and `#` (`psx-bios/src/bios.rs:597-607`).
+- **Stale doc on `card_queue`** (`psx-bios/src/card.rs:162`): it always
+  returns true.
+- **The vblank counter event ignores I_MASK.**
+  `psx-bios/src/machine.rs:392` delivers RCntCNT3 every vblank, while
+  counters 0–2 are gated on I_MASK (`machine.rs:410`) and libapi's
+  `StartRCnt(RCntCNT3)` sets bit 0 expecting the same gate.
+- **`GetlocP` loses a minute** (`psx-devices/src/cdc.rs:394`): the pregap
+  is subtracted from BCD seconds with no borrow, so 00:58 reads 01:00.
+- **GPUSTAT bits 31 and 13 follow a per-vblank field**
+  (`psx-devices/src/gpu.rs:516-517`). psx-spx: bit 31 toggles per
+  scanline in 240-line modes and is 0 in vblank; bit 13 is 1 when not
+  interlaced. *Unchecked* against hardware.
+- **GPUSTAT bit 25 is wrong for DMA directions 1–3**
+  (`psx-devices/src/gpu.rs:518-520`). psx-spx: 1 = FIFO not full,
+  2 = bit 28, 3 = bit 27.
+- **Timer 0's dot clock runs 4–10× too fast**
+  (`psx-devices/src/timers.rs:31`, `clock.rs:56-58`): it counts the
+  53.69 MHz video clock without dividing by the horizontal resolution's
+  10/8/7/5/4.
+- **Muting or disabling the SPU silences CD audio**
+  (`psx-spu/src/lib.rs:722-724`). psx-spx SPUCNT bits 14–15: "Don't care
+  for CD Audio".
+- **SPU manual-transfer writes past 32 are dropped**
+  (`psx-spu/src/lib.rs:349-354`); later DATA writes wait for the next
+  SPUCNT write.
+- **15-bit colour is shifted, not expanded, at presentation**
+  (`psx-render-gl/src/shaders.rs:341-344`): white shows as F8F8F8.
+  *Unchecked.*
+- **libgpu's timeout counts every vblank** when libetc's adapters aren't
+  running (`sdk-psyq/src/libgpu.rs:324-328`); the original calls
+  `VSync(-1)`.
+- **libmcx's last-byte wait is ~20 cycles, not a byte's ~1,000**
+  (`sdk-psyq/src/libmc.rs:498-505`). The comment predates D66; probably
+  a regression from it.
+- **A tail transfer out of an inlined callee exits the whole caller**
+  (`psxw-lift/src/graph.rs:231-237, 260-264`; `emit.rs:198-201, 255-258,
+  306-314`). *Unchecked.*
+- **`bltzal`/`bgezal` with rs = ra test the new link value**
+  (`psxw-lift/src/emit.rs:213-234`). Restricted on MIPS; GCC doesn't emit
+  it.
+- **`psxw_lift::bios_calls()` recognises only `addiu t1`**
+  (`lib.rs:524-528`), not `ori` as `t1_after_slot` does, so an `ori t1`
+  ChangeThread trampoline misses the Asyncify scope
+  (`psxw-build/src/game.rs:527`). *Unchecked.*
+- **GTE operands parse shifts tighter than `+`**, the reverse of C
+  (`psxw-cc/src/gte.rs:236-259`).
+- **The EXE header's stack beats `SYSTEM.CNF`'s `STACK=`**
+  (`psx-runtime/src/boot.rs:68`). On a real BIOS `LoadExec` writes
+  `STACK` into the header (from memory, *unchecked*).
 
 ## Gaps found along the way
 

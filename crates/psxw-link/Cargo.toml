@@ -16,4 +16,3 @@ serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1.0.154"
-wasmtime = { version = "47.0.0", default-features = false, features = ["cranelift", "runtime", "anyhow", "gc-drc"] }

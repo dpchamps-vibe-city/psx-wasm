@@ -79,17 +79,34 @@ async function importDisc(files) {
   const missing = cueFiles(await cueFile.text()).filter((n) => !files.some((f) => f.name === n));
   if (missing.length) throw new Error(`${cueFile.name} names ${missing.join(", ")}: pick them along with the .cue`);
   const store = await discStore;
-  localStorage.removeItem(store.key);
   const root = await navigator.storage.getDirectory();
-  await root.removeEntry(store.dir, { recursive: true }).catch(() => {});
   const dir = await root.getDirectoryHandle(store.dir, { create: true });
-  for (const f of files) {
-    say(`copying ${f.name} into OPFS…`);
-    const w = await (await dir.getFileHandle(f.name, { create: true })).createWritable().catch((e) => {
-      if (e.name !== "NoModificationAllowedError") throw e;
-      throw new Error(`${f.name} is open in a running game (this tab or another): close that tab or reload this one, then import again`);
-    });
-    await f.stream().pipeTo(w);
+  // Acquire every writable before writing anything: the first locked file
+  // must refuse the whole import, not be found after an earlier one was
+  // already rewritten. Abort what was acquired so the old disc survives.
+  const open = [];
+  try {
+    for (const f of files) {
+      const w = await (await dir.getFileHandle(f.name, { create: true })).createWritable().catch((e) => {
+        if (e.name !== "NoModificationAllowedError") throw e;
+        throw new Error(`${f.name} is open in a running game (this tab or another): close that tab or reload this one, then import again`);
+      });
+      open.push({ f, w });
+    }
+    for (const { f, w } of open) {
+      say(`copying ${f.name} into OPFS…`);
+      await f.stream().pipeTo(w);
+    }
+  } catch (e) {
+    // Also release the not-yet-used writers if a copy fails. Completed
+    // copies cannot be rolled back; this is cleanup, not a transaction.
+    for (const { w } of open) await w.abort().catch(() => {});
+    throw e;
+  }
+  // The new image is in place: only now drop the files it no longer names
+  // and remember it, so a refused import leaves the old disc imported.
+  for await (const [name, h] of dir.entries()) {
+    if (!files.some((f) => f.name === name)) await dir.removeEntry(name, { recursive: h.kind === "directory" }).catch(() => {});
   }
   localStorage.setItem(store.key, cueFile.name);
   return cueFile.name;

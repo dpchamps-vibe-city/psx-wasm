@@ -1,37 +1,29 @@
-//! The BIOS's CD-ROM driver and its `cdrom` device (psx-spx "BIOS CDROM
-//! Functions"; OpenBIOS `cdrom/`, which follows the retail BIOS's code),
-//! over the CD controller's registers with its timing.
+//! The BIOS's CD-ROM software services (psx-spx "BIOS CDROM Functions";
+//! OpenBIOS `cdrom/`) over the native drive and disc, not the controller's
+//! registers.
 //!
-//! - The driver is a state machine its interrupt handlers advance: two
-//!   kernel elements at priority 0 (A(90h..93h), the CD-ROM's and DMA's
-//!   verifiers and handlers), which read the controller's interrupt and
-//!   response, issue the next command, start DMA3 for each sector and
-//!   deliver the CD events (class F0000003h: 10h the transfers done, 20h a
-//!   command done, 40h data ready, 80h end of data, 8000h an error).
-//! - The asynchronous functions (`CdAsyncSeekL`, `CdAsyncGetStatus`,
-//!   `CdAsyncReadSector`, `CdAsyncSetMode`) start a command; the blocking
-//!   ones (`CdReadSector`, `CdGetStatus`) wait for the events, time passing
-//!   as the drive takes it. A CD error there is `SystemError('D', ...)`.
-//! - The `cdrom` device reads the path table and one sector of a
-//!   directory, as the retail BIOS does: a file is found by its path's
-//!   directories in the path table, then its name (`?` wildcards) in its
-//!   directory's first sector; `read` reloads the path table each time
-//!   and reads whole sectors.
-//! - The boot leaves the driver installed (`_96_init`: its handlers in
-//!   their chain, its events open, the CD-ROM's and DMA's interrupts
-//!   unmasked, its interrupts acknowledged by its handlers); libetc's
-//!   `ResetCallback` takes it out (`_96_remove`) before libcd drives the
-//!   controller. The boot's own disc reads (SYSTEM.CNF, the executable,
-//!   the path table) are the runtime's, through the host.
+//! The retail functions are a driver state machine: `A(90h..93h)` read the
+//! controller's interrupt and response, issue the next command, start DMA3
+//! and deliver the CD events (class F0000003h: 20h a command done, 40h data
+//! ready, 80h end of data, 8000h an error). That register protocol is not
+//! reproduced here. The software calls keep their signatures, guest
+//! buffers, results and event order, and drive [`psx_devices::cd::Drive`]
+//! and the host's disc directly on the virtual clock; the sector bytes are
+//! the same ones the fallback controller reads through its own core.
 //!
-//! Where it differs from OpenBIOS: the response is read before the
-//! interrupt is acknowledged (psx-spx: acknowledging drains it); a busy
-//! driver fails a blocking call at once rather than after its retries.
+//! `_96_init` opens the five events; `_96_remove` closes them. The async
+//! calls return at once and schedule their completion; a blocking call
+//! waits for the same completion event. A read's last buffer reports ACK
+//! (10h), then its normal pause reports DNE (20h); END (80h) is only the
+//! drive ending early. The fallback controller's own state is updated too,
+//! so later core queries see the head, mode, subchannel/header and status.
+//! Only one operation runs at a time, as the retail driver's state is idle
+//! before the next command.
 
-use crate::files::{self, fcb};
-use crate::machine::{Flow, Machine, Sdk, Wait, seq};
-use psx_devices::{cd, cdc, dma, irq};
-use std::collections::VecDeque;
+use crate::kernel::{self, EV_MODE_NOINTR};
+use crate::machine::{Event, Flow, GuestCall, Machine, Sdk, Wait, LOOP_BUDGET};
+use psx_devices::cd::{self, Drive};
+use std::{cell::Cell, rc::Rc};
 
 pub const EV_CD: u32 = 0xF000_0003;
 pub const ACK: u32 = 0x10;
@@ -41,951 +33,693 @@ pub const END: u32 = 0x80;
 pub const ERR: u32 = 0x8000;
 const SPECS: [u32; 5] = [ACK, DNE, RDY, END, ERR];
 
-/// The driver's states (OpenBIOS's, the command's number in most).
-const IDLE: u32 = 0xFFFF;
-const GETSTATUS: u32 = 0x01;
-const SETMODE: u32 = 0x0E;
-const SEEKL: u32 = 0x15;
-const SEEKP: u32 = 0x16;
-const SEEKL_SETLOC: u32 = 0xF2;
-const READN: u32 = 0xF6;
-const READS: u32 = 0xFB;
-const READN_PREEMPTED: u32 = 0xE6;
-const READS_PREEMPTED: u32 = 0xEB;
-const READ_SETMODE: u32 = 0xFE;
-const INITIALIZING: u32 = 0xCCC;
-const REINIT: u32 = 0xDDD;
-const PAUSING: u32 = 0xFFF;
-
-/// The driver's sector buffer and status byte in kernel RAM (OpenBIOS
-/// `g_readBuffer`).
-pub const BUFFER: u32 = 0xA000_8000;
-const STATUS: u32 = 0xA000_7FF0;
-
-const D3_MADR: u32 = dma::BASE + 0x10 * 3;
-const CDROM_DELAY: u32 = 0x1F80_1018;
-const COM_DELAY: u32 = 0x1F80_1020;
-
+/// A command's sector-count argument is signed (0 and negative fail).
 #[derive(Debug, Clone)]
-pub struct Driver {
-    state: u32,
-    preempted: u32,
-    got_int3: bool,
-    words: u32,
-    sectors: i32,
-    dmas: i32,
-    buf: u32,
-    mode: u32,
-    err: [u8; 2],
-    got_int5: bool,
-    /// Whether the handlers acknowledge their interrupt and return from the
-    /// exception (`SetCdromIrqAutoAbort`): the CD-ROM's, DMA's.
-    pub auto_ack: [u32; 2],
-    status_dst: u32,
-    init: u8,
-    /// The events `_96_init` opened: 10h, 20h, 40h, 80h, 8000h.
-    pub events: [u32; 5],
-    fs: Fs,
+enum Op {
+    Seek {
+        at: u64,
+    },
+    Status {
+        dst: Option<u32>,
+        at: u64,
+    },
+    SetMode {
+        mode: u8,
+        at: u64,
+    },
+    Read {
+        lba: u32,
+        left: u32,
+        dst: u32,
+        mode: u8,
+        at: u64,
+    },
+    /// The pause after the last sector's buffer is complete: the read's
+    /// normal DNE follows the DMA/read ACK.
+    Pause {
+        at: u64,
+    },
 }
 
-impl Default for Driver {
-    fn default() -> Self {
-        Self {
-            state: IDLE,
-            preempted: IDLE,
-            got_int3: false,
-            words: 0,
-            sectors: 0,
-            dmas: 0,
-            buf: 0,
-            mode: 0,
-            err: [0; 2],
-            got_int5: false,
-            auto_ack: [0; 2],
-            status_dst: 0,
-            init: 0,
-            events: [0; 5],
-            fs: Fs::default(),
+impl Op {
+    fn at(&self) -> u64 {
+        match self {
+            Op::Seek { at }
+            | Op::Status { at, .. }
+            | Op::SetMode { at, .. }
+            | Op::Read { at, .. }
+            | Op::Pause { at } => *at,
         }
     }
 }
 
-/// What the device keeps of the disc: the path table, the last directory
-/// read, the current directory and `firstfile`'s search.
+/// The BIOS CD driver's software state: its events, the operation in
+/// flight, and the last completion or INT5 error.
 #[derive(Debug, Clone, Default)]
-struct Fs {
-    /// (parent, LBA, name) per directory; its ID is its index + 1.
-    paths: Vec<(u32, u32, Vec<u8>)>,
-    hash: u32,
-    dir_id: usize,
-    /// (LBA, size, name) per entry of directory `dir_id`'s first sector.
-    dir: Vec<(u32, u32, Vec<u8>)>,
-    cwd: Vec<u8>,
-    found: usize,
-    pattern: Vec<u8>,
-    first_skip: bool,
-    first_dir: usize,
+pub struct Cd {
+    pub events: [u32; 5],
+    op: Option<Op>,
+    /// Each blocking waiter retains its own result even if a completion
+    /// callback immediately starts another operation.
+    done: Rc<Cell<Option<u64>>>,
+    /// The event spec of the last operation that finished.
+    pub last: Option<u32>,
+    /// The last status byte read by a status operation (`CdGetStatus`).
+    pub last_status: u8,
+    /// The last controller error's status and code
+    /// (`CdromGetInt5errCode`). The native read path has no command INT5
+    /// stage: the core records EDC failures in its `edc_errors`, and a
+    /// missing sector is an early end, so this stays zero on that path.
+    pub error: [u8; 2],
 }
 
 fn bcd(v: u32) -> u8 {
-    ((v / 10) << 4 | v % 10) as u8
+    (((v / 10) << 4) | (v % 10)) as u8
 }
 
-fn le(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+/// Call A(A1h), returning -1 if a guest table patch returns. A read error
+/// can instead sequence another attempt after this flow (OpenBIOS helpers.c).
+/// The default SystemError is fatal; retain the callable boundary.
+fn system_error<S: Sdk>(m: &Machine<S>, code: u32) -> Flow<S> {
+    Flow::Call {
+        call: GuestCall {
+            addr: m.mem.r32(crate::tables::entry(0xA0, 0xA1).unwrap()),
+            args: [b'D' as u32, code, 0, 0],
+        },
+        then: Box::new(|_, _| Flow::ret(u32::MAX)),
+    }
 }
 
-/// `SystemError('D', code)` where the console stops in a wait's
-/// continuation, which can't return an error.
-fn system_error(code: u32, why: &str) -> ! {
-    panic!("SystemError('D', {code:#x}): {why}")
+/// The bytes one read sector puts in the guest buffer for `mode`: 2048
+/// user bytes, 2340 after the sync, or 2328 after the sync and header.
+fn sector_bytes(raw: &[u8; cd::RAW], mode: u8) -> &[u8] {
+    if mode & 0x10 != 0 {
+        &raw[24..]
+    } else if mode & 0x20 != 0 {
+        &raw[12..]
+    } else {
+        cd::user_data(raw)
+    }
 }
 
-/// `?` matches any character (OpenBIOS `patternMatches`).
-fn matches(name: &[u8], pattern: &[u8]) -> bool {
-    let name = name.split(|&c| c == 0).next().unwrap_or(&[]);
-    let mut p = pattern.iter();
-    for &c in name {
-        match p.next() {
-            Some(&b'?') => {}
-            Some(&q) if q == c => {}
-            _ => return false,
+/// Poll the live B0B table, not the operation's result. Only TestEvent (or
+/// its patch) consumes flags. Cancellation is a separate native failure.
+fn cd_wait<S: Sdk>(m: &mut Machine<S>, done: Rc<Cell<Option<u64>>>, read: bool) -> Flow<S> {
+    cd_poll(m, done, read, 0, false, crate::machine::LOOP_BUDGET)
+}
+
+fn cd_poll<S: Sdk>(m: &mut Machine<S>, done: Rc<Cell<Option<u64>>>, read: bool,
+    mut index: usize, mut patched: bool, mut left: u64) -> Flow<S>
+{
+    loop {
+        // A false-returning patch can cancel native work. Observe that before
+        // another probe (which may now have a closed handle) or a quantum yield.
+        if done.get() == Some(ERR as u64) {
+            m.cd_take(ERR, &done);
+            return Flow::ret(ERR);
+        }
+        if index == if read { 3 } else { 2 } {
+            if !patched {
+                // The native TestEvent has no other effects. Sleep until a
+                // live flag, cancellation or table patch can change its result.
+                // No pending drive operation does not exclude a later event.
+                return Flow::Block {
+                    until: Wait::Cd { done: done.clone(), read },
+                    then: Box::new(move |m| cd_wait(m, done, read)),
+                };
+            }
+            left -= 1;
+            if left == 0 {
+                // A guest wrapper may always return false without containing
+                // a loop/safepoint of its own. Yield using the existing loop
+                // quantum, not instruction costs or a new polling timeout.
+                m.regs.reset_budget();
+                return Flow::Block {
+                    until: Wait::Cycle(m.clock.now + m.quantum()),
+                    then: Box::new(move |m| cd_wait(m, done, read)),
+                };
+            }
+            index = 0;
+            patched = false;
+        }
+        let (slot, spec) = [(1, DNE), (4, ERR), (3, END)][index];
+        let handle = m.kernel.cd.events[slot];
+        patched |= !m.cd_native_test_event();
+        let flow = crate::bios::dispatch(m, 0xB0, 0x0B, [handle, 0, 0, 0])
+            .unwrap_or_else(|e| panic!("CD TestEvent: {e}"));
+        index += 1;
+        match flow {
+            Flow::Return(v) if v as u32 == 0 => {}
+            Flow::Return(_) => return Flow::ret(spec),
+            flow => return crate::machine::seq(m, flow, move |m, v| {
+                if v as u32 != 0 { Flow::ret(spec) }
+                else { cd_poll(m, done, read, index, patched, left) }
+            }),
         }
     }
-    matches!(p.next(), None | Some(b'?') | Some(0))
 }
 
 impl<S: Sdk> Machine<S> {
-    fn cd_w(&mut self, r: u32, v: u8) {
-        let _ = self.reg_write(cdc::BASE + r, 1, v as u32);
-    }
-
-    fn cd_r(&mut self, r: u32) -> u8 {
-        self.reg_read(cdc::BASE + r, 1).unwrap_or(0) as u8
-    }
-
-    fn cd_command(&mut self, c: u8, params: &[u8]) {
-        self.cd_w(0, 0);
-        for &p in params {
-            self.cd_w(2, p);
+    /// The drive the BIOS's CD calls act on: the fallback controller's own
+    /// when the bus is there, so both see one head, mode and status, else
+    /// the machine's native drive.
+    pub fn cd_drive(&mut self) -> &mut Drive {
+        match self.io.as_mut() {
+            Some(io) => &mut io.cdc.drive,
+            None => &mut self.drive,
         }
-        self.cd_w(1, c);
     }
 
-    /// The parameter FIFO isn't full.
-    fn cd_ready(&mut self) -> bool {
-        self.cd_r(0) & 0x10 != 0
+    /// The drive status as the fallback controller reports it, or the
+    /// native drive's byte without a bus.
+    pub fn cd_status(&self) -> u8 {
+        match &self.io {
+            Some(io) => io.cdc.status(),
+            None => self.drive.status,
+        }
     }
 
-    fn cd_event(&mut self, spec: u32) {
+    fn cd_owns(&mut self, index: usize, h: u32) -> bool {
+        h != 0
+            && self.ev(h).is_some_and(|e| {
+                e.class == EV_CD
+                    && e.spec == SPECS[index]
+                    && e.mode == EV_MODE_NOINTR
+                    && e.status != kernel::EV_UNUSED
+            })
+    }
+
+    /// Whether `_96_init`'s five events are ours and still open.
+    pub fn cd_installed(&mut self) -> bool {
+        let events = self.kernel.cd.events;
+        (0..SPECS.len()).all(|i| self.cd_owns(i, events[i]))
+    }
+
+    /// A(54h)/A(71h) `_96_init`: all five events
+    /// open and enabled, or none left behind and a failure result.
+    pub fn cd_init(&mut self) -> u32 {
+        self.cd_remove();
+        let mut events = [0u32; 5];
+        for (i, spec) in SPECS.into_iter().enumerate() {
+            let h = self.open_event(EV_CD, spec, EV_MODE_NOINTR, 0);
+            if h == u32::MAX {
+                for (j, &h) in events.iter().enumerate() {
+                    if self.cd_owns(j, h) {
+                        self.set_ev_status(h, kernel::EV_UNUSED);
+                    }
+                }
+                self.kernel.cd.events = [0; 5];
+                return u32::MAX;
+            }
+            self.set_ev_status(h, kernel::EV_ENABLED);
+            events[i] = h;
+        }
+        self.kernel.cd.events = events;
+        self.kernel.files.cd_cwd.clear();
+        self.cd_inner_init();
+        0
+    }
+
+    /// A(95h) `CdInitSubFunc`: reset the drive, not its event allocation or
+    /// filesystem. The inner init returns 1 on success (the outer init retries 0).
+    pub fn cd_inner_init(&mut self) -> u32 {
+        self.cd_cancel();
+        self.kernel.cd.last = None;
+        self.kernel.cd.error = [0; 2];
+        self.cdc_sync();
+        if let Some(io) = self.io.as_mut() {
+            io.cdc.native_init();
+        } else {
+            self.drive.status = cd::stat::STANDBY;
+            self.drive.mode = 0;
+        }
+        self.cdc_sync();
+        // Both the outer setup and the inner init leave the critical section.
+        let _ = crate::bios::syscall(self, [2, 0, 0, 0]);
+        1
+    }
+
+    /// A(56h)/A(72h) `_96_remove`: pending native work stopped, only our
+    /// own events closed. A slot the guest reused for another event is left
+    /// alone.
+    pub fn cd_remove(&mut self) {
+        self.crit = true;
+        self.cd_cancel();
+        let events = std::mem::take(&mut self.kernel.cd.events);
+        for (i, h) in events.into_iter().enumerate() {
+            if self.cd_owns(i, h) {
+                self.set_ev_status(h, kernel::EV_UNUSED);
+            }
+        }
+    }
+
+    fn cd_cancel(&mut self) {
+        self.clock.cancel(|e| *e == Event::Cd);
+        if self.kernel.cd.op.take().is_some() {
+            self.kernel.cd.done.set(Some(ERR as u64));
+        }
+        self.cd_native_finish();
+    }
+
+    fn cd_native_seek(&mut self, target: u32) -> u64 {
+        self.cdc_sync();
+        let cycles = if let Some(io) = self.io.as_mut() {
+            io.cdc.native_seek(target)
+        } else {
+            let d = &mut self.drive;
+            let cycles = d.seek_cycles(d.head, target);
+            d.head = target;
+            d.setloc = target;
+            d.status = (d.status & !cd::stat::ERROR) | cd::stat::SEEK;
+            cycles
+        };
+        self.cdc_sync();
+        cycles
+    }
+
+    fn cd_native_seek_done(&mut self) {
+        match self.io.as_mut() {
+            Some(io) => io.cdc.native_seek_done(),
+            None => self.drive.status &= !cd::stat::SEEK,
+        }
+    }
+
+    fn cd_native_begin_read(&mut self, mode: u8) -> u64 {
+        self.cdc_sync();
+        let cycles = if let Some(io) = self.io.as_mut() {
+            io.cdc.native_begin_read(mode)
+        } else {
+            let d = &mut self.drive;
+            d.mode = mode;
+            d.status = (d.status & !cd::stat::ERROR) | cd::stat::READ;
+            d.sector_cycles()
+        };
+        self.cdc_sync();
+        cycles
+    }
+
+    fn cd_native_finish(&mut self) {
+        self.cdc_sync();
+        match self.io.as_mut() {
+            Some(io) => io.cdc.native_finish(),
+            None => self.drive.status &= !(cd::stat::SEEK | cd::stat::READ),
+        }
+        self.cdc_sync();
+    }
+
+    fn cd_native_set_mode(&mut self, mode: u8) {
+        match self.io.as_mut() {
+            Some(io) => io.cdc.native_set_mode(mode),
+            None => self.drive.mode = mode,
+        }
+    }
+
+    /// One native read sector through the same disc/EDC validation and
+    /// header/subchannel state the fallback controller uses.
+    fn cd_native_sector(&mut self, lba: u32) -> Option<[u8; cd::RAW]> {
+        let Machine {
+            io, host, drive, ..
+        } = self;
+        if let Some(io) = io {
+            let mut disc = crate::bios::HostDisc(&mut **host);
+            io.cdc.native_sector(lba, &mut disc)
+        } else {
+            let mut raw = [0u8; cd::RAW];
+            if !host.disc_read(lba, &mut raw) {
+                return None;
+            }
+            let _ = cd::check(&raw, lba);
+            drive.head = lba + 1;
+            Some(raw)
+        }
+    }
+
+    /// Start an operation at its due cycle. Stale ready events from the
+    /// previous operation must not satisfy this one's wait.
+    fn cd_begin(&mut self, op: Op) {
+        self.clock.cancel(|e| *e == Event::Cd);
+        for spec in SPECS {
+            self.undeliver_event(EV_CD, spec);
+        }
+        self.kernel.cd.last = None;
+        self.kernel.cd.done = Rc::new(Cell::new(None));
+        let at = op.at();
+        self.kernel.cd.op = Some(op);
+        self.clock.schedule(at, Event::Cd);
+    }
+
+    /// The cycle the operation in flight completes at.
+    pub fn cd_due(&self) -> u64 {
+        self.kernel
+            .cd
+            .op
+            .as_ref()
+            .map_or(self.clock.now + 1, Op::at)
+    }
+
+    fn cd_finish(&mut self, spec: u32) {
+        self.kernel.cd.op = None;
+        self.kernel.cd.last = Some(spec);
+        self.kernel.cd.done.set(Some(
+            (self.kernel.cd.last_status as u64) << 32 | spec as u64,
+        ));
         self.deliver_event(EV_CD, spec);
     }
 
-    fn cd_undeliver(&mut self, specs: &[u32]) {
-        for &s in specs {
-            self.undeliver_event(EV_CD, s);
-        }
+    /// TestEvent order from helpers.c/cdrom.c. Handles are live, even if a
+    /// callback closed/reused a slot; TestEvent tests its status, not ownership.
+    fn cd_wait_event(&self, read: bool) -> Option<(u32, u32)> {
+        let events = self.kernel.cd.events;
+        [(events[1], DNE), (events[4], ERR), (events[3], END)]
+            .into_iter().take(if read { 3 } else { 2 })
+            .find(|&(h, _)| self.event_ready(h))
     }
 
-    /// `initializeCDRomHandlersAndEvents` and `cdromInnerInit`'s kernel
-    /// side: the handlers at priority 0, the events open and enabled, the
-    /// interrupts acknowledged by the handlers and unmasked, DMA3's
-    /// interrupt on, the controller's interrupts acknowledged and enabled,
-    /// the state idle.
-    pub fn cd_install(&mut self) {
-        self.cd_enqueue();
-        for (i, spec) in SPECS.into_iter().enumerate() {
-            let h = self.open_event(EV_CD, spec, crate::kernel::EV_MODE_NOINTR, 0);
-            self.set_ev_status(h, crate::kernel::EV_ENABLED);
-            self.kernel.cd.events[i] = h;
-        }
-        self.kernel.cd.fs.cwd.clear();
-        let d = &mut self.kernel.cd;
-        d.auto_ack = [1, 1];
-        d.state = IDLE;
-        d.preempted = IDLE;
-        d.got_int3 = false;
-        d.got_int5 = false;
-        d.init = 1;
-        if self.io.is_none() {
+    fn cd_native_test_event(&self) -> bool {
+        self.mem.r32(crate::tables::entry(0xB0, 0x0B).unwrap()) == crate::tables::stand_in(0xB0, 0x0B)
+    }
+
+    pub(crate) fn cd_wait_ready(&self, done: &Rc<Cell<Option<u64>>>, read: bool) -> bool {
+        done.get() == Some(ERR as u64) || !self.cd_native_test_event() || self.cd_wait_event(read).is_some()
+    }
+
+    /// Cancellation can also leave an ERR flag to consume, but must not take
+    /// a newer operation's notification. Normal waits use live TestEvent above.
+    fn cd_take(&mut self, spec: u32, done: &Rc<Cell<Option<u64>>>) {
+        // A callback may already have completed a different operation.
+        if !Rc::ptr_eq(done, &self.kernel.cd.done) {
             return;
         }
-        let _ = self.reg_write(dma::DPCR, 4, 0x9099);
-        let dicr = self.reg_read(dma::DICR, 4).unwrap_or(0);
-        let _ = self.reg_write(dma::DICR, 4, dicr & 0xFF_FFFF | 0x8800_0000);
-        self.cd_w(0, 1);
-        self.cd_w(3, 0x1F);
-        self.cd_w(0, 1);
-        self.cd_w(2, 0x1F);
-        let _ = self.reg_write(irq::I_STAT, 4, !(1 << irq::CDROM));
-        let mask = self.reg_read(irq::I_MASK, 4).unwrap_or(0);
-        let _ = self.reg_write(irq::I_MASK, 4, mask | 1 << irq::CDROM | 1 << irq::DMA);
-    }
-
-    /// A(A2h) `EnqueueCdIntr()`: the CD-ROM's element, then DMA's, at
-    /// priority 0 (so DMA's first).
-    pub fn cd_enqueue(&mut self) {
-        use crate::kernel::{CD_DMA_ELEMENT, CD_IO_ELEMENT, kernel_element};
-        self.enq_int_rp(0, kernel_element(CD_IO_ELEMENT));
-        self.enq_int_rp(0, kernel_element(CD_DMA_ELEMENT));
-    }
-
-    /// A(A3h) `DequeueCdIntr()`.
-    pub fn cd_dequeue(&mut self) {
-        use crate::kernel::{CD_DMA_ELEMENT, CD_IO_ELEMENT, kernel_element};
-        self.deq_int_rp(0, kernel_element(CD_IO_ELEMENT));
-        self.deq_int_rp(0, kernel_element(CD_DMA_ELEMENT));
-    }
-
-    /// A(56h)/A(72h) `_96_remove()`: in a critical section (left so), the
-    /// events closed and the handlers out (OpenBIOS `deinitCDRom`).
-    pub fn cd_remove(&mut self) {
-        self.crit = true;
-        for h in std::mem::take(&mut self.kernel.cd.events) {
-            if h != 0 {
-                self.set_ev_status(h, crate::kernel::EV_UNUSED);
+        let events = self.kernel.cd.events;
+        for (i, h) in events.into_iter().enumerate() {
+            if self.cd_owns(i, h)
+                && self
+                    .ev(h)
+                    .is_some_and(|e| e.spec == spec && e.status == kernel::EV_READY)
+            {
+                self.set_ev_status(h, kernel::EV_ENABLED);
+                return;
             }
         }
-        self.cd_dequeue();
     }
 
-    /// Whether `_96_init`'s events are open, so a blocking call can end.
-    fn cd_installed(&mut self) -> Result<(), String> {
-        let events = self.kernel.cd.events;
-        let ok = events.iter().all(|&h| h != 0 && self.ev(h).is_some_and(|e| e.status != crate::kernel::EV_UNUSED));
-        if !ok {
-            return Err("the BIOS's CD driver is not installed (_96_remove took it out; _96_init installs it): its events never come".into());
-        }
-        if self.io.is_none() {
-            return Err("the BIOS's CD driver needs the CD controller".into());
-        }
-        Ok(())
-    }
-
-    /// A(78h) `CdAsyncSeekL(msf)`: Setloc, then SeekL; 1, or 0 when busy.
+    /// A(78h) `CdAsyncSeekL(msf)`: 1, or 0 when busy.
     pub fn cd_seek_l(&mut self, msf: [u8; 3]) -> u32 {
-        let st = self.kernel.cd.state;
-        let preempting = st == READN_PREEMPTED || st == READS_PREEMPTED;
-        if preempting && !self.kernel.cd.got_int3 || !preempting && st != IDLE || !self.cd_ready() {
+        if !self.cd_installed() || self.kernel.cd.op.is_some() {
             return 0;
         }
-        self.cd_undeliver(&[DNE, END, ERR, 0x100, 0x200]);
-        if preempting {
-            self.kernel.cd.preempted = st;
-        }
-        self.cd_command(0x02, &msf);
-        self.kernel.cd.state = SEEKL_SETLOC;
+        let target = cd::msf_to_lba(msf);
+        let now = self.clock.now;
+        let cycles = self.cd_native_seek(target);
+        self.cd_begin(Op::Seek { at: now + cycles });
         1
     }
 
-    /// A(7Ch) `CdAsyncGetStatus(dst)`: GetStat, its status to `dst`.
+    fn cd_get_status_at(&mut self, dst: Option<u32>) -> u32 {
+        if !self.cd_installed() || self.kernel.cd.op.is_some() {
+            return 0;
+        }
+        self.cdc_sync();
+        let at = self.clock.now + self.cd_drive().ack_cycles();
+        self.cd_begin(Op::Status { dst, at });
+        1
+    }
+
+    /// A(7Ch) `CdAsyncGetStatus(dst)`: GetStat, its status byte to `dst`.
     pub fn cd_get_status(&mut self, dst: u32) -> u32 {
-        if self.kernel.cd.state != IDLE {
-            return 0;
-        }
-        self.cd_undeliver(&[RDY, ACK, DNE, END, ERR, 0x100, 0x200]);
-        self.kernel.cd.state = GETSTATUS;
-        self.kernel.cd.status_dst = dst;
-        self.cd_command(0x01, &[]);
-        1
+        self.cd_get_status_at(Some(dst))
     }
 
-    /// A(7Eh) `CdAsyncReadSector(count, dst, mode)`: Setmode, then ReadN
-    /// (ReadS with mode bit 8); each sector by DMA3, 800h, 918h or 924h
-    /// bytes as the mode says.
+    /// A(7Eh) `CdAsyncReadSector(count, dst, mode)`: sectors from the
+    /// head, each after its own time, into `dst`; 1, or 0 when busy.
     pub fn cd_read(&mut self, count: u32, dst: u32, mode: u32) -> u32 {
-        if self.kernel.cd.state != IDLE || (count as i32) <= 0 {
+        if !self.cd_installed() || self.kernel.cd.op.is_some() || (count as i32) <= 0 {
             return 0;
         }
-        self.cd_undeliver(&[RDY, ACK, DNE, END, ERR, 0x100, 0x200]);
-        let d = &mut self.kernel.cd;
-        d.got_int3 = false;
-        d.words = match (mode & 0x10 != 0, mode & 0x20 != 0) {
-            (false, false) => 0x200,
-            (false, true) => 0x249,
-            (true, _) => 0x246,
-        };
-        d.sectors = count as i32;
-        d.dmas = count as i32;
-        d.buf = dst;
-        d.mode = mode;
-        if !self.cd_ready() {
-            return 0;
-        }
-        self.kernel.cd.state = READ_SETMODE;
-        self.cd_command(0x0E, &[mode as u8]);
+        let now = self.clock.now;
+        let cycles = self.cd_native_begin_read(mode as u8);
+        let lba = self.cd_drive().head;
+        self.cd_begin(Op::Read {
+            lba,
+            left: count,
+            dst,
+            mode: mode as u8,
+            at: now + cycles,
+        });
         1
     }
 
     /// A(81h) `CdAsyncSetMode(mode)`.
     pub fn cd_set_mode(&mut self, mode: u32) -> u32 {
-        if self.kernel.cd.state != IDLE {
+        if !self.cd_installed() || self.kernel.cd.op.is_some() {
             return 0;
         }
-        self.cd_undeliver(&[RDY, ACK, DNE, END, ERR, 0x100, 0x200]);
-        self.kernel.cd.mode = mode;
-        if !self.cd_ready() {
-            return 0;
-        }
-        self.kernel.cd.state = SETMODE;
-        self.cd_command(0x0E, &[mode as u8]);
+        self.cdc_sync();
+        self.cd_native_set_mode(mode as u8);
+        let at = self.clock.now + self.cd_drive().ack_cycles();
+        self.cd_begin(Op::SetMode {
+            mode: mode as u8,
+            at,
+        });
         1
     }
 
-    /// A(94h) `CdromGetInt5errCode(dst1, dst2)`: the last INT5's status and
-    /// error.
+    /// A(94h) `CdromGetInt5errCode(dst1, dst2)`: the last error's two bytes.
     pub fn cd_int5_error(&mut self, dst1: u32, dst2: u32) {
-        let [a, b] = self.kernel.cd.err;
+        let [a, b] = self.kernel.cd.error;
         self.mem.w8(dst1, a);
         self.mem.w8(dst2, b);
     }
 
-    fn irq_line(&mut self, bit: u32) -> bool {
-        let mask = self.reg_read(irq::I_MASK, 4).unwrap_or(0);
-        let stat = self.reg_read(irq::I_STAT, 4).unwrap_or(0);
-        mask & stat & 1 << bit != 0
-    }
-
-    /// A(90h) the CD-ROM's verifier: with IRQ2 taken, the controller's
-    /// interrupt and response, acknowledged, advance the state machine; 1.
-    pub fn cd_io_verifier(&mut self) -> u32 {
-        if self.io.is_none() || !self.irq_line(irq::CDROM) {
-            return 0;
-        }
-        self.cd_w(0, 1);
-        let flags = self.cd_r(3);
-        let mut resp = VecDeque::new();
-        while self.cd_r(0) & 0x20 != 0 && resp.len() < 16 {
-            resp.push_back(self.cd_r(1));
-        }
-        if flags & 7 != 0 {
-            self.cd_w(0, 1);
-            self.cd_w(3, 7);
-        }
-        if flags & 0x18 != 0 {
-            self.cd_w(0, 1);
-            self.cd_w(3, flags & 0x18);
-        }
-        let first = resp.pop_front().unwrap_or(0);
-        match flags & 7 {
-            1 => self.cd_data_ready(),
-            2 => self.cd_complete(),
-            3 => self.cd_acknowledge(first),
-            4 => self.cd_end(),
-            5 => self.cd_disc_error(first, resp.pop_front().unwrap_or(0)),
-            _ => {}
-        }
-        1
-    }
-
-    /// A(91h) DMA's verifier: with IRQ3 taken, DMA3's flag acknowledged
-    /// (whichever channel raised it, as OpenBIOS's does), a transfer
-    /// counted, event 10h after the last; 1.
-    pub fn cd_dma_verifier(&mut self) -> u32 {
-        if self.io.is_none() || !self.irq_line(irq::DMA) {
-            return 0;
-        }
-        let dicr = self.reg_read(dma::DICR, 4).unwrap_or(0);
-        let _ = self.reg_write(dma::DICR, 4, dicr & 0xFF_FFFF | 0x8800_0000);
-        self.kernel.cd.dmas -= 1;
-        if self.kernel.cd.dmas == 0 {
-            self.cd_event(ACK);
-        }
-        1
-    }
-
-    /// A(92h)/A(93h) the handlers: with auto-acknowledge on, the interrupt
-    /// acknowledged and the exception returned from (the rest of the chains
-    /// skipped).
-    pub fn cd_handler(&mut self, dma: bool) -> bool {
-        if self.kernel.cd.auto_ack[dma as usize] == 0 {
-            return false;
-        }
-        let bit = if dma { irq::DMA } else { irq::CDROM };
-        let _ = self.reg_write(irq::I_STAT, 4, !(1 << bit));
-        true
-    }
-
-    fn cd_data_ready(&mut self) {
-        let (p, st) = (self.kernel.cd.preempted, self.kernel.cd.state);
-        if matches!(p, READN | READS) || !matches!(p, READN_PREEMPTED | READS_PREEMPTED) && matches!(st, READN | READS) {
-            self.cd_initiate_dma();
-        } else if matches!(p, READN_PREEMPTED | READS_PREEMPTED) || matches!(st, READN_PREEMPTED | READS_PREEMPTED) {
-            self.cd_event(RDY);
-        } else {
-            self.cd_event(0x200);
-        }
-    }
-
-    /// A sector into the buffer: the controller's data request, DMA3 over
-    /// it; after the last, Pause.
-    fn cd_initiate_dma(&mut self) {
-        if self.kernel.cd.sectors == 0 {
-            self.kernel.cd.sectors = -1;
-        }
-        self.cd_w(0, 0);
-        self.cd_r(0);
-        self.cd_w(3, 0);
-        self.cd_r(3);
-        self.cd_w(0, 0);
-        self.cd_w(3, 0x80);
-        let _ = self.reg_write(CDROM_DELAY, 4, 0x2_0943);
-        let _ = self.reg_write(COM_DELAY, 4, 0x132C);
-        self.kernel.cd.sectors -= 1;
-        let (buf, words) = (self.kernel.cd.buf, self.kernel.cd.words);
-        self.kernel.cd.buf = buf.wrapping_add(4 * words);
-        let dicr = self.reg_read(dma::DICR, 4).unwrap_or(0);
-        let _ = self.reg_write(dma::DICR, 4, dicr & 0xFF_FFFF | 0x88_0000);
-        let dpcr = self.reg_read(dma::DPCR, 4).unwrap_or(0);
-        let _ = self.reg_write(dma::DPCR, 4, dpcr | 0x8000);
-        let _ = self.reg_write(D3_MADR, 4, buf);
-        let _ = self.reg_write(D3_MADR + 4, 4, words | 0x1_0000);
-        let _ = self.reg_write(D3_MADR + 8, 4, 0x1100_0000);
-        if self.kernel.cd.sectors != 0 {
+    /// One step of the operation in flight, at its due cycle.
+    pub fn cd_step(&mut self) {
+        let Some(op) = self.kernel.cd.op.clone() else {
+            return;
+        };
+        let now = self.clock.now;
+        if now < op.at() {
+            self.clock.schedule(op.at(), Event::Cd);
             return;
         }
-        self.cd_command(0x09, &[]);
-        self.kernel.cd.state = PAUSING;
-    }
-
-    fn cd_complete(&mut self) {
-        let st = self.kernel.cd.state;
-        let event = match st {
-            INITIALIZING => {
-                self.kernel.cd.init = 1;
-                None
+        match op {
+            Op::Seek { .. } => {
+                self.cd_native_seek_done();
+                self.cd_finish(DNE);
             }
-            0x08 | 0x09 | SEEKL | SEEKP => {
-                if matches!(self.kernel.cd.preempted, READN_PREEMPTED | READS_PREEMPTED | 3..=5) {
-                    self.kernel.cd.preempted = IDLE;
+            Op::Status { dst, .. } => {
+                let status = self.cd_status();
+                self.kernel.cd.last_status = status;
+                if let Some(dst) = dst {
+                    self.mem.w8(dst, status);
                 }
-                Some(DNE)
+                self.cd_finish(DNE);
             }
-            REINIT => {
-                self.kernel.cd.got_int5 = false;
-                Some(ERR)
+            Op::SetMode { mode, .. } => {
+                self.cd_native_set_mode(mode);
+                self.cd_finish(DNE);
             }
-            IDLE => Some(0x200),
-            _ => Some(DNE),
-        };
-        self.kernel.cd.state = IDLE;
-        if let Some(e) = event {
-            self.cd_event(e);
-        }
-    }
-
-    fn cd_acknowledge(&mut self, status: u8) {
-        match self.kernel.cd.state {
-            SETMODE | 0x17 => {
-                self.kernel.cd.state = IDLE;
-                self.cd_event(DNE);
-            }
-            GETSTATUS => {
-                let dst = self.kernel.cd.status_dst;
-                self.mem.w8(dst, status);
-                self.kernel.cd.state = IDLE;
-                self.cd_event(DNE);
-            }
-            READN | READS | READN_PREEMPTED | READS_PREEMPTED => self.kernel.cd.got_int3 = true,
-            0xEE | READ_SETMODE => {
-                let plain = self.kernel.cd.mode & 0x100 == 0;
-                let first = self.kernel.cd.state == READ_SETMODE;
-                self.kernel.cd.state = match (plain, first) {
-                    (true, true) => READN,
-                    (true, false) => READN_PREEMPTED,
-                    (false, true) => READS,
-                    (false, false) => READS_PREEMPTED,
+            Op::Read {
+                lba,
+                left,
+                dst,
+                mode,
+                ..
+            } => {
+                // A missing sector is the drive's early data end (80h), not
+                // an invented controller INT5. The failed sector leaves the
+                // guest buffer untouched.
+                let Some(raw) = self.cd_native_sector(lba) else {
+                    self.cd_native_finish();
+                    self.cd_finish(END);
+                    return;
                 };
-                self.cd_command(if plain { 0x06 } else { 0x1B }, &[]);
+                let bytes = sector_bytes(&raw, mode);
+                self.mem.write(dst, bytes);
+                self.loaded.push((dst, bytes.len() as u32));
+                if left <= 1 {
+                    // The last buffer is complete: the core's DMA path
+                    // reports ACK, then the normal pause completion DNE.
+                    let at = now + self.cd_drive().ack_cycles();
+                    self.kernel.cd.last = Some(ACK);
+                    self.kernel.cd.op = Some(Op::Pause { at });
+                    self.clock.cancel(|e| *e == Event::Cd);
+                    self.clock.schedule(at, Event::Cd);
+                    self.deliver_event(EV_CD, ACK);
+                } else {
+                    let cycles = self.cd_drive().sector_cycles();
+                    let dst = dst.wrapping_add(bytes.len() as u32);
+                    self.kernel.cd.op = Some(Op::Read {
+                        lba: lba + 1,
+                        left: left - 1,
+                        dst,
+                        mode,
+                        at: now + cycles,
+                    });
+                    self.clock.schedule(now + cycles, Event::Cd);
+                }
             }
-            SEEKL_SETLOC => {
-                self.kernel.cd.state = SEEKL;
-                self.cd_command(SEEKL as u8, &[]);
+            Op::Pause { .. } => {
+                self.cd_native_finish();
+                self.cd_finish(DNE);
             }
-            IDLE => self.cd_event(0x200),
-            _ => {}
-        }
-    }
-
-    fn cd_end(&mut self) {
-        let reading = |s: u32| matches!(s, READN | READS);
-        let preempting = |s: u32| matches!(s, READN_PREEMPTED | READS_PREEMPTED);
-        if reading(self.kernel.cd.preempted) || reading(self.kernel.cd.state) {
-            if self.kernel.cd.dmas > 0 {
-                self.cd_event(END);
-            }
-            if reading(self.kernel.cd.state) {
-                self.kernel.cd.state = IDLE;
-            } else {
-                self.kernel.cd.preempted = IDLE;
-            }
-        }
-        if preempting(self.kernel.cd.state) {
-            self.kernel.cd.state = IDLE;
-        } else if preempting(self.kernel.cd.preempted) {
-            self.kernel.cd.preempted = IDLE;
-        }
-        self.cd_event(0x200);
-    }
-
-    fn cd_disc_error(&mut self, status: u8, error: u8) {
-        self.kernel.cd.err = [status, error];
-        if self.kernel.cd.state == INITIALIZING {
-            self.kernel.cd.init = 2;
-        } else if !self.kernel.cd.got_int5 {
-            self.kernel.cd.got_int5 = true;
-            self.kernel.cd.preempted = IDLE;
-            self.kernel.cd.state = REINIT;
-            self.cd_command(0x0A, &[]);
-        } else {
-            self.kernel.cd.got_int5 = false;
-            self.kernel.cd.preempted = IDLE;
-            self.kernel.cd.state = IDLE;
-            self.cd_event(ERR);
-        }
-    }
-
-    /// Wait for event 20h or one of `others` (test them in that order, as
-    /// TestEvent does: the ready one goes busy again); `then` with which
-    /// (0 for 20h, else 1 + its index in `others`).
-    fn cd_wait(&mut self, others: &[u32], then: impl FnOnce(&mut Self, usize) -> Flow<S> + 'static) -> Flow<S> {
-        let ev = |spec: u32| self.kernel.cd.events[SPECS.iter().position(|&s| s == spec).expect("a CD event")];
-        let mut hs = [ev(DNE), 0, 0];
-        for (i, &o) in others.iter().enumerate() {
-            hs[i + 1] = ev(o);
-        }
-        Flow::Block {
-            until: Wait::Events(hs),
-            then: Box::new(move |m| {
-                let i = hs.iter().position(|&h| h != 0 && m.event_ready(h)).expect("an event is ready");
-                m.set_ev_status(hs[i], crate::kernel::EV_ENABLED);
-                then(m, i)
-            }),
         }
     }
 
     /// A(A5h) `CdReadSector(count, sector, dst)` (OpenBIOS
-    /// `cdromBlockReading`): SeekL to the sector, then ReadN at double
-    /// speed into `dst`; `count`, or a SystemError.
-    pub fn cd_block_read(&mut self, count: u32, sector: u32, dst: u32, then: impl FnOnce(&mut Self, u32) -> Flow<S> + 'static) -> Result<Flow<S>, String> {
-        self.cd_installed()?;
-        let s = sector + cd::PREGAP;
-        let msf = [bcd(s / 4500), bcd(s % 4500 / 75), bcd(s % 75)];
-        if self.cd_seek_l(msf) == 0 {
-            return Err("SystemError('D', 0xb): the BIOS's CD driver is busy".into());
-        }
-        Ok(self.cd_wait(&[ERR], move |m, i| {
-            if i != 0 {
-                system_error(0x0C, "the seek failed");
-            }
-            if m.cd_read(count, dst, 0x80) == 0 {
-                system_error(0x0C, "the BIOS's CD driver is busy");
-            }
-            m.cd_wait(&[ERR, END], move |m, i| match i {
-                0 => then(m, count),
-                1 => system_error(0x16, "the read failed"),
-                _ => system_error(0x17, "the read reached the end of the data"),
-            })
+    /// `cdromBlockReading`): SeekL to `sector`, then ReadN at double speed;
+    /// `count`, or -1 on failure if SystemError returns. A read ERR retries
+    /// after that call, up to ten attempts. Seek/read acceptance calls the
+    /// live A78/A7E tables at most 99999 times each before waiting for events.
+    pub fn cd_block_read(&mut self, count: u32, sector: u32, dst: u32) -> Result<Flow<S>, String> {
+        // Like the SDK's StCdInterrupt, reserve guest locals below the caller,
+        // with 16 bytes for o32 outgoing arguments. Keep the MSF across all
+        // calls, waits and read retries; nested calls get independent frames.
+        let sp = self.regs.sp();
+        let frame = sp.wrapping_sub(24);
+        self.regs.set_sp(frame);
+        let flow = self.cd_block_read_attempt(count, sector.wrapping_add(cd::PREGAP), dst, frame.wrapping_add(16), 10);
+        Ok(crate::machine::seq(self, flow, move |m, v| {
+            m.regs.set_sp(sp);
+            Flow::Return(v)
         }))
     }
 
-    /// A(A6h) `CdGetStatus()` (OpenBIOS `cdromBlockGetStatus`): the drive's
-    /// status byte.
-    pub fn cd_block_status(&mut self, then: impl FnOnce(&mut Self, u32) -> Flow<S> + 'static) -> Result<Flow<S>, String> {
-        self.cd_installed()?;
-        if self.cd_get_status(STATUS) == 0 {
-            return Err("SystemError('D', 0x1f): the BIOS's CD driver is busy".into());
+    fn cd_block_read_attempt(&mut self, count: u32, sector: u32, dst: u32, msf_addr: u32, left: u32) -> Flow<S> {
+        if left == 0 {
+            return system_error(self, 0x0C);
         }
-        Ok(self.cd_wait(&[ERR], move |m, i| {
-            if i != 0 {
-                system_error(0x20, "GetStat failed");
+        let msf = [bcd(sector / 4500), bcd(sector % 4500 / 75), bcd(sector % 75)];
+        // Retail computes MSF inside the retry loop and loses the minutes
+        // from `sector`. OpenBIOS helpers.c documents but fixes that bug.
+        let sector = sector % 4500;
+        self.mem.write(msf_addr, &msf);
+        let accept = self.cd_accept(0x78, [msf_addr, 0, 0, 0], 99999, LOOP_BUDGET);
+        crate::machine::seq(self, accept, move |m, accepted| {
+            if accepted as u32 == 0 {
+                return system_error(m, 0x0B);
             }
-            let s = m.mem.r8(STATUS) as u32;
-            then(m, s)
-        }))
-    }
-
-    /// The primary volume descriptor, then the path table, into the
-    /// device's own (OpenBIOS `cdromReadPathTable`); whether it went.
-    fn cd_read_path_table(&mut self, then: impl FnOnce(&mut Self, bool) -> Flow<S> + 'static) -> Result<Flow<S>, String> {
-        self.cd_block_read(1, 16, BUFFER, move |m, n| {
-            let b = m.mem.bytes(BUFFER, cd::USER);
-            if n != 1 || &b[1..6] != b"CD001" {
-                return then(m, false);
-            }
-            m.kernel.cd.fs.hash = le(&b, 80);
-            let lba = le(&b, 140);
-            let r = m.cd_block_read(1, lba, BUFFER, move |m, n| {
-                if n != 1 {
-                    return then(m, false);
+            let wait = m.cd_accepted_wait(false);
+            crate::machine::seq(m, wait, move |m, result| {
+                if result as u32 != DNE {
+                    return system_error(m, 0x0C);
                 }
-                let b = m.mem.bytes(BUFFER, cd::USER);
-                m.cd_path_table(&b);
-                then(m, true)
-            });
-            r.unwrap_or_else(|e| panic!("{e}"))
-        })
-    }
-
-    /// The path table from its sector: 45 entries at most, each one's
-    /// parent the sum of its parent number's two bytes (the retail BIOS's).
-    fn cd_path_table(&mut self, b: &[u8]) {
-        let fs = &mut self.kernel.cd.fs;
-        fs.hash = b.chunks(4).fold(fs.hash, |h, w| h ^ le(w, 0));
-        fs.paths.clear();
-        let mut p = 0;
-        while p + 8 < b.len() && fs.paths.len() < 45 && b[p] != 0 {
-            let n = b[p] as usize;
-            let name = b[p + 8..(p + 8 + n).min(b.len())].to_vec();
-            fs.paths.push((b[p + 6] as u32 + b[p + 7] as u32, le(b, p + 2), name));
-            p += n + 8 + (n & 1);
-        }
-        fs.dir_id = 0;
-    }
-
-    /// The path table and PVD the boot read, through the host.
-    pub fn cd_boot(&mut self) {
-        let mut disc = crate::bios::HostDisc(&mut *self.host);
-        let mut raw = [0u8; cd::RAW];
-        if !cd::Disc::read_raw(&mut disc, 16, &mut raw) {
-            return;
-        }
-        let pvd = cd::user_data(&raw).to_vec();
-        if &pvd[1..6] != b"CD001" || !cd::Disc::read_raw(&mut disc, le(&pvd, 140), &mut raw) {
-            return;
-        }
-        self.kernel.cd.fs.hash = le(&pvd, 80);
-        let table = cd::user_data(&raw).to_vec();
-        self.cd_path_table(&table);
-    }
-
-    /// Directory `id`'s first sector, unless it is the one read last
-    /// (OpenBIOS `readDirectory`): 40 entries at most. A failed read keeps
-    /// the last one's.
-    fn cd_read_dir(&mut self, id: usize, then: impl FnOnce(&mut Self) -> Flow<S> + 'static) -> Result<Flow<S>, String> {
-        if self.kernel.cd.fs.dir_id == id {
-            return Ok(then(self));
-        }
-        let lba = self.kernel.cd.fs.paths.get(id.wrapping_sub(1)).map_or(0, |p| p.1);
-        self.cd_block_read(1, lba, BUFFER, move |m, n| {
-            if n == 1 {
-                let b = m.mem.bytes(BUFFER, cd::USER);
-                let mut dir = Vec::new();
-                let mut p = 0;
-                while p + 33 < b.len() && dir.len() < 40 && b[p] != 0 {
-                    let n = b[p + 32] as usize;
-                    dir.push((le(&b, p + 2), le(&b, p + 10), b[p + 33..(p + 33 + n).min(b.len())].to_vec()));
-                    p += b[p] as usize;
-                }
-                m.kernel.cd.fs.dir = dir;
-                m.kernel.cd.fs.dir_id = id;
-            }
-            then(m)
-        })
-    }
-
-    /// The entry `name` matches, from entry `from` of its directory
-    /// (OpenBIOS `findDirectoryEntryForFilename`): the current directory
-    /// unless it starts with `\`, its directories through the path table
-    /// (8 deep at most).
-    fn cd_find(&mut self, from: usize, name: Vec<u8>, then: impl FnOnce(&mut Self, Option<usize>) -> Flow<S> + 'static) -> Result<Flow<S>, String> {
-        let mut full = name.clone();
-        if name.first() != Some(&b'\\') {
-            full = self.kernel.cd.fs.cwd.clone();
-            full.push(b'\\');
-            full.extend(&name);
-        }
-        let parts: Vec<&[u8]> = full[1..].split(|&c| c == b'\\').collect();
-        let (file, dirs) = parts.split_last().expect("split yields one");
-        let mut id = 1;
-        for (depth, d) in dirs.iter().enumerate() {
-            let found = self.kernel.cd.fs.paths.iter().position(|p| p.0 == id as u32 && p.2 == *d);
-            match found {
-                Some(i) if depth < 7 => id = i + 1,
-                _ => return Ok(then(self, None)),
-            }
-        }
-        let file = file.to_vec();
-        self.cd_read_dir(id, move |m| {
-            let hit = m.kernel.cd.fs.dir.iter().enumerate().skip(from).find(|(_, e)| matches(&e.2, &file)).map(|(i, _)| i);
-            if let Some(i) = hit {
-                m.kernel.cd.fs.found = i;
-            }
-            then(m, hit)
-        })
-    }
-
-    /// The drive's status, and the path table again when the shell was
-    /// opened (bit 4); `then` unless that read failed.
-    fn cd_check(&mut self, f: u32, then: impl FnOnce(&mut Self) -> Flow<S> + 'static) -> Result<Flow<S>, String> {
-        self.cd_block_status(move |m, st| {
-            if st & 0x10 == 0 {
-                return then(m);
-            }
-            let r = m.cd_read_path_table(move |m, ok| {
-                if !ok {
-                    m.mem.w32(f + fcb::ERRNO, files::E_GENERAL);
-                    return Flow::ret(u32::MAX);
-                }
-                then(m)
-            });
-            r.unwrap_or_else(|e| panic!("{e}"))
-        })
-    }
-
-    /// A(5Fh) `dev_cd_open(fcb, name, mode)`: the name upper-cased, `;1`
-    /// added without a version; the file's LBA, size and the disc's hash
-    /// in the FCB; 0, or -1.
-    pub fn dev_cd_open(&mut self, f: u32, name: u32) -> Result<Flow<S>, String> {
-        let mut n: Vec<u8> = self.mem.cstr(name, 128).to_ascii_uppercase();
-        if !n.contains(&b';') {
-            n.extend(b";1");
-        }
-        self.cd_check(f, move |m| {
-            let r = m.cd_find(0, n, move |m, hit| {
-                let Some(i) = hit else {
-                    m.mem.w32(f + fcb::ERRNO, files::E_NOT_FOUND);
-                    return Flow::ret(u32::MAX);
-                };
-                let (lba, size, _) = m.kernel.cd.fs.dir[i];
-                let hash = m.kernel.cd.fs.hash;
-                for (o, v) in [(fcb::LBA, lba), (fcb::LENGTH, size), (fcb::OFFSET, 0), (fcb::ERRNO, 0), (fcb::DEVICE_ID, hash)] {
-                    m.mem.w32(f + o, v);
-                }
-                Flow::ret(0)
-            });
-            r.unwrap_or_else(|e| panic!("{e}"))
-        })
-    }
-
-    /// A(60h) `dev_cd_read(fcb, dst, len)`: whole sectors from a sector
-    /// boundary, the path table reloaded and the disc checked first; the
-    /// bytes up to the file's end, or -1.
-    pub fn dev_cd_read(&mut self, f: u32, dst: u32, len: u32) -> Result<Flow<S>, String> {
-        let (off, size) = (self.mem.r32(f + fcb::OFFSET), self.mem.r32(f + fcb::LENGTH));
-        if len & 0x7FF != 0 || off & 0x7FF != 0 || (len as i32) < 0 || off >= size {
-            self.mem.w32(f + fcb::ERRNO, files::E_ALIGN);
-            return Ok(Flow::ret(u32::MAX));
-        }
-        let busy = move |m: &mut Self| {
-            m.mem.w32(f + fcb::ERRNO, files::E_GENERAL);
-            Flow::ret(u32::MAX)
-        };
-        let n = len >> 11;
-        self.cd_block_status(move |m, st| {
-            if st & 0x10 != 0 {
-                return busy(m);
-            }
-            let r = m.cd_read_path_table(move |m, ok| {
-                if !ok || m.kernel.cd.fs.hash != m.mem.r32(f + fcb::DEVICE_ID) {
-                    return busy(m);
-                }
-                let lba = m.mem.r32(f + fcb::LBA) + (off >> 11);
-                let r = m.cd_block_read(n, lba, dst, move |m, got| {
-                    if got != n {
-                        return busy(m);
+                let accept = m.cd_accept(0x7E, [count, dst, 0x80, 0], 99999, LOOP_BUDGET);
+                crate::machine::seq(m, accept, move |m, accepted| {
+                    if accepted as u32 == 0 {
+                        return system_error(m, 0x0C);
                     }
-                    let size = (n << 11).min(size - off);
-                    m.mem.w32(f + fcb::OFFSET, off + size);
-                    Flow::ret(size)
-                });
-                r.unwrap_or_else(|e| panic!("{e}"))
-            });
-            r.unwrap_or_else(|e| panic!("{e}"))
-        })
-    }
-
-    /// A(62h) `dev_cd_firstfile(fcb, pattern, direntry)`: the path table
-    /// reloaded; the pattern upper-cased, `*` (and nothing) as `?`s.
-    pub fn dev_cd_firstfile(&mut self, f: u32, name: u32, dir: u32) -> Result<Flow<S>, String> {
-        let name = self.mem.cstr(name, 128);
-        let mut pat: Vec<u8> = name.iter().take_while(|&&c| c != b'*').map(u8::to_ascii_uppercase).collect();
-        pat.truncate(20);
-        if name.is_empty() || name.contains(&b'*') {
-            pat.resize(20, b'?');
-        }
-        self.cd_read_path_table(move |m, ok| {
-            if !ok {
-                return Flow::ret(0);
-            }
-            let fs = &mut m.kernel.cd.fs;
-            fs.pattern = pat;
-            fs.found = 0;
-            fs.first_skip = true;
-            let r = m.dev_cd_nextfile(f, dir).map(|flow| {
-                seq(m, flow, |m, v| {
-                    m.kernel.cd.fs.first_dir = m.kernel.cd.fs.dir_id;
-                    Flow::Return(v)
+                    let wait = m.cd_accepted_wait(true);
+                    crate::machine::seq(m, wait, move |m, result| match result as u32 {
+                        DNE => Flow::ret(count),
+                        END => system_error(m, 0x17),
+                        _ => {
+                            let error = system_error(m, 0x16);
+                            crate::machine::seq(m, error, move |m, _| {
+                                m.cd_block_read_attempt(count, sector, dst, msf_addr, left - 1)
+                            })
+                        }
+                    })
                 })
-            });
-            r.unwrap_or_else(|e| panic!("{e}"))
+            })
         })
     }
 
-    /// A(63h) `dev_cd_nextfile(fcb, direntry)`: the next entry the pattern
-    /// matches, into the direntry; the direntry, or 0.
-    pub fn dev_cd_nextfile(&mut self, f: u32, dir: u32) -> Result<Flow<S>, String> {
-        let _ = f;
-        self.cd_block_status(move |m, st| {
-            let go = move |m: &mut Self| {
-                let fs = &m.kernel.cd.fs;
-                if !fs.first_skip && fs.dir_id != fs.first_dir {
-                    return Flow::ret(0);
-                }
-                m.kernel.cd.fs.first_skip = false;
-                let (from, pat) = (m.kernel.cd.fs.found + 1, m.kernel.cd.fs.pattern.clone());
-                let r = m.cd_find(from, pat, move |m, hit| {
-                    let Some(i) = hit else { return Flow::ret(0) };
-                    let (lba, size, mut name) = m.kernel.cd.fs.dir[i].clone();
-                    name.push(0);
-                    m.mem.write(dir, &name);
-                    for (o, v) in [(0x14, 0), (0x18, size), (0x20, lba)] {
-                        m.mem.w32(dir + o, v);
-                    }
-                    Flow::ret(dir)
-                });
-                r.unwrap_or_else(|e| panic!("{e}"))
-            };
-            if st & 0x10 == 0 {
-                return go(m);
+    /// A patch can complete entirely through software events. Only active
+    /// native work can subsequently cancel its wait; do not inherit a prior
+    /// rejected attempt's cancellation (applies to seek, read and status).
+    fn cd_accepted_wait(&mut self, read: bool) -> Flow<S> {
+        let done = if self.kernel.cd.op.is_some() { self.kernel.cd.done.clone() }
+            else { Rc::new(Cell::new(None)) };
+        cd_wait(self, done, read)
+    }
+
+    /// helpers.c/cdrom.c retry the patchable command with a bounded count.
+    /// Immediate rejections loop without Rust recursion; guest calls/blocks
+    /// resume before re-reading the table. Long rejection loops yield with the
+    /// same loop budget/quantum as CD polling, so scheduled work can progress.
+    /// These are software attempts, not instruction costs; never cancel busy
+    /// work or yield after success/exhaustion. This local counter resets, but
+    /// does not spend, the guest budget per attempt (as in cd_poll). The short
+    /// status loop can exhaust before reaching this local yield threshold.
+    fn cd_accept(&mut self, func: u32, args: [u32; 4], mut tries: u32, mut left: u64) -> Flow<S> {
+        while tries != 0 {
+            if left == 0 {
+                self.regs.reset_budget();
+                return Flow::Block {
+                    until: Wait::Cycle(self.clock.now + self.quantum()),
+                    then: Box::new(move |m| m.cd_accept(func, args, tries, LOOP_BUDGET)),
+                };
             }
-            let old = m.kernel.cd.fs.hash;
-            let r = m.cd_read_path_table(move |m, ok| {
-                if !ok || m.kernel.cd.fs.hash != old {
-                    m.kernel.cd.fs.hash = old;
-                    return Flow::ret(0);
-                }
-                go(m)
-            });
-            r.unwrap_or_else(|e| panic!("{e}"))
-        })
-    }
-
-    /// A(64h) `dev_cd_chdir(fcb, path)`: the current directory, upper-cased,
-    /// and the path table reloaded; 1, or 0.
-    pub fn dev_cd_chdir(&mut self, path: u32) -> Result<Flow<S>, String> {
-        self.kernel.cd.fs.cwd = self.mem.cstr(path, 128).to_ascii_uppercase();
-        self.cd_read_path_table(|_, ok| Flow::ret(ok as u32))
-    }
-
-    /// A(A4h) `CdGetLbn(name)`: the file's first sector; psx-spx's bug: -1
-    /// for a directory's first entry. -1 when not found (psx-spx: garbage).
-    pub fn cd_get_lbn(&mut self, name: u32) -> Result<Flow<S>, String> {
-        let mut n: Vec<u8> = self.mem.cstr(name, 128).to_ascii_uppercase();
-        if let Some(c) = n.iter().position(|&c| c == b':') {
-            n.drain(..=c);
+            tries -= 1;
+            left -= 1;
+            let flow = crate::bios::dispatch(self, 0xA0, func, args)
+                .unwrap_or_else(|e| panic!("CD command: {e}"));
+            match flow {
+                Flow::Return(v) if v as u32 == 0 => {}
+                Flow::Return(v) => return Flow::Return(v),
+                flow => return crate::machine::seq(self, flow, move |m, v| {
+                    if v as u32 == 0 { m.cd_accept(func, args, tries, left) }
+                    else { Flow::Return(v) }
+                }),
+            }
         }
-        if !n.contains(&b';') {
-            n.extend(b";1");
-        }
-        self.cd_find(0, n, |m, hit| match hit {
-            Some(i) if i > 0 => Flow::ret(m.kernel.cd.fs.dir[i].0),
-            _ => Flow::ret(u32::MAX),
-        })
+        Flow::ret(0)
     }
 
-    /// A(54h)/A(71h) `_96_init()` (OpenBIOS `initCDRom`): installed, Init
-    /// issued and its completion waited for, then the path table read.
-    pub fn cd_init(&mut self) -> Result<Flow<S>, String> {
-        self.cd_install();
-        self.cd_installed()?;
-        self.kernel.cd.state = INITIALIZING;
-        self.kernel.cd.init = 0;
-        self.cd_command(0x0A, &[]);
-        let deadline = self.clock.now + psx_devices::clock::CPU_HZ;
-        Ok(self.cd_init_wait(deadline))
-    }
-
-    /// `cdromInnerInit`'s wait for Init's completion, a millisecond at a
-    /// time.
-    fn cd_init_wait(&mut self, deadline: u64) -> Flow<S> {
-        Flow::Block {
-            until: Wait::Cycle(self.clock.now + psx_devices::clock::CPU_HZ / 1000),
-            then: Box::new(move |m| match m.kernel.cd.init {
-                1 => m.cd_read_path_table(|_, _| Flow::ret(0)).unwrap_or_else(|e| panic!("{e}")),
-                0 if m.clock.now < deadline => m.cd_init_wait(deadline),
-                _ => system_error(0x0A, "the drive didn't initialise"),
-            }),
-        }
+    /// A(A6h) `CdGetStatus()` (OpenBIOS `cdromBlockGetStatus`): ask A7C
+    /// to write a local status byte, then read it after DNE. An early software
+    /// DNE can expose the prior stack byte, as no command has written it yet.
+    pub fn cd_block_status(&mut self) -> Result<Flow<S>, String> {
+        let sp = self.regs.sp();
+        let frame = sp.wrapping_sub(24); // o32 argument area plus the local byte
+        let status = frame.wrapping_add(16);
+        self.regs.set_sp(frame);
+        let accept = self.cd_accept(0x7C, [status, 0, 0, 0], 9, LOOP_BUDGET);
+        let flow = crate::machine::seq(self, accept, move |m, accepted| {
+            if accepted as u32 == 0 {
+                return system_error(m, 0x1F);
+            }
+            let wait = m.cd_accepted_wait(false);
+            crate::machine::seq(m, wait, move |m, result| match result as u32 {
+                DNE => Flow::ret(m.mem.r8(status) as u32),
+                _ => system_error(m, 0x20),
+            })
+        });
+        Ok(crate::machine::seq(self, flow, move |m, v| {
+            m.regs.set_sp(sp);
+            Flow::Return(v)
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::Flow;
-    use crate::testing::{NoSdk, machine};
-    use psx_devices::cd;
+    use super::*;
+    use crate::bios;
+    use crate::testing::machine_with_disc;
 
-    /// A mode 2 form 1 disc: PVD at 16, path table at 17, root at 18 with
-    /// FILE.BIN;1 (2 sectors), directory DATA at 19 with X.BIN;1.
-    pub fn disc() -> Vec<[u8; cd::RAW]> {
-        let sector = |lba: u32, data: &[u8]| {
-            let mut s = [0u8; cd::RAW];
-            s[..12].copy_from_slice(&[0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0]);
-            s[12..15].copy_from_slice(&cd::lba_to_msf(lba));
-            s[15] = 2;
-            s[0x18..0x18 + data.len()].copy_from_slice(data);
-            let e = cd::edc(&s[0x10..0x818]);
-            s[0x818..0x81C].copy_from_slice(&e.to_le_bytes());
-            s
-        };
-        let rec = |name: &[u8], lba: u32, size: u32| {
-            let mut r = vec![0u8; 33 + name.len() + (name.len() + 1) % 2];
-            r[0] = r.len() as u8;
-            r[2..6].copy_from_slice(&lba.to_le_bytes());
-            r[10..14].copy_from_slice(&size.to_le_bytes());
-            r[32] = name.len() as u8;
-            r[33..33 + name.len()].copy_from_slice(name);
-            r
-        };
-        let mut s: Vec<[u8; cd::RAW]> = (0..24).map(|l| sector(l, &[])).collect();
-        let mut pvd = vec![0u8; cd::USER];
-        pvd[..6].copy_from_slice(b"\x01CD001");
-        pvd[80..84].copy_from_slice(&24u32.to_le_bytes());
-        pvd[140..144].copy_from_slice(&17u32.to_le_bytes());
-        s[16] = sector(16, &pvd);
-        let mut pt = vec![1, 0, 18, 0, 0, 0, 1, 0, 0, 0];
-        pt.extend([4, 0, 19, 0, 0, 0, 1, 0]);
-        pt.extend(b"DATA");
-        s[17] = sector(17, &pt);
-        let mut root = rec(b"\0", 18, 2048);
-        root.extend(rec(b"\x01", 18, 2048));
-        root.extend(rec(b"FILE.BIN;1", 20, 3000));
-        s[18] = sector(18, &root);
-        let mut sub = rec(b"\0", 19, 2048);
-        sub.extend(rec(b"\x01", 18, 2048));
-        sub.extend(rec(b"X.BIN;1", 22, 5));
-        s[19] = sector(19, &sub);
-        s[20] = sector(20, &[0xAB; cd::USER]);
-        s[21] = sector(21, &[0xCD; cd::USER]);
-        s[22] = sector(22, b"hello");
+    fn sector(lba: u32, data: &[u8]) -> [u8; cd::RAW] {
+        let mut s = [0u8; cd::RAW];
+        s[..12].copy_from_slice(&[
+            0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0,
+        ]);
+        s[12..15].copy_from_slice(&cd::lba_to_msf(lba));
+        s[15] = 2;
+        s[0x18..0x18 + data.len()].copy_from_slice(data);
+        let e = cd::edc(&s[0x10..0x818]);
+        s[0x818..0x81C].copy_from_slice(&e.to_le_bytes());
         s
     }
 
-    /// Run a flow as the runtime's driver does: time passes event by
-    /// event, the exception handler's kernel steps run.
-    pub fn run(m: &mut crate::Machine<NoSdk>, mut flow: Flow<NoSdk>) -> u32 {
+    fn run(m: &mut Machine<crate::testing::NoSdk>, mut flow: Flow<crate::testing::NoSdk>) -> u64 {
         loop {
             match flow {
-                Flow::Return(v) => return v as u32,
-                Flow::Call { .. } => panic!("no guest here"),
+                Flow::Return(v) => return v,
+                Flow::Call { .. } => panic!("no guest in this test"),
                 Flow::Block { until, then } => {
-                    let mut n = 0;
-                    loop {
-                        while let Some(s) = m.irq_calls.pop_front() {
-                            if let crate::IrqStep::Kernel(k) = s {
-                                if m.kernel_step(k) {
-                                    while m.irq_calls.pop_front().is_some_and(|s| s != crate::IrqStep::Exit) {}
-                                }
-                            }
-                        }
-                        if m.holds(until) {
-                            break;
-                        }
+                    while !m.holds(&until) {
                         let limit = m.clock.next_time().unwrap_or(m.clock.now + 1000);
-                        m.step(limit);
-                        n += 1;
-                        assert!(n < 100_000, "never ends: {until:?}");
+                        m.step(limit.max(m.clock.now));
                     }
                     flow = then(m);
                 }
@@ -993,57 +727,1042 @@ mod tests {
         }
     }
 
-    pub fn booted() -> crate::Machine<NoSdk> {
-        let mut m = crate::testing::machine_with_disc(disc());
-        m.io = Some(Default::default());
-        m.cdc_insert();
-        m.cd_install();
-        m.cd_boot();
-        m
+    // Resume acceptance safepoints, but leave command/event waits to the test.
+    fn accept_yields(m: &mut Machine<crate::testing::NoSdk>, mut flow: Flow<crate::testing::NoSdk>) -> Flow<crate::testing::NoSdk> {
+        while let Flow::Block { until: Wait::Cycle(at), then } = flow {
+            assert_eq!(at, m.clock.now + m.quantum());
+            while m.clock.now < at { m.step(at); }
+            flow = then(m);
+        }
+        flow
     }
 
-    /// Files on the disc through the device table: open, read with the
-    /// drive's time passing, the second directory, firstfile/nextfile.
+    fn wait(m: &mut Machine<crate::testing::NoSdk>, at: u64) {
+        // A zero-duration seek still has a completion queued at `now`.
+        m.step(at);
+        run(
+            m,
+            Flow::Block {
+                until: Wait::Cycle(at),
+                then: Box::new(|_| Flow::ret(0)),
+            },
+        );
+    }
+
+    fn ret(f: Result<Flow<crate::testing::NoSdk>, String>) -> u32 {
+        match f.unwrap() {
+            Flow::Return(v) => v as u32,
+            _ => panic!("blocked"),
+        }
+    }
+
+    /// The fallback core's command path, as an SDK caller uses it.
+    fn core_cmd(m: &mut Machine<crate::testing::NoSdk>, cmd: u8) -> Vec<u8> {
+        let now = m.clock.now;
+        m.io.as_mut().unwrap().cdc.issue(cmd, &[], now);
+        m.cdc_sync();
+        let at = m.clock.now + m.cd_drive().ack_cycles();
+        wait(m, at);
+        let io = m.io.as_mut().unwrap();
+        assert_eq!(io.cdc.pending(), 3, "INT3 for command {cmd:#04x}");
+        let response = io.cdc.take_response(16);
+        io.cdc.acknowledge();
+        response
+    }
+
+    /// Seek, status, a two-sector read, then a missing sector: guest
+    /// buffers, results, ACK-then-DNE order, no END on success, the
+    /// fallback controller's own query state, and no preexisting core work
+    /// continuing over the BIOS operation.
     #[test]
-    fn cdrom_files() {
-        let mut m = booted();
-        let s = 0x8001_0000;
-        m.mem.write(s, b"cdrom:\\FILE.BIN;1\0");
-        let f = m.open(s, 1).unwrap();
+    fn native_cd_seek_read_status_and_failure() {
+        let mut sectors = vec![[0u8; cd::RAW]; 8];
+        sectors[2] = sector(2, &[0xAB; cd::USER]);
+        let mut bad = sector(3, &[0xCD; cd::USER]);
+        bad[0x20] ^= 1; // a sector whose EDC fails, still delivered as the core does
+        sectors[3] = bad;
+        let mut m = machine_with_disc(sectors);
+        m.io = Some(Default::default());
+        m.drive.timing = cd::Timing::Instant;
+        // A core read with a raised IRQ line and a pending sector job.
+        m.io.as_mut().unwrap().cdc.set_enable(0x1F);
+        m.io.as_mut().unwrap().cdc.issue(0x06, &[], 0);
+        m.cdc_sync();
+        let at = m.clock.now + m.cd_drive().ack_cycles();
+        wait(&mut m, at);
+        assert!(m.io.as_ref().unwrap().cdc_line);
+        assert!(m.clock.pending(|e| *e == Event::Cdc).is_some());
+
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x54, [0; 4])), 0, "_96_init");
+        assert!(m.cd_installed());
+        assert_eq!(m.cd_status(), 0x02);
+        assert_eq!(
+            m.io.as_ref().unwrap().cdc.next_due(),
+            None,
+            "preexisting core work stopped"
+        );
+        assert_eq!(
+            m.clock.pending(|e| *e == Event::Cdc),
+            None,
+            "no stale controller wake"
+        );
+        assert!(
+            !m.io.as_ref().unwrap().cdc_line,
+            "line lowered for the next core IRQ"
+        );
+        assert_eq!(m.io.as_ref().unwrap().cdc.drive.timing, cd::Timing::Instant);
+
+        let msf = cd::lba_to_msf(2);
+        m.mem.write(0x8001_0000, &msf);
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x78, [0x8001_0000, 0, 0, 0])),
+            1,
+            "CdAsyncSeekL"
+        );
+        assert_eq!(m.kernel.cd.last, None);
+        assert_eq!(
+            m.cd_due(),
+            m.clock.now,
+            "native seek uses the configured timing"
+        );
+        assert_eq!(
+            m.io.as_ref().unwrap().cdc.drive.head,
+            2,
+            "the fallback controller's drive moved"
+        );
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert_eq!(m.kernel.cd.last, Some(DNE));
+        assert_eq!(m.cd_status(), 0x02);
+
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x7C, [0x8002_0000, 0, 0, 0])),
+            1,
+            "CdAsyncGetStatus"
+        );
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert_eq!(m.mem.r8(0x8002_0000), 0x02, "GetStat's byte");
+        assert_eq!(m.kernel.cd.last, Some(DNE));
+
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x81, [0x20, 0, 0, 0])),
+            1,
+            "CdAsyncSetMode"
+        );
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert_eq!(m.cd_drive().mode, 0x20);
+        assert_eq!(m.kernel.cd.last, Some(DNE));
+
+        // A read's last buffer reports ACK; the normal pause then DNE.
+        for (spec, func) in [(ACK, 0x8000_2000), (DNE, 0x8000_2001)] {
+            let h = ret(bios::call(
+                &mut m,
+                0xB0,
+                0x08,
+                [EV_CD, spec, kernel::EV_MODE_INTR, func],
+            ));
+            ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
+        }
+        m.calls.clear();
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x7E, [2, 0x8003_0000, 0, 0])),
+            1,
+            "CdAsyncReadSector"
+        );
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert_eq!(
+            m.mem.bytes(0x8003_0000, 4),
+            [0xAB; 4],
+            "the first sector before the last"
+        );
+        assert_eq!(m.kernel.cd.last, None);
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert_eq!(
+            m.mem.bytes(0x8003_0800, 4),
+            [0xCD; 4],
+            "the second sector after it"
+        );
+        assert_eq!(m.kernel.cd.last, Some(ACK), "the last buffer's completion");
+        assert_eq!(
+            m.calls.iter().map(|c| c.addr).collect::<Vec<_>>(),
+            [0x8000_2000]
+        );
+        assert_ne!(
+            m.events().iter().find(|e| e.spec == END).unwrap().status,
+            kernel::EV_READY,
+            "no early end"
+        );
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert_eq!(m.kernel.cd.last, Some(DNE), "the normal pause completion");
+        assert_eq!(
+            m.calls.iter().map(|c| c.addr).collect::<Vec<_>>(),
+            [0x8000_2000, 0x8000_2001]
+        );
+        assert_eq!(m.cd_status(), 0x02);
+        assert!(
+            m.io.as_ref()
+                .unwrap()
+                .cdc
+                .edc_errors
+                .iter()
+                .any(|e| e.contains("LBA 3")),
+            "EDC checked"
+        );
+
+        // The core's own query state sees the BIOS read's last header and
+        // status, and its sector count is only the BIOS's two.
+        let loc = core_cmd(&mut m, 0x10);
+        let expected = &sector(3, &[0xCD; cd::USER])[12..20];
+        assert_eq!(loc, expected, "GetlocL sees the BIOS read's header");
+        assert_eq!(
+            core_cmd(&mut m, 0x01),
+            [0x02],
+            "GetStat after the BIOS read"
+        );
+        assert_eq!(
+            m.io.as_ref().unwrap().cdc.sectors,
+            2,
+            "no preexisting core sector ran"
+        );
+
+        // A missing sector is an early end, not an invented INT5. The
+        // failed sector's destination stays untouched and the next status
+        // is the ordinary motor+standby byte.
+        let msf = cd::lba_to_msf(40);
+        m.mem.write(0x8001_0000, &msf);
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x78, [0x8001_0000, 0, 0, 0])),
+            1
+        );
+        let at = m.cd_due();
+        wait(&mut m, at);
+        m.mem.write(0x8004_0000, b"keep");
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x7E, [1, 0x8004_0000, 0, 0])),
+            1
+        );
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert_eq!(m.kernel.cd.last, Some(END));
+        assert_eq!(
+            m.mem.bytes(0x8004_0000, 4),
+            b"keep",
+            "the failed sector wrote nothing"
+        );
+        assert_eq!(
+            m.events().iter().find(|e| e.spec == END).unwrap().status,
+            kernel::EV_READY
+        );
+        assert_eq!(m.cd_status(), 0x02, "no sticky read/error bit");
+        ret(bios::call(
+            &mut m,
+            0xA0,
+            0x94,
+            [0x8005_0000, 0x8005_0001, 0, 0],
+        ));
+        assert_eq!(m.mem.bytes(0x8005_0000, 2), [0, 0], "no fabricated INT5");
+        let f = bios::call(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        assert_eq!(run(&mut m, f), 0x02, "the next status is ordinary");
+    }
+
+    /// `CdReadSector` waits through every sector and the pause, filling the
+    /// destination; its seek/read completions are in callback order and
+    /// consumed.
+    #[test]
+    fn blocking_cd_calls_wait_for_their_events() {
+        let mut sectors = vec![[0u8; cd::RAW]; 8];
+        sectors[2] = sector(2, b"hello");
+        sectors[3] = sector(3, b"world");
+        let mut m = machine_with_disc(sectors);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x54, [0; 4])), 0, "_96_init");
+        for (spec, func) in [(DNE, 0x8000_1000), (ACK, 0x8000_1001)] {
+            let h = ret(bios::call(
+                &mut m,
+                0xB0,
+                0x08,
+                [EV_CD, spec, kernel::EV_MODE_INTR, func],
+            ));
+            ret(bios::call(&mut m, 0xB0, 0x0C, [h, 0, 0, 0]));
+        }
+        let start = m.clock.now;
+        let sector_time = m.cd_drive().sector_cycles();
+        let f = bios::call(&mut m, 0xA0, 0xA5, [2, 2, 0x8001_0000, 0]).unwrap();
         assert_eq!(run(&mut m, f), 2);
-        let t = m.clock.now;
-        let f = m.transfer(2, 0x8002_0000, 0x1000, false).unwrap();
-        assert_eq!(run(&mut m, f), 3000);
-        assert!(m.clock.now > t + 1000, "the drive's time");
-        assert_eq!((m.mem.r8(0x8002_0000), m.mem.r8(0x8002_0FFF)), (0xAB, 0xCD));
-        let f = m.transfer(2, 0x8002_0000, 0x800, false).unwrap();
-        assert_eq!(run(&mut m, f), u32::MAX, "past the end");
-        assert_eq!(m.kernel.files.errno, crate::files::E_ALIGN);
-        m.mem.write(s, b"cdrom:\\DATA\\X.BIN\0");
-        let f = m.open(s, 1).unwrap();
-        assert_eq!(run(&mut m, f), 3);
-        m.mem.write(s, b"cdrom:\\NOPE.BIN\0");
-        let f = m.open(s, 1).unwrap();
-        assert_eq!(run(&mut m, f), u32::MAX);
-        assert_eq!(m.kernel.files.errno, crate::files::E_NOT_FOUND);
-        m.mem.write(s, b"cdrom:F*\0");
-        let f = m.firstfile(s, 0x8003_0000).unwrap();
-        assert_eq!(run(&mut m, f), 0x8003_0000);
-        assert_eq!(m.mem.cstr(0x8003_0000, 20), b"FILE.BIN;1");
-        assert_eq!(m.mem.r32(0x8003_0020), 20);
-        let f = m.nextfile(0x8003_0000).unwrap();
-        assert_eq!(run(&mut m, f), 0);
-        // CdGetLbn, CdReadSector.
-        m.mem.write(s, b"\\DATA\\X.BIN;1\0");
-        let f = m.cd_get_lbn(s).unwrap();
-        assert_eq!(run(&mut m, f), 22);
-        let f = m.cd_block_read(1, 22, 0x8004_0000, |_, n| Flow::ret(n)).unwrap();
-        assert_eq!(run(&mut m, f), 1);
-        assert_eq!(m.mem.bytes(0x8004_0000, 5), b"hello");
-        // _96_remove: the driver is out of its chain, its events closed.
-        crate::bios::call(&mut m, 0xA0, 0x72, [0; 4]).unwrap();
-        assert!(m.chain(0).iter().all(|&e| m.kernel_element_at(e) == Some(crate::kernel::SYSCALL_ELEMENT)));
-        assert!(m.cd_block_read(1, 22, 0x8004_0000, |_, n| Flow::ret(n)).is_err());
-        let _ = machine;
+        assert_eq!(m.mem.bytes(0x8001_0000, 5), b"hello");
+        assert_eq!(
+            m.mem.bytes(0x8001_0800, 5),
+            b"world",
+            "the second sector, not just the first"
+        );
+        assert_eq!(
+            m.drive.head, 4,
+            "bus-free native reads advance the same drive"
+        );
+        assert!(
+            m.clock.now >= start + 2 * sector_time,
+            "both sectors took their time"
+        );
+        assert_eq!(
+            m.calls.iter().map(|c| c.addr).collect::<Vec<_>>(),
+            [0x8000_1000, 0x8000_1001, 0x8000_1000]
+        );
+        assert_eq!(
+            m.events().iter().find(|e| e.spec == DNE).unwrap().status,
+            kernel::EV_ENABLED,
+            "DNE consumed"
+        );
+        let f = bios::call(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        assert_eq!(run(&mut m, f), 2, "motor on, standby");
+        // The inner init keeps event handles and cwd, and leaves critical.
+        let events = m.kernel.cd.events;
+        m.kernel.files.cd_cwd = "DATA".into();
+        m.crit = true;
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])),
+            1,
+            "CdInitSubFunc"
+        );
+        assert_eq!(m.kernel.cd.events, events);
+        assert_eq!(m.kernel.files.cd_cwd, "DATA");
+        assert!(!m.crit);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x56, [0; 4])), 0, "_96_remove");
+        assert!(!m.cd_installed());
+        assert!(m.crit);
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])), 1);
+        assert!(!m.cd_installed(), "inner init does not allocate events");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x54, [0; 4])), 0);
+        assert!(m.cd_installed());
+        assert!(!m.crit);
+        assert!(m.kernel.files.cd_cwd.is_empty());
+    }
+
+    /// Actual BIOS event operations control blocking calls: disabled/consumed
+    /// flags do not wake, reused handles are live, and software events can wake
+    /// before the drive finishes. No instruction-cost polling or clock advance.
+    #[test]
+    fn blocking_cd_waits_use_live_event_flags() {
+        for change in 0..3 {
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            let dne = m.kernel.cd.events[1];
+            let flow = bios::call(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+            let Flow::Block { until, then } = flow else { panic!("status must wait") };
+            match change {
+                0 => { ret(bios::call(&mut m, 0xB0, 0x0D, [dne, 0, 0, 0])); }
+                2 => { ret(bios::call(&mut m, 0xB0, 0x09, [dne, 0, 0, 0])); }
+                _ => {}
+            }
+            m.step(m.cd_due());
+            assert!(m.kernel.cd.op.is_none());
+            if change == 1 {
+                assert!(m.holds(&until));
+                assert_eq!(ret(bios::call(&mut m, 0xB0, 0x0B, [dne, 0, 0, 0])), 1);
+            }
+            assert!(!m.holds(&until), "completion is not a fallback for TestEvent");
+            let class = if change == 2 { 0x1234 } else { EV_CD };
+            if change == 2 {
+                assert_eq!(ret(bios::call(&mut m, 0xB0, 0x08,
+                    [class, DNE, kernel::EV_MODE_NOINTR, 0])), dne);
+            }
+            ret(bios::call(&mut m, 0xB0, 0x0C, [dne, 0, 0, 0]));
+            assert!(!m.holds(&until), "enable does not deliver an event");
+            let now = m.clock.now;
+            ret(bios::call(&mut m, 0xB0, 0x07, [class, DNE, 0, 0]));
+            assert!(m.holds(&until));
+            let flow = then(&mut m);
+            assert_eq!(run(&mut m, flow), 2);
+            assert!(!m.event_ready(dne));
+            assert_eq!(m.clock.now, now);
+        }
+
+        // Seek/status poll DNE, ERR, but not END. Native reset cancellation
+        // still wakes without fabricating a software or controller event.
+        for func in [0xA5, 0xA6] {
+            for cancel in [false, true] {
+                let mut m = machine_with_disc(vec![]);
+                m.cd_init();
+                let error = 0x8001_1000;
+                m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+                let flow = bios::call(&mut m, 0xA0, func, [1, 4000, 0x8002_0000, 0]).unwrap();
+                let Flow::Block { until, then } = flow else { panic!("must wait") };
+                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, END, 0, 0]));
+                assert!(!m.holds(&until));
+                let now = m.clock.now;
+                assert!(m.cd_due() > now);
+                if cancel {
+                    ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+                    assert!(!m.event_ready(m.kernel.cd.events[4]));
+                } else {
+                    ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
+                }
+                assert!(m.holds(&until));
+                let Flow::Call { call, then } = then(&mut m) else { panic!("SystemError") };
+                assert_eq!((call.addr, call.args), (error, [0x44, if func == 0xA5 { 0x0C } else { 0x20 }, 0, 0]));
+                assert!(!m.event_ready(m.kernel.cd.events[4]));
+                assert!(m.event_ready(m.kernel.cd.events[3]), "END was not polled");
+                let flow = then(&mut m, 123);
+                assert_eq!(run(&mut m, flow), u32::MAX as u64);
+                assert_eq!(m.clock.now, now, "early wake needs no CD completion");
+                assert_eq!(m.kernel.cd.op.is_none(), cancel, "software ERR does not cancel native work");
+            }
+        }
+
+        // A read polls DNE before ERR before END, consuming only the winner.
+        for winner in [DNE, ERR, END] {
+            let mut m = machine_with_disc(vec![]);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let error = 0x8001_1000;
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+            let flow = bios::call(&mut m, 0xA0, 0xA5, [2, 0, 0x8002_0000, 0]).unwrap();
+            let Flow::Block { then, .. } = flow else { panic!("seek") };
+            m.step(m.cd_due());
+            let Flow::Block { until, then } = then(&mut m) else { panic!("read") };
+            let specs: &[u32] = match winner { DNE => &[END, ERR, DNE], ERR => &[END, ERR], _ => &[END] };
+            let now = m.clock.now;
+            for &spec in specs {
+                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, spec, 0, 0]));
+            }
+            assert!(m.holds(&until));
+            let flow = then(&mut m);
+            if winner == DNE {
+                assert_eq!(run(&mut m, flow), 2);
+            } else {
+                let Flow::Call { call, then } = flow else { panic!("SystemError") };
+                assert_eq!((call.addr, call.args), (error, [0x44, if winner == ERR { 0x16 } else { 0x17 }, 0, 0]));
+                if winner == ERR {
+                    // The returning error handler retries SeekL. Busy work is
+                    // neither cancelled nor advanced before the first yield.
+                    let done = m.kernel.cd.done.clone();
+                    let flow = then(&mut m, 123);
+                    assert!(matches!(flow, Flow::Block { until: Wait::Cycle(_), .. }));
+                    assert!(Rc::ptr_eq(&done, &m.kernel.cd.done));
+                    assert_eq!(m.counts["bios.A0h:78h CdAsyncSeekL"], 1 + LOOP_BUDGET);
+                }
+            }
+            for &spec in specs {
+                let h = m.kernel.cd.events[SPECS.iter().position(|&s| s == spec).unwrap()];
+                assert_eq!(m.event_ready(h), spec != winner);
+            }
+            assert!(m.kernel.cd.op.is_some(), "software delivery does not finish the drive");
+            assert_eq!(m.clock.now, now);
+        }
+    }
+
+    /// B0B patches decide readiness without an implicit native TestEvent;
+    /// each probe reloads the table/handle and awaits its own Call or Block.
+    #[test]
+    fn blocking_cd_calls_honor_patched_test_event() {
+        const POLL: u32 = 0x8001_1000;
+        const POLL2: u32 = 0x8001_2000;
+        const ERROR: u32 = 0x8001_3000;
+        let entry = crate::tables::entry(0xB0, 0x0B).unwrap();
+        for (func, code) in [(0xA5, 0x0C), (0xA6, 0x20)] {
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            let sp = m.regs.sp();
+            let events = m.kernel.cd.events;
+            m.mem.w32(entry, POLL);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+            let flow = bios::dispatch(&mut m, 0xA0, func, [1, 4000, 0x8002_0000, 0]).unwrap();
+            let Flow::Call { call, then } = flow else { panic!("DNE probe before any wait") };
+            assert_eq!((call.addr, call.args), (POLL, [events[1], 0, 0, 0]));
+            assert_eq!(m.regs.sp(), sp - 24);
+            // Even READY is not success if the patch says false. Re-entry can
+            // replace the table and the next probe's handle (e.g. CD re-init).
+            for spec in [DNE, ERR, END] { m.deliver_event(EV_CD, spec); }
+            let replacement = m.open_event(0x1234, ERR, EV_MODE_NOINTR, 0);
+            m.set_ev_status(replacement, kernel::EV_DISABLED);
+            m.kernel.cd.events[4] = replacement;
+            m.mem.w32(entry, POLL2);
+            let Flow::Call { call, then } = then(&mut m, 1 << 32) else { panic!("ERR probe") };
+            assert_eq!((call.addr, call.args), (POLL2, [replacement, 0, 0, 0]));
+            assert!(m.event_ready(events[1]), "no implicit native DNE poll");
+            let Flow::Call { call, then } = then(&mut m, u32::MAX as u64) else { panic!("SystemError") };
+            assert_eq!((call.addr, call.args), (ERROR, [0x44, code, 0, 0]));
+            assert_eq!(m.ev(replacement).unwrap().status, kernel::EV_DISABLED,
+                "synthetic success must not consume or enable the patch's slot");
+            for i in [1, 3, 4] { assert!(m.event_ready(events[i]), "no implicit consumption"); }
+            let flow = then(&mut m, 123);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert_eq!(m.regs.sp(), sp);
+            assert_eq!(m.clock.now, 0);
+            assert!(m.kernel.cd.op.is_some(), "software result does not cancel native work");
+        }
+
+        for winner in [DNE, ERR, END] {
+            let mut m = machine_with_disc(vec![]);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let sp = m.regs.sp();
+            let saved = m.mem.r32(entry);
+            let events = m.kernel.cd.events;
+            m.mem.w32(entry, POLL);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+            let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 0, 0x8002_0000, 0]).unwrap();
+            let Flow::Call { call, then } = flow else { panic!("seek DNE") };
+            assert_eq!((call.addr, call.args), (POLL, [events[1], 0, 0, 0]));
+            m.step(m.cd_due());
+            let (t, f) = crate::tables::stand_in_fn(saved).unwrap();
+            let result = ret(bios::call(&mut m, t, f, call.args));
+            assert_eq!(result, 1, "saved TestEvent remains callable");
+            let mut flow = then(&mut m, result as u64);
+            assert!(!m.event_ready(events[1]));
+            for spec in [DNE, ERR, END] { m.deliver_event(EV_CD, spec); }
+            for (i, spec) in [(1, DNE), (4, ERR), (3, END)] {
+                let Flow::Call { call, then } = flow else { panic!("read probe {spec:x}") };
+                assert_eq!((call.addr, call.args), (POLL, [events[i], 0, 0, 0]));
+                flow = then(&mut m, if spec == winner { 7 } else { 1 << 32 });
+                if spec == winner { break; }
+            }
+            if winner != DNE {
+                let Flow::Call { call, then } = flow else { panic!("read error") };
+                assert_eq!((call.addr, call.args), (ERROR, [0x44, if winner == ERR { 0x16 } else { 0x17 }, 0, 0]));
+                // With interrupts masked, returning ERR still exhausts the
+                // busy seek rather than cancelling the active native read.
+                if winner == ERR { m.crit = true; }
+                flow = then(&mut m, 123);
+                if winner == ERR {
+                    let Flow::Call { call, then } = accept_yields(&mut m, flow) else { panic!("returning ERR retries busy seek") };
+                    assert_eq!((call.addr, call.args), (ERROR, [0x44, 0x0B, 0, 0]));
+                    flow = then(&mut m, 456);
+                }
+            }
+            assert_eq!(run(&mut m, flow), if winner == DNE { 2 } else { u32::MAX as u64 });
+            for i in [1, 3, 4] { assert!(m.event_ready(events[i]), "patch owns consumption"); }
+            assert_eq!(m.regs.sp(), sp);
+            assert_eq!(m.clock.now, if winner == ERR { 99998 / LOOP_BUDGET * m.quantum() } else { 0 });
+            assert!(m.kernel.cd.op.is_some());
+        }
+
+        // A false-returning probe can remove/reset CD work. Cancellation is
+        // observed before the next probe or yield, even with all handles closed.
+        for cancel_after in [1, 2] {
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            let sp = m.regs.sp();
+            m.mem.w32(entry, POLL);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), ERROR);
+            let mut flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+            for probe in 1..=cancel_after {
+                let Flow::Call { call, then } = flow else { panic!("TestEvent probe") };
+                assert_eq!(call.addr, POLL);
+                if probe == cancel_after {
+                    ret(bios::dispatch(&mut m, 0xA0, 0x56, [0; 4]));
+                    assert_eq!(m.kernel.cd.events, [0; 5]);
+                }
+                flow = then(&mut m, 0);
+            }
+            let Flow::Call { call, then } = flow else { panic!("cancellation before another poll") };
+            assert_eq!((call.addr, call.args), (ERROR, [0x44, 0x20, 0, 0]));
+            let flow = then(&mut m, 123);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert_eq!(m.regs.sp(), sp);
+            assert_eq!(m.clock.now, 0);
+            assert!(m.kernel.cd.op.is_none());
+        }
+
+        // Redirecting to a native blocking service still awaits that flow;
+        // do not poll ERR or read the local status until WaitEvent returns.
+        let mut m = machine_with_disc(vec![]);
+        m.cd_init();
+        let sp = m.regs.sp();
+        m.mem.w32(entry, crate::tables::stand_in(0xB0, 0x0A));
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        let Flow::Block { until, then } = flow else { panic!("patched WaitEvent") };
+        assert_eq!(until, Wait::Event(m.kernel.cd.events[1]));
+        assert!(!m.holds(&until));
+        m.step(m.cd_due());
+        assert!(m.holds(&until));
+        let flow = then(&mut m);
+        assert_eq!(run(&mut m, flow), 2);
+        assert_eq!(m.regs.sp(), sp);
+        assert!(!m.event_ready(m.kernel.cd.events[1]));
+
+        // A redirected immediate zero must yield too, without Rust recursion
+        // or consuming a ready flag behind the patch's back.
+        m.mem.w32(entry, crate::tables::stand_in(0xC0, 0x14));
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        let Flow::Block { until, then } = flow else { panic!("zero-return polling yields") };
+        assert_eq!(until, Wait::Cycle(m.clock.now + m.quantum()));
+        let zeros = m.counts["bios.C0h:14h return 0"];
+        assert_eq!(zeros, 2 * crate::machine::LOOP_BUDGET);
+        m.mem.w32(entry, crate::tables::stand_in(0xB0, 0x0B));
+        assert_eq!(run(&mut m, Flow::Block { until, then }), 2);
+        assert_eq!(m.regs.sp(), sp);
+    }
+
+    /// Terminal failures call the patchable SystemError and return -1 if it returns.
+    /// A completion callback may start another operation before a waiter resumes.
+    #[test]
+    fn blocking_results_survive_callbacks_and_errors_can_return() {
+        let mut m = machine_with_disc(vec![]);
+        m.drive.timing = cd::Timing::Instant;
+        m.cd_init();
+        let error = 0x8001_1000;
+        m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+        let sp = m.regs.sp();
+        let f = m.cd_block_read(1, 40, 0x8002_0000).unwrap();
+        m.mem.write(0x8002_0000, b"keep");
+        let mut f = f;
+        loop {
+            match f {
+                Flow::Block { until, then } => {
+                    while !m.holds(&until) {
+                        let at = m.clock.next_time().unwrap();
+                        m.step(at);
+                    }
+                    f = then(&mut m);
+                }
+                Flow::Call { call, then } => {
+                    assert_eq!((call.addr, call.args), (error, [0x44, 0x17, 0, 0]));
+                    let f = then(&mut m, 123);
+                    assert_eq!(run(&mut m, f), u32::MAX as u64);
+                    break;
+                }
+                Flow::Return(_) => panic!("SystemError was not called"),
+            }
+        }
+        assert_eq!(m.mem.bytes(0x8002_0000, 4), b"keep");
+        assert_eq!(m.regs.sp(), sp, "returning END error releases the frame");
+
+        let h = m.open_event(EV_CD, DNE, kernel::EV_MODE_INTR, 0x8001_2000);
+        m.set_ev_status(h, kernel::EV_ENABLED);
+        let f = m.cd_block_status().unwrap();
+        let Flow::Block { until, then } = f else {
+            panic!("status should wait")
+        };
+        while !m.holds(&until) {
+            let at = m.clock.next_time().unwrap();
+            m.step(at);
+        }
+        let callback = m.calls.pop_front().expect("completion callback");
+        assert_eq!(callback.addr, 0x8001_2000);
+        // Execute the callback's BIOS call before the wait continuation,
+        // as the runtime drains callbacks between scheduler steps.
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x7C, [0x8002_1000, 0, 0, 0])),
+            1
+        );
+        let Flow::Block { until, then } = then(&mut m) else {
+            panic!("the callback cleared DNE: the old result must not release the wait");
+        };
+        assert!(!m.holds(&until));
+        m.drive.status = 0xEE;
+        let at = m.cd_due();
+        wait(&mut m, at);
+        assert!(m.holds(&until));
+        assert_eq!(m.kernel.cd.last_status, 0xEE);
+        let f = then(&mut m);
+        assert_eq!(
+            run(&mut m, f),
+            2,
+            "the completed status, not the callback's operation"
+        );
+        assert!(
+            !m.event_ready(m.kernel.cd.events[1]),
+            "TestEvent consumes the live flag, even from the callback's operation"
+        );
+        m.cd_remove();
+        let Flow::Call { call, then } = m.cd_block_status().unwrap() else {
+            panic!("SystemError")
+        };
+        assert_eq!((call.addr, call.args), (error, [0x44, 0x1F, 0, 0]));
+        let f = then(&mut m, 0);
+        assert_eq!(run(&mut m, f), u32::MAX as u64);
+
+        // Unlike a read ERR, seek/status errors are terminal even when the
+        // patched error handler returns. Both consume ERR before calling it.
+        for (func, code) in [(0xA5, 0x0C), (0xA6, 0x20)] {
+            m.cd_init();
+            let flow = bios::call(&mut m, 0xA0, func, [1, 40, 0x8002_0000, 0]).unwrap();
+            let Flow::Block { until, then } = flow else {
+                panic!("operation must wait");
+            };
+            assert_eq!(ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])), 1);
+            ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
+            assert!(m.holds(&until));
+            let Flow::Call { call, then } = then(&mut m) else {
+                panic!("SystemError");
+            };
+            assert_eq!((call.addr, call.args), (error, [0x44, code, 0, 0]));
+            assert!(!m.event_ready(m.kernel.cd.events[4]));
+            let flow = then(&mut m, 123);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert!(m.kernel.cd.op.is_none(), "seek/status errors do not retry");
+        }
+    }
+
+    /// Seek/status pass real guest locals through the live command table;
+    /// retries keep the pointer and guest edits, nested calls keep separate
+    /// frames, and every returning success/error restores the caller's SP.
+    #[test]
+    fn blocking_seek_and_status_honor_patched_acceptance() {
+        for (outer, command, bound, code) in [(0xA5, 0x78, 99999, 0x0B), (0xA6, 0x7C, 9, 0x1F)] {
+            for (accept_at, software) in [(2, true), (1000, true), (1001, true), (bound, false), (0, false)] {
+                if accept_at > bound { continue; }
+                let mut sectors = vec![[0u8; cd::RAW]; 5];
+                sectors[3] = sector(3, b"edited");
+                let mut m = machine_with_disc(sectors);
+                m.drive.timing = cd::Timing::Instant;
+                m.cd_init();
+                let sp = m.regs.sp();
+                let entry = crate::tables::entry(0xA0, command).unwrap();
+                let saved = m.mem.r32(entry);
+                let patch = 0x8001_1000;
+                let error = 0x8001_2000;
+                let read_patch = 0x8001_3000;
+                let dst = 0x8002_0000;
+                m.mem.w32(entry, patch);
+                m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+                if software { m.mem.w32(crate::tables::entry(0xA0, 0x7E).unwrap(), read_patch); }
+                m.mem.write(dst, b"keep");
+                let mut flow = bios::dispatch(&mut m, 0xA0, outer, [1, 2, dst, 0]).unwrap();
+                let frame = sp - 24;
+                let local = frame + 16;
+                for attempt in 1..=bound {
+                    flow = accept_yields(&mut m, flow);
+                    let Flow::Call { call, then } = flow else { panic!("command {command:x}, attempt {attempt}") };
+                    assert_eq!(call, GuestCall { addr: patch + (attempt - 1) * 4, args: [local, 0, 0, 0] });
+                    assert_eq!(m.regs.sp(), frame);
+                    assert_eq!(m.clock.now, (attempt - 1) as u64 / LOOP_BUDGET * m.quantum(), "only whole loop quanta");
+                    assert!(m.kernel.cd.op.is_none(), "no unsolicited native command");
+                    // A callee may spill all four arguments into its incoming
+                    // o32 home area. The pointed-to local must survive.
+                    m.mem.write(frame, &[0xCC; 16]);
+                    if command == 0x78 {
+                        assert_eq!(m.mem.bytes(local, 3), if attempt == 1 { vec![0, 2, 2] } else { vec![0, 2, 3] });
+                    }
+                    if attempt == accept_at {
+                        if software {
+                            assert_eq!(m.kernel.cd.done.get(), Some(ERR as u64), "old cancellation");
+                            if command == 0x7C {
+                                // A nested status call shares the backend, not
+                                // the outer call's stack local or saved SP.
+                                m.mem.w8(local, 0xA5);
+                                let nested = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+                                let Flow::Call { call, then } = nested else { panic!("nested status patch") };
+                                assert_eq!(m.regs.sp(), frame - 24);
+                                assert_eq!(call.args[0], local - 24);
+                                m.mem.w8(call.args[0], 0x5A);
+                                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                                let nested = then(&mut m, 1);
+                                assert_eq!(run(&mut m, nested), 0x5A);
+                                assert_eq!(m.regs.sp(), frame);
+                                assert_eq!(m.mem.r8(local), 0xA5);
+                            }
+                            ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                        } else {
+                            let (t, f) = crate::tables::stand_in_fn(saved).unwrap();
+                            assert_eq!(ret(bios::call(&mut m, t, f, call.args)), 1);
+                        }
+                        flow = then(&mut m, u32::MAX as u64);
+                        break;
+                    }
+                    if attempt == 1 {
+                        if software {
+                            let (t, f) = crate::tables::stand_in_fn(saved).unwrap();
+                            assert_eq!(ret(bios::call(&mut m, t, f, call.args)), 1);
+                            ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+                        }
+                        if command == 0x78 { m.mem.w8(local + 2, 3); }
+                    }
+                    m.mem.w32(entry, patch + attempt * 4);
+                    flow = then(&mut m, 0x1_0000_0000); // only v0 is the boolean
+                }
+                if accept_at == 0 {
+                    let Flow::Call { call, then } = flow else { panic!("exhaustion") };
+                    assert_eq!(call, GuestCall { addr: error, args: [0x44, code, 0, 0] });
+                    assert_eq!(m.regs.sp(), frame, "frame lives through the error callback");
+                    flow = then(&mut m, 123);
+                    assert_eq!(run(&mut m, flow), u32::MAX as u64);
+                    assert_eq!(m.clock.now, (bound - 1) as u64 / LOOP_BUDGET * m.quantum());
+                } else if software {
+                    if command == 0x78 {
+                        let Flow::Call { call, then } = flow else { panic!("read after software seek") };
+                        assert_eq!(call, GuestCall { addr: read_patch, args: [1, dst, 0x80, 0] });
+                        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                        flow = then(&mut m, 1);
+                    }
+                    assert_eq!(run(&mut m, flow), if command == 0x78 { 1 } else { 0xA5 });
+                    assert_eq!(m.mem.bytes(dst, 4), b"keep");
+                    assert!(m.kernel.cd.op.is_none());
+                    assert_eq!(m.clock.now, (accept_at - 1) as u64 / LOOP_BUDGET * m.quantum());
+                } else {
+                    assert!(matches!(flow, Flow::Block { .. }));
+                    assert_eq!(m.regs.sp(), frame, "frame lives through native completion");
+                    assert_eq!(run(&mut m, flow), if command == 0x78 { 1 } else { 2 });
+                    if command == 0x78 { assert_eq!(m.mem.bytes(dst, 6), b"edited"); }
+                }
+                assert_eq!(m.regs.sp(), sp);
+            }
+
+            // With interrupts disabled the pending work cannot complete, even
+            // across yields. Keep the exact bound without cancelling that job.
+            let mut m = machine_with_disc(vec![]);
+            m.cd_init();
+            assert_eq!(m.cd_get_status(0x8002_1000), 1);
+            m.crit = true;
+            let done = m.kernel.cd.done.clone();
+            let sp = m.regs.sp();
+            let error = 0x8001_2000;
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+            let flow = bios::dispatch(&mut m, 0xA0, outer, [1, 2, 0x8002_0000, 0]).unwrap();
+            let Flow::Call { call, then } = accept_yields(&mut m, flow) else { panic!("busy command exhaustion") };
+            assert_eq!(call, GuestCall { addr: error, args: [0x44, code, 0, 0] });
+            let name = format!("bios.A0h:{command:02X}h {}", bios::name(0xA0, command));
+            assert_eq!(m.counts[&name], bound as u64);
+            assert_eq!(m.clock.now, (bound - 1) as u64 / LOOP_BUDGET * m.quantum());
+            assert!(Rc::ptr_eq(&done, &m.kernel.cd.done));
+            assert!(m.kernel.cd.op.is_some());
+            let flow = then(&mut m, 0);
+            assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            assert_eq!(m.regs.sp(), sp);
+        }
+
+        // A premature software DNE reads the as-yet unwritten guest byte,
+        // not a fabricated zero or a prior operation's captured status.
+        let mut m = machine_with_disc(vec![]);
+        m.cd_init();
+        let sp = m.regs.sp();
+        m.mem.w8(sp - 8, 0xB7);
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA6, [0; 4]).unwrap();
+        let Flow::Block { until, then } = flow else { panic!("native status") };
+        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+        assert!(m.holds(&until));
+        let flow = then(&mut m);
+        assert_eq!(run(&mut m, flow), 0xB7);
+        assert_eq!(m.regs.sp(), sp);
+        assert_eq!(m.clock.now, 0);
+        assert!(m.kernel.cd.op.is_some(), "software DNE does not cancel native work");
+    }
+
+    /// Read acceptance honors the live A7E table and saved original entry,
+    /// resumes before retrying, and does not run the native read a second time.
+    #[test]
+    fn blocking_read_honors_patched_read_acceptance() {
+        for (accept_at, software) in [(2, false), (99999, false), (0, false), (2, true)] {
+            let mut sectors = vec![[0u8; cd::RAW]; 4];
+            sectors[2] = sector(2, b"first");
+            sectors[3] = sector(3, b"tail");
+            let mut m = machine_with_disc(sectors);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let entry = crate::tables::entry(0xA0, 0x7E).unwrap();
+            let saved = m.mem.r32(entry);
+            let patch = 0x8001_1000;
+            let error = 0x8001_2000;
+            let dst = 0x8002_0000;
+            m.mem.w32(entry, patch);
+            m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+            m.mem.write(dst, b"keep");
+            let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 2, dst, 0]).unwrap();
+            let Flow::Block { then, .. } = flow else { panic!("seek") };
+            m.step(m.cd_due());
+            let mut flow = then(&mut m);
+            let now = m.clock.now;
+            for attempt in 1..=99999 {
+                flow = accept_yields(&mut m, flow);
+                let Flow::Call { call, then } = flow else { panic!("read attempt {attempt}") };
+                assert_eq!(call, GuestCall { addr: patch + (attempt - 1) * 4, args: [2, dst, 0x80, 0] });
+                assert!(m.kernel.cd.op.is_none(), "no native read before the patch returns");
+                assert_eq!(m.mem.bytes(dst, 4), b"keep");
+                assert_eq!(m.clock.now, now + (attempt - 1) as u64 / LOOP_BUDGET * m.quantum());
+                if attempt == accept_at {
+                    if software {
+                        assert_eq!(m.kernel.cd.done.get(), Some(ERR as u64));
+                        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+                    } else {
+                        // Model a guest patch calling its saved original pointer.
+                        let (table, func) = crate::tables::stand_in_fn(saved).unwrap();
+                        assert_eq!(ret(bios::call(&mut m, table, func, call.args)), 1);
+                    }
+                    let done = m.kernel.cd.done.clone();
+                    flow = then(&mut m, u32::MAX as u64); // any nonzero v0 accepts
+                    assert!(Rc::ptr_eq(&done, &m.kernel.cd.done), "no duplicate native start");
+                    break;
+                }
+                if software {
+                    // A rejected patch may start and cancel native work. The
+                    // next accepted software completion must not inherit it.
+                    let (table, func) = crate::tables::stand_in_fn(saved).unwrap();
+                    assert_eq!(ret(bios::call(&mut m, table, func, call.args)), 1);
+                    ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+                }
+                // Re-read the table on every retry, without replacing the
+                // original count/destination with a patch's return value.
+                m.mem.w32(entry, patch + attempt * 4);
+                flow = then(&mut m, 0x1_0000_0000); // only v0 decides acceptance
+            }
+            if accept_at == 0 {
+                let Flow::Call { call, then } = flow else { panic!("acceptance exhausted") };
+                assert_eq!(call, GuestCall { addr: error, args: [0x44, 0x0C, 0, 0] });
+                assert!(m.kernel.cd.op.is_none());
+                assert_eq!(m.clock.now, now + 99998 / LOOP_BUDGET * m.quantum(), "bounded whole-quanta yields");
+                let flow = then(&mut m, 123);
+                assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            } else if software {
+                assert_eq!(run(&mut m, flow), 2, "software DNE, not stale cancellation");
+                assert_eq!(m.mem.bytes(dst, 4), b"keep", "no unsolicited native read");
+                assert!(!m.event_ready(m.kernel.cd.events[1]));
+                assert!(m.kernel.cd.op.is_none());
+                assert_eq!(m.clock.now, now);
+            } else {
+                assert!(matches!(flow, Flow::Block { .. }), "accepted read must still wait");
+                assert_eq!(run(&mut m, flow), 2);
+                assert_eq!(m.mem.bytes(dst, 5), b"first");
+                assert_eq!(m.mem.bytes(dst + 0x800, 4), b"tail");
+            }
+        }
+
+        // Immediate native rejections also have the exact bound, without
+        // recursive continuations or a synthetic completion event.
+        let mut m = machine_with_disc(vec![]);
+        m.drive.timing = cd::Timing::Instant;
+        m.cd_init();
+        let error = 0x8001_2000;
+        m.mem.w32(crate::tables::entry(0xA0, 0xA1).unwrap(), error);
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [0, 0, 0x8002_0000, 0]).unwrap();
+        let Flow::Block { then, .. } = flow else { panic!("seek") };
+        m.step(m.cd_due());
+        let now = m.clock.now;
+        let flow = then(&mut m);
+        let Flow::Call { call, then } = accept_yields(&mut m, flow) else { panic!("invalid read count") };
+        assert_eq!(call, GuestCall { addr: error, args: [0x44, 0x0C, 0, 0] });
+        assert_eq!(m.counts["bios.A0h:7Eh CdAsyncReadSector"], 99999);
+        assert_eq!(m.clock.now, now + 99998 / LOOP_BUDGET * m.quantum());
+        assert!(m.kernel.cd.op.is_none());
+        let flow = then(&mut m, 0);
+        assert_eq!(run(&mut m, flow), u32::MAX as u64);
+
+        // Redirecting the entry to another native blocking function must also
+        // finish that function before A5 tests its read-completion flags.
+        let mut m = machine_with_disc(vec![]);
+        m.drive.timing = cd::Timing::Instant;
+        m.cd_init();
+        let status = m.mem.r32(crate::tables::entry(0xA0, 0xA6).unwrap());
+        m.mem.w32(crate::tables::entry(0xA0, 0x7E).unwrap(), status);
+        let flow = bios::dispatch(&mut m, 0xA0, 0xA5, [2, 0, 0x8002_0000, 0]).unwrap();
+        let Flow::Block { then, .. } = flow else { panic!("seek") };
+        m.step(m.cd_due());
+        let Flow::Block { then, .. } = then(&mut m) else { panic!("redirected status") };
+        assert!(matches!(m.kernel.cd.op, Some(Op::Status { .. })));
+        m.step(m.cd_due());
+        let Flow::Block { until, then } = then(&mut m) else { panic!("read waits after the replacement returns") };
+        assert!(!m.holds(&until), "status consumed its DNE before returning nonzero");
+        assert!(m.kernel.cd.op.is_none());
+        ret(bios::call(&mut m, 0xA0, 0x95, [0; 4]));
+        assert!(!m.holds(&until), "reset cannot cancel a software-only wait");
+        let now = m.clock.now;
+        ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, DNE, 0, 0]));
+        assert!(m.holds(&until));
+        let flow = then(&mut m);
+        assert_eq!(run(&mut m, flow), 2);
+        assert_eq!(m.clock.now, now);
+    }
+
+    /// Returning from a read error retries, but not before SystemError returns.
+    /// The ten-attempt limit, retail's lost-minute bug, original buffer/count,
+    /// and live error-table lookup survive the continuation boundary.
+    #[test]
+    fn blocking_read_retries_after_returning_system_error() {
+        for failures in [1, 10] {
+            let mut sectors = vec![[0u8; cd::RAW]; 4504];
+            sectors[4502] = sector(4502, b"first");
+            sectors[2] = sector(2, b"retry");
+            sectors[3] = sector(3, b"tail");
+            let mut m = machine_with_disc(sectors);
+            m.drive.timing = cd::Timing::Instant;
+            m.cd_init();
+            let error_entry = crate::tables::entry(0xA0, 0xA1).unwrap();
+            let error = 0x8001_1000;
+            let dst = 0x8002_0000;
+            m.mem.w32(error_entry, error);
+            m.mem.write(dst + 0x800, b"keep");
+            let mut flow = bios::call(&mut m, 0xA0, 0xA5, [2, 4502, dst, 0]).unwrap();
+            for attempt in 0..failures {
+                let Flow::Block { until, then } = flow else {
+                    panic!("seek must wait on attempt {attempt}");
+                };
+                assert_eq!(m.cd_drive().head, if attempt == 0 { 4502 } else { 2 });
+                m.step(m.cd_due());
+                assert!(m.holds(&until));
+                let flow_read = then(&mut m);
+                let Flow::Block { until, then } = flow_read else {
+                    panic!("read must wait on attempt {attempt}");
+                };
+                // Complete one frame, then reset the pending read through A95.
+                // This uses native cancellation, not a fabricated controller INT5.
+                m.step(m.cd_due());
+                assert!(!m.holds(&until), "one of two sectors is not completion");
+                assert_eq!(m.mem.bytes(dst, 5), if attempt == 0 { b"first" } else { b"retry" });
+                assert_eq!(m.mem.bytes(dst + 0x800, 4), b"keep");
+                assert_eq!(ret(bios::call(&mut m, 0xA0, 0x95, [0; 4])), 1);
+                ret(bios::call(&mut m, 0xB0, 0x07, [EV_CD, ERR, 0, 0]));
+                assert!(m.holds(&until));
+                let flow_error = then(&mut m);
+                let Flow::Call { call, then } = flow_error else {
+                    panic!("read error must call SystemError");
+                };
+                assert_eq!((call.addr, call.args), (error + attempt * 4, [0x44, 0x16, 0, 0]));
+                assert!(!m.event_ready(m.kernel.cd.events[4]), "ERR consumed before callback");
+                assert!(m.kernel.cd.op.is_none(), "retry waits for the guest handler");
+                // A returning patch may edit the table for the next error.
+                m.mem.w32(error_entry, error + (attempt + 1) * 4);
+                flow = then(&mut m, 123);
+            }
+            if failures == 10 {
+                let Flow::Call { call, then } = flow else {
+                    panic!("exhaustion must call SystemError once more");
+                };
+                assert_eq!((call.addr, call.args), (error + 40, [0x44, 0x0C, 0, 0]));
+                assert!(m.kernel.cd.op.is_none(), "no eleventh attempt");
+                let flow = then(&mut m, 456);
+                assert_eq!(run(&mut m, flow), u32::MAX as u64);
+            } else {
+                assert_eq!(run(&mut m, flow), 2, "original sector count");
+                assert_eq!(m.mem.bytes(dst, 5), b"retry", "retry starts at original buffer");
+                assert_eq!(m.mem.bytes(dst + 0x800, 4), b"tail");
+                assert_eq!(m.cd_drive().head, 4, "retail retry loses the first minute");
+            }
+        }
+    }
+
+    /// A partial `_96_init` leaves no event open, and `_96_remove` does not
+    /// close a slot the guest reused for a different event.
+    #[test]
+    fn cd_event_ownership_is_exact() {
+        let mut m = crate::testing::machine();
+        m.lay_out_events(1);
+        assert_eq!(
+            ret(bios::call(&mut m, 0xA0, 0x54, [0; 4])),
+            u32::MAX,
+            "not enough event blocks"
+        );
+        assert!(!m.cd_installed());
+        assert!(m.events().iter().all(|e| e.status == kernel::EV_UNUSED));
+
+        let mut m = crate::testing::machine();
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x54, [0; 4])), 0);
+        let h = m.kernel.cd.events[0];
+        ret(bios::call(&mut m, 0xB0, 0x09, [h, 0, 0, 0]));
+        let guest = ret(bios::call(
+            &mut m,
+            0xB0,
+            0x08,
+            [0xF200_0002, 2, kernel::EV_MODE_NOINTR, 0],
+        ));
+        assert_eq!(guest, h, "the guest reuses the slot");
+        assert_eq!(ret(bios::call(&mut m, 0xA0, 0x56, [0; 4])), 0);
+        assert_eq!(
+            m.ev(guest).unwrap().status,
+            kernel::EV_DISABLED,
+            "the guest's event is untouched"
+        );
     }
 }

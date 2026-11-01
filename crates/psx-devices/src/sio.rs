@@ -18,9 +18,9 @@
 //!   active for 32 cycles; the pulse raises IRQ7 when JOY_CTRL bit 12 is
 //!   set.
 //!
-//! The cards are the port's ([`Sio0::slots`], D68): the BIOS's card driver
-//! and the SDK's card code reach them through the port, each card answering
-//! as [`crate::memcard::Responder`] says.
+//! The cards are the BIOS's images (`psx-bios::card`, D43), which the
+//! caller passes to every access; each answers as
+//! [`crate::memcard::Responder`] says.
 //!
 //! State advances lazily, event by event in time order, to the cycle of
 //! each register access.
@@ -36,7 +36,7 @@ const ACK_DELAY: i64 = 0x40;
 pub const CARD_ACK_DELAY: i64 = 0x100;
 const ACK_LEN: i64 = 32;
 
-/// The memory cards in the two slots.
+/// The memory cards in the two slots, as the caller keeps them.
 pub type Cards = [Option<Card>; 2];
 
 /// A memory card slot's end of the wire: the bits of the byte coming in
@@ -96,30 +96,6 @@ pub struct Pad {
 }
 
 impl Pad {
-    /// A transfer a byte at a time, for a driver that talks to the pad
-    /// without the port's registers (the BIOS's pad handler): the pad is
-    /// selected, each byte clocked through it bit by bit as the port does,
-    /// and deselected.
-    pub fn select(&mut self) {
-        self.set_dtr(false);
-        self.set_dtr(true);
-    }
-
-    /// Byte `b` out: the pad's byte back, and whether it acknowledged.
-    pub fn exchange(&mut self, b: u8) -> (u8, bool) {
-        let (mut rx, mut ack) = (0u8, false);
-        for bit in 0..8 {
-            let mut delay = 0;
-            rx |= (self.clock(b >> bit & 1 != 0, &mut delay) as u8) << bit;
-            ack |= delay != 0;
-        }
-        (rx, ack)
-    }
-
-    pub fn deselect(&mut self) {
-        self.set_dtr(false);
-    }
-
     fn set_dtr(&mut self, dtr: bool) {
         if !self.dtr && dtr {
             self.phase = 0;
@@ -197,10 +173,8 @@ pub struct Sio0 {
     rx_avail: bool,
     /// Cycles to the next bit tick (0: idle).
     divider: i64,
-    /// The memory card slots' ends of the wire.
+    /// The memory card slots.
     cards: [CardPort; 2],
-    /// The cards in the slots.
-    pub slots: Cards,
     /// Per slot device (pad 1, pad 2, card 1, card 2): cycles to the /ACK
     /// pulse, and the cycle the pulse ends.
     ack_delay: [i64; 4],
@@ -235,18 +209,18 @@ impl Sio0 {
 
     /// Bring the port up to cycle `now`, processing every event before it
     /// at its own time (as the oracle's scheduler does).
-    pub fn update(&mut self, now: u64, irq: &mut Irq) {
+    pub fn update(&mut self, now: u64, irq: &mut Irq, cards: &mut Cards) {
         // Time never runs back: a guest that polled ahead of the clock
         // (D66) has already taken SIO0 this far.
         let now = (now as i64).max(self.last);
         while let Some(t) = self.next_event().filter(|&t| t <= now) {
-            self.step(t, irq);
+            self.step(t, irq, cards);
         }
-        self.step(now, irq);
+        self.step(now, irq, cards);
     }
 
     /// Beetle's `FrontIO_Update` at `ts`.
-    fn step(&mut self, ts: i64, irq: &mut Irq) {
+    fn step(&mut self, ts: i64, irq: &mut Irq, cards: &mut Cards) {
         let clocks = ts - self.last;
         for i in 0..4 {
             if self.ack_delay[i] > 0 {
@@ -283,7 +257,7 @@ impl Sio0 {
                 for (p, delay) in self.pads.iter_mut().zip(pad_acks) {
                     rxd &= p.clock(txd, delay);
                 }
-                for ((c, card), delay) in self.cards.iter_mut().zip(self.slots.iter_mut()).zip(card_acks) {
+                for ((c, card), delay) in self.cards.iter_mut().zip(cards.iter_mut()).zip(card_acks) {
                     rxd &= c.clock(card.as_mut(), txd, delay);
                 }
                 if self.rx_busy {
@@ -346,8 +320,8 @@ impl Sio0 {
         irq.raise(irq::SIO0);
     }
 
-    pub fn read(&mut self, addr: u32, now: u64, irq: &mut Irq) -> u32 {
-        self.update(now, irq);
+    pub fn read(&mut self, addr: u32, now: u64, irq: &mut Irq, cards: &mut Cards) -> u32 {
+        self.update(now, irq, cards);
         let reg = (addr | 0x1F00_0000) - BASE;
         let v = match reg & !1 {
             0 | 2 => {
@@ -382,8 +356,8 @@ impl Sio0 {
         v >> (8 * (reg & 1)) >> if reg & 2 != 0 && reg < 8 { 16 } else { 0 }
     }
 
-    pub fn write(&mut self, addr: u32, size: u32, v: u32, now: u64, irq: &mut Irq) {
-        self.update(now, irq);
+    pub fn write(&mut self, addr: u32, size: u32, v: u32, now: u64, irq: &mut Irq, cards: &mut Cards) {
+        self.update(now, irq, cards);
         match (addr | 0x1F00_0000) - BASE {
             0 => {
                 self.tx_byte = v as u8;
@@ -444,20 +418,21 @@ impl Sio0 {
 mod tests {
     use super::*;
 
-    /// The port and its interrupt controller.
+    /// The port, its interrupt controller and the slots' cards.
     struct Port {
         s: Sio0,
         irq: Irq,
+        cards: Cards,
         now: u64,
     }
 
     impl Port {
         fn read(&mut self, addr: u32, now: u64) -> u32 {
-            self.s.read(addr, now, &mut self.irq)
+            self.s.read(addr, now, &mut self.irq, &mut self.cards)
         }
 
         fn write(&mut self, addr: u32, size: u32, v: u32, now: u64) {
-            self.s.write(addr, size, v, now, &mut self.irq)
+            self.s.write(addr, size, v, now, &mut self.irq, &mut self.cards)
         }
 
         /// One exchange as libpad does it: write TX, wait for RX, read it,
@@ -484,7 +459,7 @@ mod tests {
     }
 
     fn port(ctrl: u32, buttons: Option<[u8; 2]>) -> Port {
-        let mut p = Port { s: Sio0::default(), irq: Irq::default(), now: 2 };
+        let mut p = Port { s: Sio0::default(), irq: Irq::default(), cards: [None, None], now: 2 };
         p.s.pads[0].buttons = buttons;
         p.write(BASE + 0xE, 2, 0x88, 0);
         p.write(BASE + 8, 2, 0x0D, 0);
@@ -525,17 +500,17 @@ mod tests {
     #[test]
     fn memory_card_on_its_slot() {
         let mut p = port(0x3003, Some([0xFF, 0xFF]));
-        p.s.slots[1] = Some(Card::formatted());
+        p.cards[1] = Some(Card::formatted());
         assert_eq!(p.xfer(0x81), (0xFF, true));
         assert_eq!(p.xfer(b'R'), (0x08, true));
         let got: Vec<u8> = [0, 0, 0, 1, 0, 0, 0, 0].iter().map(|&b| p.xfer(b).0).collect();
         assert_eq!(got, [0x5A, 0x5D, 0x00, 0x00, 0x5C, 0x5D, 0x00, 0x01]);
-        assert_eq!(p.xfer(0).0, p.s.slots[1].as_ref().unwrap().frame(1)[0]);
+        assert_eq!(p.xfer(0).0, p.cards[1].as_ref().unwrap().frame(1)[0]);
         let mut p = port(0x3003, None);
-        p.s.slots[1] = Some(Card::formatted());
+        p.cards[1] = Some(Card::formatted());
         assert_eq!(p.xfer(0x01), (0xFF, false), "a pad's address");
         let mut p = port(0x1003, None);
-        p.s.slots[1] = Some(Card::formatted());
+        p.cards[1] = Some(Card::formatted());
         assert_eq!(p.xfer(0x81), (0xFF, false), "slot 1 is empty");
     }
 
@@ -543,7 +518,7 @@ mod tests {
     #[test]
     fn card_acknowledges_later() {
         let mut p = port(0x0003, None);
-        p.s.slots[0] = Some(Card::formatted());
+        p.cards[0] = Some(Card::formatted());
         p.write(BASE, 1, 0x81, 20_000);
         let end = 20_000 + 8 * 0x88;
         assert_eq!(p.read(BASE + 4, end + CARD_ACK_DELAY as u64 - 1) & 0x80, 0);
@@ -562,7 +537,7 @@ mod tests {
     fn receive_needs_a_read_first() {
         // With RXEN (bit 2) a read starts a receive at once, clocking the
         // pad with zero bits; without a read, nothing is received.
-        let mut p = Port { s: Sio0::default(), irq: Irq::default(), now: 0 };
+        let mut p = Port { s: Sio0::default(), irq: Irq::default(), cards: [None, None], now: 0 };
         p.s.pads[0].buttons = Some([0xFF, 0xFF]);
         p.write(BASE + 0xA, 2, 0x0007, 0);
         p.write(BASE, 1, 1, 0);

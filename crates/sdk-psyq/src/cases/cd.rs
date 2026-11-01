@@ -15,10 +15,8 @@
 //!   observed.
 //! - **Sector data** as an FNV-1a hash and its first bytes; timing as
 //!   Vcount (`VSync(-1)`) at sync points; callbacks by their word.
-//! - **The budget** after every call and every wait for vblanks: the
-//!   original's instructions so far, the interrupts' among them (D71).
 
-use super::{Case, Harness, Rng, SCRATCH, budget, observe_ram, timed as call, vblanks};
+use super::{Case, Harness, Rng, SCRATCH, call, observe_ram};
 
 /// A command's result buffer.
 const R: u32 = SCRATCH;
@@ -60,7 +58,7 @@ pub fn cases() -> Vec<Case> {
             name: "cd.init",
             chip: "cd",
             level: 1,
-            covers: &["CD_init", "CD_initintr", "CD_flush", "CD_sync", "libcd/bios_1:0x14a4"],
+            covers: &["CD_init", "CD_initintr", "CD_flush", "CD_sync"],
             needs: &["CD_init", "CD_initintr", "CD_flush", "CD_cw", "CD_sync", "VSync"],
             run: init,
         },
@@ -148,7 +146,6 @@ fn data(h: &mut dyn Harness, what: &str, addr: u32, len: usize) {
 fn vcount(h: &mut dyn Harness) -> Result<(), String> {
     let v = h.call("VSync", &[u32::MAX])?;
     h.observe("Vcount", v.to_string());
-    budget(h, "VSync");
     Ok(())
 }
 
@@ -182,7 +179,7 @@ fn wait(h: &mut dyn Harness, name: &str, mode: u32) -> Result<u32, String> {
 /// Init, the handler reinstalled, flushes; a Nop still completes.
 fn init(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     let before = rng.range(0, 3);
-    vblanks(h, before)?;
+    h.vblanks(before)?;
     call(h, "CD_init", &[])?;
     wait(h, "CD_sync", 1)?;
     vcount(h)?;
@@ -190,7 +187,6 @@ fn init(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     wait(h, "CD_sync", 1)?;
     let prev = h.call("CD_initintr", &[])?;
     h.observe("CD_initintr() is a pointer", (prev != 0).to_string());
-    budget(h, "CD_initintr");
     cw(h, NOP, None, rng.range(0, 2) == 1)?;
     wait(h, "CD_sync", 0)?;
     call(h, "CD_flush", &[])?;
@@ -274,7 +270,7 @@ fn volume(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
         cw(h, SETMODE, Some(&[SPEED | XA]), false)?;
         cw(h, SETLOC, Some(&loc(movie + rng.range(0, 32))), false)?;
         cw(h, READS, None, false)?;
-        vblanks(h, 30)?;
+        h.vblanks(30)?;
         cw(h, PAUSE, None, false)?;
         wait(h, "CD_sync", 0)?;
     }
@@ -290,7 +286,6 @@ fn drain_ring(h: &mut dyn Harness, what: &str) -> Result<(), String> {
         h.write(NEXT, &[0; 8]);
         let v = h.call("StGetNext", &[NEXT, NEXT + 4])?;
         h.observe(&format!("{what}: StGetNext"), v.to_string());
-        budget(h, "StGetNext");
         if v != 0 {
             break;
         }
@@ -328,10 +323,9 @@ fn ring(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
         if every {
             wait(h, "CD_ready", 0)?;
         } else {
-            vblanks(h, 1)?;
+            h.vblanks(1)?;
         }
         h.call("StCdInterrupt", &[])?;
-        budget(h, "StCdInterrupt");
         drain_ring(h, &format!("sector {f}"))?;
         observe_word(h, "frame callback", state);
     }
@@ -361,13 +355,8 @@ fn files(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     observe_ram(h, "result", R, 8);
     call(h, "CdRead", &[1, BUF, SPEED as u32])?;
     let mut polls = 0;
-    loop {
-        let v = h.call("CdReadSync", &[1, R])?;
-        budget(h, "CdReadSync");
-        if v == 0 || polls >= 600 {
-            break;
-        }
-        vblanks(h, 1)?;
+    while h.call("CdReadSync", &[1, R])? != 0 && polls < 600 {
+        h.vblanks(1)?;
         polls += 1;
     }
     h.observe("frames to read", polls.to_string());
@@ -386,7 +375,7 @@ fn files(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     call(h, "CdSyncCallback", &[cb])?;
     call(h, "CdControlB", &[PAUSE, 0, R])?;
     observe_ram(h, "result", R, 8);
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     observe_word(h, "sync callback", state);
     call(h, "CdSyncCallback", &[0])?;
     // The data-ready interface: a callback per sector.
@@ -394,7 +383,7 @@ fn files(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     call(h, "CdControl", &[SETLOC, P, R])?;
     call(h, "CdReadyCallback", &[cb])?;
     call(h, "CdControl", &[READN, 0, R])?;
-    vblanks(h, 5)?;
+    h.vblanks(5)?;
     observe_word(h, "ready callbacks", state);
     call(h, "CdControlF", &[PAUSE, 0])?;
     call(h, "CdSync", &[0, R])?;
@@ -419,7 +408,7 @@ fn stream(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     h.write(P, &loc(movie));
     call(h, "DsRead2", &[P, 0x100 | (SPEED | SIZE | XA) as u32])?;
     for f in 0..60 {
-        vblanks(h, 1)?;
+        h.vblanks(1)?;
         drain_ring(h, &format!("frame {f}"))?;
         if f % 10 == 9 {
             observe_word(h, "frame callbacks", state);
@@ -429,7 +418,7 @@ fn stream(h: &mut dyn Harness, _rng: &mut Rng) -> Result<(), String> {
     call(h, "StUnSetRing", &[])?;
     call(h, "DsControl", &[PAUSE, 0, R])?;
     observe_ram(h, "result", R, 8);
-    vblanks(h, 2)?;
+    h.vblanks(2)?;
     vcount(h)?;
     let d = h.device();
     h.observe("device", d);

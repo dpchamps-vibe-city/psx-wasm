@@ -29,10 +29,8 @@ fn ss_init(m: &mut M, _a: [u32; 4]) -> Result {
     let vblank_minus = find(m, 0x78, 0x7C, "VBLANK_MINUS")?;
     let openflag = find(m, 0x80, 0x84, "_snd_openflag")?;
     let ev_flag = find(m, 0x88, 0x8C, "_snd_ev_flag")?;
-    // Its time is `ssinit.o`'s blocks on its path (D71): the table's 16
-    // halfwords a pass of 7, register by register; `_SsVmInit` a guest
-    // call; 32 sequences' 16 mark callbacks, an inner loop of 4 in an
-    // outer of 6.
+    // The table's 16 halfwords, register by register: a loop the
+    // translation unrolls (no budget).
     let regs: [(Option<Volume>, Option<Mask>); 8] = [
         (Some(Volume::Main), None),
         (Some(Volume::Reverb), None),
@@ -43,7 +41,7 @@ fn ss_init(m: &mut M, _a: [u32; 4]) -> Result {
         (None, Some(Mask::Reverb)),
         (None, Some(Mask::End)),
     ];
-    let set = std::rc::Rc::new(move |m: &mut M, i: u32| {
+    for i in 0..16u32 {
         let v = m.mem.r16(table + 2 * i);
         let (vol, mask) = regs[(i / 2) as usize];
         m.with_spu(|s| match (vol, mask) {
@@ -51,57 +49,28 @@ fn ss_init(m: &mut M, _a: [u32; 4]) -> Result {
             (_, Some(k)) => s.set_mask_half(k, i & 1 != 0, v),
             _ => {}
         });
-    });
-    crate::path(m, &[(0x0, 0x18)]);
-    let after = move |m: &mut M| -> Flow<crate::Psyq> {
-        crate::path(m, &[(0x38, 0x3C)]);
-        m.release_irq();
-        Flow::Call {
-            call: GuestCall { addr: vm_init, args: [24, 0, 0, 0] },
-            then: Box::new(move |m, _| {
-                crate::path(m, &[(0x40, 0x48)]);
-                marks_loop(
-                    m,
-                    marks,
-                    0,
-                    Box::new(move |m| {
-                        crate::path(m, &[(0x74, 0x9C)]);
-                        m.mem.w32(vblank_minus, 60);
-                        m.mem.w32(openflag, 0);
-                        m.mem.w32(ev_flag, 0);
-                        // No runtime call ends the original: no safepoint (D63).
-                        m.quiet = true;
-                        Flow::ret(60)
-                    }),
-                )
-            }),
-        }
-    };
-    Ok(crate::libspu::each(m, 0, 16, 7, set, Box::new(after)))
-}
-
-/// Sequence `seq`'s 16 mark callbacks cleared, from the outer loop's
-/// header, then the rest.
-fn marks_loop(m: &mut M, marks: u32, seq: u32, k: crate::libspu::K) -> Flow<crate::Psyq> {
-    if seq == 32 {
-        return k(m);
     }
-    crate::libspu::header(
-        m,
-        Box::new(move |m| {
-            crate::path(m, &[(0x4C, 0x50)]);
-            let clear = std::rc::Rc::new(move |m: &mut M, i: u32| m.mem.w32(marks + 64 * seq + 4 * (15 - i), 0));
-            crate::libspu::each(
+    m.release_irq();
+    Ok(Flow::Call {
+        call: GuestCall { addr: vm_init, args: [24, 0, 0, 0] },
+        then: Box::new(move |m, _| {
+            // 32 sequences' 16 mark callbacks: a pass per sequence (the
+            // translation unrolls the inner loop).
+            for i in 0..32 * 16 {
+                m.mem.w32(marks + 4 * i, 0);
+            }
+            crate::libspu::spend(
                 m,
-                0,
-                16,
-                4,
-                clear,
+                32,
                 Box::new(move |m| {
-                    crate::path(m, &[(0x64, 0x70)]);
-                    marks_loop(m, marks, seq + 1, k)
+                    m.mem.w32(vblank_minus, 60);
+                    m.mem.w32(openflag, 0);
+                    m.mem.w32(ev_flag, 0);
+                    // No runtime call ends the original: no safepoint (D63).
+                    m.quiet = true;
+                    Flow::ret(60)
                 }),
             )
         }),
-    )
+    })
 }

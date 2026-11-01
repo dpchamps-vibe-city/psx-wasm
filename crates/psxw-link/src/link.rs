@@ -12,7 +12,7 @@ use crate::marshal;
 use crate::object::{FuncType, NameClass, SymbolKind, WasmObject, classify_name};
 use crate::rewrite::{self, Lowered, Resolver};
 use anyhow::{Context as _, Result, anyhow, bail};
-use psxw_abi::WINDOW_BASE;
+use psxw_abi::{WINDOW_BASE, WINDOW_MASK};
 use psxw_cc::protos::Proto;
 use psxw_inputs::AddressMap;
 use std::collections::{BTreeMap, HashMap};
@@ -105,13 +105,10 @@ pub struct Division {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Mode<'a> {
+pub enum Mode {
     /// Differential harness: every call is a call-out. With `dirty`, stores
-    /// mark their page in a byte map at that wasm address. Lifted code
-    /// spends the budget global it exports (psxw-abi
-    /// `guest::BUDGET_SYMBOL`, D71), and so do C functions `costs` has the
-    /// original's loops of, by (container, address); nothing checks it.
-    Harness { sp: u32, gp: u32, dirty: Option<u32>, costs: Option<&'a BTreeMap<(String, u32), crate::cost::LoopTree>> },
+    /// mark their page in a byte map at that wasm address.
+    Harness { sp: u32, gp: u32, dirty: Option<u32> },
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +151,8 @@ enum Synth {
     MarkRange,
     /// R3000 division semantics for C code (`div_s`, `div_u`, `rem_s`, `rem_u`).
     Division(&'static str, Division),
+    /// `memcpy(dst, src, n) -> dst` expanded as a copy.
+    InlineCopy,
 }
 
 struct Ctx<'a> {
@@ -161,7 +160,7 @@ struct Ctx<'a> {
     inputs: &'a [Input],
     view: Vec<(&'a str, &'a WasmObject)>,
     layout: Layout,
-    mode: Mode<'a>,
+    mode: Mode,
     types: Vec<FuncType>,
     type_ix: HashMap<FuncType, u32>,
     nimports: u32,
@@ -174,15 +173,9 @@ struct Ctx<'a> {
     gp: u32,
     /// GCC's static chain between lifted functions (psxw_rt.h).
     chain: u32,
-    /// The safepoint budget guest code spends (D71).
-    budget: u32,
 }
 
 const CALLOUT_IMPORT: u32 = 0;
-/// `h.map_access`: psxw-abi `psx::MAP_ACCESS`, which the harness answers from
-/// the same map (a bus error traps on both sides).
-const MAP_IMPORT: u32 = 1;
-const WINDOW: rewrite::Window = rewrite::Window { base: WINDOW_BASE, map: MAP_IMPORT };
 
 impl Ctx<'_> {
     fn intern(&mut self, t: &FuncType) -> u32 {
@@ -245,7 +238,7 @@ impl Resolver for InputResolver<'_, '_> {
         let s = &inp.obj.symbols[symbol as usize];
         let name = s.name.clone();
         if name == "memcpy" && last_const.is_some() && inp.gcc.is_some_and(|g| g.builtin_memcpy) && !s.defined {
-            return Ok(Lowered::Copy);
+            return Ok(Lowered::Call(self.ctx.synth(Synth::InlineCopy)));
         }
         if let Some(op) = division_intrinsic(&name) {
             return Ok(lower_division(self, op));
@@ -301,20 +294,8 @@ impl Resolver for InputResolver<'_, '_> {
         let s = &self.ctx.inputs[self.input].obj.symbols[symbol as usize];
         match s.name.as_str() {
             "__stack_pointer" => Ok(self.ctx.sp),
-            psxw_abi::guest::BUDGET_SYMBOL => Ok(self.ctx.budget),
             other => bail!("guest code uses global {other}"),
         }
-    }
-
-    fn costs(&mut self, func_symbol: Option<&str>) -> Option<(u32, crate::cost::LoopTree)> {
-        let Mode::Harness { costs, .. } = self.ctx.mode;
-        let inp = &self.ctx.inputs[self.input];
-        let NameClass::Guest(g) = classify_name(func_symbol?) else { return None };
-        if inp.generated {
-            return None;
-        }
-        let addr = self.ctx.guest_addr(self.input, g)?;
-        Some((self.ctx.budget, costs?.get(&(inp.container.clone(), addr))?.clone()))
     }
 
     fn data_addr(&mut self, symbol: u32) -> Result<u32> {
@@ -328,10 +309,6 @@ impl Resolver for InputResolver<'_, '_> {
     fn type_index(&mut self, ty: u32) -> u32 {
         let t = self.ctx.inputs[self.input].obj.types[ty as usize].clone();
         self.ctx.intern(&t)
-    }
-
-    fn map_access(&mut self) -> u32 {
-        MAP_IMPORT
     }
 
     fn dirty_map(&self) -> Option<u32> {
@@ -404,7 +381,7 @@ pub fn link(
         mode,
         types: Vec::new(),
         type_ix: HashMap::new(),
-        nimports: 2,
+        nimports: 1,
         guest: HashMap::new(),
         guest_order: Vec::new(),
         synth: Vec::new(),
@@ -412,9 +389,7 @@ pub fn link(
         sp: 0,
         gp: 1,
         chain: 2,
-        budget: 3,
     };
-    let map_ty = ctx.intern(&FuncType { params: vec![wasmparser::ValType::I32; 3], results: vec![wasmparser::ValType::I32] });
     let callout_ty = ctx.intern(&FuncType {
         params: vec![wasmparser::ValType::I32; 8],
         results: vec![wasmparser::ValType::I64],
@@ -489,7 +464,6 @@ pub fn link(
     module.section(&types);
     let mut imports = ImportSection::new();
     imports.import("h", "callout", EntityType::Function(callout_ty));
-    imports.import("h", psxw_abi::psx::MAP_ACCESS, EntityType::Function(map_ty));
     module.section(&imports);
     let mut functions = FunctionSection::new();
     for (t, _) in &bodies {
@@ -505,7 +479,7 @@ pub fn link(
     module.section(&memory);
     let Mode::Harness { sp, gp, .. } = ctx.mode;
     let mut globals = GlobalSection::new();
-    for init in [sp, gp, 0, 0] {
+    for init in [sp, gp, 0] {
         globals.global(
             GlobalType { val_type: ValType::I32, mutable: true, shared: false },
             &ConstExpr::i32_const(init as i32),
@@ -516,7 +490,6 @@ pub fn link(
     ex.export("memory", ExportKind::Memory, 0);
     ex.export("__guest_sp", ExportKind::Global, ctx.sp);
     ex.export("__guest_gp", ExportKind::Global, ctx.gp);
-    ex.export(psxw_abi::guest::BUDGET_SYMBOL, ExportKind::Global, ctx.budget);
     for (n, i) in &export_list {
         ex.export(n, ExportKind::Func, *i);
     }
@@ -533,8 +506,7 @@ pub fn link(
     for &(i, si, addr) in &ctx.layout.aux.clone() {
         let fa = |input: usize, sym: u32| func_addr(&ctx, input, sym);
         let bytes = ctx.layout.bytes_of(&ctx.view, map, i, si, &fa)?;
-        let at = WINDOW.constant(addr, bytes.len() as u32, true).context("AUX data")?;
-        data.active(0, &ConstExpr::i32_const((WINDOW_BASE + at) as i32), bytes);
+        data.active(0, &ConstExpr::i32_const((WINDOW_BASE + (addr & WINDOW_MASK)) as i32), bytes);
         aux.push((inputs[i].label.clone(), inputs[i].obj.symbols[si as usize].name.clone(), addr));
     }
     module.section(&data);
@@ -587,7 +559,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 sig,
                 &words,
                 sp,
-                WINDOW,
+                WINDOW_BASE,
                 &|f| {
                     f.instruction(&I::I32Const(callout::CALL as i32));
                     f.instruction(&I::I32Const(addr as i32));
@@ -630,7 +602,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
                 &helper,
                 &words,
                 sp,
-                WINDOW,
+                WINDOW_BASE,
                 &|f| {
                     f.instruction(&I::I32Const(callout::INDIRECT as i32));
                     f.instruction(&I::LocalGet(target));
@@ -736,6 +708,12 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             let sig = FuncType { params: vec![wasmparser::ValType::I32; 2], results: vec![] };
             (sig, f, "mark_range".into())
         }
+        Synth::InlineCopy => {
+            let Mode::Harness { dirty, .. } = ctx.mode;
+            let mark = dirty.map(|_| ctx.synth(Synth::MarkRange));
+            let sig = FuncType { params: vec![wasmparser::ValType::I32; 3], results: vec![wasmparser::ValType::I32] };
+            (sig, crate::bodies::inline_copy(WINDOW_BASE, mark), "builtin_memcpy".into())
+        }
         Synth::Division(op, conv) => {
             let brk = ctx.synth(Synth::Service {
                 name: "__psxw_break".into(),
@@ -749,7 +727,7 @@ fn synth_body(ctx: &mut Ctx, s: &Synth, _callout_ty: u32) -> Result<(FuncType, F
             let sig = obj.types[obj.funcs[*func as usize].ty as usize].clone();
             let proto = ctx.inputs[*input].protos.get(name);
             let callee = ctx.guest[&(*input, *func)];
-            let body = marshal::o32_to_c(&sig, proto, callee, sp, WINDOW);
+            let body = marshal::o32_to_c(&sig, proto, callee, sp, WINDOW_BASE);
             (o32_sig(), body, format!("o32:{name}"))
         }
     })

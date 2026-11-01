@@ -42,10 +42,6 @@ pub fn run(b: &BiosCall) -> Result<Vec<u8>> {
     );
     // The devices the runtime's BIOS reaches (the GPU and timer functions).
     m.io = Some(Default::default());
-    // As the runner's boot leaves the BIOS (its SYSTEM.CNF: EVENT=10):
-    // the CD-ROM driver installed (`_96_init`'s events and handlers).
-    m.lay_out_events(0x10);
-    m.cd_install();
     for (addr, bytes) in &b.setup {
         m.mem.write(*addr, bytes);
     }
@@ -58,4 +54,29 @@ pub fn run(b: &BiosCall) -> Result<Vec<u8>> {
         out.extend(m.mem.bytes(addr, len as usize));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire;
+
+    fn call(table: u32, func: u32, args: [u32; 4], text: &[u8]) -> Vector {
+        Vector::BiosCall(BiosCall { table, func, args, setup: vec![(wire::SCRATCH_BASE, text.to_vec())], captures: vec![] })
+    }
+
+    fn v0(v: &Vector) -> u32 {
+        match v {
+            Vector::BiosCall(b) => u32::from_le_bytes(run(b).unwrap()[..4].try_into().unwrap()),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn calls_run_on_psx_bios() {
+        let s = wire::SCRATCH_BASE;
+        assert_eq!(v0(&call(0xA0, 0x1B, [s, 0, 0, 0], b"abc\0")), 3);
+        assert_eq!(v0(&call(0xB0, 0x02, [1, 0x100, 0, 0], b"")), 1);
+        assert_eq!(v0(&call(0xA0, 0x4E, [0, 0, 0, 0], b"")), 0);
+    }
 }

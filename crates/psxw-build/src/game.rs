@@ -25,8 +25,7 @@ pub struct Options {
     pub game: String,
     /// Trap on guest accesses to the I/O window.
     pub debug_io: bool,
-    /// The safepoint budget a quantum gives, in the original's instructions
-    /// in fixed point (psxw-abi `guest::BUDGET`, D71).
+    /// Loop iterations between safepoints.
     pub budget: u32,
     /// Compile the C with UBSan in trap mode (`game-ubsan.wasm`).
     pub ubsan: bool,
@@ -72,7 +71,7 @@ impl Options {
         Self {
             game: game.into(),
             debug_io: false,
-            budget: psxw_abi::guest::BUDGET as u32,
+            budget: 1000,
             ubsan: false,
             original: vec![],
             probes: vec![],
@@ -235,7 +234,7 @@ pub struct Prepared {
     unvalidated: BTreeSet<String>,
     hardware: Vec<Unbound>,
     void_used: BTreeSet<(String, u32)>,
-    overlay_addresses: usize,
+    overlays: BTreeMap<u32, Vec<(String, [u32; 2])>>,
     spec: GameSpec,
     /// Functions that switch threads (wasm names), seeding Asyncify.
     switches: BTreeSet<String>,
@@ -523,11 +522,15 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         );
     }
     bios_calls(&out_dir(ws, &opts.game), &lifted)?;
-    // Thread switches (ChangeThread, B0h:10h) seed the Asyncify scope (D57),
-    // by their wasm names.
+    // Thread switches (ChangeThread, B0h:10h, or SYS(03h)) seed Asyncify
+    // by their wasm names. Conservatively include every syscall site:
+    // its function number may be computed at runtime.
     let switches: BTreeSet<String> = lifted
         .iter()
-        .filter(|t| psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10)))
+        .filter(|t| {
+            psxw_lift::bios_calls(t).iter().any(|c| c.table == 0xB0 && c.func == Some(0x10))
+                || t.graph.nodes.values().any(|d| d.insn.op == psxw_lift::decode::Op::Syscall)
+        })
         .map(|t| format!("{}:{}", t.func.container, t.cname))
         .collect();
     let failures = psxw_lift::run::write_and_compile(ws, &lift_dir, &lifted)?;
@@ -556,15 +559,24 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     }
 
     // Addresses several containers define (overlay slots).
-    let mut by_addr: BTreeMap<u32, usize> = BTreeMap::new();
-    for (_, a) in tiers.keys() {
-        *by_addr.entry(*a).or_default() += 1;
+    let mut by_addr: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for (c, a) in tiers.keys() {
+        by_addr.entry(*a).or_default().push(c.clone());
     }
-    let overlay_addresses = by_addr.values().filter(|&&n| n > 1).count();
+    let mut overlays = BTreeMap::new();
+    for (a, cs) in by_addr.into_iter().filter(|(_, cs)| cs.len() > 1) {
+        let mut cands = Vec::new();
+        for c in cs {
+            let w0 = inputs.originals.word(&c, a).context("overlay code")?;
+            let w1 = inputs.originals.word(&c, a + 4).unwrap_or(0);
+            cands.push((c, [w0, w1]));
+        }
+        overlays.insert(a, cands);
+    }
 
     let spec = GameSpec {
         tiers: tiers.clone(),
-        resident: psxw_link::game::residency(&inputs.map, &inputs.originals)?,
+        overlays: overlays.clone(),
         budget: opts.budget,
         debug_io: opts.debug_io || !opts.original.is_empty(),
         device_funcs: tiers
@@ -583,13 +595,6 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         // ones the translator expands into its callers.
         slots: opts.moddable.then(|| tiers.keys().filter(|k| !expanded.contains(*k)).cloned().collect()),
         threads: !switches.is_empty(),
-        // Decompiled C spends what its original's instructions take (D71).
-        costs: translations
-            .iter()
-            .map(|t| ((t.func.container.clone(), t.func.addr), t))
-            .filter(|(k, _)| matches!(tiers.get(k), Some(Tier::C { .. })))
-            .map(|(k, t)| (k, t.graph.loop_tree()))
-            .collect(),
         probes: inputs
             .manifest
             .run
@@ -622,7 +627,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         unvalidated,
         hardware,
         void_used,
-        overlay_addresses,
+        overlays,
         spec,
         switches,
     })
@@ -656,7 +661,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         unvalidated,
         hardware,
         void_used,
-        overlay_addresses,
+        overlays,
         mut spec,
         switches,
         ..
@@ -795,7 +800,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         tiers: counts,
         by_container,
         adapters: bound.into_iter().collect(),
-        overlay_addresses,
+        overlay_addresses: overlays.len(),
         aux_symbols: linked.aux.len(),
         matched_rodata: linked.matched,
         debug_io: opts.debug_io || !opts.original.is_empty(),
@@ -871,7 +876,7 @@ fn check_abi(wasm: &[u8]) -> Result<()> {
 
 /// The name an adapter binds `t` by: its own, or, for a function the SDK's
 /// object doesn't name (a static one), its place in the object's text
-/// (`libgpu/sys:0x23a8`).
+/// (`libetc/intr_dma:0x4c`).
 fn adapter_name(map: &psxw_inputs::AddressMap, t: &psxw_lift::Translation, adapter_names: &BTreeSet<&str>) -> String {
     if adapter_names.contains(t.func.name.as_str()) {
         return t.func.name.clone();
@@ -1101,50 +1106,65 @@ fn hardware_unbound(
 }
 
 /// The BIOS calls translated code makes (M2 task 8), by table and number,
-/// with their call sites; `bios-calls.json`. Each must be one the runtime's
-/// dispatcher implements, with a constant function number.
+/// with their call sites and coverage; `bios-calls.json`. The build still
+/// requires a constant function number the dispatcher names, but reports
+/// partial, unsupported, fatal and no-op calls rather than calling them all
+/// implemented.
 fn bios_calls(dir: &Path, lifted: &[&psxw_lift::Translation]) -> Result<()> {
     #[derive(Serialize, Default)]
     struct Call {
         name: &'static str,
         implemented: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        unsupported: Option<&'static str>,
+        support: &'static str,
         sites: Vec<String>,
     }
     let mut calls: BTreeMap<String, Call> = BTreeMap::new();
     for t in lifted {
         for c in psxw_lift::bios_calls(t) {
             let site = format!("{} 0x{:08X}", t.func.name, c.pc);
-            let (key, name, ok, unsupported) = match c.func {
-                Some(f) => {
-                    let (t, f) = (c.table as u32, f);
-                    (format!("{:02X}h:{f:02X}h", c.table), psx_bios::bios::name(t, f), psx_bios::bios::implemented(t, f), psx_bios::bios::unsupported(t, f))
-                }
-                None => (format!("{:02X}h:?", c.table), "(function number not constant)", false, None),
+            let support = call_support(c.table as u32, c.func);
+            let (key, name, ok) = match c.func {
+                Some(f) => (format!("{:02X}h:{f:02X}h", c.table), psx_bios::bios::name(c.table as u32, f), psx_bios::bios::implemented(c.table as u32, f)),
+                None => (format!("{:02X}h:?", c.table), "(function number not constant)", false),
             };
-            let e = calls.entry(key).or_insert_with(|| Call { name, implemented: ok, unsupported, sites: vec![] });
+            let e = calls.entry(key).or_insert_with(|| Call { name, implemented: ok, support: support.label(), sites: vec![] });
             e.sites.push(site);
         }
     }
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("bios-calls.json"), serde_json::to_string_pretty(&calls)?)?;
-    let site = |(k, c): (&String, &Call)| format!("{k} {} at {}", c.name, c.sites.join(", "));
-    let missing: Vec<String> = calls.iter().filter(|(_, c)| !c.implemented && c.unsupported.is_none()).map(site).collect();
-    ensure!(missing.is_empty(), "translated code makes BIOS calls the runtime doesn't implement:\n  {}", missing.join("\n  "));
-    // Calls that can't be carried out without a CPU fail if they run; the
-    // build names them.
-    let failing: Vec<String> = calls.iter().filter(|(_, c)| c.unsupported.is_some()).map(|(k, c)| format!("{} ({})", site((k, c)), c.unsupported.unwrap_or_default())).collect();
-    if !failing.is_empty() {
-        eprintln!("build: BIOS calls that fail if they run:\n  {}", failing.join("\n  "));
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in calls.values() {
+        *counts.entry(c.support).or_default() += 1;
     }
-    eprintln!("build: {} BIOS calls, {} implemented", calls.len(), calls.len() - failing.len());
+    let summary: Vec<String> = ["working", "partial", "unsupported", "fatal", "noop", "unknown"]
+        .into_iter()
+        .filter_map(|s| counts.get(s).map(|n| format!("{n} {s}")))
+        .collect();
+    if summary.is_empty() {
+        eprintln!("build: 0 BIOS calls");
+    } else {
+        eprintln!("build: {} BIOS calls ({})", calls.len(), summary.join(", "));
+    }
+    let gaps: Vec<String> = calls.iter().filter(|(_, c)| matches!(c.support, "unsupported" | "unknown")).map(|(k, _)| k.clone()).collect();
+    if !gaps.is_empty() {
+        eprintln!("build: BIOS calls without working support: {}", gaps.join(", "));
+    }
+    let missing: Vec<String> =
+        calls.iter().filter(|(_, c)| !c.implemented).map(|(k, c)| format!("{k} {} at {}", c.name, c.sites.join(", "))).collect();
+    ensure!(missing.is_empty(), "translated code makes BIOS calls the runtime doesn't implement:\n  {}", missing.join("\n  "));
     Ok(())
+}
+
+/// The coverage a translated call reports: a non-constant function number is
+/// unknown, never working.
+fn call_support(table: u32, func: Option<u32>) -> psx_bios::bios::Support {
+    func.map_or(psx_bios::bios::Support::Unknown, |f| psx_bios::bios::support(table, f))
 }
 
 /// Instrument the guest with Asyncify over the functions that can be on
 /// the stack at a thread switch (D57; `psxw_link::asyncify`). Only
-/// `psx.bios` unwinds. Prints the scope's size.
+/// `psx.bios` and `psx.syscall` unwind. Prints the scope's size.
 fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>, debug: bool) -> Result<Vec<u8>> {
     let tool = if debug { psxw_inputs::toolchain::dwarf_binaryen(ws)? } else { ws.tool("binaryen", "bin/wasm-opt")? };
     let scope = psxw_link::asyncify::scope(wasm, switches)?;
@@ -1178,7 +1198,7 @@ fn asyncify(ws: &Workspace, dir: &Path, wasm: &[u8], switches: &BTreeSet<String>
         .args(FEATURES)
         .arg(&linked)
         .arg("--asyncify")
-        .arg(format!("--pass-arg=asyncify-imports@{}.{}", psxw_abi::psx::MODULE, psxw_abi::psx::BIOS))
+        .arg(format!("--pass-arg=asyncify-imports@{}", psxw_link::asyncify::IMPORTS))
         .arg(format!("--pass-arg=asyncify-onlylist@@{}", list_path.display()))
         .arg("-g")
         .arg("-o")
@@ -1197,4 +1217,21 @@ pub fn frame_counter(ws: &Workspace, game: &str, inputs: &psxw_lift::run::Inputs
     let expr = manifest.oracle.frame_counter.as_deref().with_context(|| format!("games/{game}/game.toml [oracle] frame_counter is unset"))?;
     let r = inputs.map.resolve(&inputs.map.main, expr).with_context(|| format!("[oracle] frame_counter {expr} does not resolve"))?;
     Ok(r.addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use psx_bios::bios::Support;
+
+    #[test]
+    fn bios_report_distinguishes_support_and_dynamic_calls() {
+        assert_eq!(call_support(0xA0, Some(0x1B)), Support::Working);
+        assert_eq!(call_support(0xA0, Some(0x9C)), Support::Partial);
+        assert_eq!(call_support(0xA0, Some(0x14)), Support::Unsupported);
+        assert_eq!(call_support(0xA0, Some(0x0B)), Support::Fatal);
+        assert_eq!(call_support(0xA0, Some(0x44)), Support::Noop);
+        assert_eq!(call_support(0xA0, None), Support::Unknown);
+        assert_eq!(call_support(0xA0, Some(0x00)), call_support(0xB0, Some(0x32)));
+    }
 }

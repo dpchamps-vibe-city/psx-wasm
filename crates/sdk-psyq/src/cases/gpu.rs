@@ -8,23 +8,24 @@
 //!   original (`GetDrawEnv`, `GetDispEnv`) and in the structs the adapters
 //!   write back (the RECT an image call clamps, a DRAWENV's DR_ENV packet,
 //!   a DISPENV's `pad0`, an ordering table).
-//! - **Time** (D71): the guest's budget after every call and every
-//!   vblank wait; the adapters spend their originals' instructions, so
-//!   the two sides agree at each. A case still lets a vblank pass after
-//!   heavy calls (ResetGraph's queue clear).
+//! - **Vblank alignment.** libgpu's own loops (ResetGraph's queue clear,
+//!   memcpy) spend virtual time on the device side, the adapters none
+//!   (`libgpu`'s module notes), so a case lets a vblank pass after heavy
+//!   calls, and keeps straight-line work between vblanks well under a
+//!   frame.
 //! - **Not observed:** `DMACallback(2, …)`'s result while libgpu's queue
 //!   pump is DMA2's callback (a stand-in address natively).
 //! - Before `ResetGraph` DPCR leaves DMA2 off (as after `ResetCallback`),
 //!   so a transfer waits, and `DrawSync(0)` runs into libgpu's timeout
 //!   (btn's boot does): the level-2 sequence covers it.
 
-use super::{Case, Harness, Rng, SCRATCH, observe_ram, timed as call, vblanks};
+use super::{Case, Harness, Rng, SCRATCH, call, observe_ram};
 
 pub fn cases() -> Vec<Case> {
     vec![
         Case { name: "gpu.reset-graph", chip: "gpu", level: 1, covers: &["ResetGraph"], needs: &["ResetGraph", "DrawSync", "GetDrawEnv", "GetDispEnv"], run: reset_graph },
         Case { name: "gpu.disp-mask", chip: "gpu", level: 1, covers: &["SetDispMask"], needs: &["ResetGraph", "SetDispMask", "GetDispEnv", "PutDispEnv"], run: disp_mask },
-        Case { name: "gpu.draw-sync", chip: "gpu", level: 1, covers: &["DrawSync", "libgpu/sys:0x23a8"], needs: &["ResetGraph", "DrawSync", "DrawSyncCallback", "ClearOTagR", "DrawOTag"], run: draw_sync },
+        Case { name: "gpu.draw-sync", chip: "gpu", level: 1, covers: &["DrawSync"], needs: &["ResetGraph", "DrawSync", "DrawSyncCallback", "ClearOTagR", "DrawOTag"], run: draw_sync },
         Case { name: "gpu.clear-image", chip: "gpu", level: 1, covers: &["ClearImage"], needs: &["ResetGraph", "DrawSync", "ClearImage"], run: clear_image },
         Case { name: "gpu.load-image", chip: "gpu", level: 1, covers: &["LoadImage"], needs: &["ResetGraph", "DrawSync", "LoadImage"], run: load_image },
         Case { name: "gpu.store-image", chip: "gpu", level: 1, covers: &["StoreImage"], needs: &["ResetGraph", "DrawSync", "StoreImage"], run: store_image },
@@ -146,7 +147,7 @@ fn fill(h: &mut dyn Harness, at: u32, len: u32, rng: &mut Rng) {
 /// ResetGraph(0) and a vblank: the device side's queue clear takes time.
 fn reset_graph0(h: &mut dyn Harness) -> Result<(), String> {
     call(h, "ResetGraph", &[0])?;
-    vblanks(h, 1)
+    h.vblanks(1)
 }
 
 /// A TILE at `p` with colour and place, linked into the table entry `e`.
@@ -165,7 +166,7 @@ fn reset_graph(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     for _ in 0..3 {
         let mode = [0, 1, 2, 3, 4, 5, 6, 7, 8, 0x13][rng.range(0, 10) as usize];
         call(h, "ResetGraph", &[mode])?;
-        vblanks(h, 1)?;
+        h.vblanks(1)?;
         call(h, "DrawSync", &[1])?;
         call(h, "GetDrawEnv", &[COPY])?;
         observe_ram(h, "GetDrawEnv", COPY, 0x5C);
@@ -185,7 +186,7 @@ fn disp_mask(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
         call(h, "SetDispMask", &[mask])?;
         call(h, "GetDispEnv", &[COPY])?;
         observe_ram(h, "GetDispEnv", COPY, 0x14);
-        vblanks(h, 1)?;
+        h.vblanks(1)?;
     }
     Ok(())
 }
@@ -346,7 +347,7 @@ fn disp_env(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     random_disp_env(h, ENV, rng);
     call(h, "PutDispEnv", &[ENV])?;
     observe_ram(h, "DISPENV", ENV, 0x14);
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     // The same again: nothing changes but the copy.
     call(h, "PutDispEnv", &[ENV])?;
     observe_ram(h, "DISPENV", ENV, 0x14);
@@ -357,7 +358,7 @@ fn disp_env(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     observe_ram(h, "DISPENV", ENV, 0x14);
     call(h, "GetDispEnv", &[COPY])?;
     observe_ram(h, "GetDispEnv", COPY, 0x14);
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     // A new one, and after SetDispMask(0) the same one in full.
     random_disp_env(h, ENV2, rng);
     call(h, "PutDispEnv", &[ENV2])?;
@@ -366,7 +367,7 @@ fn disp_env(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     call(h, "PutDispEnv", &[ENV2])?;
     observe_ram(h, "DISPENV", ENV2, 0x14);
     call(h, "SetDispMask", &[1])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     Ok(())
 }
 
@@ -380,14 +381,14 @@ fn reset_callback(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     let n = rng.range(1, 8);
     call(h, "ClearOTagR", &[OT, n])?;
     call(h, "DrawOTag", &[OT + 4 * (n - 1)])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     observe_ram(h, "callback word", state, 4);
     // MoveImage2 makes it DMA2's callback; its DMA's interrupt runs it.
     write_rect(h, RECT, 0, 0, 16, 16);
     call(h, "MoveImage2", &[RECT, 64, 64])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     call(h, "DrawOTag", &[OT + 4 * (n - 1)])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     observe_ram(h, "callback word", state, 4);
     call(h, "DrawSyncCallback", &[0])?;
     call(h, "DrawSync", &[0])?;
@@ -412,10 +413,10 @@ fn sequence(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     call(h, "DrawSync", &[1])?;
     call(h, "DrawSync", &[0])?;
     call(h, "DrawSync", &[1])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     // Up.
     call(h, "ResetGraph", &[0])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     call(h, "SetGraphDebug", &[0])?;
     write_rect(h, ENV, 0, 0, 320, 240);
     h.write(ENV + 8, &[0; 12]);
@@ -426,7 +427,7 @@ fn sequence(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     h.write(ENV2 + 22, &[1, 0, 1, 0x20, 0x40, 0x80]);
     call(h, "PutDrawEnv", &[ENV2])?;
     call(h, "SetDispMask", &[1])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     // The queue, with a DrawSync callback: every call queues, the pump
     // runs it at once, and the callback when it drains.
     call(h, "DrawSyncCallback", &[cb])?;
@@ -456,7 +457,7 @@ fn sequence(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     call(h, "GetDrawEnv", &[COPY])?;
     observe_ram(h, "GetDrawEnv", COPY, 0x5C);
     observe_ram(h, "callback word", state, 4);
-    vblanks(h, 2)?;
+    h.vblanks(2)?;
     call(h, "GetODE", &[])?;
     // Past the queue: MoveImage2 makes _GPU_ResetCallback DMA2's callback,
     // which puts the pump back.
@@ -464,22 +465,22 @@ fn sequence(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
     call(h, "DrawSync", &[0])?;
     write_rect(h, RECT, 0, 0, 32, 32);
     call(h, "MoveImage2", &[RECT, 512, 256])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     call(h, "DrawOTag", &[OT + 28])?;
     call(h, "DrawSync", &[0])?;
     call(h, "SetDispMask", &[0])?;
     call(h, "GetDispEnv", &[COPY])?;
     observe_ram(h, "GetDispEnv", COPY, 0x14);
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     // The lesser resets.
     for mode in [1, 3, 5] {
         call(h, "ResetGraph", &[mode])?;
-        vblanks(h, 1)?;
+        h.vblanks(1)?;
         call(h, "DrawSync", &[1])?;
     }
     call(h, "PutDispEnv", &[ENV])?;
     call(h, "SetDispMask", &[1])?;
-    vblanks(h, 1)?;
+    h.vblanks(1)?;
     observe_ram(h, "callback word at the end", state, 4);
     Ok(())
 }
@@ -496,7 +497,7 @@ fn field(h: &mut dyn Harness, rng: &mut Rng) -> Result<(), String> {
         h.write(ENV + 16, &[inter, 0, 0, 0]);
         call(h, "PutDispEnv", &[ENV])?;
         for _ in 0..3 {
-            vblanks(h, rng.range(1, 3))?;
+            h.vblanks(rng.range(1, 3))?;
             call(h, "GetODE", &[])?;
         }
     }

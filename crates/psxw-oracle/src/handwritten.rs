@@ -224,7 +224,6 @@ fn bios() -> Vec<Handwritten> {
     let call = |name, func, args, setup, captures| bios_call(name, 0xA0, func, args, setup, captures);
     let timer = |name, func, args| bios_call(name, 0xB0, func, args, vec![], vec![]);
     let text = |t: &[u8]| vec![(s, t.to_vec()), (s + 0x20, vec![0xEE; 4])];
-    let file = |name, func, args, t: &[u8]| bios_call(name, 0xB0, func, args, if t.is_empty() { vec![] } else { vec![(s, t.to_vec())] }, vec![]);
     vec![
         call("bios_strlen", 0x1B, [s, 0, 0, 0], vec![(s, b"psx-wasm device oracle\0".to_vec())], vec![]),
         call("bios_toupper", 0x25, [b'q' as u32, 0, 0, 0], vec![], vec![]),
@@ -272,27 +271,6 @@ fn bios() -> Vec<Handwritten> {
         // The GPU, idle: a NOP word, and the sync.
         call("bios_gpu_cw", 0x49, [0, 0, 0, 0], vec![], vec![]),
         call("bios_gpu_sync", 0x4E, [0, 0, 0, 0], vec![], vec![]),
-        // Files and devices (phase 3 task 9): what fails without touching a
-        // device, so the runner's BIOS keeps no state from it. fd 5 is
-        // unused, "nodev" no device. (GetB0Table and GetC0Table have no
-        // vectors: OpenBIOS stops unless the caller is a patch it knows.)
-        file("bios_open_no_device", 0x32, [s, 1, 0, 0], b"nodev:x\0"),
-        call("bios_open_no_device_a0", 0x00, [s, 1, 0, 0], text(b"nodev:x\0"), vec![]),
-        file("bios_lseek_unused", 0x33, [5, 0, 0, 0], b""),
-        file("bios_read_unused", 0x34, [5, s, 0x800, 0], b""),
-        file("bios_write_unused", 0x35, [5, s, 1, 0], b"x"),
-        file("bios_close_unused", 0x36, [5, 0, 0, 0], b""),
-        file("bios_ioctl_unused", 0x37, [5, 0, 0, 0], b""),
-        file("bios_isatty_stdout", 0x39, [1, 0, 0, 0], b""),
-        file("bios_getc_unused", 0x3A, [5, 0, 0, 0], b""),
-        file("bios_format_no_device", 0x41, [s, 0, 0, 0], b"nodev:\0"),
-        file("bios_firstfile_no_device", 0x42, [s, s + 0x40, 0, 0], b"nodev:*\0"),
-        file("bios_rename_no_device", 0x44, [s, s + 0x10, 0, 0], b"nodev:a\0\0\0\0\0\0\0\0\0nodev:b\0"),
-        file("bios_erase_no_device", 0x45, [s, 0, 0, 0], b"nodev:x\0"),
-        file("bios_deldrv_unknown", 0x48, [s, 0, 0, 0], b"nodev\0"),
-        // The CD-ROM driver's handlers acknowledge their interrupts after
-        // the boot's _96_init.
-        call("bios_set_cdrom_irq_auto_abort", 0x9E, [0, 1, 0, 0], vec![], vec![]),
     ]
 }
 

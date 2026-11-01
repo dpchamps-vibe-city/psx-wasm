@@ -248,6 +248,20 @@ pub struct Object {
 
 #[cfg(test)]
 mod tests {
+    /// Divisions by a non-literal are rewritten in place, nested ones
+    /// inside their operands, on the lines they took; a literal divisor
+    /// stays, and so does a compound assignment whose left side isn't a
+    /// plain variable (rewriting it would evaluate that side twice).
+    #[test]
+    fn divisions() {
+        let src = "int f(int a, int b, int *p, int i, int arr[4]) {\n  a /= b;\n  *p++ /= b;\n  arr[i] /= b;\n  return a\n    / b + a / 4 + (a / b) % b + a / b / b;\n}\n";
+        let text = crate::edit::apply(src, super::divisions(&super::parse(src)));
+        assert_eq!(text.lines().count(), src.lines().count());
+        assert!(text.contains("  a = __builtin_choose_expr(__builtin_constant_p(b)"), "{text}");
+        assert!(text.contains("*p++ /= b;") && text.contains("arr[i] /= b;") && text.contains(" + a / 4 + "), "{text}");
+        assert!(text.contains("__psxw_rem_s(((__builtin_choose_expr(") && !text.contains("a / b"), "{text}");
+    }
+
     /// Every loop body starts with a barrier, a body that isn't a block
     /// becoming one; a label only a later `goto` reaches is a loop head;
     /// `do { } while (0)` isn't a loop.
@@ -262,19 +276,6 @@ mod tests {
         assert!(text.contains(&format!("do {{ {b} g--; }} while (g);")), "{text}");
         assert!(text.contains(&format!("back:\n  {b} if (g)")), "{text}");
         assert_eq!(text.lines().count(), src.lines().count());
-    }
-
-    /// Divisions by a non-literal are rewritten in place, nested ones
-    /// inside their operands, on the lines they took; a literal divisor
-    /// and a compound assignment whose left side has side effects stay.
-    #[test]
-    fn divisions() {
-        let src = "int f(int a, int b, int *p) {\n  a /= b;\n  *p++ /= b;\n  return a\n    / b + a / 4 + (a / b) % b;\n}\n";
-        let text = crate::edit::apply(src, super::divisions(&super::parse(src)));
-        assert_eq!(text.lines().count(), src.lines().count());
-        assert!(text.contains("  a = __builtin_choose_expr(__builtin_constant_p(b)"), "{text}");
-        assert!(text.contains("*p++ /= b;") && text.contains(" + a / 4 + "), "{text}");
-        assert!(text.contains("__psxw_rem_s(((__builtin_choose_expr(") && !text.contains("a / b"), "{text}");
     }
 
     #[test]
@@ -405,8 +406,9 @@ pub fn loop_barriers(ast: &Ast) -> Vec<crate::edit::Edit> {
 /// divisors, floating-point and 64-bit divisions as they are, so constant
 /// expressions stay constant. The operands appear several times (all but
 /// one unevaluated), on one line; the lines they took follow, so the TU
-/// keeps its line count. A compound assignment whose left side has side
-/// effects is left as it is.
+/// keeps its line count. A compound assignment is rewritten only when its
+/// left side is a plain variable: `E op= X` evaluates `E` once, while
+/// `E = E op X` evaluates it twice.
 pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
     use crate::edit::Edit;
     /// No identifier outside `sizeof`: a literal, a cast of one, and so on.
@@ -420,14 +422,12 @@ pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
             }
         }
     }
-    fn side_effects(n: Node) -> bool {
-        matches!(n.kind(), "call_expression" | "update_expression" | "assignment_expression") || {
-            let mut c = n.walk();
-            n.named_children(&mut c).any(side_effects)
-        }
-    }
     /// `n` as C with its divisions rewritten, on one line.
     fn text(ast: &Ast, n: Node) -> String {
+        // An operand can itself be a division without parentheses (a/b/c).
+        if let Some(t) = division(ast, n) {
+            return t;
+        }
         fn splice(ast: &Ast, n: Node, s: &mut String, pos: &mut usize) {
             let mut c = n.walk();
             for k in n.named_children(&mut c) {
@@ -458,7 +458,7 @@ pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
             "%" => "rem",
             _ => return None,
         };
-        if literal(r) || (compound && side_effects(l)) {
+        if literal(r) || (compound && l.kind() != "identifier") {
             return None;
         }
         let (a, b) = (text(ast, l), text(ast, r));

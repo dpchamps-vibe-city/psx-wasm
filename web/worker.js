@@ -13,7 +13,8 @@
 //   turn: Chromium frees the frames posted to the page only there (without
 //   it, memory grows by a frame a vblank until the GPU process dies), and
 //   context-loss events land there;
-// - the disc: a .cue/.bin image in OPFS (`disc/`), sync access handles;
+// - the disc: a .cue/.bin image in this bundle's OPFS directory (`disc-<id>/`),
+//   sync access handles;
 // - pads: the main thread's SharedArrayBuffer, or a replay file;
 // - storage (memory cards): files in OPFS `saves/` (cards.js), loaded at
 //   start; each card the game changes goes to the page, which writes it;
@@ -52,7 +53,7 @@
 //   run's log lines; they come back in the `hashes` message, in the
 //   native host's shapes.
 //
-// Messages in: {type: "start", cue, padBuffer, audioRing, modBuffer, options},
+// Messages in: {type: "start", cue, discDir, padBuffer, audioRing, modBuffer, options},
 // {type: "execute", id, address, args} (one call, at a borrow-free boundary),
 // {type: "cmd", id, name, args}, {type: "load", id, url, reload}.
 // Messages out: {type: "status"|"report"|"log"|"frame"|"save"|"replay"|"hashes"|"mods"|"scripting-ready"|"execute-result"|"cmd-result"|"load-result"|"stopped", ...}.
@@ -63,7 +64,7 @@ import { loadSaves, savesDir } from "./cards.js";
 import { ModLoader, takeMod } from "./mods.js";
 import { Calls, ScriptHost, mod } from "./script.js";
 
-const ABI_VERSION = 16;
+const ABI_VERSION = 18;
 const NOTHING_PRESSED = 0xffff;
 /** How far ahead of the vblanks a recorded counter may be (see `pad_state`). */
 const RECORD_AHEAD = 1 << 20;
@@ -592,6 +593,7 @@ async function run({ cue, discDir: discName, padBuffer, audioRing, modBuffer, op
         exports,
         loader,
         snapshot,
+        windowBase,
         calls,
         log: (line) => logLine(1, line),
         status: (t) => postMessage({ type: "status", text: t }),

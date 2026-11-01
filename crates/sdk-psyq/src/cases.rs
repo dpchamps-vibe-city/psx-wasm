@@ -61,10 +61,10 @@ pub trait Harness {
     fn plug_port2(&mut self, _plugged: bool) -> Result<(), String> {
         Err("this harness can't change the pads".into())
     }
-    /// The guest's safepoint budget left (psxw-abi `guest::BUDGET_GET`):
-    /// what the original's instructions spend, observable as time (D60,
-    /// D63, D71). 0 where the build has none.
-    fn budget(&mut self) -> i32 {
+    /// The guest's safepoint budget left (loop-header passes before the
+    /// next safepoint): what the original's loops spend, observable as
+    /// time (D60, D63). 0 where the build has none.
+    fn budget(&mut self) -> u32 {
         0
     }
     /// A data symbol's address in the game, where its symbols name it.
@@ -117,27 +117,6 @@ pub fn call(h: &mut dyn Harness, name: &str, args: &[u32]) -> Result<u32, String
     let shown: Vec<String> = args.iter().map(|a| format!("{a:#x}")).collect();
     h.observe(&format!("{name}({})", shown.join(", ")), format!("{v:#x}"));
     Ok(v)
-}
-
-/// Record the guest's budget left: the original's instructions so far, the
-/// interrupts' among them (D71).
-pub fn budget(h: &mut dyn Harness, what: &str) {
-    let b = h.budget();
-    h.observe(&format!("{what}: budget"), b.to_string());
-}
-
-/// [`call`], and the budget after it.
-pub fn timed(h: &mut dyn Harness, name: &str, args: &[u32]) -> Result<u32, String> {
-    let v = call(h, name, args)?;
-    budget(h, name);
-    Ok(v)
-}
-
-/// Let `n` vblanks pass, and record the budget.
-pub fn vblanks(h: &mut dyn Harness, n: u32) -> Result<(), String> {
-    h.vblanks(n)?;
-    budget(h, &format!("{n} vblanks"));
-    Ok(())
 }
 
 /// Record `len` bytes at `addr`, in hex.

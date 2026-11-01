@@ -30,12 +30,13 @@ fn le(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
-/// The `BOOT` line's argument: what follows the file name after a space or
-/// tab, at most 7Fh characters (OpenBIOS `findStringItem`).
-fn boot_argument(text: &str) -> String {
+/// The BOOT line's argument, after the executable name. The kernel's
+/// buffer has 80h bytes including its terminator.
+fn boot_argument(text: &str) -> Vec<u8> {
     let line = text.lines().find_map(|l| l.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("BOOT")).map(|(_, v)| v));
     let v = line.unwrap_or("").trim_start();
-    v.split_once([' ', '\t']).map_or("", |(_, arg)| arg).trim_end_matches(['\r', '\n']).chars().take(0x7F).collect()
+    let arg = v.split_once([' ', '\t']).map_or("", |(_, arg)| arg).trim_end_matches(['\r', '\n']);
+    arg.bytes().take(0x7F).chain([0]).collect()
 }
 
 /// `KEY = VALUE` lines.
@@ -79,19 +80,17 @@ pub fn load<S: Sdk>(m: &mut Machine<S>) -> Result<Boot, String> {
     let sp = stack.filter(|&s| s != 0).unwrap_or(0x801F_FF00);
     m.regs.set_sp(sp);
     m.regs.set_gp(gp0);
-    // The kernel's variable for the BOOT line's argument (psx-spx).
-    let mut arg = boot_argument(&text).into_bytes();
-    arg.push(0);
-    m.mem.write(psxw_abi::kernel::BOOT_ARGUMENT, &arg);
+    m.mem.write(psxw_abi::kernel::BOOT_ARGUMENT, &boot_argument(&text));
     // The kernel's event blocks live in its RAM (D68).
     m.lay_out_events(events);
     // The kernel's thread tables live in guest RAM (D57).
     m.lay_out_threads(tcbs);
     // The CD controller, for SDK code that drives the drive (D58).
     m.cdc_insert();
-    // The BIOS's CD-ROM driver as its boot leaves it (`_96_init`: its
-    // handlers, events and interrupts), with the path table the boot read.
-    m.cd_install();
-    m.cd_boot();
+    // Boot leaves the BIOS CD services installed. ResetCallback removes
+    // their events before libcd takes over the same native drive.
+    if m.cd_init() == u32::MAX {
+        return Err("not enough event blocks for the BIOS CD services".into());
+    }
     Ok(Boot { exe, pc0, gp0, t_addr, t_size, b_addr, b_size, sp, events, text_hash: fnv(body) })
 }

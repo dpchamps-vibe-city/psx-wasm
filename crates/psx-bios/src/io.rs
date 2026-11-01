@@ -187,7 +187,8 @@ impl<S: Sdk> Machine<S> {
             self.spu_run();
         }
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
-        io.sio0.update(sio, &mut io.irq);
+        let cards = &mut self.kernel.cards.slots;
+        io.sio0.update(sio, &mut io.irq, cards);
         let v = if SPU.contains(&addr) {
             let off = addr - SPU.start;
             let half = |o: u32| io.spu.spu.read(o) as u32;
@@ -201,7 +202,7 @@ impl<S: Sdk> Machine<S> {
             // Wider reads (the data FIFO's halfwords) take bytes in turn.
             (0..size.min(4)).fold(0, |v, i| v | (io.cdc.read(addr) as u32) << (8 * i))
         } else if Sio0::handles(addr) {
-            io.sio0.read(addr, sio, &mut io.irq)
+            io.sio0.read(addr, sio, &mut io.irq, cards)
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
             let now = if n == 2 { sio } else { now };
@@ -264,7 +265,8 @@ impl<S: Sdk> Machine<S> {
         }
         self.sio0_cards(addr, v);
         let Some(io) = self.io.as_mut() else { return Err(no_bus(addr)) };
-        io.sio0.update(sio, &mut io.irq);
+        let cards = &mut self.kernel.cards.slots;
+        io.sio0.update(sio, &mut io.irq, cards);
         let v = v & mask(size);
         if SPU.contains(&addr) {
             let off = addr - SPU.start;
@@ -303,7 +305,7 @@ impl<S: Sdk> Machine<S> {
             io.cdc.write(addr, v as u8, now);
             self.cdc_sync();
         } else if Sio0::handles(addr) {
-            io.sio0.write(addr, size, v, sio, &mut io.irq);
+            io.sio0.write(addr, size, v, sio, &mut io.irq, cards);
         } else if TIMERS.contains(&addr) {
             let n = ((addr - TIMERS.start) >> 4) as usize;
             let now = if n == 2 { sio } else { now };
@@ -360,33 +362,83 @@ impl<S: Sdk> Machine<S> {
         }
     }
 
+    /// A GP1 command to the GPU core (the BIOS's `SendGP1Command`,
+    /// A0h:48h). The GPU is reached only when the device bus is present.
+    pub fn gp1(&mut self, word: u32) -> Result<(), String> {
+        let (now, video) = (self.clock.now, self.clock.video);
+        let io = self.io.as_mut().ok_or_else(no_gpu)?;
+        io.gpu.gp1(word);
+        // Root counter 0's dot clock runs at the display's width.
+        if self.timers[0].set_display_mode(0, io.gpu.display().mode, video, now) {
+            self.reschedule_timer(0);
+        }
+        Ok(())
+    }
+
+    /// GPUSTAT from the GPU core (`GetGPUStatus`, A0h:4Dh) at the clock's
+    /// cycle and video standard.
+    pub fn gpu_status(&mut self) -> Result<u32, String> {
+        let (now, video) = (self.clock.now, self.clock.video);
+        Ok(self.io.as_mut().ok_or_else(no_gpu)?.gpu.status(now, video))
+    }
+
+    /// GPU DMA channel 2 for the BIOS's `gpu_send_dma` and
+    /// `send_gpu_linked_list` (A0h:47h, 4Bh): the channel programmed and
+    /// run through the shared controller, so its completion (DICR's flag,
+    /// IRQ3) is the device's. Transfers complete at once in virtual time.
+    pub fn gpu_dma(&mut self, src: u32, bcr: u32, chcr: u32, clear_dicr: bool) -> Result<(), String> {
+        let io = self.io.as_mut().ok_or_else(no_gpu)?;
+        io.dma.madr[dma::GPU] = src & 0x00FF_FFFF;
+        io.dma.bcr[dma::GPU] = bcr;
+        io.dma.chcr[dma::GPU] = chcr;
+        // GPU's nibble in DPCR: bit 3 enables channel 2.
+        io.dma.dpcr |= 0x800;
+        if clear_dicr {
+            io.dma.dicr = 0;
+        }
+        self.run_dma()
+    }
+
+    /// `gpu_abort_dma` (A0h:4Ch): channel 2 stopped, then GP1(04h),
+    /// (02h) and (01h).
+    pub fn gpu_abort_dma(&mut self) -> Result<(), String> {
+        let io = self.io.as_mut().ok_or_else(no_gpu)?;
+        // 401h: from RAM, linked-list mode, stopped (psx-spx's write).
+        io.dma.chcr[dma::GPU] = 0x401;
+        io.gpu.gp1(0x0400_0000);
+        io.gpu.gp1(0x0200_0000);
+        io.gpu.gp1(0x0100_0000);
+        Ok(())
+    }
+
+    /// `gpu_sync` (A0h:4Eh): wait for the GPU (and GPU DMA) to be ready,
+    /// then turn DMA direction off. The front end takes words at once and
+    /// GPU DMA ends at once, so each wait holds already or never ends:
+    /// the BIOS's timeout (-1) where it has one, an error where it hasn't.
+    pub fn gpu_sync(&mut self) -> Result<u32, String> {
+        let s = self.gpu_status()?;
+        if s & 0x6000_0000 == 0 {
+            return Ok(if s & 1 << 28 != 0 { 0 } else { u32::MAX });
+        }
+        let busy = self.io.as_ref().is_some_and(|io| io.dma.chcr[dma::GPU] & dma::CHCR_BUSY != 0);
+        if busy {
+            return Ok(u32::MAX);
+        }
+        if s & 1 << 28 == 0 {
+            return Err("GPUSTAT bit 28 stays clear (a polygon or line is half sent): gpu_sync waits forever".into());
+        }
+        self.gp1(0x0400_0000)?;
+        Ok(0)
+    }
+
     /// Run every DMA channel that is ready, and whose device can serve it:
     /// MDEC output waits (as its request line does) while a decode is
     /// still taking input and hasn't produced the words asked for.
     fn run_dma(&mut self) -> Result<(), String> {
-        self.run_ready_dma(false)
-    }
-
-    /// The same for an adapter (D64): each completion held
-    /// ([`Self::dma_done_held`]). A channel its device was holding back
-    /// (DMA1 while the MDEC decodes) goes once the adapter has fed it.
-    pub fn run_dma_held(&mut self) -> Result<(), String> {
-        self.run_ready_dma(true)
-    }
-
-    /// An adapter starts channel `ch` with `chcr`, as the original's
-    /// register write does, its completion held.
-    pub fn dma_start_held(&mut self, ch: usize, chcr: u32) -> Result<(), String> {
-        let io = self.io.as_mut().ok_or_else(|| no_bus(psx_devices::dma::BASE + 0x10 * ch as u32 + 8))?;
-        io.dma.write(psx_devices::dma::BASE + 0x10 * ch as u32 + 8, 4, chcr);
-        self.run_dma_held()
-    }
-
-    fn run_ready_dma(&mut self, held: bool) -> Result<(), String> {
         let waits = |io: &Io, ch: usize| ch == DMA_MDEC_OUT && io.mdec.busy() && io.mdec.available() < io.dma.words(ch) as usize;
         while let Some(ch) = self.io.as_ref().and_then(|io| (0..7).find(|&c| io.dma.ready(c) && !waits(io, c))) {
             self.dma_transfer(ch)?;
-            if held { self.dma_done_held(ch) } else { self.dma_done(ch) }
+            self.dma_done(ch);
         }
         Ok(())
     }
@@ -784,12 +836,8 @@ impl<S: Sdk> Machine<S> {
     pub fn queue_irq_chains(&mut self) {
         for prio in 0..4u32 {
             for h in self.chain(prio) {
-                // The kernel's own elements, and those the adapters run,
-                // are steps in their places in the chain.
-                if let Some(k) = self.kernel_element_at(h) {
-                    self.irq_calls.push_back(IrqStep::Kernel(k));
-                    continue;
-                }
+                // SDK-owned dispatcher steps retain their own seam. Native
+                // kernel elements use the RAM pointers below, just like guests.
                 if let Some(s) = S::chain_element(self, h) {
                     self.irq_calls.push_back(IrqStep::Sdk(s));
                     continue;
@@ -846,6 +894,10 @@ fn no_bus(addr: u32) -> String {
     format!("guest access to I/O register {addr:#010x}; this function needs an adapter")
 }
 
+fn no_gpu() -> String {
+    "the GPU is not on the bus; this function needs an adapter".into()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::machine::{GuestCall, IrqStep};
@@ -863,13 +915,15 @@ mod tests {
         m.enq_int_rp(2, 0x8000_1000);
         m.raise_irq(psx_devices::irq::VBLANK);
         assert_eq!(m.io_read(0x1F80_1070, 4).unwrap(), 1);
-        // The kernel's syscall element (priority 0), its root counter and
-        // vblank elements (1), the element (2), the kernel's IRQ events
-        // (3).
+        // The kernel's root counter and vblank elements (priority 1), the
+        // element (2), the kernel's IRQ events (3).
         let steps: Vec<IrqStep> = m.irq_calls.drain(..).collect();
         let chain = IrqStep::Chain(GuestCall { addr: 0x8000_2000, args: [0; 4] }, Some(0x8000_3000));
-        use IrqStep::Kernel;
-        assert_eq!(steps, [Kernel(6), Kernel(3), Kernel(2), Kernel(1), Kernel(0), chain, Kernel(4), IrqStep::Exit]);
+        let native = |i: u32| {
+            let a = psxw_abi::KERNEL_STAND_INS.start + 8 * i;
+            IrqStep::Chain(GuestCall { addr: a, args: [0; 4] }, (i < 4).then_some(a + 4))
+        };
+        assert_eq!(steps, [native(3), native(2), native(1), native(0), chain, native(4), IrqStep::Exit]);
         m.io_write(0x1F80_1070, 4, !1).unwrap();
         assert_eq!(m.io_read(0x1F80_1070, 2).unwrap(), 0);
         // The SPU: main volume left reads back; the CD controller's status
@@ -904,7 +958,7 @@ mod tests {
         crate::bios::call(&mut m, 0xC0, 0x02, [2, kernel, 0, 0]).unwrap();
         m.raise_irq(psx_devices::irq::VBLANK);
         let verifiers: Vec<u32> = m.irq_calls.drain(..).filter_map(|s| if let IrqStep::Chain(c, _) = s { Some(c.addr) } else { None }).collect();
-        assert_eq!(verifiers, [0x8000_2000, 0x8000_2100]);
+        assert_eq!(verifiers, [0xBFC0_8018, 0xBFC0_8010, 0xBFC0_8008, 0xBFC0_8000, 0x8000_2000, 0x8000_2100, 0xBFC0_8020]);
         assert!(matches!(crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]), Ok(crate::Flow::Return(v)) if v as u32 == linked));
         assert_eq!(m.chain(2), [kernel]);
         assert!(matches!(crate::bios::call(&mut m, 0xC0, 0x03, [2, linked, 0, 0]), Ok(crate::Flow::Return(0))), "not there: 0");

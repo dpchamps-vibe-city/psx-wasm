@@ -5,15 +5,17 @@
 
 use crate::kernel;
 use crate::libc;
-use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait, seq};
-use crate::{files, tables};
-use psx_devices::{cd, dma};
+use crate::machine::{Flow, GuestCall, Machine, Sdk, Wait};
+use crate::{files, loader, tables, threads};
+use psx_devices::cd;
+use psxw_abi::kernel as k;
 
 /// The BIOS's own copy routines run byte by byte; lengths are bounded so a
 /// wild argument can't spin for minutes.
 pub(crate) const MAX_LEN: u32 = 0x0020_0000;
 
 pub fn name(table: u32, func: u32) -> &'static str {
+    let (table, func) = tables::canonical(table, func);
     match (table, func) {
         (0xA0, 0x0A) => "todigit",
         (0xA0, 0x0B) => "atof",
@@ -64,10 +66,12 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x38) => "realloc",
         (0xA0, 0x39) => "InitHeap",
         (0xA0, 0x3F) => "printf",
+        (0xA0, 0x40) => "SystemErrorUnresolvedException",
+        (0xA0, 0x41) => "LoadTest",
+        (0xA0, 0x42) => "Load",
         (0xA0, 0x43) => "Exec",
-        (0xA0, 0x45) => "init_a0_b0_c0_vectors",
-        (0xA0, 0x51) => "LoadExec",
         (0xA0, 0x44) => "FlushCache",
+        (0xA0, 0x45) => "init_a0_b0_c0_vectors",
         (0xA0, 0x46) => "GPU_dw",
         (0xA0, 0x47) => "gpu_send_dma",
         (0xA0, 0x48) => "SendGP1Command",
@@ -80,11 +84,7 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x54) => "_96_init",
         (0xA0, 0x55) => "_bu_init",
         (0xA0, 0x56) => "_96_remove",
-        (0xA0, 0x9F) => "SetMemSize",
-        (0xA0, 0x3A) => "_exit",
-        (0xA0, 0x40) => "SystemErrorUnresolvedException",
-        (0xA0, 0x4F) | (0xA0, 0x50) | (0xA0, 0x53) | (0xA0, 0x9A) | (0xA0, 0x9B) | (0xA0, 0xA1) => "SystemError",
-        (0xA0, 0x57..=0x5A) | (0xA0, 0x73..=0x77) | (0xA0, 0x79..=0x7B) | (0xA0, 0x7D) | (0xA0, 0x7F) | (0xA0, 0x80) | (0xA0, 0x82..=0x8F) | (0xA0, 0xB0) | (0xA0, 0xB1) | (0xA0, 0xB3) => "return 0",
+        (0xA0, 0x57) => "dev_null",
         (0xA0, 0x5B) => "dev_tty_init",
         (0xA0, 0x5C) => "dev_tty_open",
         (0xA0, 0x5D) => "dev_tty_in_out",
@@ -95,42 +95,42 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xA0, 0x62) => "dev_cd_firstfile",
         (0xA0, 0x63) => "dev_cd_nextfile",
         (0xA0, 0x64) => "dev_cd_chdir",
-        (0xA0, 0x65) => "dev_card_open",
-        (0xA0, 0x66) => "dev_card_read",
-        (0xA0, 0x67) => "dev_card_write",
-        (0xA0, 0x68) => "dev_card_close",
-        (0xA0, 0x69) => "dev_card_firstfile",
-        (0xA0, 0x6A) => "dev_card_nextfile",
-        (0xA0, 0x6B) => "dev_card_erase",
-        (0xA0, 0x6C) => "dev_card_undelete",
-        (0xA0, 0x6D) => "dev_card_format",
-        (0xA0, 0x6E) => "dev_card_rename",
-        (0xA0, 0x6F) => "card_clear_error",
         (0xA0, 0x78) => "CdAsyncSeekL",
         (0xA0, 0x7C) => "CdAsyncGetStatus",
         (0xA0, 0x7E) => "CdAsyncReadSector",
         (0xA0, 0x81) => "CdAsyncSetMode",
-        (0xA0, 0x90) => "CdromIoIrqFunc1",
-        (0xA0, 0x91) => "CdromDmaIrqFunc1",
-        (0xA0, 0x92) => "CdromIoIrqFunc2",
-        (0xA0, 0x93) => "CdromDmaIrqFunc2",
         (0xA0, 0x94) => "CdromGetInt5errCode",
         (0xA0, 0x95) => "CdInitSubFunc",
-        (0xA0, 0x96) => "AddCDROMDevice",
-        (0xA0, 0x97) => "AddMemCardDevice",
-        (0xA0, 0x98) => "AddDuartTtyDevice",
-        (0xA0, 0x99) => "add_nullcon_driver",
-        (0xA0, 0x9E) => "SetCdromIrqAutoAbort",
-        (0xA0, 0xA0) => "_boot",
-        (0xA0, 0xA2) => "EnqueueCdIntr",
-        (0xA0, 0xA3) => "DequeueCdIntr",
         (0xA0, 0xA4) => "CdGetLbn",
         (0xA0, 0xA5) => "CdReadSector",
         (0xA0, 0xA6) => "CdGetStatus",
-        (0xA0, 0xB5..=0xBF) => "jump_to_00000000h",
+        (0xA0, 0x65) => "dev_bu_open",
+        (0xA0, 0x66) => "dev_bu_read",
+        (0xA0, 0x67) => "dev_bu_write",
+        (0xA0, 0x68) => "dev_bu_close",
+        (0xA0, 0x69) => "dev_bu_firstfile",
+        (0xA0, 0x6A) => "dev_bu_nextfile",
+        (0xA0, 0x6B) => "dev_bu_erase",
+        (0xA0, 0x6C) => "dev_bu_undelete",
+        (0xA0, 0x6D) => "dev_bu_format",
+        (0xA0, 0x6E) => "dev_bu_rename",
+        (0xA0, 0x96) => "AddCdromDevice",
+        (0xA0, 0x97) => "AddMemCardDevice",
+        (0xA0, 0x98) => "AddDuartTtyDevice",
+        (0xA0, 0x99) => "AddNullConDevice",
+        (0xA0, 0x9C) => "SetConf",
+        (0xA0, 0x9D) => "GetConf",
+        (0xA0, 0x9F) => "SetMem",
+        (0xA0, 0xA1) => "SystemError",
+        (0xA0, 0xB4) => "GetSystemInfo",
         (0xA0, 0xAB) => "_card_info",
         (0xA0, 0xAC) => "_card_load",
         (0xA0, 0xAD) => "_card_auto",
+        (0xA0, 0xA7) => "bufs_cb_0",
+        (0xA0, 0xA8) => "bufs_cb_1",
+        (0xA0, 0xA9) => "bufs_cb_2",
+        (0xA0, 0xAA) => "bufs_cb_3",
+        (0xA0, 0xAE) => "bufs_cb_4",
         (0xA0, 0xAF) => "card_write_test",
         (0xB0, 0x00) => "alloc_kernel_memory",
         (0xB0, 0x01) => "free_kernel_memory",
@@ -164,27 +164,23 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x35) => "write",
         (0xB0, 0x36) => "close",
         (0xB0, 0x37) => "ioctl",
-        (0xB0, 0x38) => "exit",
         (0xB0, 0x39) => "isatty",
         (0xB0, 0x3A) => "getc",
         (0xB0, 0x3B) => "putc",
         (0xB0, 0x3C) => "getchar",
         (0xB0, 0x3D) => "putchar",
         (0xB0, 0x3E) => "gets",
-        (0xB0, 0x40) => "cd",
-        (0xB0, 0x47) => "AddDrv",
-        (0xB0, 0x48) => "DelDrv",
-        (0xB0, 0x49) => "PrintInstalledDevices",
-        (0xB0, 0x59) => "testdevice",
-        (0xB0, 0x1A..=0x1F) | (0xB0, 0x21..=0x23) | (0xB0, 0x2A) | (0xB0, 0x2B) | (0xB0, 0x52) | (0xB0, 0x5A) => "SystemError",
-        (0xB0, 0x11) | (0xB0, 0x24..=0x29) | (0xB0, 0x2C..=0x31) | (0xB0, 0x5E..=0xFF) => "jump_to_00000000h",
         (0xB0, 0x3F) => "puts",
+        (0xB0, 0x40) => "cd",
         (0xB0, 0x41) => "format",
         (0xB0, 0x42) => "firstfile",
         (0xB0, 0x43) => "nextfile",
         (0xB0, 0x44) => "rename",
         (0xB0, 0x45) => "erase",
         (0xB0, 0x46) => "undelete",
+        (0xB0, 0x47) => "AddDrv",
+        (0xB0, 0x48) => "DelDrv",
+        (0xB0, 0x49) => "PrintInstalledDevices",
         (0xB0, 0x4A) => "InitCard",
         (0xB0, 0x4B) => "StartCard",
         (0xB0, 0x4C) => "StopCard",
@@ -197,47 +193,107 @@ pub fn name(table: u32, func: u32) -> &'static str {
         (0xB0, 0x54) => "_get_errno",
         (0xB0, 0x55) => "_get_error",
         (0xB0, 0x5B) => "ChangeClearPad",
+        (0xB0, 0x4D) => "_card_info_subfunc",
+        (0xB0, 0x58) => "_card_chan",
         (0xB0, 0x5C) => "_card_status",
         (0xB0, 0x5D) => "_card_wait",
+        (0xB0, 0x59) => "testdevice",
         (0xC0, 0x00) => "EnqueueTimerAndVblankIrqs",
-        (0xC0, 0x01) => "EnqueueSyscallHandler",
+        (0xC0, 0x0C) => "InitDefInt",
         (0xC0, 0x02) => "SysEnqIntRP",
         (0xC0, 0x03) => "SysDeqIntRP",
-        (0xC0, 0x06) => "ExceptionHandler",
+        (0xC0, 0x04) => "get_free_EvCB_slot",
+        (0xC0, 0x05) => "get_free_TCB_slot",
+        (0xC0, 0x08) => "SysInitMemory",
+        (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => "return 0",
         (0xC0, 0x07) => "InstallExceptionHandlers",
-        (0xC0, 0x0B) => "SystemError",
-        (0xC0, 0x0C) => "InitDefInt",
-        (0xC0, 0x12) => "InstallDevices",
-        (0xC0, 0x13) => "FlushStdInOutPut",
-        (0xC0, 0x1B) => "KernelRedirect",
-        (0xC0, 0x1E..=0x7F) => "jump_to_00000000h",
+        (0xC0, 0x1C) => "AdjustA0Table",
         (0xC0, 0x0A) => "ChangeClearRCnt",
         (0xC0, 0x0D) => "SetIrqAutoAck",
+        (0xC0, 0x12) => "InstallDevices",
+        (0xC0, 0x13) => "FlushStdInOutPut",
+        (0xC0, 0x16) => "_cdevscan",
+        (0xC0, 0x1B) => "KernelRedirect",
         (0xC0, 0x1A) => "set_card_find_mode",
-        (0xC0, 0x1C) => "AdjustA0Table",
         (0xC0, 0x1D) => "get_card_find_mode",
         _ => "?",
     }
 }
 
-/// Whether [`call`] implements `(table, func)`: it is named and can
-/// succeed.
-pub fn implemented(table: u32, func: u32) -> bool {
-    let (table, func) = tables::canonical(table, func);
-    name(table, func) != "?" && unsupported(table, func).is_none()
+/// How much of `(table, func)`'s documented behaviour [`call`] provides.
+/// This classifies the current dispatch arm, not the name alone: a named
+/// entry may still be partial, deliberately unsupported, fatal or a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// The documented service, over the existing native backends.
+    Working,
+    /// Some documented behaviour is present; a recorded limitation keeps
+    /// the call incomplete.
+    Partial,
+    /// The entry is recognised but the required capability is unavailable
+    /// and the call deliberately errors.
+    Unsupported,
+    /// The documented retail behaviour is fatal and the arm reproduces it.
+    Fatal,
+    /// The documented behaviour is an absent hardware side effect here.
+    Noop,
+    /// The translated call does not have a constant function number.
+    Unknown,
 }
 
-/// Why a call the BIOS names always fails here: what having no CPU to run
-/// it on rules out (plans/spec-fidelity.md, Forced).
-pub fn unsupported(table: u32, func: u32) -> Option<&'static str> {
+impl Support {
+    pub fn label(self) -> &'static str {
+        match self {
+            Support::Working => "working",
+            Support::Partial => "partial",
+            Support::Unsupported => "unsupported",
+            Support::Fatal => "fatal",
+            Support::Noop => "noop",
+            Support::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether the dispatcher names and handles `(table, func)`. This is the
+/// build's compatibility gate, not a claim that the call works; see
+/// [`support`] for that.
+pub fn implemented(table: u32, func: u32) -> bool {
+    let (table, func) = tables::canonical(table, func);
+    name(table, func) != "?"
+}
+
+/// [`call`]'s coverage of `(table, func)`, after alias resolution, for the
+/// build's BIOS-call report.
+pub fn support(table: u32, func: u32) -> Support {
+    let (table, func) = tables::canonical(table, func);
+    if name(table, func) == "?" {
+        return Support::Unsupported;
+    }
     match (table, func) {
-        (0xA0, 0x14) => Some("longjmp across translated frames is not supported"),
-        (0xA0, 0x43) | (0xA0, 0x51) => Some("loading and running another executable is not supported: only what was translated at build time runs"),
-        // psx-spx: they use the absent COP1, so the console locks up.
-        (0xA0, 0x0B) | (0xA0, 0x32) => Some("it uses COP1, which the console doesn't have (the call locks up on hardware)"),
-        (0xA0, 0xA0) => Some("rebooting runs the BIOS's boot again, and only what was translated at build time runs"),
-        (0xC0, 0x06) => Some("the exception handler is entered by exceptions, which the runtime takes at safepoints (D45), not called"),
-        _ => None,
+        // psx-spx: absent COP1 or an explicit SystemError locks up.
+        (0xA0, 0x0B) | (0xA0, 0x32) | (0xA0, 0x40) | (0xA0, 0xA1) => Support::Fatal,
+        // No cache or dummy device to affect; retail returns zero.
+        (0xA0, 0x44) | (0xA0, 0x57) | (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => Support::Noop,
+        // Recognised, but the required capability is not available here.
+        (0xA0, 0x14) | (0xA0, 0x43) | (0xA0, 0x52) | (0xB0, 0x51) | (0xC0, 0x09) => Support::Unsupported,
+        // Native services with recorded gaps: continuation/thread contexts,
+        // host console input, card completion, CD errors/event waits and
+        // filesystem details, or configuration/identity restrictions. Public
+        // wrappers inherit these gaps; a working happy path is not completeness.
+        (0xA0, 0x13)
+        | (0xA0, 0x41 | 0x42)
+        | (0xA0, 0x55 | 0x5D..=0x5F)
+        | (0xA0, 0x60 | 0x62..=0x68)
+        | (0xA0, 0x78 | 0x7C | 0x7E | 0x81)
+        | (0xA0, 0x94 | 0x95 | 0x9C)
+        | (0xA0, 0xA4..=0xAC)
+        | (0xA0, 0xAE | 0xAF)
+        | (0xA0, 0xB4)
+        | (0xB0, 0x0E..=0x10)
+        | (0xB0, 0x32 | 0x34..=0x36 | 0x3A | 0x3C | 0x3E | 0x40 | 0x42 | 0x43)
+        | (0xB0, 0x4D..=0x4F | 0x5C | 0x5D)
+        | (0xC0, 0x16) => Support::Partial,
+        _ => Support::Working,
     }
 }
 
@@ -245,11 +301,9 @@ fn len(n: u32) -> u32 {
     n.min(MAX_LEN)
 }
 
-/// A guest's call through vector `table` (A0h, B0h, C0h) with `func` in
-/// t1: the function the table's entry in kernel RAM names, as the
-/// vector's dispatcher reads it (D68). A stand-in runs its function here
-/// ([`call`]); any other address, a game's patch, is called as guest code
-/// with the same arguments. A number past its table has no entry.
+/// A vector call consults its guest-visible table. A saved native entry
+/// still calls its original service; a guest patch receives the same o32
+/// arguments and returns through the existing guest-call continuation.
 pub fn dispatch<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> Result<Flow<S>, String> {
     let Some(at) = tables::entry(table, func) else { return call(m, table, func, a) };
     let entry = m.mem.r32(at);
@@ -263,8 +317,6 @@ pub fn dispatch<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) 
 /// A0h/B0h/C0h function `func` with o32 arguments `a` (more on the guest
 /// stack). Errors name a function the BIOS doesn't implement.
 pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> Result<Flow<S>, String> {
-    // Numbers psx-spx gives one function (A(00h)..A(09h) are B(32h)..B(3Bh),
-    // C(80h..) is B0h's table).
     let (table, func) = tables::canonical(table, func);
     let label = format!("bios.{:02X}h:{:02X}h {}", table, func, name(table, func));
     m.count(&label);
@@ -298,19 +350,11 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             // longjmp traps.
             r(0)
         }
-        (0xA0, 0x0B) | (0xA0, 0x14) | (0xA0, 0x32) | (0xA0, 0x43) | (0xA0, 0x51) | (0xA0, 0xA0) | (0xC0, 0x06) => {
-            Err(format!("{label}: {}", unsupported(table, func).unwrap_or_default()))
-        }
-        // The console stops: SystemError's (psx-spx), the functions whose
-        // entries jump to 0, the game exiting.
-        (0xA0, 0x40) => Err(format!("{label}: an unresolved exception: the console stops")),
-        (0xA0, 0x4F) | (0xA0, 0x50) | (0xA0, 0x53) | (0xA0, 0x9A) | (0xA0, 0x9B) | (0xB0, 0x1A..=0x1F) | (0xB0, 0x21..=0x23) | (0xB0, 0x2A) | (0xB0, 0x2B) | (0xB0, 0x52) | (0xB0, 0x5A) | (0xC0, 0x0B) => {
-            Err(format!("{label}: SystemError: the console stops"))
-        }
-        (0xA0, 0xB5..=0xBF) | (0xB0, 0x11) | (0xB0, 0x24..=0x29) | (0xB0, 0x2C..=0x31) | (0xB0, 0x5E..=0xFF) | (0xC0, 0x1E..=0x7F) => {
-            Err(format!("{label}: its entry jumps to 00000000h"))
-        }
-        (0xA0, 0x3A) => Err(format!("{label}: the game exited ({:#x}): the console stops", a[0])),
+        (0xA0, 0x0B) | (0xA0, 0x32) => Err(format!("{label}: it uses COP1, which the console does not have (the call locks up on hardware)")),
+        (0xA0, 0x14) => Err(format!("{label}: longjmp across translated frames is not supported")),
+        (0xA0, 0x41) => loader::load_test(m, a[0], a[1]),
+        (0xA0, 0x42) => loader::load(m, a[0], a[1]),
+        (0xA0, 0x43) => Err(format!("{label}: loading and running another executable is not supported")),
         (0xA0, 0x15) | (0xA0, 0x16) => {
             // strcat, strncat (at most maxlen characters, none for a
             // negative maxlen); 0 for a null pointer.
@@ -443,6 +487,21 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.kernel.rand = a[0];
             r(0)
         }
+        // A(B4h) GetSystemInfo: the retail kernel's flags and the console's
+        // sizes. The kernel date and version string (indices 0 and 2) need
+        // identity metadata this port does not have; they stay unsupported
+        // rather than being invented.
+        (0xA0, 0xB4) => r(match a[0] {
+            0 | 2 => {
+                return Err(format!("{label}: index {:#x} needs kernel identity metadata", a[0]));
+            }
+            1 => 3,
+            5 => m.mem.r32(k::RAM_SIZE) << 10,
+            7 => 1024,
+            9 => 512,
+            12..=14 => 1,
+            _ => 0,
+        }),
         (0xA0, 0x31) => Ok(libc::qsort(m, a)),
         (0xA0, 0x33) => r(libc::malloc(mem, m.kernel.heap, a[0])),
         (0xA0, 0x34) | (0xB0, 0x01) => libc::free(mem, a[0]).map(|_| Flow::ret(0)).map_err(|e| format!("{label}: {e}")),
@@ -459,23 +518,35 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             let text = printf(m, a);
             let n = text.len() as u32;
             let flow = m.putchars(text.into_bytes())?;
-            Ok(seq(m, flow, move |_, _| Flow::ret(n)))
+            Ok(crate::machine::seq(m, flow, move |_, _| Flow::ret(n)))
         }
-        (0xA0, 0x44) | (0xA0, 0x9F) => r(0),
+        (0xA0, 0x44) => r(0),
+        // SetMem: the guest-visible RAM size the kernel reports. Retail
+        // accepts 2 and 8 MB; the host's memory backing is not resized.
+        (0xA0, 0x9F) => {
+            if matches!(a[0], 2 | 8) {
+                m.mem.w32(k::RAM_SIZE, a[0]);
+            }
+            r(0)
+        }
         // "return 0" (psx-spx), and the dummy device functions.
-        (0xA0, 0x57..=0x5A) | (0xA0, 0x73..=0x77) | (0xA0, 0x79..=0x7B) | (0xA0, 0x7D) | (0xA0, 0x7F) | (0xA0, 0x80) | (0xA0, 0x82..=0x8F) | (0xA0, 0xB0) | (0xA0, 0xB1) | (0xA0, 0xB3) => r(0),
-        // --- A0h: the CD-ROM driver and its device (crate::cdrom) -------
-        (0xA0, 0x54) => m.cd_init(),
+        (0xA0, 0x57) => r(0),
+        // --- A0h: the built-in devices, over the native backends ----------
+        (0xA0, 0x5B) | (0xA0, 0x5E) => r(0),
+        (0xA0, 0x5C) => r(m.tty_open(a[0])),
+        (0xA0, 0x5D) => m.tty_in_out(a[0], a[1]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x5F) => r(m.dev_cd_open(a[0], a[1])),
+        (0xA0, 0x60) => m.dev_cd_read(a[0], a[1], a[2]),
+        (0xA0, 0x61) => r(m.dev_cd_close(a[0])),
+        (0xA0, 0x62) => r(m.dev_cd_firstfile(a[0], a[1], a[2])),
+        (0xA0, 0x63) => r(m.dev_cd_nextfile(a[0], a[1])),
+        (0xA0, 0x64) => r(m.dev_cd_chdir(a[1])),
+        (0xA0, 0x54) => r(m.cd_init()),
+        (0xA0, 0x95) => r(m.cd_inner_init()),
         (0xA0, 0x56) => {
             m.cd_remove();
             r(0)
         }
-        (0xA0, 0x5F) => m.dev_cd_open(a[0], a[1]),
-        (0xA0, 0x60) => m.dev_cd_read(a[0], a[1], a[2]),
-        (0xA0, 0x61) => r(0),
-        (0xA0, 0x62) => m.dev_cd_firstfile(a[0], a[1], a[2]),
-        (0xA0, 0x63) => m.dev_cd_nextfile(a[0], a[1]),
-        (0xA0, 0x64) => m.dev_cd_chdir(a[1]),
         (0xA0, 0x78) => {
             let msf = [mem.r8(a[0]), mem.r8(a[0] + 1), mem.r8(a[0] + 2)];
             r(m.cd_seek_l(msf))
@@ -483,57 +554,21 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xA0, 0x7C) => r(m.cd_get_status(a[0])),
         (0xA0, 0x7E) => r(m.cd_read(a[0], a[1], a[2])),
         (0xA0, 0x81) => r(m.cd_set_mode(a[0])),
-        (0xA0, 0x90) => r(m.cd_io_verifier()),
-        (0xA0, 0x91) => r(m.cd_dma_verifier()),
-        (0xA0, 0x92) | (0xA0, 0x93) => {
-            // The handler returns from the exception when it acknowledges:
-            // the guest handler that called it returns into the
-            // exception's end, its own code after the call run first.
-            if m.cd_handler(func == 0x93) {
-                if !m.in_irq {
-                    return Err(format!("{label}: returns from an exception outside one"));
-                }
-                m.rfe = true;
-            }
-            r(0)
-        }
         (0xA0, 0x94) => {
             m.cd_int5_error(a[0], a[1]);
             r(0)
         }
-        (0xA0, 0x95) => m.cd_init(),
-        (0xA0, 0x9E) => {
-            let i = (a[0] != 0) as usize;
-            r(std::mem::replace(&mut m.kernel.cd.auto_ack[i], a[1]))
-        }
-        (0xA0, 0xA2) => {
-            m.cd_enqueue();
-            r(0)
-        }
-        (0xA0, 0xA3) => {
-            m.cd_dequeue();
-            r(0)
-        }
-        (0xA0, 0xA4) => m.cd_get_lbn(a[0]),
-        (0xA0, 0xA5) => m.cd_block_read(a[0], a[1], a[2], |_, n| Flow::ret(n)),
-        (0xA0, 0xA6) => m.cd_block_status(|_, s| Flow::ret(s)),
-        // --- A0h: the devices' functions, the device table ---------------
-        (0xA0, 0x5B) => r(0),
-        (0xA0, 0x5C) => r(m.tty_open(a[0])),
-        (0xA0, 0x5D) => m.tty_in_out(a[0], a[1]).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
-        (0xA0, 0x5E) => r(0),
+        (0xA0, 0xA4) => r(m.cd_lbn(a[0])),
+        (0xA0, 0xA5) => m.cd_block_read(a[0], a[1], a[2]),
+        (0xA0, 0xA6) => m.cd_block_status(),
         (0xA0, 0x65) => r(m.dev_bu_open(a[0], a[1], a[2])),
         (0xA0, 0x66) | (0xA0, 0x67) => r(m.dev_bu_io(a[0], a[1], a[2], func == 0x67)),
-        (0xA0, 0x68) => r(0),
+        (0xA0, 0x68) => r(m.dev_bu_close(a[0])),
         (0xA0, 0x69) => r(m.dev_bu_find(a[0], a[1], a[2])),
         (0xA0, 0x6A) => r(m.dev_bu_find(a[0], 0, a[1])),
         (0xA0, 0x6B) | (0xA0, 0x6C) => r(m.dev_bu_erase(a[0], a[1], func == 0x6C)),
         (0xA0, 0x6D) => r(m.dev_bu_format(a[0])),
         (0xA0, 0x6E) => r(m.dev_bu_rename(a[0], a[1], a[3])),
-        (0xA0, 0x6F) => {
-            mem.w32(a[0] + files::fcb::ERRNO, 0);
-            r(0)
-        }
         (0xA0, 0x96..=0x99) => r(m.add_device(func)),
         (0xA0, 0x45) => {
             m.install_vectors();
@@ -541,28 +576,138 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         }
         (0xA0, 0x55) => {
             m.cards_ready();
+            // `_bu_init` starts with auto format off (psx-spx, OpenBIOS
+            // `buClear`).
+            m.kernel.cards.auto_format = 0;
             r(0)
         }
-        (0xA0, 0x46..=0x4E) => gpu(m, func, a).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
+        (0xA0, 0x49) => {
+            // GPU_cw: a GP0 word (after gpu_sync, which returns 0 here:
+            // the GPU front end takes words at once).
+            m.gp0(a[0]);
+            r(0)
+        }
+        (0xA0, 0x46) | (0xA0, 0x47) => {
+            // GPU_dw, gpu_send_dma: GP0(A0h) and w*h/2 pixel words, by
+            // software or by channel 2. Both leave their arguments in the
+            // caller's stack frame; GPU_dw returns the end address (and
+            // leaves it in [sp+10h]), gpu_send_dma GP0's address.
+            let dma = func == 0x47;
+            if dma {
+                m.gpu_sync()?;
+            } else if m.gpu_status()? & 1 << 26 == 0 {
+                return Err(format!("{label}: GPUSTAT bit 26 stays clear (a GP0 command is half sent)"));
+            }
+            let (src, words) = (m.arg(&a, 4), len(a[2].wrapping_mul(a[3]) / 2));
+            for w in [0xA000_0000, a[1] << 16 | a[0] & 0xFFFF, a[3] << 16 | a[2] & 0xFFFF] {
+                m.gp0(w);
+            }
+            let sp = m.regs.sp();
+            for (k, v) in [a[1], a[2], a[3]].into_iter().enumerate() {
+                m.mem.w32(sp + 4 * (k as u32 + 1), v);
+            }
+            if dma {
+                m.gp1(0x0400_0002)?;
+                let blocks = words / 16;
+                m.gpu_dma(src, blocks << 16 | 0x10, 0x0100_0201, false)?;
+                return r(0x1F80_1810);
+            }
+            for i in 0..words {
+                let w = m.mem.r32(src.wrapping_add(4 * i));
+                m.gp0(w);
+            }
+            let end = src.wrapping_add(4 * words);
+            m.mem.w32(sp + 0x10, end);
+            r(end)
+        }
+        (0xA0, 0x48) => {
+            // SendGP1Command: a GP1 word, nothing returned.
+            m.gp1(a[0])?;
+            r(0)
+        }
+        (0xA0, 0x4A) => {
+            // GPU_cwp: GPU words from memory, after a sync.
+            m.gpu_sync()?;
+            for i in 0..len(a[1]) {
+                let w = m.mem.r32(a[0].wrapping_add(4 * i));
+                m.gp0(w);
+            }
+            r(0)
+        }
+        (0xA0, 0x4B) => {
+            // send_gpu_linked_list: channel 2 walks the list; DICR is
+            // cleared first as psx-spx gives it.
+            m.gpu_sync()?;
+            m.gp1(0x0400_0002)?;
+            m.gpu_dma(a[0], 0, 0x0100_0401, true)?;
+            r(0)
+        }
+        (0xA0, 0x4C) => {
+            // gpu_abort_dma: the channel stopped; its result is GP1's
+            // address.
+            m.gpu_abort_dma()?;
+            r(0x1F80_1814)
+        }
+        (0xA0, 0x4D) => r(m.gpu_status()?),
+        (0xA0, 0x4E) => r(m.gpu_sync()?),
+        // A(52h): psx-spx's summary says GetSysSp, its N/A list says
+        // SystemError, and the pinned OpenBIOS table does not implement it.
+        // Those references do not establish the retail behaviour.
+        (0xA0, 0x52) => Err(format!("{label}: GetSysSp/SystemError conflict is unresolved; retail behaviour not verified")),
+        // Like A(A1h), retail loops forever. Use the existing fatal BIOS
+        // error path rather than returning or spinning the host.
+        (0xA0, 0x40) => Err(format!("{label}: unresolved exception (the console locks up)")),
         (0xA0, 0xA1) => Err(format!("{label}: SystemError({:#x}, {:#x})", a[0], a[1])),
+        (0xA0, 0x9C) => {
+            let (events, tcbs, top) = (a[0], a[1], a[2]);
+            if !(1..=k::MAX_EVENTS).contains(&events) || !(1..=k::MAX_TCBS).contains(&tcbs) {
+                return Err(format!("{label}: counts {events:#x} EvCB/{tcbs:#x} TCB out of range"));
+            }
+            // Re-laying out live threads cannot preserve the runtime's
+            // suspended stacks, so only the main thread may be reset.
+            if m.kernel.threads.current != 0 {
+                return Err(format!("{label}: resetting a thread other than the main one is not supported"));
+            }
+            let main_tcb = m.mem.bytes(threads::tcb(0), k::TCB_SIZE as usize);
+            m.lay_out_events(events);
+            m.lay_out_threads(tcbs);
+            m.mem.write(threads::tcb(0), &main_tcb);
+            m.mem.w32(threads::tcb(0) + k::TCB_STATUS, k::TCB_USED);
+            m.kernel.stack_top = top;
+            m.kernel.kheap = (0, 0);
+            m.lay_out_excb();
+            m.lay_out_kernel_handlers();
+            r(0)
+        }
+        (0xA0, 0x9D) => {
+            let (events, tcbs, top) = (m.event_count(), m.thread_count(), m.kernel.stack_top);
+            for (dst, v) in [(a[0], events), (a[1], tcbs), (a[2], top)] {
+                m.mem.w32(dst, v);
+            }
+            r(0)
+        }
         (0xA0, 0xAB) => r(m.card_info(a[0])),
         (0xA0, 0xAC) => r(m.card_load(a[0])),
         (0xA0, 0xAD) => {
-            m.kernel.cards.auto_format = a[0] != 0;
-            r(0)
+            // Returns the old setting (OpenBIOS `buSetAutoFormat`).
+            let old = m.kernel.cards.auto_format;
+            m.kernel.cards.auto_format = a[0];
+            r(old)
         }
+        (0xA0, 0xA7) => r(m.card_bufs_cb(0)),
+        (0xA0, 0xA8) => r(m.card_bufs_cb(1)),
+        (0xA0, 0xA9) => r(m.card_bufs_cb(2)),
+        (0xA0, 0xAA) => r(m.card_bufs_cb(3)),
+        (0xA0, 0xAE) => r(m.card_bufs_cb(4)),
         (0xA0, 0xAF) => r(m.card_write_test(a[0])),
 
-        // --- B0h: kernel memory, root counters, events, pads, files, cards
+        // --- B0h: kernel memory, timers, events, pads, files, cards -----
         (0xB0, 0x00) => {
             let heap = m.kernel_heap();
             r(libc::malloc(&mut *m.mem, heap, a[0]))
         }
         (0xB0, 0x02..=0x06) => timer(m, func, a).map(Flow::ret).map_err(|e| format!("{label}: {e}")),
-        (0xB0, 0x07) => {
-            m.deliver_event(a[0], a[1]);
-            r(1)
-        }
+        (0xB0, 0x07) => Ok(m.deliver_event_now(a[0], a[1])),
         (0xB0, 0x08) => r(m.open_event(a[0], a[1], a[2], a[3])),
         (0xB0, 0x09) => {
             m.set_ev_status(a[0], kernel::EV_UNUSED);
@@ -625,14 +770,12 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x16) => r(m.kernel.pad_dr(&mut *m.mem)),
         (0xB0, 0x17) => Err(format!("{label}: called outside an exception handler")),
         (0xB0, 0x18) => {
-            // ResetEntryInt: back to the default exit (ReturnFromException);
-            // the default structure's address (psx-spx).
+            // ResetEntryInt: restore and return the default exit structure.
             m.kernel.custom_exit = 0;
             r(m.lay_out_default_exit())
         }
         (0xB0, 0x19) => {
-            // HookEntryInt: the default structure is the default exit.
-            m.kernel.custom_exit = if a[0] == kernel::DEFAULT_EXIT { 0 } else { a[0] };
+            m.kernel.custom_exit = if a[0] & 0x1FFF_FFFF == kernel::DEFAULT_EXIT & 0x1FFF_FFFF { 0 } else { a[0] };
             r(0)
         }
         (0xB0, 0x20) => {
@@ -645,13 +788,12 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x34) | (0xB0, 0x35) => m.transfer(a[0], a[1], a[2], func == 0x35),
         (0xB0, 0x36) => m.close(a[0]),
         (0xB0, 0x37) => m.ioctl(a[0], a[1], a[2]),
-        (0xB0, 0x38) => Err(format!("{label}: the game exited ({:#x}): the console stops", a[0])),
         (0xB0, 0x39) => r(m.isatty(a[0])),
         (0xB0, 0x3A) => m.getc(a[0]),
         (0xB0, 0x3B) => m.putc(a[0], a[1]),
         (0xB0, 0x3C) => m.getchar(),
         (0xB0, 0x3D) => m.putchars(vec![a[0] as u8]),
-        (0xB0, 0x3E) => Err(format!("{label}: gets reads the console, which has no input")),
+        (0xB0, 0x3E) => m.gets(a[0]).map_err(|e| format!("{label}: {e}")),
         (0xB0, 0x3F) => {
             // puts: "<NULL>" for a null pointer (psx-spx).
             let s = if a[0] == 0 { b"<NULL>".to_vec() } else { mem.cstr(a[0], MAX_LEN as usize) };
@@ -666,12 +808,7 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x46) => m.erase(a[0], files::dcb::UNDELETE),
         (0xB0, 0x47) => m.add_drv(a[0]),
         (0xB0, 0x48) => m.del_drv(a[0]),
-        (0xB0, 0x49) => {
-            m.print_devices();
-            r(0)
-        }
-        (0xB0, 0x54) => r(m.kernel.files.errno),
-        (0xB0, 0x55) => r(m.get_error(a[0])),
+        (0xB0, 0x49) => m.print_devices(),
         (0xB0, 0x59) => m.test_device(a[0]),
         (0xB0, 0x4A) => r(m.card_init(a[0])),
         // StartCARD2, StopCARD2: the pad and card handler in or out of the
@@ -688,14 +825,18 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.card_new(0x10);
             r(1)
         }
+        (0xB0, 0x54) => r(m.kernel.files.errno),
+        (0xB0, 0x55) => r(m.get_error(a[0])),
+        (0xB0, 0x4D) => r(m.card_info_subfunc(a[0])),
+        (0xB0, 0x58) => r(m.card_chan()),
         (0xB0, 0x5C) => {
             m.cards_ready();
             r(m.kernel.cards.status[(a[0] & 1) as usize])
         }
-        (0xB0, 0x5D) => r(m.card_wait(a[0])),
+        (0xB0, 0x5D) => Ok(m.card_wait(a[0])),
         // No BIOS ROM, so no ROM kanji font.
         (0xB0, 0x51) => r(u32::MAX),
-        // GetC0Table, GetB0Table: the tables in kernel RAM (psx-spx).
+        // Kernel tables: addresses in kernel RAM, as the Sony BIOS has them.
         (0xB0, 0x56) => r(psxw_abi::kernel::C0_TABLE),
         (0xB0, 0x57) => r(psxw_abi::kernel::B0_TABLE),
         // ChangeClearPad: whether the pad handler acknowledges vblank; the
@@ -703,36 +844,44 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
         (0xB0, 0x5B) => r(std::mem::replace(&mut m.kernel.clear_pad, a[0])),
 
         // --- C0h: interrupt plumbing -------------------------------------
-        (0xC0, 0x02) => {
-            m.enq_int_rp(a[0], a[1]);
-            r(0)
-        }
-        (0xC0, 0x03) => r(m.deq_int_rp(a[0], a[1])),
-        (0xC0, 0x1A) => {
-            m.kernel.cards.find_mode = a[0];
-            r(0)
-        }
-        (0xC0, 0x1D) => r(m.kernel.cards.find_mode),
         (0xC0, 0x00) => {
             m.enqueue_rcnt_irqs(a[0]);
-            r(0)
-        }
-        (0xC0, 0x01) => {
-            m.enqueue_syscall_handler(a[0]);
             r(0)
         }
         (0xC0, 0x0C) => {
             m.init_def_int(a[0]);
             r(0)
         }
-        (0xC0, 0x12) => {
-            // InstallDevices(ttyflag): the control blocks, the console as
-            // KernelRedirect mounts it, cdrom and bu.
-            m.lay_out_files();
-            m.kernel_redirect(a[0])
+        (0xC0, 0x02) => {
+            m.enq_int_rp(a[0], a[1]);
+            r(0)
         }
-        (0xC0, 0x13) => m.reopen_stdio(),
-        (0xC0, 0x1B) => m.kernel_redirect(a[0]),
+        (0xC0, 0x03) => r(m.deq_int_rp(a[0], a[1])),
+        (0xC0, 0x04) => r(m.free_event_slot()),
+        (0xC0, 0x05) => r(m.free_thread_slot()),
+        // C(08h) SysInitMemory: the kernel's allocate-able region. It
+        // reinitialises the allocator and intentionally invalidates the old
+        // blocks, like InitHeap; overlapping the old layout is the caller's
+        // choice, not a policy this port invents.
+        (0xC0, 0x08) => {
+            let (addr, size) = (a[0], a[1]);
+            let phys = addr & 0x1FFF_FFFF;
+            let phys_end = phys.saturating_add(size);
+            if addr == 0 || size < 4 || phys_end > psxw_abi::phys::RAM.end {
+                return Err(format!("{label}: region {addr:#010x}+{size:#x} is outside RAM"));
+            }
+            let heap = libc::heap_init(&mut *m.mem, addr, size);
+            if heap == (0, 0) {
+                return Err(format!("{label}: invalid region {addr:#010x}+{size:#x}"));
+            }
+            m.kernel.kheap = heap;
+            r(0)
+        }
+        // C(09h): psx-spx records that the boot overwrites this entry, so
+        // post-boot calls do not have a documented callable contract. Our
+        // kernel variables are live native state; do not guess a reset.
+        (0xC0, 0x09) => Err(format!("{label}: documented post-boot corruption; no native contract")),
+        (0xC0, 0x0E..=0x11) | (0xC0, 0x14) => r(0),
         (0xC0, 0x07) => {
             m.install_exception_handlers();
             r(0)
@@ -741,6 +890,11 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             m.adjust_a0_table();
             r(0)
         }
+        (0xC0, 0x1A) => {
+            m.kernel.cards.find_mode = a[0];
+            r(0)
+        }
+        (0xC0, 0x1D) => r(m.kernel.cards.find_mode),
         (0xC0, 0x0A) => {
             let i = (a[0] as usize).min(3);
             let old = m.kernel.clear_rcnt[i];
@@ -754,6 +908,15 @@ pub fn call<S: Sdk>(m: &mut Machine<S>, table: u32, func: u32, a: [u32; 4]) -> R
             }
             r(0)
         }
+        (0xC0, 0x12) => {
+            // InstallDevices(ttyflag): the control blocks, the console as
+            // KernelRedirect mounts it, cdrom and bu.
+            m.lay_out_files();
+            m.kernel_redirect(a[0])
+        }
+        (0xC0, 0x13) => m.reopen_stdio(),
+        (0xC0, 0x16) => m.cdevscan(),
+        (0xC0, 0x1B) => m.kernel_redirect(a[0]),
         _ => Err(format!("{label}: not implemented")),
     }
 }
@@ -768,7 +931,6 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
             m.crit = true;
             Ok(was as u32)
         }
-        // ExitCriticalSection.
         // ExitCriticalSection: an interrupt left pending is taken.
         2 => {
             m.crit = false;
@@ -777,30 +939,26 @@ pub fn syscall<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> Result<u32, String> {
             }
             Ok(0)
         }
-        // ChangeThreadSubFunction.
-        3 => Ok(1),
+        // ChangeThreadSubFunction: a1 is a TCB pointer, not a handle.
+        3 => m.change_thread_tcb(a[1]),
         0 => Ok(0),
-        // The others deliver the exception event (psx-spx); v0 is the
-        // caller's on the console, 0 here.
+        // Other syscall numbers deliver the unresolved-exception event.
+        // The current seam has no incoming v0: it returns 0 rather than
+        // preserving that register as the console does.
         _ => {
             m.deliver_event(0xF000_0010, 0x4000);
             Ok(0)
-        }
+        },
     }
 }
 
-/// B0h:02h-06h on root counter `t` (the argument's low half; 3 is vblank
-/// for the interrupt mask) through the counters' registers and I_MASK
-/// (psx-spx "BIOS Timer Functions"): init_timer, get_timer,
-/// enable_timer_irq, disable_timer_irq, restart_timer.
+/// B0h:02h-06h over the shared timer core and IRQ mask. Unlike the SDK's
+/// SetRCnt, the BIOS uses the same mode calculation for all three timers
+/// (psx-spx "BIOS Timer Functions"). Counter 3 selects vblank's IRQ only.
 fn timer<S: Sdk>(m: &mut Machine<S>, func: u32, a: [u32; 4]) -> Result<u32, String> {
-    let t = a[0] & 0xFFFF;
-    let reg = |r: u32| 0x1F80_1100 + 0x10 * t + r;
-    let irq = [0x10, 0x20, 0x40, 0x01].get(t as usize).copied().unwrap_or(0);
+    let t = (a[0] & 0xFFFF) as usize;
     match func {
         0x02 if t < 3 => {
-            // 48h: reset at the target, IRQ repeating; flags bit 4: sync
-            // on; bit 0 clear: clock source 1; bit 12: IRQ at the target.
             let mut mode = if a[2] & 0x10 == 0 { 0x48 } else { 0x49 };
             if a[2] & 1 == 0 {
                 mode |= 0x100;
@@ -808,139 +966,28 @@ fn timer<S: Sdk>(m: &mut Machine<S>, func: u32, a: [u32; 4]) -> Result<u32, Stri
             if a[2] & 0x1000 != 0 {
                 mode |= 0x10;
             }
-            m.reg_write(reg(4), 2, 0)?;
-            m.reg_write(reg(8), 2, a[1] & 0xFFFF)?;
-            m.reg_write(reg(4), 2, mode)?;
+            let now = m.timer_now(t);
+            m.timers[t].target = a[1] as u16;
+            m.timers[t].write_mode(mode, now);
+            m.reschedule_timer(t);
             Ok(1)
         }
-        0x03 if t < 3 => m.reg_read(reg(0), 2),
+        0x03 if t < 3 => Ok(m.timers[t].value(t, m.clock.video, m.timer_now(t)) as u32),
         0x04 | 0x05 => {
+            let irq = [0x10, 0x20, 0x40, 0x01].get(t).copied().unwrap_or(0);
             let mask = m.reg_read(psx_devices::irq::I_MASK, 4)?;
             m.reg_write(psx_devices::irq::I_MASK, 4, if func == 0x04 { mask | irq } else { mask & !irq })?;
+            m.release_irq();
             Ok((func == 0x05 || t < 3) as u32)
         }
         0x06 if t < 3 => {
-            m.reg_write(reg(0), 2, 0)?;
+            let (video, now) = (m.clock.video, m.timer_now(t));
+            m.timers[t].write_count(t, video, now, 0);
+            m.reschedule_timer(t);
             Ok(1)
         }
         _ => Ok(0),
     }
-}
-
-const GP0: u32 = 0x1F80_1810;
-const GP1: u32 = 0x1F80_1814;
-/// DMA channel 2's registers.
-const D2_MADR: u32 = dma::BASE + 0x10 * dma::GPU as u32;
-const D2_BCR: u32 = D2_MADR + 4;
-const D2_CHCR: u32 = D2_MADR + 8;
-
-/// The A0h GPU functions (psx-spx "BIOS GPU Functions") through the GPU's
-/// and the DMA controller's registers.
-fn gpu<S: Sdk>(m: &mut Machine<S>, func: u32, a: [u32; 4]) -> Result<u32, String> {
-    let gp0 = |m: &mut Machine<S>, w: u32| m.reg_write(GP0, 4, w);
-    // GPU_dw and gpu_send_dma: an image's header, and its arguments left
-    // in the caller's argument words (psx-spx).
-    let image = |m: &mut Machine<S>| -> Result<(), String> {
-        for w in [0xA000_0000, a[1] << 16 | a[0] & 0xFFFF, a[3] << 16 | a[2] & 0xFFFF] {
-            gp0(m, w)?;
-        }
-        let sp = m.regs.sp();
-        for (k, v) in [a[1], a[2], a[3]].into_iter().enumerate() {
-            m.mem.w32(sp + 4 * (k as u32 + 1), v);
-        }
-        Ok(())
-    };
-    let dma_on = |m: &mut Machine<S>| -> Result<(), String> {
-        let dpcr = m.reg_read(dma::DPCR, 4)?;
-        m.reg_write(dma::DPCR, 4, dpcr | 0x800)
-    };
-    match func {
-        0x46 => {
-            // GPU_dw: by software once GPUSTAT bit 26 is set; w*h/2 words.
-            if m.reg_read(GP1, 4)? & 1 << 26 == 0 {
-                return Err("GPUSTAT bit 26 stays clear (a GP0 command is half sent): the BIOS waits forever".into());
-            }
-            let src = m.arg(&a, 4);
-            image(m)?;
-            let n = len(a[2].wrapping_mul(a[3]) / 2);
-            for i in 0..n {
-                let w = m.mem.r32(src.wrapping_add(4 * i));
-                gp0(m, w)?;
-            }
-            let end = src.wrapping_add(4 * n);
-            let sp = m.regs.sp();
-            m.mem.w32(sp + 0x10, end);
-            Ok(end)
-        }
-        0x47 => {
-            // gpu_send_dma: w*h/32 blocks of 16 words by DMA.
-            let src = m.arg(&a, 4);
-            gpu_sync(m)?;
-            image(m)?;
-            m.reg_write(GP1, 4, 0x0400_0002)?;
-            dma_on(m)?;
-            m.reg_write(D2_MADR, 4, src)?;
-            m.reg_write(D2_BCR, 4, (a[2].wrapping_mul(a[3]) / 32) << 16 | 0x10)?;
-            m.reg_write(D2_CHCR, 4, 0x0100_0201)?;
-            Ok(GP0)
-        }
-        0x48 => m.reg_write(GP1, 4, a[0]).map(|_| 0),
-        0x49 => {
-            let v = gpu_sync(m)?;
-            gp0(m, a[0])?;
-            Ok(v)
-        }
-        0x4A => {
-            gpu_sync(m)?;
-            for i in 0..len(a[1]) {
-                let w = m.mem.r32(a[0].wrapping_add(4 * i));
-                gp0(m, w)?;
-            }
-            Ok(0)
-        }
-        0x4B => {
-            // send_gpu_linked_list: DICR cleared as well (psx-spx). Its
-            // TTY messages are left out: psx-spx doesn't give them.
-            gpu_sync(m)?;
-            m.reg_write(GP1, 4, 0x0400_0002)?;
-            m.reg_write(dma::DICR, 4, 0)?;
-            dma_on(m)?;
-            m.reg_write(D2_MADR, 4, a[0])?;
-            m.reg_write(D2_BCR, 4, 0)?;
-            m.reg_write(D2_CHCR, 4, 0x0100_0401)?;
-            Ok(0)
-        }
-        0x4C => {
-            // gpu_abort_dma: the channel stopped; GP1(04h), (02h), (01h).
-            m.reg_write(D2_CHCR, 4, 0x401)?;
-            for c in [0x0400_0000, 0x0200_0000, 0x0100_0000] {
-                m.reg_write(GP1, 4, c)?;
-            }
-            Ok(GP1)
-        }
-        0x4D => m.reg_read(GP1, 4),
-        _ => gpu_sync(m),
-    }
-}
-
-/// `gpu_sync` (A0h:4Eh): with GPU DMA off, wait for GPUSTAT bit 28; with
-/// it on, for the channel to finish and bit 28, then DMA off (GP1(04h)).
-/// The front end takes words at once and DMA ends at once, so each wait
-/// holds already or never ends: then the BIOS's timeout (-1), or an error
-/// for the one wait without a timeout.
-fn gpu_sync<S: Sdk>(m: &mut Machine<S>) -> Result<u32, String> {
-    let ready = |m: &mut Machine<S>| m.reg_read(GP1, 4).map(|s| s & 1 << 28 != 0);
-    if m.reg_read(GP1, 4)? & 0x6000_0000 == 0 {
-        return Ok(if ready(m)? { 0 } else { u32::MAX });
-    }
-    if m.reg_read(D2_CHCR, 4)? & dma::CHCR_BUSY != 0 {
-        return Ok(u32::MAX);
-    }
-    if !ready(m)? {
-        return Err("GPUSTAT bit 28 stays clear (a polygon or line is half sent): gpu_sync waits forever".into());
-    }
-    m.reg_write(GP1, 4, 0x0400_0000)?;
-    Ok(0)
 }
 
 /// Raw sectors through the host.
@@ -956,24 +1003,19 @@ impl cd::Disc for HostDisc<'_> {
 /// precision. Arguments come from a1..a3, then the guest stack.
 pub fn printf<S: Sdk>(m: &mut Machine<S>, a: [u32; 4]) -> String {
     let mut k = 1;
-    let mut counts = Vec::new();
-    let text = format(m, a[0], &mut counts, &mut || {
+    format(m, a[0], &mut |m| {
         let v = m.arg(&a, k);
         k += 1;
         v
-    });
-    for (addr, n, half) in counts {
-        if half { m.mem.w16(addr, n as u16) } else { m.mem.w32(addr, n) }
-    }
-    text
+    })
 }
 
 /// [`printf`]'s formatting of the string at guest address `fmt`, each
 /// argument word from `next`: psx-spx's conversions (`c s d i D u U o O p
 /// x X n`) and prefixes (`+`, space, `-`, `#`, `0`, a width or `*`, a
-/// precision or `.*`, `h`, `l`, `L`), with C's meaning. `%n`'s writes
-/// (address, length, 16-bit) go to `counts`.
-pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool)>, next: &mut dyn FnMut() -> u32) -> String {
+/// precision or `.*`, `h`, `l`, `L`), with C's meaning. `%n` writes at
+/// its conversion, before later conversions or stack arguments are read.
+pub fn format<S: Sdk>(m: &mut Machine<S>, fmt: u32, next: &mut dyn FnMut(&Machine<S>) -> u32) -> String {
     let fmt = m.mem.cstr(fmt, 1024);
     let mut out = String::new();
     let mut i = 0;
@@ -1000,7 +1042,7 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
         let mut left = flags.contains('-');
         let width = if fmt.get(i) == Some(&b'*') {
             i += 1;
-            let w = next() as i32;
+            let w = next(m) as i32;
             left |= w < 0;
             w.unsigned_abs() as usize
         } else {
@@ -1011,7 +1053,7 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
             i += 1;
             prec = Some(if fmt.get(i) == Some(&b'*') {
                 i += 1;
-                (next() as i32).max(0) as usize
+                (next(m) as i32).max(0) as usize
             } else {
                 digits(&fmt, &mut i)
             });
@@ -1026,7 +1068,7 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
         // h: the argument sign-extended from 16 bits, for every conversion
         // (psx-spx: unsigned ones too).
         let mut arg = || {
-            let v = next();
+            let v = next(m);
             if half { v as i16 as i32 as u32 } else { v }
         };
         let (sign, prefix, mut body) = match conv {
@@ -1056,11 +1098,12 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
             }
             b'c' => ("", "", ((arg() as u8) as char).to_string()),
             b's' => {
-                let s = m.mem.cstr(next(), prec.unwrap_or(1024));
+                let s = m.mem.cstr(next(m), prec.unwrap_or(1024));
                 ("", "", String::from_utf8_lossy(&s).into_owned())
             }
             b'n' => {
-                counts.push((next(), out.len() as u32, half));
+                let addr = next(m);
+                if half { m.mem.w16(addr, out.len() as u16) } else { m.mem.w32(addr, out.len() as u32) }
                 continue;
             }
             b'%' => ("", "", "%".into()),
@@ -1087,4 +1130,59 @@ pub fn format<S: Sdk>(m: &Machine<S>, fmt: u32, counts: &mut Vec<(u32, u32, bool
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::machine;
+
+    #[test]
+    fn coverage_distinguishes_working_partial_unsupported_fatal_and_noop() {
+        // Native services, and aliases keep the same classification.
+        assert_eq!(support(0xA0, 0x1B), Support::Working);
+        assert_eq!(support(0xA0, 0x00), support(0xB0, 0x32));
+        assert_eq!(support(0xC0, 0x80 + 0x57), support(0xB0, 0x57));
+        assert_eq!(name(0xA0, 0x00), "open");
+        assert_eq!(name(0xA0, 0x70), "_bu_init");
+        // A saved native entry resolves to the same underlying service.
+        let (table, func) = tables::stand_in_fn(tables::stand_in(0xA0, 0x70)).unwrap();
+        assert_eq!(support(table, func), support(0xA0, 0x55));
+        // Native service with a recorded limitation.
+        assert_eq!(support(0xA0, 0x9C), Support::Partial);
+        assert_eq!(support(0xA0, 0xB4), Support::Partial);
+        assert_eq!(support(0xB0, 0x51), Support::Unsupported, "no glyph resource exists");
+        assert_eq!(support(0xB0, 0x5D), Support::Partial);
+        assert_eq!(support(0xB0, 0x10), Support::Partial, "callback thread switches are unsupported");
+        assert_eq!(support(0xA0, 0xA5), Support::Partial, "CD error/event behaviour remains incomplete");
+        assert_eq!(support(0xA0, 0x02), Support::Partial, "read inherits device limitations");
+        // Recognised but no required capability.
+        assert_eq!(support(0xA0, 0x14), Support::Unsupported);
+        assert_eq!(support(0xA0, 0x43), Support::Unsupported);
+        assert_eq!(support(0xA0, 0x42), Support::Partial, "loader works over the incomplete file backends");
+        assert_eq!(support(0xB0, 0x3E), Support::Partial);
+        assert_eq!(support(0xC0, 0x09), Support::Unsupported);
+        assert_eq!(support(0xC0, 0x16), Support::Partial, "guest scan callbacks work; built-in host input remains absent");
+        // Documented fatal and no-op behaviour.
+        assert_eq!(support(0xA0, 0x0B), Support::Fatal);
+        assert_eq!(support(0xA0, 0x32), Support::Fatal);
+        assert_eq!(support(0xA0, 0xA1), Support::Fatal);
+        assert_eq!(support(0xA0, 0x44), Support::Noop);
+        assert_eq!(support(0xC0, 0x0E), Support::Noop);
+        // implemented() stays the compatibility gate, not a working claim.
+        assert!(implemented(0xA0, 0x14));
+        assert!(implemented(0xA0, 0x0B));
+        assert!(implemented(0xA0, 0x42));
+    }
+
+    #[test]
+    fn documented_fatal_float_conversion_names_its_reason() {
+        let mut m = machine();
+        for f in [0x0B, 0x32] {
+            match call(&mut m, 0xA0, f, [0x8001_0000, 0, 0, 0]) {
+                Err(e) => assert!(e.contains("COP1"), "{e}"),
+                Ok(_) => panic!("atof/strtod {f:#x} must stay fatal"),
+            }
+        }
+    }
 }

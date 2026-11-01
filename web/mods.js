@@ -14,11 +14,10 @@
 // naming both mods, as `psxw mod check` does for compiled ones.
 
 const DEFAULT_WINDOW = 0x01000000;
-// psx-wasm's own guest addresses (psxw-abi `own`, `phys::MOD_DATA`, `SYNTHETIC_CODE`).
-const AREA_START = 0x81600000;
-const AREA_END = 0x81800000;
-const SYNTHETIC_START = 0x81200000;
-const SYNTHETIC_END = 0x81400000;
+const AREA_START = 0x80600000;
+const AREA_END = 0x80800000;
+const SYNTHETIC_START = 0x80200000;
+const SYNTHETIC_END = 0x80400000;
 
 const tableIndex = (a) => ((a & 0x003ffffc) >>> 2);
 const text = (buf) => new TextDecoder().decode(buf);

@@ -103,23 +103,13 @@ fn port_arg(rng: &mut Rng, port: usize) -> u32 {
 
 fn init(h: &mut dyn Harness, bufs: [u32; 2]) -> Result<(), String> {
     call(h, "PadInitDirect", &[bufs[0], bufs[1]])?;
-    budget(h, "PadInitDirect");
     observe_ram(h, "buffers after PadInitDirect", bufs[0], 8);
     observe_ram(h, "port 2's", bufs[1], 8);
     Ok(())
 }
 
-/// The guest's budget left: the original's instructions so far, the
-/// interrupt's among them (D71).
-fn budget(h: &mut dyn Harness, what: &str) {
-    let b = h.budget();
-    h.observe(&format!("{what}: budget"), b.to_string());
-}
-
-/// What a game reads of both ports: the buffers, the state, the type; and
-/// the time so far.
+/// What a game reads of both ports: the buffers, the state, the type.
 fn look(h: &mut dyn Harness, what: &str, bufs: [u32; 2]) -> Result<(), String> {
-    budget(h, what);
     for (i, &b) in bufs.iter().enumerate() {
         observe_ram(h, &format!("{what}: port {} buffer", i + 1), b, 8);
         call(h, "PadGetState", &[[0x00, 0x10][i]])?;
