@@ -1,6 +1,6 @@
 # Salvage the BIOS work
 
-**Status:** recovery milestone accepted for merge to `main`; full BIOS completion and validation remain open. General non-local returns are deferred by the user.
+**Status:** recovery milestone merged to `main`; full BIOS completion and validation remain open. General non-local returns are deferred by the user.
 **Goal:** preserve the working native-port architecture, recover useful work from
 spec-fidelity, and finish the missing BIOS functionality in Rust.
 **Supersedes:** `plans/spec-fidelity.md` on `archive/spec-fidelity-b8a0683`
@@ -10,10 +10,32 @@ plan remains historical evidence, not a checklist to resume.
 ## Recovery merge checkpoint
 
 The operator approved merging the recovered native foundation into `main` and
-cleaning up the worktrees. This closes the recovery delivery milestone, **not
-full BIOS implementation or full-CI certification**. Do not automatically reopen
-small follow-up lanes during merge/cleanup. Earlier checkout paths and validation
-sections below are historical provenance, not instructions to recreate worktrees.
+cleaning up the worktrees. Merge **`ceefc20`** retains both histories, with its
+tracked tree exactly matching reviewed recovery **`cfb832d`** (production source
+`7ba449e`). It deliberately supersedes the rejected spec-fidelity implementation
+rather than merging those mechanisms back. This closes the recovery delivery
+milestone, **not full BIOS implementation or full-CI certification**. No new BIOS
+follow-up lanes are active. Earlier checkout paths and validation sections below
+are historical provenance, not instructions to recreate worktrees.
+
+Cleanup removed **25 extra worktrees** and pruned one stale registration; only
+`main` at the original checkout remains. Existing branch references are retained,
+including `archive/spec-fidelity-b8a0683`. Detached heads have archive references.
+Unrelated renderer/web WIP from `main-wt-2` was committed separately as `633225b`
+on `archive/main-wt-2-wip-20261031`, **not merged into main**. Local oracle data,
+reports, outputs, configs and untracked files were preserved under ignored
+`out/worktree-cleanup-20261031/`; disposable build caches were removed with the
+worktrees. Main's inputs, local config, run storage, `.pi/` and supplied crash
+replay were preserved; its AGENTS content is unchanged.
+
+Recovery output roots were moved into main's `out/`, with replaced old roots
+archived under that cleanup directory. Main's `out/run` was not replaced with
+recovery disposable cards. Artifact epochs remain those stated below, not a new
+game build. The CLI was freshly rebuilt on merged main (`cargo build --release
+-p psxw-cli --offline`, pass); its complete log is in the cleanup archive's
+`validation-logs/`. No redundant test/replay/full-CI cycle was run for a merge
+whose source tree is identical to the tested recovery tree. Merge is local;
+no remote push was requested or performed.
 
 At source checkpoint `7ba449e`, the recovery branch contains 109 commits since
 `0bae88ac`, with 81 files changed (+15,037/-1,576 lines, including tests and
@@ -170,7 +192,7 @@ partial or that gate still fails. Detailed results below are checkpointed histor
 
 | Area | Current disposition / next action |
 |---|---|
-| Native recovery | Accepted for merge to main; spec-fidelity history remains archived. Remaining service gaps are listed above and in section 3, not hidden under recovery. |
+| Native recovery | Merged to main as `ceefc20`; extra worktrees removed and spec-fidelity history remains archived. Remaining service gaps are listed above and in section 3, not hidden under recovery. |
 | `setjmp`/`longjmp` and dependent `_ioabort` | **Deferred by the user.** Record the incorrect frame-return behaviour; revisit later. No control-flow design or implementation in the current work. |
 | Card, console and CD | Partial; CD blocking calls wake on live event flags, with ordered consumption and native cancellation. Returning read errors retry up to ten attempts. Seek/read/status honor patched A78/A7E/A7C commands and bounded acceptance retries, with per-call guest stack locals. Completion probes dispatch patched B0B TestEvent; long command-acceptance loops now yield through the existing loop budget so busy native work can progress. Remaining CD internals stay incomplete. CD opens preserve ISO versions and accept `?` filename matching. CD file reads enforce sector alignment/EOF and now use the existing native blocking helper, including patched commands/events/errors and scheduled completion. They check status through the existing blocking helper before seeking, then transfer the full requested sectors and clip using live FCB metadata after success. |
 | Other executable, exception and thread gaps | A(40h)'s documented fatal service is now named/handled/tested; BREAK event/exception entry remains open, as do executable and thread gaps. No runtime redesign authorised by the longjmp deferral. |
@@ -2111,6 +2133,12 @@ native artifacts remain at `15d15f3`, and all other validation epochs remain
 explicitly unchanged. No active children, input/save changes or main merge.
 
 ## Progress log
+
+- 2026-10-31: recovery merged into main as `ceefc20`, exact reviewed recovery
+  tree with both histories retained. Removed 25 extra worktrees and pruned one
+  stale registration, preserving unrelated WIP as `633225b` on its archive branch
+  and local artifacts under `out/worktree-cleanup-20261031/`. Fresh main release
+  CLI build passes. Full BIOS/CI remain open; see the recovery checkpoint above.
 
 - 2026-10-31: callable kernel functions and callback ordering integrated as
   described above; shared native/fallback state and baseline scheduling remain.

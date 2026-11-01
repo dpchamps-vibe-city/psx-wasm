@@ -5,10 +5,13 @@ Milestone history is in [`completed/`](completed/). Older audit findings below
 retain their provenance; the active recovery status is recorded separately.
 
 - **Active plan:** [`salvage-bios-work.md`](salvage-bios-work.md), native recovery
-  accepted for merge to main; **full BIOS completion remains a separate,
+  merged into main as `ceefc20`; **full BIOS completion remains a separate,
   unfinished milestone**. Its recovery checkpoint groups the remaining executable,
   control-flow, CD/card, console, resource and validation work. The provisional
   4–8 engineer-week allowance is low-confidence, not a delivery commitment.
+  Extra worktrees are removed; archived history, unrelated renderer/web WIP
+  (`archive/main-wt-2-wip-20261031`) and local artifacts are preserved. Details
+  and artifact locations are in the plan's recovery merge checkpoint.
   Checkpointed results supersede older coverage/gate claims below.
 - **Last full gate runs:** both `psxw ci btn` and `psxw ci bof4` completed at the
   ABI-17 recovery foundation (`a74f832`, code `4cce9e3`) and exited 2. Missing
