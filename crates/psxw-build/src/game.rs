@@ -423,15 +423,16 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     } else {
         psxw_cc::objects_compiled_with(&calls_dir, &dwarf_flags)?;
     }
-    // Declared binding operations keep their call boundary through clang.
-    let boundaries = crate::binding::boundaries(inputs.manifest.dispatch.as_ref());
+    // Declared binding operations and changing slots keep their call
+    // boundary through clang.
+    let boundaries = crate::binding::Boundaries::new(inputs.manifest.dispatch.as_ref(), &inputs.map);
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
             let (dir, flags): (PathBuf, &[&str]) =
                 if opts.ubsan { (ubsan_dir.join(c), &ubsan_flags) } else { (calls_dir.join(c), &dwarf_flags) };
-            let ops = boundaries.get(c.as_str()).cloned().unwrap_or_default();
-            c_input(&clang, c, o, &dir, flags, opts.ubsan.then_some(ignorelist.as_path()), gcc, &ops)
+            let keep = |n: &str| boundaries.keeps(&inputs.map, c, n);
+            c_input(&clang, c, o, &dir, flags, opts.ubsan.then_some(ignorelist.as_path()), gcc, &keep)
         })
         .collect::<Result<_>>()?;
 
@@ -1158,8 +1159,8 @@ pub fn game_path(ws: &Workspace, game: &str) -> PathBuf {
 /// A census C object as the link takes it (D50): every non-inline
 /// function weak and noinline, compiled with `flags` into `dir`, with its
 /// prototype facts. The object is rebuilt when its variant changed, or
-/// when it is older than `newer_than`. `boundaries`: declared binding
-/// operations, kept out of line even when written `inline`.
+/// when it is older than `newer_than`. `keep`: functions kept out of line
+/// even when written `inline` (binding operations and changing slots).
 pub(crate) fn c_input(
     clang: &psxw_cc::Clang,
     container: &str,
@@ -1168,7 +1169,7 @@ pub(crate) fn c_input(
     flags: &[&str],
     newer_than: Option<&Path>,
     gcc: Gcc,
-    boundaries: &BTreeSet<String>,
+    keep: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<Input> {
     let stem = census_obj.file_stem().unwrap_or_default().to_string_lossy().into_owned();
     let names: BTreeSet<String> = WasmObject::read(census_obj)?
@@ -1178,7 +1179,7 @@ pub(crate) fn c_input(
         .map(|s| s.name.clone())
         .collect();
     let text = std::fs::read_to_string(census_obj.with_extension("i"))?;
-    let variant = psxw_cc::ast::hook_variant(&text, &names, boundaries);
+    let variant = psxw_cc::ast::hook_variant(&text, &names, keep);
     std::fs::create_dir_all(dir)?;
     let vi = dir.join(format!("{stem}.i"));
     let vo = dir.join(format!("{stem}.o"));

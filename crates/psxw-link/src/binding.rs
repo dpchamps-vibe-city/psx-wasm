@@ -88,6 +88,8 @@ pub enum Offset {
     Value(Value),
     /// Derived from the destination by the placement's segments.
     Derive,
+    /// Derived, and this value (a `c_marker`'s) must equal it.
+    DeriveChecked(Value),
 }
 
 /// A scalar the wrapper reads at the rule's event.
@@ -299,7 +301,7 @@ pub(crate) fn operation(
             if let Target::Selector { value, .. } = target {
                 used.push(value);
             }
-            if let Offset::Value(v) = source_offset {
+            if let Offset::Value(v) | Offset::DeriveChecked(v) = source_offset {
                 used.push(v);
             }
         }
@@ -554,7 +556,7 @@ fn apply(f: &mut Function, r: &Refs, shape: &Shape, l: &Locals, index: usize, ru
     match &rule.effect {
         Effect::Invalidate => call(f, invalidate),
         Effect::Publish { target, source_offset } => {
-            if let Offset::Value(v) = source_offset {
+            if let Offset::Value(v) | Offset::DeriveChecked(v) = source_offset {
                 value(f, w, shape, l, v);
                 f.instruction(&I::LocalSet(l.so));
             }
@@ -624,7 +626,7 @@ fn check_destination(f: &mut Function, r: &Refs, l: &Locals, rule: usize, p: &Pl
                 f.instruction(&I::I32LeU);
                 f.instruction(&I::I32And);
             }
-            Offset::Derive => {
+            Offset::Derive | Offset::DeriveChecked(_) => {
                 // rel = dst - base; rel <= size && len <= size - rel
                 dstm(f);
                 f.instruction(&I::I32Const(base as i32));
@@ -638,6 +640,15 @@ fn check_destination(f: &mut Function, r: &Refs, l: &Locals, rule: usize, p: &Pl
                 f.instruction(&I::I32Sub);
                 f.instruction(&I::I32LeU);
                 f.instruction(&I::I32And);
+                if matches!(offset, Offset::DeriveChecked(_)) {
+                    // so == file.start + rel
+                    f.instruction(&I::LocalGet(l.so));
+                    f.instruction(&I::I32Const(file.start as i32));
+                    f.instruction(&I::LocalGet(l.rel));
+                    f.instruction(&I::I32Add);
+                    f.instruction(&I::I32Eq);
+                    f.instruction(&I::I32And);
+                }
             }
         }
         f.instruction(&I::If(BlockType::Empty));

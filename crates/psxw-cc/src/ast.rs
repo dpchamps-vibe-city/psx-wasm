@@ -496,19 +496,19 @@ pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
 /// GCC 2.95 at `-O2` left every call to a non-inline function. A `static`
 /// one loses `static` (a weak definition can't be internal) on every
 /// file-scope declaration. `inline` functions are left alone: GCC inlined
-/// them too, so the original program has no such calls. A function in
-/// `boundaries` (a declared binding operation, plans/dispatch-binding)
-/// keeps its call boundary even when written `inline`: it loses `inline`
-/// and becomes weak and noinline like the rest, so every call reaches its
-/// instrumentation.
-pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>, boundaries: &std::collections::BTreeSet<String>) -> String {
+/// them too, so the original program has no such calls. A function
+/// `keep` names (plans/dispatch-binding: a declared operation, or one at a
+/// changing slot) keeps its call boundary even when written `inline`: it
+/// loses `inline` and becomes weak and noinline like the rest, so every
+/// call reaches its instrumentation or binding lookup.
+pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>, keep: &dyn Fn(&str) -> bool) -> String {
     let ast = parse(text);
     let mut edits: Vec<crate::edit::Edit> = Vec::new();
     let words = |s: &str| -> Vec<String> { s.split(|c: char| !c.is_alphanumeric() && c != '_').map(str::to_string).collect() };
     let mut made_extern: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let is_inline = |s: &str| matches!(s, "inline" | "__inline" | "__inline__");
     for f in ast.functions() {
-        let boundary = boundaries.contains(&f.name);
+        let boundary = keep(&f.name);
         if !names.contains(&f.name) && !boundary {
             continue;
         }
@@ -578,7 +578,7 @@ mod hook_tests {
     fn hooked_functions_become_weak() {
         let src = "static int g(int);\nint f(int a) { return g(a) + 1; }\nstatic int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n";
         let names = ["f", "g", "h"].iter().map(|s| s.to_string()).collect();
-        let out = super::hook_variant(src, &names, &Default::default());
+        let out = super::hook_variant(src, &names, &|_| false);
         assert_eq!(
             out,
             " int g(int);\n__attribute__((weak, noinline)) int f(int a) { return g(a) + 1; }\n__attribute__((weak, noinline)) int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n"
@@ -589,8 +589,7 @@ mod hook_tests {
     fn declared_operations_keep_their_boundary() {
         let src = "static inline int h(int a) { return a; }\ninline int k(int a) { return a; }\nint f(int a) { return h(a) + k(a); }\n";
         let names = ["f"].iter().map(|s| s.to_string()).collect();
-        let ops = ["h", "k"].iter().map(|s| s.to_string()).collect();
-        let out = super::hook_variant(src, &names, &ops);
+        let out = super::hook_variant(src, &names, &|n| n == "h" || n == "k");
         assert!(!out.contains("inline int"), "{out}");
         assert!(out.contains("__attribute__((weak, noinline))  int h(int a)"), "{out}");
         assert!(out.contains("__attribute__((weak, noinline)) int k(int a)"), "{out}");

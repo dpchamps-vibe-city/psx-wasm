@@ -5,9 +5,8 @@ and acceptance remain unfinished. This milestone is **not complete**.
 D72 was removed, not adopted. Without `[dispatch]` facts, production retains
 the distinguishing-word patch and the previous D6/D7 dispatch routing. With
 them, dispatch-binding milestone A (D73) binds the covered regions explicitly.
-Thirteen `D05/explicit-binding-*` variants exercise that path; every report
-names each variant's `explicit` or `legacy` path. The full corpus is 64
-variants: 38 execution, 11 safety, 14 failed, 1 unresolved (exit 2). The 14
+Fourteen `D05/explicit-binding-*` variants exercise that path; every report
+names each variant's `explicit` or `legacy` path. The full corpus is 65 variants: 38 execution, 12 safety, 14 failed, 1 unresolved (exit 2). The 14
 failures and the unresolved variant are the legacy baseline set below. The synthetic command
 deliberately returns nonzero on them. No mandatory CI gate is installed.
 

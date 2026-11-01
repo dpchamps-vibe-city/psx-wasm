@@ -87,17 +87,39 @@ pub(crate) fn dispatch(
     Ok((binding, overlays, report))
 }
 
-/// Per container, the functions declared rules instrument: their call
-/// boundary must survive C optimization (an inlined call would skip the
-/// operation's wrapper).
-pub(crate) fn boundaries(section: Option<&DispatchSection>) -> BTreeMap<String, BTreeSet<String>> {
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for r in section.iter().flat_map(|s| &s.rules) {
-        if let (Some(c), Some(f)) = (&r.container, &r.function) {
-            out.entry(c.clone()).or_default().insert(f.clone());
+/// The functions whose call boundary must survive C optimization: declared
+/// operations (an inlined call would skip the wrapper) and every function
+/// at a changing slot (an inlined body would skip the binding lookup). By
+/// address, so whatever name the C or the facts use for them counts.
+pub(crate) struct Boundaries {
+    operations: BTreeSet<(String, u32)>,
+    /// The placements' text, as window offsets.
+    covered: Vec<Range<u32>>,
+}
+
+impl Boundaries {
+    pub(crate) fn new(section: Option<&DispatchSection>, map: &AddressMap) -> Self {
+        let mut operations = BTreeSet::new();
+        let mut covered = Vec::new();
+        if let Some(s) = section {
+            for r in &s.rules {
+                if let (Some(c), Some(f)) = (&r.container, &r.function) {
+                    operations.extend(map.resolve(c, f).map(|r| (c.clone(), r.addr)));
+                }
+            }
+            for p in &s.placements {
+                covered.extend(map.container(&p.container).into_iter().flat_map(|c| c.text.iter().map(window)));
+            }
         }
+        Self { operations, covered }
     }
-    out
+
+    /// Whether C in `container` defining `name` must keep its boundary.
+    pub(crate) fn keeps(&self, map: &AddressMap, container: &str, name: &str) -> bool {
+        map.resolve(container, name).is_some_and(|r| {
+            self.operations.contains(&(container.to_string(), r.addr)) || self.covered.iter().any(|k| k.contains(&(r.addr & WINDOW_MASK)))
+        })
+    }
 }
 
 fn window(r: &Range<u32>) -> Range<u32> {
@@ -318,6 +340,8 @@ pub(crate) fn plan(
                     facts::Target::Request => return Err(unimplemented("publishes a request's placement")),
                 };
                 let source_offset = match r.source_offset.as_ref().context("validated: source_offset")? {
+                    // A marker's offset must agree with the placement's mapping.
+                    facts::Offset::Placement if marker.is_some() => link::Offset::DeriveChecked(link::Value::Arg(2)),
                     facts::Offset::Placement => link::Offset::Derive,
                     facts::Offset::Value(v) => link::Offset::Value(val(v, 2)?),
                 };
@@ -449,12 +473,18 @@ pub(crate) fn plan(
             Some(why) => bail!("binding.invalid_fact: {what}: analysis can't bound its writes ({why}); declare `destinations`"),
         };
         let code: Vec<String> = bounds.iter().filter(|d| covered.iter().any(|k| overlaps(k, &window(d)))).map(hex).collect();
-        // A rule at its site, or at a write inside its function.
+        // A rule at its site (by address: any name for the function), or
+        // at a write inside its function.
+        let at = |site: &Site| match site {
+            Site::Function { container: c, function } => map.resolve(c, function).map(|r| (c.clone(), r.addr)),
+            _ => None,
+        };
         let by: Vec<&str> = f
             .rules
             .iter()
             .filter(|r| {
                 r.site == w.site
+                    || at(&r.site).is_some_and(|k| at(&w.site) == Some(k))
                     || matches!((&r.site, &extent), (Site::Pc { container: c, pc }, Some((wc, e))) if c == wc && e.contains(pc))
             })
             .map(|r| r.id.as_str())
@@ -627,7 +657,7 @@ fn reads(rule: &link::Rule) -> Vec<&link::Value> {
         if let link::Target::Selector { value, .. } = target {
             v.push(value);
         }
-        if let link::Offset::Value(s) = source_offset {
+        if let link::Offset::Value(s) | link::Offset::DeriveChecked(s) = source_offset {
             v.push(s);
         }
     }

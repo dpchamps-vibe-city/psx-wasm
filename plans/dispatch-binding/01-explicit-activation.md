@@ -348,6 +348,31 @@ for the required CLI/reference run.
   64 variants: 38 execution, 11 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved variant being the legacy baseline
   set. `psxw build btn` links at 2,604,703 bytes (the runtime gained the new fault cause's name) and `psxw run btn --frames 300 --check no-trap` passes.
 
+- 2026-11-01, second review fixes. Three more defects reproduced; each has a
+  regression that fails when its fix is reverted (scratchpad mutations,
+  restored):
+  1. Boundaries were chosen by the manifest's literal function name, so naming
+     the loader by its `func_<ADDR>` alias left its C inlinable. Boundaries are
+     now resolved to addresses, and any C name for that address counts. The
+     same name comparison made an aliased rule miss its writer; writer coverage
+     now compares addresses too. The mixed and edited-C variants name the loader
+     by its alias.
+  2. Only declared operations kept their boundary, so an `inline` function at a
+     changing slot could vanish into another C function and skip its binding
+     lookup. Every C function at a covered address now keeps its boundary.
+     Module A has matching C in the C variants, its `f` `inline` and called by
+     its tail `k`; reverting returns stale A from `k` after B loads.
+  3. A marker's source offset went unchecked when the rule derives it from the
+     placement. It must now equal the derived offset, or the publication is
+     rejected (`binding.bad_destination`). The positive marker variant derives
+     its offset; `explicit-binding-marker-offset` passes a wrong one.
+- Second-review evidence: `psxw-cc` 21, `psxw-inputs` 17, `psxw-build` 4 and
+  `link_passes` 8 tests pass. `psxw conform dispatch --case
+  D05/explicit-binding`: 14 variants, 4 execution and 10 safety, 0 failed, 0
+  unresolved, the live reference agreeing on the 7 it runs. Full corpus:
+  65 variants: 38 execution, 12 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved variant being the legacy baseline
+  set. `psxw build btn` links at 2,604,703 bytes and `psxw run btn --frames 300 --check no-trap` passes.
+
 ## Findings
 
 ### A1 reference inventory

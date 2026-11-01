@@ -255,15 +255,18 @@ replaces the stub for the regions it covers:
   unbinds only slots whose bound implementation depends on a written byte,
   so an untouched tail stays bound.
 - The operation runs unchanged: the wrapper takes the function's place, so
-  supplied C stays the implementation. A declared operation keeps its call
-  boundary even when its C is `inline` (weak and noinline, like D50's other
-  functions), and the arguments a rule reads are captured at entry. A selector no case names, or a
+  supplied C stays the implementation. A declared operation, and any C
+  function at a covered address, keeps its call boundary even when written
+  `inline` (weak and noinline, like D50's other functions; chosen by address,
+  whatever name the C or the facts use). The arguments a rule reads are
+  captured at entry. A selector no case names, or a
   destination outside the placement's layout, calls `psx.binding_fault`
   (ABI 19) instead of publishing a guess.
 - A write inside supplied C is stated by the C itself: the rule names a
   `c_marker`, and the C calls `psxw_binding_site_<marker>` from the
   generated `psxw_binding.h` after the write, in the function holding it.
-  Values the rule declares literally must match the call's. Writer summaries are inferred
+  Values the rule declares literally must match the call's, and a source
+  offset the rule derives from the placement must match the derived one. Writer summaries are inferred
   from constant-address stores first; declared bounds cover what analysis
   can't and must contain every known write.
 - Facts the build can't honour fail it with a `binding.*` diagnostic:

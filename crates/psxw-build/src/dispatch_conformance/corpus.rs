@@ -760,6 +760,8 @@ enum Loader {
     MarkerC,
     /// The marker call is in an unrelated helper, not the loader.
     MarkerElsewhere,
+    /// The marker passes source offset 4 where the placement maps 0.
+    MarkerBadOffset,
 }
 
 /// The executable: a resident loader, `load_module(sel, dst, len)`, that
@@ -811,9 +813,10 @@ fn explicit_main(lay: &Layout, loader: Loader) -> Image {
                 lay.log
             ),
             Loader::MarkerC => "    psxw_binding_site_module_written((unsigned)r.dst, (unsigned)r.len, 0u, r.sel, 0u);\n".to_string(),
+            Loader::MarkerBadOffset => "    psxw_binding_site_module_written((unsigned)r.dst, (unsigned)r.len, 4u, r.sel, 0u);\n".to_string(),
             _ => String::new(),
         };
-        let marked = matches!(loader, Loader::MarkerC | Loader::MarkerElsewhere);
+        let marked = matches!(loader, Loader::MarkerC | Loader::MarkerElsewhere | Loader::MarkerBadOffset);
         let include = if marked { "#include \"psxw_binding.h\"\n" } else { "" };
         let helper = if loader == Loader::MarkerElsewhere {
             "void unused_helper(void) { psxw_binding_site_module_written(0u, 0u, 0u, 0u, 0u); }\n"
@@ -851,27 +854,32 @@ fn explicit_main(lay: &Layout, loader: Loader) -> Image {
 }
 
 /// The loader's completed return publishes the selected module where it
-/// was loaded.
-const RETURN_RULE: &str = r#"[[dispatch.rules]]
+/// was loaded. `function` names it: by its symbol, or by its address
+/// alias (`func_<ADDR>`).
+fn return_rule(function: &str) -> String {
+    format!(
+        r#"[[dispatch.rules]]
 id = "load-completed"
 container = "main"
-function = "load_module"
+function = "{function}"
 event = "return"
 effect = "publish"
 placement = "selector"
 selector = "arg:0"
-cases = { "0" = "slot-a", "1" = "slot-b", "2" = "region-c" }
+cases = {{ "0" = "slot-a", "1" = "slot-b", "2" = "region-c" }}
 destination = "arg:1"
 length = "arg:2"
 source_offset = "const:0"
 success = "zero"
 request = "call"
-"#;
+"#
+    )
+}
 
 /// The loader's write, at its original store: authored C states its
 /// completed range at a `c_marker` call (`marker`), or the build asks for
 /// one. The C must pass `source_offset` as declared.
-fn write_rule(main: &Image, marker: Option<&str>, source_offset: u32) -> String {
+fn write_rule(main: &Image, marker: Option<&str>, source_offset: &str) -> String {
     let at = main.addr("load_module") + LM_STORE;
     let word = main.bytes[(at - main.base) as usize..][..4].try_into().map(u32::from_le_bytes).unwrap_or_default();
     assert_eq!(word >> 26, 0x2B, "LM_STORE names load_module's sw");
@@ -880,7 +888,7 @@ fn write_rule(main: &Image, marker: Option<&str>, source_offset: u32) -> String 
         "[[dispatch.rules]]\nid = \"module-written\"\ncontainer = \"main\"\npc = 0x{at:08X}\nevent = \"after-write\"\n{marker}\
          effect = \"publish\"\nplacement = \"selector\"\nselector = \"arg:0\"\n\
          cases = {{ \"0\" = \"slot-a\", \"1\" = \"slot-b\", \"2\" = \"region-c\" }}\n\
-         destination = \"write-address\"\nlength = \"write-size\"\nsource_offset = \"const:{source_offset}\"\n"
+         destination = \"write-address\"\nlength = \"write-size\"\nsource_offset = \"{source_offset}\"\n"
     )
 }
 
@@ -943,8 +951,9 @@ length = "arg:1"
 
 /// The slot's modules, each with f(a) = a + k; a is long, its tail
 /// function k at slot+0x80 calling the slot (b's shorter load leaves it in
-/// place); the second region's module, h() = 0xC1.
-fn explicit_images(lay: &Layout, n: &Names) -> (Image, Image, Image) {
+/// place); the second region's module, h() = 0xC1. With `c`, a has
+/// matching C, its f `inline`: k's call must still look the slot up.
+fn explicit_images(lay: &Layout, n: &Names, c: bool) -> (Image, Image, Image) {
     let mut u = Unit::new(&n.of("a"), lay.slot);
     leaf(&mut u, "f", |a| {
         a.addiu(V0, A0, 0x100);
@@ -954,7 +963,24 @@ fn explicit_images(lay: &Layout, n: &Names) -> (Image, Image, Image) {
     u.a.addiu(SP, SP, -24).sw(RA, 16, SP).jal_abs(lay.slot).nop().lw(RA, 16, SP).addiu(V0, V0, 0x1000);
     mark(&mut u.a, lay, V0);
     u.a.jr(RA).addiu(SP, SP, 24);
-    let a = u.image(Some(lay.slot + 0x100), &[]);
+    let mut a = u.image(Some(lay.slot + 0x100), &[]);
+    if c {
+        a.c = Some(format!(
+            "inline int f(int a) {{\n\
+             \x20   unsigned **log = (unsigned **)0x{log:08X}u;\n\
+             \x20   int v = a + 0x100;\n\
+             \x20   *(*log)++ = v;\n\
+             \x20   return v;\n\
+             }}\n\
+             int k(int a) {{\n\
+             \x20   unsigned **log = (unsigned **)0x{log:08X}u;\n\
+             \x20   int v = f(a) + 0x1000;\n\
+             \x20   *(*log)++ = v;\n\
+             \x20   return v;\n\
+             }}\n",
+            log = lay.log
+        ));
+    }
     let mut u = Unit::new(&n.of("c"), lay.slot2);
     leaf(&mut u, "h", |a| ret_k(a, lay, 0xC1));
     let c = u.image(Some(lay.slot2 + 0x80), &[]);
@@ -967,7 +993,7 @@ fn explicit_images(lay: &Layout, n: &Names) -> (Image, Image, Image) {
 /// unaffected second region, and an empty clear that changes nothing.
 fn d05_explicit(lay: &Layout, n: &Names, loader: Loader) -> Fixture {
     let main = explicit_main(lay, loader);
-    let (a, b, c) = explicit_images(lay, n);
+    let (a, b, c) = explicit_images(lay, n, loader != Loader::Lifted);
     let len = |im: &Image| im.bytes.len() as u32;
     let edit: &[u32] = if loader == Loader::EditedC { &[EDIT_MARK] } else { &[] };
     let (lm, load_c) = (main.addr("load_module"), main.addr("load_c"));
@@ -998,8 +1024,9 @@ fn d05_explicit(lay: &Layout, n: &Names, loader: Loader) -> Fixture {
     s.call(saved, [3, 0, 0, 0], 0x103, &[lay.slot, 0x103]);
     let init = vec![(lay.stage, a.bytes.clone()), (lay.stage + 0x400, b.bytes.clone()), (lay.stage + 0x800, c.bytes.clone())];
     let rule = match loader {
-        Loader::MarkerC | Loader::MarkerElsewhere => write_rule(&main, Some("module_written"), 0),
-        _ => RETURN_RULE.to_string(),
+        Loader::MarkerC | Loader::MarkerElsewhere | Loader::MarkerBadOffset => write_rule(&main, Some("module_written"), "placement"),
+        Loader::Lifted => return_rule("load_module"),
+        _ => return_rule(&format!("func_{:08X}", main.addr("load_module"))),
     };
     let mut f = Fixture::new(vec![main, a, b, c], s);
     f.init = init;
@@ -1024,7 +1051,7 @@ fn d05_explicit_marker(lay: &Layout, n: &Names) -> Fixture {
 /// exists, so the build asks for the marker instead of lifting the C.
 fn d05_explicit_missing_c_site(lay: &Layout, n: &Names) -> Fixture {
     let mut f = d05_explicit(lay, n, Loader::MatchingC);
-    f.dispatch = Some(explicit_facts(n, lay, &write_rule(&f.images[0], None, 0)));
+    f.dispatch = Some(explicit_facts(n, lay, &write_rule(&f.images[0], None, "placement")));
     f.script = Script::default();
     f.build = Build::Rejected("binding.missing_c_write_site: rule `module-written`".into());
     f
@@ -1041,12 +1068,25 @@ fn d05_explicit_marker_elsewhere(lay: &Layout, n: &Names) -> Fixture {
 /// The rule declares the write's source offset 4; the C passes 0.
 fn d05_explicit_marker_mismatch(lay: &Layout, n: &Names) -> Fixture {
     let mut f = d05_explicit(lay, n, Loader::MarkerC);
-    f.dispatch = Some(explicit_facts(n, lay, &write_rule(&f.images[0], Some("module_written"), 4)));
+    f.dispatch = Some(explicit_facts(n, lay, &write_rule(&f.images[0], Some("module_written"), "const:4")));
     let main = &f.images[0];
     let (lm, save) = (main.addr("load_module"), main.addr("save_ptr"));
     let len = f.images[3].bytes.len() as u32;
     let mut s = Script::default();
     s.call(save, [lay.slot, 0, 0, 0], 0, &[]).reject(lm, [2, lay.slot2, len, 0], "binding.marker_mismatch #0 0x00000000".into());
+    f.script = s;
+    f
+}
+
+/// The C passes source offset 4 where the placement maps the destination
+/// to 0: the publication is rejected.
+fn d05_explicit_marker_offset(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MarkerBadOffset);
+    let main = &f.images[0];
+    let (lm, save) = (main.addr("load_module"), main.addr("save_ptr"));
+    let len = f.images[3].bytes.len() as u32;
+    let mut s = Script::default();
+    s.call(save, [lay.slot, 0, 0, 0], 0, &[]).reject(lm, [2, lay.slot2, len, 0], format!("binding.bad_destination #0 0x{:08X}", lay.slot2));
     f.script = s;
     f
 }
@@ -1569,6 +1609,7 @@ fn defs() -> Vec<Def> {
         d("D05", "explicit-binding-missing-c-site", "rejected facts: a C write site without its c_marker", REF, d05_explicit_missing_c_site),
         d("D05", "explicit-binding-marker-elsewhere", "rejected facts: the marker call isn't in the function holding the write", REF, d05_explicit_marker_elsewhere),
         d("D05", "explicit-binding-marker-mismatch", "port rejection: a marker value contradicts its rule", REF, d05_explicit_marker_mismatch),
+        d("D05", "explicit-binding-marker-offset", "port rejection: a marker's source offset contradicts the placement", REF, d05_explicit_marker_offset),
         d("D05", "explicit-binding-cleared", "port rejection: an invalidated module isn't callable", REF, d05_explicit_cleared),
         d("D05", "explicit-binding-wrong-writer", "rejected facts: a declared writer bound contradicts a known write", REF, d05_explicit_wrong_writer),
         d("D05", "explicit-binding-unknown-selector", "port rejection: a completed load names no placement", REF, d05_explicit_unknown_selector),
