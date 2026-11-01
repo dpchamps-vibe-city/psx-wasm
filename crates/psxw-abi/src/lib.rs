@@ -56,7 +56,9 @@ pub mod replay;
 ///   to the archived, incompatible map/residency experiments.
 /// - 18: callable native kernel verifier/handler pointers, through the
 ///   existing kernel_call and exception-exit seams.
-pub const ABI_VERSION: u32 = 18;
+/// - 19: explicit binding (plans/dispatch-binding A): `psx.binding_fault`
+///   rejects a publication a binding rule can't make.
+pub const ABI_VERSION: u32 = 19;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -297,6 +299,27 @@ pub mod psx {
     /// Adapters are exported as `adapter.<function name>` with the o32
     /// signature `(a0, a1, a2, a3) -> i64`.
     pub const ADAPTER_PREFIX: &str = "adapter.";
+    /// `(rule, cause, value) -> !`: binding rule `rule` (its index in the
+    /// build report) can't publish: [`super::binding_cause`] `cause`, with
+    /// the offending value. A port diagnostic, not a guest fault.
+    pub const BINDING_FAULT: &str = "binding_fault";
+}
+
+/// Why a binding rule rejected a publication ([`psx::BINDING_FAULT`]).
+pub mod binding_cause {
+    /// The selector's value is in none of the rule's cases.
+    pub const UNKNOWN_SELECTOR: u32 = 1;
+    /// The destination, length or source offset is outside the selected
+    /// placement's layout.
+    pub const BAD_DESTINATION: u32 = 2;
+
+    pub fn name(cause: u32) -> &'static str {
+        match cause {
+            UNKNOWN_SELECTOR => "binding.unknown_selector",
+            BAD_DESTINATION => "binding.bad_destination",
+            _ => "binding.fault",
+        }
+    }
 }
 
 /// The runtime's view of the guest: module `guest`.

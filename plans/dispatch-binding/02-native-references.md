@@ -174,3 +174,9 @@ required CLI/reference evidence cannot be replaced by tool-skipping unit tests.
 - Ordinary C frames retain their source implementation. Milestone C supplies
   explicit source-owned C transitions and rebinding for already-lifted code;
   native pointer promotion never authorizes automatic C-to-lift replacement.
+- From A: the linker counts each reference where it lowers it
+  (`psxw_link::game::Ctx::reference`: `fixed`, `slot`, `lookup`, legacy
+  classes) and `build.json` reports the totals. Extend that classification for
+  B's flows rather than adding a second classifier. Covered addresses' table
+  entries are A's bindings, so a native handle for a slot must still read the
+  current binding.

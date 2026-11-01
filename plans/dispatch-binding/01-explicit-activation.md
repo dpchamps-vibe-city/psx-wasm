@@ -1,8 +1,10 @@
 # A — Explicit activation with the existing pointer ABI
 
-**Status:** not started. **Depends on:** no earlier milestone. Implement the
-contracts in the [plan README](README.md); no separate activation approval is
-required.
+**Status:** implemented; subset acceptance passes against the live reference.
+The full corpus stays red on the legacy findings, as permitted at A. Remaining
+milestone-C obligations are listed in every explicit build report.
+**Depends on:** no earlier milestone. Implement the contracts in the
+[plan README](README.md); no separate activation approval is required.
 
 ## Deliverable
 
@@ -148,90 +150,90 @@ an accepted rule or reinterpret request initiation as completion.
 
 ### A1. Add the common binding plan
 
-- [ ] Inventory direct calls, address-taking, original data pointers, lifted
+- [x] Inventory direct calls, address-taking, original data pointers, lifted
   transfers, callbacks, native stand-ins and mod hooks. Record every current
   main-image/unique-address bypass and sampled-byte consumer.
-- [ ] Add per-reference categories: fixed function, changing slot, and guest
+- [x] Add per-reference categories: fixed function, changing slot, and guest
   address requiring lookup. Reuse `(container, entry)` identities; do not replace
   the compiler IR. Symbol provenance alone must not produce a fixed classification.
-- [ ] Parse and validate the schema above against pinned input metadata. Report
+- [x] Parse and validate the schema above against pinned input metadata. Report
   the rule/site and missing field on failure; do not ask for a policy choice.
-- [ ] Build a deterministic plan containing placements, affected executable
+- [x] Build a deterministic plan containing placements, affected executable
   intervals, entries, initial availability, rules and reference classifications.
   Include unique entries and main-image overlaps, not only duplicate addresses.
-- [ ] Initialize only boot-resident ranges. Preserve unrelated intervals. Describe
+- [x] Initialize only boot-resident ranges. Preserve unrelated intervals. Describe
   exact write extents so a shorter load does not erase an untouched old tail.
 
 ### A2. Generate binding updates and instrument operations
 
-- [ ] Generate private publication helpers in the linked game module. Reuse the
+- [x] Generate private publication helpers in the linked game module. Reuse the
   current guest-address table for A and its existing o32/wrapper entries. No host
   module selector, standalone runtime crate or new scheduler is needed.
-- [ ] Route affected C direct calls, lifted direct/tail calls and pointer calls
+- [x] Route affected C direct calls, lifted direct/tail calls and pointer calls
   through the same binding plan. Remove main-container exemptions for those
   ranges. Preserve proven stable direct calls elsewhere.
-- [ ] Wrap declared operations in both C and lifted code, preserving arguments,
+- [x] Wrap declared operations in both C and lifted code, preserving arguments,
   returns and stack state. Capture values needed after the call. Publish on the
   declared event and predicate, not merely whenever the operation is entered.
   Keep the C body and its source locations; use verified C sites or the explicit
   marker interface above, never replace a C writer with its lifted implementation.
-- [ ] Ensure every invocation route reaches instrumentation. Insert before a
+- [x] Ensure every invocation route reaches instrumentation. Insert before a
   boundary can disappear through optimization or preserve that boundary locally;
   do not globally disable inlining or optimization.
-- [ ] Keep the original load/copy/unpack and its data effects. Perform a completed
+- [x] Keep the original load/copy/unpack and its data effects. Perform a completed
   publication without a callback/safepoint between its binding writes.
-- [ ] Reject unknown selector values and invalid source/destination ranges without
+- [x] Reject unknown selector values and invalid source/destination ranges without
   publishing a guessed entry. Keep rule errors distinct from original guest faults.
-- [ ] Initialize/reinitialize bindings on boot/reset using the same generated plan.
+- [x] Initialize/reinitialize bindings on boot/reset using the same generated plan.
   A compiled but unloaded function must not become callable by having a unique entry.
 
 ### A3. Preserve translation assumptions and existing interfaces
 
-- [ ] Retain runtime data/table reads. Prevent direct binding or expansion across
+- [x] Retain runtime data/table reads. Prevent direct binding or expansion across
   a replaceable dependency unless it is stable for the whole relevant execution.
   Do not add data fingerprints or whole-code hashes.
-- [ ] Keep `GuestCall.addr`, SDK/BIOS callbacks, stand-ins and host invocation in
+- [x] Keep `GuestCall.addr`, SDK/BIOS callbacks, stand-ins and host invocation in
   their existing guest representation. They must reach A's bindings, not a second
   residency authority. Native reference encoding belongs to B.
-- [ ] Record the boundaries still requiring C: partial writes, active continuations,
+- [x] Record the boundaries still requiring C: partial writes, active continuations,
   actual runtime merge and mod residency. Treat them as unfinished tasks with the
   README's fixed semantics, not unanswered contract questions.
-- [ ] Extend versioned build/conformance reports with rules, placements, fixed/slot
+- [x] Extend versioned build/conformance reports with rules, placements, fixed/slot
   classifications, available entries and all remaining legacy consumers. Reject
   malformed explicit-region facts instead of falling back to code probes.
 
 ### A4. Validate through production
 
-- [ ] Add `D05/explicit-binding-*` cases to the existing corpus. Original MIPS must
+- [x] Add `D05/explicit-binding-*` cases to the existing corpus. Original MIPS must
   actually load/copy modules; compiler facts use the same schema as real inputs.
   The host must not inject an activation answer between guest checkpoints.
-- [ ] Use one lifted and one mixed C/lift case covering A → B → A, unchanged saved
+- [x] Use one lifted and one mixed C/lift case covering A → B → A, unchanged saved
   pointers, direct/indirect calls and a second unaffected region. Include a
   failure-before-write control. Avoid a Cartesian product of tiers and variants.
-- [ ] Add focused schema-error checks and reuse existing D02/D03 dependency/routing
+- [x] Add focused schema-error checks and reuse existing D02/D03 dependency/routing
   controls. Identify which cases exercise explicit bindings versus the legacy path.
-- [ ] Add a small deliberately edited C control with a result/effect absent from
+- [x] Add a small deliberately edited C control with a result/effect absent from
   its original MIPS. Verify it survives activation and the emitted implementation
   remains C. Judge that edit against its authored-source expectation, not the old
   binary; keep unchanged reference fixtures separate.
-- [ ] Compare matching-code fixtures in linked and production-optimized Wasm against
+- [x] Compare matching-code fixtures in linked and production-optimized Wasm against
   authored observations and the live original-MIPS reference. The deliberately
   edited C control instead uses its authored-source expectation. Inspect covered
   paths for absence of resident-word selectors; behavioural agreement alone could
   hide legacy use.
-- [ ] Suppress one activation update in a disposable mutation and verify the saved
+- [x] Suppress one activation update in a disposable mutation and verify the saved
   pointer case fails. Restore the implementation and retain the evidence.
 
 ## Exit criteria
 
-- [ ] Real operations drive generated publication through normal preparation,
+- [x] Real operations drive generated publication through normal preparation,
   linking and optimization; the fixture runner does not bypass the mechanism.
-- [ ] Required subset observations match, guest pointer values remain unchanged,
+- [x] Required subset observations match, guest pointer values remain unchanged,
   and covered paths do not read code words to select implementations.
-- [ ] Bad facts fail explicitly; legacy coverage is listed; remaining milestone-C
+- [x] Bad facts fail explicitly; legacy coverage is listed; remaining milestone-C
   obligations stay visible. Supplied C bodies, edits and debug locations survive
   instrumentation; there is no automatic C-to-lift fallback.
-- [ ] Design/report changes describe the implemented subset, not completed C.
+- [x] Design/report changes describe the implemented subset, not completed C.
 
 Commands once the new fixture group exists:
 
@@ -250,10 +252,85 @@ for the required CLI/reference run.
 
 ## Progress log
 
-- Not started. Schema and implementation order prescribed; no new acceptance run.
+- 2026-11-01: implemented A.
+  - Schema: `psxw_inputs::dispatch` parses the complete `[dispatch]` section
+    (placements, writers, rules, `c_continuations`), rejects unknown fields and
+    duplicate IDs, and validates value sources and event availability, naming
+    the rule and field.
+  - Plan: `psxw_build::binding` resolves facts against the address map and
+    tiers; shared by `psxw build` and the fixtures. Every entry in a placement's
+    text is a slot; boot binds only the main image's entries.
+  - Generation: `psxw_link::binding` emits the lookup, `binding_invalidate`,
+    one `binding_publish:<placement>` per placement and an `operation:` wrapper
+    per instrumented function. The dispatch table is the binding; a global per
+    slot records which candidate is bound. Rule errors call the new
+    `psx.binding_fault` (ABI 19), distinct from guest faults.
+  - Reports: `build.json` schema 2 and conformance schema 2 carry placements,
+    rules, writers, slots, entry and reference classifications, legacy
+    consumers and the unfinished C obligations; each conformance variant names
+    its `explicit` or `legacy` path.
+- Evidence (worktree `main-wt-5`, with uncommitted A changes):
+  - `cargo test -p psxw-inputs --lib`: 16 passed. `cargo test -p psxw-build
+    --lib`: 4 passed. `cargo test -p psxw-difftest --test link_passes`: 8 passed.
+  - `PSXW_DISPATCH_CASE=D05/explicit-binding cargo test -p psxw-build --test
+    dispatch`: 7 variants, 0 failed.
+  - `psxw conform dispatch --case D05/explicit-binding`: pass, 3 execution and
+    4 safety, 0 failed, 0 unresolved. The live reference
+    `emu-beetle-7fea57a-openbios-8a86b7e-runner-1` ran the lifted, mixed and
+    unknown-selector variants' supported checkpoints; all agree. Kept apart
+    from the full report in `out/conform/dispatch/a-subset/`.
+  - `psxw conform dispatch` (full): 58 variants: 37 execution, 6 safety, 14 failed, 1 unresolved (exit 2; kept in `out/conform/dispatch/a-full/`). The failures and the unresolved
+    variant are the recorded legacy baseline set; no legacy variant changed.
+  - Mutation (scratchpad, restored): skipping `slot-b`'s publication fails
+    `D05/explicit-binding-lifted` from step 10; the saved pointer returns
+    0x103 (stale A) instead of 0x203.
+  - `psxw build btn` (no `[dispatch]`, so the legacy path) links and merges with ABI 19: 2,604,657 bytes against the recorded 2,604,299, the difference being the new import and its runtime export. Its `build.json` reports 17 sampled-word addresses and 2,178 overlay entries with no residency check. `psxw run btn --frames 300 --check no-trap` passes.
 
 ## Findings
 
+### A1 reference inventory
+
+| Reference | Representation | Legacy route | Covered address (explicit) |
+|---|---|---|---|
+| C direct call | symbol → (container, address) | direct C→C when signatures agree and the address is unshared; else an o32 entry; a shared non-main address goes through the sampled stub; main is exempt | binding lookup; never a direct C→C call |
+| C address-taking, C data relocations | guest address (D6) | masked dispatch table | the same table, whose covered entries are bindings |
+| Original data pointers | guest address in original bytes | masked dispatch table | the same |
+| Lifted direct and tail calls (`psxw_f_*`) | (container, address) | `entry_from`: stub when shared and non-main; main exempt; unique entries direct | binding lookup |
+| Lifted calls into another overlay (`psxw_d_*`) | address | stub when shared, else the only container's entry | binding lookup |
+| Lifted `jalr`/`jr` (`psxw_call_indirect`) | runtime value | masked dispatch table | the same |
+| Jump tables | discovered targets | `switch`, `bad_jump` otherwise | unchanged (C discovers the union) |
+| Translator expansions | callee code embedded in the caller | unchecked | build error across a replaceable range (`binding.replaceable_dependency`, `binding.expanded_operation`) |
+| Host invocation, `GuestCall.addr`, SDK/BIOS callbacks, `execute` | guest address | masked dispatch table; `untranslated` stand-ins | the same table, so they reach bindings |
+| BIOS/kernel stand-ins | reserved addresses | reserved table slots | unchanged |
+| Mod hooks, slots, synthetic entries | (container, address); synthetic addresses | heads; overlay heads through the stub | a bound entry is its hook head; mods at covered addresses are C |
+| Sampled-byte consumers | code words | `Synth::OverlayStub`, `psxmod.resident`, `psxmod_loaded` | no stub at a covered address (checked per fixture build); mod residency unchanged (C) |
+
+Bypasses before A: the main-container exemption (`entry`, `entry_from` and the
+hooked-call path), unique entries (their table elements and `dynamic_entry`'s
+only container), and direct C→C calls at unshared addresses. All three are gone
+at covered addresses. Uncovered regions keep them and report them as
+`legacy-exempt` and `legacy-unique` references.
+
+### Implementation findings
+
+- Replacing an operation's function index with its wrapper reaches every route
+  (C direct, its o32 wrapper, the table, a hook chain's bottom, a moddable slot)
+  without touching the C body. DWARF and the name section keep the body's own
+  index, so source locations still name the authored C.
+- Wasm cannot compare funcrefs, so a global per slot records the bound
+  candidate. Invalidation unbinds a slot only when its bound implementation
+  depends on a written byte.
+- An implementation is bound only when one publication covers its whole
+  footprint: for lifted code, its translated regions in its own container; for
+  C, its extent. A footprint split across publications stays unbound until C
+  composes ranges.
+- Undeclared writes leave bindings stale. The mutation shows stale A, not a
+  rejection. Uncovered writers are C's strict-mode coverage, not A's.
+- Bindings initialize when the module is instantiated: the active table
+  segment holds the boot entries, and the slot globals start at their boot
+  candidates. The runtime has no in-place reset; a reset re-instantiates.
+- No game declares `[dispatch]` yet. Games keep the legacy path; `build.json`
+  2 reports their classification.
 - Disc-write notifications carry ranges, not a universal activation identity.
   The schema supplies identity from software operations and input facts.
 - Reusing the address table is an implementation step, not a commitment to retain

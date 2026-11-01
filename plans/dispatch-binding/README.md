@@ -1,6 +1,7 @@
 # Dispatch binding: implementation plan
 
-**Status:** not started. **Direction:** native references for proven fixed
+**Status:** A implemented with subset evidence; B and C not started.
+**Direction:** native references for proven fixed
 bindings; explicit activation for changing bindings; no resident-byte inference
 in the completed build. This document specifies the implementation contract.
 There are no pending approvals, policy choices or design gates in this plan.
@@ -294,7 +295,7 @@ not dispatch inference and need not be deleted.
 
 ## Tasks
 
-- [ ] Complete A and retain its evidence.
+- [x] Complete A and retain its evidence.
 - [ ] Complete B and retain its evidence.
 - [ ] Complete C, production input migration and the full conformance gate.
 
@@ -305,6 +306,11 @@ not dispatch inference and need not be deleted.
   continuation, namespace and failure contracts.
 - Removed automatic C-to-lift selection. Prescribed native C frame lifetime,
   authored C continuation/state interfaces and source-debugging acceptance instead.
+- 2026-11-01: A implemented: `[dispatch]` schema, binding plan, generated
+  publication/invalidation and operation wrappers, `psx.binding_fault` (ABI 19),
+  versioned reports, and seven `D05/explicit-binding-*` variants passing against
+  the live reference. The full corpus remains red on the legacy baseline set.
+  Evidence: [A's progress log](01-explicit-activation.md#progress-log).
 
 ## Findings
 

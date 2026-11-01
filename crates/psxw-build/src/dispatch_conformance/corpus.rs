@@ -222,11 +222,12 @@ struct Fixture {
     script: Script,
     build: Build,
     threads: bool,
+    dispatch: Option<String>,
 }
 
 impl Fixture {
     fn new(images: Vec<Image>, script: Script) -> Self {
-        Self { images, init: Vec::new(), script, build: Build::Links, threads: false }
+        Self { images, init: Vec::new(), script, build: Build::Links, threads: false, dispatch: None }
     }
 }
 
@@ -273,6 +274,7 @@ fn expand(d: &Def) -> Vec<Variant> {
                 build: f.build,
                 threads: f.threads,
                 review_required: d.review_required,
+                dispatch: f.dispatch,
             }
         })
         .collect()
@@ -736,6 +738,258 @@ fn d05_unpack(lay: &Layout, n: &Names) -> Fixture {
     d05(lay, n, Arrive::Unpack)
 }
 
+// ---- D05 explicit binding: real loading operations publish -------------
+
+/// Modules staged for the resident loader, at `stage + 0x400 * selector`.
+const STAGED: u32 = 3;
+/// The edited C's extra log entry: an effect the original binary lacks.
+const EDIT_MARK: u32 = 0xED17;
+
+/// How the executable's loader and drivers are implemented.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loader {
+    /// All lifted MIPS.
+    Lifted,
+    /// Matching C for the loader and two drivers; the rest lifted.
+    MatchingC,
+    /// The loader's C deliberately logs [`EDIT_MARK`] after loading.
+    EditedC,
+}
+
+/// The executable: a resident loader, `load_module(sel, dst, len)`, that
+/// copies staged module `sel` to `dst` and returns 0, or returns 1 before
+/// writing anything when `sel` names no staged module; a saved function
+/// pointer; drivers into both regions.
+fn explicit_main(lay: &Layout, loader: Loader) -> Image {
+    let saved = lay.stage + 0x1000;
+    let mut main = main_image(lay, |u| {
+        let a = u.func("load_module");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).sltiu(T0, A0, STAGED as i32).beq(T0, ZERO, "lm_fail").nop();
+        a.sll(T0, A0, 10).li(T1, lay.stage).addu(T1, T1, T0).mov(A0, A1).mov(A1, T1).jal("copy").nop();
+        a.lw(RA, 16, SP).ori(V0, ZERO, 0).jr(RA).addiu(SP, SP, 24);
+        a.label("lm_fail");
+        a.lw(RA, 16, SP).ori(V0, ZERO, 1).jr(RA).addiu(SP, SP, 24);
+        // save_ptr(p): a function pointer kept in data.
+        u.func("save_ptr").li(T0, saved).sw(A0, 0, T0).jr(RA).ori(V0, ZERO, 0);
+        // call_saved(a): log the saved pointer, then call it.
+        let a = u.func("call_saved");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).li(T0, saved).lw(T1, 0, T0).nop();
+        mark(a, lay, T1);
+        a.jalr(T1).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        u.func("call_slot2").addiu(SP, SP, -24).sw(RA, 16, SP).jal_abs(lay.slot2).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        u.func("drive_c").addiu(SP, SP, -24).sw(RA, 16, SP).jal_abs(lay.slot).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        u.func("drive_cp").addiu(SP, SP, -24).sw(RA, 16, SP).mov(T0, A0).jalr(T0).mov(A0, A1);
+        u.a.lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+    });
+    if loader != Loader::Lifted {
+        let edit = if loader == Loader::EditedC {
+            format!("    {{ unsigned **log = (unsigned **)0x{:08X}u; *(*log)++ = 0x{EDIT_MARK:X}u; }}\n", lay.log)
+        } else {
+            String::new()
+        };
+        main.c = Some(format!(
+            "void flush(void);\n\
+             int func_{slot:08X}(int a);\n\
+             int load_module(unsigned sel, unsigned *dst, int len) {{\n\
+             \x20   unsigned *src;\n\
+             \x20   if (sel >= {STAGED}u) return 1;\n\
+             \x20   src = (unsigned *)(0x{stage:08X}u + sel * 0x400u);\n\
+             \x20   do {{ *dst++ = *src++; len -= 4; }} while (len != 0);\n\
+             \x20   flush();\n\
+             {edit}    return 0;\n\
+             }}\n\
+             int drive_c(int a) {{ return func_{slot:08X}(a); }}\n\
+             int drive_cp(int (*f)(int), int a) {{ return f(a); }}\n",
+            slot = lay.slot,
+            stage = lay.stage,
+        ));
+    }
+    main
+}
+
+/// The facts a game would state: three placements, writer summaries, and
+/// the loader's completed return publishing the selected module where it
+/// was loaded.
+fn explicit_facts(n: &Names, lay: &Layout) -> String {
+    let saved = lay.stage + 0x1000;
+    format!(
+        r#"[dispatch]
+schema_version = 1
+require_explicit = false
+
+[[dispatch.placements]]
+id = "slot-a"
+container = "{a}"
+
+[[dispatch.placements]]
+id = "slot-b"
+container = "{b}"
+
+[[dispatch.placements]]
+id = "region-c"
+container = "{c}"
+
+[[dispatch.writers]]
+id = "loader"
+container = "main"
+function = "load_module"
+destinations = [{{ start = 0x{s1:08X}, end = 0x{e1:08X} }}, {{ start = 0x{s2:08X}, end = 0x{e2:08X} }}]
+
+[[dispatch.writers]]
+id = "pointer-store"
+container = "main"
+function = "save_ptr"
+destinations = [{{ start = 0x{saved:08X}, end = 0x{saved_end:08X} }}]
+
+[[dispatch.rules]]
+id = "load-completed"
+container = "main"
+function = "load_module"
+event = "return"
+effect = "publish"
+placement = "selector"
+selector = "arg:0"
+cases = {{ "0" = "slot-a", "1" = "slot-b", "2" = "region-c" }}
+destination = "arg:1"
+length = "arg:2"
+source_offset = "const:0"
+success = "zero"
+request = "call"
+"#,
+        a = n.of("a"),
+        b = n.of("b"),
+        c = n.of("c"),
+        s1 = lay.slot,
+        e1 = lay.slot + SLOT_BYTES,
+        s2 = lay.slot2,
+        e2 = lay.slot2 + SLOT_BYTES,
+        saved_end = saved + 4,
+    )
+}
+
+/// The slot's modules, each with f(a) = a + k; a is long, its tail
+/// function k at slot+0x80 calling the slot (b's shorter load leaves it in
+/// place); the second region's module, h() = 0xC1.
+fn explicit_images(lay: &Layout, n: &Names) -> (Image, Image, Image) {
+    let mut u = Unit::new(&n.of("a"), lay.slot);
+    leaf(&mut u, "f", |a| {
+        a.addiu(V0, A0, 0x100);
+        mark(a, lay, V0);
+    });
+    u.func_at("k", lay.slot + 0x80);
+    u.a.addiu(SP, SP, -24).sw(RA, 16, SP).jal_abs(lay.slot).nop().lw(RA, 16, SP).addiu(V0, V0, 0x1000);
+    mark(&mut u.a, lay, V0);
+    u.a.jr(RA).addiu(SP, SP, 24);
+    let a = u.image(Some(lay.slot + 0x100), &[]);
+    let mut u = Unit::new(&n.of("c"), lay.slot2);
+    leaf(&mut u, "h", |a| ret_k(a, lay, 0xC1));
+    let c = u.image(Some(lay.slot2 + 0x80), &[]);
+    (a, d06_overlay(lay, n.of("b"), 0x200), c)
+}
+
+/// A -> B -> A through the resident loader, with a saved pointer, direct,
+/// tail, pointer and host calls, A's untouched tail calling into B, an
+/// unaffected second region, and a load that fails before writing.
+fn d05_explicit(lay: &Layout, n: &Names, loader: Loader) -> Fixture {
+    let main = explicit_main(lay, loader);
+    let (a, b, c) = explicit_images(lay, n);
+    let len = |im: &Image| im.bytes.len() as u32;
+    let edit: &[u32] = if loader == Loader::EditedC { &[EDIT_MARK] } else { &[] };
+    let lm = main.addr("load_module");
+    let (direct, pointer) = if loader == Loader::Lifted { ("call_slot", "call_ptr") } else { ("drive_c", "drive_cp") };
+    let (direct, pointer, saved, slot2) = (main.addr(direct), main.addr(pointer), main.addr("call_saved"), main.addr("call_slot2"));
+    let mut s = Script::default();
+    s.call(main.addr("save_ptr"), [lay.slot, 0, 0, 0], 0, &[]);
+    s.call(lm, [2, lay.slot2, len(&c), 0], 0, edit);
+    for (sel, im, k) in [(0, &a, 0x100), (1, &b, 0x200), (0, &a, 0x100)] {
+        s.call(lm, [sel, lay.slot, len(im), 0], 0, edit);
+        s.call(direct, [1, 0, 0, 0], k + 1, &[k + 1]);
+        s.call(pointer, [lay.slot, 2, 0, 0], k + 2, &[k + 2]);
+        s.call(saved, [3, 0, 0, 0], k + 3, &[lay.slot, k + 3]);
+        s.call(main.addr("call_tail"), [4, 0, 0, 0], k + 4, &[k + 4]);
+        s.call(lay.slot, [5, 0, 0, 0], k + 5, &[k + 5]);
+        s.call(slot2, [0; 4], 0xC1, &[0xC1]);
+        // A's tail stays bound across B's shorter load; its call into the
+        // slot follows the slot's binding.
+        s.call(pointer, [lay.slot + 0x80, 6, 0, 0], k + 0x1006, &[k + 6, k + 0x1006]);
+        if sel == 1 {
+            // Fails before writing: B stays bound.
+            s.call(lm, [STAGED, lay.slot, len(&a), 0], 1, &[]);
+            s.call(saved, [3, 0, 0, 0], k + 3, &[lay.slot, k + 3]);
+        }
+    }
+    let init = vec![(lay.stage, a.bytes.clone()), (lay.stage + 0x400, b.bytes.clone()), (lay.stage + 0x800, c.bytes.clone())];
+    let mut f = Fixture::new(vec![main, a, b, c], s);
+    f.init = init;
+    f.dispatch = Some(explicit_facts(n, lay));
+    f
+}
+
+fn d05_explicit_lifted(lay: &Layout, n: &Names) -> Fixture {
+    d05_explicit(lay, n, Loader::Lifted)
+}
+fn d05_explicit_mixed(lay: &Layout, n: &Names) -> Fixture {
+    d05_explicit(lay, n, Loader::MatchingC)
+}
+fn d05_explicit_edited(lay: &Layout, n: &Names) -> Fixture {
+    d05_explicit(lay, n, Loader::EditedC)
+}
+
+/// Facts that leave module b without a placement: its arrival would leave
+/// a stale binding, so the build refuses rather than probing code.
+fn d05_explicit_missing_placement(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let facts = f.dispatch.take().unwrap_or_default();
+    let placement = format!("[[dispatch.placements]]\nid = \"slot-b\"\ncontainer = \"{}\"\n\n", n.of("b"));
+    f.dispatch = Some(facts.replace(&placement, "").replace(", \"1\" = \"slot-b\"", ""));
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.missing_placement".into());
+    f
+}
+
+/// A completed load whose selector no case names: the publication is
+/// rejected at run time, never guessed.
+fn d05_explicit_unknown_selector(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let facts = f.dispatch.take().unwrap_or_default();
+    f.dispatch = Some(facts.replace(", \"2\" = \"region-c\"", ""));
+    let main = &f.images[0];
+    let (lm, direct) = (main.addr("load_module"), main.addr("call_slot"));
+    let len = f.images[3].bytes.len() as u32;
+    let mut s = Script::default();
+    s.call(lm, [0, lay.slot, f.images[1].bytes.len() as u32, 0], 0, &[]).call(direct, [1, 0, 0, 0], 0x101, &[0x101]);
+    s.reject(lm, [2, lay.slot2, len, 0], "binding.unknown_selector #0 0x00000002".into());
+    f.script = s;
+    f
+}
+
+/// A completed load of module a to the second region: not where slot-a's
+/// layout loads, so the publication is rejected.
+fn d05_explicit_bad_destination(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let main = &f.images[0];
+    let lm = main.addr("load_module");
+    let len = f.images[1].bytes.len() as u32;
+    let mut s = Script::default();
+    s.reject(lm, [0, lay.slot2, len, 0], format!("binding.bad_destination #0 0x{:08X}", lay.slot2));
+    f.script = s;
+    f
+}
+
+/// A rule this milestone doesn't implement fails the build by name.
+fn d05_explicit_unimplemented(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let facts = f.dispatch.take().unwrap_or_default();
+    let rule = format!(
+        "\n[[dispatch.rules]]\nid = \"copy-wrote\"\ncontainer = \"main\"\npc = 0x{:08X}\nevent = \"after-write\"\neffect = \"invalidate\"\ndestination = \"write-address\"\nlength = \"write-size\"\n",
+        lay.main + 0x30
+    );
+    f.dispatch = Some(facts + &rule);
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.unimplemented_rule: rule `copy-wrote`".into());
+    f
+}
+
 // ---- D06: transfer routes ----------------------------------------------
 
 /// The slot function returns a0 + k, marked.
@@ -1162,6 +1416,19 @@ fn defs() -> Vec<Def> {
         d("D05", "stores", "supported", REF, d05_stores),
         d("D05", "copy", "supported", REF, d05_copy),
         d("D05", "unpack", "supported", REF, d05_unpack),
+        d("D05", "explicit-binding-lifted", "supported: explicit binding, lifted loader", REF, d05_explicit_lifted),
+        d("D05", "explicit-binding-mixed", "supported: explicit binding, matching C loader and drivers", REF, d05_explicit_mixed),
+        d(
+            "D05",
+            "explicit-binding-edited-c",
+            "supported: explicit binding keeps a deliberately edited C loader",
+            Evidence::ClosedForm("authored C edit: its log entry is absent from the original binary"),
+            d05_explicit_edited,
+        ),
+        d("D05", "explicit-binding-unknown-selector", "port rejection: a completed load names no placement", REF, d05_explicit_unknown_selector),
+        d("D05", "explicit-binding-bad-destination", "port rejection: a load outside its placement's layout", REF, d05_explicit_bad_destination),
+        d("D05", "explicit-binding-missing-placement", "rejected facts: an image overlapping a placement has none", REF, d05_explicit_missing_placement),
+        d("D05", "explicit-binding-unimplemented", "rejected facts: an after-write rule is milestone C", REF, d05_explicit_unimplemented),
         d("D06", "lifted-routes", "supported", REF, d06_lifted),
         d("D06", "interior-entry", "supported", REF, d06_interior),
         d("D06", "c-routes", "supported", REF, d06_c),

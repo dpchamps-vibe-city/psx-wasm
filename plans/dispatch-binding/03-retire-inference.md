@@ -325,3 +325,14 @@ for the ABI/runtime/mod seams changed.
   inferred MIPS live-state transport. Neither mechanism substitutes MIPS for C.
 - Original pointer representation can remain in a completed native port. What is
   eliminated is runtime identification from instruction bytes.
+- From A: an implementation binds only when one publication covers its whole
+  footprint (translated regions in its own container, or its C extent). A
+  footprint split across publications stays unbound until C2 composes ranges.
+- From A: undeclared writes leave bindings stale, not rejected (the A mutation
+  showed stale code running). C1's writer coverage and C6's strict mode close this.
+- From A: an operation the translator expands into its callers fails with
+  `binding.expanded_operation`; C instruments those callers locally.
+  `binding.unimplemented_rule` names every rule A rejects (instruction-address,
+  native-boundary and `c_marker` sites, `after-write`, `begin`/`end`, keyed
+  requests, publication at entry). `require_explicit = true` and
+  `c_continuations` fail with `binding.unimplemented`.

@@ -2,9 +2,14 @@
 
 **Status:** baseline runner and independent reporting implemented; remediation
 and acceptance remain unfinished. This milestone is **not complete**.
-D72 was removed, not adopted. Production retains the distinguishing-word patch
-and the previous D6/D7 dispatch routing. The synthetic command deliberately
-returns nonzero on the remaining findings. No mandatory CI gate is installed.
+D72 was removed, not adopted. Without `[dispatch]` facts, production retains
+the distinguishing-word patch and the previous D6/D7 dispatch routing. With
+them, dispatch-binding milestone A (D73) binds the covered regions explicitly.
+Seven `D05/explicit-binding-*` variants exercise that path; every report names
+each variant's `explicit` or `legacy` path. The full corpus is 58 variants:
+37 execution, 6 safety, 14 failed, 1 unresolved. The 14 failures and the
+unresolved variant are the legacy baseline set below. The synthetic command
+deliberately returns nonzero on them. No mandatory CI gate is installed.
 
 **Current contract and implementation direction:** the
 [dispatch-binding plan](dispatch-binding/README.md) supplies concrete publication,

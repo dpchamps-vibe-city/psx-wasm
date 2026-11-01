@@ -129,6 +129,12 @@ pub struct Linked {
     /// C calls whose declaration and definition differ in C-level kinds
     /// though not in wasm types, routed through o32 (game link).
     pub abi_mismatches: Vec<String>,
+    /// Code references by how they bind (game link; plans/dispatch-binding
+    /// A): `fixed`, `slot`, `lookup` (a guest address called through the
+    /// dispatch table), and the legacy `legacy-sampled`, `legacy-exempt`
+    /// (a main-container call skipping the sampled check) and
+    /// `legacy-unique` (an uncovered overlay's entry, no residency check).
+    pub references: std::collections::BTreeMap<&'static str, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -523,7 +529,7 @@ pub fn link(
 
     let wasm = module.finish();
     let matched = ctx.layout.defined.values().filter(|p| p.how == How::Matched).count();
-    Ok(Linked { wasm, aux, matched, abi_mismatches: Vec::new() })
+    Ok(Linked { wasm, aux, matched, abi_mismatches: Vec::new(), references: Default::default() })
 }
 
 /// Push a call-out's operands and call it: kind, target, nwords, a0..a3, sp.

@@ -18,7 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// 2: `binding`, the explicit-binding plan and remaining legacy dispatch.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -145,6 +146,9 @@ pub struct Report {
     pub by_container: BTreeMap<String, BTreeMap<String, usize>>,
     pub adapters: Vec<String>,
     pub overlay_addresses: usize,
+    /// Explicit bindings (plans/dispatch-binding A): placements, rules,
+    /// slots, entries per reference category, and the legacy consumers.
+    pub binding: crate::binding::Report,
     pub aux_symbols: usize,
     pub matched_rodata: usize,
     pub debug_io: bool,
@@ -235,6 +239,7 @@ pub struct Prepared {
     hardware: Vec<Unbound>,
     void_used: BTreeSet<(String, u32)>,
     overlays: BTreeMap<u32, Vec<(String, Vec<(u32, u32)>)>>,
+    binding: crate::binding::Report,
     spec: GameSpec,
     /// Functions that switch threads (wasm names), seeding Asyncify.
     switches: BTreeSet<String>,
@@ -495,7 +500,16 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     let switches = thread_switches(&lifted);
     link_lifted(ws, &lift_dir, &lifted, &mut link_inputs, &mut tiers)
         .with_context(|| format!("run `psxw lift {}`", opts.game))?;
-    let overlays = overlay_plan(&inputs.program, &inputs.originals, &tiers)?;
+    let mod_residency = opts.moddable || opts.mods.as_ref().is_some_and(|m| m.spec.data.iter().any(|d| d.resident.is_some()));
+    let (binding_plan, overlays, binding) = crate::binding::dispatch(
+        inputs.manifest.dispatch.as_ref(),
+        &inputs.map,
+        &inputs.program,
+        &inputs.originals,
+        &translations,
+        &tiers,
+        mod_residency,
+    )?;
 
     let spec = GameSpec {
         tiers: tiers.clone(),
@@ -518,6 +532,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         // ones the translator expands into its callers.
         slots: opts.moddable.then(|| tiers.keys().filter(|k| !expanded.contains(*k)).cloned().collect()),
         threads: !switches.is_empty(),
+        binding: binding_plan,
         probes: inputs
             .manifest
             .run
@@ -551,6 +566,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         hardware,
         void_used,
         overlays,
+        binding,
         spec,
         switches,
     })
@@ -585,6 +601,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         hardware,
         void_used,
         overlays,
+        mut binding,
         mut spec,
         switches,
         ..
@@ -605,6 +622,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         );
     }
     validate(&linked.wasm).context("guest module fails validation")?;
+    binding.references = linked.references.clone();
 
     let dir = opts.mods.as_ref().map_or_else(|| out_dir(ws, &opts.game), |m| m.out.clone());
     std::fs::create_dir_all(&dir)?;
@@ -723,6 +741,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         by_container,
         adapters: bound.into_iter().collect(),
         overlay_addresses: overlays.len(),
+        binding,
         aux_symbols: linked.aux.len(),
         matched_rodata: linked.matched,
         debug_io: opts.debug_io || !opts.original.is_empty(),

@@ -236,6 +236,37 @@ region-write epoch is a later optimization. These sampled checks identify
 build-known overlays; they do not validate whole functions or promise support
 for arbitrary code mutation or partially loaded overlays.
 
+**Explicit binding (D73).** A game whose `game.toml` has a `[dispatch]`
+section ([plans/dispatch-binding](../plans/dispatch-binding/README.md))
+replaces the stub for the regions it covers:
+
+- Each placement names a container. Every function entry in a placement's
+  text is a *slot*. Every route into a slot looks up its binding: direct
+  and tail calls from C and lifted code, pointer calls, host invocation.
+  Main-container calls are no longer exempt there, and a unique entry is
+  callable only once something publishes it.
+- The binding is the slot's dispatch-table entry. Boot binds what the main
+  image supplies. A rule on a software operation (for example a loader's
+  successful return) publishes a placement's range or invalidates one, and
+  the linker generates that update in the guest module. Nothing reads code
+  words to choose an implementation.
+- An implementation is bound only when one publication covers its whole
+  footprint (its translated regions, or its C extent). An invalidation
+  unbinds only slots whose bound implementation depends on a written byte,
+  so an untouched tail stays bound.
+- The operation runs unchanged: the wrapper takes the function's place, so
+  supplied C stays the implementation. A selector no case names, or a
+  destination outside the placement's layout, calls `psx.binding_fault`
+  (ABI 19) instead of publishing a guess.
+- Facts the build can't honour fail it with a `binding.*` diagnostic:
+  unknown fields, an overlapping image without a placement, a translation
+  embedding replaceable code, an expanded operation, a code-changing writer
+  without a rule, or a rule milestone C implements.
+
+Regions without a placement keep the sampled stub; `build.json` lists them
+as legacy, with every reference's class. Partial composition, active
+continuations, writes the runtime makes and mod residency are milestone C.
+
 ### 4. Every function gets exactly one implementation
 
 Each function at each guest address is implemented exactly once. `psxw`
@@ -1404,6 +1435,9 @@ indirect ABI `(a0..a3) -> i64`. (design §2)
 **D7. Overlays dispatch on resident bytes.** A stub compares code words in
 RAM against each candidate overlay. *Why:* it's how hardware decides, and
 needs no per-game loader hook. (design §3)
+
+*Later:* D73 binds the regions a game's `[dispatch]` facts cover
+explicitly. The stub remains only for regions without a placement.
 
 ### Implementations
 
@@ -2643,3 +2677,21 @@ review.
 - **D71 (instruction-count time): not adopted.** Virtual time remains the
   safepoint quantum (D18), with D66's SIO0 and root-counter-2 view. No
   per-block instruction spending or decompiled-C cost regions were added.
+
+### Dispatch binding: D73
+
+**D73. Explicit binding for declared placements.** With `[dispatch]`
+facts, a covered address's dispatch-table entry is its binding. Boot binds
+the main image's entries. Generated wrappers around declared operations
+publish or invalidate ranges when the operation completes, and every route
+into a covered address looks the binding up. Guest pointer values, the data
+layout and o32 boundaries are unchanged (D5, D6). Rule errors are
+`psx.binding_fault`, ABI 19. Regions without a placement keep D7's stub
+and are reported as legacy. *Why:* the stub's sampled words can't
+establish which compiled implementation the program's loading made current
+(plans/dispatch-identity-and-binding). The dispatch-binding plan prescribes
+this contract, so no further approval was needed. Milestone A implements
+synchronous function-return publication and invalidation. Partial
+composition, request lifecycles, continuations, native loaders, mod
+residency and the callable namespace are milestones B and C. (design §3;
+plans/dispatch-binding/01-explicit-activation)

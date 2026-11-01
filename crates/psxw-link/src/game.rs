@@ -77,6 +77,10 @@ pub struct GameSpec {
     /// with Asyncify, which exports the control functions; otherwise the
     /// link exports stubs.
     pub threads: bool,
+    /// Explicit binding (plans/dispatch-binding A): covered addresses are
+    /// looked up in bindings that declared operations publish. `None`: the
+    /// legacy dispatch for every address.
+    pub binding: Option<crate::binding::Binding>,
 }
 
 /// A moddable base's tables, by index.
@@ -147,6 +151,7 @@ pub(crate) fn psx_imports() -> Vec<(&'static str, Vec<V>, Vec<V>)> {
         (psx::PROBE, vec![i], vec![]),
         (psx::RETURN_FROM_EXCEPTION, vec![], vec![]),
         (psx::MOD_LOG, vec![i, i], vec![]),
+        (psx::BINDING_FAULT, vec![i; 3], vec![]),
     ]
 }
 
@@ -186,6 +191,15 @@ enum Synth {
     KernelThunk(u32),
     /// Dispatch on the code resident at an address shared by overlays.
     OverlayStub(u32),
+    /// A covered address: through its current binding.
+    Bound(u32),
+    /// An instrumented operation around function index `inner`, the
+    /// implementation of (container, addr).
+    Operation { container: String, addr: u32, inner: u32 },
+    /// Bind placement `p`'s implementations in a published range.
+    Publish(usize),
+    /// Unbind implementations depending on an invalidated range.
+    Invalidate,
     /// C `call_indirect` with a signature (the MIPS address trails).
     ICall(FuncType),
     /// `psxw_call_indirect(addr, a0..a3)` and `guest_invoke`.
@@ -309,6 +323,15 @@ struct Ctx<'a> {
     caller_of: HashMap<(usize, u32), (String, u32)>,
     /// A moddable base's hook-count globals (init, loaded).
     moddable: Option<(u32, u32)>,
+    /// Each covered address's bound-candidate global.
+    binding_globals: BTreeMap<u32, u32>,
+    /// Functions `ref.func` names (declared for the table updates).
+    declared: BTreeSet<u32>,
+    /// Each guest function's own body index, before any wrapper takes its
+    /// place in `guest`.
+    body: HashMap<(usize, u32), u32>,
+    /// Code references by how they bind ([`crate::Linked::references`]).
+    references: BTreeMap<&'static str, usize>,
 }
 
 impl Ctx<'_> {
@@ -336,9 +359,38 @@ impl Ctx<'_> {
         self.imports[name]
     }
 
+    /// A covered address: a changing slot (plans/dispatch-binding A).
+    fn covered(&self, addr: u32) -> bool {
+        self.spec.binding.as_ref().is_some_and(|b| b.slots.contains_key(&addr))
+    }
+
+    /// Count a call or transfer to `addr` (in `container`, when the caller
+    /// locates it) by how it binds.
+    fn reference(&mut self, container: Option<&str>, addr: u32) {
+        let main = container == Some(self.spec.main.as_str());
+        let class = if self.covered(addr) {
+            "slot"
+        } else if self.spec.overlays.contains_key(&addr) {
+            if main { "legacy-exempt" } else { "legacy-sampled" }
+        } else if main {
+            "fixed"
+        } else {
+            // An uncovered overlay's entry: no residency check at all.
+            "legacy-unique"
+        };
+        *self.references.entry(class).or_default() += 1;
+    }
+
+    fn lookup_reference(&mut self) {
+        *self.references.entry("lookup").or_default() += 1;
+    }
+
     /// The o32 entry of the function at (container, addr): its hook chain
     /// when it has one.
     fn entry(&mut self, container: &str, addr: u32) -> Option<u32> {
+        if self.covered(addr) {
+            return Some(self.synth(Synth::Bound(addr)));
+        }
         if self.spec.overlays.contains_key(&addr) && container != self.spec.main {
             return Some(self.synth(Synth::OverlayStub(addr)));
         }
@@ -374,6 +426,9 @@ impl Ctx<'_> {
     /// [`Ctx::entry`] for a call from `caller`, whose `from`-scoped hooks
     /// apply.
     fn entry_from(&mut self, container: &str, addr: u32, caller: Option<&(String, u32)>) -> Option<u32> {
+        if self.covered(addr) {
+            return Some(self.synth(Synth::Bound(addr)));
+        }
         if self.spec.overlays.contains_key(&addr) && container != self.spec.main {
             return Some(self.synth(Synth::OverlayStub(addr)));
         }
@@ -437,6 +492,9 @@ impl Ctx<'_> {
         if psxw_abi::KERNEL_STAND_INS.contains(&addr) && addr & 3 == 0 {
             return Some(self.synth(Synth::KernelThunk(addr)));
         }
+        if self.covered(addr) {
+            return Some(self.synth(Synth::Bound(addr)));
+        }
         if self.spec.overlays.contains_key(&addr) {
             return Some(self.synth(Synth::OverlayStub(addr)));
         }
@@ -490,7 +548,10 @@ impl Resolver for R<'_, '_> {
             "psxw_gp_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.gp)])),
             "psxw_chain_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.chain)])),
             "psxw_chain_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.chain)])),
-            "psxw_call_indirect" => return Ok(Lowered::Call(self.ctx.synth(Synth::Indirect))),
+            "psxw_call_indirect" => {
+                self.ctx.lookup_reference();
+                return Ok(Lowered::Call(self.ctx.synth(Synth::Indirect)));
+            }
             "psxw_return_from_exception" => return Ok(Lowered::Call(self.ctx.synth(Synth::Throw))),
             _ => {}
         }
@@ -513,6 +574,7 @@ impl Resolver for R<'_, '_> {
         }
         let caller = self.ctx.caller_of.get(&(self.input, self.func)).cloned();
         if let Some((c, addr)) = parse_generated(&name, &self.ctx.spec.main) {
+            self.ctx.reference(c.as_deref(), addr);
             let e = match c {
                 Some(c) => self.ctx.entry_from(&c, addr, caller.as_ref()),
                 None => self.ctx.dynamic_entry(addr),
@@ -543,6 +605,7 @@ impl Resolver for R<'_, '_> {
         }
         let addr = resolved.with_context(|| format!("function {callee} has no address"))?.addr;
         let home = self.ctx.home(&container, addr).with_context(|| format!("{callee} at {addr:#x} is not code"))?;
+        self.ctx.reference(home.as_deref(), addr);
         // C→C with matching signatures: a plain call. Matching means clang's
         // C-level kinds as well as the wasm types: a struct by value and a
         // scalar are both i32 in wasm (a pointer to a copy; the value) but
@@ -571,7 +634,7 @@ impl Resolver for R<'_, '_> {
             match ctx.spec.tiers.get(&(c.to_string(), addr))? {
                 Tier::C { input, func } => {
                     let o = &ctx.inputs[*input].obj;
-                    (o.types[o.funcs[*func as usize].ty as usize] == *sig && !ctx.spec.overlays.contains_key(&addr))
+                    (o.types[o.funcs[*func as usize].ty as usize] == *sig && !ctx.spec.overlays.contains_key(&addr) && !ctx.covered(addr))
                         .then(|| ctx.guest[&(*input, *func)])
                 }
                 _ => None,
@@ -579,7 +642,8 @@ impl Resolver for R<'_, '_> {
         };
         // A hooked function: its chain's C entry when the signatures agree,
         // else its o32 entry. (An overlay slot's goes through the stub.)
-        if let Some(c) = home.as_ref().filter(|c| !self.ctx.spec.overlays.contains_key(&addr) || **c == self.ctx.spec.main) {
+        let covered = self.ctx.covered(addr);
+        if let Some(c) = home.as_ref().filter(|c| !covered && (!self.ctx.spec.overlays.contains_key(&addr) || **c == self.ctx.spec.main)) {
             if let Some(h) = self.ctx.head(c, addr, caller.as_ref()).cloned() {
                 if let Some((ci, csig)) = &h.c {
                     match mismatch(self.ctx, c) {
@@ -613,6 +677,7 @@ impl Resolver for R<'_, '_> {
     }
 
     fn call_indirect(&mut self, sig: &FuncType) -> Result<u32> {
+        self.ctx.lookup_reference();
         Ok(self.ctx.synth(Synth::ICall(sig.clone())))
     }
 
@@ -631,6 +696,8 @@ impl Resolver for R<'_, '_> {
     }
 
     fn func_addr(&mut self, symbol: u32) -> Result<u32> {
+        // A function's address taken: a guest address, looked up when called.
+        self.ctx.lookup_reference();
         let inputs = self.ctx.inputs;
         if let Some(m) = self.ctx.mod_of[self.input] {
             if let Some(a) = self.ctx.mod_func_addr(m, self.input, symbol) {
@@ -915,6 +982,57 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             f.instruction(&I::End);
             (o32(), f, format!("overlay:{addr:08X}"))
         }
+        Synth::Bound(addr) => {
+            let refs = binding_refs(ctx);
+            (o32(), crate::binding::lookup(&refs, addr), format!("binding:{addr:08X}"))
+        }
+        Synth::Invalidate => {
+            let refs = binding_refs(ctx);
+            (FuncType { params: vec![V::I32; 2], results: vec![] }, crate::binding::invalidate(&refs), "binding_invalidate".into())
+        }
+        Synth::Publish(p) => {
+            let b = ctx.spec.binding.as_ref().context("publish without a binding plan")?;
+            let invalidate = ctx.synth(Synth::Invalidate);
+            // Each candidate's entry: its hook chain's head, else its own.
+            let container = &b.placements[p].container;
+            let mut entries: HashMap<u32, u32> = HashMap::new();
+            for (addr, cands) in &b.slots {
+                if cands.iter().any(|c| c.container == *container) {
+                    let e = match ctx.heads.get(&(container.clone(), *addr, None)) {
+                        Some(h) => h.o32,
+                        None => ctx.entry_raw(container, *addr).with_context(|| format!("{container} {addr:#010x}: a binding candidate without an entry"))?,
+                    };
+                    ctx.declared.insert(e);
+                    entries.insert(*addr, e);
+                }
+            }
+            let refs = binding_refs(ctx);
+            let f = crate::binding::publish(&refs, p, invalidate, &mut |_, a| entries[&a]);
+            (FuncType { params: vec![V::I32; 2], results: vec![] }, f, format!("binding_publish:{}", b.placements[p].id))
+        }
+        Synth::Operation { container, addr, inner } => {
+            let b = ctx.spec.binding.as_ref().context("an operation without a binding plan")?;
+            let rules = b.operations.get(&(container.clone(), addr)).cloned().unwrap_or_default();
+            let what = format!("{container} {addr:#010x}");
+            let (sig, shape) = match ctx.spec.tiers.get(&(container.clone(), addr)) {
+                Some(Tier::Lift { .. }) => (o32(), crate::binding::Shape::O32),
+                Some(&Tier::C { input, func }) => {
+                    let sig = ctx.func_sig(input, func);
+                    let name = guest_name(ctx, input, func);
+                    let (kinds, variadic) = marshal::param_kinds(&sig, ctx.inputs[input].protos.get(&name));
+                    let (words, _) = marshal::words(&kinds, variadic);
+                    let shape = crate::binding::Shape::C { params: sig.params.len() as u32, words, result: sig.results.first().copied() };
+                    (sig, shape)
+                }
+                _ => bail!("binding.unimplemented_rule: {what} is an adapter; operations at native boundaries are milestone C"),
+            };
+            let invalidate = ctx.synth(Synth::Invalidate);
+            let publishes: Vec<u32> = (0..b.placements.len()).map(|p| ctx.synth(Synth::Publish(p))).collect();
+            let results: Vec<ValType> = sig.results.iter().map(|&t| marshal::val(t)).collect();
+            let refs = binding_refs(ctx);
+            let f = crate::binding::operation(&refs, &what, &shape, &results, inner, &rules, ctx.sp, &|p| publishes[p], invalidate)?;
+            (sig, f, format!("operation:{container}:{addr:08X}"))
+        }
         Synth::ICall(sig) => {
             let (kinds, _) = marshal::param_kinds(&sig, None);
             let (words, _) = marshal::words(&kinds, false);
@@ -1128,6 +1246,18 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
         Synth::ModInit => (FuncType { params: vec![], results: vec![] }, mod_init(ctx)?, "psxmod_init".into()),
         Synth::ModLoaded => (FuncType { params: vec![V::I32; 2], results: vec![] }, mod_loaded(ctx)?, "psxmod_loaded".into()),
     })
+}
+
+/// What the binding bodies refer to.
+fn binding_refs<'c>(ctx: &'c Ctx) -> crate::binding::Refs<'c> {
+    crate::binding::Refs {
+        binding: ctx.spec.binding.as_ref().expect("a binding plan"),
+        globals: &ctx.binding_globals,
+        untranslated: ctx.import(psx::UNTRANSLATED),
+        fault: ctx.import(psx::BINDING_FAULT),
+        o32_ty: ctx.o32_ty,
+        window: ctx.spec.window_base,
+    }
 }
 
 /// The guest name of a function (input, local function).
@@ -1544,6 +1674,13 @@ fn realize(
     }
 }
 
+/// The first binding global: after sp, gp, the budget and the static
+/// chain; the mod globals; a moddable base's counts.
+fn binding_global_base(spec: &GameSpec) -> u32 {
+    let patches = spec.mods.iter().flat_map(|m| &m.data).filter(|d| d.resident.is_some()).count() as u32;
+    4 + if spec.mods.is_some() { 3 + patches } else { 0 } + if spec.slots.is_some() { 2 } else { 0 }
+}
+
 /// Link the guest module.
 pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: &[Input]) -> Result<Linked> {
     let view: Vec<(&str, &WasmObject)> = inputs.iter().map(|i| (i.container.as_str(), &i.obj)).collect();
@@ -1593,6 +1730,10 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         bindings: HashMap::new(),
         caller_of: HashMap::new(),
         moddable: None,
+        binding_globals: BTreeMap::new(),
+        declared: BTreeSet::new(),
+        body: HashMap::new(),
+        references: BTreeMap::new(),
         o32_ty: 0,
         device: spec
             .device_funcs
@@ -1622,6 +1763,23 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             let out = ctx.nimports + ctx.guest_order.len() as u32;
             ctx.guest.insert((i, f), out);
             ctx.guest_order.push((i, f));
+        }
+    }
+    ctx.body = ctx.guest.clone();
+    // Explicit binding: each covered address's candidate global, after the
+    // module's other globals; each instrumented operation's wrapper takes
+    // its function's place, so every route into it (C, o32, hooks, the
+    // table) reaches the instrumentation.
+    if let Some(b) = &spec.binding {
+        ctx.binding_globals = b.slots.keys().enumerate().map(|(k, &a)| (a, binding_global_base(spec) + k as u32)).collect();
+        for (c, a) in b.operations.keys() {
+            let (input, func) = match spec.tiers.get(&(c.clone(), *a)) {
+                Some(Tier::Lift { input, func } | Tier::C { input, func }) => (*input, *func),
+                _ => bail!("binding.unimplemented_rule: {c} {a:#010x} is not compiled guest code; operations at native boundaries are milestone C"),
+            };
+            let inner = ctx.guest[&(input, func)];
+            let w = ctx.synth(Synth::Operation { container: c.clone(), addr: *a, inner });
+            ctx.guest.insert((input, func), w);
         }
     }
 
@@ -1702,14 +1860,24 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         if track {
             moved.insert((i, f), ops);
         }
-        names.push((ctx.guest[&(i, f)], format!("{}:{name}", inputs[i].container)));
+        names.push((ctx.body[&(i, f)], format!("{}:{name}", inputs[i].container)));
         bodies.push((tix, b));
     }
 
     // Table entries for every function with an address, and the exports.
     let mut elements: BTreeMap<u32, u32> = BTreeMap::new();
     for (c, addr) in spec.tiers.keys().cloned().collect::<Vec<_>>() {
-        let e = if spec.overlays.contains_key(&addr) {
+        let e = if let Some(b) = spec.binding.as_ref().filter(|b| b.slots.contains_key(&addr)) {
+            // A covered address starts bound only to what the boot image
+            // supplies; a compiled but unloaded function isn't callable.
+            match b.boot(addr).map(|k| &b.slots[&addr][k - 1].container) {
+                Some(boot) if *boot == c => match ctx.heads.get(&(c.clone(), addr, None)) {
+                    Some(h) => h.o32,
+                    None => ctx.entry_raw(&c, addr).context("boot binding")?,
+                },
+                _ => continue,
+            }
+        } else if spec.overlays.contains_key(&addr) {
             ctx.synth(Synth::OverlayStub(addr))
         } else {
             ctx.entry(&c, addr).context("entry")?
@@ -1830,6 +1998,10 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         // How many mods' init and loaded functions are registered.
         inits.extend([0, 0]);
     }
+    if let Some(b) = &spec.binding {
+        ensure!(inits.len() as u32 == binding_global_base(spec), "binding globals out of place");
+        inits.extend(b.slots.keys().map(|&a| b.boot(a).unwrap_or(0) as i32));
+    }
     for init in inits {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));
     }
@@ -1878,6 +2050,10 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         run.push(f);
     }
     flush(&mut elems, run_start, &mut run);
+    if !ctx.declared.is_empty() {
+        let declared: Vec<u32> = ctx.declared.iter().copied().collect();
+        elems.declared(Elements::Functions(declared.into()));
+    }
     if !entries_raw.is_empty() {
         let entries: Vec<u32> = entries_raw.iter().map(|e| e.0).collect();
         let raws: Vec<u32> = entries_raw.iter().map(|e| e.1).collect();
@@ -1929,7 +2105,7 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         ctx.unresolved.len(),
         ctx.unresolved.iter().cloned().collect::<Vec<_>>().join("\n  ")
     );
-    Ok(Linked { wasm, aux, matched, abi_mismatches: ctx.abi_mismatches.iter().cloned().collect() })
+    Ok(Linked { wasm, aux, matched, abi_mismatches: ctx.abi_mismatches.iter().cloned().collect(), references: ctx.references.clone() })
 }
 
 /// The inputs' DWARF, for where the guest passes put their code
@@ -1941,7 +2117,7 @@ fn debug_info(ctx: &Ctx, moved: &HashMap<(usize, u32), Vec<(u32, u32)>>, wasm: &
     let mut by_input: BTreeMap<usize, Vec<crate::dwarf::FuncMap>> = BTreeMap::new();
     for (&(i, f), ops) in moved {
         let obj = &ctx.inputs[i].obj;
-        let out = ctx.guest[&(i, f)] - ctx.nimports;
+        let out = ctx.body[&(i, f)] - ctx.nimports;
         by_input.entry(i).or_default().push(crate::dwarf::FuncMap {
             from: (obj.funcs[f as usize].body.start - obj.code_start) as u32,
             to: starts[out as usize],

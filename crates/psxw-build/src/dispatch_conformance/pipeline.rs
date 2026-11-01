@@ -4,7 +4,7 @@
 //! and the production optimization. Only the inputs are synthetic.
 
 use super::fixture::Variant;
-use crate::game::{c_input, link_lifted, optimize, overlay_plan, thread_switches, validate};
+use crate::game::{c_input, link_lifted, optimize, thread_switches, validate};
 use anyhow::{Context as _, Result, ensure};
 use psxw_inputs::map::Container;
 use psxw_inputs::originals::Originals;
@@ -17,8 +17,7 @@ use psxw_link::{Gcc, Input};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-/// The candidates and sampled checks at shared entry addresses.
-pub type Overlays = BTreeMap<u32, Vec<(String, Vec<(u32, u32)>)>>;
+pub use crate::binding::Overlays;
 
 pub struct Built {
     /// The linked guest module (Asyncify-instrumented when it switches
@@ -32,6 +31,8 @@ pub struct Built {
     pub tiers: BTreeMap<String, &'static str>,
     /// Functions the translator couldn't lift, and why.
     pub untranslated: Vec<String>,
+    /// The explicit-binding plan and what stays legacy.
+    pub binding: crate::binding::Report,
 }
 
 /// The address map and original images a fixture's inputs describe.
@@ -131,7 +132,15 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
     }
     let switches = thread_switches(&lifted);
     link_lifted(ws, &dir.join("lift"), &lifted, &mut link_inputs, &mut tiers)?;
-    let overlays = overlay_plan(&program, &originals, &tiers)?;
+    // Supplied C stays the implementation: no dispatch or binding concern
+    // selects another tier for it.
+    for key in c_defs.keys().filter(|k| translations.iter().any(|t| (&t.func.container, t.func.addr) == (&k.0, k.1))) {
+        ensure!(matches!(tiers.get(key), Some(Tier::C { .. })), "{} {:#010x}: supplied C is not linked at the C tier", key.0, key.1);
+    }
+    // The facts go through the same schema as a game's `[dispatch]`.
+    let section = v.dispatch.as_deref().map(psxw_inputs::dispatch::parse).transpose()?;
+    let (binding_plan, overlays, mut binding) =
+        crate::binding::dispatch(section.as_ref(), &map, &program, &originals, &translations, &tiers, false)?;
 
     let defaults = crate::game::Options::new("dispatch");
     let spec = GameSpec {
@@ -148,11 +157,18 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
         mods: None,
         slots: None,
         threads: !switches.is_empty(),
+        binding: binding_plan,
     };
     ensure!(spec.threads == v.threads, "the fixture says threads = {}, the build found {} switches", v.threads, switches.len());
     let rodata = psxw_link::layout::Rodata::new(&map, &originals);
     let linked = psxw_link::game::link(&map, Some(&rodata), &spec, &link_inputs)?;
     validate(&linked.wasm).context("guest module fails validation")?;
+    binding.references = linked.references.clone();
+    if let Some(b) = &spec.binding {
+        // Covered paths must not select implementations by code words.
+        let sampled: Vec<String> = sampled_stubs(&linked.wasm)?.into_iter().filter(|a| b.slots.contains_key(a)).map(|a| format!("{a:#010x}")).collect();
+        ensure!(sampled.is_empty(), "resident-word selectors at covered addresses: {}", sampled.join(", "));
+    }
     let guest = if spec.threads { crate::game::asyncify(ws, dir, &linked.wasm, &switches, false)? } else { linked.wasm.clone() };
     let guest_path = dir.join("guest.wasm");
     std::fs::write(&guest_path, &guest)?;
@@ -171,5 +187,24 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
             (format!("{c} 0x{a:08X}"), k)
         })
         .collect();
-    Ok(Built { linked: guest, optimized, overlays, tiers, untranslated })
+    Ok(Built { linked: guest, optimized, overlays, tiers, untranslated, binding })
+}
+
+/// Addresses of the linked module's sampled-word overlay stubs, by their
+/// names (`overlay:<addr>`).
+fn sampled_stubs(wasm: &[u8]) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for p in wasmparser::Parser::new(0).parse_all(wasm) {
+        let wasmparser::Payload::CustomSection(c) = p? else { continue };
+        let wasmparser::KnownCustom::Name(names) = c.as_known() else { continue };
+        for n in names {
+            let wasmparser::Name::Function(map) = n? else { continue };
+            for f in map {
+                if let Some(a) = f?.name.strip_prefix("overlay:").and_then(|h| u32::from_str_radix(h, 16).ok()) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
