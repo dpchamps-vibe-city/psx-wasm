@@ -194,7 +194,7 @@ fn game_overlay_dispatch_checks_beyond_the_prologue() {
         tiers, overlays: BTreeMap::from([(addr, vec![cand("a", 1), cand("b", 2)])]),
         budget: 1000, debug_io: false, device_funcs: Default::default(), main: "t".into(),
         min_pages: psxw_abi::window_pages(WINDOW_BASE), window_base: WINDOW_BASE,
-        debug_info: false, probes: vec![], mods: None, slots: None, threads: false,
+        debug_info: false, probes: vec![], mods: None, slots: None, threads: false, binding: None,
     };
     let linked = psxw_link::game::link(&map, None, &spec, &inputs).unwrap();
     let mut config = wasmtime::Config::new();
@@ -289,6 +289,7 @@ unsigned long long func_80011900(unsigned a, unsigned b, unsigned c, unsigned d)
         mods: None,
         slots: None,
         threads: false,
+        binding: None,
     };
     let inputs = [input];
     let linked = psxw_link::game::link(&map, None, &spec, &inputs).unwrap();
@@ -384,7 +385,7 @@ int func_80011000(int x) { return x + func_80011100(x * 2); }
         tiers, overlays: BTreeMap::new(), budget: 1000, debug_io: false,
         device_funcs: Default::default(), main: "t".into(),
         min_pages: psxw_abi::window_pages(WINDOW_BASE), window_base: WINDOW_BASE,
-        debug_info: false, probes: vec![], mods: None, slots: None, threads: true,
+        debug_info: false, probes: vec![], mods: None, slots: None, threads: true, binding: None,
     };
     let linked = psxw_link::game::link(&map, None, &spec, &[input]).unwrap();
     let scope = psxw_link::asyncify::scope(&linked.wasm, &["t:func_80011100".to_string()].into()).unwrap();
