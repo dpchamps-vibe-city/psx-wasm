@@ -393,6 +393,23 @@ required CLI/reference evidence cannot be replaced by tool-skipping unit tests.
     same: btn 72 guest flows and 2 carriers, bof4 1 carrier. Neither game
     passes a handle, so this shows compatibility only.
 
+- About `out/conform/dispatch/b-acceptance/`, which the entries above cite.
+  It was this milestone's local evidence directory: git-ignored build
+  output, never committed, and deleted with the implementation worktree.
+  The numbers above are its record. It held one subdirectory per run:
+  - `baseline-before-b/`: the full corpus before B, with its failing set.
+  - `all/`, `D05-explicit-binding/`, `D06-native-reference/`: the first
+    acceptance.
+  - `mutation/`: the relocation-handle mutation.
+  - `review-fixes/`, `review-2/`, `review-3/`, `review-4/` (with `final/`):
+    one per review round.
+
+  Each run kept its conformance stdout, `report.json` and summary, plus
+  focused test output, the btn and bof4 build logs and, from round 3, the
+  reviewer's `transport_review` log. Round 4 also kept the independent
+  audit (`independent-audit.md`). To regenerate a run, use the commands
+  under "Exit criteria" and `psxw build btn|bof4`.
+
 ### B2 transport: obligations, mechanism, evidence
 
 | Obligation | Mechanism | Evidence | Remaining limitation |
