@@ -217,6 +217,21 @@ impl AddressMap {
         auto_name(name)
     }
 
+    /// The container whose code a call from `from` to `addr` reaches, as
+    /// the linker binds it: `from`'s own text, else the main image's, else
+    /// `Some(None)` when only other containers hold it (resolved at run
+    /// time). `None`: no container's text holds it.
+    pub fn home(&self, from: &str, addr: u32) -> Option<Option<String>> {
+        let has = |c: &str| self.container(c).is_some_and(|k| k.text.iter().any(|r| r.contains(&addr)));
+        if has(from) {
+            return Some(Some(from.to_string()));
+        }
+        if has(&self.main) {
+            return Some(Some(self.main.clone()));
+        }
+        self.containers.iter().any(|c| has(&c.id)).then_some(None)
+    }
+
     fn lookup(&self, container: &str, name: &str, via: Via) -> Option<Resolved> {
         let i = *self.by_name.get(container)?.get(name)?;
         let e = &self.symbols[container][i];

@@ -1,193 +1,239 @@
 # A — Explicit activation with the existing pointer ABI
 
-**Status:** not started. **Depends on:** Gate A in the [plan README](README.md).
-Read that README and the [conformance plan](../dispatch-conformance.md) first.
+**Status:** not started. **Depends on:** no earlier milestone. Implement the
+contracts in the [plan README](README.md); no separate activation approval is
+required.
 
-## Goal and context
+## Deliverable
 
-Deliver an end-to-end explicit-binding path through the production compiler:
+Run real loading operations through production compilation and publish explicit
+bindings. A saved guest pointer P must call A, then B, then A as those ranges are
+loaded. Preserve original pointer values, data layout and o32 boundaries. Supplied
+C remains the executable implementation, including source edits and debug locations;
+missing binding instrumentation must not cause an automatic lift selection.
 
-```text
-declarative operation facts -> compiler instrumentation -> activate module
-                                                           |
-                                                           v
-same original pointer P -----------------------------> current entry[P]
-                                                           |
-                                                           v
-                                                    compiled function
+A first covers complete, quiescent publication from resident loading code. This
+is an implementation increment, not the final execution domain: partial loads,
+unknown writes and active replacement remain required C work, not unsupported
+positive cases.
+
+## Input schema to implement
+
+Add `DispatchSection` to `GameManifest`, with `schema_version = 1`,
+`require_explicit = false`, `placements`, `writers`, `rules`, and
+`c_continuations` (the registration format specified in milestone C, default empty).
+Unknown fields and duplicate IDs are errors. Absence of this section retains the
+reported migration path until milestone C removes legacy production selection.
+
+Each placement has `id` and `container`. Its source segments, destination layout
+and text/data boundaries come from the existing container metadata. Do not copy
+function inventories into the manifest. Additional compiled placements are
+separate input containers; a runtime destination must match the selected placement.
+
+A writer summary uses the same operation-site fields as a rule and a
+`destinations = [{ start = <u32>, end = <u32> }, ...]` list of half-open possible
+write ranges. Use inferred bounds first; pinned declarations supply bounds that
+analysis cannot establish. Report which facts are inferred versus declared and
+validate them against known writes. A writer proven/declared disjoint from every
+executable placement needs no activation instrumentation. Intersecting writers
+need rules covering their code-changing effects. An unbounded writer without a
+summary produces `binding.missing_writer` in strict mode; do not add global store
+trapping or silently trust that its writes are data-only.
+
+Each rule has this fixed shape:
+
+| Field | Meaning |
+|---|---|
+| `id` | Unique rule ID for diagnostics/provenance |
+| `container` + `function`, or `container` + `pc`, or `boundary` | Exactly one operation site: a qualified function, original instruction address, or registered native software boundary |
+| `event` | `enter`, `return`, or `after-write` |
+| `c_marker` | Optional C identifier identifying an explicit source event site when an original-PC rule cannot be mapped to C |
+| `effect` | `begin`, `invalidate`, `publish`, or `end` |
+| `placement` | Literal placement ID, `selector`, or `request` |
+| `selector`, `cases` | For `selector`: scalar value source and exhaustive declared value-to-placement mapping |
+| `destination`, `length`, `source_offset` | Scalar value sources for the affected range; source offset is in the container's source image |
+| `success` | `always`, `zero`, or `nonzero`; the latter two test the operation result at `return` |
+| `request` | `call` for synchronous invocation state, or a scalar key for a request shared across asynchronous boundaries |
+| `request_group` | Required for keyed requests; the shared static namespace of their begin/write/end rules |
+
+Scalar value sources are finite forms: `const:<u32>`, `arg:<index>`, `return`,
+`global:<qualified-symbol>` (read one u32), and `field:<arg-index>:<byte-offset>`
+(read one u32 through that argument). `after-write` also provides `write-address`
+and `write-size`. For `source_offset`, `placement` means derive the source offset
+from the destination and the selected placement's segment mapping; reject a range
+without an unambiguous mapping. Arguments are original o32 argument words, including
+stack arguments, captured at entry through existing marshalling; `return` is the
+first o32 return word. Field/global reads occur at the selected event using guest
+data addressing and captured argument pointers. Success predicates test
+that return word. No arbitrary expressions, executable plugins or game-specific
+Rust callbacks are part of the schema. Validate indexes, types, ranges and event
+availability before code generation.
+
+`begin` captures placement and allocates a compiler-private load-instance ID.
+`request = call` selects the innermost live declared begin-context in the current
+guest thread, so nested copy/write operations can share their outer load's instance.
+Contexts nest and survive suspension. Keyed requests use a private map keyed by
+`(request_group, scalar key)` and remain live until `end`; reusing a still-live key
+within that group is an error. `publish` can inherit
+placement/instance from that record. `end` removes the corresponding record and
+never rolls back writes. A standalone synchronous `publish` with a literal/selected
+placement and no begin-context creates its own instance. `invalidate` needs only
+site/destination/length and never asserts an image identity.
+
+Example for a synchronous loader whose arguments are selector, destination and
+length, returning zero on success:
+
+```toml
+[dispatch]
+schema_version = 1
+require_explicit = false
+
+[[dispatch.placements]]
+id = "slot-a"
+container = "module_a"
+
+[[dispatch.placements]]
+id = "slot-b"
+container = "module_b"
+
+[[dispatch.rules]]
+id = "load-completed"
+container = "resident"
+function = "load_module"
+event = "return"
+effect = "publish"
+placement = "selector"
+selector = "arg:0"
+cases = { "0" = "slot-a", "1" = "slot-b" }
+destination = "arg:1"
+length = "arg:2"
+source_offset = "const:0"
+success = "zero"
+request = "call"
 ```
 
-Retain D6 guest pointer values, its existing calling boundaries and the guest
-memory layout. Replace sampled overlay selection only for the explicitly covered
-regions. Keep other regions visibly legacy during this milestone.
+For a C write site without a verified compiler mapping, set `c_marker` and generate
+`void psxw_binding_site_<c_marker>(uint32_t destination, uint32_t length,
+uint32_t source_offset, uint32_t selector, uint32_t request_key)` in
+`psxw_binding.h`. The authored C calls it immediately after the described write.
+Its arguments are the normalized event values, not the enclosing function's o32
+arguments; check them against literal/placement constraints and the rule's cases.
+The original-PC path still instruments lifted code for that rule. Never execute
+that original instruction stream instead of C to obtain a convenient write site.
+A required C site with neither a verified mapping nor its declared marker produces
+`binding.missing_c_write_site`, identifying the source function/rule and declaration
+to add. Ordinary complete-operation C wrappers do not need markers.
 
-The foundation exists: `GameSpec.tiers` identifies `(container, address)` entries;
-`Resolved` retains some symbol provenance; the lift tier distinguishes static
-and dynamic locations; the linker already generates wrappers and dispatch tables.
-There is no established activation contract. Existing disc-write notifications
-used by mods are not such a contract.
+This success-only summary is valid only when no overwritten code can be observed
+before completion and failure occurs before writes. Otherwise use write-site
+invalidation/publication rules; C implements their complete range semantics.
+Do not apply this example indiscriminately to asynchronous or partially failing
+loaders. Rule facts describe original operations; they do not replace them.
 
-The initial vertical slice uses resident loading code and known placements with
-no observable execution in a changing region before its declared publication
-point, and no active/suspended translation depending on that region. Demonstrate
-these facts for the fixtures. This bounds the first implementation; it does not
-change the support classification of existing partial-load/re-entry fixtures.
+Parse the complete schema in A. Implement synchronous return publication and
+invalidation first. A rule requiring an effect/event not implemented yet fails
+with `binding.unimplemented_rule`, naming the rule; C completes it. Never ignore
+an accepted rule or reinterpret request initiation as completion.
 
-## Files and responsibility
+## Source seams
 
-| Area | Primary seams |
-|---|---|
-| Input facts and resolution | `crates/psxw-inputs/src/{game,map}.rs` |
-| Binding plan and production preparation | `crates/psxw-build/src/game.rs` |
-| Call classification and embedded dependencies | `crates/psxw-lift/src/{program,graph,emit}.rs` |
-| Wrappers, activation functions, table entries | `crates/psxw-link/src/{game,rewrite}.rs` |
-| Shared ABI, only if a boundary changes | `crates/psxw-abi/src/lib.rs` |
-| Fixture input and production integration | `crates/psxw-build/src/dispatch_conformance/{fixture,pipeline,corpus,mod}.rs` |
-
-Prefer crate-private helpers in these owners. Do not create a new crate or
-reimplement `prepare`, linking or optimization in the fixture runner.
+- `crates/psxw-inputs/src/{game,map}.rs`: schema and qualified resolution.
+- `crates/psxw-build/src/game.rs`: binding plan, normal preparation and reports.
+- `crates/psxw-lift/src/{program,graph,emit}.rs`: site/dependency information.
+- `crates/psxw-link/src/{game,rewrite}.rs`: event wrappers, calls and tables.
+- `crates/psxw-build/src/dispatch_conformance/`: fixture metadata and shared
+  production preparation. No new compiler framework or crate.
 
 ## Tasks, in order
 
-### A1. Inventory references and record the initial contract
+### A1. Add the common binding plan
 
-- [ ] Inventory direct C calls, C address relocations, lifted direct/indirect/tail
-  transfers, original pointer tables, runtime callbacks, stand-ins and mod hooks.
-  Record current bypasses: shared-address-only planning, main-container exemptions
-  and uniquely addressed functions in replaceable regions.
-- [ ] Define the conceptual categories `Function(module, entry)`,
-  `Slot(region, entry)` and unresolved `GuestAddress(value)`. Add only the metadata
-  needed to express these alongside current structures. A still encodes callable
-  pointers as guest values; category names do not authorize native handles yet.
-- [ ] Record Gate A's exact supported placements, publication event, initial state,
-  replacement extent and failure behaviour in the design. Get approval before
-  replacing D7 selection. Inventory, evidence and ordinary fixes need not wait.
-- [ ] Describe what makes an initial fixture's activation quiescent. Do not claim
-  arbitrary loader completion is atomic, or that a suspended frame disappears
-  when its entry-table slot is changed.
+- [ ] Inventory direct calls, address-taking, original data pointers, lifted
+  transfers, callbacks, native stand-ins and mod hooks. Record every current
+  main-image/unique-address bypass and sampled-byte consumer.
+- [ ] Add per-reference categories: fixed function, changing slot, and guest
+  address requiring lookup. Reuse `(container, entry)` identities; do not replace
+  the compiler IR. Symbol provenance alone must not produce a fixed classification.
+- [ ] Parse and validate the schema above against pinned input metadata. Report
+  the rule/site and missing field on failure; do not ask for a policy choice.
+- [ ] Build a deterministic plan containing placements, affected executable
+  intervals, entries, initial availability, rules and reference classifications.
+  Include unique entries and main-image overlaps, not only duplicate addresses.
+- [ ] Initialize only boot-resident ranges. Preserve unrelated intervals. Describe
+  exact write extents so a shorter load does not erase an untouched old tail.
 
-### A2. Add a small declarative activation contract
+### A2. Generate binding updates and instrument operations
 
-- [ ] Extend versioned input facts with named executable regions/placements and
-  activation rules. Derive original code ranges and function entries from existing
-  container metadata where possible; do not duplicate splat's function inventory.
-- [ ] Each rule must identify: the operation by container-qualified symbol or
-  entry address; the event boundary; the module selector; the compiled destination
-  placement; and the condition under which bindings are published.
-- [ ] Start with a bounded vocabulary: a literal module or a finite mapping from
-  an operation argument to module IDs; a declared placement or validated destination
-  argument; successful return from a known operation. Use explicit return predicates,
-  not embedded code or an expression-language/plugin framework.
-- [ ] A completion callback can be the operation when the necessary facts are
-  available there. Never annotate an asynchronous request's return as completion
-  merely because it is easier. Facts unavailable at the chosen boundary remain
-  unresolved, with their required dataflow identified for C.
-- [ ] Validate named modules, entries, selector mappings, original placements,
-  region conflicts and rule provenance before linking. A destination requiring
-  relocatable code is not implemented by changing a guest address constant; report
-  that missing capability rather than pretending a new placement is supported.
-- [ ] Retain legacy behaviour for undeclared regions and report it. An invalid or
-  incomplete rule for a declared explicit region is an error, not permission to
-  fall back to fingerprints. Keep ordinary input errors distinct from original
-  program execution rejections.
+- [ ] Generate private publication helpers in the linked game module. Reuse the
+  current guest-address table for A and its existing o32/wrapper entries. No host
+  module selector, standalone runtime crate or new scheduler is needed.
+- [ ] Route affected C direct calls, lifted direct/tail calls and pointer calls
+  through the same binding plan. Remove main-container exemptions for those
+  ranges. Preserve proven stable direct calls elsewhere.
+- [ ] Wrap declared operations in both C and lifted code, preserving arguments,
+  returns and stack state. Capture values needed after the call. Publish on the
+  declared event and predicate, not merely whenever the operation is entered.
+  Keep the C body and its source locations; use verified C sites or the explicit
+  marker interface above, never replace a C writer with its lifted implementation.
+- [ ] Ensure every invocation route reaches instrumentation. Insert before a
+  boundary can disappear through optimization or preserve that boundary locally;
+  do not globally disable inlining or optimization.
+- [ ] Keep the original load/copy/unpack and its data effects. Perform a completed
+  publication without a callback/safepoint between its binding writes.
+- [ ] Reject unknown selector values and invalid source/destination ranges without
+  publishing a guessed entry. Keep rule errors distinct from original guest faults.
+- [ ] Initialize/reinitialize bindings on boot/reset using the same generated plan.
+  A compiled but unloaded function must not become callable by having a unique entry.
 
-The proposed vocabulary is an implementation starting point, not approved TOML
-syntax. Specify and review its schema with Gate A, then use that one schema for
-real inputs and synthetic fixtures. Do not hide activation facts inside tests.
+### A3. Preserve translation assumptions and existing interfaces
 
-### A3. Produce one binding plan for all call routes
+- [ ] Retain runtime data/table reads. Prevent direct binding or expansion across
+  a replaceable dependency unless it is stable for the whole relevant execution.
+  Do not add data fingerprints or whole-code hashes.
+- [ ] Keep `GuestCall.addr`, SDK/BIOS callbacks, stand-ins and host invocation in
+  their existing guest representation. They must reach A's bindings, not a second
+  residency authority. Native reference encoding belongs to B.
+- [ ] Record the boundaries still requiring C: partial writes, active continuations,
+  actual runtime merge and mod residency. Treat them as unfinished tasks with the
+  README's fixed semantics, not unanswered contract questions.
+- [ ] Extend versioned build/conformance reports with rules, placements, fixed/slot
+  classifications, available entries and all remaining legacy consumers. Reject
+  malformed explicit-region facts instead of falling back to code probes.
 
-- [ ] In production preparation, combine activation facts, code ranges and tiers
-  into a deterministic binding plan. Keep module identity, compiled placement and
-  reference classification separate from the final Wasm function index.
-- [ ] Enumerate every entry affected by a declared replacement region, not only
-  addresses shared by multiple containers. Include main-image overlaps and unique
-  entries. Preserve unrelated regions and existing stand-in namespace protections.
-- [ ] Record initial bindings and the precise changes for each activation. Shorter
-  replacements must follow the reviewed extent contract: neither preserve every
-  old entry nor invalidate an entire container by assumption. Stale untouched bytes
-  and explicitly unavailable bindings are different facts.
-- [ ] Feed C direct calls, lifted direct/tail calls and indirect dispatch from this
-  same plan. A call into replaceable code must not bypass it merely because its
-  symbol came from the current or main container.
-- [ ] Retain established direct calls outside affected regions. Within affected
-  flows require an actual stability argument; otherwise lower through a slot.
+### A4. Validate through production
 
-### A4. Generate activation and instrument real operations
-
-- [ ] Generate module-specific binding updates and a small activation entry in the
-  linked guest module, reusing its dispatch table and o32 entries. No separate
-  runtime crate, host-controlled module selector or generic dynamic linker is needed.
-- [ ] Initialize bindings during the existing boot path before calls can enter
-  affected regions. Use existing unavailable-entry diagnostics where the approved
-  contract permits them; specify the cause rather than accepting any Wasm trap.
-- [ ] Instrument the declared operation boundary in both C and lifted code. Save
-  selector/destination arguments when needed, preserve returns and calling state,
-  and publish only at the declared successful event.
-- [ ] Ensure every route to the operation receives the instrumentation, including
-  direct C calls and calls via pointers. Insert it before an optimizer can erase
-  the boundary, or deliberately preserve that boundary. Do not disable optimization
-  globally or rely on an incidental surviving symbol name.
-- [ ] Publish updates without a guest callback/safepoint observing half of one
-  logical activation. Do not add a scheduler redesign. An ordinary load with
-  observable intermediate availability needs the finer contract in C, not a
-  fictitious whole-image atomic commit.
-- [ ] Validate failure handling. A failure before writes can leave old bindings;
-  a failure after destructive writes cannot automatically do so. Reject an
-  insufficient activation description rather than hiding this distinction.
-- [ ] Leave load/copy/unpack side effects in the compiled program. Activation
-  updates selection state; it is not a replacement for the original data operation.
-
-### A5. Guard translation assumptions and document compatibility
-
-- [ ] Audit discovered jump-table targets and expanded callees in the selected
-  flows. Prevent a static call or expansion across a changing dependency unless
-  the necessary stability is established. Preserve ordinary runtime table reads.
-- [ ] If current lifting cannot preserve a necessary dependency, report the exact
-  gap and keep acceptance blocked for that flow. Do not compensate with a larger
-  code fingerprint or declare the original positive case unsupported.
-- [ ] Keep C/lift arguments, SDK/BIOS callbacks and `guest_invoke(addr, ...)` using
-  existing guest-pointer semantics in A. Verify that these routes can reach the
-  newly updated table without inventing a second binding authority.
-- [ ] Add versioned binding-plan evidence to the build/conformance reports:
-  activation rules, initial bindings, slot references, fixed calls and every
-  remaining legacy region. List runtime/mod consumers still outside A's coverage.
-
-### A6. Validate the vertical slice through production
-
-- [ ] Add a small `D05/explicit-binding-*` fixture group to the existing corpus.
-  The original MIPS loading routine must actually copy/load the module. Supply
-  activation metadata through A2 and let the compiler emit the event; the host
-  must not call an activation API between fixture checkpoints.
-- [ ] Cover A → B → A, an unchanged saved pointer, direct and indirect callers,
-  and a second independent region whose bindings must remain unchanged. Use a
-  lifted variant and a mixed C/lift variant, not a Cartesian product of every tier.
-- [ ] Include a failure-before-write control and input-validation checks for bad
-  module/placement facts. Keep port-contract rejection checks separate from the
-  original-MIPS observations.
-- [ ] Reuse applicable D02 data/dependency controls and D03 route/overlap evidence.
-  Record which now use explicit bindings and which are still legacy; a legacy
-  pass does not demonstrate the new path.
-- [ ] Compare linked and production-optimized Wasm against the live reference and
-  authored observations. Assert the covered paths contain no resident-word selector.
-- [ ] In the scratchpad, suppress one activation update and demonstrate that the
-  saved-pointer fixture fails. Revert the mutation; record it and its result.
-  Do not launch a new large mutation campaign.
+- [ ] Add `D05/explicit-binding-*` cases to the existing corpus. Original MIPS must
+  actually load/copy modules; compiler facts use the same schema as real inputs.
+  The host must not inject an activation answer between guest checkpoints.
+- [ ] Use one lifted and one mixed C/lift case covering A → B → A, unchanged saved
+  pointers, direct/indirect calls and a second unaffected region. Include a
+  failure-before-write control. Avoid a Cartesian product of tiers and variants.
+- [ ] Add focused schema-error checks and reuse existing D02/D03 dependency/routing
+  controls. Identify which cases exercise explicit bindings versus the legacy path.
+- [ ] Add a small deliberately edited C control with a result/effect absent from
+  its original MIPS. Verify it survives activation and the emitted implementation
+  remains C. Judge that edit against its authored-source expectation, not the old
+  binary; keep unchanged reference fixtures separate.
+- [ ] Compare matching-code fixtures in linked and production-optimized Wasm against
+  authored observations and the live original-MIPS reference. The deliberately
+  edited C control instead uses its authored-source expectation. Inspect covered
+  paths for absence of resident-word selectors; behavioural agreement alone could
+  hide legacy use.
+- [ ] Suppress one activation update in a disposable mutation and verify the saved
+  pointer case fails. Restore the implementation and retain the evidence.
 
 ## Exit criteria
 
-- [ ] Gate A is recorded; input rules and bindings flow through normal preparation,
-  link and optimization, not only a test hook.
-- [ ] Selected C/lift cases agree with original execution and distinguish stale
-  bindings from correct activation. The original pointer values remain unchanged.
-- [ ] Declared explicit paths have no code-word residency reads. Other paths and
-  unresolved assumptions are individually reported, not silently classified fixed.
-- [ ] No unreviewed namespace, active-code lifetime or rejection policy was added.
-- [ ] Required tool/reference runs succeeded without skips; the full corpus's
-  remaining failures retain their evidence and classification.
+- [ ] Real operations drive generated publication through normal preparation,
+  linking and optimization; the fixture runner does not bypass the mechanism.
+- [ ] Required subset observations match, guest pointer values remain unchanged,
+  and covered paths do not read code words to select implementations.
+- [ ] Bad facts fail explicitly; legacy coverage is listed; remaining milestone-C
+  obligations stay visible. Supplied C bodies, edits and debug locations survive
+  instrumentation; there is no automatic C-to-lift fallback.
+- [ ] Design/report changes describe the implemented subset, not completed C.
 
-Commands after the new fixture group is implemented (`D05/explicit-binding` is
-planned here, not an existing case selection):
+Commands once the new fixture group exists:
 
 ```sh
 cargo test -p psxw-inputs --lib
@@ -198,24 +244,17 @@ cargo run -p psxw-cli -- conform dispatch --case D05/explicit-binding
 cargo run -p psxw-cli -- conform dispatch
 ```
 
-The last command may remain nonzero at A. Preserve its report separately from
-subset evidence and compare findings; this is not full conformance completion.
-Run additional focused lift/link tests only for the code changed.
-
-## Handoff to B and C
-
-Give B the reference categories, event-preservation rules and conversion-sensitive
-reference sites. Give C the exact unsupported instrumentation forms, remaining
-legacy consumers, translation assumptions and intermediate/lifetime cases. Do
-not broaden A's support claim to those cases without implementation and evidence.
+Keep subset and full reports separately. The full command can remain red at A;
+its failures are not milestone-wide success. Tool-skipping tests do not substitute
+for the required CLI/reference run.
 
 ## Progress log
 
-- Not started. Plan authored; no implementation or acceptance evidence claimed.
+- Not started. Schema and implementation order prescribed; no new acceptance run.
 
 ## Findings
 
-- A can reuse the address-indexed table without changing the numeric guest pointer
-  ABI. That is explicit activation, not native-reference migration.
-- Existing mod disc-write notifications say which bytes arrived, not which complete
-  module became callable. Their presence does not satisfy A2.
+- Disc-write notifications carry ranges, not a universal activation identity.
+  The schema supplies identity from software operations and input facts.
+- Reusing the address table is an implementation step, not a commitment to retain
+  unsafe masked callable namespaces; C implements the final namespace contract.

@@ -1,177 +1,159 @@
 # B — Native references where proven safe
 
-**Status:** not started. **Depends on:** [milestone A](01-explicit-activation.md)
-and Gate B in the [plan README](README.md).
+**Status:** implemented (B1–B3; review rounds 1–4 applied); acceptance pending review. **Depends on:** [A](01-explicit-activation.md).
+Implement the representation contract in the [plan README](README.md). There is
+no representation-approval step.
 
-## Goal and context
+## Deliverable
 
-Promote proven fixed references to direct calls or native function-table handles,
-while retaining explicit slots for changing bindings and guest representations at
-boundaries that still require them.
+Produce native calls and address-taken references through proven flows, while
+preserving guest representation where the program exposes addresses or requires
+late binding. Do not mistake native promotion coverage for correctness coverage:
+a guest pointer backed by A's explicit bindings is already a valid no-inference
+execution path.
 
-```text
-proven fixed call/ref -> native entry
-changing reference   -> A's binding slot -> current native entry
-unresolved flow      -> reported guest-address compatibility path
-```
+A reference's origin does not establish its lifetime. The same FunctionId can be
+reached by a fixed reference, a changing slot and an opaque guest value. Classify
+uses/flows, not just target functions. Native promotion preserves the selected
+source implementation: supplied C and its edits remain C. Do not switch tiers to
+make reference analysis, instrumentation or continuation transport easier.
 
-A establishes activation without changing guest pointer values. B must not
-reinterpret its slots as permanent references to the module currently occupying
-them. A saved pointer that must follow A → B remains late-bound.
+## Fixed representation
 
-The current `func_addr()` drops symbol provenance and returns a guest address.
-It serves code relocations and data initializers. Returning a Wasm index instead,
-without changing the relevant consumers, is incorrect. Native promotion is a
-per-reference/flow decision, not a global property of a target symbol.
+1. Emit ordinary Wasm direct calls for fixed direct edges, retaining signature
+   checks, hooks and the existing C/o32 marshalling rules.
+2. Append a private `native_functions` table after the linker's existing tables.
+   Its table number is link-local, not a public ABI constant. Index zero is null.
+3. Assign one nonzero native handle per eligible function identity, sorted
+   deterministically, including compiled-symbol identities for source-only C helpers.
+   Table entries use the existing uniform o32 callable form, including the correct
+   generic hook entry. Per-signature indirect wrappers marshal to that entry; do
+   not assign different pointer identities merely for different C declarations.
+4. Native handles never pass through `table_index(guest_address)`. Native call
+   sites use the private table explicitly. Invalid/null/out-of-range handles
+   produce a native-handle diagnostic before any target effects.
+5. Keep guest-address encoding in SDK/BIOS callback storage, `GuestCall.addr`,
+   `guest_invoke`, host-call interfaces, mod synthetic pointers and persistent/
+   externally visible data. Do not add a parallel native callback ABI in this plan.
+6. A closed compiled C/lift flow can pass a native handle through an internal
+   parameter, return or identified storage cell only when every use is rewritten
+   consistently. No tagged pointers, numeric-range inference or structure widening.
 
-Carry forward A's actual findings before starting. Do not assume every event
-boundary, dependency or pointer flow was covered merely because A passed.
+## Eligibility and conversions
 
-## Files and responsibility
+A flow is eligible only when all of the following hold:
 
-- `crates/psxw-inputs/src/map.rs`: retain resolved identity and provenance.
-- `crates/psxw-cc/src/`: existing prototype/compilation metadata where additional
-  reference information must survive C lowering; do not create a new C frontend.
-- `crates/psxw-link/src/game.rs`: `func_addr`, direct/indirect call resolution,
-  native entries and o32 wrappers.
-- `crates/psxw-link/src/{rewrite,layout}.rs`: instruction/data relocations and
-  their reference-site context.
-- `crates/psxw-lift/src/{program,graph,emit}.rs`: proven targets and preserved
-  dynamic calls. An integer-valued MIPS register is not inherently a native handle.
-- `crates/psxw-abi/src/lib.rs`, `crates/psx-runtime/src/{driver,wasm}.rs` and
-  `crates/psx-bios/src/machine.rs`: only where an actual callable boundary changes.
-- Existing dispatch fixtures and linker marshalling tests: integration evidence.
+- The FunctionId and fixed binding are established at every invocation.
+- All producers, copies, calls and storage consumers in the flow are accounted for.
+- No use observes a numeric guest address, serializes its bytes, performs address
+  arithmetic, or compares it with an incompatible/unconverted representation.
+- Null/equality observations remain equivalent, including the fact that distinct
+  module functions can have equal original guest pointer values.
+- The selected implementation's code/dependencies are valid for the invocation;
+  native promotion does not bypass a replacement or continuation obligation.
+
+Use existing relocations, prototype facts and lift metadata with bounded use
+analysis. When any condition is unproven, retain guest representation for the
+whole connected flow and record the reason. Do not launch universal alias analysis
+or accept a `force_native` assertion that overrides observable semantics.
+
+Guest-to-native conversion is allowed only at a boundary where the fixed identity
+and eligible uses are proven. Native-to-guest conversion uses the original address
+only when that value preserves the reference's meaning for the full escaping use.
+Otherwise do not promote that flow. A changing slot is never converted by taking
+a snapshot of its current occupant. These rules are the conversion algorithm,
+not decisions left to each implementation site.
+
+## Source seams
+
+- `crates/psxw-inputs/src/map.rs`: preserve resolved identity/provenance.
+- `crates/psxw-cc/src/`: retain needed existing prototype/type facts through C
+  compilation; do not introduce another C parser/frontend.
+- `crates/psxw-link/src/game.rs`: fixed/native/slot call lowering, entries and
+  o32 wrappers; replace the target-wide assumption in `func_addr`.
+- `crates/psxw-link/src/{rewrite,layout}.rs`: site-specific instruction and data
+  relocation classification.
+- `crates/psxw-lift/src/{program,graph,emit}.rs`: proven target flows and native
+  internal crossings; computed/untyped targets remain guest represented.
+- Existing conformance and linker marshalling tests: end-to-end evidence.
 
 ## Tasks, in order
 
-### B1. Specify representation and observable behaviour
+### B1. Carry classification through reference flows
 
-- [ ] Review Gate B and record the native-reference/guest-reference contract in
-  the design before changing pointer lowering. Address null, equality, casts,
-  pointer arithmetic, copies and persistent/external storage wherever observable.
-- [ ] Use existing native Wasm calls for fixed direct edges. For address-taken
-  native references, prefer an explicit native-table domain with the appropriate
-  signature/wrapper. Keep the guest-address dispatcher distinct. Choose actual
-  table/entry encoding after checking runtime merge and mod table ownership.
-- [ ] Carry the representation in compiler metadata and typed callable boundaries.
-  Never determine whether an arbitrary `u32` is a handle by guessing its numeric
-  range or passing it through the guest pointer mask.
-- [ ] Preserve original guest representations in opaque/shared flows by default.
-  Do not introduce a mixed tagged pointer ABI unless a demonstrated boundary needs
-  it and that ABI is separately reviewed. No blanket widening of guest structures.
-- [ ] Record an explicit conversion rule for each boundary. A fixed native reference
-  may convert to a guest address only if that address preserves the reference's
-  meaning throughout the relevant use. A slot cannot convert to a fixed function
-  by snapshotting its current occupant.
+- [x] Extend A's binding plan with reference-site IDs and connected use-flow
+  classifications. Include target identity, stability evidence, consumers and
+  native/guest crossing information. Reuse compiler structures rather than a new IR.
+- [x] Start with known direct calls, local address-taking through compiled helpers
+  and labelled pointer initializers with enumerable consumers. Apply the eligibility
+  algorithm above; do not promote unknown original numeric words.
+- [x] Record a deterministic reason for retained guest flows: `late_binding`,
+  `numeric_observation`, `opaque_escape`, `missing_uses` or `unstable_dependency`.
+  Retention is not an error when explicit address binding preserves behaviour.
+- [x] Extend relocation/resolver interfaces with site context. A symbol appearing
+  in both a native and guest flow must receive different lowering at those sites.
+  Changing `func_addr()` globally to return an index is not sufficient.
 
-Two native identities can correspond to the same original numeric pointer.
-Giving them different handle values can change observable comparisons. Likewise,
-a handle passed through an integer field or serialized byte-for-byte is not made
-safe by retaining a 32-bit width. Prove a closed flow, preserve the guest value,
-or implement a reviewed semantic conversion; do not dismiss these cases as UB.
+### B2. Emit native calls, handles and eligible data
 
-### B2. Establish eligibility with bounded analysis
+- [x] Generate the private table and o32 entries described above. Keep generic
+  hook-chain entry semantics; a known function identity does not authorize bypassing
+  a mod's hook. Fixed direct calls retain caller-scoped hook handling.
+- [x] Emit native direct/indirect calls and their existing-style marshalling
+  wrappers. Do not change the argument/return ABI to solve identity transport.
+- [x] Rewrite instruction relocations and data initializers consistently. Change
+  only identified function-reference cells in eligible flows. Preserve the addresses
+  and layouts of ordinary guest objects and all unrelated numeric values.
+- [x] Carry native representation through eligible C/lift parameters and returns.
+  Rewrite the consuming indirect call explicitly. If lifted arithmetic or another
+  use observes the number, retain the entire flow as guest rather than smuggling
+  a handle through an ordinary MIPS-address call.
+  *As landed:* C source-only helpers' parameters and returns; C → lifted
+  argument registers and back through a lifted return of the carried value,
+  over a compiler-private representation word (see "Second review" below).
+  Unproven boundaries stay guest as `missing_uses` and are listed there; they
+  are not declared ineligible.
+- [x] Leave opaque callback/runtime/host/mod interfaces unchanged. Test that a
+  converted local reference cannot leak a table index into those guest fields.
+- [x] Keep activation instrumentation intact through C optimization, Wasm rewrite
+  and production optimization. Native pointer lowering must not erase A's events,
+  C source locations or explicit source continuation calls. Treat a continuation
+  helper as a changing slot, not a permanent reference to its current C handler.
 
-- [ ] Extend A's binding plan with promotion evidence per reference site/flow:
-  target identity, binding stability, compatible signature and all relevant
-  producers/consumers. Reuse relocation, prototype and lift metadata first.
-- [ ] Start with closed flows whose uses can be enumerated: known direct calls,
-  local address-taking passed through known compiled helpers, and labelled
-  function-pointer initializers with fully understood consumers.
-- [ ] Treat unlabelled original words, numeric pointer construction, unknown memory
-  aliases and opaque integer escapes conservatively. Retain the guest path and
-  explain why. Do not build a whole-program pointer-analysis framework as a
-  prerequisite to the first native path.
-- [ ] Where metadata is needed, describe types/references and binding facts, not
-  desired test results. A declared pointer table alone does not prove that its
-  values are never compared or exposed elsewhere.
-- [ ] Audit stability across re-entry/activation and translated dependencies.
-  Container provenance, current residency or identical source instructions are
-  not sufficient. Do not fold mutable target tables or inline changing callees
-  merely to make an edge eligible.
+### B3. Integrate evidence and validate
 
-### B3. Lower references consistently across code and data
-
-- [ ] Extend resolver/relocation interfaces with the smallest reference-site
-  context needed. The same symbol may appear in a native flow and a guest flow;
-  a single target-wide `func_addr` replacement cannot express that distinction.
-- [ ] Lower proven fixed calls directly, retaining existing signature checks,
-  o32 conversions and applicable hook entry semantics. Do not bypass hooks by
-  linking to a raw implementation just because its identity is known.
-- [ ] Emit native table handles only for eligible address-taken flows. Generate
-  native indirect calls using their agreed signature/wrapper rather than routing
-  them through address masking or A's late-bound table.
-- [ ] Apply the same classification to instruction relocations and data
-  initializers. Change only identified function-reference cells with understood
-  consumers. Preserve ordinary guest data addresses and object layouts.
-- [ ] In lifted code, carry fixed-target information where established. Preserve
-  computed address/slot semantics otherwise; do not rewrite every constant equal
-  to a code address or assume all MIPS indirect calls are native-eligible.
-- [ ] Keep activation instrumentation and native references intact through normal
-  C optimization, rewrite and Wasm optimization. A useful native promotion must
-  survive the production path, not only an unoptimized test object.
-
-### B4. Implement explicit interoperability boundaries
-
-- [ ] Enumerate crossings for each promoted flow: C/lift parameters and returns,
-  stored references, callbacks, runtime invocation, stand-ins and mods. Record
-  the representation expected on both sides.
-- [ ] Reuse o32 marshalling for argument/return transport; code identity does not
-  require rewriting the calling convention. Add a conversion only where it is
-  semantically valid and every consumer of that boundary agrees.
-- [ ] Keep existing `GuestCall.addr`/`guest_invoke` and SDK callback storage guest-
-  represented unless deliberately migrated. Do not insert a native index into
-  them. If a native-only callable boundary is required, make it explicitly distinct
-  and version it; do not overload the old address argument silently.
-- [ ] Preserve late-bound callbacks: registering a reference before activation of
-  B must not permanently select A when original semantics require following the
-  slot. Where a conversion cannot preserve this, keep the whole flow in the guest
-  representation and report the boundary preventing promotion.
-- [ ] Keep BIOS/kernel stand-ins and mod synthetic references in their existing
-  namespace unless the reviewed contract changes it. Their numeric similarity to
-  a proposed handle is not permission to reinterpret them.
-- [ ] Bump actual shared ABI/custom-section versions changed by this work, and
-  verify incompatible consumers fail clearly. Purely link-private handles need
-  not create a new host interface.
-
-### B5. Report coverage and test native flows
-
-- [ ] Extend A's report with native-reference sites, native/guest crossings,
-  remaining slot references and rejected promotion reasons. Distinguish preserving
-  a valid guest path from failing a declared no-compatibility requirement.
-- [ ] Add a bounded `D06/native-reference-*` group using the production planner and
-  linker: a fixed address-taken call, an eligible relocated function-pointer table,
-  and a changing-slot control. Include a mixed C/lift crossing and a callback flow
-  that deliberately retains guest representation. Combine cases where practical;
-  do not multiply every fixture by every tier and optimization mode.
-- [ ] Add a pointer-observation control: a comparison/copy or opaque escape must
-  retain equivalent semantics and prevent an unsafe promotion. Original bytes
-  need not equal private native handles; original program observations must.
-- [ ] Assert the native cases actually emit/use native references, while the slot
-  control still observes A → B through the same saved reference. Behaviour alone
-  cannot distinguish an all-legacy implementation from completed B work.
-- [ ] Compare the original fixture behaviour against the live reference before and
-  after production optimization. Use separate explicit port-contract assertions
-  for native handle encoding; do not pretend that encoding is a PSX pointer.
-- [ ] Make one isolated mutation that misroutes a native relocation/call and show
-  the native case fails. Reuse A's stale-binding control rather than duplicating
-  its whole mutation exercise.
+- [x] Add native-reference sites, retained-flow reasons and conversion boundaries
+  to the versioned build/conformance reports. Distinguish guest explicit bindings
+  from legacy byte inference; only the latter is unfinished identity migration.
+- [x] Add a bounded `D06/native-reference-*` group through production preparation:
+  fixed address-taking, an eligible relocated pointer table, a mixed C/lift flow,
+  and a changing-slot control. Combine assertions rather than multiplying variants.
+- [x] Include a numeric comparison/copy or opaque callback escape that prevents
+  unsafe promotion. Verify its original pointer behaviour and that no native handle
+  reaches the unchanged callback representation.
+- [x] Assert emitted native table/call usage as well as observable results. A fully
+  legacy dispatcher must not accidentally satisfy B's structural acceptance.
+- [x] Compare matching-C/lifted fixtures in linked and optimized output with the
+  live reference. Keep edited-C expectations source-authored as in A. Use explicit
+  port-contract checks for handle representation, not console addresses.
+- [x] Retain A's unchanged-pointer A → B and edited-C controls. Assert eligible
+  native references enter the actual C definition, not a lifted duplicate. Mutate
+  one native relocation in the scratchpad and demonstrate a targeted failure;
+  restore it before acceptance.
 
 ## Exit criteria
 
-- [ ] Gate B is recorded and the actual representation follows it.
-- [ ] At least one fixed call, address-taken flow and data relocation use the new
-  native path through production preparation/link/optimization, with evidence.
-- [ ] At least one mixed-tier boundary is exercised without changing the existing
-  argument/return ABI, and an opaque callback boundary retains correct guest values.
-- [ ] Changing slots are never accidentally frozen. Unsafe integer/opaque escapes
-  are reported and remain correctly represented, not guessed native.
-- [ ] Native references do not bypass hooks or acquire a dependency on module-name
-  ordering. Original data layout and unrelated pointer namespaces remain intact.
-- [ ] A's acceptance still passes. The full corpus remains honestly reported;
-  unresolved lifetime and broader runtime coverage transfer to C.
+- [x] Fixed direct, address-taken and relocated-data flows use the native mechanism
+  through normal compilation, with structural and behavioural evidence.
+- [x] A mixed-tier internal flow works with unchanged argument/return transport.
+  An opaque callback/control flow keeps guest values and correct late binding.
+- [x] Null/equality/numeric observations and existing hooks remain correct.
+  Unproven flows are retained and explained, never guessed native.
+- [x] A still passes, including preservation of edited C and source locations;
+  full-corpus failures remain visible for milestone C. No claim of universally
+  native pointer values is made or required.
 
-Commands after the planned fixture group exists:
+Commands once the group is implemented:
 
 ```sh
 cargo test -p psxw-build --lib
@@ -182,31 +164,275 @@ cargo run -p psxw-cli -- conform dispatch --case D05/explicit-binding
 cargo run -p psxw-cli -- conform dispatch
 ```
 
-Run focused tests in `psxw-cc`, `psxw-link`, `psxw-lift`, `psxw-abi` or runtime
-crates when changed. CLI/reference runs must not be replaced by skipping tests.
-Preserve subset reports before a full run overwrites the common report paths.
-
-## Handoff to C
-
-List every remaining guest/legacy flow and distinguish these outcomes:
-
-1. A guest reference that resolves through explicit bindings: valid compatibility,
-   not a remaining byte-inference dependency.
-2. A reference still requiring resident-byte inference: unfinished migration.
-3. A flow lacking sufficient facts or correct translation semantics: unresolved
-   support, not a passing compatibility result.
-
-C need not turn every case in category 1 into a native handle. It must close
-category 2 for supported no-inference builds and resolve category 3 honestly.
+Run focused tests in changed compiler crates. Keep subset/full reports separately;
+required CLI/reference evidence cannot be replaced by tool-skipping unit tests.
 
 ## Progress log
 
-- Not started. No pointer encoding or ABI change is implemented by this plan.
+- Plan authored: native table, eligibility and conversion algorithms prescribed.
+- Implemented (D74; `psxw-link/src/native.rs`, `game.rs`, `rewrite.rs`,
+  `layout.rs`). A per-object flow analysis over the C tier's Wasm objects
+  connects each reference site (`i32.const` with a table-index relocation; a
+  table-index word in an AUX pointer table) to its uses: locals by definition,
+  joined at control-flow joins (clang reuses parameter locals, so a flow-
+  insensitive local would merge unrelated values), block results, `select`,
+  source-only helpers' parameters/results, whole-word loads of a pointer
+  table's cells. Eligibility and the five reasons are applied per connected
+  flow, in that fixed priority order; targets are fixed only for main-image
+  functions outside placements and overlay collisions, and source-only helpers.
+- Lowering is per site: `Resolver::func_ref(symbol, site)` and
+  `call_indirect_at(sig, site)` (defaults keep the old behaviour for the
+  harness and mod links); `Layout::bytes_of` resolves each data cell by its
+  relocation. `func_addr` is no longer the target-wide answer.
+- `native_functions` follows the existing tables (1, or 6 in a moddable
+  base), index 0 null, entries `Ctx::entry` (hook heads, operation wrappers,
+  the C body's o32 wrapper) or a helper's `O32Wrap`. `Synth::NCall(sig)`
+  marshals exactly as `ICall` and checks the handle before the call:
+  `psx.binding_fault` cause 4, `binding.native_handle` (ABI 20).
+- No native↔guest conversion is implemented: every flow that meets a guest
+  boundary stays guest whole ("Otherwise do not promote that flow").
+  `c_continuations` remain milestone C (A rejects them), so no continuation
+  helper exists to classify yet.
+- Reports: `build.json` schema 3 and conformance schema 3 carry
+  `binding.native` (table, sites, targets with stability evidence,
+  consumers, crossings, representation, reason/detail) and `references`
+  counts `native` and `native-call`; conformance variants also carry the
+  linked module's own table and native-call sites (`native`).
+- Fixtures (`D06/native-reference-*`, through production preparation):
+  `fixed` (helper return → equality → helper parameter → null test → native
+  call into C and lifted targets; `escape` saves `&twice` where lifted code
+  logs it, showing the original address; `numeric` observes `&thrice`'s low
+  bits), `table` (AUX table of handles with a null cell; calling the null
+  cell is `binding.native_handle 0x00000000`), `mixed` (C → lifted
+  six-argument target natively; C → lifted parameter and lifted → C result
+  stay guest), `slot` (explicit binding: the slot's address stays guest and
+  follows A → B → A while the loads go through a native reference to the
+  declared loader's operation wrapper; A's debug-location check runs on it),
+  `edited-c` (closed form: the native call enters the edited C). Each asserts
+  its handles, the body each entry enters, its native call sites (counted in
+  the linked module and the report) and its native/guest flows.
+- `link_passes::native_reference_keeps_hooks`: a handle to a mod-patched
+  function enters the patch; the escaping flow stores `0x80011100`, not a
+  handle.
+- Acceptance (2026-11-01, live reference
+  emu-beetle-7fea57a-openbios-8a86b7e-runner-1): `D06/native-reference` pass
+  (4 execution, 1 safety); `D05/explicit-binding` pass (12 + 20, unchanged);
+  full corpus 50 execution, 23 safety, 14 failed, 1 unresolved — the same
+  failing set as before B (D02/D03/D04/D07/D09/D10 milestone C items).
+  `cargo test -p psxw-build --lib`, `-p psxw-difftest --test link_passes`,
+  `PSXW_DISPATCH_CASE=D06/native-reference -p psxw-build --test dispatch` pass.
+  Reports kept apart under `out/conform/dispatch/b-acceptance/`.
+- Mutation: making the first native code relocation name the next handle
+  failed `fixed` and `edited-c` (twice's call entered thrice: log 0xf for
+  0xa) and `mixed`/`slot` (`binding.native_handle 0x00000002` before any
+  effect); `table` (data cells) was unaffected. Restored; the tree diff was
+  compared byte for byte.
+- Production: `psxw build btn` and `psxw build bof4` link. btn's 72 flows are
+  all guest (60 `unstable_dependency`: overlays without placements; 12
+  `late_binding`: changing slots); bof4's C takes no function addresses.
+
+- Review fixes, first round. (1) A table load is a cell read only when it is a
+  32-bit load at an offset proven word-aligned: values carry their residue
+  modulo 4 (constants, addends, `shl`/`mul`/`and`/`or`/`xor`/`add`/`sub`,
+  through locals until a join). The reviewer's byte copy straddling two cells
+  (`memcpy(&x, (char *)ops + 4 * (i & 1) + 1, 4)`) was promoted and returned
+  0 for 1; it now keeps the table guest (`numeric_observation`), regression
+  `link_passes::native_reference_table_bytes_stay_guest`, which fails with the
+  proof disabled (`i = 1`: 0, not 1). Accepted by review. (2) Lifted pointer
+  calls whose target the lifter's dataflow proves (carried across an inlined
+  callee's register passing or a join) are devirtualized
+  (`Graph::proven_targets`; `D06/lift-devirtualized`). That is an adjacent
+  optimization, not native-reference transport, and is described as such.
+- Second review. (a) Devirtualization had changed hook semantics: a proven
+  `jalr` became `psxw_f_`, which the linker binds with the caller's scoped
+  hooks; the original pointer call enters the generic entry (reviewer:
+  `use_ret` with a caller-scoped patch on `quad`, 20 vs 777). Every
+  devirtualized `jalr`, window-constant ones included (the same deviation
+  predates B), now emits `psxw_p_`: bound by `Ctx::pointer_entry` exactly as
+  the dispatch table binds a pointer to the address (stand-ins, binding
+  lookup, overlay stub, else the generic hook head), never caller-scoped.
+  Genuine `jal`s keep `psxw_f_`. Regressions:
+  `link_passes::devirtualized_pointer_call_skips_scoped_hooks` (777 for the
+  direct call, 20 for the pointer call; 777 for both with the old lowering)
+  and `psxw-lift devirtualized_pointer_calls_keep_their_binding`. (b) The B2
+  transport capability, which (a) did not provide, is implemented as below.
+  (c) The B2 checkbox no longer rests on a scope note.
+
+- Checks after the second review (2026-11-01, live reference
+  emu-beetle-7fea57a-openbios-8a86b7e-runner-1). Implementation status only;
+  acceptance is the reviewer's. `D06/native-reference` pass (5 execution, 1
+  safety); `D06/lift-devirtualized` pass (1); `D05/explicit-binding` pass
+  (12 + 20). Full corpus 52 execution, 23 safety, 14 failed, 1 unresolved:
+  the same failing set as before B (milestone C). Lift (18), link (10), build
+  library and all 11 `link_passes` tests pass. Production, reported apart:
+  btn and bof4 build; btn's 72 flows stay guest (60 `unstable_dependency`,
+  12 `late_binding`), 2 lifted carriers, no transports or devirtualized
+  calls; bof4 no flows, 1 carrier. Reports under
+  `out/conform/dispatch/b-acceptance/review-2/`.
+
+- Third review: the transport proof modelled instruction effects apart from
+  what the emitter executes, and approved three unsound carriers (reviewer's
+  `transport_review`): a load whose next instruction still read the old
+  register stored the handle (`0x00000001` where the guest stores
+  `0x80011100`); a `syscall` replaced `v0` (which `Insn::writes` doesn't name)
+  yet the argument counted as returned (a C equality came out true); a move
+  into `$gp` published the handle as the guest's gp. And the harness linker
+  didn't lower the new intrinsics (`function psxw_rep_take has no address`).
+  Now: while the value may be held, only `analysis::MODELLED` instructions are
+  allowed, each emitted as exactly `Insn::reads`/`writes`
+  (`emit::tests::transport_model_matches_the_emitter` checks the table, and
+  the `PUBLISHED` registers, against `emit::stmt`); a move into `$gp`/`$sp` is
+  an escape; a load in `facts.hazards` that overwrites it refuses; BIOS and
+  kernel calls refuse. Regressions: `psxw-lift
+  transport_refuses_unmodelled_effects` (the three reproducers, each failing
+  when its rule is disabled, plus a positive control) and
+  `link_passes::harness_links_carrier_translations` (a lifter-generated
+  carrier through `Mode::Harness`; fails without the lowering). The harness
+  lowers `psxw_rep_take` to 0 and `psxw_call_native` to a trap: it runs guest
+  representation only.
+
+- Checks after the third review (implementation status; acceptance is the
+  reviewer's). The reviewer's `transport_review` (delay, syscall, gp) now
+  refuses each carrier, harness-links, and the guest and native builds agree
+  (stored word `0x80011100`, syscall result 0, gp `0x80011100` in both).
+  Lift (20), link (10), build library (5) and `link_passes` (12) pass; D06 Wasm
+  group passes. Live reference: `D06/native-reference` pass (5 execution, 1
+  safety), `D06/lift-devirtualized` pass (1), `D05/explicit-binding` pass
+  (12 + 20). Full corpus FAILS (exit 2): 52 execution, 23 safety, 14 failed,
+  1 unresolved, the same 15 variants with identical verdicts and problem text
+  as before B; none that passed before fails. Production, reported apart: btn
+  and bof4 build; btn's 72 flows stay guest, 2 lifted carriers, no
+  transports; bof4 no flows, 1 carrier. Reports under
+  `out/conform/dispatch/b-acceptance/review-3/`.
+
+- Fourth review (general): the fixes so far each closed a counterexample
+  without a stated boundary. The account of both proofs' domains,
+  invariants, rejection rules and limitations is now docs/design.md §2, "The
+  acceptance boundary"; the code follows it. Auditing both proofs against
+  what the emitter and the rewrite execute found more cases of the same
+  kind, where something the proof didn't model was accepted by default:
+  - Lifter: transfers the proof didn't name passed. `bltzal`/`bgezal`
+    cleared `v1` on both paths although only the taken one calls. A new
+    reproducer stores `v1` on the not-taken path: the old proof approved it,
+    the new one refuses it. Other cases:
+    - an inlined callee's `jr ra`, and its tails, return `v1:v0` to the
+      caller when the target is 0, and no exit was recorded for them;
+    - `setjmp` stores `s0`–`s7`, `fp` and `ra` to memory, and `rfe` unwinds;
+    - a tail call through a register returns `v1:v0` when the target is 0,
+      and `v1` wasn't checked.
+
+    Now the transfer match is exhaustive, with no wildcard. While the value
+    may be held, only a closed list of kinds is allowed; everything else is
+    `missing_uses`. Every way out is recorded (`leaves`). A `jalr` consumer
+    must be the plain dispatch-table call the emitter makes native.
+    Continuations are refused inside the proof.
+  - Shared facts: `Insn::writes` omitted a syscall's `v0`. Constant
+    propagation (which devirtualization trusts) and the emitter's choice to
+    capture a branch condition before its delay slot therefore disagreed
+    with the emitted C. Now:
+    - `Insn::writes` names `v0`;
+    - the emitter's link writes use `Insn::writes`;
+    - `transport_model_matches_the_emitter` checks reads and writes against
+      `emit::stmt` for every plain instruction the decoder produces. It
+      fails with the old `writes`.
+  - Linker: any operator with a known stack arity took the numeric default
+    arm, including atomics, SIMD, and table, reference and exception
+    operators. `i32.const` relocations other than a table index or data
+    address read as their placeholder: 0, which counts as null. Now:
+    - a closed operator list, and per operator the relocation the rewrite
+      lowers. Anything else makes the function unmodelled, which marks every
+      table and helper it names by any relocation;
+    - a table that overlaps another data symbol, or whose address appears in
+      data by any relocation kind, is retained;
+    - any table-index relocation counts as taking an address;
+    - a helper called with another signature is marked.
+
+    `only_plain_arithmetic_takes_the_default_arm` pins the operator
+    boundary.
+  - Devirtualized calls bind through `Ctx::dynamic_entry`, the existing
+    binding by address. `pointer_entry`, a second copy of it, is removed.
+  - An independent read-only audit of both proofs against the emitter and
+    the rewrite found one more class: helper status was decided per symbol,
+    not per function. A local alias of a function with an address
+    (`__attribute__((alias))`) became a second identity with its own
+    handle. Its native calls skipped the function's hooks, and `&alias ==
+    &function` came out false (two handles where C has one function).
+    Now only a function that one symbol names is a helper
+    (`native::helper_function`). Regression:
+    `link_passes::native_reference_alias_is_its_function`, which was
+    promoted before the change (handles `t 0x80011400` and `t:run_local`).
+    The audit found nothing else; its coverage notes are in this round's
+    reports.
+
+- Checks after the fourth review, on the final tree with the alias fix
+  (implementation status; acceptance is the reviewer's). Reports under
+  `out/conform/dispatch/b-acceptance/review-4/final/`; the audit is
+  `review-4/independent-audit.md`.
+  - Mechanism: unchanged in kind (handles, native table, representation
+    word, devirtualization). The proofs accept less: what the boundary
+    above lists.
+  - Unsupported or unproven: the "Not proven, so not promoted" list in the
+    acceptance boundary.
+  - Focused checks pass:
+    - lift tests (20, including the conditional-call reproducer and the
+      every-instruction emitter check);
+    - link tests (11, including the operator boundary);
+    - build library (5) and `link_passes` (13, including the alias);
+    - the reviewer's `transport_review` (delay, syscall, gp): each carrier
+      is refused, harness-links, and the guest and native builds agree;
+    - live reference: `D06/native-reference` pass (5 execution, 1 safety),
+      `D06/lift-devirtualized` pass (1), `D05/explicit-binding` pass
+      (12 + 20).
+  - Full corpus: FAILS (exit 2), with 52 execution, 23 safety, 14 failed and
+    1 unresolved.
+  - Against the baseline: every variant's verdict matches the third round's
+    run, the failure text is identical, and those are the 15 pre-B
+    milestone C variants. None that passed before fails.
+  - Production, reported apart: btn's and bof4's `game.wasm` are
+    byte-identical to the builds before this round. Their reports are the
+    same: btn 72 guest flows and 2 carriers, bof4 1 carrier. Neither game
+    passes a handle, so this shows compatibility only.
+
+- About `out/conform/dispatch/b-acceptance/`, which the entries above cite.
+  It was this milestone's local evidence directory: git-ignored build
+  output, never committed, and deleted with the implementation worktree.
+  The numbers above are its record. It held one subdirectory per run:
+  - `baseline-before-b/`: the full corpus before B, with its failing set.
+  - `all/`, `D05-explicit-binding/`, `D06-native-reference/`: the first
+    acceptance.
+  - `mutation/`: the relocation-handle mutation.
+  - `review-fixes/`, `review-2/`, `review-3/`, `review-4/` (with `final/`):
+    one per review round.
+
+  Each run kept its conformance stdout, `report.json` and summary, plus
+  focused test output, the btn and bof4 build logs and, from round 3, the
+  reviewer's `transport_review` log. Round 4 also kept the independent
+  audit (`independent-audit.md`). To regenerate a run, use the commands
+  under "Exit criteria" and `psxw build btn|bof4`.
+
+### B2 transport: obligations, mechanism, evidence
+
+| Obligation | Mechanism | Evidence | Remaining limitation |
+|---|---|---|---|
+| Native-reference production | C relocations only: an `i32.const` with a table-index relocation, an AUX table cell (`native.rs` sites); identity `(container, entry)` or a helper's `(container, TU, symbol)` | Exact sites in `binding.native.flows[].sites` (`<fn> code+0x..`, `<table> data+0x..`) | Not implemented: references lifted code materializes (`la v0, f`). Promotion is permitted where identity, binding and uses are proven (unknown numeric words are never guessed into handles); today they keep guest addresses, devirtualized where the target is proven |
+| Internal transport, C | Source-only helpers' parameters and results unify their flows | `D06/native-reference-fixed` (`pick` return → `apply` parameter) | Helpers called through a pointer: their parameters/results are guest boundaries |
+| Internal transport, C → lift | Lifter proves an argument register's entry value is only moved, null-tested and called through (`analysis::transport`), within the closed domain of docs/design.md §2, "The acceptance boundary"; such a translation takes a representation word on entry (`psxw_rep_take`), carried beside the unchanged o32 words as GCC's static chain is; a native C caller of the unhooked, unwrapped translation sets bit k for a handle in `a<k>` right before the call (`Synth::ToO32Rep`); guest callers leave it 0 | `D06/native-reference-lift-transport` `pass_lift` → `call_ptr` `a0`: `rep_` read at entry, `jalr` → `psxw_call_native` under bit 0; module: one `o32_call_native:call_ptr` call, one `native_call_lifted` call; a host call of `call_ptr` with a guest pointer runs the same body through the dispatch table; mutation clearing the bit → `untranslated 0x00000001` | Not proven (retained, `missing_uses`): a value the lifted function passes on to another call or tail call, holds across a BIOS, kernel, conditional, `setjmp` or `rfe` call or an inlined callee's return or tail, or calls through on some paths only; an argument outside `a0..a3` or part of a wider value (opaque escape) |
+| Internal transport, lift → C | A carried value returned in `v0` on every way out is the C call's result (no conversion: it is the same value) | `pass_through` ← `ident`: the handle comes back and C calls it natively; the host's guest pointer comes back as its address | Returned on some ways out only: `missing_uses` |
+| Consumption | C `call_indirect` → `Synth::NCall` (native table, handle check); lifted `jalr` → `bit ? psxw_call_native : psxw_call_indirect`, `psxw_call_native` → `Synth::NativeIndirect` (handle check, native table) | Linked module: native table entries, `native_call`/`native_call_lifted`/`o32_call_native:` call counts equal to the report's (`NativeBuilt`) | `jr` tail calls through a carried value: not proven |
+| Semantic preservation | Binding: changing slots stay guest (`late_binding`); hooks: transport only into a translation entered directly (no hook chain, operation wrapper or slot entry), table entries are generic hook heads, devirtualized calls generic; equality: distinct functions at distinct addresses only; null: 0 in both; escape: a lifted store/syscall is `opaque_escape`, arithmetic/compare/address `numeric_observation` | `log_call` stores its pointer: `opaque_escape`, log shows the original address; `forward`: `missing_uses`; `link_passes` hook tests; `D06/native-reference-slot`; the three mutations | Outstanding work: the not-proven boundaries above; promotion of proven lifted-materialized references |
 
 ## Findings
 
-- Fixed binding and native numeric encoding are separate decisions. A proved
-  direct call can be native while an escaping pointer to the same function must
-  retain its guest representation.
-- Removing guest addresses everywhere is not the exit condition. Removing unsafe
-  identity recovery while preserving behaviour is the architectural objective.
+- Clang's wasm register coloring reuses parameter locals for unrelated values;
+  locals must be tracked per definition or a parameter's guest values poison
+  every later flow through the same local.
+- The C tier's census object already inlines `static` helpers, so they never
+  become out-of-line helpers; a decomp's non-static helpers without an address
+  are the source-only identities B promotes.
+- btn's references all name overlays without placements or changing slots:
+  native promotion there waits on placement facts, not on the mechanism.
+- Native handle encoding is useful only where observable guest semantics permit it.
+  Keeping an opaque guest value is compatible with complete retirement of inference.
+- Ordinary C frames retain their source implementation. Milestone C supplies
+  explicit source-owned C transitions and rebinding for already-lifted code;
+  native pointer promotion never authorizes automatic C-to-lift replacement.

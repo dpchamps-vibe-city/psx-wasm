@@ -1,11 +1,22 @@
 # Dispatch conformance: executable semantics, not game coverage
 
-**Status:** baseline runner and independent reporting implemented; architecture
-review blocked on the failures below. This milestone is **not complete**.
+**Status:** baseline runner and independent reporting implemented; remediation
+and acceptance remain unfinished. This milestone is **not complete**.
 D72 was removed, not adopted. Production retains the distinguishing-word patch
 and the previous D6/D7 dispatch routing. The synthetic command deliberately
-returns nonzero on the remaining findings. No mandatory CI gate is installed
-while the contract review is unresolved.
+returns nonzero on the remaining findings. No mandatory CI gate is installed.
+
+**Current contract and implementation direction:** the
+[dispatch-binding plan](dispatch-binding/README.md) supplies concrete publication,
+continuation, namespace and failure rules. It supersedes historical approval
+blockers and proposed-policy labels below for those subjects; no further operator
+decision is pending. Preserve the baseline evidence. Update fixture classifications
+and required observations according to that plan as the contracts are installed,
+not by relabelling incorrect execution as a pass. Supplied C remains authoritative:
+ordinary C frames retain their authored body, and C continuation switches require
+explicit source handlers/state. Preserve the existing lifted active-replacement
+positive; add separate C-source/edit/debugging checks, never a hidden C-to-lift
+fallback or a relabelled lifted result.
 
 **Goal:** establish a game-independent, independently checked contract for
 selecting and entering compiled guest code, including overlapping overlays.

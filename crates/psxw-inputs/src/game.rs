@@ -32,6 +32,10 @@ pub struct GameManifest {
     pub census: CensusSection,
     #[serde(default)]
     pub chips: ChipsSection,
+    /// `[dispatch]`: explicit binding facts (plans/dispatch-binding). Absent:
+    /// the reported legacy dispatch.
+    #[serde(default)]
+    pub dispatch: Option<crate::dispatch::DispatchSection>,
 }
 
 /// `[census]`: the census's documented exceptions.

@@ -4,6 +4,7 @@
 //! load-delay hazards.
 
 use crate::decode::{Insn, Op};
+use crate::emit::Exceptions;
 use crate::graph::{Callee, Graph, Node, Transfer};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -404,4 +405,266 @@ mod tests {
         assert!(super::is_kernel(0xA000_DF80));
         assert!(!super::is_kernel(0));
     }
+}
+
+/// The instructions the transport proof follows while it tracks a value:
+/// each touches only the translation's own registers (C locals, but for
+/// [`PUBLISHED`] ones), `hi`/`lo` and guest memory, as [`Insn::reads`] and
+/// [`Insn::writes`] say (`emit::tests::transport_model_matches_the_emitter`
+/// checks those against the emitter for every instruction), and branches
+/// and jumps as `emit::Emitter::group` performs them. The rest hand
+/// registers to the runtime or merge into them (syscalls, coprocessor
+/// moves, partial loads and stores, `break`, `rfe`): the proof refuses
+/// them while the value may be in any register.
+pub const MODELLED: &[Op] = &[
+    Op::Sll, Op::Srl, Op::Sra, Op::Sllv, Op::Srlv, Op::Srav, Op::Mfhi, Op::Mflo, Op::Mthi, Op::Mtlo, Op::Mult, Op::Multu, Op::Div,
+    Op::Divu, Op::Add, Op::Addu, Op::Sub, Op::Subu, Op::And, Op::Or, Op::Xor, Op::Nor, Op::Slt, Op::Sltu, Op::Addi, Op::Addiu,
+    Op::Slti, Op::Sltiu, Op::Andi, Op::Ori, Op::Xori, Op::Lui, Op::Lb, Op::Lbu, Op::Lh, Op::Lhu, Op::Lw, Op::Sb, Op::Sh, Op::Sw,
+    Op::Beq, Op::Bne, Op::Blez, Op::Bgtz, Op::Bltz, Op::Bgez, Op::Bltzal, Op::Bgezal, Op::J, Op::Jal, Op::Jr, Op::Jalr,
+];
+
+/// Registers whose writes the emitter publishes to the guest's shared
+/// globals (`psxw_gp_set`, `psxw_sp_set`): a value there is visible
+/// outside the translation.
+pub const PUBLISHED: u32 = (1 << 28) | (1 << 29);
+
+/// A register-to-register move: (destination, source).
+fn move_of(i: &Insn) -> Option<(u8, u8)> {
+    match i.op {
+        Op::Addu | Op::Or if i.rt == 0 => Some((i.rd, i.rs)),
+        Op::Addu | Op::Or if i.rs == 0 => Some((i.rd, i.rt)),
+        Op::Addiu if i.simm == 0 => Some((i.rt, i.rs)),
+        Op::Ori if i.uimm == 0 => Some((i.rt, i.rs)),
+        _ => None,
+    }
+}
+
+/// Why a native handle can't pass in an argument register.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The function reads the value as a number: arithmetic, a comparison,
+    /// an address.
+    Observed(String),
+    /// The value leaves where the guest sees it: stored, or to the runtime.
+    Escapes(String),
+    /// A use this proof doesn't follow (into a callee, a return, across a
+    /// BIOS call, on some paths only): not shown ineligible, not proven.
+    Unproven(String),
+}
+
+/// An argument register that can carry a native handle: the `jalr` sites
+/// (branch pcs) that call through its entry value, and whether every way
+/// out returns it in `v0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carrier {
+    pub jalrs: Vec<u32>,
+    pub returned: bool,
+}
+
+/// Representation transport (plans/dispatch-binding B): for each argument
+/// register `a0..a3` (by index), what its entry value reaches when nothing
+/// else observes it ([`Carrier`]); else why not. The domain is closed
+/// (docs/design.md §2, "The acceptance boundary"): while the value may be in
+/// any register, every instruction is [`MODELLED`] and every transfer is
+/// one of the kinds matched below, as the emitter performs it; anything
+/// else is [`Refusal::Unproven`].
+///
+/// The value may be moved between the translation's own registers and
+/// tested against zero. A `jalr` the emitter makes a dispatch-table call
+/// must call through it on every path that reaches it. Anything else that
+/// reads it (arithmetic, a comparison, a store, an address, a call's
+/// argument registers or `v0`) observes it as a number; a move into a
+/// [`PUBLISHED`] register lets it escape. It may be returned in `v0` only
+/// on every way out. Calls change only `v0`/`v1` here: a translation's
+/// registers are its own C locals. A load the next instruction reads
+/// around (the emitter's load-delay hazard, `facts.hazards`) may not
+/// overwrite it.
+pub fn transport(g: &Graph, facts: &Facts, x: &Exceptions) -> BTreeMap<u8, Result<Carrier, Refusal>> {
+    (0..4)
+        .map(|k| {
+            let r = if x.continuation {
+                Err(Refusal::Unproven("a setjmp continuation's entry registers come from a jmp_buf".into()))
+            } else {
+                transport_of(g, facts, x, k)
+            };
+            (k, r)
+        })
+        .collect()
+}
+
+/// Whether the emitted code for transfer `t` can leave the function
+/// (`emit::Emitter::group`, `tail`, `back`): a return, a tail call (whose
+/// target 0 returns too), an inlined callee's `jr ra` (0 is the caller's
+/// return address), and `rfe`'s jump.
+fn leaves(t: &Transfer, rfe: bool) -> bool {
+    use crate::graph::Dest;
+    let tail = |d: &Dest| matches!(d, Dest::Tail(_));
+    match t {
+        Transfer::Seq(_) | Transfer::Table { .. } => false,
+        Transfer::Return | Transfer::InlineReturn { .. } | Transfer::FallOff(_) => true,
+        Transfer::Jump(d) => rfe || tail(d),
+        Transfer::Cond { taken, fall } => tail(taken) || tail(fall),
+        Transfer::Call { next, .. } | Transfer::CondCall { next, .. } => tail(next),
+    }
+}
+
+fn transport_of(g: &Graph, facts: &Facts, x: &Exceptions, k: u8) -> Result<Carrier, Refusal> {
+    use Refusal::*;
+    use crate::graph::Dest;
+    let bit = |r: u8| 1u32 << r;
+    // What a call hands on: a0..a3, and v0 to a static-chain callee.
+    const PASSED: u32 = 0xF0 | 1 << 2;
+    // Per register: certainly the value (`yes`), possibly it (`maybe`).
+    let entry = Node::Normal(g.entry);
+    let mut states: BTreeMap<Node, (u32, u32)> = BTreeMap::from([(entry, (bit(4 + k), bit(4 + k)))]);
+    let mut work = VecDeque::from([entry]);
+    let mut consumers = BTreeSet::new();
+    // Per way out of the function: whether `v0` is the value there.
+    let mut exits: BTreeMap<Node, bool> = BTreeMap::new();
+    while let Some(n) = work.pop_front() {
+        let (mut yes, mut maybe) = states[&n];
+        let d = &g.nodes[&n];
+        let i = &d.insn;
+        let pc = n.pc();
+        // The branch (or last instruction) the transfer belongs to.
+        let (Node::Normal(at) | Node::Slot(at)) = n;
+        // Calls the emitter lowers specially: setjmp stores registers to
+        // memory, rfe unwinds.
+        let special = x.setjmp.contains(&at) || x.rfe.contains(&at);
+        let clear = |yes: &mut u32, maybe: &mut u32, r: u8| {
+            *yes &= !bit(r);
+            *maybe &= !bit(r);
+        };
+        if maybe != 0 && !MODELLED.contains(&i.op) {
+            return Err(Unproven(format!("{:?} at 0x{pc:08X} has effects the proof doesn't model", i.op)));
+        }
+        // The emitter gives the next instruction the loaded register's old
+        // value: that read is of the value, after this "clears" it.
+        if i.op.is_load() && facts.hazards.get(&n).is_some_and(|&r| maybe & bit(r) != 0) {
+            return Err(Unproven(format!("the load at 0x{pc:08X} overwrites it while the next instruction still reads it")));
+        }
+        match (move_of(i), i.op) {
+            (Some((rd, rs)), _) if maybe & bit(rs) != 0 && PUBLISHED & bit(rd) != 0 => {
+                return Err(Escapes(format!("moved into ${} at 0x{pc:08X}, which the guest shares", if rd == 28 { "gp" } else { "sp" })));
+            }
+            (Some((rd, rs)), _) => {
+                let (y, m) = (yes & bit(rs), maybe & bit(rs));
+                clear(&mut yes, &mut maybe, rd);
+                if y != 0 {
+                    yes |= bit(rd);
+                }
+                if m != 0 {
+                    maybe |= bit(rd);
+                }
+            }
+            (None, Op::Jalr) => {
+                if yes & bit(i.rs) != 0 {
+                    // The emitter makes only a plain dispatch-table call
+                    // native (`emit::Emitter::group`).
+                    let call = g.nodes.get(&Node::Slot(pc)).map(|s| &s.transfer);
+                    if !matches!(call, Some(Transfer::Call { callee: Callee::Indirect { .. }, .. })) || special {
+                        return Err(Unproven(format!("the jalr at 0x{pc:08X} isn't a plain call through the dispatch table")));
+                    }
+                    consumers.insert(pc);
+                } else if maybe & bit(i.rs) != 0 {
+                    return Err(Unproven(format!("the jalr at 0x{pc:08X} calls through it on some paths only")));
+                }
+                if let Some(r) = i.writes() {
+                    clear(&mut yes, &mut maybe, r);
+                }
+            }
+            // A null test.
+            (None, Op::Beq | Op::Bne) if i.rs == 0 || i.rt == 0 => {}
+            (None, Op::Jr) if maybe & bit(i.rs) != 0 => {
+                return Err(Unproven(format!("the jr at 0x{pc:08X} jumps through it")));
+            }
+            (None, op) => {
+                if op.is_store() && maybe & bit(i.rt) != 0 {
+                    return Err(Escapes(format!("stored at 0x{pc:08X}")));
+                }
+                if i.reads() & maybe != 0 {
+                    return Err(Observed(format!("{op:?} at 0x{pc:08X} uses it")));
+                }
+                if let Some(r) = i.writes() {
+                    clear(&mut yes, &mut maybe, r);
+                }
+            }
+        }
+        yes &= !1;
+        maybe &= !1;
+        // The transfer, as the emitter performs it. The kinds the proof
+        // follows while the value may be held are matched first; every
+        // other kind is refused then. With no register holding it, the
+        // value is dead (never stored, passed or in hi/lo): nothing there
+        // sees it, and a way out returns something else.
+        match &d.transfer {
+            Transfer::Seq(_) | Transfer::Table { .. } => {}
+            Transfer::Jump(Dest::Local(_)) | Transfer::Cond { taken: Dest::Local(_), fall: Dest::Local(_) } if !special => {}
+            Transfer::Call { callee: Callee::Direct { .. } | Callee::Indirect { .. }, next: Dest::Local(_) } if !special => {
+                if maybe & PASSED != 0 {
+                    return Err(Unproven(format!("it is passed on to the call at 0x{pc:08X}")));
+                }
+                clear(&mut yes, &mut maybe, 2);
+                clear(&mut yes, &mut maybe, 3);
+            }
+            Transfer::Return => {
+                if maybe & bit(3) != 0 || (maybe & bit(2) != 0 && yes & bit(2) == 0) {
+                    return Err(Unproven(format!("it is returned at 0x{pc:08X} on some paths only")));
+                }
+                exits.insert(n, yes & bit(2) != 0);
+            }
+            // A tail call out of the function's own code returns the
+            // callee's result; through a register, target 0 returns v1:v0.
+            Transfer::Jump(Dest::Tail(Callee::Direct { .. } | Callee::Indirect { .. }))
+            | Transfer::FallOff(Callee::Direct { .. } | Callee::Indirect { .. })
+                if !special && !g.inlined(at) =>
+            {
+                if maybe & (PASSED | bit(3)) != 0 {
+                    return Err(Unproven(format!("it is passed on to the tail call at 0x{pc:08X}")));
+                }
+                exits.insert(n, false);
+            }
+            // Conditional calls, BIOS and kernel calls, setjmp and rfe, an
+            // inlined callee's returns and tails, conditional tails.
+            t @ (Transfer::Jump(_)
+            | Transfer::Cond { .. }
+            | Transfer::Call { .. }
+            | Transfer::CondCall { .. }
+            | Transfer::FallOff(_)
+            | Transfer::InlineReturn { .. }) => {
+                if maybe != 0 {
+                    return Err(Unproven(format!("it may be held at 0x{pc:08X}, a transfer outside the proof's domain")));
+                }
+                if leaves(t, x.rfe.contains(&at)) {
+                    exits.insert(n, false);
+                }
+            }
+        }
+        for s in g.succs(n) {
+            let changed = match states.get_mut(&s) {
+                None => {
+                    states.insert(s, (yes, maybe));
+                    true
+                }
+                Some((y, m)) => {
+                    let (ny, nm) = (*y & yes, *m | maybe);
+                    let changed = (ny, nm) != (*y, *m);
+                    (*y, *m) = (ny, nm);
+                    changed
+                }
+            };
+            if changed {
+                work.push_back(s);
+            }
+        }
+    }
+    let returned = match (exits.values().any(|&r| r), exits.values().all(|&r| r)) {
+        (false, _) => false,
+        (true, true) => true,
+        (true, false) => return Err(Unproven("it is returned on some ways out only".into())),
+    };
+    if consumers.is_empty() && !returned {
+        return Err(Unproven("nothing calls through it or returns it".into()));
+    }
+    Ok(Carrier { jalrs: consumers.into_iter().collect(), returned })
 }

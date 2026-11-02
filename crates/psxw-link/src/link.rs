@@ -129,6 +129,17 @@ pub struct Linked {
     /// C calls whose declaration and definition differ in C-level kinds
     /// though not in wasm types, routed through o32 (game link).
     pub abi_mismatches: Vec<String>,
+    /// Code references by how they bind (game link; plans/dispatch-binding
+    /// A): `fixed`, `slot`, `lookup` (a guest address called through the
+    /// dispatch table), and the legacy `legacy-sampled`, `legacy-exempt`
+    /// (a main-container call skipping the sampled check) and
+    /// `legacy-unique` (an uncovered overlay's entry, no residency check);
+    /// `native` (an address taken as a native handle, plans/dispatch-binding
+    /// B) and `native-call` (an indirect call through the native table).
+    pub references: std::collections::BTreeMap<&'static str, usize>,
+    /// Native references (game link; plans/dispatch-binding B): the native
+    /// table, and every reference flow with its representation.
+    pub native: crate::native::Report,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -203,9 +214,10 @@ impl Ctx<'_> {
     }
 }
 
-/// Address from a generated symbol name: `psxw_f_[<container>_]<ADDR>`.
+/// Address from a generated symbol name: `psxw_{f,p}_[<container>_]<ADDR>`
+/// or `psxw_d_<ADDR>`.
 fn generated_addr(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix("psxw_f_").or_else(|| name.strip_prefix("psxw_d_"))?;
+    let rest = name.strip_prefix("psxw_f_").or_else(|| name.strip_prefix("psxw_p_")).or_else(|| name.strip_prefix("psxw_d_"))?;
     let hex = rest.rsplit('_').next()?;
     (hex.len() == 8).then(|| u32::from_str_radix(hex, 16).ok()).flatten()
 }
@@ -251,6 +263,13 @@ impl Resolver for InputResolver<'_, '_> {
             "psxw_chain_get" => return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.chain)])),
             "psxw_chain_set" => return Ok(Lowered::Instrs(vec![I::GlobalSet(self.ctx.chain)])),
             "psxw_call_indirect" => return Ok(Lowered::Call(self.ctx.synth(Synth::Indirect))),
+            // Native references (plans/dispatch-binding B): the harness
+            // runs guest representation only, so no caller says an argument
+            // is a native handle, and no native call is reached.
+            "psxw_rep_take" if inp.generated => return Ok(Lowered::Instrs(vec![I::I32Const(0)])),
+            "psxw_call_native" if inp.generated => {
+                return Ok(Lowered::Instrs(vec![I::Drop, I::Drop, I::Drop, I::Drop, I::Drop, I::Unreachable]));
+            }
             n if SERVICES.contains(&n) => {
                 return Ok(Lowered::Call(self.ctx.synth(Synth::Service { name, sig: sig.clone() })));
             }
@@ -504,7 +523,7 @@ pub fn link(
     let mut data = DataSection::new();
     let mut aux = Vec::new();
     for &(i, si, addr) in &ctx.layout.aux.clone() {
-        let fa = |input: usize, sym: u32| func_addr(&ctx, input, sym);
+        let fa = |input: usize, r: &crate::object::Reloc| func_addr(&ctx, input, r.symbol);
         let bytes = ctx.layout.bytes_of(&ctx.view, map, i, si, &fa)?;
         data.active(0, &ConstExpr::i32_const((WINDOW_BASE + (addr & WINDOW_MASK)) as i32), bytes);
         aux.push((inputs[i].label.clone(), inputs[i].obj.symbols[si as usize].name.clone(), addr));
@@ -523,7 +542,7 @@ pub fn link(
 
     let wasm = module.finish();
     let matched = ctx.layout.defined.values().filter(|p| p.how == How::Matched).count();
-    Ok(Linked { wasm, aux, matched, abi_mismatches: Vec::new() })
+    Ok(Linked { wasm, aux, matched, abi_mismatches: Vec::new(), references: Default::default(), native: Default::default() })
 }
 
 /// Push a call-out's operands and call it: kind, target, nwords, a0..a3, sp.

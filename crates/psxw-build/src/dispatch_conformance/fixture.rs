@@ -136,6 +136,35 @@ pub enum Evidence {
     ClosedForm(&'static str),
 }
 
+/// What a variant's native references must be as built
+/// (plans/dispatch-binding B), asserted on the linked module besides its
+/// observations: a build that keeps every reference at its guest address
+/// can't pass on behaviour alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeExpect {
+    /// The native table, by handle: each target's identity as the report
+    /// names it (`main 0x80100040`, or a helper's `:<symbol>`), and the
+    /// body its entry enters: `c`, `lift` or `helper`.
+    pub handles: Vec<(String, &'static str)>,
+    /// At least this many `call_indirect` sites through the native table.
+    pub calls: usize,
+    /// Flows that must be native: a site in this function (or table)
+    /// referencing this symbol.
+    pub native: Vec<(String, String)>,
+    /// Flows that must keep guest addresses: (function, symbol, reason).
+    pub retained: Vec<(String, String, &'static str)>,
+    /// Lifted pointer calls dataflow must devirtualize: (function, target).
+    pub devirtualized: Vec<(String, u32)>,
+    /// Lifted functions whose pointer calls stay through the dispatch table.
+    pub not_devirtualized: Vec<String>,
+    /// At least this many C calls passing native handles into lifted
+    /// argument registers.
+    pub transports: usize,
+    /// Lifted argument registers that must be able to carry a handle:
+    /// (function, register index).
+    pub carriers: Vec<(String, u8)>,
+}
+
 /// One fixture variant.
 #[derive(Debug, Clone)]
 pub struct Variant {
@@ -162,6 +191,11 @@ pub struct Variant {
     /// A proposed support/rejection rule needing operator approval. Keep
     /// observations and mismatches; agreement alone cannot approve it.
     pub review_required: Option<&'static str>,
+    /// `[dispatch]` facts (TOML), as a game's manifest states them: the
+    /// variant exercises explicit binding. `None`: the legacy dispatch.
+    pub dispatch: Option<String>,
+    /// Native references the build must make.
+    pub native: Option<NativeExpect>,
 }
 
 impl Variant {

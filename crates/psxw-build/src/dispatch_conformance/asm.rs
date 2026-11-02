@@ -19,6 +19,7 @@ pub const T2: u8 = 10;
 pub const T3: u8 = 11;
 pub const T7: u8 = 15;
 pub const S0: u8 = 16;
+pub const S1: u8 = 17;
 pub const T8: u8 = 24;
 pub const T9: u8 = 25;
 pub const SP: u8 = 29;
@@ -129,6 +130,9 @@ impl Asm {
     }
     pub fn sltiu(&mut self, rt: u8, rs: u8, imm: i32) -> &mut Self {
         self.word(i(0x0B, rs, rt, imm as u32))
+    }
+    pub fn andi(&mut self, rt: u8, rs: u8, imm: u32) -> &mut Self {
+        self.word(i(0x0C, rs, rt, imm))
     }
     pub fn ori(&mut self, rt: u8, rs: u8, imm: u32) -> &mut Self {
         self.word(i(0x0D, rs, rt, imm))

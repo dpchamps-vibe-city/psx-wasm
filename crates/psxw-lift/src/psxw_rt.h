@@ -43,6 +43,12 @@ uint32_t psxw_chain_get(void);
 void psxw_chain_set(uint32_t v0);
 /* Lowered to `call_indirect` through the dispatch table. */
 uint64_t psxw_call_indirect(uint32_t addr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);
+/* Native references (plans/dispatch-binding B): the representation word a
+ * native caller set for this call (bit k: argument k is a native handle),
+ * cleared as it is read; and a call through a native handle. Lowered to a
+ * compiler-private global and to the native table. */
+uint32_t psxw_rep_take(void);
+uint64_t psxw_call_native(uint32_t handle, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);
 /* ReturnFromException (B0h:17h): lowered to a wasm `throw` that unwinds to
  * the runtime's interrupt entry. */
 __attribute__((noreturn)) void psxw_return_from_exception(void);

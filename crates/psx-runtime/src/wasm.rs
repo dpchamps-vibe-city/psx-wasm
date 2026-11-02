@@ -470,6 +470,16 @@ pub extern "C" fn untranslated(addr: u32) -> u64 {
     }
 }
 
+/// A binding rule couldn't publish (plans/dispatch-binding A): never a
+/// guessed module. Or a native call's handle is invalid (B).
+#[unsafe(export_name = "binding_fault")]
+pub extern "C" fn binding_fault(rule: u32, cause: u32, value: u32) {
+    if cause == psxw_abi::binding_cause::NATIVE_HANDLE {
+        fatal(4, &format!("binding.native_handle: native call through handle {value:#x}, which names no function (the build report lists the native table)"));
+    }
+    fatal(4, &format!("{} by binding rule #{rule} (value {value:#010x}; the build report lists the rules)", psxw_abi::binding_cause::name(cause)));
+}
+
 #[unsafe(export_name = "bios")]
 pub extern "C" fn bios(table: u32, func: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u64 {
     // A resumed thread's stack has been rewound to its ChangeThread, which

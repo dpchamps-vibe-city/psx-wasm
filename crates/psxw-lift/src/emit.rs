@@ -53,6 +53,12 @@ pub struct Emitter<'a> {
     chain: &'a BTreeSet<String>,
     /// This function is one of them: its entry v0 is `psxw_chain_get()`.
     reads_chain: bool,
+    /// `jalr` sites (branch pc) that call through argument `k`'s entry value
+    /// ([`crate::analysis::transport`]): a native call when the caller's
+    /// representation word says argument `k` is a native handle.
+    native: BTreeMap<u32, u8>,
+    /// Takes the representation word on entry.
+    takes_rep: bool,
     preds: BTreeMap<Node, Vec<Node>>,
     skip: BTreeSet<Node>,
     temps: BTreeSet<String>,
@@ -79,6 +85,8 @@ impl<'a> Emitter<'a> {
             x: Exceptions::default(),
             chain: &NO_CHAIN,
             reads_chain: false,
+            native: BTreeMap::new(),
+            takes_rep: false,
             preds,
             skip: BTreeSet::new(),
             temps: BTreeSet::new(),
@@ -89,6 +97,12 @@ impl<'a> Emitter<'a> {
 
     pub fn exceptions(mut self, x: Exceptions) -> Self {
         self.x = x;
+        self
+    }
+
+    pub fn native(mut self, native: BTreeMap<u32, u8>, takes: bool) -> Self {
+        self.takes_rep = takes || !native.is_empty();
+        self.native = native;
         self
     }
 
@@ -124,6 +138,11 @@ impl<'a> Emitter<'a> {
         let mut out = String::new();
         let _ = writeln!(out, "/* {comment} */");
         let _ = writeln!(out, "uint64_t {cname}(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) {{");
+        if self.takes_rep {
+            // Bit k: argument k is a native handle. Only a native caller,
+            // calling this translation directly, sets it; 0 otherwise.
+            let _ = writeln!(out, "  uint32_t rep_ = psxw_rep_take(); (void)rep_;");
+        }
         let mut decls = Vec::new();
         let saved = |r: u32| JMP_BUF.iter().find(|(x, _)| *x as u32 == r).map(|(_, o)| format!("PSXW_LW(a0 + {o}u)"));
         for r in 1..32u32 {
@@ -234,10 +253,9 @@ impl<'a> Emitter<'a> {
         if matches!(head.op, Op::Jr | Op::Jalr) {
             self.line(&format!("t_ = {rs}; /* {b:08X}: {dis} */"));
         }
-        match head.op {
-            Op::Jal | Op::Bltzal | Op::Bgezal => self.line(&format!("r31 = 0x{:08X}u;", b + 8)),
-            Op::Jalr if head.rd != 0 => self.line(&format!("r{} = 0x{:08X}u;", head.rd, b + 8)),
-            _ => {}
+        // The link (`jal`, `jalr`, `bltzal`, `bgezal`): `Insn::writes`.
+        if let Some(r) = head.writes() {
+            self.line(&format!("r{r} = 0x{:08X}u;", b + 8));
         }
         let s = stmt(&slot.insn, b + 4, &None, self.facts.dead_loads.contains(&Node::Slot(b)));
         self.line(&format!("{s} /* {:08X}: {} (delay slot) */", b + 4, disasm(&slot.insn, b + 4)));
@@ -267,7 +285,12 @@ impl<'a> Emitter<'a> {
                 self.fall(b, &fall)
             }
             Transfer::Call { callee, next } => {
-                let call = self.call(&callee);
+                let call = match (&callee, self.native.get(&b)) {
+                    (Callee::Indirect { .. }, Some(k)) => format!(
+                        "(((rep_ >> {k}) & 1u) ? psxw_call_native(t_, r4, r5, r6, r7) : psxw_call_indirect(t_, r4, r5, r6, r7))"
+                    ),
+                    _ => self.call(&callee),
+                };
                 self.line(&format!(
                     "{{ uint64_t v_ = {call}; r2 = (uint32_t)v_; r3 = (uint32_t)(v_ >> 32); }} /* {b:08X}: {dis} */"
                 ));
@@ -477,5 +500,68 @@ pub fn stmt(i: &Insn, pc: u32, ov: &Ov, keep: bool) -> String {
         | Op::Bgez
         | Op::Bltzal
         | Op::Bgezal => unreachable!("{:?} is not a plain statement", i.op),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::{MODELLED, PUBLISHED};
+
+    /// The registers a statement assigns (`rN = `) and the ones it reads.
+    fn regs(s: &str) -> (BTreeSet<u8>, BTreeSet<u8>) {
+        let (mut assigned, mut read) = (BTreeSet::new(), BTreeSet::new());
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let starts = b[i] == b'r' && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'));
+            let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if starts && digits > 0 {
+                let r: u8 = s[i + 1..i + 1 + digits].parse().unwrap();
+                let rest = &s[i + 1 + digits..];
+                if rest.starts_with(" = ") { assigned.insert(r) } else { read.insert(r) };
+                i += 1 + digits;
+            } else {
+                i += 1;
+            }
+        }
+        (assigned, read)
+    }
+
+    /// `Insn::reads` and `Insn::writes` are the emitter's account of every
+    /// plain instruction the decoder produces: each statement assigns
+    /// exactly `writes()` and reads only within `reads()`, and only
+    /// `PUBLISHED` registers are published. The transport proof and the
+    /// constant propagation take effects from those two functions, and
+    /// the proof follows only `MODELLED` instructions.
+    #[test]
+    fn transport_model_matches_the_emitter() {
+        let mut ops: Vec<Op> = Vec::new();
+        for primary in 0..64u32 {
+            for r in 0..32u32 {
+                for sub in 0..64u32 {
+                    let op = crate::decode::decode(primary << 26 | r << 21 | r << 16 | sub).op;
+                    if !ops.contains(&op) {
+                        ops.push(op);
+                    }
+                }
+            }
+        }
+        let insn = |op: Op, rd: u8| Insn { word: 1, op, rs: 8, rt: 9, rd, sa: 3, simm: 4, uimm: 4, target: 0 };
+        let plain: Vec<Op> = ops.into_iter().filter(|op| *op != Op::Invalid && !op.has_delay_slot()).collect();
+        assert!(MODELLED.iter().all(|op| plain.contains(op) || op.has_delay_slot()));
+        for &op in &plain {
+            for keep in [false, true] {
+                let i = insn(op, 10);
+                let s = stmt(&i, 0x8001_0000, &None, keep);
+                let (assigned, read) = regs(&s);
+                assert_eq!(assigned, i.writes().into_iter().collect(), "{op:?}: {s}");
+                assert!(read.iter().all(|&r| i.reads() & (1 << r) != 0), "{op:?} reads {read:?} beyond {:#x}: {s}", i.reads());
+            }
+        }
+        for r in 1..32u8 {
+            let s = stmt(&Insn { rt: 0, ..insn(Op::Addu, r) }, 0x8001_0000, &None, false);
+            assert_eq!(s.contains("psxw_gp_set") || s.contains("psxw_sp_set"), PUBLISHED & (1 << r) != 0, "r{r}: {s}");
+        }
     }
 }

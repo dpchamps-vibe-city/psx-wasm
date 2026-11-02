@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// 2: `binding`, the explicit-binding plan and remaining legacy dispatch.
+/// 3: `binding.native`, native references and their flows.
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -145,6 +147,9 @@ pub struct Report {
     pub by_container: BTreeMap<String, BTreeMap<String, usize>>,
     pub adapters: Vec<String>,
     pub overlay_addresses: usize,
+    /// Explicit bindings (plans/dispatch-binding A): placements, rules,
+    /// slots, entries per reference category, and the legacy consumers.
+    pub binding: crate::binding::Report,
     pub aux_symbols: usize,
     pub matched_rodata: usize,
     pub debug_io: bool,
@@ -235,6 +240,7 @@ pub struct Prepared {
     hardware: Vec<Unbound>,
     void_used: BTreeSet<(String, u32)>,
     overlays: BTreeMap<u32, Vec<(String, Vec<(u32, u32)>)>>,
+    binding: crate::binding::Report,
     spec: GameSpec,
     /// Functions that switch threads (wasm names), seeding Asyncify.
     switches: BTreeSet<String>,
@@ -418,12 +424,16 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     } else {
         psxw_cc::objects_compiled_with(&calls_dir, &dwarf_flags)?;
     }
+    // Declared binding operations and changing slots keep their call
+    // boundary through clang.
+    let boundaries = psxw_link::binding::Boundaries::new(inputs.manifest.dispatch.as_ref(), &inputs.map);
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {
             let (dir, flags): (PathBuf, &[&str]) =
                 if opts.ubsan { (ubsan_dir.join(c), &ubsan_flags) } else { (calls_dir.join(c), &dwarf_flags) };
-            c_input(&clang, c, o, &dir, flags, opts.ubsan.then_some(ignorelist.as_path()), gcc)
+            let keep = |n: &str| boundaries.keeps(&inputs.map, c, n);
+            c_input(&clang, c, o, &dir, flags, opts.ubsan.then_some(ignorelist.as_path()), gcc, &keep)
         })
         .collect::<Result<_>>()?;
 
@@ -455,16 +465,22 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         .map(|(n, _)| n.as_str())
         .chain(opts.lift.iter().map(String::as_str))
         .collect();
+    // Supplied C an explicit build would otherwise replace needs a pin.
+    let name_of = |k: &(String, u32)| translations.iter().find(|t| (&t.func.container, t.func.addr) == (&k.0, k.1)).map(|t| t.func.name.clone());
+    let auto_lift = c_replaced(&void_used, &name_of, &pinned, inputs.manifest.dispatch.is_some())?;
     let adapter_id: BTreeMap<&str, u32> = adapters.iter().enumerate().map(|(i, n)| (n.as_str(), i as u32)).collect();
     let mut tiers: BTreeMap<(String, u32), Tier> = BTreeMap::new();
     let mut lifted = Vec::new();
     let mut unvalidated: BTreeSet<String> = BTreeSet::new();
-    for t in &translations {
-        let key = (t.func.container.clone(), t.func.addr);
-        let member = inputs.map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
+    // Supplied C is the implementation even where its original doesn't
+    // translate.
+    let untranslated_c = untranslated(&inputs.program, c_defs.keys(), &translations);
+    for (f, t) in translations.iter().map(|t| (&t.func, Some(t))).chain(untranslated_c.iter().map(|f| (f, None))) {
+        let key = (f.container.clone(), f.addr);
+        let member = inputs.map.sdk_at(&f.container, f.addr).map(|p| p.member.as_str());
         let original = member.is_some_and(is_device);
         let policy = member.map(policy_of);
-        let name = adapter_name(&inputs.map, t, &adapter_names);
+        let name = adapter_name(&inputs.map, f, &adapter_names);
         let adapter = adapter_id.get(name.as_str()).filter(|_| policy == Some(Policy::Adapter) && !original);
         let object_ok = member.is_some_and(|m| keys.get(m).is_some_and(|k| validated.contains(&(m, *k))));
         if let (Some(_), Some(m), false) = (adapter, member, object_ok) {
@@ -473,12 +489,12 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         let tier = if let (Some(&id), true) = (adapter, object_ok) {
             Tier::Adapter(id)
         } else if let (Some(&(input, func)), false) =
-            (c_defs.get(&key), pinned.contains(t.func.name.as_str()) || void_used.contains(&key))
+            (c_defs.get(&key), pinned.contains(f.name.as_str()) || auto_lift.contains(&key))
         {
-            debug_assert!(t.func.sources.contains(&Source::Defined));
+            debug_assert!(f.sources.contains(&Source::Defined));
             Tier::C { input, func }
         } else {
-            lifted.push(t);
+            lifted.extend(t);
             continue;
         };
         tiers.insert(key, tier);
@@ -495,7 +511,17 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     let switches = thread_switches(&lifted);
     link_lifted(ws, &lift_dir, &lifted, &mut link_inputs, &mut tiers)
         .with_context(|| format!("run `psxw lift {}`", opts.game))?;
-    let overlays = overlay_plan(&inputs.program, &inputs.originals, &tiers)?;
+    let mod_residency = opts.moddable || opts.mods.as_ref().is_some_and(|m| m.spec.data.iter().any(|d| d.resident.is_some()));
+    let (binding_plan, overlays, binding) = crate::binding::dispatch(
+        inputs.manifest.dispatch.as_ref(),
+        &inputs.map,
+        &inputs.program,
+        &inputs.originals,
+        &translations,
+        &tiers,
+        &link_inputs,
+        mod_residency,
+    )?;
 
     let spec = GameSpec {
         tiers: tiers.clone(),
@@ -518,6 +544,8 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         // ones the translator expands into its callers.
         slots: opts.moddable.then(|| tiers.keys().filter(|k| !expanded.contains(*k)).cloned().collect()),
         threads: !switches.is_empty(),
+        binding: binding_plan,
+        lifted_params: crate::binding::lifted_params(&translations, &tiers),
         probes: inputs
             .manifest
             .run
@@ -551,6 +579,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         hardware,
         void_used,
         overlays,
+        binding,
         spec,
         switches,
     })
@@ -585,6 +614,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         hardware,
         void_used,
         overlays,
+        mut binding,
         mut spec,
         switches,
         ..
@@ -605,6 +635,10 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         );
     }
     validate(&linked.wasm).context("guest module fails validation")?;
+    binding.references = linked.references.clone();
+    binding.native = linked.native.clone();
+    binding.native.devirtualized = crate::binding::devirtualized(&translations, &tiers);
+    binding.native.lifted_carriers = crate::binding::lifted_carriers(&translations, &tiers);
 
     let dir = opts.mods.as_ref().map_or_else(|| out_dir(ws, &opts.game), |m| m.out.clone());
     std::fs::create_dir_all(&dir)?;
@@ -723,6 +757,7 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
         by_container,
         adapters: bound.into_iter().collect(),
         overlay_addresses: overlays.len(),
+        binding,
         aux_symbols: linked.aux.len(),
         matched_rodata: linked.matched,
         debug_io: opts.debug_io || !opts.original.is_empty(),
@@ -796,17 +831,30 @@ fn check_abi(wasm: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The name an adapter binds `t` by: its own, or, for a function the SDK's
+/// The name an adapter binds `f` by: its own, or, for a function the SDK's
 /// object doesn't name (a static one), its place in the object's text
 /// (`libetc/intr_dma:0x4c`).
-fn adapter_name(map: &psxw_inputs::AddressMap, t: &psxw_lift::Translation, adapter_names: &BTreeSet<&str>) -> String {
-    if adapter_names.contains(t.func.name.as_str()) {
-        return t.func.name.clone();
+fn adapter_name(map: &psxw_inputs::AddressMap, f: &psxw_lift::program::Function, adapter_names: &BTreeSet<&str>) -> String {
+    if adapter_names.contains(f.name.as_str()) {
+        return f.name.clone();
     }
-    match map.sdk_at(&t.func.container, t.func.addr).filter(|p| p.is_text()) {
-        Some(p) => format!("{}:{:#x}", p.member, t.func.addr - p.vram.start),
-        None => t.func.name.clone(),
+    match map.sdk_at(&f.container, f.addr).filter(|p| p.is_text()) {
+        Some(p) => format!("{}:{:#x}", p.member, f.addr - p.vram.start),
+        None => f.name.clone(),
     }
+}
+
+/// The functions among `keys` with no translation (their originals
+/// didn't translate), as the program found them.
+pub(crate) fn untranslated<'a>(
+    program: &psxw_lift::program::Program,
+    keys: impl IntoIterator<Item = &'a (String, u32)>,
+    translations: &[psxw_lift::Translation],
+) -> Vec<psxw_lift::program::Function> {
+    let translated: BTreeSet<(&str, u32)> = translations.iter().map(|t| (t.func.container.as_str(), t.func.addr)).collect();
+    let missing: BTreeSet<(String, u32)> = keys.into_iter().filter(|(c, a)| !translated.contains(&(c.as_str(), *a))).cloned().collect();
+    let containers: BTreeSet<&str> = missing.iter().map(|(c, _)| c.as_str()).collect();
+    containers.into_iter().flat_map(|c| program.functions(c)).filter(|f| missing.contains(&(f.container.clone(), f.addr))).collect()
 }
 
 /// An SDK function that accesses I/O or kernel RAM itself but runs as
@@ -826,6 +874,34 @@ impl std::fmt::Display for Unbound {
         let how = if self.reachable { "reachable" } else { "unreachable" };
         write!(f, "{} 0x{:08X} in {} ({}; {how})", self.name, self.addr, self.member, self.what)
     }
+}
+
+/// The supplied C functions to run translated without a pin: void C whose
+/// result callers read ([`void_results`]). In an explicit binding build
+/// supplied C is authoritative (plans/dispatch-binding Contract 1), so none
+/// is replaced automatically: each needs a `[tier]` lift pin, the explicit
+/// selection, or the build fails naming them.
+fn c_replaced(
+    void_used: &BTreeSet<(String, u32)>,
+    name_of: &dyn Fn(&(String, u32)) -> Option<String>,
+    pinned: &BTreeSet<&str>,
+    explicit: bool,
+) -> Result<BTreeSet<(String, u32)>> {
+    if !explicit {
+        return Ok(void_used.clone());
+    }
+    let unpinned: Vec<String> = void_used
+        .iter()
+        .filter(|k| name_of(k).is_none_or(|n| !pinned.contains(n.as_str())))
+        .map(|k| format!("{} {} ({:#010x})", k.0, name_of(k).unwrap_or_default(), k.1))
+        .collect();
+    ensure!(
+        unpinned.is_empty(),
+        "binding.c_replaced: these C functions are void but callers read their result, and supplied C is authoritative in a \
+         [dispatch] build: pin each to the lift tier in [tier] (with the evidence) or make its C return the value:\n  {}",
+        unpinned.join("\n  ")
+    );
+    Ok(BTreeSet::new())
 }
 
 /// C functions defined `void` whose result a caller may read: C declaring
@@ -933,13 +1009,13 @@ fn chip_decision(
     let inside = |t: &psxw_lift::Translation| member(t).is_some_and(in_chip);
     let unvalidated: BTreeSet<&str> = translations
         .iter()
-        .filter(|t| adapter_names.contains(adapter_name(map, t, adapter_names).as_str()) && inside(t))
-        .filter_map(|t| member(t).filter(|m| !bound(m, &adapter_name(map, t, adapter_names))))
+        .filter(|t| adapter_names.contains(adapter_name(map, &t.func, adapter_names).as_str()) && inside(t))
+        .filter_map(|t| member(t).filter(|m| !bound(m, &adapter_name(map, &t.func, adapter_names))))
         .collect();
     if !unvalidated.is_empty() {
         return Some(format!("unvalidated objects with adapters: {}", unvalidated.into_iter().collect::<Vec<_>>().join(", ")));
     }
-    let adapted = |t: &psxw_lift::Translation| inside(t) && member(t).is_some_and(|m| bound(m, &adapter_name(map, t, adapter_names)));
+    let adapted = |t: &psxw_lift::Translation| inside(t) && member(t).is_some_and(|m| bound(m, &adapter_name(map, &t.func, adapter_names)));
     if !translations.iter().any(adapted) {
         return Some("no adapters for it".into());
     }
@@ -1135,7 +1211,8 @@ pub fn game_path(ws: &Workspace, game: &str) -> PathBuf {
 /// A census C object as the link takes it (D50): every non-inline
 /// function weak and noinline, compiled with `flags` into `dir`, with its
 /// prototype facts. The object is rebuilt when its variant changed, or
-/// when it is older than `newer_than`.
+/// when it is older than `newer_than`. `keep`: functions kept out of line
+/// even when written `inline` (binding operations and changing slots).
 pub(crate) fn c_input(
     clang: &psxw_cc::Clang,
     container: &str,
@@ -1144,6 +1221,7 @@ pub(crate) fn c_input(
     flags: &[&str],
     newer_than: Option<&Path>,
     gcc: Gcc,
+    keep: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<Input> {
     let stem = census_obj.file_stem().unwrap_or_default().to_string_lossy().into_owned();
     let names: BTreeSet<String> = WasmObject::read(census_obj)?
@@ -1153,7 +1231,17 @@ pub(crate) fn c_input(
         .map(|s| s.name.clone())
         .collect();
     let text = std::fs::read_to_string(census_obj.with_extension("i"))?;
-    let variant = psxw_cc::ast::hook_variant(&text, &names);
+    // Every call to a boundary must happen: clang may merge or delete one
+    // to a const or pure function, whatever its body.
+    let elidable: Vec<String> =
+        psxw_cc::ast::elidable_calls(&text, keep).into_iter().map(|(n, a)| format!("{n} ({a})")).collect();
+    ensure!(
+        elidable.is_empty(),
+        "binding.elidable_call: {container}/{stem} declares {}: each is a declared operation or at a changing slot, \
+         so every call to it must happen; remove the attribute",
+        elidable.join(", ")
+    );
+    let variant = psxw_cc::ast::hook_variant(&text, &names, keep);
     std::fs::create_dir_all(dir)?;
     let vi = dir.join(format!("{stem}.i"));
     let vo = dir.join(format!("{stem}.o"));
@@ -1327,6 +1415,19 @@ mod tests {
         }
         assert_eq!(checks[1], checks[3], "identical code may share an entry");
         assert_eq!(checks[0].len(), 3, "only add discriminating words");
+    }
+
+    #[test]
+    fn explicit_builds_never_replace_supplied_c_unpinned() {
+        let void_used: BTreeSet<(String, u32)> = [("main".to_string(), 0x8001_0000)].into();
+        let name_of = |_: &(String, u32)| Some("g".to_string());
+        let none = BTreeSet::new();
+        // The migration path keeps its policy.
+        assert_eq!(c_replaced(&void_used, &name_of, &none, false).unwrap(), void_used);
+        let e = c_replaced(&void_used, &name_of, &none, true).unwrap_err().to_string();
+        assert!(e.starts_with("binding.c_replaced") && e.contains("main g (0x80010000)"), "{e}");
+        // A pin is the explicit selection: its own tier rule lifts it.
+        assert!(c_replaced(&void_used, &name_of, &["g"].into(), true).unwrap().is_empty());
     }
 
     #[test]
