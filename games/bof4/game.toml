@@ -18,6 +18,16 @@ splat_dir = "configs/splat"
 symbols_dir = "configs/symbols"
 main = "exe"
 
+[dispatch]
+# Phase A opt-in. Boot supplies the resident EXE; EMI code loading remains
+# on the reported legacy path until its publication rules are declared.
+schema_version = 1
+require_explicit = false
+
+[[dispatch.placements]]
+id = "resident"
+container = "exe"
+
 [c]
 include = ["include"]
 defines = ["__GNUC__=2", "_LANGUAGE_C", "INCLUDE_ASM_USE_MACRO_INC=1"]
@@ -35,6 +45,68 @@ cpp = "mips-linux-gnu-cpp"
 cppflags = ["-Iinclude", "-undef", "-D__GNUC__=2", "-DINCLUDE_ASM_USE_MACRO_INC=1", "-lang-c", "-D_LANGUAGE_C"]
 cc1 = "dependencies/compiler/gcc-2.95.2-psx/cc1"
 cc1flags = ["-O2", "-G8", "-mips1", "-mcpu=r3000", "-funsigned-char", "-fpeephole", "-ffunction-cse", "-fpcc-struct-return", "-fcommon", "-msoft-float", "-mgas", "-fgnu-linker", "-quiet"]
+
+[tier]
+# Preserve the existing void_results lift selections at the pinned input.
+# These assembly-backed void stubs can leave an observable original v0;
+# explicit dispatch requires a source-owned selection, not automatic fallback.
+ovl_4765_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_4886_func_801F1124 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_4976_func_801F0AD8 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5009_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5167_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5209_func_801F0A00 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5255_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5323_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5346_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5429_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5443_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5515_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5573_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5632_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5644_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5680_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5689_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5712_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_579_func_801E7A9C = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5870_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_5921_func_801F08A8 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6002_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6101_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6226_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6235_func_801F0884 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6286_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6295_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6478_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6523_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6608_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6620_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6660_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6740_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6777_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6843_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6894_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_6920_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_7553_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_7664_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8246_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8257_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8555_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8632_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8657_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8685_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8898_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_8926_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9025_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9025_func_801F080C = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9081_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9107_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9196_func_801F0888 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9323_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9334_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9345_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9404_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_9460_func_801F0804 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
 
 [run]
 # main's loop (0x8013965C) calls this once a pass, after VSync: the thread
