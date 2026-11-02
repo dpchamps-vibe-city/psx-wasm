@@ -235,13 +235,16 @@ impl Layout {
     }
 
     /// Bytes of a placed symbol with its data relocations applied.
+    /// `func_ref(input, reloc)` gives the word a function reference cell
+    /// holds: its guest address, or a native handle (plans/dispatch-binding
+    /// B), by the cell.
     pub fn bytes_of(
         &self,
         inputs: &[(&str, &WasmObject)],
         map: &AddressMap,
         i: usize,
         si: u32,
-        func_addr: &dyn Fn(usize, u32) -> Result<u32>,
+        func_ref: &dyn Fn(usize, &crate::object::Reloc) -> Result<u32>,
     ) -> Result<Vec<u8>> {
         let obj = inputs[i].1;
         let def = obj.symbols[si as usize].data.expect("defined data");
@@ -249,7 +252,7 @@ impl Layout {
         for (off, r) in obj.relocs_in(def) {
             let v = match r.kind {
                 RelocKind::MemoryAddrI32 => self.data_addr(inputs, map, i, r.symbol)?.wrapping_add(r.addend as u32),
-                RelocKind::TableIndexI32 => func_addr(i, r.symbol)?,
+                RelocKind::TableIndexI32 => func_ref(i, r)?,
                 RelocKind::Other => bail!("unsupported data relocation in {}", obj.symbols[si as usize].name),
             };
             bytes[off as usize..off as usize + 4].copy_from_slice(&v.to_le_bytes());

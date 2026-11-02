@@ -7,7 +7,7 @@
 //! which is exactly how the hardware treats it.
 
 use crate::decode::{Insn, Op, decode};
-use crate::program::{Function, Located, Program, Source, call_symbol, dynamic_symbol};
+use crate::program::{Function, Located, Program, Source, call_symbol, dynamic_symbol, pointer_symbol};
 use psxw_inputs::originals::Originals;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -86,6 +86,10 @@ pub struct Graph {
     /// Jump tables inside the function's own text: base → entries. Data,
     /// not code: their base is no function pointer.
     pub embedded_tables: BTreeMap<u32, u32>,
+    /// `jalr` sites whose target only dataflow proves (it reaches the call
+    /// across an inlined callee's register passing or a join): pc →
+    /// target. Also in [`Graph::const_targets`].
+    pub proven_targets: BTreeMap<u32, u32>,
 }
 
 impl Graph {
@@ -172,6 +176,9 @@ pub struct Explorer<'a> {
     pub func: &'a Function,
     /// `jr`/`jalr` sites whose window constant dataflow didn't confirm.
     pub not_const: &'a BTreeSet<u32>,
+    /// `jalr` sites whose target dataflow proved, where the window didn't
+    /// (plans/dispatch-binding B): pc → target.
+    pub proven: &'a BTreeMap<u32, u32>,
     /// Functions expanded at their call sites, sharing every register with
     /// the caller (they pass values outside the o32 ABI): start → end.
     pub inline: &'a BTreeMap<(String, u32), u32>,
@@ -258,6 +265,16 @@ impl Explorer<'_> {
             Some(Located::Kernel) => Ok(Callee::Kernel { addr }),
             None => err(pc, format!("control transfer to 0x{addr:08X}, which is not code")),
         }
+    }
+
+    /// A `jalr` through a register known to hold `addr`: still a pointer
+    /// call, so it keeps a pointer call's binding ([`pointer_symbol`]).
+    fn pointer_callee(&self, g: &mut Graph, pc: u32, addr: u32) -> Result<Callee, LiftError> {
+        let callee = self.callee(g, pc, addr, Source::CallTarget)?;
+        Ok(match (callee, self.program.locate(&self.func.container, addr)) {
+            (Callee::Direct { addr, .. }, Some(Located::Code(c))) => Callee::Direct { addr, symbol: pointer_symbol(&self.program.main, &c, addr) },
+            (other, _) => other,
+        })
     }
 
     fn dest(&self, g: &mut Graph, pc: u32, addr: u32) -> Result<Dest, LiftError> {
@@ -442,9 +459,16 @@ impl Explorer<'_> {
                 let callee = match self.window(g, pc, insn.rs) {
                     Window::Const(c) if self.program.locate(&self.func.container, c).is_some() => {
                         g.const_targets.insert(pc, (insn.rs, c));
-                        self.callee(g, pc, c, Source::CallTarget)?
+                        self.pointer_callee(g, pc, c)?
                     }
-                    _ => Callee::Indirect { reg: insn.rs },
+                    _ => match self.proven.get(&pc).filter(|_| !self.not_const.contains(&pc)) {
+                        Some(&c) => {
+                            g.const_targets.insert(pc, (insn.rs, c));
+                            g.proven_targets.insert(pc, c);
+                            self.pointer_callee(g, pc, c)?
+                        }
+                        None => Callee::Indirect { reg: insn.rs },
+                    },
                 };
                 Transfer::Call { callee, next: self.dest(g, pc, after)? }
             }

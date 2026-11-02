@@ -208,7 +208,210 @@ call_indirect $dispatch ((fp & 0x003F_FFFC) >> 2)
 - **Functions with no MIPS address.** Mod functions get synthetic
   addresses above RAM (`SYNTHETIC_CODE`, `0x8020_0000`–`0x803F_FFFF`).
   Taking the address of any other function the address map doesn't name
-  fails the link ("function pointer to X, which has no address").
+  fails the link ("function pointer to X, which has no address"), unless
+  its flow is native (below).
+
+**Native references (D74).** Where the linker proves a reference flow
+closed, it skips the guest address
+([plans/dispatch-binding B](../plans/dispatch-binding/02-native-references.md),
+`psxw-link::native`):
+
+- A *reference site* is a function address a game C object takes: an
+  `i32.const` with a table-index relocation, or a table-index word in one
+  of its AUX pointer tables (clang's anonymous `const` tables, §1). The
+  analysis connects each site to its uses within the object: locals (by
+  definition, joined where control flow joins), block results, `select`,
+  the parameters and results of the object's source-only helpers (C
+  functions with no address, called only from that object), and the cells
+  of a pointer table read by 32-bit loads at offsets proven word-aligned
+  (any other read of a table's bytes observes them, and keeps its flow at
+  guest addresses). A connected flow is native
+  when every target's binding is fixed (a main-image function outside
+  every placement and overlay collision, or a source-only helper), and
+  its only uses are `call_indirect`, null tests, equality between
+  references whose functions have distinct addresses, and moves.
+- Anything else keeps the whole flow at guest addresses, with the first
+  reason that applies: `late_binding` (a changing slot or legacy overlay
+  entry), `unstable_dependency` (an image without a placement, no
+  implementation), `opaque_escape` (guest memory, a global, an indirect
+  call, any function the guest can call: its parameters and results, so
+  lifted code always sees addresses), `numeric_observation` (arithmetic,
+  an ordering, a number joining the flow) or `missing_uses` (what the
+  analysis doesn't model). There is no conversion between the forms: a
+  native flow never meets a guest value, so no handle reaches guest
+  memory, callbacks, `GuestCall.addr`, `guest_invoke`, host or mod
+  interfaces, and no guest value reaches the native table.
+- A native site holds a *handle*: the 1-based index of its target in the
+  private `native_functions` table, after the module's other tables
+  (link-local, never exported; 0 is null). One handle per identity:
+  `(container, entry)`, or `(container, translation unit, symbol)` for a
+  helper, in that order. An entry is the function's generic o32 entry, as
+  the dispatch table's: hook chains, operation wrappers and the C body
+  (never its translation) included. A native call marshals to o32 as a
+  pointer call does, through the native table, after rejecting a handle
+  outside the table (`psx.binding_fault` cause `binding.native_handle`,
+  ABI 20) before the target runs.
+- Into lifted code: the lifter proves which argument registers' entry
+  values a translation only moves, null-tests, calls through (`jalr`) and
+  returns in `v0` on every way out. Such a translation takes a
+  compiler-private *representation word* on entry (`psxw_rep_take`): bit k
+  says `a<k>` is a native handle. The o32 words are unchanged; the word
+  rides beside them, as GCC's static chain does. A native C caller of that
+  translation, entered directly (no hook chain, operation wrapper or slot
+  entry), sets the bits of the handles it passes right before the call;
+  guest callers leave it 0, so the one body serves both. Its proven `jalr`s
+  call through the native table under their bit (`psxw_call_native`), and
+  a returned handle is the C call's result. What the proof accepts is the
+  acceptance boundary below.
+- Devirtualization (not a native reference): a lifted `jalr` whose target
+  is known (a window constant, or the lifter's dataflow across an inlined
+  callee's register passing) calls `psxw_p_<addr>`, which the linker binds
+  as the dispatch table binds a pointer to that address: a stand-in, the
+  binding of a changing slot, an overlay stub, else the generic hook entry,
+  never a caller-scoped hook (a `jal`'s `psxw_f_` keeps those).
+- `build.json` (`binding.native`) lists the table and every flow: its
+  sites, targets with their stability evidence, consumers, crossings and
+  representation, with the reason a guest flow keeps its addresses, the
+  lifted argument registers that can carry a handle (`lifted_carriers`)
+  and the devirtualized lifted calls (`devirtualized`).
+
+**The acceptance boundary.** Promoting a flow claims that every producer,
+use, effect, boundary crossing and path keeps its meaning when the value
+is a handle. Missing a promotion costs a table lookup; a wrong promotion
+calls the wrong function. Each proof therefore works over a closed domain
+that it follows completely, and each flow gets one of three outcomes:
+proven safe (promoted), proven incompatible (`opaque_escape`,
+`numeric_observation`), or not proven by this implementation
+(`missing_uses`). Only the first promotes. Nothing outside the domain is
+judged harmless: an explicit rule refuses it by name, or a default rule
+refuses it without one.
+
+*The linker's flow analysis* (`psxw-link::native`, one game C object at a
+time; generated code and mods are not analysed):
+
+- Domain. A function is analysed only when two conditions hold:
+  - Every operator is in a closed list: parameterless blocks and their
+    branches, `call`, `call_indirect`, locals, globals, `drop`, `select`,
+    constants, loads and stores, `memory.copy` and `memory.fill`, and plain
+    i32/i64/f32/f64 arithmetic, comparisons and conversions.
+  - Every relocation is one the linker's rewrite lowers on its operator:
+    - a table index or data address on `i32.const`;
+    - a data address on a memarg;
+    - a function index on `call`;
+    - a type and table on `call_indirect`;
+    - a global on `global.get` and `global.set`.
+
+  Anything else leaves the function unmodelled: atomics, SIMD, reference
+  and table operators, exceptions, tail calls, block parameters, or any
+  other relocation. Every reference an unmodelled function takes, every
+  pointer table and helper it names, and its own parameters and results
+  are `missing_uses`. Those are the only ways its values can meet another
+  function's values: any other path goes through memory, a global or an
+  indirect call, and each of those already marks the value.
+- Producers. Every value is a node. A node starts unmarked only if it is
+  one of these:
+  - a reference site;
+  - the constant 0 (null);
+  - a node that receives values only by union: a join of locals, a block
+    result, a helper's parameter or result, or a pointer table's cells.
+
+  Every other producer is marked when it is created: a number, a load
+  from guest memory, a global, a call's result, a parameter of a function
+  the guest can call, or a parameter of a helper called through a pointer.
+- Uses. An operator either moves its operand or marks it. Moves are
+  unions: local set and tee, branch and block values, `select` operands,
+  and a helper's arguments. The only uses that leave a node unmarked are:
+  - the callee of `call_indirect`;
+  - a null test: `eqz`, `eq`/`ne` against the constant 0, or a condition;
+  - an equality between references, after a check that no two of the
+    flow's identities share an address;
+  - an argument that a lifted carrier accepts (below).
+
+  A flow promotes only when none of its nodes carries a mark, so any other
+  use retains it.
+- Pointer tables. A table is a local AUX data symbol that meets four
+  conditions:
+  - it is whole words, each a table-index relocation or zero;
+  - it overlaps no other data symbol;
+  - its address appears only in relocations on an `i32.const` or a memarg
+    of modelled code;
+  - its cells are one node, read only by 32-bit loads at offsets proven to
+    be 0 modulo 4.
+
+  Any other use of its address retains its flow: keeping it in a local,
+  passing it, storing it, comparing it, any arithmetic except an add, a
+  store into the table, or a relocation of any other kind or in data.
+- Targets. Every target's binding must be fixed (above). Otherwise the
+  flow is `late_binding` or `unstable_dependency`. A source-only helper is
+  a function only one symbol names. An alias is its function, which may
+  have an address, hooks and guest callers: one function, one identity.
+
+*The lifter's transport proof* (`psxw-lift::analysis::transport`, one
+argument register at a time; a setjmp continuation's entry registers come
+from a jmp_buf, so it has none):
+
+- Domain. While the value may be in any register, every node must be one
+  whose emitted code the proof follows exactly:
+  - an instruction in `MODELLED`;
+  - a transfer from a closed list, matched exhaustively: fall-through,
+    local jumps and branches, a jump table, a call that continues in the
+    function (direct or through the dispatch table; not BIOS, kernel,
+    `setjmp` or `rfe`), a return, or a tail call out of the function's own
+    code (direct or through a register).
+
+  These are `missing_uses` while the value may be held: conditional calls
+  (`bltzal`/`bgezal`), an inlined callee's returns and tails (their
+  target 0 returns `v1:v0` to the caller), BIOS and kernel calls, and
+  `setjmp` and `rfe` sites. Once no register may hold the value it is dead: it is never
+  stored, never in `hi`/`lo` and never passed, so nothing later can
+  observe it.
+- Effects are the emitter's.
+  - `Insn::reads` and `Insn::writes` are the emitter's reads and writes.
+    `emit::tests::transport_model_matches_the_emitter` checks this for
+    every plain instruction, and the emitter's link writes use
+    `Insn::writes` too.
+  - A branch's condition and a jump's target are read before its delay
+    slot, and the proof visits them in that order.
+  - A call passes `a0`–`a3`, and `v0` as well to a static-chain callee. It
+    sets `v0` and `v1`.
+  - The emitter's only redirected reads are loads that the next
+    instruction reads around (`facts.hazards`). Such a load may not
+    overwrite the value.
+  - A write to `$gp` or `$sp` publishes the value.
+- Uses. The value may be moved and null-tested. It may be called through
+  by a `jalr` that holds it on every path reaching it and that the emitter
+  emits as a dispatch-table call. "Holds on every path" is a
+  must-analysis; "may hold" is the may-analysis over every path. Any other
+  read observes the value. A store, or a move into `$gp` or `$sp`, lets it
+  escape. At every way out the emitter returns `v1:v0`, so the value may be
+  in `v0` only if it is there at every way out. It is never allowed in
+  `v1`, and never in an argument register or `v0` at a tail call.
+- Crossing. A C caller sets the representation word only for a
+  translation it enters directly (lift tier, no hook chain, operation
+  wrapper or slot entry), immediately before the call. The translation's
+  first statement takes the word and clears it. Nothing runs in between,
+  so guest callers always see 0.
+
+*Devirtualization* trusts the lifter's constant propagation, which follows
+`Insn::writes` (a syscall writes `v0`) and assumes every call clobbers the
+caller-saved registers. It binds the call as the dispatch table binds a
+guest pointer (`Ctx::dynamic_entry`, the same function the overlay
+dispatch uses).
+
+*Not proven, so not promoted.* These are missed optimizations, each kept
+at guest addresses with its reason:
+- references that lifted code materializes itself;
+- tail calls through the value (`jr a0`);
+- a value passed on to another call, or held across a BIOS, kernel,
+  conditional, `setjmp` or `rfe` call or an inlined callee's return;
+- references kept in memory, including on the C stack;
+- tables whose address is kept in a local.
+
+A helper called from another object still fails the link, as before.
+
+The production builds (btn, bof4) promote no flow and pass no handle, so
+they show compatibility, not behaviour. The D06 conformance variants and
+the lift and link tests show the behaviour.
 
 ### 3. Overlays: the bytes in RAM decide
 
@@ -1478,6 +1681,9 @@ needs no per-game loader hook. (design §3)
 *Later:* D73 binds the regions a game's `[dispatch]` facts cover
 explicitly. The stub remains only for regions without a placement.
 
+*Later:* D74 lowers references in proven closed C flows to handles into a
+private native table; everything else keeps D6's addresses.
+
 ### Implementations
 
 **D8. One implementation per function.** In priority order:
@@ -2735,3 +2941,23 @@ supplied C stated through `c_marker` calls. Partial
 composition, request lifecycles, continuations, native loaders, mod
 residency and the callable namespace are milestones B and C. (design §3;
 plans/dispatch-binding/01-explicit-activation)
+
+**D74. Native references in proven closed flows.** A game C object's
+function references whose connected flow has only fixed targets and only
+calls, null tests, equivalent equalities and moves are handles into a
+private `native_functions` table (index 0 null, after the other tables,
+link-local); their indirect calls go through it with the same o32
+marshalling, after a handle check (`binding.native_handle`, ABI 20).
+Every other flow keeps its guest addresses whole, with a reported reason;
+no value converts between the forms. Handles never enter guest memory or
+any guest, host, runtime or mod interface. *Why:* a native reference
+needs no dispatch-table lookup and lets source-only helpers be called
+through pointers, but a guest address is still a correct, explicitly bound
+representation wherever the program can observe it, so promotion is an
+optimization only where it can't be observed. The plan prescribes the
+algorithm, so no further approval was needed. Handles cross into a lifted
+translation's argument registers, and back through its return, where the
+lifter proves their use, under a compiler-private representation word
+beside the unchanged o32 words (guest callers leave it 0). Devirtualized
+lifted pointer calls keep a pointer call's binding and generic hooks.
+(design §2; plans/dispatch-binding/02-native-references)

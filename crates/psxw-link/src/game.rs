@@ -7,7 +7,8 @@
 //! - Function pointers are MIPS addresses; the dispatch table maps each
 //!   address to its entry. Where overlays share an address, the entry is a
 //!   stub that compares the code resident in RAM with each candidate's
-//!   original words (D7).
+//!   original words (D7). A reference in a proven closed flow is instead a
+//!   handle into the private native table ([`crate::native`], D74).
 //! - C calls C directly when the signatures agree; every other edge goes
 //!   through o32 adapters.
 //! - Every loop header spends the safepoint budget.
@@ -81,6 +82,9 @@ pub struct GameSpec {
     /// looked up in bindings that declared operations publish. `None`: the
     /// legacy dispatch for every address.
     pub binding: Option<crate::binding::Binding>,
+    /// Lifted functions' argument registers that can carry a native handle
+    /// (plans/dispatch-binding B), by (container, address) and register.
+    pub lifted_params: BTreeMap<(String, u32), BTreeMap<u8, crate::native::LiftedParam>>,
 }
 
 /// A moddable base's tables, by index.
@@ -204,6 +208,15 @@ enum Synth {
     Marker(usize),
     /// C `call_indirect` with a signature (the MIPS address trails).
     ICall(FuncType),
+    /// The same through the native table (a native handle trails).
+    NCall(FuncType),
+    /// Lifted code's `psxw_call_native(handle, a0..a3)`: through the native
+    /// table.
+    NativeIndirect,
+    /// [`Synth::ToO32`] that sets the representation word `rep` (bit k: a
+    /// native handle in argument register k) just before calling `target`,
+    /// a lifted translation that reads it on entry.
+    ToO32Rep { input: usize, name: String, sig: FuncType, target: u32, rep: u32 },
     /// `psxw_call_indirect(addr, a0..a3)` and `guest_invoke`.
     Indirect,
     /// `guest_invoke_irq`: `Indirect` catching ReturnFromException.
@@ -334,6 +347,12 @@ struct Ctx<'a> {
     body: HashMap<(usize, u32), u32>,
     /// Code references by how they bind ([`crate::Linked::references`]).
     references: BTreeMap<&'static str, usize>,
+    /// Native references (plans/dispatch-binding B) and the native table's
+    /// index, after the module's other tables.
+    native: crate::native::Plan,
+    native_table: u32,
+    /// The representation word's global (`psxw_rep_take`).
+    rep: u32,
 }
 
 impl Ctx<'_> {
@@ -493,7 +512,11 @@ impl Ctx<'_> {
         o.types[o.funcs[func as usize].ty as usize].clone()
     }
 
-    /// The entry for a call into an overlay slot from outside it.
+    /// What a call through the dispatch table to `addr` reaches: a
+    /// stand-in, a changing slot's binding, an overlay stub (an address
+    /// more than one container defines), else its one function's generic
+    /// entry. A call into an overlay slot from outside it, and a lifted
+    /// pointer call whose target is known (`psxw_p_`), bind this way.
     fn dynamic_entry(&mut self, addr: u32) -> Option<u32> {
         if psxw_abi::BIOS_STAND_INS.contains(&addr) && addr & 3 == 0 {
             return Some(self.synth(Synth::BiosThunk(addr)));
@@ -532,6 +555,18 @@ pub fn parse_generated(name: &str, main: &str) -> Option<(Option<String>, u32)> 
     u32::from_str_radix(hex, 16).ok().map(|a| (Some(container), a))
 }
 
+/// A devirtualized pointer call's callee, `psxw_p_[<container>_]<addr>`
+/// (main's without a container): bound as the dispatch table binds a
+/// guest pointer to the address ([`Ctx::dynamic_entry`]).
+pub fn parse_pointer(name: &str, main: &str) -> Option<(String, u32)> {
+    let rest = name.strip_prefix("psxw_p_")?;
+    let (container, hex) = match rest.rsplit_once('_') {
+        Some((c, h)) => (c.to_string(), h),
+        None => (main.to_string(), rest),
+    };
+    u32::from_str_radix(hex, 16).ok().map(|a| (container, a))
+}
+
 struct R<'c, 'a> {
     ctx: &'c mut Ctx<'a>,
     input: usize,
@@ -556,6 +591,14 @@ impl Resolver for R<'_, '_> {
             "psxw_call_indirect" => {
                 self.ctx.lookup_reference();
                 return Ok(Lowered::Call(self.ctx.synth(Synth::Indirect)));
+            }
+            // The representation word, cleared as it is read.
+            "psxw_rep_take" if inp.generated => {
+                return Ok(Lowered::Instrs(vec![I::GlobalGet(self.ctx.rep), I::I32Const(0), I::GlobalSet(self.ctx.rep)]));
+            }
+            "psxw_call_native" if inp.generated => {
+                *self.ctx.references.entry("native-call").or_default() += 1;
+                return Ok(Lowered::Call(self.ctx.synth(Synth::NativeIndirect)));
             }
             "psxw_return_from_exception" => return Ok(Lowered::Call(self.ctx.synth(Synth::Throw))),
             _ => {}
@@ -592,6 +635,21 @@ impl Resolver for R<'_, '_> {
             }
         }
         let caller = self.ctx.caller_of.get(&(self.input, self.func)).cloned();
+        if let Some((c, addr)) = parse_pointer(&name, &self.ctx.spec.main) {
+            self.ctx.reference(Some(&c), addr);
+            // What a guest pointer to the address reaches through the
+            // dispatch table: a stand-in, a changing slot's binding, an
+            // overlay stub, else the generic entry (never a caller's
+            // scoped hook). The lifter devirtualizes only an address in
+            // one container's text.
+            return match self.ctx.dynamic_entry(addr) {
+                Some(f) => Ok(Lowered::Call(f)),
+                None => {
+                    self.ctx.unresolved.insert(format!("{}: {name}", inp.label));
+                    Ok(Lowered::Call(self.ctx.synth(Synth::OverlayStub(addr))))
+                }
+            };
+        }
         if let Some((c, addr)) = parse_generated(&name, &self.ctx.spec.main) {
             self.ctx.reference(c.as_deref(), addr);
             let e = match c {
@@ -613,15 +671,12 @@ impl Resolver for R<'_, '_> {
             NameClass::SignatureThunk { target } => target.to_string(),
             NameClass::MainWrapper => bail!("call to clang's main wrapper {name}"),
         };
-        let resolved = self.ctx.map.resolve(&container, &callee);
-        if resolved.is_none() || inp.generated {
-            if let (true, Some(idx)) = (s.defined, s.index) {
-                let local = idx - inp.obj.num_imported_funcs();
-                if let Some(&i) = self.ctx.guest.get(&(self.input, local)) {
-                    return Ok(Lowered::Call(i));
-                }
+        if let Some(local) = crate::native::local_helper(self.ctx.map, inp, symbol) {
+            if let Some(&i) = self.ctx.guest.get(&(self.input, local)) {
+                return Ok(Lowered::Call(i));
             }
         }
+        let resolved = self.ctx.map.resolve(&container, &callee);
         let addr = resolved.with_context(|| format!("function {callee} has no address"))?.addr;
         let home = self.ctx.home(&container, addr).with_context(|| format!("{callee} at {addr:#x} is not code"))?;
         self.ctx.reference(home.as_deref(), addr);
@@ -698,6 +753,36 @@ impl Resolver for R<'_, '_> {
     fn call_indirect(&mut self, sig: &FuncType) -> Result<u32> {
         self.ctx.lookup_reference();
         Ok(self.ctx.synth(Synth::ICall(sig.clone())))
+    }
+
+    fn call_at(&mut self, symbol: u32, sig: &FuncType, last_const: Option<i32>, site: u32) -> Result<Lowered> {
+        let Some(&(target, rep)) = self.ctx.native.transports.get(&(self.input, site)) else {
+            return self.call(symbol, sig, last_const);
+        };
+        let s = &self.ctx.inputs[self.input].obj.symbols[symbol as usize];
+        let NameClass::Guest(name) = classify_name(&s.name) else { bail!("a native transport call to {}", s.name) };
+        *self.ctx.references.entry("native-transport").or_default() += 1;
+        let name = name.to_string();
+        Ok(Lowered::Call(self.ctx.synth(Synth::ToO32Rep { input: self.input, name, sig: sig.clone(), target, rep })))
+    }
+
+    fn call_indirect_at(&mut self, sig: &FuncType, site: u32) -> Result<u32> {
+        if !self.ctx.native.calls.contains(&(self.input, site)) {
+            return self.call_indirect(sig);
+        }
+        *self.ctx.references.entry("native-call").or_default() += 1;
+        Ok(self.ctx.synth(Synth::NCall(sig.clone())))
+    }
+
+    fn func_ref(&mut self, symbol: u32, site: u32) -> Result<u32> {
+        if let Some(&h) = self.ctx.native.code.get(&(self.input, site)) {
+            *self.ctx.references.entry("native").or_default() += 1;
+            return Ok(h);
+        }
+        self.func_addr(symbol).map_err(|e| match self.ctx.native.retained.get(&(self.input, site)) {
+            Some(why) => e.context(format!("its reference flow keeps the guest representation ({why})")),
+            None => e,
+        })
     }
 
     fn global(&mut self, symbol: u32) -> Result<u32> {
@@ -1080,6 +1165,82 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
                 let _ = unt;
             });
             (helper, f, "icall".into())
+        }
+        Synth::NativeIndirect => {
+            // (handle, a0..a3) -> i64, the o32 arguments as lifted code
+            // passes them; a handle outside the table is rejected first.
+            let (fault, o32_ty, table) = (ctx.import(psx::BINDING_FAULT), ctx.o32_ty, ctx.native_table);
+            let n = ctx.native.handles.len() as i32;
+            let mut f = Function::new([]);
+            f.instruction(&I::LocalGet(0));
+            f.instruction(&I::I32Const(1));
+            f.instruction(&I::I32Sub);
+            f.instruction(&I::I32Const(n));
+            f.instruction(&I::I32GeU);
+            f.instruction(&I::If(BlockType::Empty));
+            f.instruction(&I::I32Const(0));
+            f.instruction(&I::I32Const(psxw_abi::binding_cause::NATIVE_HANDLE as i32));
+            f.instruction(&I::LocalGet(0));
+            f.instruction(&I::Call(fault));
+            f.instruction(&I::Unreachable);
+            f.instruction(&I::End);
+            if n == 0 {
+                f.instruction(&I::Unreachable);
+            } else {
+                for l in 1..5 {
+                    f.instruction(&I::LocalGet(l));
+                }
+                f.instruction(&I::LocalGet(0));
+                f.instruction(&I::CallIndirect { type_index: o32_ty, table_index: table });
+            }
+            f.instruction(&I::End);
+            (FuncType { params: vec![V::I32; 5], results: vec![V::I64] }, f, "native_call_lifted".into())
+        }
+        Synth::ToO32Rep { input, name, sig, target, rep } => {
+            let proto = ctx.inputs[input].protos.get(&name);
+            let (kinds, variadic) = marshal::param_kinds(&sig, proto);
+            let calls = proto.map_or(&[][..], |p| &p.va_calls);
+            let (words, _) = marshal::call_words(&kinds, variadic, calls)
+                .with_context(|| format!("{}: variadic calls to {name}", ctx.inputs[input].label))?;
+            let g = ctx.rep;
+            // Set right before the call: nothing runs between it and the
+            // translation's entry, which takes it.
+            let f = marshal::c_to_o32(&sig, &words, sp, window, &|_| {}, &|f, _| {
+                f.instruction(&I::I32Const(rep as i32));
+                f.instruction(&I::GlobalSet(g));
+            }, &|f| {
+                f.instruction(&I::Call(target));
+            });
+            (sig, f, format!("o32_call_native:{name}"))
+        }
+        Synth::NCall(sig) => {
+            let (kinds, _) = marshal::param_kinds(&sig, None);
+            let (words, _) = marshal::words(&kinds, false);
+            let mut helper = sig.clone();
+            helper.params.push(V::I32);
+            let target = sig.params.len() as u32;
+            let (fault, o32_ty, table) = (ctx.import(psx::BINDING_FAULT), ctx.o32_ty, ctx.native_table);
+            let n = ctx.native.handles.len() as i32;
+            // A handle outside 1..=n is rejected before the target runs.
+            let check = |f: &mut Function| {
+                f.instruction(&I::LocalGet(target));
+                f.instruction(&I::I32Const(1));
+                f.instruction(&I::I32Sub);
+                f.instruction(&I::I32Const(n));
+                f.instruction(&I::I32GeU);
+                f.instruction(&I::If(BlockType::Empty));
+                f.instruction(&I::I32Const(0));
+                f.instruction(&I::I32Const(psxw_abi::binding_cause::NATIVE_HANDLE as i32));
+                f.instruction(&I::LocalGet(target));
+                f.instruction(&I::Call(fault));
+                f.instruction(&I::Unreachable);
+                f.instruction(&I::End);
+            };
+            let f = marshal::c_to_o32(&helper, &words, sp, window, &check, &|_, _| {}, &|f| {
+                f.instruction(&I::LocalGet(target));
+                f.instruction(&I::CallIndirect { type_index: o32_ty, table_index: table });
+            });
+            (helper, f, "native_call".into())
         }
         Synth::Indirect => {
             let mut f = Function::new([]);
@@ -1761,6 +1922,11 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         declared: BTreeSet::new(),
         body: HashMap::new(),
         references: BTreeMap::new(),
+        native: Default::default(),
+        // After the dispatch table, and a moddable base's five.
+        native_table: if spec.slots.is_some() { 6 } else { 1 },
+        // After every other global.
+        rep: binding_global_base(spec) + spec.binding.as_ref().map_or(0, |b| b.slots.len() as u32),
         o32_ty: 0,
         device: spec
             .device_funcs
@@ -1870,6 +2036,21 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         }
     }
 
+    // Native references (plans/dispatch-binding B): which reference flows
+    // of the game's C are proven closed, before any site is lowered.
+    let native = {
+        let ctx = &ctx;
+        let analysed = |i: usize| !inputs[i].generated && ctx.mod_of[i].is_none();
+        let aux = |i: usize, s: u32| ctx.layout.defined.get(&(i, s)).is_some_and(|p| p.how == crate::layout::How::Aux);
+        let helper = |i: usize, s: u32| crate::native::helper_function(map, &inputs[i], s).filter(|f| ctx.guest.contains_key(&(i, *f)));
+        let target = |i: usize, s: u32| native_target(ctx, i, s);
+        let transport = |i: usize, s: u32, sig: &FuncType| native_transport(ctx, i, s, sig);
+        let facts = crate::native::Facts { analysed: &analysed, aux: &aux, helper: &helper, target: &target, transport: &transport };
+        crate::native::analyze(inputs, &facts)?
+    };
+    crate::native::check(&native)?;
+    ctx.native = native;
+
     let mut bodies = Vec::new();
     let mut names: Vec<(u32, String)> = Vec::new();
     // With debug info: where each input instruction landed, per function.
@@ -1891,6 +2072,21 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         bodies.push((tix, b));
     }
 
+    // The native table: each handle's o32 entry, hooks included, as a
+    // pointer call through its address would enter it; a helper's own.
+    let mut native_entries = Vec::new();
+    for id in ctx.native.handles.clone() {
+        let e = match &id {
+            crate::native::Identity::Guest { container, addr } => {
+                ctx.entry(container, *addr).with_context(|| format!("native handle for {id}: no entry"))?
+            }
+            crate::native::Identity::Symbol { .. } => {
+                let (input, func) = ctx.native.helpers[&id];
+                ctx.synth(Synth::O32Wrap { input, func })
+            }
+        };
+        native_entries.push(e);
+    }
     // Table entries for every function with an address, and the exports.
     let mut elements: BTreeMap<u32, u32> = BTreeMap::new();
     for (c, addr) in spec.tiers.keys().cloned().collect::<Vec<_>>() {
@@ -2006,6 +2202,11 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
             tables.table(TableType { element_type: RefType::FUNCREF, minimum: min, maximum: max, table64: false, shared: false });
         }
     }
+    // `native_functions`: link-local, never exported; index 0 is null.
+    if !native_entries.is_empty() {
+        let n = native_entries.len() as u64 + 1;
+        tables.table(TableType { element_type: RefType::FUNCREF, minimum: n, maximum: Some(n), table64: false, shared: false });
+    }
     module.section(&tables);
     let mut memory = MemorySection::new();
     memory.memory(MemoryType { minimum: spec.min_pages, maximum: None, memory64: false, shared: false, page_size_log2: None });
@@ -2029,6 +2230,8 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         ensure!(inits.len() as u32 == binding_global_base(spec), "binding globals out of place");
         inits.extend(b.slots.keys().map(|&a| b.boot(a).unwrap_or(0) as i32));
     }
+    ensure!(inits.len() as u32 == ctx.rep, "the representation word out of place");
+    inits.push(0);
     for init in inits {
         globals.global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(init));
     }
@@ -2081,6 +2284,9 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         let declared: Vec<u32> = ctx.declared.iter().copied().collect();
         elems.declared(Elements::Functions(declared.into()));
     }
+    if !native_entries.is_empty() {
+        elems.active(Some(ctx.native_table), &ConstExpr::i32_const(1), Elements::Functions(native_entries.clone().into()));
+    }
     if !entries_raw.is_empty() {
         let entries: Vec<u32> = entries_raw.iter().map(|e| e.0).collect();
         let raws: Vec<u32> = entries_raw.iter().map(|e| e.1).collect();
@@ -2096,7 +2302,12 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     let mut data = DataSection::new();
     let mut aux = Vec::new();
     for &(i, si, addr) in &ctx.layout.aux.clone() {
-        let fa = |input: usize, sym: u32| -> Result<u32> {
+        let fa = |input: usize, r: &crate::object::Reloc| -> Result<u32> {
+            // A cell of a native flow's pointer table holds its handle.
+            if let Some(&h) = ctx.native.data.get(&(input, r.offset)) {
+                return Ok(h);
+            }
+            let sym = r.symbol;
             if let Some(a) = ctx.mod_of[input].and_then(|m| ctx.mod_func_addr(m, input, sym)) {
                 return Ok(a);
             }
@@ -2132,7 +2343,104 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
         ctx.unresolved.len(),
         ctx.unresolved.iter().cloned().collect::<Vec<_>>().join("\n  ")
     );
-    Ok(Linked { wasm, aux, matched, abi_mismatches: ctx.abi_mismatches.iter().cloned().collect(), references: ctx.references.clone() })
+    Ok(Linked {
+        wasm,
+        aux,
+        matched,
+        abi_mismatches: ctx.abi_mismatches.iter().cloned().collect(),
+        references: ctx.references.clone(),
+        native: ctx.native.report.clone(),
+    })
+}
+
+/// A call from game input `input` to function symbol `symbol` that enters a
+/// lifted translation directly, so it can pass native handles where the
+/// lifter proved the argument registers' use (plans/dispatch-binding B):
+/// a fixed target (as [`native_target`]), the lift tier, no hook chain or
+/// wrapper in front of its translation. Each C argument lands where the
+/// C → o32 call places it.
+fn native_transport(ctx: &Ctx, input: usize, symbol: u32, sig: &FuncType) -> Option<crate::native::Transport> {
+    use crate::native::{ArgFate, Identity, LiftedParam, Target};
+    let inp = &ctx.inputs[input];
+    let NameClass::Guest(name) = classify_name(&inp.obj.symbols[symbol as usize].name) else { return None };
+    if crate::native::local_helper(ctx.map, inp, symbol).is_some() {
+        return None;
+    }
+    let Target::Fixed { id: Identity::Guest { container, addr }, .. } = native_target(ctx, input, symbol) else { return None };
+    let Some(&Tier::Lift { input: li, func: lf }) = ctx.spec.tiers.get(&(container.clone(), addr)) else { return None };
+    let entry = ctx.body[&(li, lf)];
+    if ctx.guest[&(li, lf)] != entry || ctx.heads.keys().any(|(c, a, _)| *c == container && *a == addr) {
+        return None;
+    }
+    let params = ctx.spec.lifted_params.get(&(container.clone(), addr))?;
+    let proto = inp.protos.get(name);
+    let (kinds, variadic) = marshal::param_kinds(sig, proto);
+    let calls = proto.map_or(&[][..], |p| &p.va_calls);
+    let (words, _) = marshal::call_words(&kinds, variadic, calls).ok()?;
+    let args = (0..sig.params.len() as u32)
+        .map(|i| {
+            let reg = (0..4u8).find(|&k| words.get(k as usize) == Some(&marshal::Word::Param(i)));
+            match reg.and_then(|k| params.get(&k).map(|p| (k, p))) {
+                Some((reg, LiftedParam::Native { jalrs, returned })) => ArgFate::Native { reg, jalrs: jalrs.clone(), returned: *returned },
+                Some((reg, LiftedParam::Refused(r, why))) => ArgFate::Refused(*r, format!("a{reg}: {why}")),
+                None => ArgFate::Escape,
+            }
+        })
+        .collect();
+    Some(crate::native::Transport { entry, callee: format!("{container} 0x{addr:08X}"), args })
+}
+
+/// The target of a function reference symbol `symbol` of game input
+/// `input`, as the linker binds it (plans/dispatch-binding B). Fixed: a
+/// main-image function outside every placement and overlay collision
+/// (nothing else is ever bound at its address), or a source-only C helper.
+fn native_target(ctx: &Ctx, input: usize, symbol: u32) -> crate::native::Target {
+    use crate::native::{Identity, Reason, Target};
+    let inp = &ctx.inputs[input];
+    let s = &inp.obj.symbols[symbol as usize];
+    let name = match classify_name(&s.name) {
+        NameClass::Guest(n) | NameClass::SignatureThunk { target: n } => n,
+        NameClass::MainWrapper => return Target::Guest(Reason::MissingUses, "clang's main wrapper".into()),
+    };
+    let Some(r) = ctx.map.resolve(&inp.container, name) else {
+        return match crate::native::helper_function(ctx.map, inp, symbol).filter(|f| ctx.guest.contains_key(&(input, *f))) {
+            Some(f) => Target::Fixed {
+                id: Identity::Symbol { container: inp.container.clone(), tu: inp.label.clone(), symbol: name.to_string() },
+                tier: "C helper".into(),
+                evidence: "source-only, called only from its own object".into(),
+                helper: Some((input, f)),
+            },
+            None => Target::Guest(Reason::MissingUses, format!("{name} has no address and isn't a source-only helper here (an alias, or defined elsewhere)")),
+        };
+    };
+    let a = r.addr;
+    if ctx.covered(a) {
+        return Target::Guest(Reason::LateBinding, format!("0x{a:08X} is a changing slot: a guest pointer through its explicit binding"));
+    }
+    if ctx.spec.overlays.contains_key(&a) {
+        return Target::Guest(Reason::LateBinding, format!("0x{a:08X} is shared by overlays: resident code words choose (legacy)"));
+    }
+    match ctx.home(&inp.container, a) {
+        Some(Some(c)) if c == ctx.spec.main => match ctx.spec.tiers.get(&(c.clone(), a)) {
+            Some(t) => {
+                let tier = match t {
+                    Tier::C { .. } => "C",
+                    Tier::Lift { .. } => "lift",
+                    Tier::Adapter(_) => "adapter",
+                };
+                let hooked = if ctx.heads.contains_key(&(c.clone(), a, None)) { " through its hook chain" } else { "" };
+                Target::Fixed {
+                    id: Identity::Guest { container: c, addr: a },
+                    tier: format!("{tier}{hooked}"),
+                    evidence: format!("boot image, no placement or overlay at the address; name resolved {:?}", r.via),
+                    helper: None,
+                }
+            }
+            None => Target::Guest(Reason::UnstableDependency, format!("0x{a:08X} has no compiled implementation")),
+        },
+        Some(Some(c)) => Target::Guest(Reason::UnstableDependency, format!("0x{a:08X} is in {c}, an image without a placement: no fixed binding")),
+        _ => Target::Guest(Reason::UnstableDependency, format!("0x{a:08X} is in no image's code")),
+    }
 }
 
 /// The inputs' DWARF, for where the guest passes put their code

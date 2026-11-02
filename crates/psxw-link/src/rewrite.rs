@@ -9,7 +9,9 @@
 //! 3. **Calls** are resolved by the linker, which may lower intrinsics to
 //!    plain instructions.
 //! 4. **`call_indirect`** sites call an o32 helper for their signature,
-//!    because function pointers are MIPS addresses.
+//!    because function pointers are MIPS addresses; in a proven native flow
+//!    the helper calls through the native table instead. Function
+//!    references and indirect calls are resolved per site.
 
 use crate::object::{FuncType, WasmObject};
 use anyhow::{Context as _, Result, bail};
@@ -30,6 +32,12 @@ pub trait Resolver {
     /// `last_const` is the immediately preceding `i32.const`, if any (the
     /// last argument).
     fn call(&mut self, symbol: u32, sig: &FuncType, last_const: Option<i32>) -> Result<Lowered>;
+    /// [`Resolver::call`] at one site, the operator's CODE offset: a game
+    /// link may pass native handles to a lifted callee there
+    /// (plans/dispatch-binding B).
+    fn call_at(&mut self, symbol: u32, sig: &FuncType, last_const: Option<i32>, _site: u32) -> Result<Lowered> {
+        self.call(symbol, sig, last_const)
+    }
     /// The helper replacing `call_indirect` with signature `sig`; it takes
     /// the MIPS address as an extra trailing i32.
     fn call_indirect(&mut self, sig: &FuncType) -> Result<u32>;
@@ -39,6 +47,17 @@ pub trait Resolver {
     fn data_addr(&mut self, symbol: u32) -> Result<u32>;
     /// MIPS address of function symbol `symbol` (a function pointer).
     fn func_addr(&mut self, symbol: u32) -> Result<u32>;
+    /// The value a function reference takes at one site, its CODE
+    /// relocation's offset: by default its guest address. A game link
+    /// lowers sites in proven native flows to native handles
+    /// (plans/dispatch-binding B), so one symbol can take both forms.
+    fn func_ref(&mut self, symbol: u32, _site: u32) -> Result<u32> {
+        self.func_addr(symbol)
+    }
+    /// [`Resolver::call_indirect`] at one site, the operator's CODE offset.
+    fn call_indirect_at(&mut self, sig: &FuncType, _site: u32) -> Result<u32> {
+        self.call_indirect(sig)
+    }
     /// Output type index for an object type index (block types).
     fn type_index(&mut self, ty: u32) -> u32;
     /// When set, every store marks its 4 KiB page in a byte map at this
@@ -236,13 +255,13 @@ pub fn rewrite_mapped<R: Resolver>(
                     Operator::Call { function_index } => {
                         let rl = reloc_of(RelocationType::FunctionIndexLeb).context("call without relocation")?;
                         let sig = obj.func_type(function_index).clone();
-                        r.call(rl.symbol, &sig, prev_const)?
+                        r.call_at(rl.symbol, &sig, prev_const, pos - base)?
                     }
                     Operator::CallIndirect { type_index, .. } => {
                         let sig = obj.types[type_index as usize].clone();
                         match direct.take() {
-                            Some(symbol) => r.call(symbol, &sig, prev_const)?,
-                            None => Lowered::Call(r.call_indirect(&sig)?),
+                            Some(symbol) => r.call_at(symbol, &sig, prev_const, pos - base)?,
+                            None => Lowered::Call(r.call_indirect_at(&sig, pos - base)?),
                         }
                     }
                     _ => unreachable!(),
@@ -287,7 +306,7 @@ pub fn rewrite_mapped<R: Resolver>(
                 } else if let Some(rl) = reloc_of(RelocationType::TableIndexSleb) {
                     match r.func_rel(rl.symbol)? {
                         Some((g, o)) => (o as i32, Some(g)),
-                        None => (r.func_addr(rl.symbol)? as i32, None),
+                        None => (r.func_ref(rl.symbol, rl.offset)? as i32, None),
                     }
                 } else {
                     (value, None)

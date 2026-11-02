@@ -10,8 +10,8 @@
 //!   calling back into the guest) and returns its result;
 //! - ChangeThread (B0h:10h) suspends the call through Asyncify, to be
 //!   resumed by a later step;
-//! - `binding_fault` (a binding rule rejecting a publication) is a typed
-//!   rejection named by its cause.
+//! - `binding_fault` (a binding rule rejecting a publication, or a native
+//!   call's invalid handle) is a typed rejection named by its cause.
 
 use super::fixture::{Layout, Observation, Outcome, Step, Variant, decode_log};
 use anyhow::{Context as _, Result, bail};
@@ -73,6 +73,9 @@ fn linker(engine: &Engine) -> Result<Linker<State>> {
     l.func_wrap("psx", "untranslated", |addr: u32| -> wasmtime::Result<u64> { reject(format!("untranslated 0x{addr:08X}")) })?;
     l.func_wrap("psx", "bad_jump", |pc: u32, to: u32| -> wasmtime::Result<()> { reject(format!("bad_jump 0x{pc:08X} -> 0x{to:08X}")) })?;
     l.func_wrap("psx", "binding_fault", |rule: u32, cause: u32, value: u32| -> wasmtime::Result<()> {
+        if cause == psxw_abi::binding_cause::NATIVE_HANDLE {
+            return reject(format!("binding.native_handle 0x{value:08X}"));
+        }
         reject(format!("{} #{rule} 0x{value:08X}", psxw_abi::binding_cause::name(cause)))
     })?;
     l.func_wrap("psx", "brk", |code: u32| -> wasmtime::Result<()> { host_fail(format!("break {code:#x}")) })?;

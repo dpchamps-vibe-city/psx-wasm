@@ -131,6 +131,9 @@ impl Asm {
     pub fn sltiu(&mut self, rt: u8, rs: u8, imm: i32) -> &mut Self {
         self.word(i(0x0B, rs, rt, imm as u32))
     }
+    pub fn andi(&mut self, rt: u8, rs: u8, imm: u32) -> &mut Self {
+        self.word(i(0x0C, rs, rt, imm))
+    }
     pub fn ori(&mut self, rt: u8, rs: u8, imm: u32) -> &mut Self {
         self.word(i(0x0D, rs, rt, imm))
     }

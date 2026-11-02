@@ -4,8 +4,9 @@
 //! - data symbols at their original addresses from the [`AddressMap`];
 //!   clang-only anonymous data on identical original bytes or in
 //!   `phys::AUX_DATA` ([`layout`]);
-//! - function pointers are MIPS addresses; every cross-tier edge gets an
-//!   o32 adapter ([`marshal`]);
+//! - function pointers are MIPS addresses, except in proven closed flows,
+//!   which call through a private native table ([`native`]); every
+//!   cross-tier edge gets an o32 adapter ([`marshal`]);
 //! - guest passes over every function body: address masking, the guest
 //!   stack pointer, intrinsic lowering, `call_indirect` rewriting
 //!   ([`rewrite`]).
@@ -26,6 +27,7 @@ pub mod marshal;
 pub mod merge;
 pub mod mods;
 pub mod module;
+pub mod native;
 pub mod object;
 pub mod rewrite;
 

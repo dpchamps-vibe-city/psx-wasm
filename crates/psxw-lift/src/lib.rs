@@ -101,6 +101,22 @@ pub struct Translation {
     pub graph: Graph,
     pub facts: Facts,
     pub externs: BTreeSet<String>,
+    /// Per argument register (index into `a0..a3`): the `jalr` sites that
+    /// call through its entry value, which the representation word may make
+    /// native calls, or why a native handle can't pass there
+    /// ([`analysis::transport`]).
+    pub transport: BTreeMap<u8, Result<analysis::Carrier, analysis::Refusal>>,
+}
+
+/// Whether a call to `addr` from `from` may be bound statically: an
+/// existing function's entry, in exactly one container's text, so a direct
+/// call reaches what a call through the dispatch table would (the linker
+/// still routes it through a changing slot's binding).
+fn proven_entry(program: &Program, from: &str, addr: u32) -> bool {
+    let Some(Located::Code(c)) = program.locate(from, addr) else { return false };
+    addr & 3 == 0
+        && program.code(&c).is_some_and(|code| code.starts.contains_key(&addr))
+        && program.containers.values().filter(|k| k.in_text(addr)).count() == 1
 }
 
 pub fn translate(
@@ -115,10 +131,15 @@ pub fn translate(
             || program.code(&program.main).is_some_and(|c| c.in_text(a))
     };
     // A window constant must agree with dataflow over the finished graph;
-    // otherwise that site is re-explored as an indirect transfer.
+    // otherwise that site is re-explored as an indirect transfer. Then a
+    // call through a register dataflow proves holds a function's entry is
+    // the same call: a target carried across an inlined callee's register
+    // passing, or across a join, as one a window shows (plans/
+    // dispatch-binding B: a proven target flow, not a computed one).
     let mut not_const = BTreeSet::new();
+    let mut proven: BTreeMap<u32, u32> = BTreeMap::new();
     let (graph, facts) = loop {
-        let graph = Explorer { program, originals, func, not_const: &not_const, inline }.explore()?;
+        let graph = Explorer { program, originals, func, not_const: &not_const, proven: &proven, inline }.explore()?;
         let facts = analysis::analyze(&graph, &in_code);
         let wrong: Vec<u32> = graph
             .const_targets
@@ -126,10 +147,25 @@ pub fn translate(
             .filter(|&(b, &(r, c))| facts.consts.get(&Node::Normal(*b)).map(|st| st[r as usize]) != Some(Some(c)))
             .map(|(b, _)| *b)
             .collect();
-        if wrong.is_empty() {
+        if !wrong.is_empty() {
+            not_const.extend(wrong);
+            continue;
+        }
+        let more: Vec<(u32, u32)> = graph
+            .nodes
+            .iter()
+            .filter_map(|(n, d)| {
+                // A jalr's call is its delay slot's transfer; its target is
+                // the register on entry to the jalr.
+                let (Node::Slot(b), Transfer::Call { callee: Callee::Indirect { reg }, .. }) = (n, &d.transfer) else { return None };
+                let c = facts.consts.get(&Node::Normal(*b))?[*reg as usize]?;
+                (!not_const.contains(b) && !proven.contains_key(b) && proven_entry(program, &func.container, c)).then_some((*b, c))
+            })
+            .collect();
+        if more.is_empty() {
             break (graph, facts);
         }
-        not_const.extend(wrong);
+        proven.extend(more);
     };
     let cname = program::translated_symbol(&program.main, &func.container, func.addr);
     let comment = format!(
@@ -148,9 +184,17 @@ pub fn translate(
         graph.wanted.insert((func.container.clone(), b + 8, Source::Continuation));
     }
     let reads_chain = chain.contains(&program::call_symbol(&program.main, &func.container, func.addr));
-    let (c, externs) =
-        emit::Emitter::new(&graph, &facts)?.exceptions(exceptions).chain(chain, reads_chain).function(&cname, &comment);
-    Ok(Translation { func: func.clone(), cname, c, graph, facts, externs })
+    let transport = analysis::transport(&graph, &facts, &exceptions);
+    let native = transport.iter().filter_map(|(k, r)| r.as_ref().ok().map(|c| (k, c))).flat_map(|(k, c)| c.jalrs.iter().map(|&b| (b, *k))).collect();
+    // A carrier means a native caller may set the representation word,
+    // which the function must take even when no jalr reads it.
+    let takes = transport.values().any(|r| r.is_ok());
+    let (c, externs) = emit::Emitter::new(&graph, &facts)?
+        .exceptions(exceptions)
+        .chain(chain, reads_chain)
+        .native(native, takes)
+        .function(&cname, &comment);
+    Ok(Translation { func: func.clone(), cname, c, graph, facts, externs, transport })
 }
 
 /// Result of translating every function of the requested containers.
@@ -413,11 +457,15 @@ pub fn translate_all(program: &mut Program, originals: &Originals, containers: &
             // neither is inlined, since decompiled C is otherwise taken to
             // be ABI-conformant. Every translation that reads v0 on entry
             // takes it from the caller this way, as the hardware would.
+            // A pointer call to it passes v0 just the same.
             let chain: BTreeSet<String> = out
                 .ok
                 .iter()
                 .filter(|t| t.facts.entry_reads & (1 << 2) != 0)
-                .map(|t| program::call_symbol(&program.main, &t.func.container, t.func.addr))
+                .flat_map(|t| {
+                    let (m, c, a) = (&program.main, &t.func.container, t.func.addr);
+                    [program::call_symbol(m, c, a), program::pointer_symbol(m, c, a)]
+                })
                 .collect();
             if !chain.is_empty() {
                 let again: Vec<usize> = (0..out.ok.len())
@@ -635,6 +683,76 @@ mod tests {
         };
         let originals = Originals::from_images(vec![("test".into(), BASE, code)]);
         translate_all(&mut program, &originals, &["test".into()])
+    }
+
+    /// The entry value of `a0` in `words` (one function at BASE), as the
+    /// transport proof sees it.
+    fn a0_transport(words: &[u32]) -> Result<analysis::Carrier, analysis::Refusal> {
+        a0_transport_in(words, &[(BASE, 4 * words.len() as u32)])
+    }
+
+    fn a0_transport_in(words: &[u32], extents: &[(u32, u32)]) -> Result<analysis::Carrier, analysis::Refusal> {
+        let out = lift_words(words, extents);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        out.ok.iter().find(|t| t.func.addr == BASE).expect("translated").transport[&0].clone()
+    }
+
+    /// Reproducers from review: each lets the incoming reference reach
+    /// guest-visible state or replaces it, so `a0` can't carry a handle.
+    #[test]
+    fn transport_refuses_unmodelled_effects() {
+        // move t0, a0; lw t0, 0(a1); sw t0, 0(a2): the load's delay slot
+        // stores the old t0, the reference.
+        let delay = [0x0080_4021, 0x8CA8_0000, 0xACC8_0000, 0x03E0_0008, 0x0080_1021];
+        assert!(matches!(a0_transport(&delay), Err(analysis::Refusal::Unproven(w)) if w.contains("load")), "{:?}", a0_transport(&delay));
+        // move v0, a0; li a0, 1; syscall: v0 becomes the syscall's result.
+        let syscall = [0x0080_1021, 0x2404_0001, 0x0000_000C, 0x03E0_0008, 0];
+        assert!(matches!(a0_transport(&syscall), Err(analysis::Refusal::Unproven(w)) if w.contains("Syscall")), "{:?}", a0_transport(&syscall));
+        // move gp, a0: the guest's shared gp.
+        let gp = [0x0080_E021, 0x03E0_0008, 0x0080_1021];
+        assert!(matches!(a0_transport(&gp), Err(analysis::Refusal::Escapes(w)) if w.contains("$gp")), "{:?}", a0_transport(&gp));
+        // move t0, a0; move v1, a0; move a0, zero; bgezal a1, f; nop;
+        // sw v1, 0(a2); jalr t0: a call only when a1 >= 0, so v1 is still
+        // the reference the store writes on the other path. Conditional
+        // calls are outside the proof's domain while the value is held.
+        let cond = [
+            0x0080_4021, 0x0080_1821, 0x0000_2021, 0x04B1_0006, 0, 0xACC3_0000, 0x0100_F809, 0, 0x03E0_0008, 0, 0x03E0_0008, 0,
+        ];
+        let r = a0_transport_in(&cond, &[(BASE, 40), (BASE + 40, 8)]);
+        assert!(matches!(&r, Err(analysis::Refusal::Unproven(w)) if w.contains("outside the proof's domain")), "{r:?}");
+        // The positive control: moved to t0, called through, never seen.
+        let call = [0x27BD_FFE8, 0xAFBF_0010, 0x0080_4021, 0x0100_F809, 0x00A0_2021, 0x8FBF_0010, 0, 0x03E0_0008, 0x27BD_0018];
+        assert_eq!(a0_transport(&call), Ok(analysis::Carrier { jalrs: vec![BASE + 12], returned: false }));
+    }
+
+    /// A `jalr` through a register known to hold a function's entry is a
+    /// devirtualized pointer call: it keeps a pointer call's binding
+    /// (`psxw_p_`, the dispatch table's entry and generic hooks), while a
+    /// `jal` to the same function is a direct call (`psxw_f_`, caller-scoped
+    /// hooks included).
+    #[test]
+    fn devirtualized_pointer_calls_keep_their_binding() {
+        let target = BASE + 0x2C;
+        let words = [
+            0x27BD_FFE8,                              // addiu sp, sp, -24
+            0xAFBF_0010,                              // sw ra, 16(sp)
+            0x3C08_0000 | target >> 16,               // lui t0, %hi(target)
+            0x3508_0000 | target & 0xFFFF,            // ori t0, t0, %lo(target)
+            0x0100_F809,                              // jalr t0
+            0,                                        // nop
+            0x0C00_0000 | target >> 2 & 0x03FF_FFFF,  // jal target
+            0,                                        // nop
+            0x8FBF_0010,                              // lw ra, 16(sp)
+            0x03E0_0008,                              // jr ra
+            0x27BD_0018,                              // addiu sp, sp, 24
+            0x03E0_0008,                              // target: jr ra
+            0x2482_0001,                              //   addiu v0, a0, 1
+        ];
+        let out = lift_words(&words, &[(BASE, 0x2C), (target, 8)]);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let t = out.ok.iter().find(|t| t.func.addr == BASE).expect("translated");
+        assert!(t.c.contains(&format!("psxw_p_{target:08X}(r4, r5, r6, r7)")), "{}", t.c);
+        assert!(t.c.contains(&format!("psxw_f_{target:08X}(r4, r5, r6, r7)")), "{}", t.c);
     }
 
     /// A callee inlined for the registers it reads ends in a tail jump to

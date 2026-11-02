@@ -260,6 +260,15 @@ pub fn call_symbol(main: &str, container: &str, addr: u32) -> String {
     if container == main { format!("psxw_f_{addr:08X}") } else { format!("psxw_f_{container}_{addr:08X}") }
 }
 
+/// Symbol translated code calls for a call through a register whose value
+/// is a known function's entry (a devirtualized `jalr`): the linker binds it
+/// to what a guest pointer to that address reaches through the dispatch
+/// table (its generic hook entry, a changing slot's binding), never to a
+/// caller's scoped hooks as [`call_symbol`] is.
+pub fn pointer_symbol(main: &str, container: &str, addr: u32) -> String {
+    if container == main { format!("psxw_p_{addr:08X}") } else { format!("psxw_p_{container}_{addr:08X}") }
+}
+
 /// Symbol for a call into an overlay slot from outside it; the linker binds
 /// it to a stub that dispatches on the resident code.
 pub fn dynamic_symbol(addr: u32) -> String {
