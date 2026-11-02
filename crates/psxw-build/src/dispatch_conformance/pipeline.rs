@@ -4,7 +4,7 @@
 //! and the production optimization. Only the inputs are synthetic.
 
 use super::fixture::Variant;
-use crate::game::{c_input, link_lifted, optimize, overlay_plan, thread_switches, validate};
+use crate::game::{c_input, link_lifted, optimize, thread_switches, validate};
 use anyhow::{Context as _, Result, ensure};
 use psxw_inputs::map::Container;
 use psxw_inputs::originals::Originals;
@@ -14,11 +14,10 @@ use psxw_lift::program::{Program, Source};
 use psxw_link::game::{GameSpec, Tier};
 use psxw_link::object::{NameClass, SymbolKind, classify_name};
 use psxw_link::{Gcc, Input};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-/// The candidates and sampled checks at shared entry addresses.
-pub type Overlays = BTreeMap<u32, Vec<(String, Vec<(u32, u32)>)>>;
+pub use crate::binding::Overlays;
 
 pub struct Built {
     /// The linked guest module (Asyncify-instrumented when it switches
@@ -32,6 +31,8 @@ pub struct Built {
     pub tiers: BTreeMap<String, &'static str>,
     /// Functions the translator couldn't lift, and why.
     pub untranslated: Vec<String>,
+    /// The explicit-binding plan and what stays legacy.
+    pub binding: crate::binding::Report,
 }
 
 /// The address map and original images a fixture's inputs describe.
@@ -80,7 +81,13 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
     // normalization; its definitions seed discovery as the decomp's do.
     let cdir = dir.join("c");
     std::fs::create_dir_all(&cdir)?;
-    let clang = psxw_cc::Clang::new(ws.clang()?, cdir.clone(), vec![], vec![], &cdir)?;
+    // The facts go through the same schema as a game's `[dispatch]`; the
+    // C includes the header it generates, as the census arranges.
+    let section = v.dispatch.as_deref().map(psxw_inputs::dispatch::parse).transpose()?;
+    if let Some(s) = &section {
+        std::fs::write(cdir.join(psxw_inputs::dispatch::HEADER), psxw_inputs::dispatch::header(s))?;
+    }
+    let clang = psxw_cc::Clang::new(ws.clang()?, cdir.clone(), vec![cdir.clone()], vec![], &cdir)?;
     let mut census = Vec::new();
     for im in v.images.iter().filter(|im| im.c.is_some()) {
         let src = cdir.join(format!("{}.c", im.id));
@@ -105,10 +112,17 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
     let untranslated = outcome.failed.iter().map(|(f, e)| format!("{} 0x{:08X}: {}", f.container, f.addr, e.message)).collect();
 
     let gcc = Gcc { division: psxw_difftest::division_convention(&translations), builtin_memcpy: true, main_calls_main: true };
+    // With DWARF, as every production object has it (D53).
     let calls = dir.join("calls");
+    std::fs::create_dir_all(&calls)?;
+    psxw_cc::objects_compiled_with(&calls, &["-g"])?;
+    let boundaries = psxw_link::binding::Boundaries::new(section.as_ref(), &map);
     let mut link_inputs: Vec<Input> = census
         .iter()
-        .map(|(c, obj)| c_input(&clang, c, obj, &calls.join(c), &[], None, gcc))
+        .map(|(c, obj)| {
+            let keep = |n: &str| boundaries.keeps(&map, c, n);
+            c_input(&clang, c, obj, &calls.join(c), &["-g"], None, gcc, &keep)
+        })
         .collect::<Result<_>>()?;
     let mut c_defs: BTreeMap<(String, u32), (usize, u32)> = BTreeMap::new();
     for (i, inp) in link_inputs.iter().enumerate() {
@@ -129,9 +143,25 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
             None => lifted.push(t),
         }
     }
+    // Supplied C is the implementation even where its original doesn't
+    // translate.
+    let untranslated_c = crate::game::untranslated(&program, c_defs.keys(), &translations);
+    for f in &untranslated_c {
+        let key = (f.container.clone(), f.addr);
+        let (input, func) = c_defs[&key];
+        tiers.insert(key, Tier::C { input, func });
+    }
     let switches = thread_switches(&lifted);
     link_lifted(ws, &dir.join("lift"), &lifted, &mut link_inputs, &mut tiers)?;
-    let overlays = overlay_plan(&program, &originals, &tiers)?;
+    // Supplied C stays the implementation: no dispatch or binding concern
+    // selects another tier for it.
+    let functions: BTreeSet<(&str, u32)> =
+        translations.iter().map(|t| &t.func).chain(&untranslated_c).map(|f| (f.container.as_str(), f.addr)).collect();
+    for key in c_defs.keys().filter(|k| functions.contains(&(k.0.as_str(), k.1))) {
+        ensure!(matches!(tiers.get(key), Some(Tier::C { .. })), "{} {:#010x}: supplied C is not linked at the C tier", key.0, key.1);
+    }
+    let (binding_plan, overlays, mut binding) =
+        crate::binding::dispatch(section.as_ref(), &map, &program, &originals, &translations, &tiers, &link_inputs, false)?;
 
     let defaults = crate::game::Options::new("dispatch");
     let spec = GameSpec {
@@ -148,11 +178,23 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
         mods: None,
         slots: None,
         threads: !switches.is_empty(),
+        binding: binding_plan,
     };
     ensure!(spec.threads == v.threads, "the fixture says threads = {}, the build found {} switches", v.threads, switches.len());
     let rodata = psxw_link::layout::Rodata::new(&map, &originals);
     let linked = psxw_link::game::link(&map, Some(&rodata), &spec, &link_inputs)?;
     validate(&linked.wasm).context("guest module fails validation")?;
+    binding.references = linked.references.clone();
+    if let Some(b) = &spec.binding {
+        // Covered paths must not select implementations by code words.
+        let sampled: Vec<String> = sampled_stubs(&linked.wasm)?.into_iter().filter(|a| b.covers(*a)).map(|a| format!("{a:#010x}")).collect();
+        ensure!(sampled.is_empty(), "resident-word selectors at covered addresses: {}", sampled.join(", "));
+        // Supplied C keeps its source locations through instrumentation.
+        if !c_defs.is_empty() {
+            let debug = psxw_link::game::link(&map, Some(&rodata), &GameSpec { debug_info: true, ..spec.clone() }, &link_inputs)?;
+            debug_locations(&debug.wasm)?;
+        }
+    }
     let guest = if spec.threads { crate::game::asyncify(ws, dir, &linked.wasm, &switches, false)? } else { linked.wasm.clone() };
     let guest_path = dir.join("guest.wasm");
     std::fs::write(&guest_path, &guest)?;
@@ -171,5 +213,61 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
             (format!("{c} 0x{a:08X}"), k)
         })
         .collect();
-    Ok(Built { linked: guest, optimized, overlays, tiers, untranslated })
+    Ok(Built { linked: guest, optimized, overlays, tiers, untranslated, binding })
+}
+
+/// Each C subprogram's DWARF starts in the body the name section gives that
+/// function, never in a generated wrapper (the operation, its o32 entry):
+/// breakpoints refer to the C that actually runs.
+fn debug_locations(wasm: &[u8]) -> Result<()> {
+    let subs = psxw_link::dwarf::subprograms(&psxw_link::dwarf::sections(wasm)?)?;
+    ensure!(!subs.is_empty(), "the debug link carries no C subprograms");
+    let starts = psxw_link::dwarf::body_starts(wasm)?;
+    let mut imported = 0u32;
+    let mut names: BTreeMap<u32, String> = BTreeMap::new();
+    for p in wasmparser::Parser::new(0).parse_all(wasm) {
+        match p? {
+            wasmparser::Payload::ImportSection(r) => {
+                imported += r.into_imports().filter(|i| i.as_ref().is_ok_and(|i| matches!(i.ty, wasmparser::TypeRef::Func(_)))).count() as u32;
+            }
+            wasmparser::Payload::CustomSection(c) => {
+                let wasmparser::KnownCustom::Name(n) = c.as_known() else { continue };
+                for n in n {
+                    if let wasmparser::Name::Function(map) = n? {
+                        for f in map {
+                            let f = f?;
+                            names.insert(f.index, f.name.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, low) in subs {
+        // The body holding it; its size field precedes its locals.
+        let k = starts.iter().rposition(|&s| u64::from(s) <= low + 5).context("a subprogram before the code")?;
+        let body = names.get(&(imported + k as u32)).cloned().unwrap_or_default();
+        ensure!(body.ends_with(&format!(":{name}")), "{name}'s debug location is in `{body}`, not its C body");
+    }
+    Ok(())
+}
+
+/// Addresses of the linked module's sampled-word overlay stubs, by their
+/// names (`overlay:<addr>`).
+fn sampled_stubs(wasm: &[u8]) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for p in wasmparser::Parser::new(0).parse_all(wasm) {
+        let wasmparser::Payload::CustomSection(c) = p? else { continue };
+        let wasmparser::KnownCustom::Name(names) = c.as_known() else { continue };
+        for n in names {
+            let wasmparser::Name::Function(map) = n? else { continue };
+            for f in map {
+                if let Some(a) = f?.name.strip_prefix("overlay:").and_then(|h| u32::from_str_radix(h, 16).ok()) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    Ok(out)
 }

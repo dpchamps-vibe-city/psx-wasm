@@ -48,13 +48,15 @@ pub fn run(ws: &Workspace, opts: &Options) -> Result<(Report, PathBuf)> {
     let out_dir = ws.out_dir().join("census").join(&manifest.game.id).join(pin.short());
     let obj_dir = out_dir.join("obj");
     std::fs::create_dir_all(&obj_dir)?;
-    let mut clang = Clang::new(
-        ws.clang()?,
-        snap.clone(),
-        manifest.c.include.clone(),
-        manifest.c.defines.clone(),
-        &out_dir,
-    )?;
+    // `[dispatch]` c_marker sites: the generated header authored C includes.
+    let mut includes = manifest.c.include.clone();
+    if let Some(d) = &manifest.dispatch {
+        let dir = out_dir.join("binding");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(psxw_inputs::dispatch::HEADER), psxw_inputs::dispatch::header(d))?;
+        includes.push(dir);
+    }
+    let mut clang = Clang::new(ws.clang()?, snap.clone(), includes, manifest.c.defines.clone(), &out_dir)?;
     clang.reference(&manifest.reference.cc1flags);
 
     let tus: Vec<_> = map

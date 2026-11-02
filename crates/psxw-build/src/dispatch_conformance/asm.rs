@@ -19,6 +19,7 @@ pub const T2: u8 = 10;
 pub const T3: u8 = 11;
 pub const T7: u8 = 15;
 pub const S0: u8 = 16;
+pub const S1: u8 = 17;
 pub const T8: u8 = 24;
 pub const T9: u8 = 25;
 pub const SP: u8 = 29;

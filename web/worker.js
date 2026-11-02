@@ -65,7 +65,7 @@ import { ModLoader, takeMod } from "./mods.js";
 import { Calls, ScriptHost, mod } from "./script.js";
 import { NATIVE_RENDER_SETTINGS, unpackRenderSettings } from "./rendering.js";
 
-const ABI_VERSION = 18;
+const ABI_VERSION = 19;
 const NOTHING_PRESSED = 0xffff;
 /** How far ahead of the vblanks a recorded counter may be (see `pad_state`). */
 const RECORD_AHEAD = 1 << 20;
