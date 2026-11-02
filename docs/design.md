@@ -236,76 +236,6 @@ region-write epoch is a later optimization. These sampled checks identify
 build-known overlays; they do not validate whole functions or promise support
 for arbitrary code mutation or partially loaded overlays.
 
-**Explicit binding (D73).** A game whose `game.toml` has a `[dispatch]`
-section ([plans/dispatch-binding](../plans/dispatch-binding/README.md))
-replaces the stub for the regions it covers:
-
-- Each placement names a container. Every function entry in a placement's
-  text is a *slot*: its backing bytes (D5), so a KSEG0 entry and its KSEG1
-  alias are one slot. Every route into a slot looks up its binding: direct
-  and tail calls from C and lifted code, pointer calls, host invocation.
-  Main-container calls are no longer exempt there, and a unique entry is
-  callable only once something publishes it.
-- The binding is the slot's dispatch-table entry. Boot binds what the main
-  image supplies. A rule on a software operation (for example a loader's
-  successful return) publishes a placement's range or invalidates one, and
-  the linker generates that update in the guest module. Nothing reads code
-  words to choose an implementation.
-- An implementation is bound only when one publication covers its whole
-  footprint (its translated regions, or its C extent). An invalidation
-  unbinds only slots whose bound implementation depends on a written byte,
-  so an untouched tail stays bound. A range is its window bytes, split
-  where it wraps the window, in the build's checks and the generated
-  updates alike.
-- The operation runs unchanged: the wrapper takes the function's place, so
-  supplied C stays the implementation. A declared operation, and any function
-  at a covered address, keeps its call boundary: its C stays out of line
-  even when written `inline` (weak and noinline, like D50's other functions; chosen by address,
-  whatever name the C or the facts use), and a call to it is never lowered
-  to an intrinsic (a constant-length `memcpy`); C may not declare it
-  `const` or `pure`, which would let clang merge or drop its calls
-  (`binding.elidable_call`). Which function a C name means is the one the
-  linker calls (the name resolved from the caller's container, then the
-  container whose code holds it), whichever container's C names it. The
-  arguments a rule reads are the original's o32 words and v0, as the C's
-  o32 wrapper maps them (a variadic function's after its TU's calls, a
-  struct return's hidden pointer in v0), captured at entry; a variadic
-  word no call places can't be read. Supplied C is the implementation even where its
-  original doesn't translate. In a `[dispatch]` build supplied C is never
-  replaced by its translation automatically: void C whose result callers
-  read needs a `[tier]` lift pin (`binding.c_replaced`). A selector no case
-  names, or a
-  destination outside the placement's layout, calls `psx.binding_fault`
-  (ABI 19) instead of publishing a guess.
-- A write inside supplied C is stated by the C itself: the rule names a
-  `c_marker`, and the C calls `psxw_binding_site_<marker>` from the
-  generated `psxw_binding.h` after the write, in the function holding it.
-  The build generates that function; C defining it fails
-  (`binding.defined_marker`).
-  Values the rule declares literally must match the call's (a destination
-  as backing bytes), and a source
-  offset the rule derives from the placement must match the derived one. Writer summaries are inferred
-  from constant-address stores first; declared bounds cover what analysis
-  can't and must contain every known write, both compared as backing bytes
-  (D5), so an alias names the same bytes. Analysis follows each call where
-  the linker binds it, and a call to a changing slot into every
-  implementation at any alias of it. A store's known constant address is a
-  known write whatever its register; an unknown `$sp`-relative one counts as
-  a stack write only where the function, and every caller between it and
-  the writer, moves `$sp` by constants alone (the writer itself is entered
-  with a stack).
-  Anything else analysis can't bound needs declared bounds. When a writer's
-  rules all have constant ranges, they must cover the code it can change.
-- Facts the build can't honour fail it with a `binding.*` diagnostic:
-  unknown fields, an overlapping image without a placement, a translation
-  embedding replaceable code, an expanded operation, a code-changing writer
-  without a rule, a declared writer bound a known write falls outside, a
-  write in supplied C without its marker, or a rule milestone C implements.
-
-Regions without a placement keep the sampled stub; `build.json` lists them
-as legacy, with every reference's class. Partial composition, active
-continuations, writes the runtime makes and mod residency are milestone C.
-
 ### 4. Every function gets exactly one implementation
 
 Each function at each guest address is implemented exactly once. `psxw`
@@ -1474,9 +1404,6 @@ indirect ABI `(a0..a3) -> i64`. (design §2)
 **D7. Overlays dispatch on resident bytes.** A stub compares code words in
 RAM against each candidate overlay. *Why:* it's how hardware decides, and
 needs no per-game loader hook. (design §3)
-
-*Later:* D73 binds the regions a game's `[dispatch]` facts cover
-explicitly. The stub remains only for regions without a placement.
 
 ### Implementations
 
@@ -2716,22 +2643,3 @@ review.
 - **D71 (instruction-count time): not adopted.** Virtual time remains the
   safepoint quantum (D18), with D66's SIO0 and root-counter-2 view. No
   per-block instruction spending or decompiled-C cost regions were added.
-
-### Dispatch binding: D73
-
-**D73. Explicit binding for declared placements.** With `[dispatch]`
-facts, a covered address's dispatch-table entry is its binding. Boot binds
-the main image's entries. Generated wrappers around declared operations
-publish or invalidate ranges when the operation completes, and every route
-into a covered address looks the binding up. Guest pointer values, the data
-layout and o32 boundaries are unchanged (D5, D6). Rule errors are
-`psx.binding_fault`, ABI 19. Regions without a placement keep D7's stub
-and are reported as legacy. *Why:* the stub's sampled words can't
-establish which compiled implementation the program's loading made current
-(plans/dispatch-identity-and-binding). The dispatch-binding plan prescribes
-this contract, so no further approval was needed. Milestone A implements
-synchronous function-return publication and invalidation, and writes in
-supplied C stated through `c_marker` calls. Partial
-composition, request lifecycles, continuations, native loaders, mod
-residency and the callable namespace are milestones B and C. (design §3;
-plans/dispatch-binding/01-explicit-activation)

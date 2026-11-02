@@ -5,7 +5,6 @@
 //! "Pinning the inputs".
 
 pub mod boundary;
-pub mod dispatch;
 pub mod game;
 pub mod headers;
 pub mod identity;

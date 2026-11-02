@@ -30,8 +30,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::path::PathBuf;
 
-/// 2: each variant's dispatch `path` and explicit-binding plan.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// A variant's verdict class (docs/conventions.md "Reports").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -75,11 +74,6 @@ pub struct VariantReport {
     pub dispatch: Vec<String>,
     pub tiers: Vec<String>,
     pub untranslated: Vec<String>,
-    /// `explicit` when `[dispatch]` facts bind the variant's placements,
-    /// else `legacy` (sampled code words).
-    pub path: &'static str,
-    /// The explicit-binding plan and what stays legacy.
-    pub binding: Option<crate::binding::Report>,
     /// sha256 of the fixture as built.
     pub fixture_sha256: String,
 }
@@ -287,8 +281,6 @@ pub fn report_variant(w: &WasmResult, reference: Option<&Result<Vec<Observation>
             .unwrap_or_default(),
         tiers: built.map(|b| b.tiers.iter().map(|(k, t)| format!("{k} {t}")).collect()).unwrap_or_default(),
         untranslated: built.map(|b| b.untranslated.clone()).unwrap_or_default(),
-        path: if v.dispatch.is_some() { "explicit" } else { "legacy" },
-        binding: built.map(|b| b.binding.clone()),
         fixture_sha256: psxw_oracle::Hash::of(format!("{v:?}").as_bytes()).hex(),
     }
 }
@@ -337,7 +329,7 @@ impl Report {
                 Verdict::Unresolved => "UNRESOLVED",
                 Verdict::Failed => "FAIL",
             };
-            s += &format!("{verdict:<11} {:<9} {:<8} {}\n", v.kind, v.path, v.id);
+            s += &format!("{verdict:<11} {:<9} {}\n", v.kind, v.id);
             for p in &v.problems {
                 s += &format!("            {p}\n");
             }
@@ -393,7 +385,7 @@ mod tests {
             variant,
             build: Ok(pipeline::Built {
                 linked: vec![], optimized: vec![], overlays: Default::default(),
-                tiers: Default::default(), untranslated: vec![], binding: Default::default(),
+                tiers: Default::default(), untranslated: vec![],
             }),
             linked: Ok(observations.clone()), optimized: Ok(observations),
         };

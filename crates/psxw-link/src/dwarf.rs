@@ -189,32 +189,6 @@ pub fn source_paths(sections: &[(String, Vec<u8>)]) -> Result<std::collections::
     Ok(out)
 }
 
-/// Every subprogram with code: its name and its first code address (an
-/// offset in the code section).
-pub fn subprograms(sections: &[(String, Vec<u8>)]) -> Result<Vec<(String, u64)>> {
-    let read = read::Dwarf::load(|id| -> Result<_, gimli::Error> {
-        let data = sections.iter().find(|(n, _)| n == id.name()).map_or(&[][..], |(_, b)| b.as_slice());
-        Ok(EndianSlice::new(data, LittleEndian))
-    })?;
-    let mut out = Vec::new();
-    let mut units = read.units();
-    while let Some(header) = units.next()? {
-        let unit = read.unit(header)?;
-        let mut entries = unit.entries();
-        while let Some(e) = entries.next_dfs()? {
-            if e.tag() != gimli::DW_TAG_subprogram {
-                continue;
-            }
-            let (Some(name), Some(low)) = (e.attr_value(gimli::DW_AT_name), e.attr_value(gimli::DW_AT_low_pc)) else {
-                continue;
-            };
-            let Some(low) = read.attr_address(&unit, low)? else { continue };
-            out.push((read.attr_string(&unit, name)?.to_string_lossy().into_owned(), low));
-        }
-    }
-    Ok(out)
-}
-
 /// `parts` joined with `/`: an absolute part starts over, `.` and `..`
 /// are resolved as a URL's are.
 fn join_path(parts: &[String]) -> String {

@@ -496,59 +496,35 @@ pub fn divisions(ast: &Ast) -> Vec<crate::edit::Edit> {
 /// GCC 2.95 at `-O2` left every call to a non-inline function. A `static`
 /// one loses `static` (a weak definition can't be internal) on every
 /// file-scope declaration. `inline` functions are left alone: GCC inlined
-/// them too, so the original program has no such calls. A function
-/// `keep` names (plans/dispatch-binding: a declared operation, or one at a
-/// changing slot) keeps its call boundary even when written `inline`: it
-/// loses `inline` and becomes weak and noinline like the rest, so every
-/// call reaches its instrumentation or binding lookup.
-pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>, keep: &dyn Fn(&str) -> bool) -> String {
+/// them too, so the original program has no such calls.
+pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>) -> String {
     let ast = parse(text);
     let mut edits: Vec<crate::edit::Edit> = Vec::new();
     let words = |s: &str| -> Vec<String> { s.split(|c: char| !c.is_alphanumeric() && c != '_').map(str::to_string).collect() };
     let mut made_extern: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let is_inline = |s: &str| matches!(s, "inline" | "__inline" | "__inline__");
     for f in ast.functions() {
-        let boundary = keep(&f.name);
-        if !names.contains(&f.name) && !boundary {
+        if !names.contains(&f.name) {
             continue;
         }
         let head = &ast.src[f.range.start..f.decl_end];
         let specifiers = head.split(&f.name).next().unwrap_or("");
         let w = words(specifiers);
-        let node = ast.top_level_at(f.range.start).filter(|n| n.kind() == "function_definition");
-        // A boundary's `inline` specifiers go; the first takes the attribute
-        // when there's no `static` to.
-        let mut inline_specs = Vec::new();
-        if w.iter().any(|w| is_inline(w)) {
-            if !boundary {
-                continue;
-            }
-            let mut c = node.map(|n| n.walk());
-            inline_specs = node
-                .zip(c.as_mut())
-                .into_iter()
-                .flat_map(|(n, c)| n.named_children(c).collect::<Vec<_>>())
-                .filter(|s| s.kind() == "storage_class_specifier" && is_inline(ast.text(*s)))
-                .map(|s| s.byte_range())
-                .collect();
+        if w.iter().any(|w| matches!(w.as_str(), "inline" | "__inline" | "__inline__")) {
+            continue;
         }
         const ATTR: &str = "__attribute__((weak, noinline))";
+        let node = ast.top_level_at(f.range.start).filter(|n| n.kind() == "function_definition");
         let mut c2 = node.map(|n| n.walk());
         let stat = node.zip(c2.as_mut()).and_then(|(n, c)| {
             n.named_children(c).find(|s| s.kind() == "storage_class_specifier" && ast.text(*s) == "static")
         });
-        let mut inline_specs = inline_specs.into_iter();
         match stat {
             Some(st) => {
                 made_extern.insert(f.name.clone());
                 edits.push(crate::edit::Edit::replace(st.byte_range(), ATTR));
             }
-            None => match inline_specs.next() {
-                Some(r) => edits.push(crate::edit::Edit::replace(r, ATTR)),
-                None => edits.push(crate::edit::Edit::insert(f.range.start, format!("{ATTR} "))),
-            },
+            None => edits.push(crate::edit::Edit::insert(f.range.start, format!("{ATTR} "))),
         }
-        edits.extend(inline_specs.map(|r| crate::edit::Edit::replace(r, "")));
     }
     // `static` off every file-scope declaration of those functions.
     let root = ast.tree.root_node();
@@ -572,90 +548,16 @@ pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>, keep
     crate::edit::apply(text, edits)
 }
 
-/// Functions `keep` names that a declaration or definition anywhere in the
-/// TU marks `const` or `pure` (C23: `unsequenced`, `reproducible`), each
-/// with the attribute: clang may merge or delete such calls, which weak and
-/// noinline don't prevent (plans/dispatch-binding).
-pub fn elidable_calls(text: &str, keep: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
-    fn elidable(ast: &Ast, n: Node) -> Option<String> {
-        let mut c = n.walk();
-        let names: Vec<Node> = match n.kind() {
-            "attribute_specifier" => n
-                .named_children(&mut c)
-                .flat_map(|a| a.named_children(&mut a.walk()).collect::<Vec<_>>())
-                .map(|a| a.child_by_field_name("function").unwrap_or(a))
-                .collect(),
-            "attribute_declaration" => {
-                n.named_children(&mut c).filter_map(|a| a.child_by_field_name("name")).collect()
-            }
-            _ => return None,
-        };
-        names.into_iter().map(|a| ast.text(a)).find(|a| {
-            matches!(a.trim_matches('_'), "const" | "pure" | "unsequenced" | "reproducible")
-        }).map(str::to_string)
-    }
-    fn own(ast: &Ast, n: Node) -> Option<String> {
-        let mut c = n.walk();
-        n.named_children(&mut c).find_map(|a| elidable(ast, a))
-    }
-    fn walk(ast: &Ast, n: Node, keep: &dyn Fn(&str) -> bool, out: &mut Vec<(String, String)>) {
-        if matches!(n.kind(), "declaration" | "function_definition") {
-            let shared = own(ast, n);
-            let mut c = n.walk();
-            for d in n.children_by_field_name("declarator", &mut c) {
-                let mut f = Some(d);
-                while let Some(x) = f.filter(|x| x.kind() != "function_declarator") {
-                    f = x.child_by_field_name("declarator");
-                }
-                let Some(f) = f else { continue };
-                let Some(name) = ast.declarator_name(f).filter(|n| keep(n)) else { continue };
-                if let Some(a) = own(ast, f).or_else(|| shared.clone()) {
-                    out.push((name, a));
-                }
-            }
-        }
-        let mut c = n.walk();
-        for k in n.named_children(&mut c) {
-            walk(ast, k, keep, out);
-        }
-    }
-    let ast = parse(text);
-    let mut out = Vec::new();
-    walk(&ast, ast.tree.root_node(), keep, &mut out);
-    out
-}
-
 #[cfg(test)]
 mod hook_tests {
     #[test]
     fn hooked_functions_become_weak() {
         let src = "static int g(int);\nint f(int a) { return g(a) + 1; }\nstatic int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n";
         let names = ["f", "g", "h"].iter().map(|s| s.to_string()).collect();
-        let out = super::hook_variant(src, &names, &|_| false);
+        let out = super::hook_variant(src, &names);
         assert_eq!(
             out,
             " int g(int);\n__attribute__((weak, noinline)) int f(int a) { return g(a) + 1; }\n__attribute__((weak, noinline)) int g(int a) { return a * 2; }\nstatic inline int h(int a) { return a; }\n"
         );
-    }
-
-    #[test]
-    fn declared_operations_keep_their_boundary() {
-        let src = "static inline int h(int a) { return a; }\ninline int k(int a) { return a; }\nint f(int a) { return h(a) + k(a); }\n";
-        let names = ["f"].iter().map(|s| s.to_string()).collect();
-        let out = super::hook_variant(src, &names, &|n| n == "h" || n == "k");
-        assert!(!out.contains("inline int"), "{out}");
-        assert!(out.contains("__attribute__((weak, noinline))  int h(int a)"), "{out}");
-        assert!(out.contains("__attribute__((weak, noinline)) int k(int a)"), "{out}");
-    }
-
-    #[test]
-    fn elidable_boundaries() {
-        let src = "int f(int a) __attribute__((const));\n__attribute__((nothrow, __pure__)) int g(int);\n\
-                   int h(int), k(int) __attribute__((const));\n[[gnu::const]] int m(int);\n\
-                   int q(void) { extern int r(int) __attribute__((const)); return r(1); }\nint s(int) __attribute__((noreturn));\n";
-        let all = super::elidable_calls(src, &|_| true);
-        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["f", "g", "k", "m", "r"]);
-        assert!(super::elidable_calls(src, &|n| n == "h" || n == "s").is_empty());
     }
 }

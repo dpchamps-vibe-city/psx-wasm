@@ -162,9 +162,6 @@ pub struct Variant {
     /// A proposed support/rejection rule needing operator approval. Keep
     /// observations and mismatches; agreement alone cannot approve it.
     pub review_required: Option<&'static str>,
-    /// `[dispatch]` facts (TOML), as a game's manifest states them: the
-    /// variant exercises explicit binding. `None`: the legacy dispatch.
-    pub dispatch: Option<String>,
 }
 
 impl Variant {

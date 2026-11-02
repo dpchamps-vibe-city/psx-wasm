@@ -16,7 +16,6 @@
 //! [`AddressMap`]: psxw_inputs::AddressMap
 
 pub mod asyncify;
-pub mod binding;
 pub mod bodies;
 pub mod dwarf;
 pub mod game;

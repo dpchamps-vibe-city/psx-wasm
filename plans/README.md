@@ -81,7 +81,7 @@ Nothing in code may be specific to either.
 | [SDK adapters](adaptor-status.md): the rest of PsyQ 4.7 | not started | — |
 | [Dispatch conformance](dispatch-conformance.md): synthetic original-MIPS programs through production dispatch, checked independently of either game | **baseline implemented; remediation and acceptance unfinished; D72 removed** | Contracts and implementation prescribed by dispatch binding |
 | [Dispatch identity and binding](dispatch-identity-and-binding.md): sampled code identification, dynamic binding and the information a general compiler needs | background problem statement; execution plan linked | — |
-| [Dispatch binding](dispatch-binding/README.md): explicit activation, proven native references, then retirement of resident-byte inference | **A implemented (explicit-binding subset passes); B/C not started; no outstanding decisions** | A → B → C; implementation and evidence, not approvals |
+| [Dispatch binding](dispatch-binding/README.md): explicit activation, proven native references, then retirement of resident-byte inference | **prescriptive plan; A/B/C not started; no outstanding decisions** | A → B → C; implementation and evidence, not approvals |
 | [Geometry-provider addons](geometry-provider-addons.md): optional game-specific geometry feeds for independent visual consumers | planned; feasibility first | Existing modkit/visual interface; D56 decision |
 
 ## Completed
