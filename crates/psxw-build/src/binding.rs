@@ -9,10 +9,9 @@
 //! never a fallback to code probes.
 
 use anyhow::{Context as _, Result, bail, ensure};
-use psxw_abi::WINDOW_MASK;
 use psxw_inputs::AddressMap;
 use psxw_inputs::dispatch::{self as facts, DispatchSection, Effect, Event, HEADER, SITE_PREFIX, Site};
-use psxw_link::binding as link;
+use psxw_link::binding::{self as link, slot, span, window};
 use psxw_link::game::Tier;
 use psxw_link::marshal;
 use psxw_link::object::{NameClass, classify_name};
@@ -82,63 +81,10 @@ pub(crate) fn dispatch(
     };
     let mut overlays = crate::game::overlay_plan(program, originals, tiers)?;
     if let Some(b) = &binding {
-        overlays.retain(|a, _| !b.slots.contains_key(a));
+        overlays.retain(|a, _| !b.covers(*a));
     }
     classify(&mut report, map, tiers, binding.as_ref(), &overlays, mod_residency);
     Ok((binding, overlays, report))
-}
-
-/// The functions whose call boundary must survive C optimization: declared
-/// operations (an inlined call would skip the wrapper) and every function
-/// at a changing slot (an inlined body would skip the binding lookup). By
-/// address, so whatever name the C or the facts use for them counts.
-pub(crate) struct Boundaries {
-    operations: BTreeSet<(String, u32)>,
-    /// The placements' text, as window offsets.
-    covered: Vec<Range<u32>>,
-}
-
-impl Boundaries {
-    pub(crate) fn new(section: Option<&DispatchSection>, map: &AddressMap) -> Self {
-        let mut operations = BTreeSet::new();
-        let mut covered = Vec::new();
-        if let Some(s) = section {
-            for r in &s.rules {
-                if let (Some(c), Some(f)) = (&r.container, &r.function) {
-                    operations.extend(map.resolve(c, f).map(|r| (c.clone(), r.addr)));
-                }
-            }
-            for p in &s.placements {
-                covered.extend(map.container(&p.container).into_iter().flat_map(|c| c.text.iter().flat_map(window)));
-            }
-        }
-        Self { operations, covered }
-    }
-
-    /// Whether C in `container` defining `name` must keep its boundary.
-    pub(crate) fn keeps(&self, map: &AddressMap, container: &str, name: &str) -> bool {
-        map.resolve(container, name).is_some_and(|r| {
-            self.operations.contains(&(container.to_string(), r.addr)) || self.covered.iter().any(|k| k.contains(&(r.addr & WINDOW_MASK)))
-        })
-    }
-}
-
-/// A guest range's backing bytes (D5: `addr & WINDOW_MASK`) as window
-/// offsets: split where it wraps the window, all of it when it spans one.
-fn window(r: &Range<u32>) -> Vec<Range<u32>> {
-    span(r.start, r.end.saturating_sub(r.start))
-}
-
-/// [`window`] of the `len` bytes from `start`, which may end at 2^32.
-fn span(start: u32, len: u32) -> Vec<Range<u32>> {
-    const SIZE: u64 = WINDOW_MASK as u64 + 1;
-    let (start, len) = ((start & WINDOW_MASK) as u64, len as u64);
-    match len {
-        0 => vec![],
-        _ if len >= SIZE => vec![0..SIZE as u32],
-        _ if start + len <= SIZE => vec![start as u32..(start + len) as u32],
-        _ => vec![start as u32..SIZE as u32, 0..(start + len - SIZE) as u32],
-    }
 }
 
 fn overlaps(a: &Range<u32>, b: &Range<u32>) -> bool {
@@ -189,7 +135,7 @@ pub(crate) fn plan(
         placements.push(link::Placement { id: p.id.clone(), container: p.container.clone(), segments: c.segments.clone() });
         covered.extend(c.text.iter().flat_map(window));
     }
-    let in_covered = |a: u32| covered.iter().any(|r| r.contains(&(a & WINDOW_MASK)));
+    let in_covered = |a: u32| covered.iter().any(|r| r.contains(&slot(a)));
     let placement_of: BTreeMap<&str, usize> = f.placements.iter().enumerate().map(|(i, p)| (p.id.as_str(), i)).collect();
     let placed: BTreeSet<&str> = f.placements.iter().map(|p| p.container.as_str()).collect();
     // Another image that can occupy covered bytes needs a placement, or its
@@ -233,7 +179,7 @@ pub(crate) fn plan(
         }
         if in_covered(*a) {
             ensure!(!footprint.is_empty(), "{c} {a:#010x}: an implementation with no extent");
-            slots.entry(*a).or_default().push(link::Candidate { container: c.clone(), footprint, boot: *c == map.main });
+            slots.entry(slot(*a)).or_default().push(link::Candidate { container: c.clone(), addr: *a, footprint, boot: *c == map.main });
         } else if let Some(r) = footprint.iter().find(|r| covered.iter().any(|k| overlaps(k, r))) {
             bail!(
                 "binding.replaceable_dependency: {c} {a:#010x} is entered outside the placements but its code at window {:#x}..{:#x} can be replaced",
@@ -244,8 +190,10 @@ pub(crate) fn plan(
     }
 
     // Each compiled function's o32 shape, to validate what rules read
-    // before code generation: its argument words, and whether it returns.
-    let shape = |key: &(String, u32)| -> (u32, bool) {
+    // before code generation: the argument words whose o32 position is
+    // proven, of how many, and whether it returns a v0 (the linker's own
+    // [`marshal::c_shape`]).
+    let shape = |key: &(String, u32)| -> (u32, u32, bool) {
         match tiers.get(key) {
             Some(&Tier::C { input, func }) => {
                 let o = &inputs[input].obj;
@@ -255,10 +203,10 @@ pub(crate) fn plan(
                     NameClass::Guest(n) => n.to_string(),
                     _ => name,
                 };
-                let (kinds, variadic) = marshal::param_kinds(sig, inputs[input].protos.get(&guest));
-                (marshal::words(&kinds, variadic).0.len() as u32, !sig.results.is_empty())
+                let s = marshal::c_shape(sig, inputs[input].protos.get(&guest));
+                (s.proven, s.words.len() as u32, s.v0 != marshal::V0::None)
             }
-            _ => (facts::MAX_ARG, true),
+            _ => (facts::MAX_ARG, facts::MAX_ARG, true),
         }
     };
     // The function whose extent holds an instruction.
@@ -423,9 +371,15 @@ pub(crate) fn plan(
             continue;
         }
         // What the rule reads must exist in the operation's signature.
-        let (words, returns) = shape(&key);
+        let (words, all, returns) = shape(&key);
         for v in reads(&rule) {
             match v {
+                link::Value::Arg(a) | link::Value::Field { arg: a, .. } if *a >= words && *a < all => bail!(
+                    "binding.invalid_fact: {what}: arg:{a} of {} {:#010x} is a variadic argument word whose o32 position no call in its TU \
+                     shows (a 64-bit argument could move it); call it there from C with the arguments it takes",
+                    key.0,
+                    key.1
+                ),
                 link::Value::Arg(a) | link::Value::Field { arg: a, .. } => ensure!(
                     *a < words,
                     "binding.invalid_fact: {what}: {} {:#010x} has {words} argument words; the rule reads arg:{a}",
@@ -573,7 +527,8 @@ pub(crate) fn plan(
         ));
     }
 
-    let binding = link::Binding { slots, placements, rules, operations, markers };
+    let boundaries = link::Boundaries::new(Some(section), map);
+    let binding = link::Binding { slots, boundaries, placements, rules, operations, markers };
     let report = Report {
         explicit: true,
         placements: binding
@@ -594,7 +549,7 @@ pub(crate) fn plan(
                     .iter()
                     .map(|c| {
                         let fp: Vec<String> = c.footprint.iter().map(|r| format!("{:#x}..{:#x}", r.start, r.end)).collect();
-                        format!("{}{} [{}]", c.container, if c.boot { " (boot)" } else { "" }, fp.join(" "))
+                        format!("{} 0x{:08X}{} [{}]", c.container, c.addr, if c.boot { " (boot)" } else { "" }, fp.join(" "))
                     })
                     .collect();
                 format!("0x{a:08X}: {}", each.join("; "))
@@ -617,14 +572,12 @@ struct Writes {
 }
 
 /// One store of a lifted function, by the register constants on entry to
-/// its node.
+/// its node. A known address is a known write, whatever the register; an
+/// unknown one through `$sp` is to a stack frame only where `$sp` is the
+/// caller's, moved by constants.
 fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::Node) {
     use psxw_lift::decode::Op;
     let insn = &t.graph.nodes[&node].insn;
-    if insn.rs == 29 {
-        out.stack = true;
-        return;
-    }
     match t.facts.consts.get(&node).and_then(|c| c[insn.rs as usize]) {
         Some(base) => {
             let at = base.wrapping_add(insn.simm as u32);
@@ -641,14 +594,25 @@ fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::N
                 }
             }
         }
+        None if insn.rs == 29 && frame_sp(t) => out.stack = true,
         None => {
             out.unbounded.get_or_insert_with(|| format!("{} stores through a register at 0x{:08X}", t.func.name, node.pc()));
         }
     }
 }
 
-/// The writes of the function at `key` and everything it calls. A call
-/// to a changing slot can reach any of its implementations.
+/// Whether the function only moves `$sp` by constants (`addiu sp, sp, k`),
+/// so it always holds the caller's stack pointer plus some offset.
+fn frame_sp(t: &psxw_lift::Translation) -> bool {
+    use psxw_lift::decode::Op;
+    t.graph.nodes.values().all(|d| d.insn.writes() != Some(29) || (matches!(d.insn.op, Op::Addiu | Op::Addi) && d.insn.rs == 29))
+}
+
+/// The writes of the function at `key` and everything it calls, each call
+/// followed where the linker binds it: the container its symbol names,
+/// except that a call to a changing slot (any alias of it), a run-time
+/// resolved one, or one to a shared legacy entry from outside main can
+/// reach every implementation there.
 fn writes(
     key: &(String, u32),
     by_key: &BTreeMap<(&str, u32), &psxw_lift::Translation>,
@@ -697,17 +661,16 @@ fn writes(
             };
             for callee in callees {
                 match callee {
-                    Callee::Direct { addr, .. } => {
-                        // As the linker binds it: whatever a changing slot
-                        // has bound, else the caller's container, the main
-                        // one, else every container holding it.
-                        let every = || tiers.keys().filter(|(_, x)| *x == addr).cloned();
-                        let own = [c.as_str(), main].into_iter().find(|k| tiers.contains_key(&(k.to_string(), addr)));
-                        match own.filter(|_| !changing(addr)) {
-                            Some(k) => work.push((k.to_string(), addr)),
-                            None => work.extend(every()),
+                    Callee::Direct { addr, symbol } => {
+                        let every: Vec<(String, u32)> = tiers.keys().filter(|(_, x)| slot(*x) == slot(addr)).cloned().collect();
+                        let shared = tiers.keys().filter(|(_, x)| *x == addr).count() > 1;
+                        match psxw_link::game::parse_generated(&symbol, main) {
+                            Some((Some(k), _)) if !changing(addr) && (k == main || !shared) && tiers.contains_key(&(k.clone(), addr)) => {
+                                work.push((k, addr))
+                            }
+                            _ => work.extend(every.iter().cloned()),
                         }
-                        if every().next().is_none() {
+                        if every.is_empty() {
                             out.unbounded.get_or_insert_with(|| format!("a call to 0x{addr:08X}, which nothing implements"));
                         }
                     }
@@ -748,7 +711,7 @@ fn classify(
     overlays: &Overlays,
     mod_residency: bool,
 ) {
-    let covered = |a: u32| binding.is_some_and(|b| b.slots.contains_key(&a));
+    let covered = |a: u32| binding.is_some_and(|b| b.covers(a));
     let placed = |c: &str| binding.is_some_and(|b| b.placements.iter().any(|p| p.container == c));
     let mut unique: BTreeMap<&str, usize> = BTreeMap::new();
     for (c, a) in tiers.keys() {

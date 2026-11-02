@@ -163,6 +163,58 @@ pub fn call_words(kinds: &[Kind], variadic: bool, calls: &[Vec<Kind>]) -> Result
     Ok((w, fixed))
 }
 
+/// Where a C function's first o32 return word (v0) comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V0 {
+    /// Nothing meaningful: the function returns nothing.
+    None,
+    /// Its wasm result.
+    Result(wasmparser::ValType),
+    /// Its hidden struct-return pointer (wasm parameter 0), which o32
+    /// returns in v0.
+    Sret,
+}
+
+/// How o32 sees a C function: where each argument word lives among its wasm
+/// parameters, and where v0 comes from. The one answer for every consumer:
+/// its o32 wrapper ([`o32_to_c`]) and binding rules that read its o32 words.
+#[derive(Debug, Clone)]
+pub struct CShape {
+    pub kinds: Vec<Kind>,
+    pub words: Vec<Word>,
+    /// The leading words whose o32 position is certain. A variadic
+    /// function's va-buffer follows its TU's calls ([`call_words`]), then
+    /// lies as it is up to [`VARIADIC_WORDS`]; after an odd number of
+    /// words, a 64-bit argument no call shows could sit elsewhere.
+    pub proven: u32,
+    pub v0: V0,
+}
+
+/// The [`CShape`] of a C function with signature `sig`.
+pub fn c_shape(sig: &FuncType, proto: Option<&Proto>) -> CShape {
+    let (kinds, variadic) = param_kinds(sig, proto);
+    let (mut words_, fixed) = words(&kinds, false);
+    let mut proven = fixed;
+    if variadic {
+        let calls = proto.map_or(&[][..], |p| &p.va_calls);
+        let mapped = match call_words(&kinds, true, calls) {
+            Ok((w, _)) if !calls.is_empty() => w[fixed as usize..].to_vec(),
+            _ => Vec::new(),
+        };
+        let va = kinds.len() as u32;
+        let shown = mapped.iter().filter(|w| matches!(w, Word::Mem(..))).count() as u32;
+        words_.extend(&mapped);
+        words_.extend((shown..VARIADIC_WORDS.max(shown)).map(|q| Word::Mem(va, 4 * q)));
+        proven = if fixed % 2 == 0 { words_.len() as u32 } else { fixed + mapped.len() as u32 };
+    }
+    let v0 = match (kinds.first(), sig.results.first()) {
+        (Some(Kind::Sret { .. }), _) => V0::Sret,
+        (_, Some(&t)) => V0::Result(t),
+        _ => V0::None,
+    };
+    CShape { kinds, words: words_, proven, v0 }
+}
+
 fn memarg(window: u32, align: u32) -> MemArg {
     MemArg { offset: window as u64, align, memory_index: 0 }
 }
@@ -356,8 +408,7 @@ pub fn c_to_o32(
 /// signature `sig` (function index `callee`). Structs by value and
 /// va-buffers are rebuilt on the guest stack below the caller's frame.
 pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u32, window: u32) -> Function {
-    let (kinds, variadic) = param_kinds(sig, proto);
-    let (ws, _) = words(&kinds, variadic);
+    let CShape { kinds, words: ws, v0, .. } = c_shape(sig, proto);
     // Locals: 0..3 = a0..a3, 4 = entry sp, 5 = scratch base.
     let entry_sp = 4;
     let scratch = 5;
@@ -370,18 +421,20 @@ pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u
             load_word(f, window, entry_sp, 4 * k as u32);
         }
     };
-    // Memory-passed parameters (struct copies, va-buffer) get scratch space.
-    let mut mem_params: Vec<(u32, Vec<usize>)> = Vec::new();
+    // Memory-passed parameters (struct copies, va-buffer) get scratch space,
+    // each 8-aligned, every word at its offset there (a va-buffer can have
+    // padding o32 doesn't).
+    let mut mem_params: Vec<(u32, Vec<(usize, u32)>)> = Vec::new();
     for (k, w) in ws.iter().enumerate() {
-        if let Word::Mem(n, _) = w {
-            match mem_params.iter_mut().find(|(m, _)| m == n) {
-                Some((_, ks)) => ks.push(k),
-                None => mem_params.push((*n, vec![k])),
+        if let Word::Mem(n, off) = *w {
+            match mem_params.iter_mut().find(|(m, _)| *m == n) {
+                Some((_, ks)) => ks.push((k, off)),
+                None => mem_params.push((n, vec![(k, off)])),
             }
         }
     }
-    let scratch_bytes: u32 = mem_params.iter().map(|(_, ks)| ks.len() as u32 * 4).sum();
-    let scratch_bytes = scratch_bytes.div_ceil(8) * 8;
+    let size = |ks: &[(usize, u32)]| ks.iter().map(|(_, off)| off + 4).max().unwrap_or(0).div_ceil(8) * 8;
+    let scratch_bytes: u32 = mem_params.iter().map(|(_, ks)| size(ks)).sum();
     f.instruction(&I::GlobalGet(sp_global));
     f.instruction(&I::LocalTee(entry_sp));
     f.instruction(&I::I32Const(scratch_bytes as i32));
@@ -392,15 +445,15 @@ pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u
     let mut at = 0u32;
     for (n, ks) in &mem_params {
         offsets.push((*n, at));
-        for (j, &k) in ks.iter().enumerate() {
+        for &(k, off) in ks {
             f.instruction(&I::LocalGet(scratch));
-            f.instruction(&I::I32Const((at + 4 * j as u32) as i32));
+            f.instruction(&I::I32Const((at + off) as i32));
             f.instruction(&I::I32Add);
             mask(&mut f);
             word(&mut f, k);
             f.instruction(&I::I32Store(memarg(window, 2)));
         }
-        at += 4 * ks.len() as u32;
+        at += size(ks);
     }
     let pos = |pred: &dyn Fn(&Word) -> bool| ws.iter().position(pred);
     for (i, t) in sig.params.iter().enumerate() {
@@ -444,8 +497,7 @@ pub fn o32_to_c(sig: &FuncType, proto: Option<&Proto>, callee: u32, sp_global: u
         }
     }
     f.instruction(&I::Call(callee));
-    let sret = matches!(kinds.first(), Some(Kind::Sret { .. }));
-    if sret {
+    if v0 == V0::Sret {
         // o32 returns the struct's address in v0.
         to_o32_result(&mut f, &sig.results);
         f.instruction(&I::Drop);

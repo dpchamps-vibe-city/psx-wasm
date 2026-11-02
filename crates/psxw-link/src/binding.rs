@@ -7,18 +7,95 @@
 //!
 //! A per-slot global holds which candidate is bound (1-based; 0 none), so
 //! an invalidation unbinds only a slot whose bound candidate it overlaps.
+//!
+//! One meaning for each fact, here, for the build's checks and the code
+//! generated alike: a slot is an address's backing bytes ([`slot`], D5), so
+//! KSEG aliases are one slot; a guest range is the window bytes [`span`]
+//! gives, split where it wraps; a call's callee is the one
+//! [`AddressMap::resolve`] and [`AddressMap::home`] give.
 
 use crate::marshal::{self, Word};
 use psxw_abi::{WINDOW_MASK, binding_cause, table_index};
-use std::collections::BTreeMap;
+use psxw_inputs::AddressMap;
+use psxw_inputs::dispatch::DispatchSection;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use wasm_encoder::{BlockType, Function, HeapType, Instruction as I, MemArg, ValType};
+
+/// The slot an address is: its backing bytes' window offset (D5). Every
+/// alias of a covered entry binds and looks up the same slot.
+pub fn slot(addr: u32) -> u32 {
+    addr & WINDOW_MASK
+}
+
+/// A guest range's backing bytes as window offsets: split where it wraps
+/// the window, all of it when it spans one.
+pub fn window(r: &Range<u32>) -> Vec<Range<u32>> {
+    span(r.start, r.end.saturating_sub(r.start))
+}
+
+/// [`window`] of the `len` bytes from `start`, which may end at 2^32. The
+/// generated invalidation and publication test the same bytes.
+pub fn span(start: u32, len: u32) -> Vec<Range<u32>> {
+    const SIZE: u64 = WINDOW_MASK as u64 + 1;
+    let (start, len) = ((start & WINDOW_MASK) as u64, len as u64);
+    match len {
+        0 => vec![],
+        _ if len >= SIZE => vec![0..SIZE as u32],
+        _ if start + len <= SIZE => vec![start as u32..(start + len) as u32],
+        _ => vec![start as u32..SIZE as u32, 0..(start + len - SIZE) as u32],
+    }
+}
+
+/// The functions whose call boundary must survive C optimization: declared
+/// operations (an inlined or elided call would skip the wrapper) and every
+/// function at a changing slot (an inlined body would skip the lookup).
+#[derive(Debug, Clone, Default)]
+pub struct Boundaries {
+    operations: BTreeSet<(String, u32)>,
+    /// The placements' text, as window offsets.
+    covered: Vec<Range<u32>>,
+}
+
+impl Boundaries {
+    pub fn new(section: Option<&DispatchSection>, map: &AddressMap) -> Self {
+        let mut operations = BTreeSet::new();
+        let mut covered = Vec::new();
+        if let Some(s) = section {
+            for r in &s.rules {
+                if let (Some(c), Some(f)) = (&r.container, &r.function) {
+                    operations.extend(map.resolve(c, f).map(|r| (c.clone(), r.addr)));
+                }
+            }
+            for p in &s.placements {
+                covered.extend(map.container(&p.container).into_iter().flat_map(|c| c.text.iter().flat_map(window)));
+            }
+        }
+        Self { operations, covered }
+    }
+
+    /// Whether `name`, as C in container `from` names it, is one of them:
+    /// the function a call to it reaches (resolved as the linker binds it),
+    /// whichever container's code that is.
+    pub fn keeps(&self, map: &AddressMap, from: &str, name: &str) -> bool {
+        let Some(r) = map.resolve(from, name) else { return false };
+        if self.covered.iter().any(|k| k.contains(&slot(r.addr))) {
+            return true;
+        }
+        match map.home(from, r.addr) {
+            Some(Some(c)) => self.operations.contains(&(c, r.addr)),
+            _ => self.operations.iter().any(|(_, a)| *a == r.addr),
+        }
+    }
+}
 
 /// The binding plan the linker generates (built in psxw-build).
 #[derive(Debug, Clone, Default)]
 pub struct Binding {
-    /// Covered addresses, each with every implementation compiled there.
+    /// Changing slots ([`slot`]), each with every implementation compiled
+    /// at an address that is it.
     pub slots: BTreeMap<u32, Vec<Candidate>>,
+    pub boundaries: Boundaries,
     pub placements: Vec<Placement>,
     pub rules: Vec<Rule>,
     /// Instrumented operations: (container, address) → indices of `rules`.
@@ -32,6 +109,8 @@ pub struct Binding {
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub container: String,
+    /// Its entry, an address of the slot.
+    pub addr: u32,
     /// Window offsets (`addr & WINDOW_MASK`) the implementation depends
     /// on; it is bound only when one publication covers them all.
     pub footprint: Vec<Range<u32>>,
@@ -114,9 +193,19 @@ pub enum Success {
 }
 
 impl Binding {
+    /// Whether `addr` is a changing slot.
+    pub fn covers(&self, addr: u32) -> bool {
+        self.slots.contains_key(&slot(addr))
+    }
+
+    /// The implementations a call to `addr` can reach.
+    pub fn candidates(&self, addr: u32) -> Option<&[Candidate]> {
+        self.slots.get(&slot(addr)).map(Vec::as_slice)
+    }
+
     /// The candidate bound at boot, 1-based.
     pub fn boot(&self, addr: u32) -> Option<usize> {
-        self.slots.get(&addr)?.iter().position(|c| c.boot).map(|k| k + 1)
+        self.candidates(addr)?.iter().position(|c| c.boot).map(|k| k + 1)
     }
 }
 
@@ -160,7 +249,8 @@ pub(crate) fn lookup(r: &Refs, addr: u32) -> Function {
 }
 
 /// Locals 0, 1: the window offset and length; local 2 becomes the end
-/// (the length clamped to the window).
+/// (the length clamped to the window). As [`span`]: an end past the
+/// window wraps, `[WINDOW, end)` being the bytes `[0, end - WINDOW)`.
 fn end_local(f: &mut Function) {
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I32Const(WINDOW));
@@ -191,7 +281,8 @@ pub(crate) fn invalidate(r: &Refs) -> Function {
             f.instruction(&I::I32Eq);
             f.instruction(&I::I32Const(0));
             for range in &c.footprint {
-                // range.start < end && offset < range.end
+                // range.start < end && offset < range.end, or the wrapped
+                // part reaches it: range.start + WINDOW < end
                 f.instruction(&I::I32Const(range.start as i32));
                 f.instruction(&I::LocalGet(2));
                 f.instruction(&I::I32LtU);
@@ -199,6 +290,10 @@ pub(crate) fn invalidate(r: &Refs) -> Function {
                 f.instruction(&I::I32Const(range.end as i32));
                 f.instruction(&I::I32LtU);
                 f.instruction(&I::I32And);
+                f.instruction(&I::I32Const(range.start as i32 + WINDOW));
+                f.instruction(&I::LocalGet(2));
+                f.instruction(&I::I32LtU);
+                f.instruction(&I::I32Or);
                 f.instruction(&I::I32Or);
             }
             f.instruction(&I::I32And);
@@ -230,7 +325,8 @@ pub(crate) fn publish(r: &Refs, p: usize, invalidate: u32, entry: &mut dyn FnMut
         for (k, c) in cands.iter().enumerate().filter(|(_, c)| c.container == *container) {
             f.instruction(&I::I32Const(1));
             for range in &c.footprint {
-                // offset <= range.start && range.end <= end
+                // offset <= range.start && range.end <= end, or the wrapped
+                // part holds it: range.end + WINDOW <= end
                 f.instruction(&I::LocalGet(0));
                 f.instruction(&I::I32Const(range.start as i32));
                 f.instruction(&I::I32LeU);
@@ -238,13 +334,17 @@ pub(crate) fn publish(r: &Refs, p: usize, invalidate: u32, entry: &mut dyn FnMut
                 f.instruction(&I::LocalGet(2));
                 f.instruction(&I::I32LeU);
                 f.instruction(&I::I32And);
+                f.instruction(&I::I32Const(range.end as i32 + WINDOW));
+                f.instruction(&I::LocalGet(2));
+                f.instruction(&I::I32LeU);
+                f.instruction(&I::I32Or);
                 f.instruction(&I::I32And);
             }
             f.instruction(&I::If(BlockType::Empty));
             f.instruction(&I::I32Const(k as i32 + 1));
             f.instruction(&I::GlobalSet(r.globals[addr]));
             f.instruction(&I::I32Const(table_index(*addr) as i32));
-            f.instruction(&I::RefFunc(entry(&c.container, *addr)));
+            f.instruction(&I::RefFunc(entry(&c.container, c.addr)));
             f.instruction(&I::TableSet(0));
             f.instruction(&I::End);
         }
@@ -258,8 +358,19 @@ pub(crate) enum Shape {
     /// `(a0..a3) -> i64`.
     O32,
     /// A C function: its parameters, where each o32 argument word comes
-    /// from, and its result.
-    C { params: u32, words: Vec<Word>, result: Option<wasmparser::ValType> },
+    /// from (those whose position is proven), and where v0 comes from
+    /// ([`marshal::c_shape`]).
+    C { params: u32, words: Vec<Word>, v0: marshal::V0 },
+}
+
+impl Shape {
+    /// Whether it returns a first o32 word a rule can read.
+    fn returns(&self) -> bool {
+        match self {
+            Shape::O32 => true,
+            Shape::C { v0, .. } => *v0 != marshal::V0::None,
+        }
+    }
 }
 
 /// The wrapper's locals.
@@ -337,12 +448,12 @@ pub(crate) fn operation(
             next += 1;
         }
         if matches!(v, Value::Return) {
-            anyhow::ensure!(result_ty.is_some(), "binding.invalid_fact: {name} returns nothing; a rule reads `return`");
+            anyhow::ensure!(shape.returns(), "binding.invalid_fact: {name} returns nothing; a rule reads `return`");
         }
     }
     for (_, rule) in &rules {
         anyhow::ensure!(
-            rule.success == Success::Always || result_ty.is_some(),
+            rule.success == Success::Always || shape.returns(),
             "binding.invalid_fact: rule `{}` tests the result of {name}, which returns nothing",
             rule.id
         );
@@ -388,7 +499,7 @@ pub(crate) fn operation(
 /// normalized values, checked against the placement's layout and the
 /// rule's cases like any other publication.
 pub(crate) fn marker(r: &Refs, rule: usize, publish: &dyn Fn(usize) -> u32, invalidate: u32) -> Function {
-    let shape = Shape::C { params: 5, words: (0..5).map(Word::Param).collect(), result: None };
+    let shape = Shape::C { params: 5, words: (0..5).map(Word::Param).collect(), v0: marshal::V0::None };
     let first = 5;
     let l = Locals {
         params: 5,
@@ -404,10 +515,18 @@ pub(crate) fn marker(r: &Refs, rule: usize, publish: &dyn Fn(usize) -> u32, inva
     };
     let mut f = Function::new([(7, ValType::I32)]);
     let rule_ = &r.binding.rules[rule];
-    // What the rule declares literally, the C must pass.
+    // What the rule declares literally, the C must pass: a destination as
+    // its backing bytes (an alias names the same ones).
     for (word, expected) in &rule_.checks {
+        let backing = |f: &mut Function| {
+            if *word == 0 {
+                marshal::mask(f);
+            }
+        };
         f.instruction(&I::LocalGet(*word));
+        backing(&mut f);
         value(&mut f, r.window, &shape, &l, expected);
+        backing(&mut f);
         f.instruction(&I::I32Ne);
         f.instruction(&I::If(BlockType::Empty));
         fault(&mut f, r, rule, binding_cause::MARKER_MISMATCH, *word);
@@ -418,22 +537,26 @@ pub(crate) fn marker(r: &Refs, rule: usize, publish: &dyn Fn(usize) -> u32, inva
     f
 }
 
-/// Push the first return word.
+/// Push the first o32 return word: what [`marshal::o32_to_c`] returns in v0.
 fn return_word(f: &mut Function, shape: &Shape, l: &Locals) {
+    if let Shape::C { v0: marshal::V0::Sret, .. } = shape {
+        f.instruction(&I::LocalGet(0));
+        return;
+    }
     let res = l.res.expect("validated: a result");
     f.instruction(&I::LocalGet(res));
     match shape {
         Shape::O32 => {
             f.instruction(&I::I32WrapI64);
         }
-        Shape::C { result, .. } => match result {
-            Some(wasmparser::ValType::I64) => {
+        Shape::C { v0, .. } => match v0 {
+            marshal::V0::Result(wasmparser::ValType::I64) => {
                 f.instruction(&I::I32WrapI64);
             }
-            Some(wasmparser::ValType::F32) => {
+            marshal::V0::Result(wasmparser::ValType::F32) => {
                 f.instruction(&I::I32ReinterpretF32);
             }
-            Some(wasmparser::ValType::F64) => {
+            marshal::V0::Result(wasmparser::ValType::F64) => {
                 f.instruction(&I::I64ReinterpretF64);
                 f.instruction(&I::I32WrapI64);
             }

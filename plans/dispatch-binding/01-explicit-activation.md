@@ -442,7 +442,65 @@ for the required CLI/reference run.
   being the legacy baseline set. `psxw build btn` links at 2,604,703 bytes with the same tiers as before (86 adapter, 2,574 C, 727 lift: none of its supplied C has an untranslatable original), and `psxw run btn --frames 300 --check no-trap` passes.
   Not changed: a `c_marker` call's literal destination check still compares raw
   values, so the C passing an alias of a declared constant destination faults
-  (`binding.marker_mismatch`) instead of publishing.
+  (`binding.marker_mismatch`) instead of publishing. (Fixed in the sixth
+  review's consolidation.)
+- 2026-11-01, sixth review: consolidation. The review's six counterexamples
+  shared one cause: stages re-derived the same fact differently, so one
+  approved what another ran differently. Each fact now has one definition in
+  `psxw-link` (`binding`, `marshal`), which the build's checks and the
+  generated code both use:
+  1. Callee identity. `Boundaries` is the one test of whether a C name is an
+     operation or a changing slot's function, used by the build (`weak,
+     noinline`, `binding.elidable_call`) and the linker (no intrinsic
+     lowering). A name means what the linker calls: resolved from the
+     caller's container, then the container whose code holds it
+     (`AddressMap::home`, moved from the linker). An overlay declaring the
+     resident loader `const` escaped the check before.
+     `explicit-binding-overlay-const`.
+  2. Slot identity. A slot is its backing bytes (`binding::slot`, D5), so
+     KSEG aliases are one slot: `Binding.slots` is keyed so, each candidate
+     carries its own entry, and the linker's lookups, boot binding and
+     publication, the report's classification and writer analysis all ask
+     the plan (`covers`, `candidates`). Writer analysis follows each call
+     where the linker binds it: the container the lifter's call symbol names
+     (`parse_generated`, now public), or every implementation at any alias of
+     a changing slot, a run-time resolved entry or a shared legacy entry.
+     `explicit-binding-alias-candidate`: the callee-candidates fixture with
+     B compiled at the slot's KSEG1 alias.
+  3. Ranges. `span`/`window` moved to `psxw-link`. The generated
+     invalidation and publication now test the part of a range past the
+     window's end as the bytes from 0, as the planner does.
+     `explicit-binding-wrapped-range` (closed form: a write wrapping the 16 MB
+     window has no hardware counterpart) invalidates from the window's last
+     word through the slot.
+  4. o32 values. `marshal::c_shape` gives a C function's o32 argument words,
+     how many have a proven position, and its v0. `o32_to_c`, the operation
+     wrapper and the build's rule check all use it. A variadic function's
+     va-buffer follows its TU's calls (`call_words`), each word at its offset,
+     then lies as it is. A word after an odd number of words that no call
+     places can't be read (`binding.invalid_fact`). A struct return's v0 is
+     its hidden pointer. `explicit-binding-variadic` (a `(tag, ...)` loader
+     taking a 64-bit selector: rule words 2, 4, 5) and `explicit-binding-sret`
+     (a struct-returning clearer, `success = "nonzero"`), both against the
+     reference. Lifted callers of such a variadic C function now get the
+     va-buffer its body reads. Scratch regions are 8-aligned.
+  5. Write safety. A store's known constant address is a known write
+     whatever its base register. An unknown `$sp`-relative store counts as a
+     stack write only where the function moves `$sp` by `addiu sp, sp, k`
+     alone; otherwise it is unbounded. `explicit-binding-sp-write`.
+  6. A `c_marker`'s literal destination is compared as backing bytes.
+     `explicit-binding-marker-alias` (against the reference).
+  Evidence: the reviewer's reproducers now give the required results
+  (wrapped invalidation and the variadic and sret loaders run, the
+  cross-container `const`, aliased candidate and `$sp` writer are rejected;
+  the native-index variadic control now faults, as it should). Reverting each
+  fix fails its fixture. The explicit subset is 30 variants: 11 execution
+  and 19 safety, 0 failed, 0 unresolved, 15 of them against the live reference.
+  Unit tests: `psxw-cc` 22, `psxw-inputs` 17, `psxw-link` 9, `psxw-build` 5,
+  `link_passes` 8. Full corpus: 81 variants: 45 execution, 21 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved
+  variant being the legacy baseline set. `psxw build btn` links at 2,604,703
+  bytes with the same tiers (86 adapter, 2,574 C, 727 lift), and `psxw run btn
+  --frames 300 --check no-trap` passes.
 
 ## Findings
 

@@ -363,7 +363,7 @@ impl Ctx<'_> {
 
     /// A covered address: a changing slot (plans/dispatch-binding A).
     fn covered(&self, addr: u32) -> bool {
-        self.spec.binding.as_ref().is_some_and(|b| b.slots.contains_key(&addr))
+        self.spec.binding.as_ref().is_some_and(|b| b.covers(addr))
     }
 
     /// Count a call or transfer to `addr` (in `container`, when the caller
@@ -384,17 +384,10 @@ impl Ctx<'_> {
     }
 
     /// Whether `name`, called from `container`, is a function a binding
-    /// rule instruments or one at a changing slot (by address, as the call
-    /// would resolve): a call to it must stay a call.
+    /// rule instruments or one at a changing slot: a call to it must stay
+    /// a call. The build's own test ([`crate::binding::Boundaries`]).
     fn keeps_call(&self, container: &str, name: &str) -> bool {
-        let (Some(b), Some(r)) = (&self.spec.binding, self.map.resolve(container, name)) else { return false };
-        if b.slots.contains_key(&r.addr) {
-            return true;
-        }
-        match self.home(container, r.addr) {
-            Some(Some(c)) => b.operations.contains_key(&(c, r.addr)),
-            _ => b.operations.keys().any(|(_, a)| *a == r.addr),
-        }
+        self.spec.binding.as_ref().is_some_and(|b| b.boundaries.keeps(self.map, container, name))
     }
 
     fn lookup_reference(&mut self) {
@@ -520,18 +513,14 @@ impl Ctx<'_> {
 
     /// Container whose code holds `addr`, as seen from `from`.
     fn home(&self, from: &str, addr: u32) -> Option<Option<String>> {
-        let has = |c: &str| self.map.container(c).is_some_and(|k| k.text.iter().any(|r| r.contains(&addr)));
-        if has(from) {
-            return Some(Some(from.to_string()));
-        }
-        if has(&self.spec.main) {
-            return Some(Some(self.spec.main.clone()));
-        }
-        self.map.containers.iter().any(|c| has(&c.id)).then_some(None)
+        self.map.home(from, addr)
     }
 }
 
-fn parse_generated(name: &str, main: &str) -> Option<(Option<String>, u32)> {
+/// The callee a generated call symbol names: `psxw_f_[<container>_]<addr>`
+/// (that container's function; main's without one) or `psxw_d_<addr>`
+/// (`None`: resolved at run time).
+pub fn parse_generated(name: &str, main: &str) -> Option<(Option<String>, u32)> {
     if let Some(rest) = name.strip_prefix("psxw_d_") {
         return u32::from_str_radix(rest, 16).ok().map(|a| (None, a));
     }
@@ -1026,15 +1015,14 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             // Each candidate's entry: its hook chain's head, else its own.
             let container = &b.placements[p].container;
             let mut entries: HashMap<u32, u32> = HashMap::new();
-            for (addr, cands) in &b.slots {
-                if cands.iter().any(|c| c.container == *container) {
-                    let e = match ctx.heads.get(&(container.clone(), *addr, None)) {
-                        Some(h) => h.o32,
-                        None => ctx.entry_raw(container, *addr).with_context(|| format!("{container} {addr:#010x}: a binding candidate without an entry"))?,
-                    };
-                    ctx.declared.insert(e);
-                    entries.insert(*addr, e);
-                }
+            for c in b.slots.values().flatten().filter(|c| c.container == *container) {
+                let addr = c.addr;
+                let e = match ctx.heads.get(&(container.clone(), addr, None)) {
+                    Some(h) => h.o32,
+                    None => ctx.entry_raw(container, addr).with_context(|| format!("{container} {addr:#010x}: a binding candidate without an entry"))?,
+                };
+                ctx.declared.insert(e);
+                entries.insert(addr, e);
             }
             let refs = binding_refs(ctx);
             let f = crate::binding::publish(&refs, p, invalidate, &mut |_, a| entries[&a]);
@@ -1055,12 +1043,13 @@ fn body(ctx: &mut Ctx, s: &Synth) -> Result<(FuncType, Function, String)> {
             let (sig, shape) = match ctx.spec.tiers.get(&(container.clone(), addr)) {
                 Some(Tier::Lift { .. }) => (o32(), crate::binding::Shape::O32),
                 Some(&Tier::C { input, func }) => {
+                    // The words and v0 its o32 wrapper uses: rules read the
+                    // original's o32 values whoever calls it.
                     let sig = ctx.func_sig(input, func);
                     let name = guest_name(ctx, input, func);
-                    let (kinds, variadic) = marshal::param_kinds(&sig, ctx.inputs[input].protos.get(&name));
-                    let (words, _) = marshal::words(&kinds, variadic);
-                    let shape = crate::binding::Shape::C { params: sig.params.len() as u32, words, result: sig.results.first().copied() };
-                    (sig, shape)
+                    let s = marshal::c_shape(&sig, ctx.inputs[input].protos.get(&name));
+                    let words = s.words[..s.proven as usize].to_vec();
+                    (sig.clone(), crate::binding::Shape::C { params: sig.params.len() as u32, words, v0: s.v0 })
                 }
                 _ => bail!("binding.unimplemented_rule: {what} is an adapter; operations at native boundaries are milestone C"),
             };
@@ -1905,11 +1894,11 @@ pub fn link(map: &AddressMap, rodata: Option<&Rodata>, spec: &GameSpec, inputs: 
     // Table entries for every function with an address, and the exports.
     let mut elements: BTreeMap<u32, u32> = BTreeMap::new();
     for (c, addr) in spec.tiers.keys().cloned().collect::<Vec<_>>() {
-        let e = if let Some(b) = spec.binding.as_ref().filter(|b| b.slots.contains_key(&addr)) {
+        let e = if let Some(cands) = spec.binding.as_ref().and_then(|b| b.candidates(addr)) {
             // A covered address starts bound only to what the boot image
             // supplies; a compiled but unloaded function isn't callable.
-            match b.boot(addr).map(|k| &b.slots[&addr][k - 1].container) {
-                Some(boot) if *boot == c => match ctx.heads.get(&(c.clone(), addr, None)) {
+            match cands.iter().find(|k| k.boot) {
+                Some(boot) if boot.container == c && boot.addr == addr => match ctx.heads.get(&(c.clone(), addr, None)) {
                     Some(h) => h.o32,
                     None => ctx.entry_raw(&c, addr).context("boot binding")?,
                 },

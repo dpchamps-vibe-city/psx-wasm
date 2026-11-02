@@ -425,7 +425,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     }
     // Declared binding operations and changing slots keep their call
     // boundary through clang.
-    let boundaries = crate::binding::Boundaries::new(inputs.manifest.dispatch.as_ref(), &inputs.map);
+    let boundaries = psxw_link::binding::Boundaries::new(inputs.manifest.dispatch.as_ref(), &inputs.map);
     let mut link_inputs: Vec<Input> = objs
         .par_iter()
         .map(|(c, o)| -> Result<Input> {

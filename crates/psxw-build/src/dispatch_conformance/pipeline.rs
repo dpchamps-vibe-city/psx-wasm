@@ -116,7 +116,7 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
     let calls = dir.join("calls");
     std::fs::create_dir_all(&calls)?;
     psxw_cc::objects_compiled_with(&calls, &["-g"])?;
-    let boundaries = crate::binding::Boundaries::new(section.as_ref(), &map);
+    let boundaries = psxw_link::binding::Boundaries::new(section.as_ref(), &map);
     let mut link_inputs: Vec<Input> = census
         .iter()
         .map(|(c, obj)| {
@@ -187,7 +187,7 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
     binding.references = linked.references.clone();
     if let Some(b) = &spec.binding {
         // Covered paths must not select implementations by code words.
-        let sampled: Vec<String> = sampled_stubs(&linked.wasm)?.into_iter().filter(|a| b.slots.contains_key(a)).map(|a| format!("{a:#010x}")).collect();
+        let sampled: Vec<String> = sampled_stubs(&linked.wasm)?.into_iter().filter(|a| b.covers(*a)).map(|a| format!("{a:#010x}")).collect();
         ensure!(sampled.is_empty(), "resident-word selectors at covered addresses: {}", sampled.join(", "));
         // Supplied C keeps its source locations through instrumentation.
         if !c_defs.is_empty() {

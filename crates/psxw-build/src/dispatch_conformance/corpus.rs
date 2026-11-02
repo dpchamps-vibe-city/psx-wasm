@@ -1266,6 +1266,194 @@ fn d05_explicit_alias_bounds(lay: &Layout, n: &Names) -> Fixture {
     f
 }
 
+// The same facts in another representation: each variant below restates an
+// earlier one through a different container, address alias, register, range
+// encoding or o32 ABI route, and must mean the same thing.
+
+/// Append function `name` (its symbol moves there) to `im`'s text.
+fn append(im: &mut Image, name: &str, body: impl FnOnce(&mut Asm)) -> u32 {
+    assert_eq!(im.text as usize, im.bytes.len(), "{}: appended code follows the text", im.id);
+    let at = im.base + im.text;
+    let mut a = Asm::new(at);
+    body(&mut a);
+    let bytes = a.bytes().expect("appended code assembles");
+    im.bytes.extend_from_slice(&bytes);
+    im.text = im.bytes.len() as u32;
+    im.funcs.retain(|f| f.0 != name);
+    im.funcs.push((name.to_string(), at, Some(bytes.len() as u32)));
+    at
+}
+
+/// [`d05_explicit_const_callee`] from another container: module a's C
+/// declares main's loader, a declared operation, `const`.
+fn d05_explicit_overlay_const(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MatchingC);
+    let a = f.images.iter_mut().find(|im| im.id == n.of("a")).expect("module a");
+    let c = a.c.take().expect("module a's C");
+    a.c = Some(format!(
+        "struct load_req {{ unsigned sel; unsigned *dst; int len; }};\nint load_module(struct load_req r) __attribute__((const));\n{c}"
+    ));
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.elidable_call".into());
+    f
+}
+
+/// [`d05_explicit_callee_candidates`] with module b compiled at the slot's
+/// KSEG1 alias: the same slot, so k's call can still reach it.
+fn d05_explicit_alias_candidate(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit_callee_candidates(lay, n);
+    let b = f.images.iter_mut().find(|im| im.id == n.of("b")).expect("module b");
+    b.base |= 0x2000_0000;
+    for func in &mut b.funcs {
+        func.1 |= 0x2000_0000;
+    }
+    f
+}
+
+/// [`d05_explicit_uncovered_write`]'s store into the slot's code, through
+/// `$sp` holding the slot's address (saved and restored around it).
+fn d05_explicit_sp_write(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    append(&mut f.images[0], "sp_store", |a| {
+        a.mov(T1, SP).li(SP, lay.slot + 4).sw(ZERO, 0, SP).mov(SP, T1).jr(RA).ori(V0, ZERO, 0);
+    });
+    let writer = "\n[[dispatch.writers]]\nid = \"sp-writer\"\ncontainer = \"main\"\nfunction = \"sp_store\"\n";
+    f.dispatch = f.dispatch.take().map(|d| d + writer);
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.uncovered_writer: writer `sp-writer`".into());
+    f
+}
+
+/// [`d05_explicit_cleared`]'s invalidation as a constant range that wraps
+/// the window (D5): from its last word through the slot's bytes.
+fn d05_explicit_wrapped_range(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let len = 4 + (lay.slot & psxw_abi::WINDOW_MASK) + SLOT_BYTES;
+    let rule = format!(
+        "\n[[dispatch.rules]]\nid = \"wrapped\"\ncontainer = \"main\"\nfunction = \"save_ptr\"\nevent = \"return\"\n\
+         effect = \"invalidate\"\ndestination = \"const:0x{:08X}\"\nlength = \"const:0x{len:X}\"\n",
+        0x8000_0000 | psxw_abi::WINDOW_MASK & !3
+    );
+    f.dispatch = f.dispatch.take().map(|d| d + &rule);
+    let main = &f.images[0];
+    let (lm, slot) = (main.addr("load_module"), main.addr("call_slot"));
+    let len = f.images[1].bytes.len() as u32;
+    let mut s = Script::default();
+    s.call(lm, [0, lay.slot, len, 0], 0, &[]).call(slot, [1, 0, 0, 0], 0x101, &[0x101]);
+    s.call(main.addr("save_ptr"), [lay.slot, 0, 0, 0], 0, &[]).untranslated(slot, [1, 0, 0, 0], lay.slot);
+    f.script = s;
+    f
+}
+
+/// [`d05_explicit_mixed`]'s loader as `load_module(unsigned tag, ...)`,
+/// called with a 64-bit selector, the destination and the length. o32 pads
+/// before the selector (words 2, 3; destination 4, length 5); clang's
+/// va-buffer doesn't. The rule names the original's o32 words.
+fn d05_explicit_variadic(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MatchingC);
+    let main = &mut f.images[0];
+    let lm = main.addr("load_module");
+    let mut a = Asm::new(lm);
+    a.addiu(SP, SP, -24).sw(RA, 16, SP).lw(T3, 40, SP).lw(T2, 44, SP).sll(T0, A2, 10).li(T1, lay.stage).addu(T1, T1, T0);
+    a.label("lm_loop");
+    a.lw(T0, 0, T1).addiu(T1, T1, 4).sw(T0, 0, T3).addiu(T2, T2, -4).bne(T2, ZERO, "lm_loop").addiu(T3, T3, 4);
+    a.jal_abs(main.addr("flush")).nop().lw(RA, 16, SP).ori(V0, ZERO, 0).jr(RA).addiu(SP, SP, 24);
+    let bytes = a.bytes().expect("load_module assembles");
+    let next = main.funcs.iter().map(|f| f.1).filter(|&x| x > lm).min().expect("a function follows load_module");
+    assert!(lm + bytes.len() as u32 <= next, "the variadic load_module fits in place");
+    let at = (lm - main.base) as usize;
+    main.bytes[at..at + bytes.len()].copy_from_slice(&bytes);
+    main.funcs.iter_mut().find(|f| f.0 == "load_module").expect("load_module").2 = Some(bytes.len() as u32);
+    // load_c(sel, dst, len): load_module(0, (unsigned long long)sel, dst, len).
+    let load_c = append(main, "load_c", |a| {
+        a.addiu(SP, SP, -32).sw(RA, 24, SP).sw(A1, 16, SP).sw(A2, 20, SP).mov(A2, A0).ori(A3, ZERO, 0).ori(A0, ZERO, 0);
+        a.jal_abs(lm).nop().lw(RA, 24, SP).nop().jr(RA).addiu(SP, SP, 32);
+    });
+    main.c = Some(format!(
+        "void flush(void);\n\
+         int load_module(unsigned tag, ...) {{\n\
+         \x20   __builtin_va_list ap;\n\
+         \x20   unsigned long long sel;\n\
+         \x20   unsigned *dst, *src, len;\n\
+         \x20   __builtin_va_start(ap, tag);\n\
+         \x20   sel = __builtin_va_arg(ap, unsigned long long);\n\
+         \x20   dst = __builtin_va_arg(ap, unsigned *);\n\
+         \x20   len = __builtin_va_arg(ap, unsigned);\n\
+         \x20   __builtin_va_end(ap);\n\
+         \x20   src = (unsigned *)(0x{stage:08X}u + (unsigned)sel * 0x400u);\n\
+         \x20   do {{ *dst++ = *src++; len -= 4; }} while (len != 0);\n\
+         \x20   flush();\n\
+         \x20   return 0;\n\
+         }}\n\
+         int load_c(unsigned sel, unsigned *dst, unsigned len) {{ return load_module(0u, (unsigned long long)sel, dst, len); }}\n",
+        stage = lay.stage
+    ));
+    f.dispatch = f.dispatch.take().map(|d| {
+        d.replace("selector = \"arg:0\"", "selector = \"arg:2\"")
+            .replace("destination = \"arg:1\"\nlength = \"arg:2\"\nsource_offset", "destination = \"arg:4\"\nlength = \"arg:5\"\nsource_offset")
+    });
+    let len_a = f.images[1].bytes.len() as u32;
+    let mut s = Script::default();
+    for (sel, len, k) in [(0, len_a, 0x100), (1, 0x80, 0x200), (0, len_a, 0x100)] {
+        s.call(load_c, [sel, lay.slot, len, 0], 0, &[]).call(lay.slot, [1, 0, 0, 0], k + 1, &[k + 1]);
+    }
+    f.script = s;
+    f
+}
+
+/// [`d05_explicit_cleared`] with a clearer returning a struct: o32 returns
+/// its hidden destination in v0, which `success = "nonzero"` tests.
+fn d05_explicit_sret(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let main = &mut f.images[0];
+    // clear(ret, dst, len): zero len bytes at dst; *ret = {1, 2}; v0 = ret.
+    let clear = append(main, "clear", |a| {
+        a.beq(A2, ZERO, "clr_done").nop();
+        a.label("clr_loop");
+        a.sw(ZERO, 0, A1).addiu(A2, A2, -4).bne(A2, ZERO, "clr_loop").addiu(A1, A1, 4);
+        a.label("clr_done");
+        a.ori(T0, ZERO, 1).sw(T0, 0, A0).ori(T0, ZERO, 2).sw(T0, 4, A0).jr(RA).mov(V0, A0);
+    });
+    main.c = Some(
+        "struct cleared { unsigned lo, hi; };\n\
+         struct cleared clear(unsigned *dst, unsigned len) {\n\
+         \x20   struct cleared r;\n\
+         \x20   while (len != 0) { *dst++ = 0; len -= 4; }\n\
+         \x20   r.lo = 1;\n\
+         \x20   r.hi = 2;\n\
+         \x20   return r;\n\
+         }\n"
+            .into(),
+    );
+    f.dispatch = f.dispatch.take().map(|d| {
+        d.replace("effect = \"invalidate\"\ndestination = \"arg:0\"\nlength = \"arg:1\"", "effect = \"invalidate\"\ndestination = \"arg:1\"\nlength = \"arg:2\"\nsuccess = \"nonzero\"")
+    });
+    let main = &f.images[0];
+    let (lm, slot) = (main.addr("load_module"), main.addr("call_slot"));
+    let (len, out) = (f.images[1].bytes.len() as u32, lay.stage + 0x1100);
+    let mut s = Script::default();
+    s.call(lm, [0, lay.slot, len, 0], 0, &[]).call(slot, [1, 0, 0, 0], 0x101, &[0x101]);
+    s.call(clear, [out, lay.slot, len, 0], out, &[]).untranslated(slot, [1, 0, 0, 0], lay.slot);
+    f.script = s;
+    f
+}
+
+/// [`d05_explicit_marker`]'s rule stating its destination literally, as
+/// the KSEG1 alias of the address the C passes: the same bytes.
+fn d05_explicit_marker_alias(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MarkerC);
+    let rule = write_rule(&f.images[0], Some("module_written"), "placement");
+    let alias = format!("destination = \"const:0x{:08X}\"", lay.slot2 | 0x2000_0000);
+    f.dispatch = Some(explicit_facts(n, lay, &rule.replace("destination = \"write-address\"", &alias)));
+    let main = &f.images[0];
+    let (lm, slot2) = (main.addr("load_module"), main.addr("call_slot2"));
+    let len = f.images[3].bytes.len() as u32;
+    let mut s = Script::default();
+    s.call(lm, [2, lay.slot2, len, 0], 0, &[]).call(slot2, [0; 4], 0xC1, &[0xC1]);
+    f.script = s;
+    f
+}
+
 /// A declared writer bound its known store falls outside.
 fn d05_explicit_wrong_writer(lay: &Layout, n: &Names) -> Fixture {
     let mut f = d05_explicit(lay, n, Loader::Lifted);
@@ -1782,6 +1970,19 @@ fn defs() -> Vec<Def> {
         d("D05", "explicit-binding-const-callee", "rejected facts: C declares a changing slot's function const", REF, d05_explicit_const_callee),
         d("D05", "explicit-binding-callee-candidates", "rejected facts: a writer's slot call can reach another module's code write", REF, d05_explicit_callee_candidates),
         d("D05", "explicit-binding-defined-marker", "rejected facts: C defines its compiler-owned marker function", REF, d05_explicit_defined_marker),
+        d("D05", "explicit-binding-overlay-const", "rejected facts: an overlay's C declares the resident loader const", REF, d05_explicit_overlay_const),
+        d("D05", "explicit-binding-alias-candidate", "rejected facts: a slot call reaches a module compiled at the slot's KSEG1 alias", REF, d05_explicit_alias_candidate),
+        d("D05", "explicit-binding-sp-write", "rejected facts: a known code write through $sp", REF, d05_explicit_sp_write),
+        d(
+            "D05",
+            "explicit-binding-wrapped-range",
+            "port rejection: a constant range wrapping the window invalidates what it reaches",
+            Evidence::ClosedForm("a range wrapping the 16 MB window (D5) has no hardware counterpart"),
+            d05_explicit_wrapped_range,
+        ),
+        d("D05", "explicit-binding-variadic", "supported: a variadic C loader's rule reads its o32 argument words", REF, d05_explicit_variadic),
+        d("D05", "explicit-binding-sret", "port rejection: a struct-returning C clearer's success reads its o32 v0", REF, d05_explicit_sret),
+        d("D05", "explicit-binding-marker-alias", "supported: a c_marker rule's literal destination names the C's through an alias", REF, d05_explicit_marker_alias),
         d("D05", "explicit-binding-wrong-writer", "rejected facts: a declared writer bound contradicts a known write", REF, d05_explicit_wrong_writer),
         d("D05", "explicit-binding-unknown-selector", "port rejection: a completed load names no placement", REF, d05_explicit_unknown_selector),
         d("D05", "explicit-binding-bad-destination", "port rejection: a load outside its placement's layout", REF, d05_explicit_bad_destination),
