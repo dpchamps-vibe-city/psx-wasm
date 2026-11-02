@@ -1346,17 +1346,24 @@ fn d05_explicit_wrapped_range(lay: &Layout, n: &Names) -> Fixture {
 }
 
 /// [`d05_explicit_mixed`]'s loader as `load_module(unsigned tag, ...)`,
-/// called with a 64-bit selector, the destination and the length. o32 pads
-/// before the selector (words 2, 3; destination 4, length 5); clang's
-/// va-buffer doesn't. The rule names the original's o32 words.
-fn d05_explicit_variadic(lay: &Layout, n: &Names) -> Fixture {
+/// taking a selector (`cookie`: then an unused 64-bit word), the destination
+/// and the length, each load made from C (`load_c`) and from lifted code
+/// (`load_lift`, the same MIPS with no C). A 64-bit selector: o32 pads before
+/// it (words 2, 3) and clang's va-buffer doesn't. A 32-bit selector and the
+/// cookie: clang's va-buffer pads before the cookie and o32 doesn't (selector
+/// word 1). Destination and length are words 4, 5. The rule names the
+/// original's o32 words, whichever route the arguments come by.
+fn d05_explicit_variadic(lay: &Layout, n: &Names, cookie: bool) -> Fixture {
     let mut f = d05_explicit(lay, n, Loader::MatchingC);
     let main = &mut f.images[0];
     let lm = main.addr("load_module");
+    let sel = if cookie { A1 } else { A2 };
     let mut a = Asm::new(lm);
-    a.addiu(SP, SP, -24).sw(RA, 16, SP).lw(T3, 40, SP).lw(T2, 44, SP).sll(T0, A2, 10).li(T1, lay.stage).addu(T1, T1, T0);
+    a.addiu(SP, SP, -24).sw(RA, 16, SP).lw(T3, 40, SP).lw(T2, 44, SP).sll(T0, sel, 10).li(T1, lay.stage).addu(T1, T1, T0);
+    a.beq(T2, ZERO, "lm_done").nop();
     a.label("lm_loop");
     a.lw(T0, 0, T1).addiu(T1, T1, 4).sw(T0, 0, T3).addiu(T2, T2, -4).bne(T2, ZERO, "lm_loop").addiu(T3, T3, 4);
+    a.label("lm_done");
     a.jal_abs(main.addr("flush")).nop().lw(RA, 16, SP).ori(V0, ZERO, 0).jr(RA).addiu(SP, SP, 24);
     let bytes = a.bytes().expect("load_module assembles");
     let next = main.funcs.iter().map(|f| f.1).filter(|&x| x > lm).min().expect("a function follows load_module");
@@ -1364,40 +1371,77 @@ fn d05_explicit_variadic(lay: &Layout, n: &Names) -> Fixture {
     let at = (lm - main.base) as usize;
     main.bytes[at..at + bytes.len()].copy_from_slice(&bytes);
     main.funcs.iter_mut().find(|f| f.0 == "load_module").expect("load_module").2 = Some(bytes.len() as u32);
-    // load_c(sel, dst, len): load_module(0, (unsigned long long)sel, dst, len).
-    let load_c = append(main, "load_c", |a| {
-        a.addiu(SP, SP, -32).sw(RA, 24, SP).sw(A1, 16, SP).sw(A2, 20, SP).mov(A2, A0).ori(A3, ZERO, 0).ori(A0, ZERO, 0);
-        a.jal_abs(lm).nop().lw(RA, 24, SP).nop().jr(RA).addiu(SP, SP, 32);
-    });
+    // (sel, dst, len): load_module(0, sel, [0ull,] dst, len). Word 6, which
+    // nothing passes, is zero.
+    let caller = |a: &mut Asm| {
+        a.addiu(SP, SP, -40).sw(RA, 32, SP).sw(A1, 16, SP).sw(A2, 20, SP).sw(ZERO, 24, SP).mov(sel, A0);
+        if cookie {
+            a.ori(A2, ZERO, 0);
+        }
+        a.ori(A3, ZERO, 0).ori(A0, ZERO, 0).jal_abs(lm).nop().lw(RA, 32, SP).nop().jr(RA).addiu(SP, SP, 40);
+    };
+    let load_c = append(main, "load_c", caller);
+    let load_lift = append(main, "load_lift", caller);
+    let (take, pass) = if cookie {
+        ("sel = __builtin_va_arg(ap, unsigned);\n    (void)__builtin_va_arg(ap, unsigned long long);", "sel, 0ull")
+    } else {
+        ("sel = (unsigned)__builtin_va_arg(ap, unsigned long long);", "(unsigned long long)sel")
+    };
     main.c = Some(format!(
         "void flush(void);\n\
          int load_module(unsigned tag, ...) {{\n\
          \x20   __builtin_va_list ap;\n\
-         \x20   unsigned long long sel;\n\
-         \x20   unsigned *dst, *src, len;\n\
+         \x20   unsigned sel, *dst, *src, len;\n\
          \x20   __builtin_va_start(ap, tag);\n\
-         \x20   sel = __builtin_va_arg(ap, unsigned long long);\n\
+         \x20   {take}\n\
          \x20   dst = __builtin_va_arg(ap, unsigned *);\n\
          \x20   len = __builtin_va_arg(ap, unsigned);\n\
          \x20   __builtin_va_end(ap);\n\
-         \x20   src = (unsigned *)(0x{stage:08X}u + (unsigned)sel * 0x400u);\n\
-         \x20   do {{ *dst++ = *src++; len -= 4; }} while (len != 0);\n\
+         \x20   src = (unsigned *)(0x{stage:08X}u + sel * 0x400u);\n\
+         \x20   while (len != 0) {{ *dst++ = *src++; len -= 4; }}\n\
          \x20   flush();\n\
          \x20   return 0;\n\
          }}\n\
-         int load_c(unsigned sel, unsigned *dst, unsigned len) {{ return load_module(0u, (unsigned long long)sel, dst, len); }}\n",
+         int load_c(unsigned sel, unsigned *dst, unsigned len) {{ return load_module(0u, {pass}, dst, len); }}\n",
         stage = lay.stage
     ));
+    let word = if cookie { "selector = \"arg:1\"" } else { "selector = \"arg:2\"" };
     f.dispatch = f.dispatch.take().map(|d| {
-        d.replace("selector = \"arg:0\"", "selector = \"arg:2\"")
+        d.replace("selector = \"arg:0\"", word)
             .replace("destination = \"arg:1\"\nlength = \"arg:2\"\nsource_offset", "destination = \"arg:4\"\nlength = \"arg:5\"\nsource_offset")
     });
     let len_a = f.images[1].bytes.len() as u32;
     let mut s = Script::default();
-    for (sel, len, k) in [(0, len_a, 0x100), (1, 0x80, 0x200), (0, len_a, 0x100)] {
-        s.call(load_c, [sel, lay.slot, len, 0], 0, &[]).call(lay.slot, [1, 0, 0, 0], k + 1, &[k + 1]);
+    for (via, sel, len, k) in [(load_c, 0, len_a, 0x100), (load_lift, 1, 0x80, 0x200), (load_lift, 0, len_a, 0x100), (load_c, 1, 0x80, 0x200)] {
+        s.call(via, [sel, lay.slot, len, 0], 0, &[]).call(lay.slot, [1, 0, 0, 0], k + 1, &[k + 1]);
     }
     f.script = s;
+    f
+}
+
+fn d05_explicit_variadic_selector(lay: &Layout, n: &Names) -> Fixture {
+    d05_explicit_variadic(lay, n, false)
+}
+fn d05_explicit_variadic_padding(lay: &Layout, n: &Names) -> Fixture {
+    d05_explicit_variadic(lay, n, true)
+}
+
+/// [`d05_explicit_sp_write`]'s store moved into a helper: the writer points
+/// `$sp` at the slot's code and calls it. The helper's `$sp` is no stack, so
+/// analysis can't bound the writer, which declares no bounds.
+fn d05_explicit_sp_callee(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let main = &mut f.images[0];
+    let helper = append(main, "sp_helper", |a| {
+        a.sw(ZERO, 0, SP).jr(RA).ori(V0, ZERO, 0);
+    });
+    append(main, "sp_caller", |a| {
+        a.mov(S0, SP).mov(S1, RA).li(SP, lay.slot).jal_abs(helper).nop().mov(SP, S0).mov(RA, S1).jr(RA).nop();
+    });
+    let writer = "\n[[dispatch.writers]]\nid = \"sp-call-writer\"\ncontainer = \"main\"\nfunction = \"sp_caller\"\n";
+    f.dispatch = f.dispatch.take().map(|d| d + writer);
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.invalid_fact: writer `sp-call-writer`: analysis can't bound its writes".into());
     f
 }
 
@@ -1973,6 +2017,7 @@ fn defs() -> Vec<Def> {
         d("D05", "explicit-binding-overlay-const", "rejected facts: an overlay's C declares the resident loader const", REF, d05_explicit_overlay_const),
         d("D05", "explicit-binding-alias-candidate", "rejected facts: a slot call reaches a module compiled at the slot's KSEG1 alias", REF, d05_explicit_alias_candidate),
         d("D05", "explicit-binding-sp-write", "rejected facts: a known code write through $sp", REF, d05_explicit_sp_write),
+        d("D05", "explicit-binding-sp-callee", "rejected facts: a callee's $sp store where its caller made $sp no stack", REF, d05_explicit_sp_callee),
         d(
             "D05",
             "explicit-binding-wrapped-range",
@@ -1980,7 +2025,14 @@ fn defs() -> Vec<Def> {
             Evidence::ClosedForm("a range wrapping the 16 MB window (D5) has no hardware counterpart"),
             d05_explicit_wrapped_range,
         ),
-        d("D05", "explicit-binding-variadic", "supported: a variadic C loader's rule reads its o32 argument words", REF, d05_explicit_variadic),
+        d("D05", "explicit-binding-variadic", "supported: a variadic C loader's rule reads its o32 words, from C and lifted callers", REF, d05_explicit_variadic_selector),
+        d(
+            "D05",
+            "explicit-binding-variadic-padding",
+            "supported: a variadic C loader whose va-buffer pads where o32 doesn't, from C and lifted callers",
+            REF,
+            d05_explicit_variadic_padding,
+        ),
         d("D05", "explicit-binding-sret", "port rejection: a struct-returning C clearer's success reads its o32 v0", REF, d05_explicit_sret),
         d("D05", "explicit-binding-marker-alias", "supported: a c_marker rule's literal destination names the C's through an alias", REF, d05_explicit_marker_alias),
         d("D05", "explicit-binding-wrong-writer", "rejected facts: a declared writer bound contradicts a known write", REF, d05_explicit_wrong_writer),

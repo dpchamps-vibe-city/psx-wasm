@@ -438,7 +438,7 @@ pub(crate) fn plan(
                 ensure!(node != Some(None), "binding.invalid_fact: {what}: 0x{pc:08X} is not a store");
                 let mut one = Writes::default();
                 match (tiers.get(&(c.clone(), f.addr)), t, node.flatten()) {
-                    (Some(Tier::Lift { .. }), Some(t), Some(node)) => store(&mut one, t, node),
+                    (Some(Tier::Lift { .. }), Some(t), Some(node)) => store(&mut one, t, node, frame_sp(t)),
                     (Some(Tier::Lift { .. }), ..) => bail!("{c} {:#010x}: lifted with no translation", f.addr),
                     (Some(Tier::Adapter(_)), ..) => one.unbounded = Some(format!("{} is an adapter", f.name)),
                     _ => one.unbounded = Some(format!("{} is supplied C", f.name)),
@@ -573,9 +573,9 @@ struct Writes {
 
 /// One store of a lifted function, by the register constants on entry to
 /// its node. A known address is a known write, whatever the register; an
-/// unknown one through `$sp` is to a stack frame only where `$sp` is the
-/// caller's, moved by constants.
-fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::Node) {
+/// unknown one through `$sp` is to a stack frame only where `frame`: `$sp`
+/// is a stack pointer there.
+fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::Node, frame: bool) {
     use psxw_lift::decode::Op;
     let insn = &t.graph.nodes[&node].insn;
     match t.facts.consts.get(&node).and_then(|c| c[insn.rs as usize]) {
@@ -594,7 +594,7 @@ fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::N
                 }
             }
         }
-        None if insn.rs == 29 && frame_sp(t) => out.stack = true,
+        None if insn.rs == 29 && frame => out.stack = true,
         None => {
             out.unbounded.get_or_insert_with(|| format!("{} stores through a register at 0x{:08X}", t.func.name, node.pc()));
         }
@@ -602,7 +602,8 @@ fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::N
 }
 
 /// Whether the function only moves `$sp` by constants (`addiu sp, sp, k`),
-/// so it always holds the caller's stack pointer plus some offset.
+/// so it always holds the stack pointer it was entered with plus some
+/// offset.
 fn frame_sp(t: &psxw_lift::Translation) -> bool {
     use psxw_lift::decode::Op;
     t.graph.nodes.values().all(|d| d.insn.writes() != Some(29) || (matches!(d.insn.op, Op::Addiu | Op::Addi) && d.insn.rs == 29))
@@ -613,6 +614,11 @@ fn frame_sp(t: &psxw_lift::Translation) -> bool {
 /// except that a call to a changing slot (any alias of it), a run-time
 /// resolved one, or one to a shared legacy entry from outside main can
 /// reach every implementation there.
+///
+/// `key` is entered with a stack pointer (the ABI's). A function keeps it
+/// one, and passes it on to what it calls, only where [`frame_sp`] holds;
+/// anything entered otherwise has no stack, and its `$sp` stores are
+/// unbounded.
 fn writes(
     key: &(String, u32),
     by_key: &BTreeMap<(&str, u32), &psxw_lift::Translation>,
@@ -622,10 +628,10 @@ fn writes(
 ) -> Writes {
     use psxw_lift::graph::{Callee, Dest, Transfer};
     let mut out = Writes::default();
-    let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
-    let mut work = vec![key.clone()];
-    while let Some((c, a)) = work.pop() {
-        if !seen.insert((c.clone(), a)) {
+    let mut seen: BTreeSet<(String, u32, bool)> = BTreeSet::new();
+    let mut work = vec![(key.0.clone(), key.1, true)];
+    while let Some((c, a, entered)) = work.pop() {
+        if !seen.insert((c.clone(), a, entered)) {
             continue;
         }
         let name = || by_key.get(&(c.as_str(), a)).map_or_else(|| format!("{c} 0x{a:08X}"), |t| t.func.name.clone());
@@ -644,9 +650,10 @@ fn writes(
                 continue;
             }
         };
+        let frame = entered && frame_sp(t);
         for (node, d) in &t.graph.nodes {
             if d.insn.op.is_store() {
-                store(&mut out, t, *node);
+                store(&mut out, t, *node, frame);
             }
             let tail = |d: &Dest| match d {
                 Dest::Tail(c) => vec![c.clone()],
@@ -666,9 +673,9 @@ fn writes(
                         let shared = tiers.keys().filter(|(_, x)| *x == addr).count() > 1;
                         match psxw_link::game::parse_generated(&symbol, main) {
                             Some((Some(k), _)) if !changing(addr) && (k == main || !shared) && tiers.contains_key(&(k.clone(), addr)) => {
-                                work.push((k, addr))
+                                work.push((k, addr, frame))
                             }
-                            _ => work.extend(every.iter().cloned()),
+                            _ => work.extend(every.iter().map(|(k, x)| (k.clone(), *x, frame))),
                         }
                         if every.is_empty() {
                             out.unbounded.get_or_insert_with(|| format!("a call to 0x{addr:08X}, which nothing implements"));

@@ -183,9 +183,10 @@ pub struct CShape {
     pub kinds: Vec<Kind>,
     pub words: Vec<Word>,
     /// The leading words whose o32 position is certain. A variadic
-    /// function's va-buffer follows its TU's calls ([`call_words`]), then
-    /// lies as it is up to [`VARIADIC_WORDS`]; after an odd number of
-    /// words, a 64-bit argument no call shows could sit elsewhere.
+    /// function's va-buffer follows its TU's calls ([`call_words`]), then,
+    /// past every word they place, lies as it is up to [`VARIADIC_WORDS`];
+    /// after an odd number of words, a 64-bit argument no call shows could
+    /// sit elsewhere.
     pub proven: u32,
     pub v0: V0,
 }
@@ -202,9 +203,11 @@ pub fn c_shape(sig: &FuncType, proto: Option<&Proto>) -> CShape {
             _ => Vec::new(),
         };
         let va = kinds.len() as u32;
-        let shown = mapped.iter().filter(|w| matches!(w, Word::Mem(..))).count() as u32;
+        // The va-buffer words the calls occupy, padding holes included: the
+        // rest follows all of them, never reusing one.
+        let used = mapped.iter().filter_map(|w| if let Word::Mem(_, off) = w { Some(off / 4 + 1) } else { None }).max().unwrap_or(0);
         words_.extend(&mapped);
-        words_.extend((shown..VARIADIC_WORDS.max(shown)).map(|q| Word::Mem(va, 4 * q)));
+        words_.extend((used..VARIADIC_WORDS.max(used)).map(|q| Word::Mem(va, 4 * q)));
         proven = if fixed % 2 == 0 { words_.len() as u32 } else { fixed + mapped.len() as u32 };
     }
     let v0 = match (kinds.first(), sig.results.first()) {
@@ -758,6 +761,21 @@ mod tests {
         let m = |o: u32| Word::Mem(2, o);
         let (w, _) = call_words(&[Kind::Ptr; 2], true, &[vec![Kind::I32, Kind::F64], vec![Kind::I32; 9]]).unwrap();
         assert_eq!(w[2..], (0..9).map(|k| m(4 * k)).collect::<Vec<_>>()[..]);
+    }
+
+    /// A va-buffer hole o32 lacks (before a 64-bit argument after an odd
+    /// word) leaves the words after the calls' last one to the fallback:
+    /// none lands on a word a call places.
+    #[test]
+    fn variadic_tail_follows_the_calls() {
+        use wasmparser::ValType::I32;
+        let sig = FuncType { params: vec![I32, I32], results: vec![I32] };
+        let calls = vec![vec![Kind::I32, Kind::I64, Kind::Ptr, Kind::I32]];
+        let proto = Proto { name: "f".into(), defined: true, ret: Kind::I32, params: vec![Kind::I32], variadic: true, va_calls: calls };
+        let s = c_shape(&sig, Some(&proto));
+        let m = |o: u32| Word::Mem(1, o);
+        assert_eq!(s.words[..7], [Word::Param(0), m(0), m(8), m(12), m(16), m(20), m(24)]);
+        assert_eq!(s.proven, 6);
     }
 
     /// An o32 caller's words reach 8- and 16-bit parameters extended as

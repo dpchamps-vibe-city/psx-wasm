@@ -501,6 +501,33 @@ for the required CLI/reference run.
   variant being the legacy baseline set. `psxw build btn` links at 2,604,703
   bytes with the same tiers (86 adapter, 2,574 C, 727 lift), and `psxw run btn
   --frames 300 --check no-trap` passes.
+- 2026-11-01, seventh review fixes:
+  1. `c_shape` started a variadic function's fallback words after as many
+     va-buffer words as the calls place, not after the last one. A hole
+     clang's layout has and o32's doesn't (before a 64-bit argument after an
+     odd word) made a fallback word land on a placed one, so a lifted caller's
+     o32 word 6 overwrote the length. The fallback now starts past every
+     placed word (unit test `variadic_tail_follows_the_calls`).
+     `explicit-binding-variadic-padding`: `(tag, sel, cookie64, dst, len)`;
+     both variadic fixtures now load from C and from a lifted caller, against
+     the reference.
+  2. Writer analysis gave every function it reached a stack, so a writer
+     pointing `$sp` at code and calling a helper that stores through `$sp`
+     was reported disjoint. A function's `$sp` is now a stack only where it
+     was entered with one (the writer is, by the ABI) and moves it by
+     constants alone, and it passes that on to what it calls; otherwise its
+     unknown `$sp` stores are unbounded. `explicit-binding-sp-callee` (the
+     writer, declaring no bounds, is rejected: `binding.invalid_fact`).
+  Evidence: the reviewer's reproducers pass (both variadic routes verified,
+  the lifted one agreeing with the reference) or reject (`sp-callee-provenance`),
+  and the KSEG-alias execution control still passes. Reverting either fix fails its
+  fixture. The explicit subset is 32 variants: 12 execution and 20 safety, 0
+  failed, 0 unresolved, 16 of them against the live reference. Unit tests:
+  `psxw-cc` 22, `psxw-inputs` 17, `psxw-link` 10, `psxw-build` 5,
+  `link_passes` 8. Full corpus: 83 variants: 46 execution, 22 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved
+  variant being the legacy baseline set. `psxw build btn` links at 2,604,703
+  bytes with the same tiers, and `psxw run btn --frames 300 --check no-trap`
+  passes.
 
 ## Findings
 

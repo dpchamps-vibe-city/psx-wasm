@@ -291,7 +291,9 @@ replaces the stub for the regions it covers:
   the linker binds it, and a call to a changing slot into every
   implementation at any alias of it. A store's known constant address is a
   known write whatever its register; an unknown `$sp`-relative one counts as
-  a stack write only where the function moves `$sp` by constants alone.
+  a stack write only where the function, and every caller between it and
+  the writer, moves `$sp` by constants alone (the writer itself is entered
+  with a stack).
   Anything else analysis can't bound needs declared bounds. When a writer's
   rules all have constant ranges, they must cover the code it can change.
 - Facts the build can't honour fail it with a `binding.*` diagnostic:
