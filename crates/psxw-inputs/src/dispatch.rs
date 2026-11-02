@@ -521,6 +521,23 @@ request = "call"
     }
 
     #[test]
+    fn supported_games_opt_into_phase_one() {
+        for (id, text) in [
+            ("btn", include_str!("../../../games/btn/game.toml")),
+            ("bof4", include_str!("../../../games/bof4/game.toml")),
+        ] {
+            let manifest: crate::GameManifest = toml::from_str(text).unwrap();
+            assert_eq!(manifest.game.id, id);
+            let facts = manifest.dispatch.as_ref().expect("phase-one opt-in").check().unwrap();
+            assert!(!facts.require_explicit, "{id}: strict coverage is milestone C");
+            assert!(
+                facts.placements.iter().any(|p| p.container == manifest.containers.main),
+                "{id}: boot-resident placement is declared"
+            );
+        }
+    }
+
+    #[test]
     fn the_plan_example_parses() {
         let facts = parse(EXAMPLE).unwrap().check().unwrap();
         let r = &facts.rules[0];

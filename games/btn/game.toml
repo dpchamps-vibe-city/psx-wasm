@@ -21,6 +21,16 @@ splat_dir = "configs/splat"
 symbols_dir = "configs/symbols"
 main = "exe"
 
+[dispatch]
+# Phase A opt-in. Boot supplies the resident EXE; overlay loading remains
+# on the reported legacy path until its publication rules are declared.
+schema_version = 1
+require_explicit = false
+
+[[dispatch.placements]]
+id = "resident"
+container = "exe"
+
 [c]
 include = ["include", "include/psyq"]
 defines = ["__GNUC__=2", "_LANGUAGE_C", "INCLUDE_ASM_USE_MACRO_INC=1"]
@@ -71,6 +81,60 @@ press = ["START@400", "START@550", "START@700", "START@850", "CROSS@1000", "CROS
 # Per-function tier pins, each with its evidence. Only for function-specific
 # defects; GCC/GNU C idioms get normalizer rules instead.
 [tier]
+# Preserve the existing void_results lift selections at the pinned input.
+# Their C definitions are void, but original v0 can be observed by callers
+# or through function pointers. Explicit dispatch must not silently replace C.
+CancelIndexedSelection = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+CommitIndexedSelectionIndex = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+DrawSpriteGridCell = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+DrawSpriteGridCellInContext = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+DrawUiSprite27Frame0 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+DrawUiSprite27Frame1 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+DrawUiSprite27Frame2 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+DrawUiSprite27Frame3 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl08UpdateSceneSelectMenu = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11AnimateStateRecordMotion20 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11BeginLightAreaEntry = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11CopyPrimaryValueLabel = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11CopySecondaryValueLabel = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11DiscardSpriteRotationActiveQuery = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11DrawStatusSmallRecordPage = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11DrawStatusSummaryPage = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11DrawStatusTaggedRecordPageA = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11DrawStatusTaggedRecordPageB = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11FinishSelectionMenu = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11LoadAreaScene = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11ReloadAreaScene = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11UpdateOptionsListPage = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl11UpdateOptionsSettingsPage = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl17DispatchRecordSceneStage = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl17DispatchRecordSceneSubphase = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl17RunRecordSceneStage = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl19StepScene = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl19UpdateScenePhase = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl21PromptRetryChoice = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl21ResolveChoice = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl21StepScene = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl21UpdateScenePhase = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl23DispatchRecordRunStage = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl23DispatchRecordRunSubphase = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl23InitRecordRunBounds = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl23ResetRecordRunState = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl23UpdateRecordStage6 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl25ApplySceneCamera = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl25DrawPrimarySprite = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl25InitSceneRecordState = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl25UpdateSceneMode = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl25UpdateSceneTransition = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl27DrawTitleRecordSummary = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl27FinishTitleMenu = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl27InitWorkOptions = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl28FinishSpriteSequenceScene = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+Ovl28UpdateSpriteSequenceScene = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+PresentFrame = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+SetSoundMono = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+SetSoundStereo = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
+ovl_19_func_800B89C8 = { tier = "lift", reason = "void_results: void C can drop an observable original v0" }
 
 # Functions the M1 difftest can't compare on random inputs, with evidence.
 # Each is local-array UB reached only with inputs outside the function's
