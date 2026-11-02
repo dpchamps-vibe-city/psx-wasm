@@ -1178,6 +1178,94 @@ fn d05_explicit_uncovered_write(lay: &Layout, n: &Names) -> Fixture {
     f
 }
 
+/// Main's C declares the slot function `const`: clang may merge two calls
+/// to it across a load, so the build refuses the attribute.
+fn d05_explicit_const_callee(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MatchingC);
+    let decl = format!("int func_{:08X}(int a);", lay.slot);
+    let c = f.images[0].c.take().unwrap_or_default();
+    assert!(c.contains(&decl), "main's C declares the slot function");
+    f.images[0].c = Some(c.replace(&decl, &decl.replace(");", ") __attribute__((const));")));
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.elidable_call".into());
+    f
+}
+
+/// A's untouched k calls the slot. A's f writes nothing, but B's f clears
+/// the second region's code: k's writes are whatever the slot has bound.
+fn d05_explicit_callee_candidates(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let mut u = Unit::new(&n.of("a"), lay.slot);
+    leaf(&mut u, "f", |a| {
+        a.addiu(V0, A0, 0x100);
+    });
+    u.func_at("k", lay.slot + 0x80);
+    u.a.addiu(SP, SP, -24).sw(RA, 16, SP).jal_abs(lay.slot).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+    let a = u.image(Some(lay.slot + 0x100), &[]);
+    let mut u = Unit::new(&n.of("b"), lay.slot);
+    leaf(&mut u, "f", |a| {
+        a.li(T0, lay.slot2).sw(ZERO, 0, T0);
+    });
+    let b = u.image(Some(lay.slot + 0x80), &[]);
+    for im in &mut f.images {
+        if im.id == a.id {
+            *im = a.clone();
+        } else if im.id == b.id {
+            *im = b.clone();
+        }
+    }
+    let writer = format!("\n[[dispatch.writers]]\nid = \"slot-caller\"\ncontainer = \"{}\"\nfunction = \"k\"\n", n.of("a"));
+    f.dispatch = f.dispatch.take().map(|d| d + &writer);
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.uncovered_writer: writer `slot-caller`".into());
+    f
+}
+
+/// A's symbol file sizes its f to end before its return's delay slot, so
+/// the original doesn't translate (the CPU runs it regardless); its
+/// supplied C is still what the slot binds.
+fn d05_explicit_c_untranslatable(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MatchingC);
+    let a = f.images.iter_mut().find(|im| im.id == n.of("a")).expect("module a");
+    let jr_ra = 0x03E0_0008u32.to_le_bytes();
+    let ret = a.bytes.chunks(4).position(|w| w == jr_ra).expect("f returns") as u32 * 4;
+    for func in a.funcs.iter_mut().filter(|func| func.0 == "f") {
+        func.2 = Some(ret + 4);
+    }
+    f
+}
+
+/// Main's C defines the marker function itself: it would run instead of
+/// the publication the rule describes.
+fn d05_explicit_defined_marker(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::MarkerC);
+    let c = f.images[0].c.take().unwrap_or_default();
+    f.images[0].c = Some(c + "void psxw_binding_site_module_written(unsigned d, unsigned l, unsigned o, unsigned s, unsigned k) {}\n");
+    f.script = Script::default();
+    f.build = Build::Rejected("binding.defined_marker".into());
+    f
+}
+
+/// A rule invalidating the address space's last word: its range ends at
+/// 2^32, and changes no placement.
+fn d05_explicit_top_word(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let rule = "\n[[dispatch.rules]]\nid = \"top-word\"\ncontainer = \"main\"\nfunction = \"save_ptr\"\nevent = \"return\"\n\
+                effect = \"invalidate\"\ndestination = \"const:0xFFFFFFFC\"\nlength = \"const:4\"\n";
+    f.dispatch = f.dispatch.take().map(|d| d + rule);
+    f
+}
+
+/// The pointer store's bound, declared through the uncached alias of the
+/// address it writes: the same bytes (D5).
+fn d05_explicit_alias_bounds(lay: &Layout, n: &Names) -> Fixture {
+    let mut f = d05_explicit(lay, n, Loader::Lifted);
+    let alias = (lay.stage + 0x1000) | 0x2000_0000;
+    let declared = format!("function = \"save_ptr\"\ndestinations = [{{ start = 0x{alias:08X}, end = 0x{:08X} }}]\n", alias + 4);
+    f.dispatch = f.dispatch.take().map(|d| d.replace("function = \"save_ptr\"\n", &declared));
+    f
+}
+
 /// A declared writer bound its known store falls outside.
 fn d05_explicit_wrong_writer(lay: &Layout, n: &Names) -> Fixture {
     let mut f = d05_explicit(lay, n, Loader::Lifted);
@@ -1688,6 +1776,12 @@ fn defs() -> Vec<Def> {
         d("D05", "explicit-binding-cleared", "port rejection: an invalidated module isn't callable", REF, d05_explicit_cleared),
         d("D05", "explicit-binding-intrinsic-slot", "supported: a changing slot named like an intrinsic is still looked up", REF, d05_explicit_intrinsic_slot),
         d("D05", "explicit-binding-uncovered-write", "rejected facts: a known code write its rule's constant range misses", REF, d05_explicit_uncovered_write),
+        d("D05", "explicit-binding-c-untranslatable", "supported: supplied C binds where its original doesn't translate", REF, d05_explicit_c_untranslatable),
+        d("D05", "explicit-binding-top-word", "supported: a constant range ending at 2^32", REF, d05_explicit_top_word),
+        d("D05", "explicit-binding-alias-bounds", "supported: a writer bound declared through an address alias", REF, d05_explicit_alias_bounds),
+        d("D05", "explicit-binding-const-callee", "rejected facts: C declares a changing slot's function const", REF, d05_explicit_const_callee),
+        d("D05", "explicit-binding-callee-candidates", "rejected facts: a writer's slot call can reach another module's code write", REF, d05_explicit_callee_candidates),
+        d("D05", "explicit-binding-defined-marker", "rejected facts: C defines its compiler-owned marker function", REF, d05_explicit_defined_marker),
         d("D05", "explicit-binding-wrong-writer", "rejected facts: a declared writer bound contradicts a known write", REF, d05_explicit_wrong_writer),
         d("D05", "explicit-binding-unknown-selector", "port rejection: a completed load names no placement", REF, d05_explicit_unknown_selector),
         d("D05", "explicit-binding-bad-destination", "port rejection: a load outside its placement's layout", REF, d05_explicit_bad_destination),

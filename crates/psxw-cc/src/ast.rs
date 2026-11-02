@@ -572,6 +572,59 @@ pub fn hook_variant(text: &str, names: &std::collections::BTreeSet<String>, keep
     crate::edit::apply(text, edits)
 }
 
+/// Functions `keep` names that a declaration or definition anywhere in the
+/// TU marks `const` or `pure` (C23: `unsequenced`, `reproducible`), each
+/// with the attribute: clang may merge or delete such calls, which weak and
+/// noinline don't prevent (plans/dispatch-binding).
+pub fn elidable_calls(text: &str, keep: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
+    fn elidable(ast: &Ast, n: Node) -> Option<String> {
+        let mut c = n.walk();
+        let names: Vec<Node> = match n.kind() {
+            "attribute_specifier" => n
+                .named_children(&mut c)
+                .flat_map(|a| a.named_children(&mut a.walk()).collect::<Vec<_>>())
+                .map(|a| a.child_by_field_name("function").unwrap_or(a))
+                .collect(),
+            "attribute_declaration" => {
+                n.named_children(&mut c).filter_map(|a| a.child_by_field_name("name")).collect()
+            }
+            _ => return None,
+        };
+        names.into_iter().map(|a| ast.text(a)).find(|a| {
+            matches!(a.trim_matches('_'), "const" | "pure" | "unsequenced" | "reproducible")
+        }).map(str::to_string)
+    }
+    fn own(ast: &Ast, n: Node) -> Option<String> {
+        let mut c = n.walk();
+        n.named_children(&mut c).find_map(|a| elidable(ast, a))
+    }
+    fn walk(ast: &Ast, n: Node, keep: &dyn Fn(&str) -> bool, out: &mut Vec<(String, String)>) {
+        if matches!(n.kind(), "declaration" | "function_definition") {
+            let shared = own(ast, n);
+            let mut c = n.walk();
+            for d in n.children_by_field_name("declarator", &mut c) {
+                let mut f = Some(d);
+                while let Some(x) = f.filter(|x| x.kind() != "function_declarator") {
+                    f = x.child_by_field_name("declarator");
+                }
+                let Some(f) = f else { continue };
+                let Some(name) = ast.declarator_name(f).filter(|n| keep(n)) else { continue };
+                if let Some(a) = own(ast, f).or_else(|| shared.clone()) {
+                    out.push((name, a));
+                }
+            }
+        }
+        let mut c = n.walk();
+        for k in n.named_children(&mut c) {
+            walk(ast, k, keep, out);
+        }
+    }
+    let ast = parse(text);
+    let mut out = Vec::new();
+    walk(&ast, ast.tree.root_node(), keep, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod hook_tests {
     #[test]
@@ -593,5 +646,16 @@ mod hook_tests {
         assert!(!out.contains("inline int"), "{out}");
         assert!(out.contains("__attribute__((weak, noinline))  int h(int a)"), "{out}");
         assert!(out.contains("__attribute__((weak, noinline)) int k(int a)"), "{out}");
+    }
+
+    #[test]
+    fn elidable_boundaries() {
+        let src = "int f(int a) __attribute__((const));\n__attribute__((nothrow, __pure__)) int g(int);\n\
+                   int h(int), k(int) __attribute__((const));\n[[gnu::const]] int m(int);\n\
+                   int q(void) { extern int r(int) __attribute__((const)); return r(1); }\nint s(int) __attribute__((noreturn));\n";
+        let all = super::elidable_calls(src, &|_| true);
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["f", "g", "k", "m", "r"]);
+        assert!(super::elidable_calls(src, &|n| n == "h" || n == "s").is_empty());
     }
 }

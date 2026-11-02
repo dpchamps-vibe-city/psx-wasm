@@ -14,7 +14,7 @@ use psxw_lift::program::{Program, Source};
 use psxw_link::game::{GameSpec, Tier};
 use psxw_link::object::{NameClass, SymbolKind, classify_name};
 use psxw_link::{Gcc, Input};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 pub use crate::binding::Overlays;
@@ -143,11 +143,21 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
             None => lifted.push(t),
         }
     }
+    // Supplied C is the implementation even where its original doesn't
+    // translate.
+    let untranslated_c = crate::game::untranslated(&program, c_defs.keys(), &translations);
+    for f in &untranslated_c {
+        let key = (f.container.clone(), f.addr);
+        let (input, func) = c_defs[&key];
+        tiers.insert(key, Tier::C { input, func });
+    }
     let switches = thread_switches(&lifted);
     link_lifted(ws, &dir.join("lift"), &lifted, &mut link_inputs, &mut tiers)?;
     // Supplied C stays the implementation: no dispatch or binding concern
     // selects another tier for it.
-    for key in c_defs.keys().filter(|k| translations.iter().any(|t| (&t.func.container, t.func.addr) == (&k.0, k.1))) {
+    let functions: BTreeSet<(&str, u32)> =
+        translations.iter().map(|t| &t.func).chain(&untranslated_c).map(|f| (f.container.as_str(), f.addr)).collect();
+    for key in c_defs.keys().filter(|k| functions.contains(&(k.0.as_str(), k.1))) {
         ensure!(matches!(tiers.get(key), Some(Tier::C { .. })), "{} {:#010x}: supplied C is not linked at the C tier", key.0, key.1);
     }
     let (binding_plan, overlays, mut binding) =

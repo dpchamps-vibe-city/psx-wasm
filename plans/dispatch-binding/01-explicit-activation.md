@@ -405,6 +405,45 @@ for the required CLI/reference run.
   fix 1 or 2 fails its fixture. `psxw-build` 5 tests pass. Full corpus: 68 variants: 40 execution, 13 safety, 14 failed, 1 unresolved (exit 2),
   the failures and the unresolved variant being the legacy baseline set. `psxw build btn` (no `[dispatch]`, so its void-result policy is unchanged) links at 2,604,703 bytes and `psxw run btn --frames 300 --check no-trap` passes.
 
+- 2026-11-01, fifth review fixes:
+  1. `weak, noinline` kept a changing call's boundary but not the call itself:
+     C declaring the slot function `__attribute__((const))` let clang merge
+     two calls across a load. C that declares a declared operation or a
+     function at a covered address `const` or `pure` (or C23 `unsequenced`,
+     `reproducible`), anywhere in the TU, now fails with
+     `binding.elidable_call`. `explicit-binding-const-callee`.
+  2. Writer analysis followed a call to a changing slot into the caller's own
+     container only. It now follows every implementation the slot can bind.
+     `explicit-binding-callee-candidates`: A's k calls the slot, A's f writes
+     nothing, B's f clears the second region's code; k's writer needs a rule.
+  3. Tier selection walked successful translations only, so supplied C whose
+     original didn't translate got no tier and its slot reported untranslated.
+     Supplied C now takes its tier (and its binding, by its function's extent)
+     either way, in production and in the fixture pipeline.
+     `explicit-binding-c-untranslatable`: A's symbol file sizes f to end
+     before its return's delay slot.
+  4. C defining `psxw_binding_site_*` passed site validation while the linker
+     instrumented only undefined calls, so the rule never ran. Any definition
+     of one now fails with `binding.defined_marker`.
+     `explicit-binding-defined-marker`.
+  5. A constant range ending at 2^32 wrapped to zero and panicked the planner.
+     Window offsets are now computed from start and length, and the schema
+     rejects a constant range running past 2^32 (unit test).
+     `explicit-binding-top-word` invalidates the last word and runs.
+  6. Declared writer bounds and known writes compared as raw addresses. Both
+     now compare as backing bytes (D5), split where a range wraps the window.
+     `explicit-binding-alias-bounds` declares the pointer store's bound through
+     its KSEG1 alias. Lifted stores ending at 2^32 count as unbounded rather
+     than overflowing.
+  Evidence: the explicit subset is 23 variants, 9 execution and 14 safety, 0 failed, 0 unresolved, the live reference agreeing on
+  the 12 it runs; reverting each fix fails its fixture (the range fix by the
+  reported panic). Unit tests: `psxw-cc` 22, `psxw-inputs` 17, `psxw-build` 5,
+  `link_passes` 8. Full corpus: 74 variants: 43 execution, 16 safety, 14 failed, 1 unresolved (exit 2), the failures and the unresolved variant
+  being the legacy baseline set. `psxw build btn` links at 2,604,703 bytes with the same tiers as before (86 adapter, 2,574 C, 727 lift: none of its supplied C has an untranslatable original), and `psxw run btn --frames 300 --check no-trap` passes.
+  Not changed: a `c_marker` call's literal destination check still compares raw
+  values, so the C passing an alias of a declared constant destination faults
+  (`binding.marker_mismatch`) instead of publishing.
+
 ## Findings
 
 ### A1 reference inventory

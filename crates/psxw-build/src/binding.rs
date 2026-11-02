@@ -74,7 +74,8 @@ pub(crate) fn dispatch(
 ) -> Result<(Option<link::Binding>, Overlays, Report)> {
     let (binding, mut report) = match section {
         Some(s) => {
-            let (b, r) = plan(s, map, translations, tiers, inputs)?;
+            let untranslated = crate::game::untranslated(program, tiers.keys(), translations);
+            let (b, r) = plan(s, map, translations, &untranslated, tiers, inputs)?;
             (Some(b), r)
         }
         None => (None, Report::default()),
@@ -108,7 +109,7 @@ impl Boundaries {
                 }
             }
             for p in &s.placements {
-                covered.extend(map.container(&p.container).into_iter().flat_map(|c| c.text.iter().map(window)));
+                covered.extend(map.container(&p.container).into_iter().flat_map(|c| c.text.iter().flat_map(window)));
             }
         }
         Self { operations, covered }
@@ -122,8 +123,22 @@ impl Boundaries {
     }
 }
 
-fn window(r: &Range<u32>) -> Range<u32> {
-    (r.start & WINDOW_MASK)..((r.end - 1) & WINDOW_MASK) + 1
+/// A guest range's backing bytes (D5: `addr & WINDOW_MASK`) as window
+/// offsets: split where it wraps the window, all of it when it spans one.
+fn window(r: &Range<u32>) -> Vec<Range<u32>> {
+    span(r.start, r.end.saturating_sub(r.start))
+}
+
+/// [`window`] of the `len` bytes from `start`, which may end at 2^32.
+fn span(start: u32, len: u32) -> Vec<Range<u32>> {
+    const SIZE: u64 = WINDOW_MASK as u64 + 1;
+    let (start, len) = ((start & WINDOW_MASK) as u64, len as u64);
+    match len {
+        0 => vec![],
+        _ if len >= SIZE => vec![0..SIZE as u32],
+        _ if start + len <= SIZE => vec![start as u32..(start + len) as u32],
+        _ => vec![start as u32..SIZE as u32, 0..(start + len - SIZE) as u32],
+    }
 }
 
 fn overlaps(a: &Range<u32>, b: &Range<u32>) -> bool {
@@ -152,6 +167,7 @@ pub(crate) fn plan(
     section: &DispatchSection,
     map: &AddressMap,
     translations: &[psxw_lift::Translation],
+    untranslated: &[psxw_lift::program::Function],
     tiers: &BTreeMap<(String, u32), Tier>,
     inputs: &[psxw_link::Input],
 ) -> Result<(link::Binding, Report)> {
@@ -171,7 +187,7 @@ pub(crate) fn plan(
         let c = container(&p.container, &format!("placement `{}`", p.id))?;
         ensure!(!c.text.is_empty(), "binding.invalid_fact: placement `{}`: {} has no text", p.id, p.container);
         placements.push(link::Placement { id: p.id.clone(), container: p.container.clone(), segments: c.segments.clone() });
-        covered.extend(c.text.iter().map(window));
+        covered.extend(c.text.iter().flat_map(window));
     }
     let in_covered = |a: u32| covered.iter().any(|r| r.contains(&(a & WINDOW_MASK)));
     let placement_of: BTreeMap<&str, usize> = f.placements.iter().enumerate().map(|(i, p)| (p.id.as_str(), i)).collect();
@@ -182,25 +198,29 @@ pub(crate) fn plan(
         if c.is_main || placed.contains(c.id.as_str()) {
             continue;
         }
-        if let Some(r) = c.text.iter().map(window).find(|r| covered.iter().any(|k| overlaps(k, r))) {
+        if let Some(r) = c.text.iter().flat_map(window).find(|r| covered.iter().any(|k| overlaps(k, r))) {
             bail!("binding.missing_placement: {}'s text {} overlaps a placement's; declare a placement for it", c.id, hex(&r));
         }
     }
 
-    // Implementations and what each depends on.
+    // Implementations and what each depends on. Supplied C is located by
+    // its function's extent, whether or not its original translated.
     let by_key: BTreeMap<(&str, u32), &psxw_lift::Translation> =
         translations.iter().map(|t| ((t.func.container.as_str(), t.func.addr), t)).collect();
+    let funcs: BTreeMap<(&str, u32), &psxw_lift::program::Function> =
+        translations.iter().map(|t| &t.func).chain(untranslated).map(|f| ((f.container.as_str(), f.addr), f)).collect();
     let mut slots: BTreeMap<u32, Vec<link::Candidate>> = BTreeMap::new();
     for ((c, a), tier) in tiers {
-        let t = by_key.get(&(c.as_str(), *a)).with_context(|| format!("{c} {a:#010x}: no translation to locate"))?;
-        let regions: Vec<(u32, u32, String)> = match tier {
-            Tier::Lift { .. } => t.graph.regions.clone(),
-            _ => vec![(t.func.addr, t.func.end, c.clone())],
+        let f = funcs.get(&(c.as_str(), *a)).with_context(|| format!("{c} {a:#010x}: no function to locate"))?;
+        let regions: Vec<(u32, u32, String)> = match (tier, by_key.get(&(c.as_str(), *a))) {
+            (Tier::Lift { .. }, Some(t)) => t.graph.regions.clone(),
+            (Tier::Lift { .. }, None) => bail!("{c} {a:#010x}: lifted with no translation"),
+            _ => vec![(f.addr, f.end, c.clone())],
         };
         let mut footprint = Vec::new();
         for (s, e, rc) in regions.into_iter().filter(|(s, e, _)| s < e) {
             let r = window(&(s..e));
-            let changing = covered.iter().any(|k| overlaps(k, &r));
+            let changing = r.iter().any(|r| covered.iter().any(|k| overlaps(k, r)));
             if rc != *c && changing {
                 bail!(
                     "binding.replaceable_dependency: {c} {a:#010x}'s translation embeds {rc}'s code at {}, which a placement can replace",
@@ -208,7 +228,7 @@ pub(crate) fn plan(
                 );
             }
             if rc == *c {
-                footprint.push(r);
+                footprint.extend(r);
             }
         }
         if in_covered(*a) {
@@ -243,10 +263,7 @@ pub(crate) fn plan(
     };
     // The function whose extent holds an instruction.
     let function_at = |c: &str, pc: u32| {
-        translations
-            .iter()
-            .filter(|t| t.func.container == c && t.func.interior_of.is_none() && (t.func.addr..t.func.end).contains(&pc))
-            .max_by_key(|t| t.func.addr)
+        funcs.values().copied().filter(|f| f.container == c && f.interior_of.is_none() && (f.addr..f.end).contains(&pc)).max_by_key(|f| f.addr)
     };
     let site_key = |site: &Site, what: &str| -> Result<(String, u32)> {
         let Site::Function { container: c, function } = site else { unreachable!("function sites only") };
@@ -271,6 +288,13 @@ pub(crate) fn plan(
             }
         })
     };
+    // The build generates each c_marker function: a definition in C would
+    // run in its place, and the rule never would.
+    for inp in inputs {
+        if let Some(s) = inp.obj.symbols.iter().find(|s| s.defined && s.name.starts_with(SITE_PREFIX)) {
+            bail!("binding.defined_marker: {} defines {}; {HEADER} declares it and the build generates it, so remove the definition", inp.label, s.name);
+        }
+    }
     let mut rules = Vec::new();
     let mut operations: BTreeMap<(String, u32), Vec<usize>> = BTreeMap::new();
     let mut markers: BTreeMap<String, usize> = BTreeMap::new();
@@ -293,7 +317,7 @@ pub(crate) fn plan(
                 container(c, &what)?;
                 ensure!(r.event == Event::AfterWrite, "binding.invalid_fact: {what}: an instruction-address site takes event `after-write`");
                 let t = function_at(c, *pc).with_context(|| format!("binding.unknown_site: {what}: no compiled function of {c} holds 0x{pc:08X}"))?;
-                let key = (c.clone(), t.func.addr);
+                let key = (c.clone(), t.addr);
                 let (input, func) = match tiers.get(&key) {
                     Some(&Tier::C { input, func }) => (input, func),
                     Some(Tier::Lift { .. }) => return Err(unimplemented("instruments a lifted write at an instruction address")),
@@ -304,7 +328,7 @@ pub(crate) fn plan(
                         "binding.missing_c_write_site: {what}: 0x{pc:08X} is in {}, supplied C with no verified mapping of its writes; \
                          declare c_marker = \"<name>\" and call {SITE_PREFIX}<name>(destination, length, source_offset, selector, \
                          request_key) from {HEADER} right after the write",
-                        t.func.name
+                        t.name
                     )
                 })?;
                 // The call must be in the function holding the write, not
@@ -321,7 +345,7 @@ pub(crate) fn plan(
                 ensure!(
                     calls,
                     "binding.missing_c_write_site: {what}: {} ({}) never calls {symbol}; call it there, right after the write",
-                    t.func.name,
+                    t.name,
                     inputs[input].label
                 );
                 ensure!(!markers.contains_key(m), "binding.invalid_fact: two rules declare c_marker `{m}`");
@@ -442,27 +466,28 @@ pub(crate) fn plan(
     // Writer summaries: bounds inferred first, declared where analysis
     // can't establish them, and every known write inside the declaration.
     // A writer that can change a placement's code needs a rule.
-    let by_key: BTreeMap<(&str, u32), &psxw_lift::Translation> =
-        translations.iter().map(|t| ((t.func.container.as_str(), t.func.addr), t)).collect();
     let mut writers = Vec::new();
     for w in &f.writers {
         let what = format!("writer `{}`", w.id);
         let (analysed, extent) = match &w.site {
             Site::Function { .. } => {
                 let key = site_key(&w.site, &what)?;
-                let t = by_key[&(key.0.as_str(), key.1)];
-                (writes(&key, &by_key, tiers, &map.main), Some((key.0.clone(), t.func.addr..t.func.end)))
+                let f = funcs[&(key.0.as_str(), key.1)];
+                (writes(&key, &by_key, tiers, &map.main, &in_covered), Some((key.0.clone(), f.addr..f.end)))
             }
             Site::Pc { container: c, pc } => {
                 container(c, &what)?;
-                let t = function_at(c, *pc).with_context(|| format!("binding.unknown_site: {what}: no compiled function of {c} holds 0x{pc:08X}"))?;
-                let node = t.graph.nodes.iter().find(|(n, d)| n.pc() == *pc && d.insn.op.is_store());
-                let (node, _) = node.with_context(|| format!("binding.invalid_fact: {what}: 0x{pc:08X} is not a store"))?;
+                let f = function_at(c, *pc).with_context(|| format!("binding.unknown_site: {what}: no compiled function of {c} holds 0x{pc:08X}"))?;
+                // The original's instruction there, where it translated.
+                let t = by_key.get(&(c.as_str(), f.addr));
+                let node = t.map(|t| t.graph.nodes.iter().find(|(n, d)| n.pc() == *pc && d.insn.op.is_store()).map(|(n, _)| *n));
+                ensure!(node != Some(None), "binding.invalid_fact: {what}: 0x{pc:08X} is not a store");
                 let mut one = Writes::default();
-                if matches!(tiers.get(&(c.clone(), t.func.addr)), Some(Tier::Lift { .. })) {
-                    store(&mut one, t, *node);
-                } else {
-                    one.unbounded = Some(format!("{} is supplied C", t.func.name));
+                match (tiers.get(&(c.clone(), f.addr)), t, node.flatten()) {
+                    (Some(Tier::Lift { .. }), Some(t), Some(node)) => store(&mut one, t, node),
+                    (Some(Tier::Lift { .. }), ..) => bail!("{c} {:#010x}: lifted with no translation", f.addr),
+                    (Some(Tier::Adapter(_)), ..) => one.unbounded = Some(format!("{} is an adapter", f.name)),
+                    _ => one.unbounded = Some(format!("{} is supplied C", f.name)),
                 }
                 (one, None)
             }
@@ -470,9 +495,11 @@ pub(crate) fn plan(
         };
         let declared: Vec<Range<u32>> = w.destinations.iter().map(|d| d.start..d.end).collect();
         if !declared.is_empty() {
+            // As backing bytes: any alias of a byte names it (D5).
+            let backing: Vec<Range<u32>> = declared.iter().flat_map(window).collect();
             for (pc, r) in &analysed.known {
                 ensure!(
-                    declared.iter().any(|d| d.start <= r.start && r.end <= d.end),
+                    window(r).iter().all(|r| covers(&backing, r)),
                     "binding.invalid_fact: {what} declares {} but writes {} at 0x{pc:08X}",
                     declared.iter().map(hex).collect::<Vec<_>>().join(", "),
                     hex(r)
@@ -484,7 +511,8 @@ pub(crate) fn plan(
             Some(why) if !declared.is_empty() => (declared.clone(), format!("declared (analysis can't bound it: {why})")),
             Some(why) => bail!("binding.invalid_fact: {what}: analysis can't bound its writes ({why}); declare `destinations`"),
         };
-        let code: Vec<String> = bounds.iter().filter(|d| covered.iter().any(|k| overlaps(k, &window(d)))).map(hex).collect();
+        let code: Vec<String> =
+            bounds.iter().filter(|d| window(d).iter().any(|d| covered.iter().any(|k| overlaps(k, d)))).map(hex).collect();
         // A rule at its site (by address: any name for the function), or
         // at a write inside its function.
         let at = |site: &Site| match site {
@@ -509,16 +537,15 @@ pub(crate) fn plan(
         );
         // Rules whose ranges are constants must cover the code it can write;
         // a range known only at run time can't be refuted here.
-        let fixed: Option<Vec<Range<u32>>> = by_rules
+        let fixed: Option<Vec<Vec<Range<u32>>>> = by_rules
             .iter()
             .map(|r| match (&r.destination, &r.length) {
-                (Some(facts::Value::Const(d)), Some(facts::Value::Const(n))) if *n > 0 => Some(window(&(*d..d.wrapping_add(*n)))),
-                (Some(facts::Value::Const(_)), Some(facts::Value::Const(_))) => Some(0..0),
+                (Some(facts::Value::Const(d)), Some(facts::Value::Const(n))) => Some(span(*d, *n)),
                 _ => None,
             })
             .collect();
-        if let Some(fixed) = fixed.filter(|_| !code.is_empty()) {
-            for b in bounds.iter().map(window) {
+        if let Some(fixed) = fixed.map(|f| f.concat()).filter(|_| !code.is_empty()) {
+            for b in bounds.iter().flat_map(window) {
                 for k in &covered {
                     let piece = b.start.max(k.start)..b.end.min(k.end);
                     ensure!(
@@ -601,13 +628,18 @@ fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::N
     match t.facts.consts.get(&node).and_then(|c| c[insn.rs as usize]) {
         Some(base) => {
             let at = base.wrapping_add(insn.simm as u32);
-            let bytes = match insn.op {
-                Op::Sb => at..at + 1,
-                Op::Sh => at..at + 2,
-                Op::Swl | Op::Swr => (at & !3)..(at & !3) + 4,
-                _ => at..at + 4,
+            let (at, n) = match insn.op {
+                Op::Sb => (at, 1),
+                Op::Sh => (at, 2),
+                Op::Swl | Op::Swr => (at & !3, 4),
+                _ => (at, 4),
             };
-            out.known.push((node.pc(), bytes));
+            match at.checked_add(n) {
+                Some(end) => out.known.push((node.pc(), at..end)),
+                None => {
+                    out.unbounded.get_or_insert_with(|| format!("{} stores at the top of the address space at 0x{:08X}", t.func.name, node.pc()));
+                }
+            }
         }
         None => {
             out.unbounded.get_or_insert_with(|| format!("{} stores through a register at 0x{:08X}", t.func.name, node.pc()));
@@ -615,12 +647,14 @@ fn store(out: &mut Writes, t: &psxw_lift::Translation, node: psxw_lift::graph::N
     }
 }
 
-/// The writes of the function at `key` and everything it calls.
+/// The writes of the function at `key` and everything it calls. A call
+/// to a changing slot can reach any of its implementations.
 fn writes(
     key: &(String, u32),
     by_key: &BTreeMap<(&str, u32), &psxw_lift::Translation>,
     tiers: &BTreeMap<(String, u32), Tier>,
     main: &str,
+    changing: &dyn Fn(u32) -> bool,
 ) -> Writes {
     use psxw_lift::graph::{Callee, Dest, Transfer};
     let mut out = Writes::default();
@@ -630,21 +664,22 @@ fn writes(
         if !seen.insert((c.clone(), a)) {
             continue;
         }
-        let Some(t) = by_key.get(&(c.as_str(), a)) else {
-            out.unbounded.get_or_insert_with(|| format!("a call to 0x{a:08X}, which nothing implements"));
-            continue;
-        };
-        match tiers.get(&(c.clone(), a)) {
-            Some(Tier::Lift { .. }) => {}
-            Some(Tier::C { .. }) => {
-                out.unbounded.get_or_insert_with(|| format!("{} is supplied C", t.func.name));
+        let name = || by_key.get(&(c.as_str(), a)).map_or_else(|| format!("{c} 0x{a:08X}"), |t| t.func.name.clone());
+        let t = match (tiers.get(&(c.clone(), a)), by_key.get(&(c.as_str(), a))) {
+            (Some(Tier::Lift { .. }), Some(t)) => t,
+            (Some(Tier::C { .. }), _) => {
+                out.unbounded.get_or_insert_with(|| format!("{} is supplied C", name()));
+                continue;
+            }
+            (Some(Tier::Adapter(_)), _) => {
+                out.unbounded.get_or_insert_with(|| format!("{} is an adapter", name()));
                 continue;
             }
             _ => {
-                out.unbounded.get_or_insert_with(|| format!("{} is an adapter", t.func.name));
+                out.unbounded.get_or_insert_with(|| format!("a call to 0x{a:08X}, which nothing implements"));
                 continue;
             }
-        }
+        };
         for (node, d) in &t.graph.nodes {
             if d.insn.op.is_store() {
                 store(&mut out, t, *node);
@@ -663,14 +698,16 @@ fn writes(
             for callee in callees {
                 match callee {
                     Callee::Direct { addr, .. } => {
-                        // As the linker locates it: the caller's container,
-                        // the main one, else every container holding it.
-                        let own = [c.as_str(), main].into_iter().find(|k| by_key.contains_key(&(*k, addr)));
-                        match own {
+                        // As the linker binds it: whatever a changing slot
+                        // has bound, else the caller's container, the main
+                        // one, else every container holding it.
+                        let every = || tiers.keys().filter(|(_, x)| *x == addr).cloned();
+                        let own = [c.as_str(), main].into_iter().find(|k| tiers.contains_key(&(k.to_string(), addr)));
+                        match own.filter(|_| !changing(addr)) {
                             Some(k) => work.push((k.to_string(), addr)),
-                            None => work.extend(by_key.keys().filter(|(_, x)| *x == addr).map(|(k, x)| (k.to_string(), *x))),
+                            None => work.extend(every()),
                         }
-                        if !by_key.keys().any(|(_, x)| *x == addr) {
+                        if every().next().is_none() {
                             out.unbounded.get_or_insert_with(|| format!("a call to 0x{addr:08X}, which nothing implements"));
                         }
                     }

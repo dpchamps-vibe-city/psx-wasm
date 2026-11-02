@@ -259,8 +259,11 @@ replaces the stub for the regions it covers:
   at a covered address, keeps its call boundary: its C stays out of line
   even when written `inline` (weak and noinline, like D50's other functions; chosen by address,
   whatever name the C or the facts use), and a call to it is never lowered
-  to an intrinsic (a constant-length `memcpy`). The arguments a rule reads
-  are captured at entry. In a `[dispatch]` build supplied C is never
+  to an intrinsic (a constant-length `memcpy`); C may not declare it
+  `const` or `pure`, which would let clang merge or drop its calls
+  (`binding.elidable_call`). The arguments a rule reads
+  are captured at entry. Supplied C is the implementation even where its
+  original doesn't translate. In a `[dispatch]` build supplied C is never
   replaced by its translation automatically: void C whose result callers
   read needs a `[tier]` lift pin (`binding.c_replaced`). A selector no case
   names, or a
@@ -269,11 +272,15 @@ replaces the stub for the regions it covers:
 - A write inside supplied C is stated by the C itself: the rule names a
   `c_marker`, and the C calls `psxw_binding_site_<marker>` from the
   generated `psxw_binding.h` after the write, in the function holding it.
+  The build generates that function; C defining it fails
+  (`binding.defined_marker`).
   Values the rule declares literally must match the call's, and a source
   offset the rule derives from the placement must match the derived one. Writer summaries are inferred
   from constant-address stores first; declared bounds cover what analysis
-  can't and must contain every known write. When a writer's rules all have
-  constant ranges, they must cover the code it can change.
+  can't and must contain every known write, both compared as backing bytes
+  (D5), so an alias names the same bytes. Analysis follows a call to a
+  changing slot into every implementation it can bind. When a writer's rules
+  all have constant ranges, they must cover the code it can change.
 - Facts the build can't honour fail it with a `binding.*` diagnostic:
   unknown fields, an overlapping image without a placement, a translation
   embedding replaceable code, an expanded operation, a code-changing writer

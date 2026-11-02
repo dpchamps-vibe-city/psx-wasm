@@ -461,6 +461,9 @@ impl Rule {
             success == Success::Always || self.event == Event::Return,
             "{what}: success = {success:?} tests the operation's result, which only event `return` has"
         );
+        if let (Some(Value::Const(d)), Some(Value::Const(n))) = (&destination, &length) {
+            ensure!(*d as u64 + *n as u64 <= 1 << 32, "{what}: destination 0x{d:08X} + length 0x{n:X} runs past the end of the address space");
+        }
         Ok(RuleFacts {
             id: self.id.clone(),
             site,
@@ -559,6 +562,11 @@ request = "call"
         assert!(e.contains("request_group"), "{e}");
         let e = err(&EXAMPLE.replace("schema_version = 1", "schema_version = 2"));
         assert!(e.contains("schema_version 2"), "{e}");
+        // A constant range may end at 2^32, not past it.
+        let top = EXAMPLE.replace("destination = \"arg:1\"", "destination = \"const:0xFFFFFFFC\"");
+        assert!(parse(&top.replace("length = \"arg:2\"", "length = \"const:4\"")).unwrap().check().is_ok());
+        let e = err(&top.replace("length = \"arg:2\"", "length = \"const:8\""));
+        assert!(e.contains("runs past the end of the address space"), "{e}");
     }
 
     #[test]

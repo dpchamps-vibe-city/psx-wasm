@@ -471,12 +471,15 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
     let mut tiers: BTreeMap<(String, u32), Tier> = BTreeMap::new();
     let mut lifted = Vec::new();
     let mut unvalidated: BTreeSet<String> = BTreeSet::new();
-    for t in &translations {
-        let key = (t.func.container.clone(), t.func.addr);
-        let member = inputs.map.sdk_at(&t.func.container, t.func.addr).map(|p| p.member.as_str());
+    // Supplied C is the implementation even where its original doesn't
+    // translate.
+    let untranslated_c = untranslated(&inputs.program, c_defs.keys(), &translations);
+    for (f, t) in translations.iter().map(|t| (&t.func, Some(t))).chain(untranslated_c.iter().map(|f| (f, None))) {
+        let key = (f.container.clone(), f.addr);
+        let member = inputs.map.sdk_at(&f.container, f.addr).map(|p| p.member.as_str());
         let original = member.is_some_and(is_device);
         let policy = member.map(policy_of);
-        let name = adapter_name(&inputs.map, t, &adapter_names);
+        let name = adapter_name(&inputs.map, f, &adapter_names);
         let adapter = adapter_id.get(name.as_str()).filter(|_| policy == Some(Policy::Adapter) && !original);
         let object_ok = member.is_some_and(|m| keys.get(m).is_some_and(|k| validated.contains(&(m, *k))));
         if let (Some(_), Some(m), false) = (adapter, member, object_ok) {
@@ -485,12 +488,12 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         let tier = if let (Some(&id), true) = (adapter, object_ok) {
             Tier::Adapter(id)
         } else if let (Some(&(input, func)), false) =
-            (c_defs.get(&key), pinned.contains(t.func.name.as_str()) || auto_lift.contains(&key))
+            (c_defs.get(&key), pinned.contains(f.name.as_str()) || auto_lift.contains(&key))
         {
-            debug_assert!(t.func.sources.contains(&Source::Defined));
+            debug_assert!(f.sources.contains(&Source::Defined));
             Tier::C { input, func }
         } else {
-            lifted.push(t);
+            lifted.extend(t);
             continue;
         };
         tiers.insert(key, tier);
@@ -823,17 +826,30 @@ fn check_abi(wasm: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The name an adapter binds `t` by: its own, or, for a function the SDK's
+/// The name an adapter binds `f` by: its own, or, for a function the SDK's
 /// object doesn't name (a static one), its place in the object's text
 /// (`libetc/intr_dma:0x4c`).
-fn adapter_name(map: &psxw_inputs::AddressMap, t: &psxw_lift::Translation, adapter_names: &BTreeSet<&str>) -> String {
-    if adapter_names.contains(t.func.name.as_str()) {
-        return t.func.name.clone();
+fn adapter_name(map: &psxw_inputs::AddressMap, f: &psxw_lift::program::Function, adapter_names: &BTreeSet<&str>) -> String {
+    if adapter_names.contains(f.name.as_str()) {
+        return f.name.clone();
     }
-    match map.sdk_at(&t.func.container, t.func.addr).filter(|p| p.is_text()) {
-        Some(p) => format!("{}:{:#x}", p.member, t.func.addr - p.vram.start),
-        None => t.func.name.clone(),
+    match map.sdk_at(&f.container, f.addr).filter(|p| p.is_text()) {
+        Some(p) => format!("{}:{:#x}", p.member, f.addr - p.vram.start),
+        None => f.name.clone(),
     }
+}
+
+/// The functions among `keys` with no translation (their originals
+/// didn't translate), as the program found them.
+pub(crate) fn untranslated<'a>(
+    program: &psxw_lift::program::Program,
+    keys: impl IntoIterator<Item = &'a (String, u32)>,
+    translations: &[psxw_lift::Translation],
+) -> Vec<psxw_lift::program::Function> {
+    let translated: BTreeSet<(&str, u32)> = translations.iter().map(|t| (t.func.container.as_str(), t.func.addr)).collect();
+    let missing: BTreeSet<(String, u32)> = keys.into_iter().filter(|(c, a)| !translated.contains(&(c.as_str(), *a))).cloned().collect();
+    let containers: BTreeSet<&str> = missing.iter().map(|(c, _)| c.as_str()).collect();
+    containers.into_iter().flat_map(|c| program.functions(c)).filter(|f| missing.contains(&(f.container.clone(), f.addr))).collect()
 }
 
 /// An SDK function that accesses I/O or kernel RAM itself but runs as
@@ -988,13 +1004,13 @@ fn chip_decision(
     let inside = |t: &psxw_lift::Translation| member(t).is_some_and(in_chip);
     let unvalidated: BTreeSet<&str> = translations
         .iter()
-        .filter(|t| adapter_names.contains(adapter_name(map, t, adapter_names).as_str()) && inside(t))
-        .filter_map(|t| member(t).filter(|m| !bound(m, &adapter_name(map, t, adapter_names))))
+        .filter(|t| adapter_names.contains(adapter_name(map, &t.func, adapter_names).as_str()) && inside(t))
+        .filter_map(|t| member(t).filter(|m| !bound(m, &adapter_name(map, &t.func, adapter_names))))
         .collect();
     if !unvalidated.is_empty() {
         return Some(format!("unvalidated objects with adapters: {}", unvalidated.into_iter().collect::<Vec<_>>().join(", ")));
     }
-    let adapted = |t: &psxw_lift::Translation| inside(t) && member(t).is_some_and(|m| bound(m, &adapter_name(map, t, adapter_names)));
+    let adapted = |t: &psxw_lift::Translation| inside(t) && member(t).is_some_and(|m| bound(m, &adapter_name(map, &t.func, adapter_names)));
     if !translations.iter().any(adapted) {
         return Some("no adapters for it".into());
     }
@@ -1210,6 +1226,16 @@ pub(crate) fn c_input(
         .map(|s| s.name.clone())
         .collect();
     let text = std::fs::read_to_string(census_obj.with_extension("i"))?;
+    // Every call to a boundary must happen: clang may merge or delete one
+    // to a const or pure function, whatever its body.
+    let elidable: Vec<String> =
+        psxw_cc::ast::elidable_calls(&text, keep).into_iter().map(|(n, a)| format!("{n} ({a})")).collect();
+    ensure!(
+        elidable.is_empty(),
+        "binding.elidable_call: {container}/{stem} declares {}: each is a declared operation or at a changing slot, \
+         so every call to it must happen; remove the attribute",
+        elidable.join(", ")
+    );
     let variant = psxw_cc::ast::hook_variant(&text, &names, keep);
     std::fs::create_dir_all(dir)?;
     let vi = dir.join(format!("{stem}.i"));
