@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 2: `binding`, the explicit-binding plan and remaining legacy dispatch.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: `binding.native`, native references and their flows.
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -544,6 +545,7 @@ pub fn prepare(ws: &Workspace, opts: &Options) -> Result<Prepared> {
         slots: opts.moddable.then(|| tiers.keys().filter(|k| !expanded.contains(*k)).cloned().collect()),
         threads: !switches.is_empty(),
         binding: binding_plan,
+        lifted_params: crate::binding::lifted_params(&translations, &tiers),
         probes: inputs
             .manifest
             .run
@@ -634,6 +636,9 @@ pub fn finish(ws: &Workspace, opts: &Options, prep: Prepared) -> Result<(Report,
     }
     validate(&linked.wasm).context("guest module fails validation")?;
     binding.references = linked.references.clone();
+    binding.native = linked.native.clone();
+    binding.native.devirtualized = crate::binding::devirtualized(&translations, &tiers);
+    binding.native.lifted_carriers = crate::binding::lifted_carriers(&translations, &tiers);
 
     let dir = opts.mods.as_ref().map_or_else(|| out_dir(ws, &opts.game), |m| m.out.clone());
     std::fs::create_dir_all(&dir)?;

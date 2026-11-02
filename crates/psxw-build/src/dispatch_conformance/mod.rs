@@ -31,7 +31,9 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 /// 2: each variant's dispatch `path` and explicit-binding plan.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: `binding.native` (native references and their flows) and `native`,
+/// the linked module's native table and calls as built.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// A variant's verdict class (docs/conventions.md "Reports").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,6 +82,8 @@ pub struct VariantReport {
     pub path: &'static str,
     /// The explicit-binding plan and what stays legacy.
     pub binding: Option<crate::binding::Report>,
+    /// The linked module's native table and calls, as built.
+    pub native: Option<pipeline::NativeBuilt>,
     /// sha256 of the fixture as built.
     pub fixture_sha256: String,
 }
@@ -238,6 +242,9 @@ pub fn report_variant(w: &WasmResult, reference: Option<&Result<Vec<Observation>
             }
         }
     }
+    if let (Some(e), Ok(b)) = (&v.native, &w.build) {
+        problems.extend(native_problems(e, b));
+    }
     if let Some(why) = v.review_required {
         unresolved.push(why.into());
     }
@@ -289,8 +296,80 @@ pub fn report_variant(w: &WasmResult, reference: Option<&Result<Vec<Observation>
         untranslated: built.map(|b| b.untranslated.clone()).unwrap_or_default(),
         path: if v.dispatch.is_some() { "explicit" } else { "legacy" },
         binding: built.map(|b| b.binding.clone()),
+        native: built.map(|b| b.native.clone()),
         fixture_sha256: psxw_oracle::Hash::of(format!("{v:?}").as_bytes()).hex(),
     }
+}
+
+/// What's wrong with a build's native references, judged against the
+/// variant's structural expectation: the table's handles, the bodies its
+/// entries enter, its calls, and each named flow's representation.
+fn native_problems(e: &fixture::NativeExpect, b: &pipeline::Built) -> Vec<String> {
+    let mut out = Vec::new();
+    let report = &b.binding.native;
+    let table = &b.native.table;
+    if report.handles.len() != e.handles.len() || table.len() != report.handles.len() + usize::from(!report.handles.is_empty()) {
+        out.push(format!("native table: expected {} handles, the report has [{}], the module [{}]", e.handles.len(), report.handles.join(", "), table.join(", ")));
+    }
+    for (id, kind) in &e.handles {
+        let Some(k) = report.handles.iter().position(|h| h.split_once(' ').is_some_and(|(_, i)| i == id || (id.starts_with(':') && i.ends_with(id.as_str())))) else {
+            out.push(format!("native table: no handle for {id}"));
+            continue;
+        };
+        let name = table.get(k + 1).map_or("", String::as_str);
+        let ok = match *kind {
+            "c" | "helper" => name.starts_with("o32:") && !name.starts_with("o32:hook"),
+            "lift" => name.contains(":psxw_t_"),
+            "operation" => name.starts_with("operation:"),
+            _ => false,
+        };
+        if !ok {
+            out.push(format!("native handle {} ({id}) enters `{name}`, not a {kind} body", k + 1));
+        }
+    }
+    if b.native.calls < e.calls || b.native.calls != report.native_calls || (e.calls > 0 && b.native.native_indirect == 0) {
+        out.push(format!(
+            "expected at least {} native call sites: the module calls its native-call wrappers {} times ({} through the native table), the report counts {}",
+            e.calls, b.native.calls, b.native.native_indirect, report.native_calls
+        ));
+    }
+    let site = |f: &psxw_link::native::Flow, func: &str, sym: &str| f.sites.iter().any(|s| s.starts_with(&format!("{func} ")) && s.ends_with(&format!(": &{sym}")));
+    for (func, sym) in &e.native {
+        if !report.flows.iter().any(|f| f.representation == "native" && site(f, func, sym)) {
+            out.push(format!("expected {func}'s reference to {sym} in a native flow"));
+        }
+    }
+    let carried = (b.native.transports, b.native.lifted_native_calls, report.native_transports);
+    if carried.0 < e.transports || carried.0 != carried.2 || (e.transports > 0 && carried.1 == 0) {
+        out.push(format!(
+            "expected at least {} native transports into lifted code: the module calls {} transport wrappers and lifted code calls through the native table {} times, the report counts {}",
+            e.transports, carried.0, carried.1, carried.2
+        ));
+    }
+    for (func, k) in &e.carriers {
+        if !report.lifted_carriers.iter().any(|l| l.contains(&format!(" {func} a{k}: "))) {
+            out.push(format!("expected {func}'s a{k} to carry a native handle; carriers: [{}]", report.lifted_carriers.join(", ")));
+        }
+    }
+    for (func, to) in &e.devirtualized {
+        if !report.devirtualized.iter().any(|l| l.contains(&format!(" {func} 0x")) && l.ends_with(&format!("→ 0x{to:08X}"))) {
+            out.push(format!("expected {func}'s pointer call to 0x{to:08X} devirtualized; devirtualized: [{}]", report.devirtualized.join(", ")));
+        }
+    }
+    for func in &e.not_devirtualized {
+        if let Some(l) = report.devirtualized.iter().find(|l| l.contains(&format!(" {func} 0x"))) {
+            out.push(format!("expected {func}'s pointer calls through the dispatch table; {l}"));
+        }
+    }
+    for (func, sym, reason) in &e.retained {
+        let found = report.flows.iter().find(|f| site(f, func, sym));
+        match found {
+            Some(f) if f.representation == "guest" && f.reason.map(|r| r.name()) == Some(*reason) => {}
+            Some(f) => out.push(format!("expected {func}'s reference to {sym} kept as guest ({reason}); it is {} ({:?})", f.representation, f.detail)),
+            None => out.push(format!("expected {func}'s reference to {sym} kept as guest ({reason}); no flow has it")),
+        }
+    }
+    out
 }
 
 /// Whether a variant has supported checkpoints to run on the reference.
@@ -393,7 +472,7 @@ mod tests {
             variant,
             build: Ok(pipeline::Built {
                 linked: vec![], optimized: vec![], overlays: Default::default(),
-                tiers: Default::default(), untranslated: vec![], binding: Default::default(),
+                tiers: Default::default(), untranslated: vec![], binding: Default::default(), native: Default::default(),
             }),
             linked: Ok(observations.clone()), optimized: Ok(observations),
         };

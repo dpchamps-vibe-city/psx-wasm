@@ -33,6 +33,28 @@ pub struct Built {
     pub untranslated: Vec<String>,
     /// The explicit-binding plan and what stays legacy.
     pub binding: crate::binding::Report,
+    /// The linked module's native table and calls.
+    pub native: NativeBuilt,
+}
+
+/// The linked module's native references as built (plans/dispatch-binding
+/// B): read from the module itself, not the linker's report of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct NativeBuilt {
+    /// The native table by index, 0 (null) included: each entry's name.
+    pub table: Vec<String>,
+    /// Calls to the native-call wrappers (`native_call`): the native call
+    /// sites.
+    pub calls: usize,
+    /// `call_indirect` instructions through the native table (one per
+    /// wrapper signature) and through the guest dispatch table.
+    pub native_indirect: usize,
+    pub guest_indirect: usize,
+    /// Calls to the wrappers passing native handles to lifted functions
+    /// (`o32_call_native:<name>`), and lifted code's calls through the
+    /// native table (`native_call_lifted`).
+    pub transports: usize,
+    pub lifted_native_calls: usize,
 }
 
 /// The address map and original images a fixture's inputs describe.
@@ -179,12 +201,16 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
         slots: None,
         threads: !switches.is_empty(),
         binding: binding_plan,
+        lifted_params: crate::binding::lifted_params(&translations, &tiers),
     };
     ensure!(spec.threads == v.threads, "the fixture says threads = {}, the build found {} switches", v.threads, switches.len());
     let rodata = psxw_link::layout::Rodata::new(&map, &originals);
     let linked = psxw_link::game::link(&map, Some(&rodata), &spec, &link_inputs)?;
     validate(&linked.wasm).context("guest module fails validation")?;
     binding.references = linked.references.clone();
+    binding.native = linked.native.clone();
+    binding.native.devirtualized = crate::binding::devirtualized(&translations, &tiers);
+    binding.native.lifted_carriers = crate::binding::lifted_carriers(&translations, &tiers);
     if let Some(b) = &spec.binding {
         // Covered paths must not select implementations by code words.
         let sampled: Vec<String> = sampled_stubs(&linked.wasm)?.into_iter().filter(|a| b.covers(*a)).map(|a| format!("{a:#010x}")).collect();
@@ -195,6 +221,7 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
             debug_locations(&debug.wasm)?;
         }
     }
+    let native = native_built(&linked.wasm)?;
     let guest = if spec.threads { crate::game::asyncify(ws, dir, &linked.wasm, &switches, false)? } else { linked.wasm.clone() };
     let guest_path = dir.join("guest.wasm");
     std::fs::write(&guest_path, &guest)?;
@@ -213,7 +240,68 @@ pub fn build(ws: &Workspace, v: &Variant, dir: &Path) -> Result<Built> {
             (format!("{c} 0x{a:08X}"), k)
         })
         .collect();
-    Ok(Built { linked: guest, optimized, overlays, tiers, untranslated, binding })
+    Ok(Built { linked: guest, optimized, overlays, tiers, untranslated, binding, native })
+}
+
+/// The native table (the guest's second table; a fixture is never a
+/// moddable base) and the indirect calls through each table.
+pub fn native_built(wasm: &[u8]) -> Result<NativeBuilt> {
+    use wasmparser::{ElementItems, ElementKind, Operator, Payload};
+    let mut out = NativeBuilt::default();
+    let mut tables = 0u32;
+    let mut entries: Vec<u32> = Vec::new();
+    let mut names: BTreeMap<u32, String> = BTreeMap::new();
+    let mut callees: Vec<u32> = Vec::new();
+    for p in wasmparser::Parser::new(0).parse_all(wasm) {
+        match p? {
+            Payload::TableSection(r) => tables += r.count(),
+            Payload::ElementSection(r) => {
+                for e in r {
+                    let e = e?;
+                    let ElementKind::Active { table_index: Some(1), offset_expr } = e.kind else { continue };
+                    let mut ops = offset_expr.get_operators_reader();
+                    ensure!(matches!(ops.read()?, Operator::I32Const { value: 1 }), "the native table's entries start past null");
+                    let ElementItems::Functions(fs) = e.items else { anyhow::bail!("native table entries aren't functions") };
+                    for f in fs {
+                        entries.push(f?);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let mut ops = body.get_operators_reader()?;
+                while !ops.eof() {
+                    match ops.read()? {
+                        Operator::CallIndirect { table_index: 0, .. } => out.guest_indirect += 1,
+                        Operator::CallIndirect { .. } => out.native_indirect += 1,
+                        Operator::Call { function_index } => callees.push(function_index),
+                        _ => {}
+                    }
+                }
+            }
+            Payload::CustomSection(c) => {
+                let wasmparser::KnownCustom::Name(n) = c.as_known() else { continue };
+                for n in n {
+                    if let wasmparser::Name::Function(map) = n? {
+                        for f in map {
+                            let f = f?;
+                            names.insert(f.index, f.name.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let calls_to = |p: &dyn Fn(&str) -> bool| callees.iter().filter(|f| names.get(f).is_some_and(|n| p(n))).count();
+    out.calls = calls_to(&|n| n == "native_call");
+    out.transports = calls_to(&|n| n.starts_with("o32_call_native:"));
+    out.lifted_native_calls = calls_to(&|n| n == "native_call_lifted");
+    ensure!(tables <= 2, "a fixture's guest module has {tables} tables");
+    if tables == 2 {
+        out.table.push("null".into());
+        out.table.extend(entries.iter().map(|f| names.get(f).cloned().unwrap_or_else(|| format!("#{f}"))));
+    }
+    Ok(out)
 }
 
 /// Each C subprogram's DWARF starts in the body the name section gives that

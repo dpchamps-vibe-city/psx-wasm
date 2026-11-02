@@ -358,6 +358,8 @@ impl Insn {
             Addi | Addiu | Slti | Sltiu | Andi | Ori | Xori | Lui => self.rt,
             Mfc0 | Mfc2 | Cfc2 => self.rt,
             Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr => self.rt,
+            // The kernel's result.
+            Syscall => 2,
             _ => return None,
         };
         (r != 0).then_some(r)

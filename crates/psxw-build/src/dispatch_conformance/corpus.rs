@@ -76,6 +76,11 @@ fn words(ws: &[u32]) -> Vec<u8> {
 /// The main executable: the driver functions every fixture calls, then
 /// whatever `extra` adds.
 fn main_image(lay: &Layout, extra: impl FnOnce(&mut Unit)) -> Image {
+    main_unit(lay, extra).image(None, &[])
+}
+
+/// [`main_image`] before it is assembled, for data after its text.
+fn main_unit(lay: &Layout, extra: impl FnOnce(&mut Unit)) -> Unit {
     let mut u = Unit::new("main", lay.main);
     // call_slot(a0..a3): the slot's function, by a direct call.
     u.func("call_slot").addiu(SP, SP, -24).sw(RA, 16, SP).jal_abs(lay.slot).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
@@ -99,7 +104,7 @@ fn main_image(lay: &Layout, extra: impl FnOnce(&mut Unit)) -> Image {
     // poke(addr, word): one guest store, flush, return 0.
     u.func("poke").addiu(SP, SP, -24).sw(RA, 16, SP).sw(A1, 0, A0).jal("flush").nop().lw(RA, 16, SP).ori(V0, ZERO, 0).jr(RA).addiu(SP, SP, 24);
     extra(&mut u);
-    u.image(None, &[])
+    u
 }
 
 /// An overlay function at the unit's current address: the prologue, then
@@ -223,11 +228,12 @@ struct Fixture {
     build: Build,
     threads: bool,
     dispatch: Option<String>,
+    native: Option<NativeExpect>,
 }
 
 impl Fixture {
     fn new(images: Vec<Image>, script: Script) -> Self {
-        Self { images, init: Vec::new(), script, build: Build::Links, threads: false, dispatch: None }
+        Self { images, init: Vec::new(), script, build: Build::Links, threads: false, dispatch: None, native: None }
     }
 }
 
@@ -275,6 +281,7 @@ fn expand(d: &Def) -> Vec<Variant> {
                 threads: f.threads,
                 review_required: d.review_required,
                 dispatch: f.dispatch,
+                native: f.native,
             }
         })
         .collect()
@@ -1650,6 +1657,377 @@ fn d06_c(lay: &Layout, n: &Names) -> Fixture {
     Fixture::new(vec![main, a, b], s)
 }
 
+
+// ---- D06 native references (plans/dispatch-binding B) -------------------
+
+/// The targets every native-reference fixture takes the address of:
+/// `twice` (C), `thrice` (lifted) and `quad` (C), each logging and
+/// returning 2a, 3a and 4a.
+fn native_targets(u: &mut Unit, lay: &Layout) {
+    let a = u.func("twice");
+    a.addu(V0, A0, A0);
+    mark(a, lay, V0);
+    a.jr(RA).nop();
+    let a = u.func("thrice");
+    a.addu(V0, A0, A0).addu(V0, V0, A0);
+    mark(a, lay, V0);
+    a.jr(RA).nop();
+    let a = u.func("quad");
+    a.sll(V0, A0, 2);
+    mark(a, lay, V0);
+    a.jr(RA).nop();
+}
+
+/// The C of [`native_targets`] (thrice stays lifted), the log macro and
+/// `fn_t`. With `edited`, twice also logs [`EDIT_MARK`], which its MIPS
+/// doesn't.
+fn native_c(lay: &Layout, edited: bool) -> String {
+    let edit = if edited { format!("LOG(0x{EDIT_MARK:X}u); ") } else { String::new() };
+    format!(
+        "#define LOG(v) (*(*(unsigned **)0x{log:08X}u)++ = (unsigned)(v))\n\
+         typedef int (*fn_t)(int);\n\
+         int thrice(int a);\n\
+         int twice(int a) {{ int v = a + a; {edit}LOG(v); return v; }}\n\
+         int quad(int a) {{ int v = a << 2; LOG(v); return v; }}\n",
+        log = lay.log
+    )
+}
+
+/// Fixed address-taking in C: `use_fixed` takes its target from a helper's
+/// return (`pick`), compares it with `&twice` and calls it through another
+/// helper's parameter (`apply`), which tests it for null: a closed flow of
+/// fixed targets, native. The helpers are source-only: no address, as a
+/// decomp's own helpers are. Controls in the same image keep their guest
+/// addresses: `escape` saves `&twice` where lifted code reads, logs and
+/// calls it (opaque escape: the log shows the original address), and
+/// `numeric` adds `&thrice`'s low bits to its call's result (numeric
+/// observation).
+fn native_fixed_with(lay: &Layout, edited: bool) -> Fixture {
+    let saved = lay.stage + 0x1000;
+    let mut main = main_image(lay, |u| {
+        native_targets(u, lay);
+        u.func("save_ptr").li(T0, saved).sw(A0, 0, T0).jr(RA).ori(V0, ZERO, 0);
+        let a = u.func("call_saved");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).li(T0, saved).lw(T1, 0, T0).nop();
+        mark(a, lay, T1);
+        a.jalr(T1).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        // use_fixed(which, a): f = which ? thrice : twice; 0xEE if f is
+        // twice; f(a) + 1.
+        let a = u.func("use_fixed");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).la(T1, "thrice").bne(A0, ZERO, "uf_picked").nop().la(T1, "twice");
+        a.label("uf_picked");
+        a.la(T2, "twice").bne(T1, T2, "uf_call").nop();
+        mark_k(a, lay, 0xEE);
+        a.label("uf_call");
+        a.jalr(T1).mov(A0, A1).lw(RA, 16, SP).addiu(V0, V0, 1).jr(RA).addiu(SP, SP, 24);
+        // escape(a): save &twice, then call_saved(a).
+        let a = u.func("escape");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).sw(A0, 20, SP).la(A0, "twice").jal("save_ptr").nop();
+        a.lw(A0, 20, SP).jal("call_saved").nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        // numeric(a): thrice(a) + (&thrice & 0xFFF).
+        let a = u.func("numeric");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).la(T0, "thrice").andi(T1, T0, 0xFFF).sw(T1, 20, SP).jalr(T0).nop();
+        a.lw(T1, 20, SP).lw(RA, 16, SP).addu(V0, V0, T1).jr(RA).addiu(SP, SP, 24);
+    });
+    main.c = Some(format!(
+        "{}void save_ptr(fn_t p);\n\
+         int call_saved(int a);\n\
+         fn_t pick(int which) {{ return which ? thrice : twice; }}\n\
+         int apply(fn_t f, int a) {{ return f ? f(a) + 1 : -1; }}\n\
+         int use_fixed(int which, int a) {{\n\
+         \x20   fn_t f = pick(which);\n\
+         \x20   if (f == twice) LOG(0xEEu);\n\
+         \x20   return apply(f, a);\n\
+         }}\n\
+         int escape(int a) {{ save_ptr(twice); return call_saved(a); }}\n\
+         int observe(fn_t f, int a) {{ return f(a) + (int)((unsigned)f & 0xFFFu); }}\n\
+         int numeric(int a) {{ return observe(thrice, a); }}\n",
+        native_c(lay, edited)
+    ));
+    let (twice, thrice) = (main.addr("twice"), main.addr("thrice"));
+    let edit: &[u32] = if edited { &[EDIT_MARK] } else { &[] };
+    let mut s = Script::default();
+    let uf = main.addr("use_fixed");
+    s.call(uf, [0, 5, 0, 0], 11, &[[0xEE].as_slice(), edit, &[10]].concat());
+    s.call(uf, [1, 5, 0, 0], 16, &[15]);
+    s.call(main.addr("escape"), [6, 0, 0, 0], 12, &[[twice].as_slice(), edit, &[12]].concat());
+    s.call(main.addr("numeric"), [7, 0, 0, 0], 21 + (thrice & 0xFFF), &[21]);
+    let mut f = Fixture::new(vec![main], s);
+    f.native = Some(NativeExpect {
+        handles: vec![(format!("main 0x{twice:08X}"), "c"), (format!("main 0x{thrice:08X}"), "lift")],
+        calls: 1,
+        native: pairs(&[("pick", "thrice"), ("pick", "twice"), ("use_fixed", "twice")]),
+        retained: kept(&[("escape", "twice", "opaque_escape"), ("numeric", "thrice", "numeric_observation")]),
+        ..Default::default()
+    });
+    f
+}
+
+fn native_fixed(lay: &Layout, _: &Names) -> Fixture {
+    native_fixed_with(lay, false)
+}
+
+/// The same flows with twice's C deliberately edited: the native call
+/// enters the authored C, not its original's translation.
+fn native_edited(lay: &Layout, _: &Names) -> Fixture {
+    native_fixed_with(lay, true)
+}
+
+/// A relocated pointer table: C's `static const` table of `twice`,
+/// `thrice`, null and `quad` lives in AUX (clang's, no original address),
+/// read only by loads of whole cells. Its cells hold handles and its calls
+/// go through the native table; the original's table is in its data.
+/// Calling the null cell without a test is a native-handle rejection.
+fn native_table(lay: &Layout, _: &Names) -> Fixture {
+    let mut u = main_unit(lay, |u| {
+        native_targets(u, lay);
+        // call_op(i, a): f = ops[i & 3]; f ? f(a) : -1.
+        let a = u.func("call_op");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).andi(T0, A0, 3).sll(T0, T0, 2).la(T1, "ops").addu(T1, T1, T0).lw(T1, 0, T1).nop();
+        a.beq(T1, ZERO, "op_null").nop().jalr(T1).mov(A0, A1).lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        a.label("op_null");
+        a.lw(RA, 16, SP).addiu(V0, ZERO, -1).jr(RA).addiu(SP, SP, 24);
+        // call_op_raw(i, a): ops[i & 3](a).
+        let a = u.func("call_op_raw");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).andi(T0, A0, 3).sll(T0, T0, 2).la(T1, "ops").addu(T1, T1, T0).lw(T1, 0, T1).nop();
+        a.jalr(T1).mov(A0, A1).lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+    });
+    let at = |n: &str| u.a.addr_of(n).expect("a target");
+    let table = [at("twice"), at("thrice"), 0, at("quad")];
+    let ops = u.a.here();
+    u.a.define("ops", ops);
+    let mut main = u.image(None, &words(&table));
+    main.c = Some(format!(
+        "{}int quad(int a);\n\
+         static const fn_t ops[4] = {{ twice, thrice, 0, quad }};\n\
+         int call_op(int i, int a) {{ fn_t f = ops[i & 3]; return f ? f(a) : -1; }}\n\
+         int call_op_raw(int i, int a) {{ return ops[i & 3](a); }}\n",
+        native_c(lay, false)
+    ));
+    let (op, raw) = (main.addr("call_op"), main.addr("call_op_raw"));
+    let mut s = Script::default();
+    s.call(op, [0, 5, 0, 0], 10, &[10]);
+    s.call(op, [1, 5, 0, 0], 15, &[15]);
+    s.call(op, [2, 5, 0, 0], u32::MAX, &[]);
+    s.call(op, [7, 5, 0, 0], 20, &[20]);
+    s.call(raw, [1, 7, 0, 0], 21, &[21]);
+    // The original jumps to address 0: outside the supported domain.
+    s.reject(raw, [2, 7, 0, 0], "binding.native_handle 0x00000000".into());
+    let mut f = Fixture::new(vec![main], s);
+    f.native = Some(NativeExpect {
+        handles: vec![(format!("main 0x{:08X}", table[0]), "c"), (format!("main 0x{:08X}", table[1]), "lift"), (format!("main 0x{:08X}", table[3]), "c")],
+        calls: 2,
+        native: pairs(&[("ops", "twice"), ("ops", "thrice"), ("ops", "quad")]),
+        retained: vec![],
+        ..Default::default()
+    });
+    f
+}
+
+/// A mixed-tier flow: C calls a lifted six-argument function through a
+/// helper's parameter, natively, its stack words and result through o32 as
+/// before. C calling what lifted code returns keeps a guest address: a
+/// lifted return doesn't carry the representation word.
+fn native_mixed(lay: &Layout, _: &Names) -> Fixture {
+    let mut main = main_image(lay, |u| {
+        native_targets(u, lay);
+        // sum6(a..f) = a + .. + f, marked.
+        let a = u.func("sum6");
+        a.lw(T0, 16, SP).lw(T1, 20, SP).addu(V0, A0, A1).addu(V0, V0, A2).addu(V0, V0, A3).addu(V0, V0, T0).addu(V0, V0, T1);
+        mark(a, lay, V0);
+        a.jr(RA).nop();
+        // use_sum6(a) = sum6(a, 2..6) + sum6(a + 10, 2..6).
+        let a = u.func("use_sum6");
+        a.addiu(SP, SP, -40).sw(RA, 32, SP).sw(A0, 28, SP);
+        a.ori(T0, ZERO, 5).sw(T0, 16, SP).ori(T0, ZERO, 6).sw(T0, 20, SP).ori(A1, ZERO, 2).ori(A2, ZERO, 3).jal("sum6").ori(A3, ZERO, 4);
+        a.sw(V0, 24, SP).lw(A0, 28, SP);
+        a.ori(T0, ZERO, 5).sw(T0, 16, SP).ori(T0, ZERO, 6).sw(T0, 20, SP).addiu(A0, A0, 10).ori(A1, ZERO, 2).ori(A2, ZERO, 3);
+        a.jal("sum6").ori(A3, ZERO, 4).lw(T1, 24, SP).lw(RA, 32, SP).addu(V0, V0, T1).jr(RA).addiu(SP, SP, 40);
+        // get_fn() = &thrice; from_lift(a) = get_fn()(a).
+        u.func("get_fn").la(V0, "thrice").jr(RA).nop();
+        let a = u.func("from_lift");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).sw(A0, 20, SP).jal("get_fn").nop().lw(A0, 20, SP).jalr(V0).nop();
+        a.lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+    });
+    main.c = Some(format!(
+        "{}typedef int (*fn6_t)(int, int, int, int, int, int);\n\
+         int sum6(int a, int b, int c, int d, int e, int f);\n\
+         fn_t get_fn(void);\n\
+         int apply6(fn6_t f, int a) {{ return f(a, 2, 3, 4, 5, 6); }}\n\
+         int use_sum6(int a) {{ int x = apply6(sum6, a); return x + apply6(sum6, a + 10); }}\n\
+         int from_lift(int a) {{ return get_fn()(a); }}\n",
+        native_c(lay, false)
+    ));
+    let mut s = Script::default();
+    s.call(main.addr("use_sum6"), [1, 0, 0, 0], 52, &[21, 31]);
+    s.call(main.addr("from_lift"), [5, 0, 0, 0], 15, &[15]);
+    let mut f = Fixture::new(vec![main.clone()], s);
+    f.native = Some(NativeExpect {
+        handles: vec![(format!("main 0x{:08X}", main.addr("sum6")), "lift")],
+        calls: 1,
+        native: pairs(&[("use_sum6", "sum6")]),
+        ..Default::default()
+    });
+    f
+}
+
+/// Devirtualization, not native references: a lifted pointer call's target
+/// passed to an inlined callee in a temporary (outside the o32 ABI:
+/// `reg_call` reads `t0`), and one an inlined callee leaves in a temporary
+/// for its caller (`get_reg` sets `t1`). The lifter's dataflow over the
+/// expanded translation proves both targets, so the calls bind as the
+/// dispatch table would bind those pointers (`psxw_p_`), without a lookup.
+/// A target in an ABI argument (`call_ptr`'s) is a run-time value: still a
+/// dispatch-table call.
+fn lift_devirtualized(lay: &Layout, _: &Names) -> Fixture {
+    let main = main_image(lay, |u| {
+        native_targets(u, lay);
+        let a = u.func("reg_call");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).jalr(T0).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        let a = u.func("pass_reg");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).la(T0, "thrice").jal("reg_call").nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        u.func("get_reg").la(T1, "quad").jr(RA).nop();
+        let a = u.func("use_ret");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).sw(A0, 20, SP).jal("get_reg").nop().lw(A0, 20, SP).jalr(T1).nop();
+        a.lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        let a = u.func("pass_abi");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).mov(A1, A0).la(A0, "twice").jal("call_ptr").nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+    });
+    let mut s = Script::default();
+    s.call(main.addr("pass_reg"), [4, 0, 0, 0], 12, &[12]);
+    s.call(main.addr("use_ret"), [5, 0, 0, 0], 20, &[20]);
+    s.call(main.addr("pass_abi"), [6, 0, 0, 0], 12, &[12]);
+    let (thrice, quad) = (main.addr("thrice"), main.addr("quad"));
+    let mut f = Fixture::new(vec![main], s);
+    f.native = Some(NativeExpect {
+        devirtualized: vec![("pass_reg".into(), thrice), ("use_ret".into(), quad)],
+        not_devirtualized: vec!["call_ptr".into(), "pass_abi".into()],
+        ..Default::default()
+    });
+    f
+}
+
+/// Native-handle transport through a lifted argument register: C passes
+/// `&twice` to lifted `call_ptr`, which only moves its `a0` to `t0` and
+/// calls through it. The C call sets the representation word's bit 0, and
+/// `call_ptr`'s jalr calls through the native table; a guest pointer from
+/// the host takes the same body through the dispatch table (bit 0 clear).
+/// And back: lifted `ident` returns its `a0`, so `pass_through`'s handle
+/// returns to C, which calls it natively; the host's guest pointer comes
+/// back as the address it was.
+/// Controls: `log_call` stores its pointer in the log (an escape: the log
+/// shows the original address), and `forward` passes it on to `call_ptr`,
+/// a use the proof doesn't follow (not proven), so both keep guest
+/// addresses.
+fn native_lift_transport(lay: &Layout, _: &Names) -> Fixture {
+    let mut main = main_image(lay, |u| {
+        native_targets(u, lay);
+        // log_call(f, a): log f, then f(a).
+        let a = u.func("log_call");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).mov(T0, A0);
+        mark(a, lay, T0);
+        a.jalr(T0).mov(A0, A1).lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        // forward(f, a) = call_ptr(f, a).
+        let a = u.func("forward");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).jal("call_ptr").nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        // ident(f) = f.
+        u.func("ident").jr(RA).mov(V0, A0);
+        // pass_through(a) = ident(&twice)(a) + 1.
+        let a = u.func("pass_through");
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).sw(A0, 20, SP).la(A0, "twice").jal("ident").nop().lw(A0, 20, SP).jalr(V0).nop();
+        a.addiu(V0, V0, 1).lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        for (name, target, callee) in [("pass_lift", "twice", "call_ptr"), ("pass_logged", "thrice", "log_call"), ("pass_forward", "quad", "forward")] {
+            let a = u.func(name);
+            a.addiu(SP, SP, -24).sw(RA, 16, SP).mov(A1, A0).la(A0, target).jal(callee).nop();
+            a.lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+        }
+    });
+    main.c = Some(format!(
+        "{}int call_ptr(fn_t f, int a, int b, int c);\n\
+         int log_call(fn_t f, int a);\n\
+         int forward(fn_t f, int a);\n\
+         fn_t ident(fn_t f);\n\
+         int pass_lift(int a) {{ return call_ptr(twice, a, 0, 0); }}\n\
+         int pass_through(int a) {{ fn_t f = ident(twice); return f(a) + 1; }}\n\
+         int pass_logged(int a) {{ return log_call(thrice, a); }}\n\
+         int pass_forward(int a) {{ return forward(quad, a); }}\n",
+        native_c(lay, false)
+    ));
+    let (twice, thrice, quad) = (main.addr("twice"), main.addr("thrice"), main.addr("quad"));
+    let mut s = Script::default();
+    s.call(main.addr("pass_lift"), [4, 0, 0, 0], 8, &[8]);
+    s.call(main.addr("pass_logged"), [5, 0, 0, 0], 15, &[thrice, 15]);
+    s.call(main.addr("pass_forward"), [6, 0, 0, 0], 24, &[24]);
+    s.call(main.addr("call_ptr"), [quad, 7, 0, 0], 28, &[28]);
+    s.call(main.addr("pass_through"), [9, 0, 0, 0], 19, &[18]);
+    s.call(main.addr("ident"), [quad, 0, 0, 0], quad, &[]);
+    let mut f = Fixture::new(vec![main], s);
+    f.native = Some(NativeExpect {
+        handles: vec![(format!("main 0x{twice:08X}"), "c")],
+        native: pairs(&[("pass_lift", "twice"), ("pass_through", "twice")]),
+        retained: kept(&[("pass_logged", "thrice", "opaque_escape"), ("pass_forward", "quad", "missing_uses")]),
+        calls: 1,
+        transports: 2,
+        carriers: vec![("call_ptr".into(), 0), ("ident".into(), 0)],
+        ..Default::default()
+    });
+    f
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+}
+
+fn kept(v: &[(&str, &str, &'static str)]) -> Vec<(String, String, &'static str)> {
+    v.iter().map(|(a, b, r)| (a.to_string(), b.to_string(), *r)).collect()
+}
+
+/// A changing-slot control under explicit binding: C takes the slot's
+/// address (`drive_ref`), which keeps its guest address and follows the
+/// binding A -> B -> A, while each load goes through a native reference to
+/// the declared loader (`load_ref`): its instrumentation still publishes.
+fn native_slot(lay: &Layout, n: &Names) -> Fixture {
+    let mut main = explicit_main(lay, Loader::Lifted);
+    append(&mut main, "drive_ref", |a| {
+        a.addiu(SP, SP, -24).sw(RA, 16, SP).li(T0, lay.slot).jalr(T0).nop().lw(RA, 16, SP).nop().jr(RA).addiu(SP, SP, 24);
+    });
+    let lm = main.addr("load_module");
+    append(&mut main, "load_ref", |a| {
+        a.j_abs(lm).nop();
+    });
+    let slot_fn = format!("func_{:08X}", lay.slot);
+    main.c = Some(format!(
+        "typedef int (*fn_t)(int);\n\
+         typedef int (*load_t)(unsigned sel, unsigned *dst, int len);\n\
+         int {slot_fn}(int a);\n\
+         int load_module(unsigned sel, unsigned *dst, int len);\n\
+         int apply(fn_t f, int a) {{ return f(a); }}\n\
+         int load_via(load_t l, unsigned sel, unsigned *dst, int len) {{ return l(sel, dst, len); }}\n\
+         int drive_ref(int a) {{ return apply({slot_fn}, a); }}\n\
+         int load_ref(unsigned sel, unsigned *dst, int len) {{ return load_via(load_module, sel, dst, len); }}\n"
+    ));
+    let (a, b, c) = explicit_images(lay, n, false);
+    let len = |im: &Image| im.bytes.len() as u32;
+    let (load, drive) = (main.addr("load_ref"), main.addr("drive_ref"));
+    let mut s = Script::default();
+    for (arg, sel, im, k) in [(1, 0, &a, 0x100), (2, 1, &b, 0x200), (3, 0, &a, 0x100)] {
+        s.call(load, [sel, lay.slot, len(im), 0], 0, &[]);
+        s.call(drive, [arg, 0, 0, 0], arg + k, &[arg + k]);
+    }
+    let init = vec![(lay.stage, a.bytes.clone()), (lay.stage + 0x400, b.bytes.clone()), (lay.stage + 0x800, c.bytes.clone())];
+    let mut f = Fixture::new(vec![main, a, b, c], s);
+    f.init = init;
+    f.dispatch = Some(explicit_facts(n, lay, &return_rule("load_module")));
+    f.native = Some(NativeExpect {
+        handles: vec![(format!("main 0x{lm:08X}"), "operation")],
+        calls: 1,
+        native: pairs(&[("load_ref", "load_module")]),
+        retained: kept(&[("drive_ref", &slot_fn, "late_binding")]),
+        ..Default::default()
+    });
+    f
+}
+
 // ---- D07: addresses and namespaces -------------------------------------
 
 /// Overlay a resident; one call through `ptr`, expecting `expect`.
@@ -2043,6 +2421,19 @@ fn defs() -> Vec<Def> {
         d("D06", "lifted-routes", "supported", REF, d06_lifted),
         d("D06", "interior-entry", "supported", REF, d06_interior),
         d("D06", "c-routes", "supported", REF, d06_c),
+        d("D06", "native-reference-fixed", "supported: fixed address-taking in C, native; escaping and numeric controls keep guest addresses", REF, native_fixed),
+        d("D06", "native-reference-table", "supported: a relocated pointer table of handles; its null cell called is a native-handle rejection", REF, native_table),
+        d("D06", "native-reference-mixed", "supported: C calls a lifted function natively, its stack words and result through o32", REF, native_mixed),
+        d("D06", "native-reference-lift-transport", "supported: a native handle passes into a lifted argument register and its jalr calls natively; a lifted function storing or forwarding the pointer keeps it guest", REF, native_lift_transport),
+        d("D06", "lift-devirtualized", "supported: lifted pointer calls whose targets dataflow proves across inlined callees are devirtualized; an ABI argument's stays a table call", REF, lift_devirtualized),
+        d("D06", "native-reference-slot", "supported: a changing slot's address keeps its binding; a native reference reaches the loader's instrumentation", REF, native_slot),
+        d(
+            "D06",
+            "native-reference-edited-c",
+            "supported: a native reference enters the deliberately edited C",
+            Evidence::ClosedForm("authored C edit: its log entry is absent from the original binary"),
+            native_edited,
+        ),
         d("D07", "kseg1-alias", "supported: KSEG1 views the same RAM", REF, d07_kseg1),
         d("D07", "kuseg-alias", "supported: KUSEG views the same RAM", REF, d07_kuseg),
         d("D07", "misaligned", "proposed port rejection, not a console address-error model", REF, d07_misaligned),

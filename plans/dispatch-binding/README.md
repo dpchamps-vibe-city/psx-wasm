@@ -295,7 +295,7 @@ not dispatch inference and need not be deleted.
 ## Tasks
 
 - [ ] Complete A and retain its evidence.
-- [ ] Complete B and retain its evidence.
+- [x] Complete B and retain its evidence (subset; [B progress](02-native-references.md#progress-log)).
 - [ ] Complete C, production input migration and the full conformance gate.
 
 ## Progress log
@@ -305,6 +305,11 @@ not dispatch inference and need not be deleted.
   continuation, namespace and failure contracts.
 - Removed automatic C-to-lift selection. Prescribed native C frame lifetime,
   authored C continuation/state interfaces and source-debugging acceptance instead.
+- B implemented (D74): per-object native reference flows, the private native
+  table and handle check (ABI 20), transport into lifted argument registers
+  and back over a representation word, reports and the `D06/native-reference-*`
+  group; acceptance pending review. The full corpus keeps its pre-B failing
+  set for milestone C.
 
 ## Findings
 

@@ -41,9 +41,16 @@ pub struct Report {
     /// overlay's entry, callable whatever is resident).
     pub classification: BTreeMap<&'static str, usize>,
     /// Code references by how the linker bound them: `fixed`, `slot`,
-    /// `lookup` (a guest address through the dispatch table) and the
-    /// legacy classes.
+    /// `lookup` (a guest address through the dispatch table), `native` and
+    /// `native-call` (a native handle and a call through the native table,
+    /// plans/dispatch-binding B) and the legacy classes.
     pub references: BTreeMap<&'static str, usize>,
+    /// Native references (B): the native table, and each reference flow's
+    /// sites, targets, consumers, crossings and representation, with the
+    /// reason a guest flow keeps its addresses. A guest flow whose reason
+    /// names an explicit binding is complete; one naming resident code
+    /// words is the legacy identity migration milestone C finishes.
+    pub native: psxw_link::native::Report,
     /// What still bypasses explicit bindings.
     pub legacy: Vec<String>,
     /// Required work this build doesn't do yet (milestone C).
@@ -692,6 +699,65 @@ fn writes(
         }
     }
     out
+}
+
+/// Lifted functions' argument registers, as the lift proved them, for the
+/// link's native references (plans/dispatch-binding B).
+pub(crate) fn lifted_params(
+    translations: &[psxw_lift::Translation],
+    tiers: &BTreeMap<(String, u32), Tier>,
+) -> BTreeMap<(String, u32), BTreeMap<u8, psxw_link::native::LiftedParam>> {
+    use psxw_lift::analysis::Refusal;
+    use psxw_link::native::{LiftedParam, Reason};
+    translations
+        .iter()
+        .filter(|t| matches!(tiers.get(&(t.func.container.clone(), t.func.addr)), Some(Tier::Lift { .. })))
+        .map(|t| {
+            let params = t
+                .transport
+                .iter()
+                .map(|(k, r)| {
+                    let p = match r {
+                        Ok(c) => LiftedParam::Native { jalrs: c.jalrs.clone(), returned: c.returned },
+                        Err(Refusal::Observed(w)) => LiftedParam::Refused(Reason::NumericObservation, w.clone()),
+                        Err(Refusal::Escapes(w)) => LiftedParam::Refused(Reason::OpaqueEscape, w.clone()),
+                        Err(Refusal::Unproven(w)) => LiftedParam::Refused(Reason::MissingUses, format!("not proven: {w}")),
+                    };
+                    (*k, p)
+                })
+                .collect();
+            ((t.func.container.clone(), t.func.addr), params)
+        })
+        .collect()
+}
+
+/// The lifted argument registers that can carry a native handle, for the
+/// report: `<container> <function> a<k>: jalr 0x..`.
+pub(crate) fn lifted_carriers(translations: &[psxw_lift::Translation], tiers: &BTreeMap<(String, u32), Tier>) -> Vec<String> {
+    translations
+        .iter()
+        .filter(|t| matches!(tiers.get(&(t.func.container.clone(), t.func.addr)), Some(Tier::Lift { .. })))
+        .flat_map(|t| {
+            t.transport.iter().filter_map(move |(k, r)| {
+                let c = r.as_ref().ok()?;
+                let jalrs: Vec<String> = c.jalrs.iter().map(|p| format!("0x{p:08X}")).collect();
+                let ret = if c.returned { "; returned in v0" } else { "" };
+                Some(format!("{} {} a{k}: jalr [{}]{ret}", t.func.container, t.func.name, jalrs.join(", ")))
+            })
+        })
+        .collect()
+}
+
+/// Lifted pointer calls devirtualized on a target only dataflow proves, for
+/// the native report.
+pub(crate) fn devirtualized(translations: &[psxw_lift::Translation], tiers: &BTreeMap<(String, u32), Tier>) -> Vec<String> {
+    translations
+        .iter()
+        .filter(|t| matches!(tiers.get(&(t.func.container.clone(), t.func.addr)), Some(Tier::Lift { .. })))
+        .flat_map(|t| {
+            t.graph.proven_targets.iter().map(|(pc, to)| format!("{} {} 0x{pc:08X}: jalr → 0x{to:08X}", t.func.container, t.func.name))
+        })
+        .collect()
 }
 
 /// The values a rule reads.

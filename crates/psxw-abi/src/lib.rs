@@ -58,7 +58,10 @@ pub mod replay;
 ///   existing kernel_call and exception-exit seams.
 /// - 19: explicit binding (plans/dispatch-binding A): `psx.binding_fault`
 ///   rejects a publication a binding rule can't make.
-pub const ABI_VERSION: u32 = 19;
+/// - 20: native references (plans/dispatch-binding B): the guest keeps a
+///   private native function table; `psx.binding_fault` with
+///   [`binding_cause::NATIVE_HANDLE`] rejects an invalid native handle.
+pub const ABI_VERSION: u32 = 20;
 
 /// The audio output rate: the SPU's, one sample per 768 CPU cycles.
 pub const AUDIO_HZ: u32 = 44_100;
@@ -314,12 +317,16 @@ pub mod binding_cause {
     pub const BAD_DESTINATION: u32 = 2;
     /// A `c_marker` call passed a value its rule declares otherwise.
     pub const MARKER_MISMATCH: u32 = 3;
+    /// A native call's handle names no entry of the native function table
+    /// (plans/dispatch-binding B); the value is the handle, the rule 0.
+    pub const NATIVE_HANDLE: u32 = 4;
 
     pub fn name(cause: u32) -> &'static str {
         match cause {
             UNKNOWN_SELECTOR => "binding.unknown_selector",
             BAD_DESTINATION => "binding.bad_destination",
             MARKER_MISMATCH => "binding.marker_mismatch",
+            NATIVE_HANDLE => "binding.native_handle",
             _ => "binding.fault",
         }
     }
