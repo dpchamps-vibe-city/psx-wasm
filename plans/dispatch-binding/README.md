@@ -1,206 +1,314 @@
-# Dispatch binding: explicit identity instead of resident-byte inference
+# Dispatch binding: implementation plan
 
-**Status:** prescriptive implementation plan; execution not started. The operator
-requested this plan, not a blanket change to D5/D6/D7 or to the supported
-execution contract. Resolve the specific decision gates below before the work
-that depends on them. Ordinary fixes within the existing contract may proceed;
-do not treat every compiler change as requiring a new architectural decision.
+**Status:** not started. **Direction:** native references for proven fixed
+bindings; explicit activation for changing bindings; no resident-byte inference
+in the completed build. This document specifies the implementation contract.
+There are no pending approvals, policy choices or design gates in this plan.
+
+Missing facts produce the diagnostics specified below. Missing mechanisms are
+implementation tasks. Neither is an invitation to choose weaker semantics or
+ask the operator to design the mechanism. Keep implementation and acceptance
+status separate: writing this plan does not claim that production has changed.
 
 ## Read first
 
-- [Project conventions](../../docs/conventions.md) and
-  [architecture](../../docs/emulation-layers.md).
-- [Design](../../docs/design.md), especially §§1–4 and D5/D6/D7/D11.
-- [Problem statement and diagrams](../dispatch-identity-and-binding.md).
-- [Dispatch conformance](../dispatch-conformance.md): current evidence, proposed
-  contracts, failures and unfinished harness/gate work. This plan supplies a
-  remediation path; it does not replace that independent correctness contract.
+- [Project conventions](../../docs/conventions.md).
+- [Architecture](../../docs/emulation-layers.md): SDK → adaptor → native backend;
+  hosts integrate with the backend. This is a static compiler/native port.
+- [Current design](../../docs/design.md), particularly D5/D6/D7/D11.
+- [Problem statement](../dispatch-identity-and-binding.md).
+- [Conformance evidence](../dispatch-conformance.md).
+
+The contracts here replace the earlier dispatch-specific approval placeholders.
+Preserve historical reports, but do not carry their `review_required` labels
+forward as unresolved decisions where this plan supplies the answer. Update the
+design and decision log alongside implementation, describing what actually lands.
 
 ## Context
 
-The tool compiles separate functions identified by `(container, guest address)`.
-C, lifted MIPS and native adaptors already have distinct compiled entries. But
-function pointers retain guest addresses. Two modules can use the same address
-P for different functions at different times.
+The compiler already identifies functions by `(container, guest address)` and
+emits separate Wasm implementations. Original references can nevertheless use
+one address P for different functions at different times. Loading MIPS bytes into
+game memory does not replace either compiled function.
 
-Loading original bytes into game memory does not replace a Wasm function. The
-current linker uses sampled original code words to choose a precompiled function
-at shared addresses. Additional distinguishing words fix some image collisions,
-but do not establish translation validity. Identical code can depend on different
-runtime tables or replaceable callees; mixed bytes can pass the same probes.
+Today, shared addresses use sampled instruction words to identify a candidate.
+That distinguishes some known images, but cannot establish all translation
+assumptions. Identical instructions may depend on runtime tables; partial loads
+can combine known code; suspended execution can resume into replaced code.
 
-The target architecture has two paths through one binding model:
-
-```text
-                            code reference
-                                  |
-                    +-------------+-------------+
-                    v                           v
-              proven fixed                 late-bound slot
-                    |                           |
-             native call/ref           activation sets binding
-                    |                           |
-                    +-------------+-------------+
-                                  v
-                           compiled function
-```
-
-A third category, unresolved guest-address references, remains visible during
-migration. Do not guess that such a reference is fixed or silently label its
-legacy behaviour native.
-
-Activation is compiler-support runtime functionality, not CPU emulation. The
-compiler/input contract establishes when a module becomes callable; generated
-runtime code publishes the bindings. The browser or native host does not decide
-which module a guest address means. A generic binding runtime can remain in the
-finished port: removing every runtime helper is not the goal.
-
-## Deliverables and order
-
-| Milestone | Result | Depends on |
-|---|---|---|
-| [A — Explicit activation, existing pointer ABI](01-explicit-activation.md) | Declarative activation facts, common binding plan, generated activation events and updated guest dispatch entries; bounded C/lift integration | Approval of the explicit activation contract |
-| [B — Native references where proven safe](02-native-references.md) | Direct/native references through proven flows, relocations and explicit interoperability boundaries; remaining guest references reported | A's binding model; approval of representation/conversion rules |
-| [C — Coverage and retirement of inference](03-retire-inference.md) | Runtime/mod integration, reviewed difficult cases, complete supported-path coverage and enforcement of no byte-based execution selection | A/B; reviewed lifetime/overlap policies and conformance completion |
-
-Do these in order. A is a real vertical slice, not merely a table API. B delivers
-native references incrementally, not a claim that all original integers have
-been converted. C is required before claiming production dispatch no longer
-infers code identity from bytes.
-
-### Where the six workstreams land
-
-| Workstream | A | B | C |
-|---|---|---|---|
-| Common reference/binding model | Inventory, classify and report | Carry per-reference identity through lowering | Close supported-path coverage gaps |
-| Fixed-reference path | Retain existing proven direct calls | Native references, relocations and conversion boundaries | Finish relevant consumers |
-| Activation runtime | Initial state and generated binding updates | Reuse; never snapshot slots as fixed functions | Replacement/lifetime cases and production rollout |
-| Activation facts/instrumentation | Small declarative contract; C and lift instrumentation | Preserve events through native lowering | Cover supported arrival mechanisms |
-| Translation assumptions | Prevent unsound binding/expansion in the vertical slice | Proof obligations for native promotion | Jump tables, independent regions, suspension and remaining findings |
-| Callable boundaries | Preserve guest ABI; inventory all consumers | Explicit native/guest interoperability | Real runtime, callbacks, stand-ins, hooks and data patches |
-
-## Scope boundaries
-
-Keep these unless a separate reviewed change requires otherwise:
-
-- Guest data-memory layout, scratchpad placement and ordinary data pointers.
-- The C and MIPS-to-C frontends, existing o32 marshalling and native adaptors.
-- SDK → adaptor → native backend; host integration remains below that boundary.
-- Ahead-of-time compilation. No production MIPS interpreter, JIT, console-wide
-  memory bus, instruction-count scheduler or register-level SDK detour.
-- The existing synthetic/reference harness. Extend its production seams rather
-  than create another compiler, oracle framework or matrix of every variant.
-
-Do not add whole-code hashes, watch every store, or invent a universal provenance
-engine as a shortcut to completing this plan. Do not patch an individual game's
-loader in compiler source. Game facts belong in versioned declarative inputs;
-SDK facts belong in `boundary/` where applicable.
-
-A source symbol's container is provenance, not proof of a permanent binding:
+The replacement is:
 
 ```text
-activate A; p = P; call p -> A
-activate B;        call p -> B
+                           code reference
+                                 |
+                   +-------------+-------------+
+                   v                           v
+             proven fixed                 changing slot
+                   |                           |
+             native call/ref          explicit binding lookup
+                   |                           ^
+                   |                  publication updates it
+                   +-------------+-------------+
+                                 v
+                         compiled implementation
 ```
 
-A native reference to A would be wrong for this flow. Preserve the changing slot.
-Likewise, retaining original data addresses is independent of choosing native
-code references; do not turn this into a whole-memory-layout rewrite.
+Guest-address references remain at opaque boundaries, but their lookup uses
+explicit bindings, not instruction bytes. A generic binding runtime is legitimate
+compiler support. Eliminating all runtime support or relocating all data is not
+the objective.
 
-## Shared implementation rules
+## Milestones
 
-1. **Reuse the identities and wrappers we have.** Add a small binding plan beside
-   existing compiler structures, not a replacement IR or a new runtime crate.
-2. **Decide per reference/flow, not merely per function.** The same compiled
-   function can be reached through fixed and late-bound references.
-3. **Keep unknowns explicit.** Every fallback needs a site/region, reason and
-   coverage status. Metadata for a declared explicit region must not silently
-   fall back to byte probing if it is incomplete or invalid.
-4. **Separate image identity from translation validity.** Audit embedded code,
-   discovered jump targets and cross-region calls. Preserve dynamic dependencies
-   or establish their stability; do not add mutable data to an image fingerprint.
-5. **Keep optimization enabled.** Activation events and reference semantics must
-   survive ordinary C compilation, Wasm rewriting and `wasm-opt -O2`.
-6. **Do not shrink the correctness contract to pass tests.** A's bounded fixtures
-   are an implementation boundary, not a declaration that partial loads or
-   active-code replacement in the existing corpus are unsupported.
-7. **Make ordering explicit.** Initial publication, re-entry, callbacks and data
-   patches must not observe an accidental half-updated binding map.
-8. **Version actual boundaries.** Bump changed report/custom-section/runtime ABI
-   versions and reject incompatible consumers. Do not introduce an ABI break for
-   a helper entirely private to generated game code.
-
-## Decision gates
-
-Record the resolution and supporting evidence in `docs/design.md` and its
- decision log before implementing the corresponding architectural change. Do not
-restore the removed D72 or treat the deferred D69 proposal as already approved.
-
-| Gate | Decision required | Work it gates |
+| Milestone | Deliverable | Dependency |
 |---|---|---|
-| A | Activation facts, callable regions/placements, initial/replacement bindings and failure semantics for the initial explicit path; D7 change while retaining D6 values | Publishing explicit bindings instead of byte identification |
-| B | Native reference representation, pointer-observable behaviour and conversion boundaries; the relevant D6 change | Emitting native references into eligible flows |
-| C | Remaining executable overlap, intermediate availability, active/suspended lifetime and namespace policies | Broad rollout and retirement of legacy execution selection |
+| [A — Explicit activation](01-explicit-activation.md) | Input facts, binding plan, real operation instrumentation and generated binding updates; original pointer ABI retained | None |
+| [B — Native references](02-native-references.md) | Native calls/handles in proven closed flows; explicit preservation of guest representation elsewhere | A |
+| [C — Coverage and retirement](03-retire-inference.md) | Partial replacement, source-owned C continuations and lifted continuation rebinding, runtime/mod integration and no-inference builds | A and B |
 
-For C, classify each outstanding finding as an ordinary implementation defect,
-a missing input fact, or a concrete architecture decision. Do not replace this
-classification with a blanket approval request. Rejections are not proof of
-support for a positive original-MIPS case.
+A and B are bounded implementation increments. Their passing subsets do not
+complete C or erase the remaining full-corpus failures.
 
-## Evidence and reporting
+## Contract 1: identities, placements and data
 
-Use existing `build.json` and `out/conform/dispatch/{report.json,summary.txt}`.
-Add deterministic, versioned binding evidence rather than a separate reporting
-platform. Record:
+- Guest-associated functions retain `(container, original entry)` identities.
+  Source-only C helpers and continuation handlers use qualified compiled-symbol
+  identities `(container, translation unit, symbol)` instead; do not invent original
+  PSX addresses for them. Dense runtime IDs are assigned deterministically at link
+  time; numeric IDs are not part of the guest ABI.
+- A placement is a container's compiled original address layout, derived from
+  its segments. Compile additional placements explicitly; do not pretend an
+  arbitrary destination relocates already-compiled code.
+- A slot identifies a callable entry or continuation at a placement address.
+  Overlapping containers share the affected slots; unrelated regions do not.
+- Supplied game C is authoritative, including edits that differ from the original
+  binary. Use lifting only for missing C implementations or an explicit per-function
+  lift selection. Dispatch, instrumentation and continuation limitations must never
+  trigger an automatic C-to-lift fallback. Existing SDK/adaptor policy is unchanged.
+- Keep D5's data-memory window, scratchpad, structure layouts and data pointers.
+  Keep o32 transport at existing C/lift/runtime boundaries.
+- Preserve function identity separately from binding semantics. `p = P` can name
+  a changing slot even when P initially belongs to a known module. Never freeze
+  such a reference to its initial occupant.
 
-- Function/region identity, reference site and binding classification.
-- Activation-rule provenance and selected compiled placement.
-- Translation assumptions relevant to binding and why native promotion is safe.
-- Every byte-inference or unresolved compatibility path, including mod consumers.
-- Input/rule hashes, compiler revision, toolchain/reference provenance and whether
-  the run is a subset. Counts must not hide the individual remaining sites.
+## Contract 2: executable availability and activation
 
-Use original MIPS as the independent oracle for original program behaviour.
-Activation annotations belong to the compiler input: the reference program still
-performs its real load/copy/unpack and does not receive a host-authored activation
-answer. Port-only handle/ABI rules require explicit port-contract tests, not an
-invented console oracle.
+Maintain a compiler-private interval map of published executable provenance:
+`(destination range, module, source range, load instance)`, plus generation
+counters for affected bindings. Key ranges by D5 backing-window offsets so writes
+through data-address aliases affect the same availability; retain original guest
+addresses for diagnostics. This is event-derived state, not a scan of RAM.
 
-A's and B's selected acceptance cases can pass while the full corpus remains
-red. Preserve those full reports and their classifications. Missing reference
-input, an unresolved required contract, a timeout or an arbitrary trap is never
-an acceptance pass. Unit tests that skip without tools are not sufficient exit
-evidence; run the CLI with its required tools/reference configured.
+1. Boot publishes the executable ranges actually supplied by the boot image.
+   Merely having compiled a module does not make it callable.
+2. A declared code write invalidates exactly the bytes it replaces. A subsequent
+   publication records the known source identity of the completed, visible range.
+3. Publication is range-based, not an atomic whole-overlay transaction. Untouched
+   tails retain their previous provenance. Independently replaced ranges retain
+   independent bindings.
+4. A completed copy/unpack publishes its established source identity. Unknown
+   writes invalidate without publishing a known identity. Failure does not roll
+   back already completed writes or restore overwritten bindings.
+5. Preserve original writes and data effects. Publish before the next guest
+   observation of that completed range; do not insert a callback/safepoint in the
+   middle of a logically indivisible binding update. Use the existing scheduler.
+6. Only cache-coherent publication is in scope, as in the existing reference
+   fixtures. Do not reproduce instruction-cache hardware or infer visibility from
+   a random disc completion.
+7. Every reachable code-changing operation must be covered by compiler analysis
+   or a declarative writer summary. Conservatively unresolved writer effects are
+   a strict-build error, not permission to install global store interception or
+   silently retain byte inference.
 
-## Completion and maintenance
+The event API has two effects: `invalidate(destination, length)` and
+`publish(module, placement, source_offset, destination, length, instance)`.
+Generate their implementation in the game module. For a known completed write,
+combine invalidation/publication into one non-observable update. Native loaders
+use the same generated boundary; hosts do not choose modules independently.
+Availability changes govern binding lookups; they do not revoke the compiled body
+of an already active C invocation. Contract 4 defines that source-owned lifetime.
 
-- Keep each milestone's tasks, findings and progress log current. Carry findings
-  affecting later work into the later milestone's Context section.
-- Update this table and `plans/README.md` when status changes. Do not mark the
-  whole effort complete when only A or B is done.
-- C's exit requires covered execution and mod-patch paths to be free of resident-
-  byte inference, supported-case evidence, and the reviewed conformance gate.
-  Legitimate diagnostics comparing original bytes need not be deleted.
-- Broad architectural closure is blocked if necessary input facts or supported
-  lifetime semantics remain unresolved. Say what is missing; do not relabel a
-  partial migration complete.
-- Preserve unrelated working-tree changes and existing replays. Use the session
-  scratchpad for mutations and exploratory work; generated outputs stay ignored.
+## Contract 3: partial code, dependencies and unknown states
+
+Support build-known code versions and, for lifted implementations, instruction-
+aligned compositions of their published ranges. Do not require every function or
+image to arrive atomically. Supplied C is not replaced with lifted fragments to
+implement a composition: use the source-level continuation mechanism in Contract 4
+where that composition requires an explicit C control-flow transition.
+
+Partition affected lifted control flow at entry points, replacement-range
+boundaries and observable continuation points. Compile fragments from known
+instructions ahead of time and bind their transfers explicitly. Keep ordinary
+loops structured within stable fragments. A mixed function can therefore execute
+B's published prefix and A's untouched suffix without pretending either whole
+image is resident. No runtime instruction fetch/decode/execute loop is introduced.
+
+- Preserve runtime table reads. Discover/compile the supported targets across
+  the known inputs; do not freeze a mutable table to one image's target set.
+- Do not inline across independently replaceable dependencies. Existing non-o32
+  register-sharing transfers use the compiled continuation/frame mechanism below.
+- Share equivalent implementations only when code and relevant assumptions agree.
+  Module names or candidate order never resolve ambiguity.
+- A binding lookup into incomplete/unknown instructions, an unregistered patch,
+  an absent dependency or an unavailable entry must not choose stale compiled code.
+  Fail at that transfer with its address and cause. Completed unrelated code remains
+  callable. This does not invalidate an existing native C frame: its continuation
+  follows authored C unless the source explicitly requests a different binding.
+- A patch version explicitly supplied as a known compiler input is ordinary
+  supported code. Do not synthesize executable code at runtime. Do not automatically
+  register arbitrary values passed to a memory-write routine as code versions.
+
+## Contract 4: source-owned C and lifted continuations
+
+### Supplied C retains ordinary native frame semantics
+
+Entering a C implementation selects that compiled C body for the invocation.
+Activation changes subsequent slot-based calls, not the instructions or locals
+of an existing C frame. Asyncify resumes that same authored C frame. This does
+not snapshot guest data: later reads and calls still observe current data/bindings.
+
+Do not reconstruct C locals from MIPS registers, replace the body with original
+instructions, or require continuation annotations merely because a C function's
+original address is reused. Keep authored functions and source locations in debug
+builds; mark compiler wrappers artificial, not the source function. Source edits
+must affect execution and breakpoints must refer to the C that actually runs.
+
+### C code explicitly expresses a changing continuation
+
+When the port requires switching the remainder of an active C computation, expose
+that transition in C. Use an authored shared state struct and authored continuation
+functions with the uniform form `uint64_t handler(State *state)`. Register them in
+`dispatch.c_continuations` by logical slot, placement and original anchor address.
+For a slot named `after_wait`, generate a typed declaration
+`uint64_t psxw_continue_after_wait(State *state)` in `psxw_binding.h`.
+
+The source explicitly calls this helper at its transition point. The helper
+resolves the handler currently bound at that slot's anchor, checks the registered
+state ABI, and calls the selected C function. It does not modify the caller's C
+frame or replay a replacement prologue. Each handler owns its authored behaviour;
+state is transferred only through the explicit struct, not a guessed locals map.
+An ordinary resumed C function with no such call continues its own body.
+
+Registrations for one slot must share the canonical state type/layout and return
+ABI. Resolve C symbols from compiled source objects, not original MIPS bodies.
+Missing handlers or conflicting state layouts are build errors. A reachable
+lifted-to-C interior continuation additionally requires an authored C bridge that
+constructs that state from the lifted continuation frame; no implicit register-
+to-C-local conversion is allowed. Report `binding.missing_c_continuation` with the
+slot, source function and missing handler/bridge. Do not substitute lifted code.
+
+### Functions already assigned to the lift tier retain MIPS continuation semantics
+
+Only for those functions, generate continuation entries at relevant calls,
+safepoints and independently replaceable fragment boundaries. Save frame-local
+live state covering known replacement continuations, using original register/stack
+locations and conservative values where liveness is not proven. Resume using the
+currently published continuation. Use a frame-local compiled-handle trampoline to
+avoid recursion growth; there is no global CPU state or instruction interpreter.
+Asyncify and the existing scheduler remain unchanged.
+
+The existing lifted `D09/suspend-replaced` remains a required **0x22A** positive,
+not **0x12A** and not a rejection. Add separate C tests: an ordinary C frame retains
+its authored body after reload, while an explicitly authored C continuation can
+produce the matching **0x22A** transition. Do not change the lifted fixture to the
+native-C lifetime contract just to obtain a pass.
+
+## Contract 5: callable representations and namespaces
+
+B uses a separate native function table. Index zero is null. Native indices exist
+only in compiler-proven native flows; guest references never enter that table by
+numeric guesswork. Keep SDK/BIOS callback storage, `GuestCall.addr`, host invocation
+and mod pointer interfaces guest-represented. Cross-tier native flows use typed
+compiled wrappers. No tagged-pointer ABI or blanket structure widening is needed.
+
+C replaces masked guest-call indexing with this exact software-callable policy:
+
+1. Reject null and misaligned callable values before dispatch.
+2. Recognize registered BIOS/kernel stand-ins and mod synthetic entries by their
+   exact ABI values, in separate namespaces. An ordinary RAM address cannot alias
+   one by sharing masked low bits.
+3. Accept KUSEG, KSEG0 and KSEG1 views of the declared 2 MiB RAM callable space;
+   canonicalize only these aliases, then require an available compiled entry.
+   Other explicitly compiled text placements, such as scratchpad code, resolve by
+   their registered addresses; never manufacture an entry from masked low bits.
+4. Do not accept 2 MiB/4 MiB wraparound, unmapped addresses or unregistered synthetic
+   values. A value inside the synthetic reservation works only if explicitly
+   registered, never because its mask happens to select a RAM function.
+
+This changes the callable ABI, not D5's data-address mapping or console hardware
+exception behaviour. It resolves the D07 rejection cases as port-contract tests.
+It does not restore whole-code validation or the removed D72 implementation.
+
+## Contract 6: failure, compatibility and completion
+
+Use deterministic diagnostics carrying the original address/site and relevant
+module/range. Retain existing `untranslated` reporting where applicable and add
+structured causes rather than accepting arbitrary traps:
+
+| Cause | Required action |
+|---|---|
+| Missing writer/activation/reference facts needed for strict compilation | Build error naming the site and missing schema field |
+| Required C write-site or explicit continuation mapping is absent | `binding.missing_c_write_site` or `binding.missing_c_continuation`; identify the source marker/handler/bridge to supply, never change tiers |
+| Unknown selector or destination outside compiled placements | Reject the publication; never publish a guessed module |
+| Invalid callable value | Reject before entering any target |
+| Unavailable/unknown code or dependency | Reject at that transfer before executing incompatible code |
+| Incompatible artifact ABI/schema | Refuse linking/loading with both versions reported |
+| Unimplemented supported positive case | Keep the milestone/test failing and implement the missing mechanism |
+
+A/B permit explicitly reported legacy regions during development. C adds
+`[dispatch].require_explicit = true`; it rejects any executable/mod-policy consumer
+still relying on resident-byte identification or incomplete writer coverage.
+Guest pointers backed by explicit bindings satisfy this requirement. Native-handle
+promotion is not required for opaque flows.
+
+Keep the old mode only as an explicit migration option while inputs are converted.
+Final acceptance requires all supported production inputs to require explicit
+binding. No automatic fallback is allowed. Then delete the legacy execution/mod
+selectors and their metadata. Publish dispatch input schema version 2 with explicit
+binding as the default; reject `require_explicit = false` and version-1 inputs
+with a migration diagnostic. Update the supported manifests to version 2.
+Byte comparisons used solely for diagnostics or by original program logic are
+not dispatch inference and need not be deleted.
+
+## Evidence and maintenance
+
+- Use existing build reports and `out/conform/dispatch/{report.json,summary.txt}`.
+  Version them; list classifications, event facts, placements, actual source/tier
+  provenance, C handlers/state ABIs, remaining legacy consumers and missing writer
+  coverage, not just totals. C bodies must not acquire an implicit lift selection.
+- Use original MIPS plus the live reference for original behaviour and matching C
+  fixtures. Compiler annotations do not give the reference an activation answer.
+  Deliberately edited C and native-C frame semantics use explicit authored-source
+  expectations; do not discard edits to match an obsolete binary. Keep these tests
+  distinct from unchanged lifted positives. Port-only callable namespaces and
+  handles use explicit ABI expectations, not CPU exception claims.
+- Extend the production fixture path; do not create another compiler/test framework.
+  Keep a few integration cases per milestone and reuse D01–D10.
+- Preserve failing observations and historical reports. Changing the mixed-code
+  case from a proposed rejection to required execution strengthens coverage; obtain
+  its original-MIPS evidence. Do not change positive expectations to avoid work.
+- Missing tools, missing saves or absent input facts are failed prerequisites with
+  explicit remediation. They do not become approval requests or passing skips.
+- Update design/index/audits as implementation lands. Preserve unrelated work and
+  replays. Keep mutations in the session scratchpad and generated artifacts ignored.
 
 ## Tasks
 
-- [ ] Complete milestone A and record its evidence.
-- [ ] Complete milestone B and record its evidence.
-- [ ] Complete milestone C and reconcile the conformance plan's remaining work.
+- [ ] Complete A and retain its evidence.
+- [ ] Complete B and retain its evidence.
+- [ ] Complete C, production input migration and the full conformance gate.
 
 ## Progress log
 
-- Plan authored from the identity/binding discussion; no implementation or new
-  acceptance run is claimed.
+- Plan authored; implementation not started.
+- Replaced approval placeholders with concrete publication, representation,
+  continuation, namespace and failure contracts.
+- Removed automatic C-to-lift selection. Prescribed native C frame lifetime,
+  authored C continuation/state interfaces and source-debugging acceptance instead.
 
 ## Findings
 
-- Existing byte inference also serves mods/data patches. Function dispatch alone
-  is insufficient for the final no-inference claim.
-- The present synthetic runner does not merge the real runtime. C must close
-  that gap rather than extrapolate from fixture callback stubs.
+- Function dispatch, active continuations and mod data-patch residency are distinct
+  consumers of code identity. All are included in final acceptance.
+- Existing standalone fixture guests do not establish real runtime-merge coverage;
+  C explicitly supplies that integration.

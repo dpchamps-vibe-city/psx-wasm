@@ -1,14 +1,17 @@
 # Dispatch: code identity, runtime binding and translation validity
 
-**Status:** problem statement and design discussion, not an approved redesign.
-No implementation work or change to the supported execution model is authorized
-by this document.
+**Status:** background problem statement. The concrete contracts, implementation
+steps and acceptance requirements are now prescribed in the
+[dispatch-binding plan](dispatch-binding/README.md). Its answers supersede the
+open design questions recorded here; this document remains explanatory context.
 
 **Scope:** a general compiler/static-recompiler problem, not a porting recipe
 for an individual game. Input-specific facts belong in declarative input
 metadata; compiler rules must not be fitted to particular games.
 
 Related:
+- [Prescriptive implementation plan](dispatch-binding/README.md): three milestones
+  for explicit activation, proven native references and retirement of inference.
 - [Architecture](../docs/emulation-layers.md): SDK → adaptor → native backend;
   the host integrates with the backend. This is not a PlayStation CPU emulator.
 - [Design](../docs/design.md): D5 preserves guest addresses, D6 preserves guest
